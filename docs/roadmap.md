@@ -19,7 +19,7 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| tests | **246 passing**, including the health gate against a real `robotd` process |
+| tests | **272 passing**, including the health gate against a real `robotd` process |
 | missing | `mediad`, `btd`, `robot-config`, app, SDK, hardware |
 
 ## The framing

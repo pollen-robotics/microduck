@@ -25,6 +25,11 @@ After=local-fs.target
 Type=exec
 ExecStart=/opt/robot/daemon/current/bin/robotd --socket /run/robotd.sock
 
+# Parameters come from /etc/robot/robotd.toml, which is robotd's default path and is not
+# named here on purpose: the file is optional, and a missing one means built-in defaults
+# rather than a daemon that refuses to start. Naming it with --params would make it
+# mandatory. See deploy/robotd.toml.
+
 # --unhealthy and --busy are deliberately absent. They exist to exercise the updater's
 # rollback path on a bench robot and are added by hand for that, never shipped: a robot
 # started with --unhealthy reverts every update it is offered.
@@ -63,10 +68,9 @@ RestrictSUIDSGID=yes
 
 # stderr → journal; level via RUST_LOG.
 #
-# `info` is safe to ship: the per-tick heartbeat is at `debug`, and the loop logs one
-# summary line every five minutes. `debug` on a long-running board would write a line per
-# control cycle and evict older logs under journald's size cap — use it while debugging,
-# not as a standing setting.
+# `info` is safe to ship: the control loop logs one summary line every five minutes and
+# nothing per tick. At 50 Hz a per-tick line would be ~4.3M entries a day, which under
+# journald's size cap is what *evicts* the logs support actually needs.
 #
 # The startup identity line (version, revision, exe path) is at `warn`, so it survives even
 # RUST_LOG=warn. See deploy/README.md for log retention.

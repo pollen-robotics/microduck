@@ -20,7 +20,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-246 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+272 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
@@ -56,7 +56,8 @@ to watch the boot counter undo a release that never confirmed healthy.
 
 | | |
 |---|---|
-| `robotd` | motor control, kinematics, gait model, **safety authority**. Currently a skeleton: a heartbeat plus the four `robot.*` methods the updater needs. |
+| `robotd` | motor control, kinematics, gait model, **safety authority**. Currently holds the pose it starts in: a real 50 Hz loop on the Dynamixel bus, plus the four `robot.*` methods the updater needs. Walking arrives in slice 2 ([`docs/robotd-design.md`](docs/robotd-design.md)). |
+| `duck-control` | the control core — robot model, bus, sensing. A library, not a service: no tokio, no sockets, no systemd. |
 | `updaterd` | the update engine. Resident, and deliberately independent of `robotd` — it is the recovery path, so it must work when the robot does not. |
 | `mediad` | camera, audio, WebRTC gateway. **Not built yet.** |
 | `btd` | BLE: wifi provisioning, naming, update trigger from the phone. **Not built yet.** |
@@ -67,13 +68,14 @@ never inherit the update engine's http/tar/crypto tree.
 
 ```
 duck-ipc-proto/ the wire contract
+duck-control/   the control core: robot model · Dynamixel bus · IMU · the RobotIo seam
 updater/        engine + updaterd
 robotd/         control daemon
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped
-deploy/         what a robot is configured with: updater.toml, trust anchor, journald
+deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        install.sh (provisioning) · board-test.sh (aarch64 checks)
-docs/           architecture · update design · roadmap · CI setup
+docs/           architecture · update design · robotd design · roadmap · CI setup
 ```
 
 ## Working on the robot
@@ -226,7 +228,9 @@ Honest version, kept current in [`docs/roadmap.md`](docs/roadmap.md):
 - **Open:** artifact hosting. This repo is private, and a robot without a token cannot
   download from it (§6.1). Dev boards have tokens; the fleet will need a public
   artifact-only repository or an object store. Blocks hardware bring-up, not development.
-- **Skeleton:** `robotd`.
+- **`robotd` holds a pose.** A real 50 Hz loop on the Dynamixel bus, and `robot.health`
+  now means *the loop is meeting its deadline* rather than *it ticked once* — which is what
+  makes the updater's auto-rollback gate on something real. Walking is slice 2.
 - **Not started:** `mediad`, `btd`, the phone app, the SDK, safety authority.
 - **Runs on aarch64 Linux, emulated.** `scripts/board-test.sh` runs in CI: it
   cross-compiles for the board and executes 13 checks — rollback, tampered-artifact

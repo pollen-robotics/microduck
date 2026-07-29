@@ -177,6 +177,16 @@ install_config() {
     if grep -q '"ORG/' "${CONFIG_DIR}/updater.toml"; then
         die "${CONFIG_DIR}/updater.toml still names a placeholder repository"
     fi
+
+    # Same rule: never overwritten, because it is where a bench robot's loop rate and
+    # health thresholds get tuned. robotd runs on built-in defaults if it is missing, so
+    # this is documentation as much as configuration.
+    if [ -f "${CONFIG_DIR}/robotd.toml" ]; then
+        warn "keeping the existing ${CONFIG_DIR}/robotd.toml"
+    else
+        fetch "${RAW}/deploy/robotd.toml" "${CONFIG_DIR}/robotd.toml"
+        chmod 644 "${CONFIG_DIR}/robotd.toml"
+    fi
 }
 
 # Land the first release through the real engine. `--config` is the config installed

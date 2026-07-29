@@ -4,7 +4,7 @@
 # docs/architecture.md §1. `robotd`, `btd` and `mediad` join as siblings.
 [workspace]
 resolver = "3"
-members = ["duck-ipc-proto", "updater", "robotctl", "robotd", "test-support", "xtask"]
+members = ["duck-control", "duck-ipc-proto", "updater", "robotctl", "robotd", "test-support", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,51 @@
+# robotd — per-robot parameters.
+#
+# Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
+# anything here needs `systemctl restart robotd`. Live reload is deferred
+# (docs/robotd-design.md §7.2).
+#
+# It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
+# per-robot configuration rather than a shipped default, so it must survive an update
+# *and* a rollback (docs/architecture.md §3). The installer never overwrites it.
+#
+# Every value below is the built-in default. The file may be deleted entirely — an
+# unprovisioned board comes up on these same numbers rather than refusing to start, which
+# is far easier to diagnose remotely than a daemon that will not run.
+
+[bus]
+# Serial port the 15 servos and the imu_to_dxl board share. /dev/ttyS2 is the Radxa
+# Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
+# `robotd --port`, which is the dev escape hatch rather than the thing to edit here.
+port = "/dev/ttyS2"
+
+[control]
+# Control loop rate, Hz.
+#
+# 50 is inherited from the prototype, where it was chosen on a Raspberry Pi Zero 2W. It
+# has never been re-derived on the Radxa. Before trusting it, measure: `bench_dynamixel_bus`
+# in microduck_runtime reports achieved rate, jitter, bus utilisation and error counts at a
+# given rate, and the loop's own five-minute summary reports the same from inside robotd.
+hz = 50
+
+[health]
+# What `robot.health` means, and therefore what the update system rolls back on.
+#
+# This is the whole point of the daemon in its current form: the updater's auto-rollback is
+# only meaningful if health is a real measurement. A loop running at 60% of target is
+# alive, answers every request, and is badly broken — these three thresholds are what
+# distinguish that from a healthy robot.
+
+# Achieved rate floor. Below this, unhealthy. 45 is 90% of the default 50 Hz: loose enough
+# not to trip on one slow tick, tight enough that a loop dropping every tenth cycle is not
+# called healthy. Raise it in step with `control.hz`.
+min_achieved_hz = 45.0
+
+# How many periods may pass with no tick at all before the loop counts as stalled. This is
+# what turns a wedged control thread into an honest "unhealthy" instead of a socket that
+# keeps answering "healthy" on the strength of one tick it managed an hour ago.
+stall_periods = 3
+
+# Consecutive failed bus reads tolerated. One dropped transaction is ordinary on a serial
+# bus; a run of them means the bus is gone, and a robot that cannot read its own joints is
+# not healthy whatever rate the loop is spinning at.
+max_consecutive_errors = 10

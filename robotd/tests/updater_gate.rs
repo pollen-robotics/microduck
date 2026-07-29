@@ -48,11 +48,11 @@ impl Robotd {
     async fn spawn(socket: PathBuf, extra_args: &[&str]) -> Self {
         let mut command = Command::new(robotd_bin());
         command.arg("--socket").arg(&socket);
-        // Fast heartbeat: `robot.health` reports unhealthy until the control loop has
-        // ticked at least once, so a 1s default would add a second to every test.
-        command.arg("--heartbeat").arg("50ms");
+        // No Dynamixel bus here, and there must never need to be: this test runs in CI and
+        // on a laptop. `--fake` is the whole reason `RobotIo` is a trait.
+        command.arg("--fake");
         command.args(extra_args);
-        // Quiet the heartbeat, which would otherwise bury the test output. `error` rather
+        // Quiet the loop summary, which would otherwise bury the test output. `error` rather
         // than `off` so a real startup failure still shows up.
         command.env("RUST_LOG", "error");
         let child = command.spawn().expect("spawn robotd");

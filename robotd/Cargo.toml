@@ -7,6 +7,7 @@ description = "Robot control daemon — skeleton"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+duck-control = { path = "../duck-control" }
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +23,8 @@ tokio = { workspace = true, features = [
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 libc = "0.2"
+thiserror.workspace = true
+toml = "0.9"
 
 # Test-only. `tests/updater_gate.rs` drives the real update engine against this binary,
 # which is why `updater` appears here: the test asserts that robotd upholds the contract
