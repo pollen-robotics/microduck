@@ -903,6 +903,9 @@ mod tests {
             fn write(&mut self, t: &JointTargets) -> duck_control::io::Result<()> {
                 self.0.write(t)
             }
+            fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
+                self.0.set_gain(kp)
+            }
         }
         control_loop(Borrowed(io), state, period).await
     }

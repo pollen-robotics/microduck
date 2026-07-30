@@ -250,6 +250,15 @@ impl RobotIo for DynamixelIo {
             .sync_write_goal_position(&JOINT_IDS, &targets.positions)
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
     }
+
+    fn set_gain(&mut self, kp: u16) -> Result<()> {
+        for &id in &JOINT_IDS {
+            self.controller
+                .write_position_p_gain(id, kp)
+                .map_err(|e| IoError::Bus(format!("position_p_gain {kp} on {id}: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

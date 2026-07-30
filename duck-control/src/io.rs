@@ -76,6 +76,14 @@ pub trait RobotIo {
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
+
+    /// Set the position P gain on every joint.
+    ///
+    /// Here rather than in the bus layer alone because it is what makes "go limp" mean
+    /// something. Refusing to command a fallen robot only freezes it in the pose it fell
+    /// in; dropping the gain lets it yield. The prototype does the same, at kP 50 against
+    /// a running value of 200.
+    fn set_gain(&mut self, kp: u16) -> Result<()>;
 }
 
 /// A robot made of nothing, for tests.
@@ -91,6 +99,8 @@ pub struct FakeIo {
     pub last_written: Option<JointTargets>,
     pub reads: usize,
     pub writes: usize,
+    /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
+    pub last_gain: Option<u16>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
 }
@@ -109,6 +119,7 @@ impl FakeIo {
             last_written: None,
             reads: 0,
             writes: 0,
+            last_gain: None,
             track_targets: true,
         }
     }
@@ -152,6 +163,11 @@ impl RobotIo for FakeIo {
         if self.track_targets {
             self.sensors.positions = targets.positions;
         }
+        Ok(())
+    }
+
+    fn set_gain(&mut self, kp: u16) -> Result<()> {
+        self.last_gain = Some(kp);
         Ok(())
     }
 }
