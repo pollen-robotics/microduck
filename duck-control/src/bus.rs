@@ -204,7 +204,17 @@ impl RobotIo for DynamixelIo {
             let mut raw = [0u8; IMU_BLOCK_LEN];
             raw.copy_from_slice(&blocks[0]);
             if raw == self.last_imu_block {
-                self.stale_imu_blocks = self.stale_imu_blocks.saturating_add(1);
+                let n = self.stale_imu_blocks.saturating_add(1);
+                self.stale_imu_blocks = n;
+                // Say so, or the counter is a number nobody ever reads. Rate-limited
+                // because a board that has stopped refreshing produces one of these every
+                // single tick, and 50 Hz of identical warnings would evict the journal.
+                if n == 1 || n.is_multiple_of(500) {
+                    tracing::warn!(
+                        stale_blocks = n,
+                        "imu board returned the same sample as last tick — orientation may be dead"
+                    );
+                }
             }
             self.last_imu_block = raw;
             sensors.imu = self.imu.decode(&raw);

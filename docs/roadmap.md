@@ -11,16 +11,18 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | | |
 |---|---|
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
+| `duck-control/` | robot model · Dynamixel bus · IMU · the `RobotIo` seam — **slice 1 done**. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
-| `robotd/` | heartbeat + the four `robot.*` methods, systemd unit — **skeleton done**; no control, no kinematics |
+| `robotd/` | a real 50 Hz loop on the Dynamixel bus holding the startup pose, health from deadline adherence, the four `robot.*` methods, systemd unit — **slice 1 done**, untested on a board; no policy, no kinematics |
 | `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
-| `deploy/` | shipped `updater.toml`, trust anchor, journald retention drop-in |
+| `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
 | tests | **272 passing**, including the health gate against a real `robotd` process |
-| missing | `mediad`, `btd`, `robot-config`, app, SDK, hardware |
+| missing | `mediad`, `btd`, `robot-config`, app, SDK |
+| never run on hardware | every claim above is from CI and a laptop. Slice 1's whole purpose is to change that |
 
 ## The framing
 
@@ -113,18 +115,39 @@ over the network, and a customer-robot config refused the same build.
 **Open, and it blocks M4:** a private repo's release assets need a token, and a customer robot
 has none. See `updater-design.md` §6.1.
 
-### M3 — `robotd` for real  ·  sim first
+### M3 — `robotd` for real  ·  hardware first, in two slices
 
-Port control into the new architecture. The MuJoCo setup in `microduck_brain` means
-most of this needs no hardware — worth building the seam early: a `RobotBackend` trait
-with `Mujoco` and `Hardware` impls, the same shape as `RobotClient` in the updater.
+Designed in [`robotd-design.md`](robotd-design.md). `robotd` **replaces**
+`microduck_runtime`, by extracting its control core into `duck-control` rather than
+reimplementing it — so the prototype keeps running while the daemon grows, and parity
+arrives as a consequence of the extraction instead of as a race against a moving target.
+Only the alpha variant on the Radxa survives; the other three variants, four IMUs and two
+boards are dropped.
 
-**Safety authority belongs here, not in M6.** `architecture.md` §6 designs it and
-nothing implements it. It's the one thing that can hurt someone, and retrofitting
-authority arbitration into a working control loop is far worse than designing it in.
+**Hardware first, sim after.** An earlier draft of this milestone said the reverse. It was
+wrong on the facts: there are boards, and correctness gets settled on them. The simulator's
+job is a clean laptop dev environment, not a validation oracle, so it lands after slice 2
+and never becomes a second definition of what the robot is. Tests run against a `FakeIo`
+backend — no hardware, no network, no Docker, no Python.
 
-**Done when:** it walks in sim through the new architecture, and `robotd` enforces
-joint/thermal/fall limits regardless of what any client asks for.
+**Slice 1 — hold the pose · done, pending a board.** A real 50 Hz loop on the Dynamixel
+bus, holding whatever pose it starts in. No policy. It exists so `robot.health` means *the
+loop is meeting its deadline* rather than *it ticked once* — until now the updater's
+auto-rollback has been gating on a placeholder. Holding a pose is also what makes it safe to
+hammer install/rollback/power-cut cycles at a bench for a day.
+
+**Slice 2 — walk and stand.** One 61-D observation builder (every alpha policy is
+`obs[1,61] → actions[1,14]`), the main-plus-standing policy shaped as it is in the runtime,
+`move`/`head`/`stop`/`enable` intents, and a gamepad client that goes through them.
+
+**Safety authority belongs here, not in M6** — `architecture.md` §6 designs it and nothing
+implements it. It lands in slice 2, holding the only write handle to the bus, so no policy
+and no client *can* command a motor around it. Joint clamp, fall → limp, and an intent
+deadman; thermal waits for a measured threshold rather than a guessed one.
+
+**Done when:** it walks on a board driven through the intent API, an update applied with
+`robotctl` restarts it cleanly with the gate passing, and a release built to come up
+unhealthy is automatically rolled back.
 
 ### M4 — Hardware bring-up
 
