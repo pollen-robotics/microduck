@@ -9,6 +9,12 @@ description = "Robot control core: model, bus, sensing"
 serde = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
+# `load-dynamic` dlopens libonnxruntime at first use instead of linking it. Two
+# consequences, both wanted: the aarch64 cross-build needs no target-arch ONNX Runtime at
+# build time, and a laptop with no libonnxruntime still compiles and runs every test that
+# does not create a session. Pinned to the version microduck_runtime runs today, so the
+# board keeps the ABI it already works against.
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
 rustypot = "1.4.2"
 # `default-features = false` drops serialport's `libudev` feature, which exists only for

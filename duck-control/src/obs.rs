@@ -103,6 +103,16 @@ impl Observation {
         &self.data
     }
 
+    /// An all-zero observation, for warming a session up before the control loop starts.
+    ///
+    /// Not a valid robot state — it is only ever fed to an inference whose output is
+    /// discarded, to pay the first-call cost off the hot path.
+    pub fn zeroed() -> Self {
+        Self {
+            data: [0.0; OBS_LEN],
+        }
+    }
+
     /// Assemble the observation.
     ///
     /// `joint_positions` are absolute; the policy sees them relative to the home pose,
