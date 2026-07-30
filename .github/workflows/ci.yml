@@ -101,3 +101,32 @@ jobs:
           platforms: arm64
 
       - run: ./scripts/board-test.sh
+
+  coverage:
+    # Its own job rather than another step in `check`: coverage needs a full
+    # instrumented rebuild, which shares no artifacts with the ordinary one, so bolting it
+    # onto `check` would roughly double the time to the signal everyone actually waits for.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # `xtask` is excluded because it is build tooling that never ships. It is exercised
+      # by CI actually packaging a release — the `check` job runs `xtask package` — not by
+      # unit tests, so counting it would only ever measure the wrong thing.
+      #
+      # Everything else stays in, including code that cannot be covered without hardware
+      # (`duck-control/src/bus.rs` is the Dynamixel driver, and `FakeIo` deliberately
+      # covers the trait rather than the driver). Those are honest zeroes and the floor
+      # below is set with them included, rather than hidden by widening the exclusion until
+      # the number looks good.
+      #
+      # The floor is a ratchet, not a target: raise it when the real number rises. It sits
+      # a few points under today's ~77% so ordinary work does not trip it, while a genuine
+      # collapse still fails. Lowering it should be a deliberate, explained commit.
+      - name: Coverage
+        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines 72
