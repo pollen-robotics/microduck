@@ -11,16 +11,17 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | | |
 |---|---|
 | `updater/` | engine, verification, store, journal, hooks, preflight, GitHub/HF/local sources, IPC server, systemd unit — **done** |
-| `duck-control/` | robot model · Dynamixel bus · IMU · the `RobotIo` seam — **slice 1 done**. A library: no tokio, no sockets, no systemd |
+| `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done**, untested on a board. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
-| `robotd/` | a real 50 Hz loop on the Dynamixel bus holding the startup pose, health from deadline adherence, the four `robot.*` methods, systemd unit — **slice 1 done**, untested on a board; no policy, no kinematics |
+| `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done**, untested on a board; no kinematics |
+| `padd/` | gamepad → intents, as an ordinary socket client — **done on a laptop**; does not cross-compile to the board yet (`gilrs` wants a libudev sysroot) |
 | `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| tests | **272 passing**, including the health gate against a real `robotd` process |
+| tests | **301 passing**, including the health gate against a real `robotd` process |
 | missing | `mediad`, `btd`, `robot-config`, app, SDK |
 | never run on hardware | every claim above is from CI and a laptop. Slice 1's whole purpose is to change that |
 
