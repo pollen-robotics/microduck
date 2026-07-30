@@ -51,6 +51,11 @@ impl Robotd {
         // No Dynamixel bus here, and there must never need to be: this test runs in CI and
         // on a laptop. `--fake` is the whole reason `RobotIo` is a trait.
         command.arg("--fake");
+        // And no policy: ONNX Runtime is not installed in CI or on a dev laptop, and a
+        // robotd that wanted a policy and could not load one correctly reports unhealthy —
+        // which is the behaviour these tests would otherwise trip over. What is under test
+        // here is the update gate, not the gait.
+        command.arg("--no-policy");
         command.args(extra_args);
         // Quiet the loop summary, which would otherwise bury the test output. `error` rather
         // than `off` so a real startup failure still shows up.

@@ -7,9 +7,13 @@
 //! It lives outside `releases/<ver>/` so it survives an update *and* a rollback: this is
 //! per-robot configuration, not shipped defaults (`architecture.md` §3).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+/// Where a release is mounted. Policy paths default under here, so an ordinary update
+/// carries the policy with the binaries that were trained against it.
+pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
 
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
@@ -20,6 +24,79 @@ pub struct Params {
     pub bus: Bus,
     pub control: Control,
     pub health: Health,
+    pub policy: PolicyParams,
+    pub safety: SafetyParams,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyParams {
+    /// Whether to load a policy at all.
+    ///
+    /// False means slice 1's behaviour: run the loop, hold the pose, stay healthy. That is a
+    /// legitimate configuration — it is the safest thing to be doing while hammering
+    /// install/rollback cycles at a bench — and it is distinct from a policy that was wanted
+    /// and could not be loaded, which is unhealthy.
+    pub enabled: bool,
+    /// Walking policy. Defaults inside the release directory so a normal update ships it;
+    /// point this elsewhere to try a build without cutting a release, which is the loop
+    /// anyone iterating on gait actually runs.
+    pub walk: PathBuf,
+    /// Standing policy. Without one the walking policy runs at every velocity.
+    pub stand: Option<PathBuf>,
+    /// Scales raw policy output into a joint offset.
+    pub action_scale: f64,
+    pub standing_action_scale: f64,
+    /// Standing runs softer, at this fraction of `gain`.
+    pub standing_gain_ratio: f64,
+    /// Position P gain while running.
+    pub gain: u16,
+    /// First-order low-pass on the head joints. Absent means none, which is what the
+    /// prototype ships — there it is behind `--head-low-pass`, off by default.
+    pub head_lowpass: Option<f64>,
+    pub legs_lowpass: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SafetyParams {
+    /// Projected-gravity z above which the robot counts as going down. Upright is about
+    /// -1.0; on its side is near 0.
+    pub fall_gravity_z: f64,
+    /// How long that has to hold. Debounced so a firm footfall is not a fall.
+    pub fall_debounce_ms: u64,
+    /// Intent age past which the velocity is zeroed. Stop, not limp.
+    pub deadman_ms: u64,
+    /// Gain once fallen — low enough to yield rather than fight the floor.
+    pub gain_limp: u16,
+}
+
+impl Default for PolicyParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            walk: PathBuf::from(RELEASE_DIR).join("policies/alpha_walking.onnx"),
+            stand: Some(PathBuf::from(RELEASE_DIR).join("policies/alpha_stand.onnx")),
+            // The prototype's numbers.
+            action_scale: 0.7,
+            standing_action_scale: 1.0,
+            standing_gain_ratio: 0.6,
+            gain: 200,
+            head_lowpass: None,
+            legs_lowpass: None,
+        }
+    }
+}
+
+impl Default for SafetyParams {
+    fn default() -> Self {
+        Self {
+            fall_gravity_z: -0.5,
+            fall_debounce_ms: 200,
+            deadman_ms: 500,
+            gain_limp: 50,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

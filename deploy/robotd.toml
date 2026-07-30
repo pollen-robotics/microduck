@@ -54,3 +54,64 @@ stall_periods = 25
 # bus; a run of them means the bus is gone, and a robot that cannot read its own joints is
 # not healthy whatever rate the loop is spinning at.
 max_consecutive_errors = 10
+
+[policy]
+# Whether to load a policy at all.
+#
+# `false` runs the loop and holds whatever pose the robot started in, and stays healthy
+# doing it. That is a legitimate configuration, not a degraded one: it is the safest thing
+# to be doing while hammering install / rollback / power-cut cycles at a bench, because
+# nothing falls over when a deliberately broken release lands.
+#
+# It is deliberately distinct from a policy that was wanted and could not be loaded — that
+# reports unhealthy, so the updater rolls the release back. `robotd --no-policy` sets this
+# from the command line.
+enabled = true
+
+# Policy files. Default inside the release directory, so an ordinary update carries the
+# policy alongside the binaries that were trained against it. Point these at your own
+# .onnx to try a build without cutting a release — the loop anyone iterating on gait runs.
+#
+# Both must be 61-input, 14-output: every alpha policy is obs[1,61] -> actions[1,14], and
+# robotd checks that at load rather than discovering it mid-stride.
+walk = "/opt/robot/daemon/current/policies/alpha_walking.onnx"
+stand = "/opt/robot/daemon/current/policies/alpha_stand.onnx"
+
+# Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
+# a startup failure rather than a build one — robotd reports it through robot.health and
+# holds its pose. scripts/install.sh installs it; ORT_DYLIB_PATH overrides where to look.
+
+# Scales raw policy output into a joint offset. The prototype's value.
+action_scale = 0.7
+# The standing policy is trained to be applied whole.
+standing_action_scale = 1.0
+# Standing runs softer, at this fraction of `gain`.
+standing_gain_ratio = 0.6
+# Position P gain while running.
+gain = 200
+
+# First-order low-pass on the head and leg joints, as a blend factor in (0, 1].
+#
+# Commented out, which means no filtering — matching the prototype, where both sit behind
+# `--head-low-pass` / `--legs-low-pass` and are off unless asked for. Enabling them by
+# default would silently change how the robot moves relative to the thing it replaces.
+# The prototype's alpha when enabled is 0.6.
+# head_lowpass = 0.6
+# legs_lowpass = 0.6
+
+[safety]
+# Fall detection, on projected gravity in the trunk frame. Upright reads about -1.0 on z;
+# a robot on its side reads near 0. Debounced, because the impulse from a firm footfall
+# would otherwise read as a fall — and dropping the robot mid-stride is how you cause one.
+fall_gravity_z = -0.5
+fall_debounce_ms = 200
+
+# How long the robot goes without a velocity intent before it stops.
+#
+# Stop, not limp: losing contact with a client should leave a biped standing, because
+# standing is its safe state. Losing balance is the other event, and it goes limp instead.
+deadman_ms = 500
+
+# Gain once fallen — low enough to yield rather than fight the floor. Refusing to command
+# a fallen robot only freezes it in the pose it fell in; going soft lets it settle.
+gain_limp = 50

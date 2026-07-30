@@ -11,6 +11,7 @@
 //! updater rolls the release back instead of leaving a robot that cannot walk.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
@@ -48,6 +49,65 @@ pub enum PolicyError {
     },
     #[error("inference failed: {0}")]
     Inference(String),
+    /// ONNX Runtime is not installed, or not where it is being looked for.
+    ///
+    /// Its own diagnosis, because it is an operator problem with an operator fix — install
+    /// the library or set `ORT_DYLIB_PATH` — and not a broken policy bundle.
+    #[error("ONNX Runtime not loadable ({searched}): {detail}")]
+    RuntimeMissing { searched: String, detail: String },
+}
+
+/// Where `ort` will look for the runtime, replicating its own logic.
+fn dylib_name() -> String {
+    match std::env::var("ORT_DYLIB_PATH") {
+        Ok(path) if !path.is_empty() => path,
+        _ => {
+            if cfg!(target_os = "windows") {
+                "onnxruntime.dll".to_owned()
+            } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+                "libonnxruntime.dylib".to_owned()
+            } else {
+                "libonnxruntime.so".to_owned()
+            }
+        }
+    }
+}
+
+/// Confirm ONNX Runtime is loadable **before** calling into `ort`.
+///
+/// This exists because `ort` does not return an error when the dylib is missing — it
+/// `expect`s inside `setup_api`, from a lazy path reachable through any API call, so a
+/// missing library aborts the thread that touched it. In the control loop that means the
+/// thread dies, no tick ever lands, and `robot.health` reports "the loop has not completed a
+/// cycle" forever: the daemon looks wedged instead of saying ONNX Runtime is not installed.
+///
+/// Probing first turns that into an ordinary error the caller can report. We use the same
+/// loader and the same search rule `ort` does, so a probe that succeeds means its load will
+/// succeed too and the panic cannot fire.
+fn ensure_runtime() -> Result<(), PolicyError> {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    let outcome = PROBE.get_or_init(|| {
+        let name = dylib_name();
+        // Safety: loading a shared library runs its initialisers. This is the same library
+        // `ort` is about to load itself, so the risk is not one this probe introduces.
+        match unsafe { libloading::Library::new(&name) } {
+            Ok(library) => {
+                // Leak it: `ort` will dlopen the same file moments later and the OS
+                // reference-counts the mapping. Dropping ours would be harmless but
+                // pointless churn.
+                std::mem::forget(library);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    });
+
+    outcome
+        .clone()
+        .map_err(|detail| PolicyError::RuntimeMissing {
+            searched: dylib_name(),
+            detail,
+        })
 }
 
 /// A loaded policy pair.
@@ -67,6 +127,7 @@ impl Policy {
         stand: Option<&Path>,
         standing_threshold: f64,
     ) -> Result<Self, PolicyError> {
+        ensure_runtime()?;
         let mut walk_session = open(walk)?;
         let mut stand_session = match stand {
             Some(path) => Some(open(path)?),

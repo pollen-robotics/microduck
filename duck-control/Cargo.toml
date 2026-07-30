@@ -14,6 +14,10 @@ tracing.workspace = true
 # build time, and a laptop with no libonnxruntime still compiles and runs every test that
 # does not create a session. Pinned to the version microduck_runtime runs today, so the
 # board keeps the ABI it already works against.
+# Used to probe for the ONNX Runtime dylib before touching `ort`. Same loader `ort` uses
+# internally, so a successful probe means its own load will succeed too — see
+# `policy::ensure_runtime` for why that matters.
+libloading = "0.8"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
 rustypot = "1.4.2"

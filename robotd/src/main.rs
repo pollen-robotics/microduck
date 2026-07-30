@@ -19,6 +19,8 @@
 //! publishes and never calls into the loop — a wedged loop reports itself unhealthy rather
 //! than hanging the caller.
 
+mod control;
+mod intents;
 mod params;
 
 use std::path::PathBuf;
@@ -27,13 +29,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use clap::{Parser, Subcommand};
 use duck_control::io::RobotIo;
-use duck_control::{DEFAULT_POSITION, FakeIo, JointTargets, NUM_JOINTS};
+use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy};
+use duck_control::safety::{Safety, SafetyConfig};
+use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use control::{Controller, Tuning};
+use intents::Intents;
 use params::Params;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
@@ -75,6 +82,14 @@ struct Args {
     /// simulator yet, and this is what stands in for one.
     #[arg(long)]
     fake: bool,
+
+    /// Do not load a policy: run the loop and hold the startup pose.
+    ///
+    /// Distinct from a policy that failed to load, which is unhealthy. This is the
+    /// configuration to use when the thing under test is the updater rather than the gait —
+    /// nothing falls over when a deliberately broken release lands.
+    #[arg(long)]
+    no_policy: bool,
 
     /// Report unhealthy. For exercising the updater's rollback path on a bench robot
     /// without having to break a real build.
@@ -138,6 +153,13 @@ struct RobotState {
     /// Consecutive failed bus reads. Reset by any success.
     consecutive_errors: AtomicU32,
     shutdown: AtomicBool,
+    /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
+    /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
+    policy_error: ArcSwapOption<String>,
+    /// Published by the loop so the IPC side can answer without consulting it.
+    fallen: AtomicBool,
+    /// The policy is driving and has been asked for a non-zero velocity.
+    moving: AtomicBool,
 
     period_us: u64,
     min_achieved_hz: f64,
@@ -157,6 +179,9 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            policy_error: ArcSwapOption::empty(),
+            fallen: AtomicBool::new(false),
+            moving: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.health.min_achieved_hz,
             stall_periods: params.health.stall_periods,
@@ -179,6 +204,13 @@ impl RobotState {
         // "Starting" is not "started". The gate polls, so it will see the transition.
         if self.ticks.load(Ordering::Relaxed) == 0 {
             return unhealthy("control loop has not completed a cycle yet".into());
+        }
+
+        // A daemon that came up but cannot run its policy is not healthy, however well the
+        // loop is ticking. This is what makes the updater roll back a release whose bundle
+        // is wrong, instead of leaving a robot that holds a pose and never walks again.
+        if let Some(reason) = self.policy_error.load_full() {
+            return unhealthy(format!("policy unavailable: {reason}"));
         }
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
@@ -216,9 +248,15 @@ impl RobotState {
                 reason: Some("forced busy by --busy".into()),
             };
         }
-        // Slice 1 holds a constant pose, so interrupting it cannot put the robot anywhere it
-        // was not already. Slice 2 must consult actual motion state: restarting motor
-        // control mid-stride is how a robot falls over (`updater-design.md` §7.2).
+        // Restarting motor control mid-stride is how a robot falls over
+        // (`updater-design.md` §7.2). A robot that is merely standing, or already down, is
+        // safe to interrupt — it is going nowhere either way.
+        if self.moving.load(Ordering::Relaxed) && !self.fallen.load(Ordering::Relaxed) {
+            return proto::SafeToRestartResult {
+                safe: false,
+                reason: Some("the robot is walking".into()),
+            };
+        }
         proto::SafeToRestartResult {
             safe: true,
             reason: None,
@@ -276,6 +314,9 @@ async fn main() -> ExitCode {
     if let Some(port) = args.port.clone() {
         params.bus.port = port;
     }
+    if args.no_policy {
+        params.policy.enabled = false;
+    }
 
     if let Some(Command::Init { duration }) = args.command {
         return run_init(&params, duration);
@@ -290,15 +331,22 @@ async fn main() -> ExitCode {
         tracing::warn!("--busy: will refuse restarts, so updates will be held off");
     }
 
-    let control = match spawn_control_thread(&args, &params, Arc::clone(&state)) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::error!(error = %e, "cannot start the control loop");
-            return ExitCode::FAILURE;
-        }
-    };
+    let intents = Arc::new(Intents::new());
 
-    let serving = serve(Arc::clone(&state), args.socket.clone());
+    let control =
+        match spawn_control_thread(&args, &params, Arc::clone(&state), Arc::clone(&intents)) {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::error!(error = %e, "cannot start the control loop");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let serving = serve(
+        Arc::clone(&state),
+        Arc::clone(&intents),
+        args.socket.clone(),
+    );
     let mut code = ExitCode::SUCCESS;
     tokio::select! {
         result = serving => {
@@ -360,10 +408,12 @@ fn spawn_control_thread(
     args: &Args,
     params: &Params,
     state: Arc<RobotState>,
+    intents: Arc<Intents>,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
     let port = params.bus.port.clone();
+    let params = params.clone();
 
     std::thread::Builder::new()
         .name("control".into())
@@ -381,12 +431,18 @@ fn spawn_control_thread(
 
             if fake {
                 tracing::warn!("--fake: no bus, no robot");
-                runtime.block_on(control_loop(FakeIo::at(DEFAULT_POSITION), state, period));
+                runtime.block_on(control_loop(
+                    FakeIo::at(DEFAULT_POSITION),
+                    state,
+                    intents,
+                    params,
+                    period,
+                ));
                 return;
             }
 
             if let Some(io) = open_bus(&port) {
-                runtime.block_on(control_loop(io, state, period));
+                runtime.block_on(control_loop(io, state, intents, params, period));
             }
         })
 }
@@ -420,24 +476,88 @@ fn open_bus(_port: &str) -> Option<FakeIo> {
 
 /// The tick.
 ///
-/// Slice 1 reads, publishes, and writes back the pose adopted at startup. The sensor sample
-/// is read every tick even though nothing consumes it yet — it is what makes the bus load,
-/// and therefore the timing, representative of what slice 2 will do.
-async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Duration) {
+/// ```text
+/// read → observe (fall) → gate (deadman) → policy → safety.apply
+/// ```
+///
+/// Safety holds the only `RobotIo`, so everything above it can propose targets and nothing
+/// above it can command a motor.
+///
+/// A policy that failed to load is survivable, and deliberately so: the loop keeps running
+/// at rate, holds its pose, and `robot.health` says why. The updater then rolls the release
+/// back. The alternative — refusing to start — becomes a crashloop under
+/// `Restart=always` and reaches the health gate as `Unreachable`, which blames the wrong
+/// thing in the journal.
+async fn control_loop<T: RobotIo>(
+    io: T,
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    params: Params,
+    period: Duration,
+) {
+    let mut safety = Safety::new(
+        io,
+        SafetyConfig {
+            fall_gravity_z: params.safety.fall_gravity_z,
+            fall_debounce: Duration::from_millis(params.safety.fall_debounce_ms),
+            deadman: Duration::from_millis(params.safety.deadman_ms),
+            gain_running: params.policy.gain,
+            gain_limp: params.safety.gain_limp,
+        },
+    );
+
     // Adopt the pose the robot is already in. Never move on start: the servos hold their
     // last commanded goal while this process is dead, so a restart mid-update leaves a
     // standing robot standing, with no gap.
-    let targets = match io.read() {
-        Ok(sensors) => JointTargets::new(sensors.positions),
+    let mut hold = match safety.read() {
+        Ok(sensors) => sensors.positions,
         Err(e) => {
             tracing::error!(error = %e, "first bus read failed; not commanding anything");
             return;
         }
     };
+
+    // A policy that was *not wanted* is healthy; one that was wanted and could not be
+    // loaded is not. Collapsing those two would either make a bench robot look broken or
+    // let a release with an unusable bundle pass the health gate.
+    let mut controller = if !params.policy.enabled {
+        tracing::warn!("policy disabled; holding the startup pose");
+        None
+    } else {
+        let tuning = Tuning {
+            action_scale: params.policy.action_scale,
+            standing_action_scale: params.policy.standing_action_scale,
+            standing_gain_ratio: params.policy.standing_gain_ratio,
+            gain: params.policy.gain,
+            head_lowpass: params.policy.head_lowpass,
+            legs_lowpass: params.policy.legs_lowpass,
+        };
+        match Policy::load(
+            &params.policy.walk,
+            params.policy.stand.as_deref(),
+            DEFAULT_STANDING_THRESHOLD,
+        ) {
+            Ok(policy) => {
+                tracing::warn!(
+                    walk = %params.policy.walk.display(),
+                    stand = ?params.policy.stand.as_ref().map(|p| p.display().to_string()),
+                    "policy loaded"
+                );
+                Some(Controller::new(policy, tuning))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "policy unavailable; holding the pose");
+                state.policy_error.store(Some(Arc::new(e.to_string())));
+                None
+            }
+        }
+    };
+
     tracing::warn!(
         joints = NUM_JOINTS,
         hz = 1.0 / period.as_secs_f64(),
-        "holding the pose found at startup"
+        driving = controller.is_some(),
+        "control loop running"
     );
 
     let mut ticker = tokio::time::interval(period);
@@ -448,13 +568,17 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
     let mut window_start = Instant::now();
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
+    let mut was_driving = false;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
 
-        match io.read() {
-            Ok(_sensors) => state.consecutive_errors.store(0, Ordering::Relaxed),
+        let sensors = match safety.read() {
+            Ok(sensors) => {
+                state.consecutive_errors.store(0, Ordering::Relaxed);
+                Some(sensors)
+            }
             Err(e) => {
                 let n = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
                 // One dropped transaction is ordinary on a serial bus; a run of them is not.
@@ -463,10 +587,55 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
                 if n == 1 || n.is_multiple_of(10) {
                     tracing::warn!(error = %e, consecutive = n, "bus read failed");
                 }
+                None
+            }
+        };
+
+        if let Some(sensors) = sensors.as_ref() {
+            safety.observe(sensors, period);
+        }
+        state.fallen.store(safety.fallen(), Ordering::Relaxed);
+
+        let snapshot = intents.snapshot();
+        let (command, _deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+
+        // Drive only with a sample to drive from: a tick whose read failed has no
+        // observation to build, and inventing one would feed the policy a stale robot.
+        let driving =
+            snapshot.enabled && controller.is_some() && !safety.fallen() && sensors.is_some();
+
+        if driving && !was_driving {
+            // Starting fresh: a stale previous action in the observation, or a filter
+            // anchored to where the robot was a minute ago, would both show up as a lurch.
+            if let Some(controller) = controller.as_mut() {
+                controller.reset();
             }
         }
+        if was_driving && !driving {
+            // Freeze where it is rather than snapping back to the startup pose. Captured
+            // once, not re-read each tick, or the hold target would sag under gravity.
+            if let Some(sensors) = sensors.as_ref() {
+                hold = sensors.positions;
+            }
+        }
+        was_driving = driving;
 
-        if let Err(e) = io.write(&targets) {
+        let (targets, gain, moving) = match (driving, sensors.as_ref()) {
+            (true, Some(sensors)) => {
+                let controller = controller.as_mut().expect("driving implies a controller");
+                match controller.step(sensors, &command) {
+                    Ok(step) => (step.targets, step.gain, command.twist_magnitude() > 0.0),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "inference failed; holding");
+                        (hold, params.policy.gain, false)
+                    }
+                }
+            }
+            _ => (hold, params.policy.gain, false),
+        };
+        state.moving.store(moving, Ordering::Relaxed);
+
+        if let Err(e) = safety.apply(targets, hold, gain) {
             tracing::warn!(error = %e, "bus write failed");
         }
 
@@ -492,6 +661,8 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
                     total = ticks,
                     hz = format!("{hz:.1}"),
                     missed = state.missed.load(Ordering::Relaxed),
+                    driving,
+                    fallen = safety.fallen(),
                     "control loop"
                 );
                 last_summary = Instant::now();
@@ -501,7 +672,11 @@ async fn control_loop<T: RobotIo>(mut io: T, state: Arc<RobotState>, period: Dur
     tracing::info!("control loop stopped");
 }
 
-async fn serve(state: Arc<RobotState>, socket_path: PathBuf) -> std::io::Result<()> {
+async fn serve(
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    socket_path: PathBuf,
+) -> std::io::Result<()> {
     // A leftover socket from a killed process must not stop us coming up.
     if socket_path.exists() {
         tracing::warn!(path = %socket_path.display(), "removing stale socket");
@@ -532,15 +707,20 @@ async fn serve(state: Arc<RobotState>, socket_path: PathBuf) -> std::io::Result<
             }
         };
         let state = Arc::clone(&state);
+        let intents = Arc::clone(&intents);
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream).await {
+            if let Err(e) = handle(state, intents, stream).await {
                 tracing::debug!(error = %e, "connection ended");
             }
         });
     }
 }
 
-async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<()> {
+async fn handle(
+    state: Arc<RobotState>,
+    intents: Arc<Intents>,
+    stream: UnixStream,
+) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -569,13 +749,20 @@ async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<(
             }
         };
 
-        // Notifications get no reply, per the spec.
+        let call = request.as_call();
+
+        // Notifications get no reply, per the spec. Continuous intents arrive this way —
+        // at 50 Hz a response per message would be pure overhead, and there is nothing
+        // useful to say about a velocity that is superseded 20 ms later.
         let Some(id) = request.id.clone() else {
+            if let Ok(call) = call {
+                apply_intent(&intents, &call);
+            }
             continue;
         };
 
-        let response = match request.as_call() {
-            Ok(call) => dispatch(&state, id, &call),
+        let response = match call {
+            Ok(call) => dispatch(&state, &intents, id, &call),
             Err(e) => proto::Response::err(Some(id), e),
         };
         write_line(&mut write_half, &response).await?;
@@ -587,8 +774,52 @@ async fn handle(state: Arc<RobotState>, stream: UnixStream) -> std::io::Result<(
 ///
 /// Synchronous and allocation-light on purpose: these answers must be available even when
 /// everything else is broken.
-fn dispatch(state: &RobotState, id: proto::Id, call: &proto::Call) -> proto::Response {
+/// Apply a continuous intent. Shared by the notification path and the request path, so a
+/// client that sends `robot.move` with an `id` is not silently ignored — the spec permits
+/// either, and refusing one because of a framing choice would be a surprise.
+fn apply_intent(intents: &Intents, call: &proto::Call) -> bool {
     match call {
+        proto::Call::RobotMove(p) => {
+            intents.set_twist([p.vx, p.vy, p.vyaw]);
+            true
+        }
+        proto::Call::RobotHead(p) => {
+            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn dispatch(
+    state: &RobotState,
+    intents: &Intents,
+    id: proto::Id,
+    call: &proto::Call,
+) -> proto::Response {
+    match call {
+        proto::Call::RobotMove(_) | proto::Call::RobotHead(_) => {
+            apply_intent(intents, call);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        proto::Call::RobotStop => {
+            intents.stop();
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // Refusing to enable a fallen robot is a normal answer with a reason, not an
+        // error: the client asked something reasonable and safety declined.
+        proto::Call::RobotEnable(p) => {
+            let result = if p.on && state.fallen.load(Ordering::Relaxed) {
+                proto::IntentResult::refused("the robot is down; stand it up first")
+            } else {
+                intents.set_enabled(p.on);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
         proto::Call::RobotSafeToRestart => proto::Response::ok(Some(id), &state.safe_to_restart()),
         proto::Call::RobotModelApi => proto::Response::ok(
@@ -814,20 +1045,26 @@ mod tests {
         ticked(&s, 1);
         let id = || proto::Id::Number(1);
 
-        let health: proto::HealthResult = dispatch(&s, id(), &proto::Call::RobotHealth)
-            .result_as()
-            .expect("robot.health must deserialize as HealthResult");
+        let health: proto::HealthResult =
+            dispatch(&s, &Intents::new(), id(), &proto::Call::RobotHealth)
+                .result_as()
+                .expect("robot.health must deserialize as HealthResult");
         assert!(health.healthy);
 
-        let safe: proto::SafeToRestartResult = dispatch(&s, id(), &proto::Call::RobotSafeToRestart)
-            .result_as()
-            .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
+        let safe: proto::SafeToRestartResult =
+            dispatch(&s, &Intents::new(), id(), &proto::Call::RobotSafeToRestart)
+                .result_as()
+                .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
 
-        let session: proto::SessionActiveResult =
-            dispatch(&s, id(), &proto::Call::RobotRemoteSessionActive)
-                .result_as()
-                .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
+        let session: proto::SessionActiveResult = dispatch(
+            &s,
+            &Intents::new(),
+            id(),
+            &proto::Call::RobotRemoteSessionActive,
+        )
+        .result_as()
+        .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
         assert!(!session.active);
     }
 
@@ -836,7 +1073,12 @@ mod tests {
     #[test]
     fn calls_belonging_to_updaterd_are_refused() {
         let s = state();
-        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::Status);
+        let response = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::Status,
+        );
         let error = response.error.expect("update.status must be refused");
         assert_eq!(error.code, proto::code::METHOD_NOT_FOUND);
         assert!(error.message.contains("robotd"), "{}", error.message);
@@ -845,7 +1087,12 @@ mod tests {
     #[test]
     fn model_api_is_reported() {
         let s = state();
-        let response = dispatch(&s, proto::Id::Number(1), &proto::Call::RobotModelApi);
+        let response = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotModelApi,
+        );
         let result: proto::ModelApiResult = response.result_as().unwrap();
         assert_eq!(result.model_api, MODEL_API);
     }
@@ -892,6 +1139,64 @@ mod tests {
         );
     }
 
+    /// **The policy-failure contract.** A policy that cannot load must not stop the robot
+    /// working: the loop keeps ticking at rate, holds its pose, and health says why.
+    ///
+    /// This is the branch that makes a broken bundle a rollback instead of an outage. It
+    /// nearly did not work at all — `ort` does not return an error when ONNX Runtime is
+    /// missing, it `expect`s deep inside a lazy init, so the control thread died, no tick
+    /// ever landed, and health reported "the loop has not completed a cycle" forever. The
+    /// daemon looked wedged rather than saying what was wrong.
+    ///
+    /// Works whether or not ONNX Runtime is installed: with it, the bogus path fails to
+    /// load; without it, the runtime probe fails first. Either way the contract is the same.
+    #[tokio::test]
+    async fn an_unloadable_policy_holds_the_pose_and_reports_why() {
+        let mut params = Params::default();
+        params.policy.walk = PathBuf::from("/nonexistent/definitely-not-a-policy.onnx");
+        params.policy.stand = None;
+
+        let resting = DEFAULT_POSITION;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        // Enabled, so this is not passing merely because nothing asked the robot to move.
+        intents.set_enabled(true);
+        intents.set_twist([0.4, 0.0, 0.0]);
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(resting).frozen(),
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            Duration::from_millis(2),
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.ticks.load(Ordering::Relaxed) < 5 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        let health = s.health();
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert!(
+            ticks >= 5,
+            "the loop must keep running without a policy, got {ticks} ticks"
+        );
+        assert!(!health.healthy, "a robot that cannot walk is not healthy");
+        let reason = health.reason.unwrap_or_default();
+        assert!(
+            reason.contains("policy"),
+            "health must name the policy as the cause, got {reason:?}"
+        );
+        assert!(
+            !s.moving.load(Ordering::Relaxed),
+            "nothing should be reported as moving"
+        );
+    }
+
     /// `control_loop` takes its IO by value, which makes the fake unreachable afterwards.
     /// This borrows instead so a test can inspect what was written.
     async fn control_loop_probe<T: RobotIo>(io: &mut T, state: Arc<RobotState>, period: Duration) {
@@ -900,13 +1205,20 @@ mod tests {
             fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
                 self.0.read()
             }
-            fn write(&mut self, t: &JointTargets) -> duck_control::io::Result<()> {
+            fn write(&mut self, t: &duck_control::JointTargets) -> duck_control::io::Result<()> {
                 self.0.write(t)
             }
             fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
                 self.0.set_gain(kp)
             }
         }
-        control_loop(Borrowed(io), state, period).await
+        control_loop(
+            Borrowed(io),
+            state,
+            Arc::new(Intents::new()),
+            Params::default(),
+            period,
+        )
+        .await
     }
 }

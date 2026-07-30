@@ -159,10 +159,14 @@ impl<T: RobotIo> Safety<T> {
     ///
     /// `hold` is what to command when the policy must not drive — normally the pose the
     /// robot is already in.
+    /// `running_gain` is what the caller wants while upright — the standing policy runs
+    /// softer than the walking one, and that is a control decision, not a safety one. The
+    /// limp gain is not negotiable and overrides it whenever the robot is down.
     pub fn apply(
         &mut self,
         targets: [f64; NUM_JOINTS],
         hold: [f64; NUM_JOINTS],
+        running_gain: u16,
     ) -> Result<Applied, IoError> {
         let mut applied = Applied::default();
 
@@ -175,7 +179,7 @@ impl<T: RobotIo> Safety<T> {
             self.io.write(&JointTargets::new(hold))?;
             return Ok(applied);
         }
-        self.set_gain(self.config.gain_running)?;
+        self.set_gain(running_gain)?;
 
         // Non-finite is refused, not clamped. Clamping `NaN` silently produces a boundary
         // value, which is a plausible-looking joint angle — far worse than declining to
@@ -276,7 +280,13 @@ mod tests {
         let mut wanted = DEFAULT_POSITION;
         wanted[0] = 0.9;
 
-        let applied = s.apply(wanted, DEFAULT_POSITION).unwrap();
+        let applied = s
+            .apply(
+                wanted,
+                DEFAULT_POSITION,
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
         assert!(applied.limited_by(Limit::Fallen));
         assert_eq!(
             s.io().last_gain,
@@ -299,7 +309,13 @@ mod tests {
 
         let mut poisoned = DEFAULT_POSITION;
         poisoned[3] = f64::NAN;
-        let applied = s.apply(poisoned, DEFAULT_POSITION).unwrap();
+        let applied = s
+            .apply(
+                poisoned,
+                DEFAULT_POSITION,
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
 
         assert!(applied.limited_by(Limit::NotFinite));
         assert!(!applied.limited_by(Limit::Range), "must not be clamped");
@@ -316,7 +332,9 @@ mod tests {
         let mut wild = DEFAULT_POSITION;
         wild[2] = 100.0;
         wild[7] = -100.0;
-        let applied = s.apply(wild, DEFAULT_POSITION).unwrap();
+        let applied = s
+            .apply(wild, DEFAULT_POSITION, SafetyConfig::default().gain_running)
+            .unwrap();
 
         assert!(applied.limited_by(Limit::Range));
         let written = s.io().last_written.unwrap().positions;
@@ -331,7 +349,13 @@ mod tests {
         let mut s = safety();
         s.observe(&upright(), Duration::from_millis(20));
 
-        let applied = s.apply(DEFAULT_POSITION, DEFAULT_POSITION).unwrap();
+        let applied = s
+            .apply(
+                DEFAULT_POSITION,
+                DEFAULT_POSITION,
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
         assert!(applied.limits.is_empty(), "{:?}", applied.limits);
         assert_eq!(s.io().last_written.unwrap().positions, DEFAULT_POSITION);
         assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
@@ -364,9 +388,24 @@ mod tests {
     fn the_gain_is_only_written_when_it_changes() {
         let mut s = safety();
         s.observe(&upright(), Duration::from_millis(20));
-        s.apply(DEFAULT_POSITION, DEFAULT_POSITION).unwrap();
-        s.apply(DEFAULT_POSITION, DEFAULT_POSITION).unwrap();
-        s.apply(DEFAULT_POSITION, DEFAULT_POSITION).unwrap();
+        s.apply(
+            DEFAULT_POSITION,
+            DEFAULT_POSITION,
+            SafetyConfig::default().gain_running,
+        )
+        .unwrap();
+        s.apply(
+            DEFAULT_POSITION,
+            DEFAULT_POSITION,
+            SafetyConfig::default().gain_running,
+        )
+        .unwrap();
+        s.apply(
+            DEFAULT_POSITION,
+            DEFAULT_POSITION,
+            SafetyConfig::default().gain_running,
+        )
+        .unwrap();
 
         // Three applies, three position writes, but only the first gain write.
         assert_eq!(s.io().writes, 3);

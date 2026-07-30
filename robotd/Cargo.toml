@@ -25,6 +25,9 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 libc = "0.2"
 thiserror.workspace = true
 toml = "0.9"
+# Lock-free single-value slots for the intent hand-off: the control loop does one
+# atomic load per tick and can never be held up by an IPC task writing the other side.
+arc-swap = "1"
 
 # Test-only. `tests/updater_gate.rs` drives the real update engine against this binary,
 # which is why `updater` appears here: the test asserts that robotd upholds the contract
