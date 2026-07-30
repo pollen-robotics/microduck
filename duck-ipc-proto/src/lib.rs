@@ -345,6 +345,21 @@ impl Request {
         }
     }
 
+    /// A call sent as a notification: no `id`, so no response is expected.
+    ///
+    /// This is how continuous intents travel. At 50 Hz a reply per message would be pure
+    /// overhead, and there is nothing useful to say about a velocity that is superseded
+    /// 20 ms later. Discrete intents use [`Self::call`] instead, because "refused, and here
+    /// is why" is an answer the caller needs.
+    pub fn notify(call: &Call) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: call.method().to_owned(),
+            params: Some(call.params()),
+        }
+    }
+
     /// A progress notification: no `id`, so no response is expected.
     pub fn notify_progress(progress: &Progress) -> Self {
         Self {

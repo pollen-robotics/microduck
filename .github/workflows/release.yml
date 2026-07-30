@@ -78,7 +78,7 @@ jobs:
           DUCK_REVISION: ${{ github.sha }}
         run: |
           export DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cargo board --bins
+          cargo board --bins -p updater -p robotd -p robotctl
 
       - name: Package
         run: |

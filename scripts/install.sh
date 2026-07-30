@@ -99,7 +99,9 @@ check_environment() {
         die "this installer publishes aarch64 binaries only, and this box is ${arch}"
     fi
 
-    for tool in curl systemctl sha256sum install; do
+    # tar and find are used by the ONNX Runtime step; better to fail here than
+    # halfway through unpacking it.
+    for tool in curl systemctl sha256sum install tar find; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             die "${tool} is required"
         fi
@@ -344,9 +346,66 @@ waiting to be asked. Ordinary releases wait for a client.
 EOF
 }
 
+
+# ONNX Runtime, which `robotd` dlopens to run its gait policy.
+#
+# A board prerequisite rather than something a release carries. It changes far less often
+# than the daemon, so shipping ~20 MB of it in every artifact would make each update
+# download several times larger for nothing.
+#
+# The consequence is worth stating: it is loaded at runtime, not linked, so a board without
+# it installs and starts fine and *then* cannot walk. `robotd` reports that through
+# `robot.health` with the searched path in the message and holds its pose, so the failure
+# names itself rather than looking like a wedged daemon — but it is still a failure, which
+# is why this step exists instead of a line in a setup document.
+ONNX_VERSION="${ONNX_VERSION:-1.20.1}"
+ONNX_LIB_DIR=/usr/local/lib
+
+install_onnxruntime() {
+    if [ -f "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
+        say "ONNX Runtime already present in ${ONNX_LIB_DIR}"
+        return 0
+    fi
+
+    url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz"
+    tmp="$(mktemp -d)"
+    say "installing ONNX Runtime ${ONNX_VERSION}"
+
+    if ! fetch "$url" "${tmp}/ort.tgz"; then
+        rm -rf "$tmp"
+        die "cannot download ONNX Runtime from ${url}
+  robotd needs it to run a policy. Install it by hand into ${ONNX_LIB_DIR}, or set
+  ORT_DYLIB_PATH in robotd's unit to wherever it lives."
+    fi
+
+    tar -xzf "${tmp}/ort.tgz" -C "$tmp" || die "cannot unpack ONNX Runtime"
+
+    # The tarball nests everything under a versioned directory; take the versioned .so and
+    # the symlinks beside it so `dlopen("libonnxruntime.so")` resolves.
+    found="$(find "$tmp" -name 'libonnxruntime.so*' -type f | head -1)"
+    [ -n "$found" ] || die "no libonnxruntime.so in the ONNX Runtime tarball"
+
+    install -m 0644 "$found" "${ONNX_LIB_DIR}/$(basename "$found")"
+    ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so"
+
+    # ldconfig lives in /usr/sbin, which is often absent from a login PATH, so
+    # `command -v ldconfig` would report it missing and skip the refresh — leaving the
+    # freshly copied library unfindable by dlopen. Try the absolute path too.
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig
+    elif [ -x /usr/sbin/ldconfig ]; then
+        /usr/sbin/ldconfig
+    else
+        warn "no ldconfig; robotd may need ORT_DYLIB_PATH=${ONNX_LIB_DIR}/libonnxruntime.so"
+    fi
+
+    rm -rf "$tmp"
+}
+
 main() {
     check_environment
     wait_for_clock
+    install_onnxruntime
     install_config
     bootstrap_first_release
     create_group
