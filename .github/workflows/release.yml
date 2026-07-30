@@ -52,11 +52,8 @@ jobs:
       #   - "latest" would let the glibc floor move under us between runs. The floor is
       #     the whole point of building with zig (see .cargo/config.toml), so the
       #     toolchain that sets it must be a fixed input.
-      - name: libudev for aarch64
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update || true
-          sudo apt-get install -y libudev-dev:arm64
+      - name: Cross-compilation C dependencies
+        run: ./scripts/ci-cross-deps.sh
 
       - uses: mlugg/setup-zig@v2
         with:

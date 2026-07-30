@@ -101,11 +101,8 @@ jobs:
       #
       # This is the price of keeping gilrs, and it is worth naming: the same expense returns
       # for the next C dependency that has to reach the board.
-      - name: libudev for aarch64
-        run: |
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update || true
-          sudo apt-get install -y libudev-dev:arm64
+      - name: Cross-compilation C dependencies
+        run: ./scripts/ci-cross-deps.sh
 
       - uses: mlugg/setup-zig@v2
         with:
