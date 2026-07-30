@@ -70,7 +70,7 @@ never inherit the update engine's http/tar/crypto tree.
 ```
 duck-ipc-proto/ the wire contract
 duck-control/   the control core: model · bus · IMU · observations · policy · safety
-padd/           gamepad → intents (laptop only for now: gilrs wants a libudev sysroot)
+padd/           gamepad → intents — an ordinary socket client, no privileged access
 updater/        engine + updaterd
 robotd/         control daemon
 robotctl/       the local CLI

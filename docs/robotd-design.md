@@ -449,11 +449,16 @@ per-device IMU calibration.
 3. **Golden vectors** would still be worth having from `microduck_brain` — as a regression
    check against the training env rather than as the source of truth they were going to be.
    No longer a prerequisite for slice 2.
-4. **`padd` does not reach the board.** `gilrs` pulls `libudev-sys` unconditionally on Linux,
-   which needs a pkg-config sysroot — the thing building with zig was chosen to avoid. Three
-   ways out: a cross sysroot, a pure-Rust evdev backend, or building it natively on the
-   board. Until one is picked it runs on a laptop against a forwarded socket, which is
-   genuinely useful but is not the gamepad-on-the-robot story.
+4. ~~**`padd` does not reach the board**~~ — **decided**: install libudev. `gilrs` pulls
+   `libudev-sys` unconditionally on Linux, so CI and the board cross-build now install it,
+   and `padd` ships in the release. The alternative was a pure-Rust evdev backend, rejected
+   because `gilrs`'s value is its SDL controller database — without it each pad needs a
+   hand-written mapping, and the same Xbox controller reports different codes over USB and
+   Bluetooth. **Note the standing cost:** the same expense recurs for the next C dependency
+   that has to reach the board, so prefer pure-Rust crates elsewhere on that path.
+   *Unverified on macOS:* the cross-build needs an aarch64 sysroot, which a Mac cannot
+   provide, so `cargo board --bins` fails locally there — build the shipped set with
+   `-p updater -p robotd -p robotctl`, or build on Linux.
 5. **Per-joint limits do not exist.** Safety clamps to the *actuator's* travel, which catches
    `NaN`, a bad action scale and a garbage tensor — it will not stop a joint being driven
    somewhere mechanically unwise. The real limits are in the alpha MJCF (31 KB), not vendored

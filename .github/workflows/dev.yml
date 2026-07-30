@@ -45,6 +45,12 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      - name: libudev for aarch64
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update || true
+          sudo apt-get install -y libudev-dev:arm64
+
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
@@ -75,9 +81,13 @@ jobs:
       - name: Build for the board
         env:
           DUCK_REVISION: ${{ github.sha }}
+          # libudev-sys (via gilrs, via padd) resolves the target's C library through
+          # pkg-config, which refuses to answer for another architecture unless told to.
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
         run: |
           export DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cargo board --bins -p updater -p robotd -p robotctl
+          cargo board --bins
 
       - name: Package
         run: |
@@ -85,6 +95,10 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/updaterd staged/
           cp target/aarch64-unknown-linux-gnu/release/robotctl staged/
           cp target/aarch64-unknown-linux-gnu/release/robotd staged/
+          # padd is the gamepad intent client. Shipped because a dev board is where
+          # anyone drives the robot from, and the intent API only stays honest if the
+          # thing exercising it daily is actually on the robot.
+          cp target/aarch64-unknown-linux-gnu/release/padd staged/
 
           # Same contents as a real release: a dev build that omitted the units or robotd
           # would fail its own restart step on the board and roll itself back, which is a

@@ -8,16 +8,14 @@ description = "Gamepad → robot intents"
 # Its own crate so a gamepad stack stays out of `robotctl`, which has to work on a broken
 # robot and is part of the recovery path. Nothing here is on that path.
 #
-# ⚠ This crate does **not** cross-compile to the board yet, and so is not in a release.
-# `gilrs` depends on `libudev-sys` unconditionally on Linux — no feature disables it — and
-# that needs a pkg-config sysroot, which is exactly what building with zig was chosen to
-# avoid (see .cargo/config.toml). The board build therefore names its packages explicitly
-# rather than using `--bins`.
+# gilrs depends on libudev-sys unconditionally on Linux — no feature disables it — so both
+# CI and the board cross-build install libudev. That is a real cost, paid to keep gilrs's
+# SDL controller database: without it we would hand-map each pad's raw evdev codes, and the
+# same Xbox controller reports different codes over USB and Bluetooth.
 #
-# It is useful today regardless: run it on a laptop against a board over
-# `ssh -L /tmp/robotd.sock:/run/robotd.sock`. Getting it onto the robot means picking one of
-# — a sysroot for the cross-build, a pure-Rust evdev backend instead of gilrs, or building
-# it natively on the board. That is an open decision, not an oversight.
+# The same expense returns for the next C dependency that has to reach the board, which is
+# an argument for preferring pure-Rust crates anywhere else on that path.
+
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 clap = { workspace = true, features = ["derive"] }

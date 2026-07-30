@@ -33,6 +33,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `padd` reads the gamepad through gilrs, which depends on libudev-sys — a binding to
+      # a C library, unconditional on Linux with no feature to disable it. The runner image
+      # does not ship the headers, so without this `cargo clippy --workspace` fails to build
+      # before it checks anything.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
@@ -89,6 +95,18 @@ jobs:
       #   - "latest" would let the glibc floor move under us between runs. The floor is
       #     the whole point of building with zig (see .cargo/config.toml), so the
       #     toolchain that sets it must be a fixed input.
+      # libudev for the *target* architecture, so gilrs can be cross-compiled. zig supplies
+      # the compiler but not the target's C libraries, and libudev-sys resolves those
+      # through pkg-config — hence multiarch plus the cross hints on the build step.
+      #
+      # This is the price of keeping gilrs, and it is worth naming: the same expense returns
+      # for the next C dependency that has to reach the board.
+      - name: libudev for aarch64
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update || true
+          sudo apt-get install -y libudev-dev:arm64
+
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.14.1
@@ -118,6 +136,8 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
+      # Same reason as the check job: the workspace does not build without it.
+      - run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
       # `xtask` is excluded because it is build tooling that never ships. It is exercised
       # by CI actually packaging a release — the `check` job runs `xtask package` — not by

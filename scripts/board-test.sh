@@ -50,6 +50,12 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 echo "==> cross-compiling for aarch64-unknown-linux-gnu (glibc <= $GLIBC_FLOOR)"
+# pkg-config has to be told it is allowed to answer for another architecture, and where
+# that architecture's .pc files live. Without both, libudev-sys (via gilrs, via padd)
+# either refuses outright or silently answers with the host's library.
+export PKG_CONFIG_ALLOW_CROSS="${PKG_CONFIG_ALLOW_CROSS:-1}"
+export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/usr/lib/aarch64-linux-gnu/pkgconfig}"
+
 cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" --bins
 cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" \
     -p updater --example playground

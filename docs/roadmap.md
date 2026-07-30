@@ -14,7 +14,7 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done**, untested on a board. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
 | `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done**, untested on a board; no kinematics |
-| `padd/` | gamepad → intents, as an ordinary socket client — **done on a laptop**; does not cross-compile to the board yet (`gilrs` wants a libudev sysroot) |
+| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release; needs libudev, installed by CI and the board cross-build |
 | `robotctl/` | CLI over the update socket — **done** for the `update` namespace; depends on `duck-ipc-proto`, not `updater` |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **ci passing**; release/promote still unrun (needs secrets + the `release` environment) |
