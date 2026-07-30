@@ -11,7 +11,9 @@ pub mod bus;
 pub mod imu;
 pub mod io;
 pub mod model;
+pub mod obs;
 
 pub use imu::ImuData;
 pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors};
 pub use model::{DEFAULT_POSITION, JOINT_IDS, JOINT_NAMES, NUM_JOINTS};
+pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};
