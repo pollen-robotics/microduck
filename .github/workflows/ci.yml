@@ -180,8 +180,6 @@ jobs:
               echo "**${head_pct}% lines** on this branch. No base measurement to compare against."
             fi
             echo
-            echo "Floor is 72; \`xtask\` is excluded as build tooling. Code that needs hardware is *not* excluded and counts against the total."
-            echo
             echo "<details><summary>Per-file</summary>"
             echo
             echo '```'
