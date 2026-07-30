@@ -11,4 +11,9 @@ thiserror.workspace = true
 tracing.workspace = true
 
 rustypot = "1.4.2"
-serialport = "4.8"
+# `default-features = false` drops serialport's `libudev` feature, which exists only for
+# enumerating ports (`available_ports`). We open one by path from the params file and never
+# enumerate — and libudev-sys needs a pkg-config sysroot that the board's cross-build does
+# not have, so leaving it on breaks the aarch64 build outright. rustypot disables it for the
+# same reason; this crate has to as well, or cargo's feature unification turns it back on.
+serialport = { version = "4.8", default-features = false }
