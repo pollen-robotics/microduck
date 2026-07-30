@@ -107,6 +107,10 @@ jobs:
     # instrumented rebuild, which shares no artifacts with the ordinary one, so bolting it
     # onto `check` would roughly double the time to the signal everyone actually waits for.
     runs-on: ubuntu-latest
+    # To leave a comment on the pull request. Everything else here is read-only.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -129,4 +133,67 @@ jobs:
       # a few points under today's ~77% so ordinary work does not trip it, while a genuine
       # collapse still fails. Lowering it should be a deliberate, explained commit.
       - name: Coverage
-        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines 72
+        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' --fail-under-lines 72 | tee "$RUNNER_TEMP/head.txt"
+
+      # The base branch, built separately, purely to get a number to subtract. Only on
+      # pull requests: a push to main has nothing to compare against, and paying for a
+      # second instrumented build there would be waste.
+      #
+      # A second checkout rather than a git worktree, so the two builds keep separate
+      # target directories and cannot poison each other's incremental state.
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+
+      - name: Coverage on the base branch
+        if: github.event_name == 'pull_request'
+        working-directory: base
+        # No `--fail-under-lines`: the base is a measurement, not a gate. If main is
+        # already below the floor that is main's problem, and failing here would block an
+        # unrelated pull request from merging.
+        run: cargo llvm-cov --workspace --summary-only --ignore-filename-regex '(^|/)xtask/' | tee "$RUNNER_TEMP/base.txt"
+
+      # Column 10 of the TOTAL row is line coverage. The whole table goes in the run
+      # summary, where it renders without anyone opening a log; the comment carries the
+      # numbers that matter.
+      - name: Report
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pct() { awk '/^TOTAL/ {gsub("%","",$10); print $10}' "$1" 2>/dev/null; }
+          head_pct=$(pct "$RUNNER_TEMP/head.txt")
+          base_pct=$(pct "$RUNNER_TEMP/base.txt")
+          : "${head_pct:=unknown}"
+
+          {
+            echo "## Coverage"
+            echo
+            if [ "$head_pct" = "unknown" ]; then
+              echo "The coverage run did not produce a total — it most likely failed before finishing."
+            elif [ -n "$base_pct" ]; then
+              delta=$(awk -v a="$head_pct" -v b="$base_pct" 'BEGIN { printf "%+.2f", a - b }')
+              echo "**${head_pct}% lines** on this branch, ${base_pct}% on \`${{ github.base_ref }}\` — **${delta}**."
+            else
+              echo "**${head_pct}% lines** on this branch. No base measurement to compare against."
+            fi
+            echo
+            echo "Floor is 72; \`xtask\` is excluded as build tooling. Code that needs hardware is *not* excluded and counts against the total."
+            echo
+            echo "<details><summary>Per-file</summary>"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/head.txt" 2>/dev/null || echo "no report"
+            echo '```'
+            echo
+            echo "</details>"
+          } > "$RUNNER_TEMP/comment.md"
+
+          cat "$RUNNER_TEMP/comment.md" >> "$GITHUB_STEP_SUMMARY"
+
+          # Edit the previous comment rather than adding one per push, so a long-running
+          # branch does not accumulate a wall of near-identical coverage reports.
+          gh pr comment "${{ github.event.number }}" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
+            || gh pr comment "${{ github.event.number }}" --body-file "$RUNNER_TEMP/comment.md"
