@@ -78,6 +78,31 @@ pub mod method {
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
     /// Is a telepresence session live?
     pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
+
+    // ── intents ──────────────────────────────────────────────────────────────
+    //
+    // What a client asks the robot to *do*, as opposed to what `updaterd` asks it about.
+    // Clients send intents, never joint commands: `robotd` stays authoritative on what is
+    // executable (`architecture.md` §6).
+    //
+    // Two kinds, and JSON-RPC's two message families map onto them exactly:
+    //
+    //   * **Continuous** — `move`, `head`. Sent as *notifications* (no `id`, no reply),
+    //     20–50 Hz, last-writer-wins, expiring. No response traffic at rate, and when they
+    //     later travel over WebRTC they belong on the unreliable channel, because a
+    //     retransmitted 80 ms-old stick position is worse than useless (`architecture.md`
+    //     §5.2). The message family already says which channel it wants.
+    //   * **Discrete** — `stop`, `enable`. Sent as *requests*, answered, because the caller
+    //     needs to know whether it was accepted and why not.
+
+    /// Velocity twist. Continuous; send as a notification.
+    pub const ROBOT_MOVE: &str = "robot.move";
+    /// Head joint targets. Continuous; send as a notification.
+    pub const ROBOT_HEAD: &str = "robot.head";
+    /// Stop moving — zero the velocity. Not "go limp".
+    pub const ROBOT_STOP: &str = "robot.stop";
+    /// Turn policy execution on or off.
+    pub const ROBOT_ENABLE: &str = "robot.enable";
 }
 
 /// JSON-RPC error codes.
@@ -155,6 +180,14 @@ pub enum Call {
     RobotHealth,
     RobotModelApi,
     RobotRemoteSessionActive,
+
+    // ── intents ──────────────────────────────────────────────────────────────
+    /// Continuous. Send as a notification.
+    RobotMove(MoveParams),
+    /// Continuous. Send as a notification.
+    RobotHead(HeadParams),
+    RobotStop,
+    RobotEnable(EnableParams),
 }
 
 impl Call {
@@ -176,6 +209,10 @@ impl Call {
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
             Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
+            Call::RobotMove(_) => method::ROBOT_MOVE,
+            Call::RobotHead(_) => method::ROBOT_HEAD,
+            Call::RobotStop => method::ROBOT_STOP,
+            Call::RobotEnable(_) => method::ROBOT_ENABLE,
         }
     }
 
@@ -225,12 +262,16 @@ impl Call {
             Call::Select(p) => encode(p),
             Call::Pin(p) => encode(p),
             Call::Log(p) => encode(p),
+            Call::RobotMove(p) => encode(p),
+            Call::RobotHead(p) => encode(p),
+            Call::RobotEnable(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive => Value::Object(serde_json::Map::new()),
+            | Call::RobotRemoteSessionActive
+            | Call::RobotStop => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -261,6 +302,10 @@ impl Call {
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
             method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
+            method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
+            method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
+            method::ROBOT_STOP => Call::RobotStop,
+            method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -441,6 +486,51 @@ pub struct HelloParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentParams {
     pub component: ComponentId,
+}
+
+// ── intent parameters ────────────────────────────────────────────────────────
+//
+// **Units and frame, stated once so no consumer has to rediscover them.** Everything is
+// radians and radians per second, in the robot's trunk frame, right-handed: `x` forward,
+// `y` left, `z` up. Positive `vyaw` turns left.
+//
+// This paragraph is load-bearing. The prototype accumulated
+// `--laser-track-yaw-sign`, `--laser-track-pitch-sign`, `--laser-fk-pitch-sign`,
+// `--laser-fk-neck-sign` and `--imu-z-rotation-deg` precisely because the convention was
+// never written down, so every new consumer determined it empirically and disagreed.
+// Fixing it in the protocol deletes that entire category of flag.
+
+/// Velocity twist. Continuous intent — see [`method::ROBOT_MOVE`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoveParams {
+    /// Forward, m/s.
+    pub vx: f64,
+    /// Left, m/s.
+    pub vy: f64,
+    /// Yaw rate, rad/s, positive turns left.
+    pub vyaw: f64,
+}
+
+/// Head joint targets, radians. Continuous intent — see [`method::ROBOT_HEAD`].
+///
+/// Joint-space rather than a gaze direction. Both forms are wanted eventually and both will
+/// be exposed; this is the one the gamepad and calibration produce, and it is what the
+/// policy's observation actually carries, so it is the one that exists first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeadParams {
+    pub neck_pitch: f64,
+    pub head_pitch: f64,
+    pub head_yaw: f64,
+    pub head_roll: f64,
+}
+
+/// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnableParams {
+    pub on: bool,
 }
 
 /// What an apply should move to.
@@ -657,6 +747,34 @@ pub struct HealthResult {
     pub reason: Option<String>,
 }
 
+/// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].
+///
+/// `accepted: false` is a normal outcome, not an error: safety may refuse to enable a
+/// policy on a fallen robot, and the caller needs to know *why* rather than receiving a
+/// JSON-RPC error that reads as "something broke".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentResult {
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl IntentResult {
+    pub fn accepted() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+
+    pub fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 /// Answer to [`Call::RobotModelApi`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelApiResult {
@@ -773,7 +891,33 @@ mod tests {
             Call::RobotHealth,
             Call::RobotModelApi,
             Call::RobotRemoteSessionActive,
+            Call::RobotMove(MoveParams {
+                vx: 0.2,
+                vy: -0.1,
+                vyaw: 0.4,
+            }),
+            Call::RobotHead(HeadParams {
+                neck_pitch: 0.35,
+                head_pitch: -0.1,
+                head_yaw: 0.2,
+                head_roll: 0.0,
+            }),
+            Call::RobotStop,
+            Call::RobotEnable(EnableParams { on: true }),
         ]
+    }
+
+    /// `every_call` is a hand-written list, so a new variant is silently untested unless
+    /// someone remembers to add it. Pin the count: adding a `Call` without extending the
+    /// list fails here, which is the only thing standing between a new method and it never
+    /// being round-tripped at all.
+    #[test]
+    fn every_call_covers_every_variant() {
+        assert_eq!(
+            every_call().len(),
+            19,
+            "a Call variant was added or removed — update every_call() and this count"
+        );
     }
 
     /// Every call must survive the wire unchanged.
