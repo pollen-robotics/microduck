@@ -101,17 +101,18 @@ fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
     // Skipping one valid index leaves exactly one fewer. Stated as a compile-time check so
     // the reasoning is enforced rather than merely believed.
     const { assert!(OBS_JOINTS == NUM_JOINTS - 1) };
+    std::array::from_fn(|slot| values[joint_of(slot)])
+}
 
-    let mut out = [0.0; OBS_JOINTS];
-    let kept = values
-        .iter()
-        .enumerate()
-        .filter(|(joint, _)| *joint != MOUTH_INDEX)
-        .map(|(_, value)| *value);
-    for (slot, value) in out.iter_mut().zip(kept) {
-        *slot = value;
-    }
-    out
+/// The joint a policy slot refers to.
+///
+/// Slots below the mouth map straight through; at and above, everything shifts up by one.
+/// Written once and used in both directions — [`policy_joints`] reads through it,
+/// [`Observation::scatter_action`] writes through it — so the two cannot disagree about
+/// where the policy's n-th value belongs.
+#[inline]
+const fn joint_of(slot: usize) -> usize {
+    if slot < MOUTH_INDEX { slot } else { slot + 1 }
 }
 
 /// Write one block, narrowing to `f32` on the way in.
@@ -122,9 +123,7 @@ fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
 /// zero, and a zero in the observation is a joint sitting at its home pose. The policy
 /// would act on a plausible robot that does not exist.
 fn fill<const N: usize>(block: &mut [f32; N], values: [f64; N]) {
-    for (slot, value) in block.iter_mut().zip(values) {
-        *slot = value as f32;
-    }
+    *block = values.map(|value| value as f32);
 }
 
 /// A built observation, ready to hand to the policy.
@@ -181,16 +180,14 @@ impl Observation {
 
         fill(gyro, imu.gyro);
         fill(gravity, imu.gravity);
-        let mut relative = policy_joints(joint_positions);
-        for (angle, home) in relative.iter_mut().zip(policy_joints(home_pose)) {
-            *angle -= home;
-        }
-        fill(positions, relative);
+        let angles = policy_joints(joint_positions);
+        let home = policy_joints(home_pose);
+        fill(positions, std::array::from_fn(|i| angles[i] - home[i]));
         fill(velocities, policy_joints(joint_velocities));
 
-        for (slot, value) in previous_action.iter_mut().zip(last_action) {
-            *slot = *value;
-        }
+        // Already `f32`, and the same width, so this is a plain copy rather than a
+        // conversion — the previous action is the policy's own output fed back.
+        *previous_action = *last_action;
 
         // Reads in the same order as the table, which is the point: this block is the one
         // with no second source of truth, so it should be checkable against the docs by eye.
@@ -223,16 +220,10 @@ impl Observation {
     /// both catastrophic and completely silent.
     pub fn scatter_action(action: &[f32; ACTION_LEN]) -> [f64; NUM_JOINTS] {
         let mut out = [0.0f64; NUM_JOINTS];
-        // The mirror of `policy_joints`: that one skips the mouth on the way in, this skips
-        // it on the way out. Same filter, so the two cannot disagree about which slot the
-        // policy's n-th output belongs to.
-        let slots = out
-            .iter_mut()
-            .enumerate()
-            .filter(|(joint, _)| *joint != MOUTH_INDEX)
-            .map(|(_, slot)| slot);
-        for (slot, value) in slots.zip(action) {
-            *slot = *value as f64;
+        // The mirror of `policy_joints`, through the same `joint_of` mapping: that one
+        // reads the mouth out, this writes around it.
+        for (slot, value) in action.iter().enumerate() {
+            out[joint_of(slot)] = *value as f64;
         }
         out
     }
