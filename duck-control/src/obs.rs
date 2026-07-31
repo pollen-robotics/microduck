@@ -93,27 +93,38 @@ pub struct BodyPose {
 ///
 /// One definition, used for positions, velocities and the home pose alike — so those three
 /// blocks cannot disagree about which joints they cover or what order they are in.
-fn policy_joints(values: &[f64; NUM_JOINTS]) -> impl Iterator<Item = f64> + '_ {
-    values
+///
+/// Returns an array rather than an iterator so its width is part of its type. A filtered
+/// iterator is not `ExactSizeIterator` — `Filter` cannot know how many elements pass — and
+/// that is what would force [`fill`] to count at runtime instead of being checked here.
+fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
+    // Skipping one valid index leaves exactly one fewer. Stated as a compile-time check so
+    // the reasoning is enforced rather than merely believed.
+    const { assert!(OBS_JOINTS == NUM_JOINTS - 1) };
+
+    let mut out = [0.0; OBS_JOINTS];
+    let kept = values
         .iter()
         .enumerate()
         .filter(|(joint, _)| *joint != MOUTH_INDEX)
-        .map(|(_, value)| *value)
+        .map(|(_, value)| *value);
+    for (slot, value) in out.iter_mut().zip(kept) {
+        *slot = value;
+    }
+    out
 }
 
 /// Write one block, narrowing to `f32` on the way in.
 ///
-/// Asserts the block was filled exactly. `zip` stops at the shorter side, so a source that
-/// yields too few values would otherwise leave the tail silently at zero — which for an
-/// observation means the policy quietly sees a robot with some joints pinned at their home
-/// pose, and behaves plausibly wrongly.
-fn fill(block: &mut [f32], values: impl IntoIterator<Item = f64>) {
-    let mut written = 0;
+/// Both sides are fixed-size arrays of the same `N`, so a block and its source cannot
+/// disagree about width — the compiler rejects it. That matters more than it sounds: `zip`
+/// stops at the shorter side, so a mismatch would otherwise leave the tail silently at
+/// zero, and a zero in the observation is a joint sitting at its home pose. The policy
+/// would act on a plausible robot that does not exist.
+fn fill<const N: usize>(block: &mut [f32; N], values: [f64; N]) {
     for (slot, value) in block.iter_mut().zip(values) {
         *slot = value as f32;
-        written += 1;
     }
-    debug_assert_eq!(written, block.len(), "observation block under-filled");
 }
 
 /// A built observation, ready to hand to the policy.
@@ -155,23 +166,26 @@ impl Observation {
     ) -> Self {
         let mut data = [0.0f32; OBS_LEN];
 
-        // Carve the buffer into the blocks of the layout table above, by name. The widths
-        // are checked here, once, by the split itself — rather than by a running cursor
-        // that every branch below has to remember to advance correctly.
-        let (gyro, rest) = data.split_at_mut(3);
-        let (gravity, rest) = rest.split_at_mut(3);
-        let (positions, rest) = rest.split_at_mut(OBS_JOINTS);
-        let (velocities, rest) = rest.split_at_mut(OBS_JOINTS);
-        let (previous_action, command_block) = rest.split_at_mut(OBS_JOINTS);
+        // Carve the buffer into the blocks of the layout table above, by name — as
+        // *arrays*, so each block's width is in its type and [`fill`] can only be handed a
+        // source of matching length. `expect` cannot fire: the widths are constants that
+        // sum to `OBS_LEN`, which `the_layout_widths_sum_to_the_declared_input` pins.
+        const LAYOUT: &str = "block widths must sum to OBS_LEN";
+        let (gyro, rest) = data.split_first_chunk_mut::<3>().expect(LAYOUT);
+        let (gravity, rest) = rest.split_first_chunk_mut::<3>().expect(LAYOUT);
+        let (positions, rest) = rest.split_first_chunk_mut::<OBS_JOINTS>().expect(LAYOUT);
+        let (velocities, rest) = rest.split_first_chunk_mut::<OBS_JOINTS>().expect(LAYOUT);
+        let (previous_action, rest) = rest.split_first_chunk_mut::<OBS_JOINTS>().expect(LAYOUT);
+        let (command_block, rest) = rest.split_first_chunk_mut::<COMMAND_LEN>().expect(LAYOUT);
+        debug_assert!(rest.is_empty(), "{LAYOUT}");
 
         fill(gyro, imu.gyro);
         fill(gravity, imu.gravity);
-        fill(
-            positions,
-            policy_joints(joint_positions)
-                .zip(policy_joints(home_pose))
-                .map(|(angle, home)| angle - home),
-        );
+        let mut relative = policy_joints(joint_positions);
+        for (angle, home) in relative.iter_mut().zip(policy_joints(home_pose)) {
+            *angle -= home;
+        }
+        fill(positions, relative);
         fill(velocities, policy_joints(joint_velocities));
 
         for (slot, value) in previous_action.iter_mut().zip(last_action) {
