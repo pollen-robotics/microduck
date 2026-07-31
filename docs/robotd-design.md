@@ -71,6 +71,53 @@ transition, without that being a rewrite.
 
 (`padd` is a placeholder name.)
 
+### 3.1 The shape of it
+
+Who talks to `robotd`, and over what:
+
+```text
+   ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
+   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │ gamepad  │   robot.stop / robot.enable    │                     │
+   └──────────┘───(requests, answered)────────►│                     │
+                                               │   /run/robotd.sock  │
+   ┌──────────┐   robot.subscribe              │   JSON-RPC 2.0      │
+   │ robotctl │──────────────────────────────► │   NDJSON            │
+   │ monitor  │◄──robot.state (decimated)──────│                     │
+   └──────────┘                                │                     │
+                                               │                     │
+   ┌──────────┐   robot.health                 │                     │
+   │ updaterd │──robot.safeToRestart──────────►│                     │
+   │          │  robot.modelApi                └──────────┬──────────┘
+   └──────────┘                                           │
+        │                                                 │
+        │ on_apply: systemctl restart robotd              │
+        └─────────────────────────────────────────────────┘
+
+   ┌ not built ─────────────────────────────────┐
+   │  mediad — WebRTC + JSON-RPC relay          │  phone, browser and LLM
+   │  btd    — BLE, a subset of the same API    │  clients arrive through here
+   └────────────────────────────────────────────┘
+```
+
+Every one of those speaks the same two vocabularies — intents in, state out — so `mediad`
+will **relay** frames rather than translate them (§5.5, §5.6).
+
+And the crate boundary, which is the same boundary:
+
+```text
+  duck-ipc-proto   the wire types — serde only; no tokio, no http, no crypto
+        │
+  duck-control     model · bus · IMU · RobotIo · obs · policy · safety
+        │          everything between reading the bus and writing it
+        │          no tokio, no sockets, no systemd
+        ▼
+  robotd           the process: socket, JSON-RPC, systemd, health reporting
+```
+
+`safety` holds the `RobotIo`, so the policy, the controller and every client can *propose*
+targets and none of them can send one. That is the borrow checker, not a convention.
+
 ## 4. Slice 1 — hold the pose
 
 A daemon that drives the real bus at the real rate and tells the truth about itself. No
@@ -370,6 +417,78 @@ paths have only been exercised against `FakeIo`. The tests establish that the lo
 self-consistent — not that the robot walks. Note also that `padd` cannot run on the board
 yet (§11.4), so the first hardware driving will be from a laptop over a forwarded socket.
 
+### 5.10 The tick, end to end
+
+Where the data goes, once per period:
+
+```text
+  Dynamixel bus
+       │  one sync_read: IMU board + 15 servos, one transaction
+       ▼
+   Sensors ──────────┬──────────────────────► safety.observe ──► fallen? (debounced)
+   joints, IMU       │
+                     ▼
+              Observation::build  ◄──── Command ◄── gate(deadman) ◄── intent snapshot
+                     │              (twist, head, body = nominal)
+                     │  [f32; 61]
+                     ▼
+              Policy::infer ──── walk | stand, chosen on |twist|
+                     │
+                     │  [f32; 14]   — mouth excluded
+                     ▼
+              home_pose + scale × action ──► low-pass (off by default)
+                     │
+                     │  [f64; 15] proposed targets
+                     ▼
+        ╔═══════════════════════════════════════════╗
+        ║  safety.apply   ← owns the only RobotIo    ║
+        ║  · refuse non-finite                       ║
+        ║  · clamp to actuator range                 ║
+        ║  · fallen → hold pose, soft gain           ║
+        ╚═══════════════════════════════════════════╝
+                     │  sync_write goal positions
+                     ▼
+              Dynamixel bus
+```
+
+And the decisions around it, which the dataflow above does not show:
+
+```text
+  startup
+    ├─ Safety::new(io)          safety takes the RobotIo; nothing else can write again
+    ├─ read() → hold = the pose the robot is already in     ── never move on start
+    └─ policy
+         disabled ─────────────► controller = None                    healthy
+         loaded   ─────────────► controller = Some
+         failed   ─────────────► controller = None + policy_error   unhealthy
+
+  each tick
+    read ─┬─ ok  ─► clear the consecutive-error count
+          └─ err ─► count++, sensors = None   (the tick still runs)
+
+    observe → fallen?
+
+    driving = enabled ∧ policy loaded ∧ ¬fallen ∧ sensors this tick
+
+    edges ─┬─ started driving ──► controller.reset()
+           │                      else a stale last action, or a filter anchored to
+           │                      where the robot was a minute ago, shows up as a lurch
+           └─ stopped driving ──► hold = current pose, captured once
+                                  re-reading each tick would sag under gravity
+
+    driving ─┬─ yes ─► step() → targets, gain, "walk" | "stand"
+             └─ no  ─► targets = hold, default gain, "held"
+
+    safety.apply(targets, hold, gain)
+
+    publish ─┬─ atomics            always      → robot.health, safeToRestart
+             └─ state frame        only if subscribed   → robot.state
+```
+
+The four conditions on `driving` are each load-bearing. `sensors this tick` is the
+non-obvious one: a read that failed leaves nothing to build an observation from, and
+inventing one would feed the policy a robot that does not exist.
+
 ## 6. The robot model
 
 Rust consts for alpha only: 15 joints, Dynamixel IDs `20–24 / 30–34 / 10–14`, names,
@@ -385,6 +504,29 @@ Intents and params are published by IPC threads and read by the loop as a single
 load. Nothing can apply backpressure to the loop and no request enters it synchronously.
 Telemetry goes out through a bounded broadcast where a slow subscriber gets a gap, never
 backpressure — the pattern the updater's IPC layer already uses and documents.
+
+```text
+   IPC tasks (tokio, multi-thread)        control thread (own runtime, 50 Hz)
+   ═══════════════════════════════        ═══════════════════════════════════
+
+     robot.move  ──► ┌────────────┐
+     robot.head  ──► │intent slots│ ──atomic load, once per tick──►  read
+                     │ twist│head │
+                     └────────────┘
+                     ArcSwap, stamped
+
+     robot.health ◄── ┌──────────┐ ◄────────── publish ───────────  atomics
+     safeToRestart    │ atomics  │              ticks, hz, missed,
+                      └──────────┘              fallen, moving
+
+     robot.state  ◄── ┌──────────┐ ◄─── send, only if subscribed ──  frame
+                      │broadcast │
+                      └──────────┘
+                      bounded, drop-on-lag
+```
+
+**No channel runs the other way.** Health is *published*, never asked for, which is what
+lets a wedged loop report itself unhealthy instead of hanging the caller.
 
 ### 7.2 Params
 

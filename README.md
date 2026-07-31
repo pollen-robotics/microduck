@@ -11,6 +11,11 @@ This repo is the daemons plus the update system. Start with
 [`docs/architecture.md`](docs/architecture.md) for how the services fit together, and
 [`docs/roadmap.md`](docs/roadmap.md) for what exists today versus what is designed.
 
+For the control side specifically, [`docs/robotd-design.md`](docs/robotd-design.md) §3.1 is
+the fastest way in — who talks to `robotd` and where the crate boundary sits — with the
+per-tick dataflow in §5.10 and the thread-to-thread channels in §7.1. Those three diagrams
+are the part that is hardest to reconstruct from prose.
+
 ## Getting started
 
 Needs Rust **1.89+** (stable) and nothing else. macOS and Linux both work for development;
