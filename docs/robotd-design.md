@@ -331,6 +331,18 @@ ports on 9874/9875 and the web hub's `/state.json`. Adding a field today means e
 places that can silently disagree; here it means one struct, and older clients ignore what
 they do not know.
 
+**Built.** `robot.subscribe` turns a connection into a stream; the loop publishes into a
+bounded broadcast and never waits on a subscriber, so a slow client gets a gap rather than
+applying backpressure — the rule the updater already uses for progress. Decimation is
+server-side and per-subscriber, so a 10 Hz dashboard genuinely costs the robot less than a
+50 Hz digital twin.
+
+Two details that are easy to get wrong. **Nothing is assembled when nobody is subscribed** —
+which is the normal state of a robot — because building a frame allocates on the thread that
+should not be visiting the allocator without reason. And the limit names are **spelled out
+for the wire** rather than derived from the Rust enum, so renaming a variant cannot silently
+break a client branching on `limited_by`.
+
 ### 5.7 The gamepad is a client
 
 `padd` reads `gilrs` and sends intents over `robotd`'s socket. Its own crate, so a gamepad

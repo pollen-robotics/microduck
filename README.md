@@ -111,6 +111,15 @@ directory the process was launched from, at `warn`, so it survives any log level
 journalctl -u robotd -b
 ```
 
+Logs say what happened; `monitor` says what is happening. It shows what a client asked for
+next to what was actually applied, and names the reason when they differ — safety clamps
+things constantly, and "the stick is forward and the robot is still" is unreadable without
+that:
+
+```bash
+robotctl monitor
+```
+
 The update history is separate from the journal on purpose — `fsync`ed per entry under
 `/var/lib/robot/updater/` — so it survives a robot whose logs were volatile:
 

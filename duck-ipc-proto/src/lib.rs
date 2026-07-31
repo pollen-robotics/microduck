@@ -103,6 +103,18 @@ pub mod method {
     pub const ROBOT_STOP: &str = "robot.stop";
     /// Turn policy execution on or off.
     pub const ROBOT_ENABLE: &str = "robot.enable";
+
+    /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
+    pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
+    /// Server → client. Never carries an `id`.
+    ///
+    /// One stream for every consumer — `robotctl monitor`, a digital-twin viewer, later the
+    /// app through `mediad`. It replaces the prototype's five bespoke channels: a 180-byte
+    /// binary frame on 9870, JPEG on 9871, a UDP command socket on 9872, maploc on
+    /// 9874/9875, and the web hub's `/state.json`. Adding a field there meant editing four
+    /// places that could silently disagree; here it is one struct, and older clients ignore
+    /// what they do not recognise.
+    pub const ROBOT_STATE: &str = "robot.state";
 }
 
 /// JSON-RPC error codes.
@@ -188,6 +200,7 @@ pub enum Call {
     RobotHead(HeadParams),
     RobotStop,
     RobotEnable(EnableParams),
+    RobotSubscribe(SubscribeParams),
 }
 
 impl Call {
@@ -213,6 +226,7 @@ impl Call {
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
         }
     }
 
@@ -265,6 +279,7 @@ impl Call {
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
+            Call::RobotSubscribe(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -306,6 +321,7 @@ impl Call {
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -358,6 +374,24 @@ impl Request {
             method: call.method().to_owned(),
             params: Some(call.params()),
         }
+    }
+
+    /// A robot-state notification: no `id`, so no response is expected.
+    pub fn notify_state(state: &RobotState) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::ROBOT_STATE.to_owned(),
+            params: Some(serde_json::to_value(state).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a robot-state notification back.
+    pub fn as_state(&self) -> Option<RobotState> {
+        if self.method != method::ROBOT_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
     }
 
     /// A progress notification: no `id`, so no response is expected.
@@ -539,6 +573,18 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+}
+
+/// How often a subscriber wants [`method::ROBOT_STATE`].
+///
+/// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
+/// costs the robot a tenth of what a digital twin asking for 50 Hz does — and neither can
+/// slow the control loop, which publishes into a bounded buffer and never waits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubscribeParams {
+    /// Absent means every tick.
+    pub hz: Option<u32>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
@@ -790,6 +836,55 @@ impl IntentResult {
     }
 }
 
+/// What the robot is doing, pushed as [`method::ROBOT_STATE`].
+///
+/// **It reports what was refused, not just what happened.** Safety clamps things
+/// constantly, and a client watching the robot ignore its command with no explanation
+/// cannot tell a bug from a limit. That is why `applied` and `limited_by` exist beside
+/// `requested` rather than the stream carrying only outcomes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotState {
+    /// Seconds since the daemon started. Monotonic: it is for correlating samples, not for
+    /// telling the time.
+    pub t: f64,
+    #[serde(rename = "move")]
+    pub movement: MoveState,
+    pub head: [f64; 4],
+    /// Which policy drove this tick: `walk`, `stand`, or `held` when none did.
+    pub policy: String,
+    pub safety: SafetyState,
+    #[serde(rename = "loop")]
+    pub control_loop: LoopState,
+    /// Measured joint angles, radians, in the model's joint order.
+    pub joints: Vec<f64>,
+    /// What was commanded, so a viewer can show tracking error rather than guessing at it.
+    pub targets: Vec<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoveState {
+    pub requested: [f64; 3],
+    pub applied: [f64; 3],
+    /// Empty when the command went through untouched.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limited_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafetyState {
+    pub fallen: bool,
+    /// Gains have been dropped so the robot yields.
+    pub limp: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoopState {
+    /// Achieved rate over the last window. Zero until the first window closes.
+    pub hz: f64,
+    /// Ticks whose work overran the period, cumulative.
+    pub missed: u64,
+}
+
 /// Answer to [`Call::RobotModelApi`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelApiResult {
@@ -919,6 +1014,7 @@ mod tests {
             }),
             Call::RobotStop,
             Call::RobotEnable(EnableParams { on: true }),
+            Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
         ]
     }
 
@@ -930,7 +1026,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            19,
+            20,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -1125,6 +1221,56 @@ mod tests {
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
+    }
+
+    /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
+    /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
+    #[test]
+    fn robot_state_uses_the_documented_field_names() {
+        let state = RobotState {
+            t: 1.5,
+            movement: MoveState {
+                requested: [0.4, 0.0, 0.0],
+                applied: [0.15, 0.0, 0.0],
+                limited_by: vec!["deadman".into()],
+            },
+            head: [0.0; 4],
+            policy: "walk".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+            },
+            control_loop: LoopState {
+                hz: 49.8,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+        };
+
+        let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
+        assert!(line.contains(r#""method":"robot.state""#), "{line}");
+        assert!(line.contains(r#""move":"#), "{line}");
+        assert!(line.contains(r#""loop":"#), "{line}");
+        assert!(!line.contains("movement"), "{line}");
+        assert!(!line.contains("control_loop"), "{line}");
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert!(back.is_notification(), "state carries no id");
+        assert_eq!(back.as_state().unwrap(), state);
+    }
+
+    /// An unlimited command must not carry an empty array — a consumer checking
+    /// truthiness on `limited_by` should see the field absent, not present-and-empty.
+    #[test]
+    fn an_unlimited_command_omits_limited_by() {
+        let movement = MoveState {
+            requested: [0.0; 3],
+            applied: [0.0; 3],
+            limited_by: Vec::new(),
+        };
+        let line = serde_json::to_string(&movement).unwrap();
+        assert!(!line.contains("limited_by"), "{line}");
     }
 
     /// A local build must say so, rather than looking like a release whose revision was

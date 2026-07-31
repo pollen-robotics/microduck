@@ -58,6 +58,12 @@ const MAX_LINE: usize = 64 * 1024;
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How far a subscriber may fall behind before it starts losing frames.
+///
+/// Five seconds at 50 Hz. State is advisory: a client that cannot keep up gets a gap, never
+/// backpressure onto the control loop. Same rule the updater applies to progress.
+const STATE_BUFFER: usize = 256;
+
 /// Window over which the achieved rate is measured, and therefore how quickly a degraded
 /// loop becomes visible to the health gate.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -153,6 +159,8 @@ struct RobotState {
     /// Consecutive failed bus reads. Reset by any success.
     consecutive_errors: AtomicU32,
     shutdown: AtomicBool,
+    /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
+    state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
@@ -179,6 +187,7 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
+            state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             policy_error: ArcSwapOption::empty(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
@@ -597,7 +606,8 @@ async fn control_loop<T: RobotIo>(
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
         let snapshot = intents.snapshot();
-        let (command, _deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+        let (command, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
+        let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
         // Drive only with a sample to drive from: a tick whose read failed has no
         // observation to build, and inventing one would feed the policy a stale robot.
@@ -620,23 +630,57 @@ async fn control_loop<T: RobotIo>(
         }
         was_driving = driving;
 
-        let (targets, gain, moving) = match (driving, sensors.as_ref()) {
+        let (targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command) {
-                    Ok(step) => (step.targets, step.gain, command.twist_magnitude() > 0.0),
+                    Ok(step) => (
+                        step.targets,
+                        step.gain,
+                        command.twist_magnitude() > 0.0,
+                        if step.standing { "stand" } else { "walk" },
+                    ),
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
-                        (hold, params.policy.gain, false)
+                        (hold, params.policy.gain, false, "held")
                     }
                 }
             }
-            _ => (hold, params.policy.gain, false),
+            _ => (hold, params.policy.gain, false, "held"),
         };
         state.moving.store(moving, Ordering::Relaxed);
 
-        if let Err(e) = safety.apply(targets, hold, gain) {
-            tracing::warn!(error = %e, "bus write failed");
+        match safety.apply(targets, hold, gain) {
+            Ok(applied) => limits.extend(applied.limits),
+            Err(e) => tracing::warn!(error = %e, "bus write failed"),
+        }
+
+        // Only assemble a frame when somebody is subscribed. On a robot nobody usually is,
+        // and this would otherwise be a per-tick allocation on the thread that should not
+        // be visiting the allocator without a reason.
+        if state.state_tx.receiver_count() > 0
+            && let Some(sensors) = sensors.as_ref()
+        {
+            let _ = state.state_tx.send(proto::RobotState {
+                t: state.started.elapsed().as_secs_f64(),
+                movement: proto::MoveState {
+                    requested: snapshot.command.twist,
+                    applied: command.twist,
+                    limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
+                },
+                head: command.head,
+                policy: policy_label.to_owned(),
+                safety: proto::SafetyState {
+                    fallen: safety.fallen(),
+                    limp: safety.fallen(),
+                },
+                control_loop: proto::LoopState {
+                    hz: f64::from_bits(state.achieved_hz.load(Ordering::Relaxed)),
+                    missed: state.missed.load(Ordering::Relaxed),
+                },
+                joints: sensors.positions.to_vec(),
+                targets: targets.to_vec(),
+            });
         }
 
         let ticks = state.ticks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -670,6 +714,20 @@ async fn control_loop<T: RobotIo>(
         }
     }
     tracing::info!("control loop stopped");
+}
+
+/// Stable wire names for the reasons a command was altered.
+///
+/// Spelled out rather than `Debug`-formatted: this goes over the wire, and a client
+/// branching on it must not break because a variant was renamed in Rust.
+fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
+    use duck_control::safety::Limit;
+    match limit {
+        Limit::Deadman => "deadman",
+        Limit::Range => "joint_range",
+        Limit::NotFinite => "not_finite",
+        Limit::Fallen => "fallen",
+    }
 }
 
 async fn serve(
@@ -724,7 +782,47 @@ async fn handle(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
-    while let Some(line) = lines.next_line().await? {
+    // `None` until the client subscribes. Once set, the connection is both a request
+    // channel and a state stream, so the loop below waits on whichever speaks first.
+    let mut states: Option<tokio::sync::broadcast::Receiver<proto::RobotState>> = None;
+    let mut decimate = Duration::ZERO;
+    let mut last_sent: Option<Instant> = None;
+
+    loop {
+        let line = match states.as_mut() {
+            None => lines.next_line().await?,
+            Some(rx) => {
+                tokio::select! {
+                    line = lines.next_line() => line?,
+                    received = rx.recv() => {
+                        match received {
+                            Ok(state) => {
+                                // Decimate per subscriber: a dashboard asking for 10 Hz
+                                // should not cost what a digital twin asking for 50 does.
+                                let due = last_sent
+                                    .map(|at| at.elapsed() >= decimate)
+                                    .unwrap_or(true);
+                                if due {
+                                    last_sent = Some(Instant::now());
+                                    write_line(&mut write_half, &proto::Request::notify_state(&state))
+                                        .await?;
+                                }
+                            }
+                            // Lagged: the client fell behind and lost frames. That is the
+                            // designed behaviour — state is advisory and must never apply
+                            // backpressure to the control loop — so carry on from the newest.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::debug!(dropped = n, "state subscriber fell behind");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        let Some(line) = line else { return Ok(()) };
+
         if line.trim().is_empty() {
             continue;
         }
@@ -761,13 +859,23 @@ async fn handle(
             continue;
         };
 
+        if let Ok(proto::Call::RobotSubscribe(params)) = &call {
+            decimate = params
+                .hz
+                .filter(|hz| *hz > 0)
+                .map(|hz| Duration::from_secs_f64(1.0 / hz as f64))
+                .unwrap_or(Duration::ZERO);
+            // Subscribing again replaces the rate rather than opening a second stream.
+            states = Some(state.state_tx.subscribe());
+            last_sent = None;
+        }
+
         let response = match call {
             Ok(call) => dispatch(&state, &intents, id, &call),
             Err(e) => proto::Response::err(Some(id), e),
         };
         write_line(&mut write_half, &response).await?;
     }
-    Ok(())
 }
 
 /// Answer one request.
@@ -800,6 +908,12 @@ fn dispatch(
     match call {
         proto::Call::RobotMove(_) | proto::Call::RobotHead(_) => {
             apply_intent(intents, call);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // Handled by the caller, which owns the connection; answering here keeps the
+        // request/response pairing in one place.
+        proto::Call::RobotSubscribe(_) => {
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
@@ -1194,6 +1308,104 @@ mod tests {
         assert!(
             !s.moving.load(Ordering::Relaxed),
             "nothing should be reported as moving"
+        );
+    }
+
+    /// **The reporting claim.** Safety says it reports what it refused rather than silently
+    /// altering commands — that is only true if the reason reaches the state stream.
+    ///
+    /// The deadman is the easiest limit to provoke: intents start maximally stale, so a
+    /// loop with the policy enabled and nothing driving it must publish a frame whose twist
+    /// was zeroed and whose `limited_by` says why. Without this, a client watching the robot
+    /// ignore its command has no way to tell a limit from a bug.
+    #[tokio::test]
+    async fn the_state_stream_reports_why_a_command_was_refused() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let mut states = s.state_tx.subscribe();
+
+        let intents = Arc::new(Intents::new());
+        intents.set_enabled(true);
+        // Asked for, but never refreshed — so already past the deadman.
+        intents.set_twist([0.4, 0.0, 0.0]);
+        tokio::time::sleep(Duration::from_millis(params.safety.deadman_ms + 20)).await;
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION),
+            loop_state,
+            Arc::clone(&intents),
+            params,
+            Duration::from_millis(2),
+        ));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+            .await
+            .expect("a frame within five seconds")
+            .expect("the stream stayed open");
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(
+            frame.movement.requested,
+            [0.4, 0.0, 0.0],
+            "what the client asked for must survive to the stream"
+        );
+        assert_eq!(
+            frame.movement.applied, [0.0; 3],
+            "a stale twist must be zeroed"
+        );
+        assert!(
+            frame.movement.limited_by.contains(&"deadman".to_owned()),
+            "the reason must be named, got {:?}",
+            frame.movement.limited_by
+        );
+        assert_eq!(frame.policy, "held", "no policy was loaded");
+        assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// Assembling a frame allocates, on the thread that should not be visiting the
+    /// allocator without reason. With nobody subscribed — the normal case on a robot —
+    /// nothing should be built at all.
+    #[tokio::test]
+    async fn no_subscribers_means_no_frames() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(&params, false, false));
+        assert_eq!(s.state_tx.receiver_count(), 0);
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION),
+            loop_state,
+            Arc::new(Intents::new()),
+            params,
+            Duration::from_millis(2),
+        ));
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        // Subscribing afterwards must find an empty channel: nothing was published while
+        // no one was listening.
+        let mut late = s.state_tx.subscribe();
+        assert!(
+            late.try_recv().is_err(),
+            "frames were built with nobody subscribed"
         );
     }
 

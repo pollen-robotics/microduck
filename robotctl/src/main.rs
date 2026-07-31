@@ -91,6 +91,23 @@ enum Namespace {
         command: UpdateCommand,
     },
 
+    /// Watch what the robot is doing, live.
+    ///
+    /// This is the one window into the control loop. It shows what a client asked for
+    /// alongside what was actually applied and why they differ — safety clamps things
+    /// constantly, and "the stick is forward and the robot is still" is unreadable without
+    /// the reason next to it.
+    Monitor {
+        /// Frames per second. The robot decimates server-side, so asking for less genuinely
+        /// costs it less.
+        #[arg(long, default_value_t = 10)]
+        hz: u32,
+
+        /// One JSON object per line, for piping somewhere.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// What is running on this robot, and what is installed. The first thing to ask for
     /// in a support report.
     ///
@@ -377,6 +394,75 @@ struct VersionReport {
 /// That exits non-zero when `updaterd` is unreachable, which is precisely the situation
 /// where someone is running this command. Every failure here becomes a line in the report
 /// instead.
+/// Stream `robot.state` until interrupted.
+///
+/// Reads notifications rather than waiting for a terminal response, so it never "finishes"
+/// — Ctrl-C is the exit. A closed socket ends it too, which is what happens when `robotd`
+/// restarts during an update, and is worth seeing rather than hanging through.
+fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    let call = proto::Call::RobotSubscribe(proto::SubscribeParams {
+        hz: (hz > 0).then_some(hz),
+    });
+    client.send(&proto::Request::call(proto::Id::Number(1), &call))?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = client
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("stream ended: {e}")))?;
+        if read == 0 {
+            // robotd went away — a restart mid-update looks exactly like this, so say so
+            // rather than exiting silently as though the user had asked to stop.
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                "robotd closed the connection".to_owned(),
+            ));
+        }
+
+        let Ok(request) = serde_json::from_str::<proto::Request>(&line) else {
+            continue;
+        };
+        let Some(state) = request.as_state() else {
+            // The subscribe acknowledgement, or anything else this client does not model.
+            continue;
+        };
+
+        if json {
+            println!("{}", line.trim_end());
+            continue;
+        }
+
+        let limits = if state.movement.limited_by.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", state.movement.limited_by.join(","))
+        };
+        println!(
+            "{:8.2}  {:>5}  {:5.1}Hz miss={:<4} {}  req[{:+.2} {:+.2} {:+.2}] \
+             app[{:+.2} {:+.2} {:+.2}]{}",
+            state.t,
+            state.policy,
+            state.control_loop.hz,
+            state.control_loop.missed,
+            if state.safety.fallen {
+                "FALLEN"
+            } else {
+                "ok    "
+            },
+            state.movement.requested[0],
+            state.movement.requested[1],
+            state.movement.requested[2],
+            state.movement.applied[0],
+            state.movement.applied[1],
+            state.movement.applied[2],
+            limits,
+        );
+    }
+}
+
 fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Failure> {
     let build = proto::build_info!();
     let mut report = VersionReport {
@@ -675,6 +761,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
+        }
+        Namespace::Monitor { hz, json } => {
+            return run_monitor(&cli.robot_socket, hz, json);
         }
         Namespace::Update { command } => command,
     };
