@@ -89,6 +89,33 @@ pub struct BodyPose {
     pub pitch: f64,
 }
 
+/// The joints a policy sees, in order, with the mouth skipped.
+///
+/// One definition, used for positions, velocities and the home pose alike — so those three
+/// blocks cannot disagree about which joints they cover or what order they are in.
+fn policy_joints(values: &[f64; NUM_JOINTS]) -> impl Iterator<Item = f64> + '_ {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(joint, _)| *joint != MOUTH_INDEX)
+        .map(|(_, value)| *value)
+}
+
+/// Write one block, narrowing to `f32` on the way in.
+///
+/// Asserts the block was filled exactly. `zip` stops at the shorter side, so a source that
+/// yields too few values would otherwise leave the tail silently at zero — which for an
+/// observation means the policy quietly sees a robot with some joints pinned at their home
+/// pose, and behaves plausibly wrongly.
+fn fill(block: &mut [f32], values: impl IntoIterator<Item = f64>) {
+    let mut written = 0;
+    for (slot, value) in block.iter_mut().zip(values) {
+        *slot = value as f32;
+        written += 1;
+    }
+    debug_assert_eq!(written, block.len(), "observation block under-filled");
+}
+
 /// A built observation, ready to hand to the policy.
 ///
 /// A fixed array rather than a `Vec`: it is rebuilt 50 times a second on a thread that
@@ -127,54 +154,51 @@ impl Observation {
         command: &Command,
     ) -> Self {
         let mut data = [0.0f32; OBS_LEN];
-        let mut at = 0;
 
-        for v in imu.gyro {
-            data[at] = v as f32;
-            at += 1;
-        }
-        for v in imu.gravity {
-            data[at] = v as f32;
-            at += 1;
-        }
+        // Carve the buffer into the blocks of the layout table above, by name. The widths
+        // are checked here, once, by the split itself — rather than by a running cursor
+        // that every branch below has to remember to advance correctly.
+        let (gyro, rest) = data.split_at_mut(3);
+        let (gravity, rest) = rest.split_at_mut(3);
+        let (positions, rest) = rest.split_at_mut(OBS_JOINTS);
+        let (velocities, rest) = rest.split_at_mut(OBS_JOINTS);
+        let (previous_action, command_block) = rest.split_at_mut(OBS_JOINTS);
 
-        for joint in 0..NUM_JOINTS {
-            if joint == MOUTH_INDEX {
-                continue;
-            }
-            data[at] = (joint_positions[joint] - home_pose[joint]) as f32;
-            at += 1;
-        }
-        for (joint, velocity) in joint_velocities.iter().enumerate() {
-            if joint == MOUTH_INDEX {
-                continue;
-            }
-            data[at] = *velocity as f32;
-            at += 1;
-        }
-        for value in last_action {
-            data[at] = *value;
-            at += 1;
+        fill(gyro, imu.gyro);
+        fill(gravity, imu.gravity);
+        fill(
+            positions,
+            policy_joints(joint_positions)
+                .zip(policy_joints(home_pose))
+                .map(|(angle, home)| angle - home),
+        );
+        fill(velocities, policy_joints(joint_velocities));
+
+        for (slot, value) in previous_action.iter_mut().zip(last_action) {
+            *slot = *value;
         }
 
-        data[at] = command.twist[0] as f32;
-        data[at + 1] = command.twist[1] as f32;
-        data[at + 2] = command.twist[2] as f32;
-        data[at + 3] = command.head[0] as f32;
-        data[at + 4] = command.head[1] as f32;
-        data[at + 5] = command.head[2] as f32;
-        data[at + 6] = command.head[3] as f32;
-        // body x, y — unbound in training, always zero.
-        data[at + 7] = 0.0;
-        data[at + 8] = 0.0;
-        data[at + 9] = command.body.z as f32;
-        data[at + 10] = command.body.roll as f32;
-        data[at + 11] = command.body.pitch as f32;
-        // body yaw — unbound.
-        data[at + 12] = 0.0;
-        at += COMMAND_LEN;
+        // Reads in the same order as the table, which is the point: this block is the one
+        // with no second source of truth, so it should be checkable against the docs by eye.
+        fill(
+            command_block,
+            [
+                command.twist[0],
+                command.twist[1],
+                command.twist[2],
+                command.head[0],
+                command.head[1],
+                command.head[2],
+                command.head[3],
+                0.0, // body x — unbound in training
+                0.0, // body y — unbound
+                command.body.z,
+                command.body.roll,
+                command.body.pitch,
+                0.0, // body yaw — unbound
+            ],
+        );
 
-        debug_assert_eq!(at, OBS_LEN, "observation layout drifted");
         Self { data }
     }
 
@@ -185,13 +209,16 @@ impl Observation {
     /// both catastrophic and completely silent.
     pub fn scatter_action(action: &[f32; ACTION_LEN]) -> [f64; NUM_JOINTS] {
         let mut out = [0.0f64; NUM_JOINTS];
-        let mut from = 0;
-        for (joint, slot) in out.iter_mut().enumerate() {
-            if joint == MOUTH_INDEX {
-                continue;
-            }
-            *slot = action[from] as f64;
-            from += 1;
+        // The mirror of `policy_joints`: that one skips the mouth on the way in, this skips
+        // it on the way out. Same filter, so the two cannot disagree about which slot the
+        // policy's n-th output belongs to.
+        let slots = out
+            .iter_mut()
+            .enumerate()
+            .filter(|(joint, _)| *joint != MOUTH_INDEX)
+            .map(|(_, slot)| slot);
+        for (slot, value) in slots.zip(action) {
+            *slot = *value as f64;
         }
         out
     }
