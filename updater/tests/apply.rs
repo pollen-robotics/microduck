@@ -68,6 +68,26 @@ impl RobotClient for DeadThenHealthy {
     }
 }
 
+/// A robot that came up fine but cannot see its servos — a bench board with the motor
+/// supply off, which is exactly the configuration the update system gets tested on.
+struct DegradedRobot;
+
+#[async_trait::async_trait]
+impl RobotClient for DegradedRobot {
+    async fn safe_to_restart(&self, _t: std::time::Duration) -> SafeToRestart {
+        SafeToRestart::Yes
+    }
+    async fn health(&self, _t: std::time::Duration) -> Health {
+        Health::Degraded("no answer from the motor bus after 12 attempts".into())
+    }
+    async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
+        None
+    }
+    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
+        false
+    }
+}
+
 #[async_trait::async_trait]
 impl RobotClient for FakeRobot {
     async fn safe_to_restart(&self, _t: std::time::Duration) -> SafeToRestart {
@@ -560,6 +580,30 @@ async fn rolls_back_when_the_new_release_is_unhealthy() {
     // The robot must be running the *old* release, content and all.
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
     assert_eq!(fx.live_marker().as_deref(), Some("version=1.0.0\n"));
+}
+
+/// The counterpart to `rolls_back_when_the_new_release_is_unhealthy`. Rollback answers
+/// "did this release break the robot?", and a board with no servo power answers nothing
+/// about the release — it said the same before the swap, and reverting cannot change it.
+/// Rolling back there would revert every release shipped to a bench board and churn the
+/// boot counter doing it.
+#[tokio::test]
+async fn commits_when_the_robot_is_degraded_rather_than_broken() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut engine = fx.engine(Box::new(DegradedRobot), Faults::none(), "");
+    let result = apply_latest(&mut engine).await.unwrap();
+
+    assert!(
+        matches!(result, ApplyResult::Applied { .. }),
+        "a degraded board must still take the update, got {result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
 }
 
 #[tokio::test]

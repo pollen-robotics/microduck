@@ -1228,6 +1228,17 @@ impl Engine {
                 while tokio::time::Instant::now() < deadline {
                     match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
                         crate::robot::Health::Healthy => return Ok(()),
+                        // Passes. Logged at warn, not swallowed: committing a release onto a
+                        // robot that cannot move is the right call, but nobody should have to
+                        // guess afterwards that that is what happened.
+                        crate::robot::Health::Degraded(reason) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "committing: the robot is degraded for a reason this release \
+                                 cannot have caused and a rollback cannot fix"
+                            );
+                            return Ok(());
+                        }
                         crate::robot::Health::Unhealthy(reason) => last = reason,
                         crate::robot::Health::Unreachable => {
                             last = "unreachable".into();

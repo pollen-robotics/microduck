@@ -108,6 +108,17 @@ enum Namespace {
         json: bool,
     },
 
+    /// Is the robot healthy, and if not, why not.
+    ///
+    /// The same question the update system's health gate asks, and the reason auto-rollback
+    /// means anything. It was previously only answerable by hand-writing JSON at the socket,
+    /// which is a poor way to ask the one thing that decides whether a release is kept.
+    Health {
+        /// Machine-readable output, for scripts and support bundles.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// What is running on this robot, and what is installed. The first thing to ask for
     /// in a support report.
     ///
@@ -463,6 +474,54 @@ fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> 
     }
 }
 
+/// Ask `robotd` whether it is healthy.
+///
+/// Exits non-zero when the robot is unhealthy or unreachable, so a script can gate on it —
+/// `robotctl health && do_the_thing`. The reason is always printed, because "unhealthy" on
+/// its own sends someone hunting: it distinguishes a loop that has not started from one
+/// missing its deadline from a policy that would not load.
+fn run_health(robot_socket: &Path, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    let response = client.call(&proto::Call::RobotHealth)?;
+
+    let health: proto::HealthResult = response.result_as().map_err(|e| {
+        Failure::new(
+            exit::FAILED,
+            format!("robotd answered robot.health with something unexpected: {e}"),
+        )
+    })?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_owned())
+        );
+    } else if health.healthy {
+        println!("healthy");
+    } else {
+        // "degraded" reads as what it is: this release is fine, this board cannot move.
+        // Still a non-zero exit — `install.sh` and anyone else scripting this should hear
+        // about an unpowered robot rather than see a silent success.
+        println!(
+            "{}: {}",
+            if health.degraded {
+                "degraded"
+            } else {
+                "unhealthy"
+            },
+            health.reason.as_deref().unwrap_or("no reason given")
+        );
+    }
+
+    if health.healthy {
+        Ok(())
+    } else {
+        // REFUSED, not FAILED: the robot answered correctly and the answer was "no". That is
+        // a verdict, not a malfunction, and a script should be able to tell them apart.
+        Err(Failure::silent(exit::REFUSED))
+    }
+}
+
 fn run_version(socket: &Path, robot_socket: &Path, json: bool) -> Result<(), Failure> {
     let build = proto::build_info!();
     let mut report = VersionReport {
@@ -701,6 +760,19 @@ impl Failure {
         Self { code, message }
     }
 
+    /// An exit code with nothing to say.
+    ///
+    /// For a command that has already printed its own answer on stdout and only needs the
+    /// status to be non-zero — `robotctl health` on an unhealthy robot has reported the
+    /// reason already, and repeating it as `error: ...` on stderr would read as though
+    /// something had gone wrong with the command rather than with the robot.
+    fn silent(code: u8) -> Self {
+        Self {
+            code,
+            message: String::new(),
+        }
+    }
+
     /// Map a daemon error code to a CLI exit code, preserving the distinctions that
     /// let scripts branch: retry on BUSY, "correctly rejected" on REFUSED.
     fn from_rpc(error: proto::Error) -> Self {
@@ -722,10 +794,48 @@ impl Failure {
 }
 
 /// Progress goes to stderr so `--json` output on stdout stays pipeable.
+///
+/// The engine emits progress once per network chunk — around 250 notifications for a 3.6 MB
+/// artifact — and printing a line for each buried the phases that actually matter in a
+/// screenful of `Downloading N%`. On a terminal this now rewrites a single line; when
+/// redirected, where `\r` is useless, it prints one line per decile instead.
 fn report_progress(progress: &proto::Progress) {
-    match progress.percent {
-        Some(percent) => eprintln!("  {:?} {percent}%", progress.phase),
-        None => eprintln!("  {:?}", progress.phase),
+    use std::io::{IsTerminal, Write};
+
+    // `Some` also means "a bare `\r` line is open and owes a newline".
+    static LAST: std::sync::Mutex<Option<(proto::Phase, u8)>> = std::sync::Mutex::new(None);
+
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let tty = std::io::stderr().is_terminal();
+
+    let Some(percent) = progress.percent else {
+        // A phase with no percentage. Close any open counter line first, or it gets
+        // overwritten and the download appears to stop partway.
+        if tty && last.is_some() {
+            eprintln!();
+        }
+        *last = None;
+        eprintln!("  {:?}", progress.phase);
+        return;
+    };
+
+    if tty {
+        eprint!("\r  {:?} {percent}%", progress.phase);
+        if percent >= 100 {
+            eprintln!();
+            *last = None;
+        } else {
+            *last = Some((progress.phase, 0));
+        }
+        let _ = std::io::stderr().flush();
+        return;
+    }
+
+    // 100 in its own bucket, so a finished download says so rather than stopping at 90.
+    let decile = if percent >= 100 { 10 } else { percent / 10 };
+    if *last != Some((progress.phase, decile)) {
+        *last = Some((progress.phase, decile));
+        eprintln!("  {:?} {percent}%", progress.phase);
     }
 }
 
@@ -751,7 +861,9 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::from(exit::OK),
         Err(failure) => {
-            eprintln!("error: {}", failure.message);
+            if !failure.message.is_empty() {
+                eprintln!("error: {}", failure.message);
+            }
             ExitCode::from(failure.code)
         }
     }
@@ -759,6 +871,9 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
+        Namespace::Health { json } => {
+            return run_health(&cli.robot_socket, json);
+        }
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, json);
         }

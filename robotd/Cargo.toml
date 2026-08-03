@@ -42,6 +42,10 @@ arc-swap = "1"
 # already.
 [dev-dependencies]
 updater = { path = "../updater" }
+# `start_paused` for the startup-retry tests: the retry interval is a second of real time,
+# which is right on a robot and far too slow in a test. Dev-only — `cargo build` does not
+# pull dev-dependencies, so the shipped binary has no test-util in it.
+tokio = { workspace = true, features = ["test-util"] }
 test-support = { path = "../test-support" }
 minisign = "0.9.1"
 semver.workspace = true

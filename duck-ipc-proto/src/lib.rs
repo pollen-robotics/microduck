@@ -804,6 +804,19 @@ pub struct SafeToRestartResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthResult {
     pub healthy: bool,
+    /// Set when the reason is a property of the *board*, not of the running release.
+    ///
+    /// The whole point of the health gate is to answer "did this release break the robot?".
+    /// A robot with no servo power answers nothing about the release: it reported exactly
+    /// the same before the swap, and reverting cannot change it — so rolling back only
+    /// wastes an update and churns the boot counter. Such conditions are reported here so
+    /// the gate can commit anyway, while a release that genuinely broke the control loop
+    /// still reverts.
+    ///
+    /// Only meaningful when `healthy` is false. Defaults to false, so an older `robotd`
+    /// that does not send it keeps the previous strict behaviour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -1205,6 +1218,7 @@ mod tests {
     #[test]
     fn robot_results_round_trip() {
         let healthy = HealthResult {
+            degraded: false,
             healthy: true,
             reason: None,
         };
@@ -1216,6 +1230,7 @@ mod tests {
         );
 
         let sick = HealthResult {
+            degraded: false,
             healthy: false,
             reason: Some("motors not responding".into()),
         };
@@ -1271,6 +1286,35 @@ mod tests {
         };
         let line = serde_json::to_string(&movement).unwrap();
         assert!(!line.contains("limited_by"), "{line}");
+    }
+
+    /// `degraded` must default to false, so an older `robotd` that never sends the field
+    /// keeps the strict behaviour: unhealthy means roll back.
+    #[test]
+    fn health_without_the_degraded_field_is_not_degraded() {
+        let answer: HealthResult =
+            serde_json::from_str(r#"{"healthy":false,"reason":"motors not responding"}"#).unwrap();
+        assert!(!answer.degraded);
+    }
+
+    /// And it is absent from the wire when false, so the common answers stay small.
+    #[test]
+    fn degraded_is_omitted_when_false_and_present_when_true() {
+        let plain = HealthResult {
+            healthy: true,
+            degraded: false,
+            reason: None,
+        };
+        assert!(!serde_json::to_string(&plain).unwrap().contains("degraded"));
+
+        let bench = HealthResult {
+            healthy: false,
+            degraded: true,
+            reason: Some("no answer from the motor bus".into()),
+        };
+        let line = serde_json::to_string(&bench).unwrap();
+        assert!(line.contains(r#""degraded":true"#), "{line}");
+        assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), bench);
     }
 
     /// A local build must say so, rather than looking like a release whose revision was

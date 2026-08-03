@@ -51,10 +51,12 @@ jobs:
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          sh -n scripts/install.sh
-          shellcheck --shell=sh scripts/install.sh
-          # The one-liner is only correct if the file is executable and self-contained.
-          test -x scripts/install.sh
+          for script in scripts/install.sh scripts/setup-board.sh; do
+            sh -n "$script"
+            shellcheck --shell=sh "$script"
+            # The one-liner is only correct if the file is executable and self-contained.
+            test -x "$script"
+          done
 
       # The publish tooling must keep working, or a release can't be cut. Cheap to
       # assert here rather than discovering it at tag time.

@@ -1,0 +1,79 @@
+# Delete the dev-channel prerelease belonging to a branch that no longer exists.
+#
+# `dev.yml` publishes every branch push to a moving tag `daemon-dev-<branch>`. Nothing ever
+# removed those, so each merged branch left a prerelease and ~11 MB of signed binaries
+# behind for good.
+#
+# Tidiness is the least of it. **A dead tag stays installable**: months later
+# `robotctl update apply daemon --ref some-old-branch` still resolves, verifies and
+# installs, because the artifact is genuinely signed with the team dev key. It looks like a
+# valid install and it is arbitrary stale code from a branch nobody remembers.
+#
+# What this cannot break: the release stream. Dev versions are semver prereleases and
+# `latest` resolves to the highest *stable* version, so a customer robot could never have
+# been on one of these — and `allow_dev_keys = false` is a second, independent barrier.
+name: prune-dev-releases
+
+on:
+  # The immediate path: a branch is deleted, its prerelease goes with it.
+  delete:
+  # The sweeper. Catches branches deleted before this workflow existed, deleted through the
+  # API without an event reaching us, or missed for any other reason. Without it the
+  # `delete` trigger can only ever keep up with the future.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "List what would be deleted, delete nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # One implementation for all three triggers. The `delete` event could be handled with
+      # a single targeted call, but then the common path and the sweeper would be different
+      # code, and the one that runs rarely would be the one that rots.
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          branches="$(gh api --paginate repos/${{ github.repository }}/branches --jq '.[].name')"
+          echo "live branches:"
+          echo "$branches" | sed 's/^/  /'
+          echo
+
+          deleted=0
+          for tag in $(gh release list --limit 200 --json tagName --jq '.[].tagName' \
+                       | grep '^daemon-dev-' || true); do
+              branch="${tag#daemon-dev-}"
+
+              # `grep -x` so a branch named `foo` does not keep `daemon-dev-foo-bar` alive.
+              if echo "$branches" | grep -qx -- "$branch"; then
+                  echo "keep   $tag"
+                  continue
+              fi
+
+              if [ "${DRY_RUN:-false}" = "true" ]; then
+                  echo "would delete $tag"
+              else
+                  # --cleanup-tag, or the tag survives the release and `--ref <branch>`
+                  # keeps resolving to it — which is the actual hazard here.
+                  gh release delete "$tag" --cleanup-tag --yes
+                  echo "delete $tag"
+                  deleted=$((deleted + 1))
+              fi
+          done
+
+          echo
+          echo "pruned ${deleted} dev release(s)"

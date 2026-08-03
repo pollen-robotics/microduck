@@ -13,6 +13,50 @@ next to their service (`updater/systemd/`, `robotd/systemd/`); anything robot-wi
 
 ## Installing a robot from scratch
 
+Two steps, because they answer to different things. `setup-board.sh` is OS-level bring-up —
+device-tree overlays, ONNX Runtime — which changes rarely and needs a reboot. `install.sh`
+installs a signed daemon release, which happens on every update. Conflating them would mean
+every update re-litigating boot configuration.
+
+**1. Prepare the board.** Idempotent, and it never reboots on its own: if it changes boot
+config it says so and stops, and running it again afterwards continues.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/setup-board.sh -o /tmp/setup-board.sh
+```
+
+```bash
+sudo sh /tmp/setup-board.sh
+```
+
+The first run copies itself to `/usr/local/sbin/robot-setup-board`, so after the reboot it
+asks for there is still something to run:
+
+```bash
+sudo reboot
+```
+
+```bash
+sudo /usr/local/sbin/robot-setup-board
+```
+
+`/tmp` is cleared on reboot, and a script whose whole job is *change boot config, reboot,
+confirm* should not delete itself in the middle of that.
+
+It ends with a status block — motor bus, ONNX Runtime, clock — so "is this board ready" is a
+question you can ask on its own, not only as a side effect of installing something.
+
+The one thing it fixes that is otherwise very hard to diagnose: Armbian ships
+`overlay_prefix=rk35xx`, but the RK3566 shares device-tree overlays with the RK3568 and they
+are named `rk3568-*.dtbo`. With the wrong prefix the loader finds nothing, the board boots
+happily, and there is simply no `/dev/ttyS2`. `armbian-config`'s overlay editor crashes for
+the same reason, so the file is patched directly.
+
+⚠ A kernel upgrade that repoints `/boot/{Image,dtb,uInitrd}` can undo it. A board that stops
+seeing its motors after an `apt upgrade` needs this re-run.
+
+**2. Install the daemon.**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pollen-robotics/microduck_daemon/main/scripts/install.sh | sudo sh
 ```
@@ -58,11 +102,14 @@ A private repo's release assets are unreachable without credentials — the
 release API instead. `updaterd` reads `GITHUB_TOKEN` from its environment, which on a board
 means a systemd drop-in, not a shell export.
 
-That is fine on a developer's board (see the README) and **not** fine on a customer robot: a
-fleet-wide credential in an image is one that leaks and cannot be rotated without reflashing,
-which is the failure the tiered signing keys exist to avoid. So `scripts/install.sh` does not
-provision a token, and a robot installed today can be provisioned but cannot fetch an update
-unless someone adds one by hand.
+That is fine on a developer's board and **not** fine on a customer robot: a fleet-wide
+credential in an image is one that leaks and cannot be rotated without reflashing, which is
+the failure the tiered signing keys exist to avoid.
+
+`install.sh` therefore writes the drop-in **only when `DUCK_TOKEN` was supplied** — mode 600,
+and it says so loudly. A customer robot installs from a public artifact repository and passes
+no token, so it never reaches that path. Without it `updaterd` would be installed, running,
+and unable to fetch a single update, which is most of what it is for.
 
 Artifact hosting is therefore an open decision, not a settled one —
 [`../docs/updater-design.md`](../docs/updater-design.md) §6.1 has the options. The cheap one

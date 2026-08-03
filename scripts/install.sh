@@ -60,7 +60,11 @@ REF="${DUCK_REF:-main}"
 TOKEN="${DUCK_TOKEN:-}"
 
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
-BOOTSTRAP_URL="https://github.com/${REPO}/releases/latest/download/updaterd-bootstrap-aarch64"
+BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
+
+# Set by `resolve_bootstrap_asset`. A global rather than a `$(...)` result so a failure can
+# `die` in the caller's shell instead of exiting a subshell and returning an empty string.
+BOOTSTRAP_URL=""
 
 CONFIG_DIR=/etc/robot
 KEYS_DIR="${CONFIG_DIR}/trusted_keys"
@@ -87,6 +91,20 @@ fetch() {
     fi
 }
 
+# As `fetch`, but asking the release API for bytes rather than metadata.
+#
+# Without `Accept: application/octet-stream` that endpoint answers with the asset's JSON
+# description, which downloads perfectly and is not a binary.
+fetch_asset() {
+    # $1 url, $2 destination
+    if [ -n "$TOKEN" ]; then
+        curl -fsSL -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/octet-stream" -o "$2" "$1"
+    else
+        curl -fsSL -H "Accept: application/octet-stream" -o "$2" "$1"
+    fi
+}
+
 # ── steps ────────────────────────────────────────────────────────────────────
 
 check_environment() {
@@ -99,9 +117,7 @@ check_environment() {
         die "this installer publishes aarch64 binaries only, and this box is ${arch}"
     fi
 
-    # tar and find are used by the ONNX Runtime step; better to fail here than
-    # halfway through unpacking it.
-    for tool in curl systemctl sha256sum install tar find; do
+    for tool in curl systemctl sha256sum install; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             die "${tool} is required"
         fi
@@ -195,9 +211,66 @@ install_config() {
 # above, so there is one statement of where keys live, where state lives and which channel
 # this robot tracks — rather than a copy of those values here that could disagree with the
 # one the daemon reads a minute later.
+# Find the bootstrap asset's API download URL on the latest stable release.
+#
+# **Not** `releases/latest/download/<asset>`. On a private repository that browser URL
+# returns 404 with or without a token — see `docs/updater-design.md` §6.1 — which is exactly
+# how this failed the first time it was run against a real board. The engine already
+# re-resolves its own download URLs through the release API (`resolve_download` in
+# `source/github.rs`); this script was the one place that had not caught up, because until a
+# release was promoted there was nothing here to exercise.
+resolve_bootstrap_asset() {
+    api="https://api.github.com/repos/${REPO}/releases/latest"
+    json="$(mktemp)"
+
+    if ! fetch "$api" "$json"; then
+        rm -f "$json"
+        die "cannot read ${api}
+  A stable, non-prerelease release must exist. If only staging releases have been
+  published, promote one first:  gh workflow run promote --field version=X.Y.Z"
+    fi
+
+    # Parsed with grep rather than jq: this script runs before anything is installed, and
+    # requiring a JSON parser on a freshly flashed board, in order to bootstrap the thing
+    # that installs software, would be the wrong way round.
+    #
+    # Whitespace is stripped *first*. The API pretty-prints, so `tr '{'` alone leaves the
+    # original newlines in place and grep still matches line by line — the line naming the
+    # asset does not carry its id, and the search silently finds nothing. Compacting makes
+    # one line per JSON object, and an asset's `id` and `name` both precede its nested
+    # `uploader` object, so the line naming the asset carries its id too.
+    id="$(
+        tr -d ' \n' < "$json" \
+        | tr '{' '\n' \
+        | grep "\"name\":\"${BOOTSTRAP_ASSET}\"" \
+        | grep -o '"id":[0-9][0-9]*' \
+        | grep -o '[0-9][0-9]*' \
+        | head -1
+    )"
+    rm -f "$json"
+
+    if [ -z "$id" ]; then
+        die "the latest release has no asset named ${BOOTSTRAP_ASSET}.
+  A promoted release must carry it — release.yml attaches it, promote.yml copies it across."
+    fi
+
+    BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
+}
+
 bootstrap_first_release() {
     if [ -L "${INSTALL_DIR}/current" ]; then
         say "a release is already live ($(readlink "${INSTALL_DIR}/current")); skipping the bootstrap"
+        # This script provisions a bare board; it is not how an installed board updates. Say
+        # so, because everything after this point still prints reassuring green output and it
+        # is entirely reasonable to read that as "now on the latest release".
+        cat <<'EOF'
+
+  This script only bootstraps a board with no release on it, so the daemon version below
+  will not change. To update an installed board:
+
+    sudo robotctl update apply daemon
+
+EOF
         return 0
     fi
 
@@ -206,15 +279,20 @@ bootstrap_first_release() {
     trap "rm -rf '$tmp'" EXIT INT TERM
 
     say "fetching the bootstrap updaterd"
-    if ! fetch "$BOOTSTRAP_URL" "${tmp}/updaterd"; then
-        die "cannot fetch ${BOOTSTRAP_URL}
-  A stable release must exist and carry the updaterd-bootstrap-aarch64 asset. If only
-  staging releases have been published, promote one first."
+    resolve_bootstrap_asset
+    if ! fetch_asset "$BOOTSTRAP_URL" "${tmp}/updaterd"; then
+        die "cannot fetch ${BOOTSTRAP_URL}"
     fi
     chmod +x "${tmp}/updaterd"
 
     say "installing the first release (verifying signatures)"
-    "${tmp}/updaterd" install --config "${CONFIG_DIR}/updater.toml"
+    # GITHUB_TOKEN, not DUCK_TOKEN: the engine reads that name, and it needs one for the
+    # same reason this script does — a private repo's API answers 404 to an unauthenticated
+    # caller. Exported only for this command, deliberately: nothing is written to disk, so
+    # the installed `updaterd` still has no credential and still cannot fetch a *later*
+    # update until someone adds the systemd drop-in by hand. That asymmetry is the point —
+    # provisioning is a person at a keyboard, an unattended update is not.
+    GITHUB_TOKEN="$TOKEN" "${tmp}/updaterd" install --config "${CONFIG_DIR}/updater.toml"
 
     if [ ! -L "${INSTALL_DIR}/current" ]; then
         die "the install reported success but nothing is live"
@@ -329,6 +407,25 @@ verify_install() {
     # support report. Non-fatal: a daemon that is active but not yet answering is a timing
     # artefact, not a failed install.
     robotctl version || warn "robotctl could not reach the daemons yet"
+
+    # And ask whether it is actually *working*, which `is-active` cannot tell you.
+    #
+    # robotd stays active with no motor bus: it logs the failure, keeps serving its socket,
+    # and reports unhealthy. Before this, a board with no servos wired produced a completely
+    # green install of a daemon that could not see a robot.
+    #
+    # Non-fatal on purpose. A bench board with no motors attached is a legitimate state — it
+    # is the right thing to test the update system against — so this reports rather than
+    # refuses. The exit code is swallowed deliberately.
+    if robotctl health; then
+        :
+    else
+        warn "robotd is up but not healthy. That is the honest answer, not necessarily a
+  failed install — a bench board reports exactly this until its servos are powered, and
+  the reason above says which. robotd keeps retrying, so powering the servos brings it up
+  without reinstalling or restarting anything. Look at:
+    journalctl -u robotd -b --no-pager"
+    fi
 }
 
 report() {
@@ -347,69 +444,70 @@ EOF
 }
 
 
-# ONNX Runtime, which `robotd` dlopens to run its gait policy.
+# The motor bus, checked but never configured here.
 #
-# A board prerequisite rather than something a release carries. It changes far less often
-# than the daemon, so shipping ~20 MB of it in every artifact would make each update
-# download several times larger for nothing.
-#
-# The consequence is worth stating: it is loaded at runtime, not linked, so a board without
-# it installs and starts fine and *then* cannot walk. `robotd` reports that through
-# `robot.health` with the searched path in the message and holds its pose, so the failure
-# names itself rather than looking like a wedged daemon — but it is still a failure, which
-# is why this step exists instead of a line in a setup document.
-ONNX_VERSION="${ONNX_VERSION:-1.20.1}"
-ONNX_LIB_DIR=/usr/local/lib
+# Board bring-up is `setup-board.sh`'s job — device-tree overlays need a reboot and belong to
+# the board, not to a daemon release. But installing a robot daemon onto a board with no bus
+# is worth saying out loud: the install will succeed, `robotd` will start, fail to open the
+# bus, and report unhealthy. That is honest behaviour, and an easy thing to stare past.
+MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
-install_onnxruntime() {
-    if [ -f "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
-        say "ONNX Runtime already present in ${ONNX_LIB_DIR}"
+check_board() {
+    if [ -e "$MOTOR_PORT" ]; then
+        return 0
+    fi
+    warn "${MOTOR_PORT} does not exist, so robotd will have no motor bus.
+  Run scripts/setup-board.sh (then reboot) to enable it. Installing anyway: the update
+  system is worth testing on a board whose bus is not wired yet, and robotd reports itself
+  unhealthy rather than pretending."
+}
+
+# Let `updaterd` fetch updates on a *developer's* board.
+#
+# Only when a token was supplied, and never on a customer robot: those install from a public
+# artifact repository and pass no token, so they never reach this path. A fleet-wide
+# credential baked into an image is one that leaks and cannot be rotated without reflashing —
+# the failure the tiered signing keys exist to avoid (deploy/README.md).
+#
+# Without this, `updaterd` is installed, running, and unable to fetch a single update — which
+# is most of what it is for.
+install_token_dropin() {
+    if [ -z "$TOKEN" ]; then
+        say "no token supplied; updaterd will not be able to fetch updates"
         return 0
     fi
 
-    url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz"
-    tmp="$(mktemp -d)"
-    say "installing ONNX Runtime ${ONNX_VERSION}"
-
-    if ! fetch "$url" "${tmp}/ort.tgz"; then
-        rm -rf "$tmp"
-        die "cannot download ONNX Runtime from ${url}
-  robotd needs it to run a policy. Install it by hand into ${ONNX_LIB_DIR}, or set
-  ORT_DYLIB_PATH in robotd's unit to wherever it lives."
-    fi
-
-    tar -xzf "${tmp}/ort.tgz" -C "$tmp" || die "cannot unpack ONNX Runtime"
-
-    # The tarball nests everything under a versioned directory; take the versioned .so and
-    # the symlinks beside it so `dlopen("libonnxruntime.so")` resolves.
-    found="$(find "$tmp" -name 'libonnxruntime.so*' -type f | head -1)"
-    [ -n "$found" ] || die "no libonnxruntime.so in the ONNX Runtime tarball"
-
-    install -m 0644 "$found" "${ONNX_LIB_DIR}/$(basename "$found")"
-    ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so"
-
-    # ldconfig lives in /usr/sbin, which is often absent from a login PATH, so
-    # `command -v ldconfig` would report it missing and skip the refresh — leaving the
-    # freshly copied library unfindable by dlopen. Try the absolute path too.
-    if command -v ldconfig >/dev/null 2>&1; then
-        ldconfig
-    elif [ -x /usr/sbin/ldconfig ]; then
-        /usr/sbin/ldconfig
-    else
-        warn "no ldconfig; robotd may need ORT_DYLIB_PATH=${ONNX_LIB_DIR}/libonnxruntime.so"
-    fi
-
-    rm -rf "$tmp"
+    dir=/etc/systemd/system/updaterd.service.d
+    mkdir -p "$dir"
+    # Restrictive umask before the write, not chmod after: a drop-in is world-readable by
+    # default, and this one holds a credential from the moment it exists.
+    (
+        umask 077
+        printf '[Service]\nEnvironment=GITHUB_TOKEN=%s\n' "$TOKEN" > "${dir}/token.conf"
+    )
+    systemctl daemon-reload
+    # `daemon-reload` re-reads unit files; it does not restart anything. Without this the
+    # drop-in exists on disk and the *running* updaterd still has no GITHUB_TOKEN, so every
+    # later check 404s against a private repo — silently, on a timer, forever. The units are
+    # started before this function runs, so this was not a corner case: it was every board.
+    #
+    # `try-restart`, not `restart`: if updaterd is not running, starting it is
+    # `install_units`' job and doing it here would hide a failure there.
+    systemctl try-restart updaterd.service || warn "could not restart updaterd"
+    say "wrote ${dir}/token.conf (mode 600) so updaterd can fetch updates"
+    warn "that file holds a GitHub token in plaintext. Fine on a developer's board, not on a
+  robot you ship. It is why artifact hosting is still open — docs/updater-design.md §6.1."
 }
 
 main() {
     check_environment
+    check_board
     wait_for_clock
-    install_onnxruntime
     install_config
     bootstrap_first_release
     create_group
     install_units
+    install_token_dropin
     verify_install
     report
 }

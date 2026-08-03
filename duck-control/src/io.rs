@@ -96,6 +96,9 @@ pub struct FakeIo {
     /// Set to make the next [`RobotIo::read`] fail, then cleared. For exercising the
     /// loop's error path without a flaky bus.
     pub fail_next_read: bool,
+    /// Reads still to fail before this one starts answering, decremented per read. Models a
+    /// robot whose servos are not powered yet, and then are.
+    pub fail_reads: u32,
     pub last_written: Option<JointTargets>,
     pub reads: usize,
     pub writes: usize,
@@ -116,6 +119,7 @@ impl FakeIo {
         Self {
             sensors: Sensors::default(),
             fail_next_read: false,
+            fail_reads: 0,
             last_written: None,
             reads: 0,
             writes: 0,
@@ -138,6 +142,13 @@ impl FakeIo {
         self
     }
 
+    /// Fail the next `n` reads, then behave normally. Models a board that comes up before
+    /// its servo power does.
+    pub fn failing_reads(mut self, n: u32) -> Self {
+        self.fail_reads = n;
+        self
+    }
+
     pub fn set_imu(&mut self, imu: ImuData) {
         self.sensors.imu = imu;
     }
@@ -151,6 +162,10 @@ impl RobotIo for FakeIo {
     fn read(&mut self) -> Result<Sensors> {
         if self.fail_next_read {
             self.fail_next_read = false;
+            return Err(IoError::Simulated);
+        }
+        if self.fail_reads > 0 {
+            self.fail_reads -= 1;
             return Err(IoError::Simulated);
         }
         self.reads += 1;

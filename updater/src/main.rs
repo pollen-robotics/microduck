@@ -318,12 +318,32 @@ async fn install(args: &Args, from: Option<PathBuf>, component: &str, dry_run: b
 
     // Progress is advisory and the channel unbounded, so this cannot slow the install
     // down — it just makes a long download visible in the journal.
+    //
+    // Logged in deciles, not per callback. The engine emits progress per network chunk, so
+    // a single 3.6 MB download produced ~250 journal lines — 13 of them at "percent=0",
+    // before the first whole percent had even accrued. That is not merely noise: under
+    // journald's size cap it is what evicts the logs someone actually needs, and this runs
+    // on a robot whose logs may be all anyone has.
+    //
+    // Deciles because the point of the line is "is it moving", which ten lines answer as
+    // well as two hundred and fifty.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<updater::proto::Progress>();
     tokio::spawn(async move {
+        let mut last_logged: Option<(updater::proto::Phase, u8)> = None;
         while let Some(p) = rx.recv().await {
             match p.percent {
-                Some(percent) => tracing::info!(phase = ?p.phase, percent, "installing"),
-                None => tracing::info!(phase = ?p.phase, "installing"),
+                Some(percent) => {
+                    let decile = progress_decile(percent);
+                    if last_logged == Some((p.phase, decile)) {
+                        continue;
+                    }
+                    last_logged = Some((p.phase, decile));
+                    tracing::info!(phase = ?p.phase, percent, "installing");
+                }
+                None => {
+                    last_logged = None;
+                    tracing::info!(phase = ?p.phase, "installing");
+                }
             }
         }
     });
@@ -511,6 +531,13 @@ async fn shutdown() {
     }
 }
 
+/// Which decile a percentage falls in, for throttling progress logs.
+///
+/// 100 gets its own bucket so a finished download reports 100 rather than stopping at 90.
+fn progress_decile(percent: u8) -> u8 {
+    if percent >= 100 { 10 } else { percent / 10 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,5 +619,52 @@ mod tests {
         .unwrap();
         assert_eq!(args.config, PathBuf::from("/etc/robot/updater.toml"));
         assert!(matches!(args.command, Some(Command::Install { .. })));
+    }
+
+    /// The engine emits progress once per network chunk, so a single 3.6 MB download wrote
+    /// ~250 journal lines — 13 of them before the first whole percent had even accrued.
+    /// That is not just noise: under journald's size cap it evicts the logs someone needs,
+    /// on a robot where the journal may be all anyone has to go on.
+    #[test]
+    fn a_full_download_logs_eleven_lines_not_hundreds() {
+        // The shape a chunked download really reports: repeated zeros, then every percent
+        // more than once.
+        let mut reported = vec![0u8; 13];
+        for percent in 0..=100u8 {
+            reported.push(percent);
+            reported.push(percent);
+        }
+        assert!(
+            reported.len() > 200,
+            "the flood this throttling exists to fix"
+        );
+
+        let mut logged = 0;
+        let mut last = None;
+        for percent in reported {
+            let decile = progress_decile(percent);
+            if last != Some(decile) {
+                last = Some(decile);
+                logged += 1;
+            }
+        }
+        // 0, 10, ... 90, then completion.
+        assert_eq!(logged, 11, "one line per decile plus completion");
+    }
+
+    /// 100 must not share a bucket with 90, or a finished download looks stalled at 90%.
+    #[test]
+    fn completion_is_its_own_bucket() {
+        assert_eq!(progress_decile(90), 9);
+        assert_eq!(progress_decile(99), 9);
+        assert_eq!(progress_decile(100), 10);
+    }
+
+    /// The start of a phase is worth exactly one line, not thirteen.
+    #[test]
+    fn the_leading_zeros_collapse() {
+        assert_eq!(progress_decile(0), 0);
+        assert_eq!(progress_decile(9), 0);
+        assert_ne!(progress_decile(10), progress_decile(9));
     }
 }

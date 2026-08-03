@@ -361,7 +361,11 @@ fn github_token() -> Option<String> {
 fn describe_failure(url: &str, status: reqwest::StatusCode) -> String {
     let hint = match status.as_u16() {
         401 | 403 => " (private repo, or rate-limited — set GITHUB_TOKEN?)",
-        404 => " (wrong repo, tag, or asset name?)",
+        // GitHub answers 404 — not 403 — for a private resource the caller cannot see, so
+        // as not to disclose that it exists. So the one status that most often means "you
+        // need a token" was the one suggesting a typo. That cost a real debugging round
+        // trip on the first board: the repo name was right and the message said it was not.
+        404 => " (wrong repo, tag, or asset name? or a private repo — set GITHUB_TOKEN?)",
         429 => " (rate-limited; retry later)",
         500..=599 => " (server-side; retry later)",
         _ => "",
@@ -386,10 +390,19 @@ mod tests {
     }
 
     /// Failure messages must be actionable — "HTTP 404" alone sends someone hunting.
+    ///
+    /// **404 must mention the token.** GitHub answers 404, not 403, for a private resource
+    /// the caller cannot see, so as not to disclose that it exists — which means the status
+    /// most likely to mean "you need a token" was the one suggesting a typo. On the first
+    /// real board that message sent someone checking a repository name that was correct.
     #[test]
     fn failures_carry_a_hint() {
         let msg = describe_failure("https://x/y", reqwest::StatusCode::NOT_FOUND);
         assert!(msg.contains("wrong repo"), "{msg}");
+        assert!(
+            msg.contains("GITHUB_TOKEN"),
+            "404 must offer the token too: {msg}"
+        );
 
         let msg = describe_failure("https://x/y", reqwest::StatusCode::FORBIDDEN);
         assert!(msg.contains("GITHUB_TOKEN"), "{msg}");

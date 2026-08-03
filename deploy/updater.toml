@@ -104,6 +104,11 @@ units  = ["robotd"]
 # The gate that makes auto-rollback real. 30s is still the placeholder M4 is meant to
 # replace with a measured boot time plus margin; too short reverts a healthy release that
 # merely starts slowly.
+#
+# The gate rolls back on *unhealthy*, not on *degraded*. A robot that cannot see its servos
+# reports degraded, and passes: it said the same thing before the swap, so reverting cannot
+# fix it and would revert every release ever shipped to a bench board. A release that broke
+# the control loop still reverts. `robotctl health` prints which one it is.
 [component.daemon.health]
 probe   = "socket"
 timeout = "30s"

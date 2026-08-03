@@ -36,6 +36,10 @@ impl SafeToRestart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     Healthy,
+    /// Came up and reported a problem, but one belonging to the board rather than to the
+    /// release — no servo power, no motor bus. Passes the gate: see
+    /// [`crate::proto::HealthResult::degraded`].
+    Degraded(String),
     /// Came up and reported a problem.
     Unhealthy(String),
     /// Did not answer within the timeout — includes crash-looping and hung
@@ -157,6 +161,11 @@ impl RobotClient for SocketRobotClient {
         };
         match serde_json::from_value::<crate::proto::HealthResult>(result) {
             Ok(answer) if answer.healthy => Health::Healthy,
+            Ok(answer) if answer.degraded => Health::Degraded(
+                answer
+                    .reason
+                    .unwrap_or_else(|| "robot reports degraded".into()),
+            ),
             Ok(answer) => Health::Unhealthy(
                 answer
                     .reason
