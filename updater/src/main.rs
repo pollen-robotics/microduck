@@ -106,7 +106,33 @@ enum Command {
         /// installable without committing to it.
         #[arg(long)]
         dry_run: bool,
+
+        /// Install over a release that is already live, with `robotd` stopped.
+        ///
+        /// For a board whose installed `updaterd` is too old to accept the release you are
+        /// trying to give it — it will roll the new release back and can never install the
+        /// version that fixes that. `robotctl update apply` cannot help, because the old
+        /// binary is the one running the gate.
+        ///
+        /// Refused unless `robotd` is silent, so the reason plain `install` refuses — no
+        /// health gate on a *working* robot — cannot apply. Stop it first:
+        /// `systemctl stop robotd`. Signatures, hashes and compatibility are still checked;
+        /// what is given up is auto-rollback for this one install.
+        #[arg(long)]
+        force: bool,
     },
+}
+
+/// Is a `robotd` answering the socket?
+///
+/// Short timeout: this asks whether anything is *there*, not whether it is well. Anything
+/// other than `Unreachable` means a robot is running and must not have the release swapped
+/// out from under it without a gate.
+async fn robot_is_answering(robot: &dyn updater::robot::RobotClient) -> bool {
+    !matches!(
+        robot.health(std::time::Duration::from_secs(2)).await,
+        updater::robot::Health::Unreachable
+    )
 }
 
 /// The first line each daemon logs, before anything that can fail.
@@ -147,7 +173,8 @@ async fn main() -> ExitCode {
             ref from,
             ref component,
             dry_run,
-        }) => install(&args, from.clone(), component, dry_run).await,
+            force,
+        }) => install(&args, from.clone(), component, dry_run, force).await,
         None => serve(args).await,
     }
 }
@@ -227,7 +254,13 @@ fn load(args: &Args) -> Option<Loaded> {
 ///
 /// See [`Command::Install`] for why this exists and why it refuses to run on a robot
 /// that already has a release live.
-async fn install(args: &Args, from: Option<PathBuf>, component: &str, dry_run: bool) -> ExitCode {
+async fn install(
+    args: &Args,
+    from: Option<PathBuf>,
+    component: &str,
+    dry_run: bool,
+    force: bool,
+) -> ExitCode {
     use updater::config::{ApplyAction, HealthCheck, SourceConfig};
 
     let Some(mut loaded) = load(args) else {
@@ -267,6 +300,29 @@ async fn install(args: &Args, from: Option<PathBuf>, component: &str, dry_run: b
     let store = updater::store::Store::new(cfg.install_dir.clone());
     match store.current() {
         Ok(None) => {}
+        // `--force`, and only with a silent robot. The objection to installing over a live
+        // release is about a *working robot* losing auto-rollback, so the honest guard is
+        // "is a robot answering", not "is a release live" — a stopped robotd cannot be
+        // misled about its own health, which is the same position a bare board is in.
+        Ok(Some(live)) if force => {
+            if robot_is_answering(loaded.robot.as_ref()).await {
+                tracing::error!(
+                    component,
+                    live = %live,
+                    "refusing --force: robotd is still answering, so this would swap the \
+                     release under a running robot with no health gate behind it. Stop it \
+                     first: systemctl stop robotd"
+                );
+                return ExitCode::FAILURE;
+            }
+            tracing::warn!(
+                component,
+                live = %live,
+                "--force: installing over a live release with robotd stopped. No health \
+                 gate, so this install cannot auto-roll-back — `robotctl rollback` is the \
+                 recovery path if the new release misbehaves."
+            );
+        }
         Ok(Some(live)) => {
             tracing::error!(
                 component,
@@ -274,7 +330,9 @@ async fn install(args: &Args, from: Option<PathBuf>, component: &str, dry_run: b
                 "refusing: this component already has a release live. `install` forces \
                  on_apply and health off, which on a working robot would silently disable \
                  auto-rollback. Use `robotctl update apply` — it goes through the daemon, \
-                 with the real health gate."
+                 with the real health gate. If that rolls back because the installed \
+                 updaterd is too old to accept the release, stop robotd and re-run with \
+                 --force."
             );
             return ExitCode::FAILURE;
         }
@@ -583,6 +641,7 @@ mod tests {
             from,
             component,
             dry_run,
+            force,
         }) = args.command
         else {
             panic!("expected install, got {:?}", args.command);
@@ -590,6 +649,7 @@ mod tests {
         assert_eq!(from.as_deref(), Some(Path::new("/var/tmp/rel")));
         assert_eq!(component, "daemon");
         assert!(!dry_run);
+        assert!(!force, "a plain install must never force");
     }
 
     /// The one-liner installer's path: no `--from`, so the configured source resolves
@@ -619,6 +679,26 @@ mod tests {
         .unwrap();
         assert_eq!(args.config, PathBuf::from("/etc/robot/updater.toml"));
         assert!(matches!(args.command, Some(Command::Install { .. })));
+    }
+
+    /// `--force` must be opt-in. Defaulting it on would let any bootstrap install swap a
+    /// release under a running robot with no health gate.
+    #[test]
+    fn install_does_not_force_by_default() {
+        let args = Args::try_parse_from(["updaterd", "install"]).unwrap();
+        match args.command {
+            Some(Command::Install { force, .. }) => assert!(!force),
+            other => panic!("expected Install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_accepts_force() {
+        let args = Args::try_parse_from(["updaterd", "install", "--force"]).unwrap();
+        match args.command {
+            Some(Command::Install { force, .. }) => assert!(force),
+            other => panic!("expected Install, got {other:?}"),
+        }
     }
 
     /// The engine emits progress once per network chunk, so a single 3.6 MB download wrote

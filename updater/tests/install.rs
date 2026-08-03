@@ -317,6 +317,42 @@ fn refuses_once_a_release_is_live_and_says_what_to_use_instead() {
         Some("1.0.0"),
         "a refused install must not disturb the live release"
     );
+    assert!(
+        stderr.contains("--force"),
+        "the refusal must name the escape hatch, got: {stderr}"
+    );
+}
+
+/// The escape hatch, and the reason it exists: a board whose installed `updaterd` is too
+/// old to accept the release that fixes it. `robotctl update apply` cannot help, because the
+/// old binary is the one running the gate.
+///
+/// No `robotd` answers in this fixture, which is the condition `--force` requires — the
+/// objection to installing over a live release is about a *working* robot losing
+/// auto-rollback, and there is no robot here.
+#[test]
+fn force_installs_over_a_live_release_when_no_robot_answers() {
+    let fresh = FreshRobot::new();
+    fresh.publish("1.0.0");
+    assert!(fresh.install(&[]).status.success());
+    fresh.publish("1.1.0");
+
+    let out = fresh.install(&["--force"]);
+    assert!(
+        out.status.success(),
+        "--force must install over a live release: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fresh.live().as_deref(),
+        Some("1.1.0"),
+        "the forced install must actually move the live release"
+    );
+    let stderr = stderr(&out);
+    assert!(
+        stderr.contains("cannot auto-roll-back"),
+        "a forced install must say what it gave up, got: {stderr}"
+    );
 }
 
 /// `--dry-run` proves a downloaded release is installable without committing to it,

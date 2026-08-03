@@ -59,6 +59,26 @@ REF="${DUCK_REF:-main}"
 # release download, which needs auth on a private repo.
 TOKEN="${DUCK_TOKEN:-}"
 
+# Re-install a release onto a board that already has one, using the release's *own*
+# updaterd rather than the one installed.
+#
+# The escape hatch for a board whose installed updaterd is too old to accept the release you
+# are trying to give it. Not hypothetical: 0.1.4 taught the health gate to commit on a
+# `degraded` robot, and a board on 0.1.2 rolls 0.1.4 back for reporting exactly that — it
+# cannot install the version that fixes it. Every future change to health semantics or
+# manifest format has the same shape.
+#
+# `updaterd install` refuses when a release is live, and it is right to: it forces
+# `on_apply = none` and `health = none`, which on a *running* robot would silently disable
+# auto-rollback. So this stops the daemons first. With nothing running there is no robot to
+# mislead anyone about, which is the same position a bare board is in — and that is a path
+# this script already takes. `install_units` starts them again afterwards.
+#
+# What is genuinely given up is auto-rollback *for this one install*: with no gate, a bad
+# release stays live. `verify_install` reports health at the end and `report` names
+# `robotctl rollback` for that reason. Ordinary updates keep the gate.
+FORCE_REINSTALL="${DUCK_FORCE_REINSTALL:-}"
+
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
 BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 
@@ -257,8 +277,25 @@ resolve_bootstrap_asset() {
     BOOTSTRAP_URL="https://api.github.com/repos/${REPO}/releases/assets/${id}"
 }
 
+# Stop the daemons so a forced re-install is operating on an inert board.
+#
+# Deliberately not `try-restart`-style politeness: the point is that nothing is live while
+# the swap happens with no health gate behind it. Motors stop; on this robot that is
+# acceptable and is the price of the escape hatch.
+stop_for_reinstall() {
+    say "stopping the daemons for a clean re-install"
+    for unit in robotd.service updaterd.service; do
+        systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
+    done
+}
+
 bootstrap_first_release() {
-    if [ -L "${INSTALL_DIR}/current" ]; then
+    if [ -L "${INSTALL_DIR}/current" ] && [ -n "$FORCE_REINSTALL" ]; then
+        say "forcing a clean re-install over $(readlink "${INSTALL_DIR}/current")"
+        warn "the health gate does not apply to a forced re-install, so this one cannot
+  auto-roll-back. If the robot misbehaves afterwards:  sudo robotctl rollback daemon"
+        stop_for_reinstall
+    elif [ -L "${INSTALL_DIR}/current" ]; then
         say "a release is already live ($(readlink "${INSTALL_DIR}/current")); skipping the bootstrap"
         # This script provisions a bare board; it is not how an installed board updates. Say
         # so, because everything after this point still prints reassuring green output and it
@@ -269,6 +306,12 @@ bootstrap_first_release() {
   will not change. To update an installed board:
 
     sudo robotctl update apply daemon
+
+  If that rolls back because the installed updaterd is too old to accept the new release,
+  re-install through the release's own updaterd. This stops the daemons and runs without a
+  health gate, so it cannot auto-roll-back — signatures and hashes are still verified:
+
+    sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_FORCE_REINSTALL=1 sh /tmp/install.sh
 
 EOF
         return 0
@@ -292,7 +335,17 @@ EOF
     # the installed `updaterd` still has no credential and still cannot fetch a *later*
     # update until someone adds the systemd drop-in by hand. That asymmetry is the point —
     # provisioning is a person at a keyboard, an unattended update is not.
-    GITHUB_TOKEN="$TOKEN" "${tmp}/updaterd" install --config "${CONFIG_DIR}/updater.toml"
+    # `--force` only on the forced path, where the daemons have just been stopped. updaterd
+    # verifies that itself — it refuses --force while robotd still answers — so this cannot
+    # quietly swap a release under a running robot.
+    force_flag=""
+    if [ -n "$FORCE_REINSTALL" ]; then
+        force_flag="--force"
+    fi
+
+    # shellcheck disable=SC2086 # unquoted so an empty force_flag passes no argument at all
+    GITHUB_TOKEN="$TOKEN" "${tmp}/updaterd" install \
+        --config "${CONFIG_DIR}/updater.toml" $force_flag
 
     if [ ! -L "${INSTALL_DIR}/current" ]; then
         die "the install reported success but nothing is live"
@@ -337,6 +390,43 @@ create_group() {
     fi
     if ! getent group robot >/dev/null; then
         die "the robot group could not be created; updaterd.service will not start without it"
+    fi
+
+    add_operator_to_group
+}
+
+# Put the person doing the install in the `robot` group.
+#
+# The socket is mode 0660, root:robot, and `Group=robot` in the unit is load-bearing for
+# exactly this reason: group membership is how a non-root client reaches robotd. But the group
+# was only ever created, never populated — so on every board provisioned so far, no
+# unprivileged user could talk to the robot at all:
+#
+#   $ robotctl health
+#   error: cannot reach robotd at /run/robotd.sock: Permission denied (os error 13)
+#
+# which reads like a crashed daemon rather than a missing group.
+#
+# Read-only access, not a privilege grant: mutations are refused to non-root peers regardless
+# of group, so this permits asking and not commanding.
+add_operator_to_group() {
+    # The human who ran sudo, not `whoami` — that is root, which is already able to connect
+    # and would make this a silent no-op.
+    operator="${SUDO_USER:-}"
+    if [ -z "$operator" ] || [ "$operator" = root ]; then
+        return 0
+    fi
+
+    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx robot; then
+        return 0
+    fi
+
+    if usermod -aG robot "$operator"; then
+        say "added ${operator} to the robot group"
+        warn "${operator} must log out and back in before that takes effect. Until then,
+  read-only commands need sudo:  sudo robotctl health"
+    else
+        warn "could not add ${operator} to the robot group; robotctl will need sudo"
     fi
 }
 
