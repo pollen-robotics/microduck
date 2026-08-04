@@ -24,25 +24,31 @@ lines from `.github/workflows/{release,dev}.yml`.
 Copied from `apirrone/microduck_runtime` at commit `567fdcd`, dereferencing the symlinks that
 repository uses to give stable names to specific training runs:
 
-| here | there | size | used by default |
-| --- | --- | --- | --- |
-| `walking.onnx` | `policies/new_policies/vel_noise_walk.onnx` | 772527 | **yes** |
-| `standing.onnx` | `policies/new_policies/standup_gentle_more_range.onnx` | 772527 | **yes** |
-| `alpha_walking.onnx` | `policies/BEST_alpha_walking_flat.onnx` | 793705 | no |
-| `alpha_stand.onnx` | `policies/BEST_alpha_stand.onnx` | 793695 | no |
+| here | there | size |
+| --- | --- | --- |
+| `alpha_walking.onnx` | `policies/BEST_alpha_walking_flat.onnx` | 793705 |
+| `alpha_stand.onnx` | `policies/BEST_alpha_stand.onnx` | 793695 |
 
-Two generations, and the distinction cost a hardware round trip. `walking.onnx` and
-`standing.onnx` are what `microduck_runtime` loads by default — `src/main.rs` has them as the
-`--policy` / `--standing-policy` defaults — so they are the pair with a track record on a real
-robot. The `alpha_*` pair was chosen here first, purely because `deploy/robotd.toml` asked for
-a file of that name and the prototype had one; nothing checked which the working system
-actually ran.
+## Why not the ones microduck_runtime loads by default
 
-Everything in the prototype's `new_policies/` is exactly 772527 bytes and everything in the
-`BEST_alpha_*` set is ~793700, so the two are clearly distinct generations. Both are shipped
-so a board can A/B them by editing `deploy/robotd.toml` and restarting, rather than waiting on
-a release — `robotd` checks the 61-input/14-output shape at load, but nothing detects "right
-shape, wrong robot", so which family suits alpha is a question only the hardware answers.
+Its `src/main.rs` defaults to `policies/walking.onnx` and `policies/standing.onnx`, which
+resolve into `new_policies/`. Those were vendored here briefly on the strength of being the
+proven pair, and the robot rejected them:
+
+```
+policy unavailable: .../walking.onnx: observation width is 51, expected 61
+```
+
+They are not an older generation — they are a different **observation format**. 51 is
+`3 gyro + 3 gravity + 42 joints + 3 command`, the legacy `[vx, vy, vtheta]` command. 61 is the
+same sensors with the unified 13-value command (`[vel(3), head(4), body(6)]`) this daemon
+builds. The prototype runs the legacy path by default and reaches the 61-D policies only under
+`--new-cmd-obs`, so "what the working runtime loads by default" is the wrong question to ask
+of it. The right one is which policies match the observation we build, and that is the
+`BEST_alpha_*` family.
+
+Worth noting the shape check earned its place here: it turned a wrong-policy mistake into one
+precise line naming both widths, instead of a robot moving in ways nobody could explain.
 
 The names here are the *roles* — what `deploy/robotd.toml` asks for — not the training runs.
 That indirection is deliberate and worth keeping: swapping which run is "the walking policy"

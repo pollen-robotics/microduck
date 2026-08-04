@@ -74,11 +74,12 @@ enabled = true
 #
 # Both must be 61-input, 14-output: every alpha policy is obs[1,61] -> actions[1,14], and
 # robotd checks that at load rather than discovering it mid-stride.
-# These two are what microduck_runtime loads by default, so they are the pair with a track
-# record on a real robot. The release also carries alpha_walking.onnx / alpha_stand.onnx, an
-# earlier generation — swap the paths here and restart to A/B them without cutting a release.
-walk = "/opt/robot/daemon/current/policies/walking.onnx"
-stand = "/opt/robot/daemon/current/policies/standing.onnx"
+# The alpha pair, which are the 61-D policies this daemon can run. microduck_runtime also
+# ships a 51-D family (legacy 3-value command instead of the unified 13); those load only
+# under its --new-cmd-obs=false path and robotd refuses them at load with
+# "observation width is 51, expected 61".
+walk = "/opt/robot/daemon/current/policies/alpha_walking.onnx"
+stand = "/opt/robot/daemon/current/policies/alpha_stand.onnx"
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and

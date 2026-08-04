@@ -75,8 +75,8 @@ impl Default for PolicyParams {
     fn default() -> Self {
         Self {
             enabled: true,
-            walk: PathBuf::from(RELEASE_DIR).join("policies/walking.onnx"),
-            stand: Some(PathBuf::from(RELEASE_DIR).join("policies/standing.onnx")),
+            walk: PathBuf::from(RELEASE_DIR).join("policies/alpha_walking.onnx"),
+            stand: Some(PathBuf::from(RELEASE_DIR).join("policies/alpha_stand.onnx")),
             // The prototype's numbers.
             action_scale: 0.7,
             standing_action_scale: 1.0,
