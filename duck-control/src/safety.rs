@@ -142,6 +142,12 @@ impl<T: RobotIo> Safety<T> {
         self.fallen
     }
 
+    /// The gain last written to the servos, or `None` before the first write. This is what
+    /// the robot is running at, which is not always what the caller asked for.
+    pub fn gain(&self) -> Option<u16> {
+        self.gain
+    }
+
     /// Update fall state from a fresh sample. Call every tick, before [`Self::apply`].
     ///
     /// Debounced in both directions: a robot has to be down for `fall_debounce` to count as

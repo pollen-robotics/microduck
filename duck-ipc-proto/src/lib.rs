@@ -998,11 +998,27 @@ pub struct MoveState {
     pub limited_by: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` is gone with the arrival of a float: gravity is a measurement, and exact equality on
+// one is not a comparison anybody should be offered.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SafetyState {
     pub fallen: bool,
     /// Gains have been dropped so the robot yields.
     pub limp: bool,
+    /// Projected gravity in the trunk frame, the input `fallen` is decided from. Upright is
+    /// about `[0, 0, -1]`.
+    ///
+    /// Reported because the verdict alone is not diagnosable: "the robot is down" and "the
+    /// IMU is mounted differently than this build assumes" produce an identical `fallen`, and
+    /// telling them apart otherwise means stopping the daemon and reaching for another tool.
+    #[serde(default)]
+    pub gravity: [f64; 3],
+    /// Position P gain last written to the servos, or `None` before the first write.
+    ///
+    /// What the robot is actually running at, not what was asked for: safety overrides the
+    /// requested gain when it decides the robot has fallen, and that override was invisible.
+    #[serde(default)]
+    pub gain: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1367,6 +1383,8 @@ mod tests {
             safety: SafetyState {
                 fallen: false,
                 limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: Some(200),
             },
             control_loop: LoopState {
                 hz: 49.8,

@@ -941,6 +941,8 @@ async fn control_loop<T: RobotIo>(
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
                     limp: safety.fallen(),
+                    gravity: sensors.imu.gravity,
+                    gain: safety.gain(),
                 },
                 control_loop: proto::LoopState {
                     hz: f64::from_bits(state.achieved_hz.load(Ordering::Relaxed)),

@@ -502,9 +502,12 @@ fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> 
         } else {
             format!("  [{}]", state.movement.limited_by.join(","))
         };
+        // Gravity and gain sit next to the fall verdict on purpose: `fallen` is derived from
+        // the first and overrides the second, and reading the verdict without its input made
+        // "the robot is down" indistinguishable from "the IMU frame is wrong".
         println!(
-            "{:8.2}  {:>5}  {:5.1}Hz miss={:<4} {}  req[{:+.2} {:+.2} {:+.2}] \
-             app[{:+.2} {:+.2} {:+.2}]{}",
+            "{:8.2}  {:>5}  {:5.1}Hz miss={:<4} {}  g[{:+.2} {:+.2} {:+.2}] kp={:<4} \
+             req[{:+.2} {:+.2} {:+.2}] app[{:+.2} {:+.2} {:+.2}]{}",
             state.t,
             state.policy,
             state.control_loop.hz,
@@ -514,6 +517,13 @@ fn run_monitor(robot_socket: &Path, hz: u32, json: bool) -> Result<(), Failure> 
             } else {
                 "ok    "
             },
+            state.safety.gravity[0],
+            state.safety.gravity[1],
+            state.safety.gravity[2],
+            state
+                .safety
+                .gain
+                .map_or_else(|| "-".to_owned(), |g| g.to_string()),
             state.movement.requested[0],
             state.movement.requested[1],
             state.movement.requested[2],
