@@ -17,6 +17,10 @@ description = "Local CLI for the robot — currently the `update` namespace only
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 semver.workspace = true
 clap = { version = "4.6.4", features = ["derive"] }
+# Shell completions, generated from the same `Cli` the parser uses, so they cannot
+# describe commands this binary does not have. Pure codegen over clap's own model —
+# no runtime, and nothing on the recovery path depends on it.
+clap_complete = "4.6.4"
 serde_json.workspace = true
 serde.workspace = true
 libc = "0.2.189"

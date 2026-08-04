@@ -204,7 +204,7 @@ namespace (§7.4).
 
 | method | slice 1 |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature |
 | `robot.safeToRestart` | `true` (a constant pose is always safe to interrupt) |
 | `robot.modelApi` | unchanged constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -216,6 +216,39 @@ already built around.
 
 A loop running at 60% of target is alive, answers every request, and is badly broken. That
 distinction is the whole reason slice 1 exists.
+
+**What may and may not reach the verdict.** `healthy` and `degraded` are the update system's
+inputs, so only conditions a *release* can be blamed for may set them — that is what
+`degraded` already exists to enforce for an unpowered bench board. Everything else on the
+answer is a **description**, and no automatic decision may read it: battery, motor
+temperature, and the loop/bus/IMU counters. Gating on the battery would mean a robot updated
+on a low pack rolls the release back, then judges its replacement on the same low pack, and
+cannot be updated at all until someone works out why. Motor temperature would do the same on
+a hot afternoon.
+
+**Why they travel together anyway.** One method, because the question arrives once: a robot
+behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
+starts a second round of questions. The loop section carries the very figures the verdict was
+computed from, so `unhealthy: control loop at 43.9 Hz` can be read next to `missed = 0` —
+which distinguishes a loop being woken late from a loop doing too much, and those have
+different fixes. `robotctl health` adds the software half from `updaterd` and prints both.
+
+**Two bus transactions, not one.** The tick reads a contiguous block at 124–136 (pwm, current,
+velocity, position). Voltage and temperature sit at 144–146, eight bytes past its end, with
+twelve bytes of trajectory registers nothing wants in between — so they are sampled together
+once a second in a second transaction (~1 ms) rather than widening the tick's read to 22 bytes
+per servo at 50 Hz. Temperature is reported per joint reduced to *the hottest* one and named:
+a knee holding a squat runs far above the mouth, and a mean over fifteen servos hides the one
+approaching the overheat shutdown its error mask latches on.
+
+**Board temperature is a third source, and not on the bus at all.** The hottest of the SoC's
+thermal zones, read from `sysfs` in the same once-a-second sample (`robotd/src/soc.rs`). It
+lives in `robotd` rather than `duck-control` because it is a property of the Linux board, not
+of the robot — which is also why it keeps answering when the motor bus does not, and that is
+precisely when it earns its place: a board cooking behind a blocked vent and a robot with dead
+servos are the same symptom until you can see both numbers. Servo and board temperature are
+reported separately for the same reason. The maximum across zones rather than one zone by name,
+so a board that wires its sensors differently cannot silently omit the one that was climbing.
 
 ### 4.6 Done when
 
@@ -368,9 +401,20 @@ explanation, is unusable, and safety clamps things constantly:
   "t":1234.567,
   "move":{"requested":[0.4,0,0],"applied":[0.15,0,0],"limited_by":["max_velocity"]},
   "policy":"walk", "safety":{"fallen":false,"limp":false},
-  "loop":{"hz":49.8,"missed":0}
+  "loop":{"hz":49.8,"missed":0},
+  "battery":{"volts":7.62,"percent":64}
 }}
 ```
+
+**Battery carries both volts and percent**, here and in `robot.health`. The mapping — 6.6 V
+empty, 8.2 V full under load, an NP-F550 — lives in `duck_control::model::battery_percent` and
+travels already applied. The prototype sent volts only and the app re-derived the percentage
+from constants of its own, which is how the same pack shows two different numbers on two
+screens. A client drawing a battery pill should not have to know which pack this robot ships
+with.
+
+There is no fuel gauge: the measurement is the servos' own supply voltage, read once a second
+in its own bus transaction and smoothed, so it sags under load and recovers at rest.
 
 Same payload for `robotctl monitor` and, later, the app. This is what replaces the runtime's
 180-byte frame on 9870, the JPEG stream on 9871, the UDP command socket on 9872, the maploc

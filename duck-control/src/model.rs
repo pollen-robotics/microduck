@@ -90,6 +90,36 @@ pub fn joint_index(name: &str) -> Option<usize> {
     JOINT_NAMES.iter().position(|n| *n == name)
 }
 
+// ── battery ──────────────────────────────────────────────────────────────────
+//
+// There is no fuel gauge and no ADC. The only measurement available is what the servos
+// report as their own supply (`crate::bus::DynamixelIo::bus_voltage`), which is the pack
+// seen through the bus — so it sags under load and recovers when the robot stands still.
+// That is why the span below is *usable-under-load*, not the cell chemistry's range.
+
+/// Off a full charge, under load. NP-F550, 2S Li-ion.
+pub const BATTERY_FULL_V: f64 = 8.2;
+
+/// The sag floor: below this the robot starts struggling, well before the pack's own
+/// protection trips. Empty for our purposes, not empty for the cells'.
+pub const BATTERY_EMPTY_V: f64 = 6.6;
+
+/// Fraction of a pack, 0–100, for a bus voltage.
+///
+/// Linear, and the numbers come from `microduck_runtime`'s `check_battery`, where they were
+/// arrived at by running a duck flat. It lives here rather than in `robotd` so there is one
+/// mapping: the prototype had it in a CLI *and* re-derived in the app, which is how two
+/// screens end up disagreeing about the same pack.
+///
+/// A non-finite or non-positive reading is 0 — those mean "no answer from the bus", and the
+/// caller is expected to report that as unknown rather than to display this number.
+pub fn battery_percent(volts: f64) -> f64 {
+    if !volts.is_finite() || volts <= 0.0 {
+        return 0.0;
+    }
+    ((volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)).clamp(0.0, 1.0) * 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +156,33 @@ mod tests {
     fn mouth_index_names_the_mouth() {
         assert_eq!(JOINT_NAMES[MOUTH_INDEX], "mouth");
         assert_eq!(joint_index("mouth"), Some(MOUTH_INDEX));
+    }
+
+    /// The ends of the span and the middle of it. Getting the direction wrong here would
+    /// report a full pack as flat, which is the kind of thing nobody double-checks.
+    #[test]
+    fn battery_percent_spans_the_usable_range() {
+        assert_eq!(battery_percent(BATTERY_FULL_V), 100.0);
+        assert_eq!(battery_percent(BATTERY_EMPTY_V), 0.0);
+        assert!((battery_percent(7.4) - 50.0).abs() < 0.001);
+    }
+
+    /// Voltages outside the span are ordinary — a fresh pack reads over 8.2 V off the
+    /// charger, and a robot being run into the ground reads under 6.6 V. Neither may
+    /// produce a percentage outside 0–100 for a caller to display.
+    #[test]
+    fn battery_percent_clamps_rather_than_extrapolating() {
+        assert_eq!(battery_percent(9.5), 100.0);
+        assert_eq!(battery_percent(5.0), 0.0);
+    }
+
+    /// A bus that did not answer arrives here as 0.0, and NaN is what a mean over an empty
+    /// set produces. Both must be 0 rather than a wild number a caller might print.
+    #[test]
+    fn battery_percent_treats_no_reading_as_zero() {
+        assert_eq!(battery_percent(0.0), 0.0);
+        assert_eq!(battery_percent(f64::NAN), 0.0);
+        assert_eq!(battery_percent(-1.0), 0.0);
     }
 
     /// The legs are mirrored: the roll/pitch/ankle pairs are equal and opposite. A sign

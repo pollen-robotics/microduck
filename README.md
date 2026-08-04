@@ -25,7 +25,7 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-301 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+350 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
 The fastest way to actually *see* the update engine work is the playground, which drives
 the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
@@ -89,9 +89,38 @@ docs/           architecture · update design · robotd design · roadmap · CI 
 
 Everything below assumes a **dev board**, never a customer robot.
 
-What is running, and what is installed — these are different questions, because `updaterd`
-never restarts itself during an update and so legitimately lags the installed release until
-the next reboot:
+The state of the robot, hardware and software, in one answer — control loop, motor bus, IMU,
+battery, servo and board temperatures, then what is running, what is installed, what is
+pinned and how the last update went:
+
+```bash
+robotctl health
+```
+
+```
+robot     healthy
+  loop      50.1 of 50.0 Hz · 2834 ticks · 0 missed · last 13 ms ago
+  bus       ok
+  imu       ready
+  battery   7.62 V (64%)
+  motors    41 °C max (left_knee) · 36 °C mean
+  cpu       52 °C
+
+software
+  updaterd  0.1.4 (rev abc1234)
+  robotd    0.1.5 (rev def5678)
+  daemon    0.1.5 installed
+            last update 0.1.4 → 0.1.5: applied
+```
+
+It exits non-zero when the robot is unhealthy or unreachable, so it can gate a script.
+Nothing else there affects the exit code: a flat pack, a hot motor and a pinned component are
+reported, not judged — a release must never be rolled back for the state of the board it
+landed on.
+
+`version` is the software half on its own, for when that is all you want. What is running and
+what is installed are different questions, because `updaterd` never restarts itself during an
+update and so legitimately lags the installed release until the next reboot:
 
 ```bash
 robotctl version
@@ -131,6 +160,17 @@ The update history is separate from the journal on purpose — `fsync`ed per ent
 ```bash
 robotctl update log
 ```
+
+`install.sh` sets up tab-completion for `robotctl` in `/etc/bash_completion.d/`, as a loader
+that asks the binary for its own completions — so they follow the installed release instead
+of going stale when an update adds a command. For a shell it did not cover, or for a build
+you are running straight out of `target/`:
+
+```bash
+eval "$(robotctl completions bash)"
+```
+
+`zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
 
 Provisioning a board from scratch, and the log-retention caveats on Armbian, are in
 [`deploy/README.md`](deploy/README.md).

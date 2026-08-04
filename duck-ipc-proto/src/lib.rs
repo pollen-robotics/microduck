@@ -801,7 +801,13 @@ pub struct SafeToRestartResult {
 ///
 /// A robot that is up but *not* healthy must say so rather than fail to answer: the
 /// difference decides whether an update rolls back for a known reason or for a timeout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: the battery reading is a float. Nothing compares these for exact equality
+// outside tests, where `PartialEq` is what `assert_eq!` needs anyway.
+//
+// `Default` is "nothing known": not healthy, nothing measured. That is the honest starting
+// point — and it means the next reported field added here does not break every caller that
+// builds one.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct HealthResult {
     pub healthy: bool,
     /// Set when the reason is a property of the *board*, not of the running release.
@@ -819,6 +825,115 @@ pub struct HealthResult {
     pub degraded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Motor-bus voltage, when it has been read.
+    ///
+    /// **Reported, never judged.** Nothing here may influence `healthy` or `degraded`: a flat
+    /// pack is a fact about the robot, and a release rolled back over one would be replaced by
+    /// a release judged on the same flat pack — so the robot could not be updated at all until
+    /// someone charged it. It rides on this method because this is the one a human already
+    /// asks (`robotctl health`), not because the gate has any use for it.
+    ///
+    /// Absent means *not known yet* — the first second after startup, a bus that cannot
+    /// answer, or an older `robotd`. Absent is not zero volts, and a client must not render
+    /// it as an empty battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<Battery>,
+    /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
+    /// never judged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motors: Option<MotorThermal>,
+    /// Board temperature in °C — the hottest of the SoC's thermal zones.
+    ///
+    /// Distinct from [`Self::motors`], and the pair is the point: a robot that has been walking
+    /// has hot *servos*, while a board in a warm enclosure with a blocked vent has a hot *SoC*
+    /// and cool motors. They fail differently and are fixed differently, and one number cannot
+    /// stand for both.
+    ///
+    /// Absent off Linux, and on a kernel without thermal sysfs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_temp_c: Option<f64>,
+    /// The control loop's own numbers — the ones `healthy` was decided from.
+    ///
+    /// Carried so a verdict can be *checked* rather than taken on faith. "unhealthy: control
+    /// loop at 43.9 Hz" is a better bug report when the reader can also see that the loop has
+    /// ticked two million times and missed none of its deadlines, which says late wakeups
+    /// rather than overrunning work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_loop: Option<LoopHealth>,
+    /// What the motor bus is doing. Present on every answer; the zero values are meaningful
+    /// ("no failures"), not missing data.
+    #[serde(default)]
+    pub bus: BusHealth,
+    /// Orientation source. Absent from an older `robotd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<ImuHealth>,
+}
+
+/// The control loop's rate and timing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoopHealth {
+    /// What the loop is configured to run at, so the achieved figure means something without
+    /// the reader having the params file open.
+    pub target_hz: f64,
+    /// Achieved rate over the last window. `None` until the first window closes — which is
+    /// *unknown*, not zero: a rate of 0 Hz describes a stopped loop, and printing that for
+    /// the first second of every robot's uptime would be a lie.
+    pub achieved_hz: Option<f64>,
+    pub ticks: u64,
+    /// Ticks whose work overran the period, cumulative. Distinct from a rate shortfall: this
+    /// is the loop doing too much, a low rate is the loop being woken late, and telling them
+    /// apart is the difference between optimising and fixing a timer.
+    pub missed: u64,
+    /// Age of the last completed tick. Large means wedged.
+    pub last_tick_age_ms: u64,
+}
+
+/// The motor bus, as the loop sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BusHealth {
+    /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
+    /// which is why the cumulative count is not what is reported.
+    pub consecutive_errors: u32,
+    /// Failed attempts to bring the bus up at all. Non-zero means the loop has never
+    /// commanded anything and is still waiting for a robot to answer — the signature of
+    /// servo power being off.
+    pub startup_failures: u32,
+}
+
+/// The IMU board, which rides the motor bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImuHealth {
+    /// Has the orientation filter converged?
+    pub ready: bool,
+    /// Reads that returned the previous sample unchanged. Non-zero means the board is
+    /// answering without refreshing: the reads succeed, nothing reports an error, and the
+    /// orientation is frozen.
+    pub stale_blocks: u64,
+}
+
+/// Servo case temperature, reduced to the part worth acting on.
+///
+/// The hottest joint rather than a mean over fifteen: a knee holding a squat runs far hotter
+/// than the mouth, and averaging hides the one servo approaching the overheat shutdown its
+/// error mask latches on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MotorThermal {
+    /// Name of the hottest joint, as `duck_control::model::JOINT_NAMES` spells it.
+    pub hottest: String,
+    pub max_c: f64,
+    pub mean_c: f64,
+}
+
+/// Motor-bus voltage, and what fraction of a pack that is.
+///
+/// Both, deliberately. Volts is the measurement; percent is a *mapping* over a pack the
+/// robot knows and a client should not have to (`duck_control::model::battery_percent`).
+/// The prototype shipped volts only, and the mapping was duplicated into the app — which is
+/// how two screens end up disagreeing about the same battery.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Battery {
+    pub volts: f64,
+    pub percent: f64,
 }
 
 /// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].
@@ -1218,9 +1333,8 @@ mod tests {
     #[test]
     fn robot_results_round_trip() {
         let healthy = HealthResult {
-            degraded: false,
             healthy: true,
-            reason: None,
+            ..Default::default()
         };
         let line = serde_json::to_string(&healthy).unwrap();
         assert!(!line.contains("reason"), "{line}");
@@ -1230,9 +1344,8 @@ mod tests {
         );
 
         let sick = HealthResult {
-            degraded: false,
-            healthy: false,
             reason: Some("motors not responding".into()),
+            ..Default::default()
         };
         let line = serde_json::to_string(&sick).unwrap();
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), sick);
@@ -1302,19 +1415,49 @@ mod tests {
     fn degraded_is_omitted_when_false_and_present_when_true() {
         let plain = HealthResult {
             healthy: true,
-            degraded: false,
-            reason: None,
+            ..Default::default()
         };
         assert!(!serde_json::to_string(&plain).unwrap().contains("degraded"));
 
         let bench = HealthResult {
-            healthy: false,
             degraded: true,
             reason: Some("no answer from the motor bus".into()),
+            ..Default::default()
         };
         let line = serde_json::to_string(&bench).unwrap();
         assert!(line.contains(r#""degraded":true"#), "{line}");
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), bench);
+    }
+
+    /// An absent battery must stay absent, not become zero volts.
+    ///
+    /// This is the answer for the first second after startup, for a bus that cannot reply,
+    /// and for an older `robotd` that has never heard of the field. A `0.0` default would
+    /// make every one of those render as a flat pack — alarming, and wrong.
+    #[test]
+    fn a_missing_battery_is_unknown_not_empty() {
+        let answer: HealthResult = serde_json::from_str(r#"{"healthy":true}"#).unwrap();
+        assert!(answer.battery.is_none());
+
+        let unread = HealthResult {
+            healthy: true,
+            ..Default::default()
+        };
+        assert!(!serde_json::to_string(&unread).unwrap().contains("battery"));
+
+        let measured = HealthResult {
+            battery: Some(Battery {
+                volts: 7.62,
+                percent: 63.75,
+            }),
+            ..unread
+        };
+        let line = serde_json::to_string(&measured).unwrap();
+        assert!(line.contains(r#""volts":7.62"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<HealthResult>(&line).unwrap(),
+            measured
+        );
     }
 
     /// A local build must say so, rather than looking like a release whose revision was

@@ -108,6 +108,36 @@ impl Robotd {
         }
         panic!("robotd never became healthy; last answer was {last:?}");
     }
+
+    /// One `robot.health` answer, as raw JSON over the socket.
+    ///
+    /// Raw rather than through `SocketRobotClient`, whose `health()` collapses the answer to
+    /// the three-way verdict the engine needs and drops everything else — including the
+    /// battery this exists to look at. These are the bytes `robotctl health` sends.
+    async fn health(&self) -> updater::proto::HealthResult {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::UnixStream::connect(&self.socket).await.unwrap();
+        let request = format!(
+            "{}\n",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": updater::proto::method::ROBOT_HEALTH,
+                "params": {},
+            })
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+
+        let response: updater::proto::Response = serde_json::from_str(line.trim()).unwrap();
+        assert!(response.error.is_none(), "{:?}", response.error);
+        serde_json::from_value(response.result.expect("result")).expect("HealthResult shape")
+    }
 }
 
 impl Drop for Robotd {
@@ -250,6 +280,41 @@ async fn real_robotd_answers_every_method_the_engine_calls() {
     assert!(
         !client.remote_session_active(t).await,
         "no session should be active on a fresh robotd"
+    );
+}
+
+/// The battery reaches the wire, mapped, from a real process.
+///
+/// The only test that covers the whole chain: the loop calling `RobotIo::bus_voltage`, the
+/// EMA, the published atomic, the volts→percent mapping, and the JSON. Unit tests write the
+/// atomic directly and would all still pass if the sampler were never called at all — which
+/// is precisely the bug worth catching, because on a board it looks like a flat battery.
+#[tokio::test]
+async fn real_robotd_reports_a_mapped_battery() {
+    let fx = Fixture::new();
+    let robotd = Robotd::spawn(fx.socket(), &[]).await;
+    robotd.wait_until_healthy().await;
+
+    // Sampled once per rate window, so the first reading lands about a second after the loop
+    // starts. Absent before that is correct, not a failure.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut health = robotd.health().await;
+    while health.battery.is_none() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        health = robotd.health().await;
+    }
+
+    let battery = health
+        .battery
+        .expect("battery must be sampled within a few seconds of the loop starting");
+    // `FakeIo` reports 7.4 V, which is the middle of the 6.6–8.2 V span.
+    assert!(
+        (battery.volts - 7.4).abs() < 0.01,
+        "expected the fake bus voltage, got {battery:?}"
+    );
+    assert!(
+        (battery.percent - 50.0).abs() < 1.0,
+        "percent must be mapped from volts, got {battery:?}"
     );
 }
 

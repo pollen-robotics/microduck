@@ -27,13 +27,18 @@ port = "/dev/ttyS2"
 # given rate, and the loop's own five-minute summary reports the same from inside robotd.
 hz = 50
 
-[health]
-# What `robot.health` means, and therefore what the update system rolls back on.
+[update_gate]
+# What decides `healthy`, and therefore what the update system rolls back on.
 #
 # This is the whole point of the daemon in its current form: the updater's auto-rollback is
-# only meaningful if health is a real measurement. A loop running at 60% of target is
+# only meaningful if that verdict is a real measurement. A loop running at 60% of target is
 # alive, answers every request, and is badly broken — these three thresholds are what
-# distinguish that from a healthy robot.
+# distinguish that from a working robot.
+#
+# Named `update_gate` rather than `health` because `robot.health` reports much more than
+# this: battery, motor temperature, loop and bus counters. None of those may reach a verdict
+# — a release must never be rolled back for the state of the board it landed on — so none of
+# them is configured here.
 
 # Achieved rate floor. Below this, unhealthy. 45 is 90% of the default 50 Hz: loose enough
 # not to trip on one slow tick, tight enough that a loop dropping every tenth cycle is not

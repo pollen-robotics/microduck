@@ -23,7 +23,7 @@ pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 pub struct Params {
     pub bus: Bus,
     pub control: Control,
-    pub health: Health,
+    pub update_gate: UpdateGate,
     pub policy: PolicyParams,
     pub safety: SafetyParams,
 }
@@ -115,9 +115,24 @@ pub struct Control {
     pub hz: u32,
 }
 
+/// Thresholds that decide `healthy` — and therefore whether an update is kept.
+///
+/// **Not** the thresholds for everything `robot.health` reports. That answer also describes the
+/// battery, the motor temperatures and the loop counters, and none of those may reach a verdict
+/// (`docs/robotd-design.md` §4.5) — so none of them has a setting here. Naming this section
+/// `[health]` invited exactly that mistake: it reads like "how the robot is doing", when what it
+/// configures is the one question auto-rollback turns on.
+///
+/// Everything here is a property of the *software*. A future `[thermal]` section for a motor
+/// temperature that should throttle the robot would be a different thing, and belongs under a
+/// different name.
+///
+/// The section was called `[health]`. Renamed outright rather than aliased: a board carrying
+/// the old name gets a parse error naming the section, which is a better outcome than a robot
+/// quietly running on default thresholds nobody chose.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct Health {
+pub struct UpdateGate {
     /// Below this achieved rate the robot reports unhealthy, which is what makes the
     /// updater's auto-rollback mean something. A loop running at 60% of target is alive,
     /// answers every request, and is badly broken.
@@ -149,7 +164,7 @@ impl Default for Control {
     }
 }
 
-impl Default for Health {
+impl Default for UpdateGate {
     fn default() -> Self {
         Self {
             // 90% of the default rate. Generous enough not to trip on a slow tick, tight
@@ -263,7 +278,7 @@ mod tests {
         let p = Params::load(&path, true).unwrap();
         assert_eq!(p.bus.port, "/dev/ttyUSB0");
         assert_eq!(p.control.hz, 50);
-        assert_eq!(p.health.stall_periods, 25);
+        assert_eq!(p.update_gate.stall_periods, 25);
     }
 
     /// The shipped example must agree with the built-in defaults, or the file documents a
@@ -278,25 +293,39 @@ mod tests {
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(
-            from_file.health.min_achieved_hz,
-            built_in.health.min_achieved_hz
+            from_file.update_gate.min_achieved_hz,
+            built_in.update_gate.min_achieved_hz
         );
         assert_eq!(
-            from_file.health.stall_periods,
-            built_in.health.stall_periods
+            from_file.update_gate.stall_periods,
+            built_in.update_gate.stall_periods
         );
         assert_eq!(
-            from_file.health.max_consecutive_errors,
-            built_in.health.max_consecutive_errors
+            from_file.update_gate.max_consecutive_errors,
+            built_in.update_gate.max_consecutive_errors
         );
     }
 
     /// A typo in a key must fail loudly. Silently ignoring `min_acheived_hz` would leave
-    /// the health gate at a threshold the operator believes they changed.
+    /// the update gate at a threshold the operator believes they changed.
     #[test]
     fn an_unknown_key_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write(dir.path(), "[health]\nmin_acheived_hz = 10.0\n");
+        let path = write(dir.path(), "[update_gate]\nmin_acheived_hz = 10.0\n");
+        assert!(Params::load(&path, true).is_err());
+    }
+
+    /// The old section name must be *rejected*, not silently ignored.
+    ///
+    /// A board still carrying `[health]` gets a `robotd` that refuses to start and says why,
+    /// which is the honest outcome: `deny_unknown_fields` means the operator hears about the
+    /// file rather than running on defaults they did not choose while believing otherwise.
+    /// `install.sh` never overwrites `robotd.toml`, so the fix is to edit the section name —
+    /// and the parse error names it.
+    #[test]
+    fn the_old_health_section_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[health]\nmin_achieved_hz = 40.0\n");
         assert!(Params::load(&path, true).is_err());
     }
 

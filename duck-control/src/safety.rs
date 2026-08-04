@@ -120,6 +120,24 @@ impl<T: RobotIo> Safety<T> {
         self.io.read()
     }
 
+    /// Bus reads that are not part of the tick, passed through rather than exposing the IO.
+    ///
+    /// Safety owns the only `RobotIo` handle — that is what makes "nothing commands a motor
+    /// except through here" a fact the borrow checker enforces rather than a convention. Slow
+    /// sensors and IMU diagnostics read rather than write, so they are no threat to that, but
+    /// handing out the handle to reach them would be.
+    pub fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors, IoError> {
+        self.io.slow_sensors()
+    }
+
+    pub fn imu_stale_blocks(&self) -> u64 {
+        self.io.imu_stale_blocks()
+    }
+
+    pub fn imu_ready(&self) -> bool {
+        self.io.imu_ready()
+    }
+
     pub fn fallen(&self) -> bool {
         self.fallen
     }
