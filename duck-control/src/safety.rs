@@ -148,6 +148,26 @@ impl<T: RobotIo> Safety<T> {
     /// fallen, and one upright sample clears the accumulator. Without the debounce, the
     /// impulse from a firm footfall reads as a fall.
     pub fn observe(&mut self, sensors: &Sensors, dt: Duration) {
+        // An orientation filter that has not converged does not get a vote.
+        //
+        // The SFLP filter needs a few seconds of samples before its quaternion means
+        // anything, and until then projected gravity is not `[0, 0, -1]` — it is whatever the
+        // filter is mid-way through deciding, which reads as "above the fall threshold", which
+        // reads as "on its side". Two hundred milliseconds of that and an upright robot on a
+        // bench latches `fallen` at startup: `apply` writes `gain_limp`, the policy is refused
+        // with "the robot is down; stand it up first", and it clears itself a few seconds
+        // later leaving the gain behind at 50 with nothing to explain it.
+        //
+        // Observed on a board: a joint set to 137 by hand read back 50 after five seconds of
+        // robotd, while `robotctl monitor` — sampled later, after convergence — reported `ok`.
+        //
+        // Holding the previous verdict is the safe default in both directions. At startup that
+        // is "not fallen", which is what the robot standing on the bench actually is; and a
+        // filter that stops being ready mid-run leaves a fallen robot fallen.
+        if !self.io.imu_ready() {
+            return;
+        }
+
         let down = sensors.imu.gravity[2] > self.config.fall_gravity_z;
         if down {
             self.falling_for = self.falling_for.saturating_add(dt);
@@ -289,6 +309,54 @@ mod tests {
 
     /// Falling must drop the gain, not merely stop commanding. Refusing to command only
     /// freezes the robot in the pose it fell in; going soft lets it yield.
+    /// **The regression.** An orientation filter that has not converged must not be able to
+    /// declare a robot fallen.
+    ///
+    /// On a board this cost an afternoon: an upright robot latched `fallen` within 200 ms of
+    /// startup, `apply` wrote `gain_limp`, `padd` was refused with "the robot is down; stand
+    /// it up first", and a few seconds later it cleared itself — leaving the servos at kP 50
+    /// with `robotctl monitor` reporting `ok`, because the gain is only written when it
+    /// changes. Nothing in the observable state explained it.
+    #[test]
+    fn an_unconverged_imu_cannot_declare_a_fall() {
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        io.imu_ready = false;
+        let mut safety = Safety::new(io, SafetyConfig::default());
+
+        // Gravity well above the threshold — what an unconverged filter reports, and what
+        // a robot on its side reports. The difference is only whether the filter is ready.
+        let mut sensors = Sensors::default();
+        sensors.imu.gravity = [0.0, 0.0, 0.0];
+
+        for _ in 0..50 {
+            safety.observe(&sensors, Duration::from_millis(20));
+        }
+        assert!(
+            !safety.fallen(),
+            "a robot was called fallen on an orientation filter that had not converged"
+        );
+    }
+
+    /// And once it has converged, the same sample must be believed — otherwise the guard
+    /// above would simply disable fall detection.
+    #[test]
+    fn a_converged_imu_still_detects_a_fall() {
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        io.imu_ready = true;
+        let mut safety = Safety::new(io, SafetyConfig::default());
+
+        let mut sensors = Sensors::default();
+        sensors.imu.gravity = [0.0, 0.0, 0.0];
+
+        for _ in 0..50 {
+            safety.observe(&sensors, Duration::from_millis(20));
+        }
+        assert!(
+            safety.fallen(),
+            "a converged filter must still report a fall"
+        );
+    }
+
     #[test]
     fn falling_goes_limp_rather_than_freezing() {
         let mut s = safety();

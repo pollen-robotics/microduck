@@ -145,6 +145,9 @@ pub struct FakeIo {
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
     pub last_gain: Option<u16>,
+    /// Whether the orientation filter reports converged. False models the first seconds after
+    /// startup, when projected gravity is not yet a measurement.
+    pub imu_ready: bool,
     /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
     /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
     /// fails the read, which is what a robot with no bus does.
@@ -169,6 +172,7 @@ impl FakeIo {
             reads: 0,
             writes: 0,
             last_gain: None,
+            imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
@@ -233,6 +237,10 @@ impl RobotIo for FakeIo {
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         self.last_gain = Some(kp);
         Ok(())
+    }
+
+    fn imu_ready(&self) -> bool {
+        self.imu_ready
     }
 
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
