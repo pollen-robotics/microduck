@@ -25,46 +25,17 @@ the robot is aarch64 Linux.
 cargo test --workspace
 ```
 
-350 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
+352 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
-To actually *see* the update engine work, drive the real `updaterd` and `robotctl` against
-signed releases in a temp directory — real signatures, real atomic swaps, real rollback, no
-robot and no network. First mint the releases, which is the one thing neither binary does:
+Those tests are also where the engine's failure paths are: a bad signature, a release that
+comes up unhealthy, a post-install hook that fails, power loss between the swap and the
+health gate. Each drives the real engine with the fault injected rather than a mock of it, so
+`updater/tests/apply.rs` is the honest answer to "what does this actually guarantee" — more
+so than anything you could run by hand here.
 
-```bash
-cargo run -p test-support --example fake-release -- /tmp/pg 1.0.0 1.1.0
-```
-
-Offer 1.0.0 and install it, the way a bare board gets its first release:
-
-```bash
-cp /tmp/pg/r/1.0.0/* /tmp/pg/published/
-```
-```bash
-cargo run -p updater --bin updaterd -- --config /tmp/pg/updater.toml install --from /tmp/pg/published
-```
-
-Then break it on purpose, which is the interesting half. Offer 1.1.0 and start the daemon
-with the health gate rigged to fail, so the release installs and then gets reverted under
-you:
-
-```bash
-cp /tmp/pg/r/1.1.0/* /tmp/pg/published/
-```
-```bash
-cargo run -p updater --bin updaterd -- --config /tmp/pg/updater.toml --socket /tmp/pg/d.sock --inject-fault fail_health
-```
-
-That one keeps running, so ask for the update from a second terminal:
-
-```bash
-cargo run -p robotctl -- --socket /tmp/pg/d.sock update apply daemon
-```
-
-It reports `rolled_back`, and `/tmp/pg/opt/daemon/current` still points at 1.0.0.
-`--inject-fault abort_after_swap` is the harsher version — power loss with the swap already
-done. Run `updaterd --config /tmp/pg/updater.toml --check-only` twice afterwards, which is
-what two boots do, and watch the boot counter undo a release that never confirmed healthy.
+Using the updater for real needs a board. Provisioning one from nothing is two commands, in
+[`deploy/README.md`](deploy/README.md). Everything you do to it afterwards is
+[Working on the robot](#working-on-the-robot) below.
 
 ## The services
 
@@ -291,6 +262,39 @@ And refusing to move:
 sudo robotctl update pin daemon 0.1.4    # accept nothing else
 sudo robotctl update pin daemon          # unpin
 ```
+
+Installing with no network at all — a factory or offline install, or sideloading a build you
+carried in on a stick. This one is `updaterd` rather than `robotctl`, because it is also the
+path a board takes *before* there is a daemon to ask, and `updaterd` is deliberately not on
+`PATH`:
+
+```bash
+sudo /opt/robot/daemon/current/bin/updaterd install --from /media/usb/release
+```
+
+The directory holds what a release is: `<version>.manifest.json`, its `.minisig`, the artifact
+and the artifact's `.minisig`. Signatures, hashes and compatibility are checked exactly as they
+are for a download — `--from` changes where the bytes come from, not what is trusted.
+
+That command refuses to run once a release is live, because it forces `on_apply` and the
+health gate off, and doing that to a working robot would silently disable auto-rollback. One
+situation needs it anyway, and `robotctl update apply` cannot help with it — a board whose
+installed `updaterd` is too old to accept the release that *fixes* being too old. It rolls the
+new release back every time, and the binary running that gate is the one being replaced. Stop
+the robot and say so explicitly:
+
+```bash
+sudo systemctl stop robotd
+```
+
+```bash
+sudo /opt/robot/daemon/current/bin/updaterd install --from /media/usb/release --force
+```
+
+`--force` is itself refused while `robotd` is still answering, since the objection is about a
+*working* robot losing its safety net. It gives up auto-rollback for that one install and
+nothing else — signatures, hashes and compatibility are still checked, and
+`sudo robotctl update rollback daemon` is the recovery path if the release misbehaves.
 
 Three things that are easy to get wrong.
 
