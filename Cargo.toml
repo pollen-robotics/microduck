@@ -6,6 +6,17 @@
 resolver = "3"
 members = ["duck-control", "duck-ipc-proto", "padd", "updater", "robotctl", "robotd", "test-support", "xtask"]
 
+# ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
+# bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
+# agrees with them. Two copies drifting apart is exactly how a board ended up with 1.20.1
+# against an `ort` that panics below 1.23.
+#
+# `floor` is the minimum `ort` accepts — raise it in step with the `ort` dependency.
+# `target` is what we install when a board is below the floor.
+[workspace.metadata.onnxruntime]
+floor  = "1.23"
+target = "1.28.0"
+
 [workspace.package]
 version = "0.1.4"
 edition = "2024"

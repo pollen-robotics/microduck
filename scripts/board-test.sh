@@ -217,6 +217,14 @@ chmod +x /stub/curl /stub/find /stub/systemctl
 touch /usr/local/lib/libonnxruntime.so.9.9.9
 ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
 
+# A BlueZ config with [General] but no Privacy key — the insert-after-[General] branch, which
+# is the one a stock Armbian image takes.
+mkdir -p /etc/bluetooth
+cat > /etc/bluetooth/main.conf <<"BTCONF"
+[General]
+Name = radxa
+BTCONF
+
 # The wrong overlay prefix and a console on the motor UART: what Armbian actually ships.
 cat > /boot/armbianEnv.txt <<"ENV"
 overlay_prefix=rk35xx
@@ -248,6 +256,60 @@ grep -q "^overlay_prefix=rk3568$" /boot/armbianEnv.txt
 grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
+
+# The gamepad settings, which are the kind that fail silently: a pad that pairs and drops, or
+# a padd that reads nothing because the user is not in `input`.
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+echo "    [ok] setup-board sets Privacy = device for gamepad pairing"
+
+# Idempotent too: the second run above must not have added a duplicate key, which BlueZ
+# would read as a conflicting setting.
+test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
+echo "    [ok] Privacy is set exactly once"
+
+# ── the generated preinstall hook ──
+#
+# The hook that asserts a board can run the release being installed. Exercised here because
+# the alternative is discovering on a robot that it rejects every update, and because the
+# whole point of moving this check into a hook was to stop relying on someone remembering to
+# re-run a script.
+#
+# Rendered from the template the way xtask does, so this covers the shipped shape rather than
+# a hand-written approximation.
+sed -e "s/@ONNX_FLOOR@/1.23/" -e "s/@ONNX_TARGET@/1.28.0/" \
+    /bin/hooks/preinstall.in > /tmp/preinstall
+chmod +x /tmp/preinstall
+if grep -q "@ONNX_" /tmp/preinstall; then
+    echo "    [FAIL] placeholders left in the rendered hook"
+    exit 1
+fi
+
+# Satisfied: a runtime at or above the floor must pass, touching nothing.
+rm -f /usr/local/lib/libonnxruntime.so*
+touch /usr/local/lib/libonnxruntime.so.1.28.0
+ln -sf libonnxruntime.so.1.28.0 /usr/local/lib/libonnxruntime.so
+PATH="/stub:$PATH" /tmp/preinstall > /tmp/hook1.log 2>&1
+grep -q "satisfies" /tmp/hook1.log
+echo "    [ok] preinstall accepts a runtime at the floor"
+
+# Too old, and unfixable: curl fails, so the hook must exit non-zero *before* the swap rather
+# than let a release install that cannot load a policy. This is the case that used to reach a
+# board and panic robotd control thread.
+mkdir -p /stubfail
+cat > /stubfail/curl <<"STUB"
+#!/bin/sh
+exit 22
+STUB
+chmod +x /stubfail/curl
+rm -f /usr/local/lib/libonnxruntime.so*
+touch /usr/local/lib/libonnxruntime.so.1.20.1
+ln -sf libonnxruntime.so.1.20.1 /usr/local/lib/libonnxruntime.so
+code=0
+PATH="/stubfail:$PATH" /tmp/preinstall > /tmp/hook2.log 2>&1 || code=$?
+test "$code" -ne 0 || { echo "    [FAIL] hook passed an unusable runtime"; exit 1; }
+grep -q "1.20.1 is below 1.23" /tmp/hook2.log
+grep -q "cannot download ONNX Runtime" /tmp/hook2.log
+echo "    [ok] preinstall refuses an old runtime it cannot replace, naming the fix"
 '
 
 for image in $IMAGES; do
@@ -256,6 +318,7 @@ for image in $IMAGES; do
     docker run --rm --platform linux/arm64 \
         -v "$PWD/$TARGET_DIR:/bin/robot:ro" \
         -v "$PWD/scripts:/bin/scripts:ro" \
+        -v "$PWD/hooks:/bin/hooks:ro" \
         "$image" sh -c "$CHECKS"
 done
 

@@ -77,7 +77,10 @@ jobs:
           # workspace member in an unspecified order, so the old form read whichever
           # sorted first and passed only because they all share one version today.
           version="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "updater"))')"
-          cargo run -p xtask -- package --version "$version" --bin-dir /tmp/bin --out /tmp/dist
+          # --zstd-level 1: this artifact is asserted on and thrown away, never downloaded.
+          # The default 19 on unstripped debug binaries took ~400s — most of this job — to
+          # save bytes nothing reads. Every other code path is exercised unchanged.
+          cargo run -p xtask -- package --version "$version" --bin-dir /tmp/bin --out /tmp/dist --zstd-level 1
           test -f /tmp/dist/manifest.json
           test -f "/tmp/dist/${version}.manifest.json"
 

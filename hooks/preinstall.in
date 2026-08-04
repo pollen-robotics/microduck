@@ -1,0 +1,131 @@
+#!/bin/sh
+# Make sure this board can actually run the release being installed.
+#
+# TEMPLATE. `xtask package` substitutes @ONNX_FLOOR@ and @ONNX_TARGET@ from
+# [workspace.metadata.onnxruntime] in Cargo.toml and ships the result as `hooks/preinstall`.
+# Edit this file, never the generated one — and there is no copy of the version to keep in
+# step, because the hook is built from the same constant the release is.
+#
+# Runs after the artifact is downloaded, verified and extracted, but *before* the swap. That
+# placement is the whole value: failing here aborts the update with the old release still
+# live, no rollback, and no boot-counter churn. Compare the alternative, which is what
+# actually happened on a board — full download, swap, restart, a 30s health gate, a rollback,
+# and `control loop has not completed a cycle yet` as the only explanation.
+#
+# The environment is cleared by the updater apart from PATH and the hook context, so there is
+# no token here. That is fine: ONNX Runtime comes from microsoft/onnxruntime, which is public.
+set -eu
+
+ONNX_FLOOR="@ONNX_FLOOR@"
+ONNX_TARGET="@ONNX_TARGET@"
+ONNX_LIB_DIR=/usr/local/lib
+
+# Below the updater's 120s ceiling on a hook, so a slow network produces our message naming
+# the fix rather than a bare "timed out after 120s".
+CURL_MAX_TIME=90
+
+say() { printf 'preinstall: %s\n' "$*"; }
+die() { printf 'preinstall: %s\n' "$*" >&2; exit 1; }
+
+# The version ONNX Runtime is installed at, or empty.
+#
+# The tarball lays down `libonnxruntime.so.<version>` with the bare name as a symlink, so the
+# resolved target names the version without running anything. Asking the library itself would
+# mean dlopening it, which is what we are trying to avoid doing unsafely.
+installed_onnx() {
+    resolved="$(readlink -f "${ONNX_LIB_DIR}/libonnxruntime.so" 2>/dev/null || true)"
+    case "$resolved" in
+        */libonnxruntime.so.*) printf '%s' "${resolved##*/libonnxruntime.so.}" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Is $1 at least $2, comparing major.minor numerically?
+#
+# Numeric rather than string: "1.9" sorts above "1.23" lexically, which would pass a board
+# that cannot run the release. Patch is ignored — `ort` cares about the API version, which
+# moves with the minor.
+at_least() {
+    [ -n "$1" ] || return 1
+
+    have_major="${1%%.*}"
+    have_rest="${1#*.}"
+    have_minor="${have_rest%%.*}"
+    want_major="${2%%.*}"
+    want_rest="${2#*.}"
+    want_minor="${want_rest%%.*}"
+
+    # Guard against a version that is not numeric at all, rather than letting `test` fail
+    # noisily on it.
+    case "${have_major}${have_minor}${want_major}${want_minor}" in
+        *[!0-9]*) return 1 ;;
+    esac
+
+    if [ "$have_major" -gt "$want_major" ]; then
+        return 0
+    elif [ "$have_major" -lt "$want_major" ]; then
+        return 1
+    elif [ "$have_minor" -ge "$want_minor" ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Install ONNX Runtime, replacing whatever is there.
+#
+# This writes to /usr/local/lib before the swap, so the change outlives an aborted update.
+# Deliberate and safe in this direction: `ort` asks the dylib for *at least* its
+# ORT_API_VERSION and ONNX Runtime keeps the C API backward compatible, so the release we are
+# about to abandon still works against the newer runtime.
+install_onnx() {
+    url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_TARGET}/onnxruntime-linux-aarch64-${ONNX_TARGET}.tgz"
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expand $tmp now, deliberately
+    trap "rm -rf '$tmp'" EXIT INT TERM
+
+    say "fetching ONNX Runtime ${ONNX_TARGET}"
+    curl -fsSL --max-time "$CURL_MAX_TIME" -o "${tmp}/ort.tgz" "$url" \
+        || die "cannot download ONNX Runtime ${ONNX_TARGET} from ${url}
+  This board needs it to run a policy, and this release cannot start without one. With
+  network access, re-running the update will retry. Otherwise install it by hand, or run
+  scripts/setup-board.sh."
+
+    tar -xzf "${tmp}/ort.tgz" -C "$tmp" || die "cannot unpack ONNX Runtime"
+
+    found="$(find "$tmp" -name 'libonnxruntime.so.*' -type f | head -1)"
+    [ -n "$found" ] || die "no libonnxruntime.so.* in the ONNX Runtime tarball"
+
+    install -m 0644 "$found" "${ONNX_LIB_DIR}/$(basename "$found")"
+    ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so"
+
+    # ldconfig lives in /usr/sbin, which a hook's minimal PATH does include — but check
+    # anyway, because a freshly copied library that dlopen cannot find is the same failure
+    # this hook exists to prevent.
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig
+    elif [ -x /usr/sbin/ldconfig ]; then
+        /usr/sbin/ldconfig
+    else
+        say "no ldconfig; robotd may need ORT_DYLIB_PATH=${ONNX_LIB_DIR}/libonnxruntime.so"
+    fi
+}
+
+have="$(installed_onnx)"
+
+if at_least "$have" "$ONNX_FLOOR"; then
+    say "ONNX Runtime ${have} satisfies >= ${ONNX_FLOOR}"
+    exit 0
+fi
+
+say "ONNX Runtime ${have:-absent} is below ${ONNX_FLOOR}, which this release requires"
+install_onnx
+
+# Verified rather than assumed: an install that reported success but left the symlink wrong
+# would otherwise be discovered by robotd's control thread panicking, which is the failure
+# mode this hook was written to remove.
+have="$(installed_onnx)"
+at_least "$have" "$ONNX_FLOOR" \
+    || die "installed ONNX Runtime ${have:-none}, still below ${ONNX_FLOOR}"
+
+say "ONNX Runtime now ${have}"
