@@ -20,5 +20,5 @@
 # on the target userland.
 
 [alias]
-# Release build for the board. Add `--bins`, `-p updater --example playground`, etc.
+# Release build for the board. Add `--bins`, `-p updater`, etc.
 board = "zigbuild --release --target aarch64-unknown-linux-gnu.2.31"

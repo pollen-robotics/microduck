@@ -90,7 +90,17 @@ impl Publisher {
 
     /// Corrupt a published artifact *after* signing: a tampered mirror or truncated transfer.
     pub fn tamper(&self, channel: &str, version: &str) {
-        let path = self.releases.join(format!("{channel}-{version}.tar.zst"));
+        self.tamper_in(&self.releases, channel, version);
+    }
+
+    /// [`Publisher::tamper`], for a release published into its own directory with
+    /// [`Release::dir`].
+    ///
+    /// Split out rather than duplicated at the call site: what "tampered" means has to be
+    /// the same thing everywhere, or a caller can invent a corruption the engine happens
+    /// not to catch and call it a passing test.
+    pub fn tamper_in(&self, dir: &Path, channel: &str, version: &str) {
+        let path = dir.join(format!("{channel}-{version}.tar.zst"));
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.push(0xff);
         std::fs::write(&path, bytes).unwrap();

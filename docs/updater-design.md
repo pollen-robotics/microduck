@@ -980,8 +980,8 @@ Three properties worth stating, because each is asserted rather than assumed:
   the same archive, so a rebuild can be compared against what shipped; a test asserts two
   packages of the same inputs hash identically.
 - **`release.yml` verifies before publishing.** It installs the release through the real
-  engine (`LocalDir` + `playground apply`) and asserts the binaries land executable. If
-  the updater cannot accept a release, nobody can download it.
+  engine (`updaterd install --from`, over a `LocalDir` source) and asserts the binaries land
+  executable. If the updater cannot accept a release, nobody can download it.
 
 Two guards exist because both mistakes are easy: `package` refuses a `--version` that
 doesn't match `Cargo.toml` (tagging without bumping), and `promote` refuses a version

@@ -27,35 +27,44 @@ cargo test --workspace
 
 350 tests, no hardware, no network, no Docker. If they pass, your checkout is sound.
 
-The fastest way to actually *see* the update engine work is the playground, which drives
-the real engine — real signatures, real atomic swaps, real rollback — against a fake remote
-in a temp directory, with no daemon and no robot:
+To actually *see* the update engine work, drive the real `updaterd` and `robotctl` against
+signed releases in a temp directory — real signatures, real atomic swaps, real rollback, no
+robot and no network. First mint the releases, which is the one thing neither binary does:
 
 ```bash
-cargo run -p updater --example playground -- init /tmp/pg
-```
-```bash
-cargo run -p updater --example playground -- publish /tmp/pg 1.0.0
-```
-```bash
-cargo run -p updater --example playground -- apply /tmp/pg
-```
-```bash
-cargo run -p updater --example playground -- status /tmp/pg
+cargo run -p test-support --example fake-release -- /tmp/pg 1.0.0 1.1.0
 ```
 
-Then break it on purpose, which is the interesting half — install a release that comes up
-unhealthy and watch it revert:
+Offer 1.0.0 and install it, the way a bare board gets its first release:
 
 ```bash
-cargo run -p updater --example playground -- publish /tmp/pg 1.1.0
+cp /tmp/pg/r/1.0.0/* /tmp/pg/published/
 ```
 ```bash
-cargo run -p updater --example playground -- apply /tmp/pg --unhealthy
+cargo run -p updater --bin updaterd -- --config /tmp/pg/updater.toml install --from /tmp/pg/published
 ```
 
-`--fault abort_after_swap` simulates power loss mid-update; run `recover` twice afterwards
-to watch the boot counter undo a release that never confirmed healthy.
+Then break it on purpose, which is the interesting half. Offer 1.1.0 and start the daemon
+with the health gate rigged to fail, so the release installs and then gets reverted under
+you:
+
+```bash
+cp /tmp/pg/r/1.1.0/* /tmp/pg/published/
+```
+```bash
+cargo run -p updater --bin updaterd -- --config /tmp/pg/updater.toml --socket /tmp/pg/d.sock --inject-fault fail_health
+```
+
+That one keeps running, so ask for the update from a second terminal:
+
+```bash
+cargo run -p robotctl -- --socket /tmp/pg/d.sock update apply daemon
+```
+
+It reports `rolled_back`, and `/tmp/pg/opt/daemon/current` still points at 1.0.0.
+`--inject-fault abort_after_swap` is the harsher version — power loss with the swap already
+done. Run `updaterd --config /tmp/pg/updater.toml --check-only` twice afterwards, which is
+what two boots do, and watch the boot counter undo a release that never confirmed healthy.
 
 ## The services
 

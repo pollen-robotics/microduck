@@ -2235,6 +2235,7 @@ dependencies = [
 name = "test-support"
 version = "0.1.4"
 dependencies = [
+ "clap",
  "minisign",
  "semver",
  "serde_json",

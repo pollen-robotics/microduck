@@ -16,3 +16,7 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 tempfile = "3.27.0"
 zstd = "0.13"
+
+# Only the `fake-release` example, which is a CLI and needs to parse like one.
+[dev-dependencies]
+clap.workspace = true

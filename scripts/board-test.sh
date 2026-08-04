@@ -49,6 +49,8 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
+FIXTURE=target/board-fixture
+
 echo "==> cross-compiling for aarch64-unknown-linux-gnu (glibc <= $GLIBC_FLOOR)"
 # pkg-config has to be told it is allowed to answer for another architecture, and where
 # that architecture's .pc files live. Without both, libudev-sys (via gilrs, via padd)
@@ -57,8 +59,19 @@ export PKG_CONFIG_ALLOW_CROSS="${PKG_CONFIG_ALLOW_CROSS:-1}"
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/usr/lib/aarch64-linux-gnu/pkgconfig}"
 
 cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" --bins
-cargo zigbuild --release --target "aarch64-unknown-linux-gnu.$GLIBC_FLOOR" \
-    -p updater --example playground
+
+# Releases for the engine to install, minted host-native: a release is signed manifests and
+# tarballs, which depend on the target architecture no more than the ones GitHub serves do.
+# Building this for aarch64 too would only mean a second cross-compile to produce identical
+# bytes.
+#
+# `--prefix` is the path *inside the container*, because that is where `updater.toml` is
+# read. Every version the checks need is minted in one run: one run is one signing key, and
+# releases signed by two different keys cannot sit in the same tree.
+echo "==> minting release fixtures"
+rm -rf "$FIXTURE"
+cargo run -q -p test-support --example fake-release -- "$FIXTURE" --prefix /tmp/duck \
+    1.0.0 1.1.0 1.2.0:tamper 2.0.0 3.0.0 | sed 's/^./    &/'
 
 echo
 echo "==> what we built"
@@ -79,73 +92,119 @@ fi
 # one word in $IMAGES.
 CHECKS='
 set -eu
-P=/bin/robot/examples/playground
+U=/bin/robot/updaterd
 R=/bin/robot/robotctl
+C=/tmp/duck/updater.toml
+S=/tmp/duck/d.sock
+LIVE=/tmp/duck/opt/daemon/current/version.toml
 
 echo "    $(uname -m), $(ldd --version 2>&1 | head -1)"
 
-# ── engine, driven directly ──
-$P init /tmp/duck >/dev/null
-$P publish /tmp/duck 1.0.0 >/dev/null
-$P apply /tmp/duck >/dev/null
-$P status /tmp/duck | grep -q "daemon: 1.0.0"
+# Everything below drives the binaries that ship, because the point of this script is the
+# binaries that ship. Nothing here is a test double except the releases themselves.
+
+# The fixture is mounted read-only; copy it so releases can be staged as the checks walk
+# forward through versions.
+cp -r /bin/fixture /tmp/duck
+
+# `local_dir` serves the newest version it can see, so what the daemon is *offered* is
+# decided by what has been copied in. Staging one release at a time is what makes each
+# check below unambiguous about which version it is applying.
+stage() { cp /tmp/duck/r/"$1"/* /tmp/duck/published/; }
+
+# A fresh daemon per fault configuration, so every assertion has exactly one reason it can
+# fail. Cheap: startup is a config parse, a recovery pass and a bind.
+start_daemon() {
+    RUST_LOG=info $U --config $C --socket $S "$@" >>/tmp/d.log 2>&1 &
+    DAEMON=$!
+    i=0
+    while [ ! -S $S ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
+    test -S $S
+}
+
+# `wait` as well as `kill`: the next step may run `updaterd` again, and two of them on one
+# state directory contend for the update lock.
+stop_daemon() {
+    kill $DAEMON 2>/dev/null || true
+    wait $DAEMON 2>/dev/null || true
+}
+
+# ── the first install, which is the path scripts/install.sh takes on a bare board ──
+stage 1.0.0
+RUST_LOG=info $U --config $C install --from /tmp/duck/published >/tmp/install.log 2>&1
+grep -q "version=1.0.0" $LIVE
 echo "    [ok] installed 1.0.0"
 
-# An unhealthy robot must revert, content and all.
-$P publish /tmp/duck 1.1.0 >/dev/null
-$P apply /tmp/duck --unhealthy 2>&1 | grep -q "ROLLED BACK"
-$P status /tmp/duck | grep -q "daemon: 1.0.0"
-echo "    [ok] unhealthy release rolled back"
-
-# A tampered artifact must be refused with nothing installed.
-$P publish /tmp/duck 1.2.0 --tamper >/dev/null
-$P apply /tmp/duck 2>&1 | grep -q "REFUSED (code 6)"
-echo "    [ok] tampered artifact refused"
-
-# Crash after the swap, then two boots: the boot counter must revert it.
-$P publish /tmp/duck 2.0.0 >/dev/null
-$P apply /tmp/duck --fault abort_after_swap >/dev/null 2>&1 || true
-$P recover /tmp/duck >/dev/null
-$P recover /tmp/duck 2>&1 | grep -q "ROLLED BACK"
-$P status /tmp/duck | grep -q "daemon: 1.0.0"
-echo "    [ok] crash after swap reverted by boot counter"
-
-# Piping must not panic: Rust ignores SIGPIPE, so `| head` used to abort.
-$P log /tmp/duck | head -1 >/dev/null
-echo "    [ok] output survives a closed pipe"
-
-# ── daemon + CLI over a real unix socket ──
-sed -i "s|health = .*|health = { probe = \"none\" }|" /tmp/duck/updater.toml
-RUST_LOG=info /bin/robot/updaterd \
-    --config /tmp/duck/updater.toml --socket /tmp/duck/d.sock >/tmp/d.log 2>&1 &
-DAEMON=$!
-i=0
-while [ ! -S /tmp/duck/d.sock ] && [ $i -lt 100 ]; do i=$((i+1)); sleep 0.1; done
-test -S /tmp/duck/d.sock
+# ── an unhealthy release must revert, content and all ──
+#
+# `fail_health` rather than a robot that answers "unhealthy": there is no robotd here, and a
+# socket probe with nothing to ask fails the gate on its timeout instead — which would roll
+# every release back and prove nothing about the gate.
+start_daemon --inject-fault fail_health
 
 # Group-restricted, not world-writable: anyone who can write here can update firmware.
-test "$(stat -c %A /tmp/duck/d.sock)" = "srw-rw----"
+test "$(stat -c %A $S)" = "srw-rw----"
 echo "    [ok] socket is srw-rw---- (0660)"
 
-$R --socket /tmp/duck/d.sock update status >/dev/null
-$P publish /tmp/duck 3.0.0 >/dev/null
-$R --socket /tmp/duck/d.sock update apply daemon >/dev/null 2>&1
-$R --socket /tmp/duck/d.sock update status | grep -q "3.0.0"
-echo "    [ok] robotctl apply over the socket"
+stage 1.1.0
+# Progress phases go to stderr, into the daemon log rather than the terminal: this script
+# prints one line per property checked, and 13 lines of `Downloading`/`Swapping` per apply
+# buries them. Captured, not discarded, so a failure still has something to read.
+$R --socket $S update apply daemon 2>>/tmp/d.log | grep -q rolled_back
+grep -q "version=1.0.0" $LIVE
+echo "    [ok] unhealthy release rolled back"
+
+# A tampered artifact must be refused before the swap, with its own exit code so a script
+# can tell "correctly rejected" from "something broke". `|| code=$?` keeps set -e from
+# treating the expected failure as fatal.
+stage 1.2.0
+code=0
+$R --socket $S update apply daemon >/dev/null 2>&1 || code=$?
+test "$code" -eq 5 || { echo "    [FAIL] expected REFUSED (5), got $code"; exit 1; }
+grep -q "version=1.0.0" $LIVE
+echo "    [ok] tampered artifact refused (exit 5)"
 
 # SO_PEERCRED is enforced, and the audit line is what support reads.
 grep -q "mutating request" /tmp/d.log
 echo "    [ok] peer credentials recorded"
 
-# An unreachable daemon must be its own exit code, so a script can tell "not running"
-# from "rejected". `|| code=$?` keeps set -e from treating the expected failure as
-# fatal.
+# Piping must not panic: Rust ignores SIGPIPE, so `| head` used to abort.
+$R --socket $S update log | head -1 >/dev/null
+echo "    [ok] output survives a closed pipe"
+
+# An unreachable daemon must be its own exit code too, so "not running" and "rejected" stay
+# distinguishable.
 code=0
 $R --socket /tmp/nope.sock update status >/dev/null 2>&1 || code=$?
 test "$code" -eq 3 || { echo "    [FAIL] expected exit 3, got $code"; exit 1; }
 echo "    [ok] unreachable daemon exits 3"
+stop_daemon
 
-kill $DAEMON 2>/dev/null || true
+# ── power loss straight after the swap: the boot counter, not the gate, is what reverts ──
+start_daemon --inject-fault abort_after_swap
+stage 2.0.0
+$R --socket $S update apply daemon >/dev/null 2>&1 || true
+# The swap already happened, which is the situation the boot counter exists for.
+grep -q "version=2.0.0" $LIVE
+stop_daemon
+
+# `--check-only` is what a boot does, minus serving. Two of them: the first records the
+# trial, the second exhausts it (MAX_BOOT_ATTEMPTS = 2) and reverts.
+RUST_LOG=info $U --config $C --check-only >/tmp/boot1.log 2>&1
+grep -q "update still on trial" /tmp/boot1.log
+RUST_LOG=info $U --config $C --check-only >/tmp/boot2.log 2>&1
+grep -q "never confirmed healthy; reverting" /tmp/boot2.log
+grep -q "version=1.0.0" $LIVE
+echo "    [ok] crash after swap reverted by the boot counter"
+
+# ── and the ordinary case, with nothing injected at all ──
+start_daemon
+stage 3.0.0
+$R --socket $S update apply daemon 2>>/tmp/d.log | grep -q "\"outcome\": \"applied\""
+$R --socket $S update status | grep -q "3.0.0"
+grep -q "version=3.0.0" $LIVE
+echo "    [ok] robotctl applied 3.0.0 over the socket"
+stop_daemon
 
 # ── layered access control, as the systemd unit configures it ──
 # Only meaningful on Linux, so this is the only place it can be tested.
@@ -317,6 +376,7 @@ for image in $IMAGES; do
     echo "==> $image"
     docker run --rm --platform linux/arm64 \
         -v "$PWD/$TARGET_DIR:/bin/robot:ro" \
+        -v "$PWD/$FIXTURE:/bin/fixture:ro" \
         -v "$PWD/scripts:/bin/scripts:ro" \
         -v "$PWD/hooks:/bin/hooks:ro" \
         "$image" sh -c "$CHECKS"
