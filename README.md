@@ -176,8 +176,11 @@ sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updat
 
 While this repository is **private**, the board also needs a GitHub token — a private repo's
 release assets are unreachable without one, and `updaterd` reads `GITHUB_TOKEN` from its
-environment, so exporting it in your shell does not reach the daemon. Use a drop-in with a
-fine-grained, read-only token:
+environment, so exporting it in your shell does not reach the daemon.
+
+`scripts/install.sh` writes this drop-in for you when given `DUCK_TOKEN`, and restarts
+`updaterd` so the running process actually picks it up. The manual steps below are for a board
+provisioned some other way:
 
 ```bash
 sudo mkdir -p /etc/systemd/system/updaterd.service.d
@@ -204,6 +207,70 @@ sudo systemctl daemon-reload && sudo systemctl restart updaterd
 
 A token on a *developer's* board is fine. A token on a customer robot is not, and is why
 artifact hosting is still an open question — see `docs/updater-design.md` §6.1.
+
+### Switching between releases
+
+What is on the board, and what it is doing. None of these need root:
+
+```bash
+robotctl version          # running vs installed, per daemon, with the git rev
+robotctl update status    # per-component state, pin, last attempt
+robotctl update check     # is a newer release available; changes nothing
+robotctl update log       # recent attempts and their outcomes
+```
+
+Switching by downloading. These mutate the robot, so they are root-only by design:
+
+```bash
+sudo robotctl update apply daemon                    # the latest release
+sudo robotctl update apply daemon --version 0.1.4    # one exact version
+sudo robotctl update apply daemon --ref my-branch    # what a branch last built
+sudo robotctl update apply daemon --dry-run          # verify, stop before the swap
+```
+
+Switching to something the board already has, without a download or a network:
+
+```bash
+sudo robotctl update select daemon 0.1.4      # activate an installed release
+sudo robotctl update rollback daemon          # the previously installed one
+sudo robotctl update reset-to-golden daemon   # the never-pruned known-good one
+```
+
+And refusing to move:
+
+```bash
+sudo robotctl update pin daemon 0.1.4    # accept nothing else
+sudo robotctl update pin daemon          # unpin
+```
+
+Three things that are easy to get wrong.
+
+**`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has
+exactly one release, so `rollback` right then has nothing older to go to and says so. Auto-
+rollback is *not* affected: applying a release unpacks it alongside the current one and only
+then moves `current`, so by the time the health gate runs there are two, and the release you
+came from is the target. `rollback_target` picks the highest installed version below `current`
+that the journal has not already recorded as bad — so a board with one release is fully
+protected from the moment it takes its first update.
+
+The one genuinely unprotected install is the bootstrap itself, which has nothing before it by
+definition. `golden` would cover that, and it is deliberately unset until 1.0.0 exists — so
+`reset-to-golden` reports honestly that none is configured rather than doing something
+surprising.
+
+**`version` shows the live release per component, not the release store.** It will never list
+two versions, however many are unpacked under `/opt/robot/daemon/releases/`. Ask the store
+directly if you need to know what is there:
+
+```bash
+ls -l /opt/robot/daemon/releases/ /opt/robot/daemon/current
+```
+
+**`apply --version` needs the release to still exist upstream; `select` does not.** Releases
+carrying known-bad builds get deleted from GitHub, so `apply --version 0.1.3` fails on
+purpose, while `select 0.1.3` still works on a board that already unpacked it. The asymmetry
+is deliberate: no new board can acquire a broken release, and a board that has one keeps its
+escape hatch.
 
 ## Releasing
 

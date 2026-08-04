@@ -20,7 +20,19 @@
 # Radxa Zero 3W on Armbian. Nothing here is specific to a robot revision.
 set -eu
 
-ONNX_VERSION="${ONNX_VERSION:-1.20.1}"
+# Must satisfy `ort`'s minimum, which is a hard runtime check and not a warning: ort
+# 2.0.0-rc.11 requires >= 1.23.x and *panics* in `setup_api` when the dylib is older —
+# killing robotd's control thread rather than returning an error. 1.20.1 was pinned here and
+# every board provisioned with it could load a policy only far enough to die:
+#
+#   thread 'control' panicked at ort-2.0.0-rc.11/src/lib.rs:191:41:
+#   Failed to load ONNX Runtime dylib: ... expected version >= '1.23.x', but got '1.20.1'
+#
+# Newer is safe: ort asks for *at least* its `ORT_API_VERSION`, and ONNX Runtime keeps the C
+# API backward compatible, so a runtime above the floor serves an older API version happily.
+# Raise this in step with `ort` in Cargo.toml — the two are one decision, and only one of them
+# is checked at compile time.
+ONNX_VERSION="${ONNX_VERSION:-1.28.0}"
 ONNX_LIB_DIR=/usr/local/lib
 
 # The Dynamixel bus. Every servo and the imu_to_dxl board share it, so without this there
@@ -141,9 +153,28 @@ configure_overlay() {
 # starts fine and *then* cannot walk. `robotd` reports that through `robot.health` with the
 # searched path in the message, so the failure names itself, but it is still a failure.
 install_onnxruntime() {
-    if [ -f "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
-        say "ONNX Runtime already present in ${ONNX_LIB_DIR}"
+    # Version-aware, not merely presence-aware. The old check returned early whenever the
+    # symlink existed, so a board carrying an incompatible runtime could never be fixed by
+    # re-running this script — which is exactly the situation the 1.20.1 pin created.
+    #
+    # The tarball installs `libonnxruntime.so.<version>` with the bare name as a symlink, so
+    # the resolved target names the version without needing to run anything.
+    existing=""
+    if [ -e "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
+        resolved="$(readlink -f "${ONNX_LIB_DIR}/libonnxruntime.so" 2>/dev/null || true)"
+        case "$resolved" in
+            */libonnxruntime.so.*) existing="${resolved##*/libonnxruntime.so.}" ;;
+            *) existing="unknown" ;;
+        esac
+    fi
+
+    if [ "$existing" = "$ONNX_VERSION" ]; then
+        say "ONNX Runtime ${ONNX_VERSION} already present in ${ONNX_LIB_DIR}"
         return 0
+    fi
+
+    if [ -n "$existing" ]; then
+        say "replacing ONNX Runtime ${existing} with ${ONNX_VERSION}"
     fi
 
     url="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-aarch64-${ONNX_VERSION}.tgz"
@@ -265,8 +296,17 @@ report() {
   ${ENV_TXT} and reboot."
     fi
 
-    if [ -f "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
-        printf '  %-22s %s\n' "ONNX Runtime" "present"
+    if [ -e "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
+        # The version, not just "present": an incompatible runtime is indistinguishable from
+        # a correct one until robotd tries to load a policy and its control thread dies.
+        have="$(readlink -f "${ONNX_LIB_DIR}/libonnxruntime.so" 2>/dev/null || true)"
+        have="${have##*/libonnxruntime.so.}"
+        if [ "$have" = "$ONNX_VERSION" ]; then
+            printf '  %-22s %s\n' "ONNX Runtime" "$have"
+        else
+            printf '  %-22s %s\n' "ONNX Runtime" "${have:-unknown} (expected ${ONNX_VERSION})"
+            warn "this ONNX Runtime will not load a policy. Re-run this script to replace it."
+        fi
     else
         printf '  %-22s %s\n' "ONNX Runtime" "ABSENT — robotd cannot load a policy"
     fi

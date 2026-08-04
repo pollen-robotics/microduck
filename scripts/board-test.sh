@@ -182,6 +182,72 @@ test "$code" -eq 6 || { echo "    [FAIL] member should be denied (6), got $code"
 echo "    [ok] group member cannot mutate (exit 6, denied)"
 
 kill $DAEMON2 2>/dev/null || true
+
+# ── setup-board.sh, the provisioning script nothing else covered ──
+#
+# Added because two green-CI regressions landed here in one day, including #13 deleting the
+# console fix outright: deleting a working feature breaks no test. The scripts that provision
+# hardware were the least-covered surface in the repo, and the only one that touches a robot.
+#
+# Behavioural rather than a grep. `systemctl` is stubbed to record its arguments, so this
+# asserts what the script *does*. A grep would have caught the deletion but not a masking
+# call naming the wrong unit.
+mkdir -p /stub /boot /usr/local/lib
+
+# check_environment only probes with `command -v`, and the ONNX step is skipped below, so
+# stubs for tools this image lacks are enough and cost no download.
+cat > /stub/curl <<"STUB"
+#!/bin/sh
+exit 0
+STUB
+cp /stub/curl /stub/find
+cat > /stub/systemctl <<"STUB"
+#!/bin/sh
+echo "$@" >> /stub/systemctl.log
+exit 0
+STUB
+chmod +x /stub/curl /stub/find /stub/systemctl
+
+# Already present at the version asked for, so install_onnxruntime returns early instead of
+# fetching ~20 MB. Both halves matter: the check resolves the symlink and reads the version out
+# of the target name, so a bare file would be treated as a mismatch and trigger a download.
+#
+# ONNX_VERSION is passed explicitly rather than mirroring the script default, so bumping that
+# default — which happens whenever ort moves — cannot silently break this test.
+touch /usr/local/lib/libonnxruntime.so.9.9.9
+ln -sf libonnxruntime.so.9.9.9 /usr/local/lib/libonnxruntime.so
+
+# The wrong overlay prefix and a console on the motor UART: what Armbian actually ships.
+cat > /boot/armbianEnv.txt <<"ENV"
+overlay_prefix=rk35xx
+console=both
+ENV
+
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board.log 2>&1
+
+# The RK3566 shares overlays with the RK3568, so the wrong prefix boots happily with no
+# /dev/ttyS2 at all.
+grep -q "^overlay_prefix=rk3568$" /boot/armbianEnv.txt
+grep -E "^overlays=" /boot/armbianEnv.txt | grep -qw uart2-m0
+echo "    [ok] setup-board fixes overlay_prefix and enables uart2-m0"
+
+# A getty *reads* the port, consuming servo replies, so every motor looks absent —
+# indistinguishable from unwired hardware and far harder to guess.
+grep -q "mask serial-getty@ttyS2.service" /stub/systemctl.log
+echo "    [ok] setup-board masks the getty on the motor port"
+
+# console=both puts printk on the same wires as the servos, corrupting replies
+# intermittently rather than cleanly.
+grep -q "^console=display$" /boot/armbianEnv.txt
+echo "    [ok] setup-board takes the kernel console off the UART"
+
+# Idempotent: it is re-run after the reboot it asks for, and must not undo its own work or
+# append a second copy of the overlay.
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board2.log 2>&1
+grep -q "^overlay_prefix=rk3568$" /boot/armbianEnv.txt
+grep -q "^console=display$" /boot/armbianEnv.txt
+test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
+echo "    [ok] setup-board is idempotent on a second run"
 '
 
 for image in $IMAGES; do
@@ -189,6 +255,7 @@ for image in $IMAGES; do
     echo "==> $image"
     docker run --rm --platform linux/arm64 \
         -v "$PWD/$TARGET_DIR:/bin/robot:ro" \
+        -v "$PWD/scripts:/bin/scripts:ro" \
         "$image" sh -c "$CHECKS"
 done
 

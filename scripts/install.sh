@@ -79,6 +79,17 @@ TOKEN="${DUCK_TOKEN:-}"
 # `robotctl rollback` for that reason. Ordinary updates keep the gate.
 FORCE_REINSTALL="${DUCK_FORCE_REINSTALL:-}"
 
+# Trust the team dev key on this board, so `robotctl update apply --ref <branch>` works.
+#
+#   sudo DUCK_TOKEN=... DUCK_DEV_KEY=/path/to/team.dev.pub sh install.sh
+#
+# Operator-supplied on purpose, and never fetched. `deploy/trusted_keys/README.md` is
+# explicit that `team.dev.pub` stays out of the repository: a robot that trusts it installs
+# anything anyone on the team builds, unreviewed. Fetching it here would turn that from a
+# per-board decision into the default for every robot we image, which is precisely the
+# property that must not be automatic.
+DEV_KEY="${DUCK_DEV_KEY:-}"
+
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}"
 BOOTSTRAP_ASSET="updaterd-bootstrap-aarch64"
 
@@ -430,6 +441,48 @@ add_operator_to_group() {
     fi
 }
 
+# Make this a developer board: trust the dev key, and allow dev-signed releases.
+#
+# Both halves are needed and they are independent checks in the updater — a trusted key only
+# counts as a dev key if its filename ends `.dev.pub`, and a dev key is only honoured when
+# `allow_dev_keys` is on. Doing one without the other silently produces a board that still
+# refuses branch builds, with a signature error that reads like a corrupt release.
+install_dev_key() {
+    [ -n "$DEV_KEY" ] || return 0
+
+    [ -f "$DEV_KEY" ] || die "DUCK_DEV_KEY=${DEV_KEY} is not a readable file.
+  Pass the *public* half — team.dev.pub. If you only have the secret key:
+    minisign -R -s <secret> -p team.dev.pub"
+
+    # Checked here rather than discovered at verification time, where the error names the
+    # release and not the key, and sends you looking at the wrong thing.
+    if ! head -1 "$DEV_KEY" | grep -q 'untrusted comment:'; then
+        die "${DEV_KEY} does not look like a minisign public key.
+  Expected a two-line file beginning 'untrusted comment:'. A secret key or a signature
+  will be accepted by this file copy and then fail every verification."
+    fi
+
+    config="${CONFIG_DIR}/updater.toml"
+    if ! grep -q '^allow_dev_keys' "$config"; then
+        die "${config} has no allow_dev_keys setting to enable.
+  It is a top-level key, so it cannot be safely appended — a line added at the end would
+  land inside whichever [table] comes last. Add it by hand near trusted_keys_dir."
+    fi
+
+    # The filename is load-bearing, so it is ours to choose rather than the caller's: a key
+    # installed under any other name is classified as a *release* key, and branch builds
+    # would then be trusted as though they had been reviewed.
+    install -m 644 "$DEV_KEY" "${KEYS_DIR}/team.dev.pub"
+    sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' "$config"
+
+    say "dev mode: trusting team.dev.pub and allowing dev-signed releases"
+    warn "this board will now install any branch build anyone on the team pushes, without
+  review. Never do this to a robot you ship. To undo:
+    sudo rm ${KEYS_DIR}/team.dev.pub
+    sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = false/' ${config}
+    sudo systemctl restart updaterd"
+}
+
 # The units live inside the release, so this can only run after the release is installed.
 # They are *copied* rather than symlinked through `current`: a unit file read through the
 # symlink would change under systemd's feet on every update, and after a rollback
@@ -531,6 +584,18 @@ report() {
 This robot polls for updates on its own and will apply a *mandatory* release without
 waiting to be asked. Ordinary releases wait for a client.
 EOF
+
+    # Only on a board that is actually in dev mode. Printing it everywhere would advertise a
+    # capability most boards correctly refuse, and the failure then looks like a broken
+    # release rather than a board that was never meant to take one.
+    if [ -f "${KEYS_DIR}/team.dev.pub" ]; then
+        cat <<'EOF'
+
+DEV BOARD: trusts team.dev.pub and accepts dev-signed branch builds.
+
+  sudo robotctl update apply daemon --ref BRANCH   install what a branch last built
+EOF
+    fi
 }
 
 
@@ -603,6 +668,7 @@ main() {
     check_board
     wait_for_clock
     install_config
+    install_dev_key
     bootstrap_first_release
     create_group
     install_units
