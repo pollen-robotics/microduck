@@ -103,6 +103,55 @@ pub struct HookOutcome {
 /// the update log.
 const MAX_OUTPUT: usize = 8 * 1024;
 
+/// How many times to retry a spawn that fails with `ETXTBSY`, and how long to wait between.
+///
+/// Ten attempts over ~100 ms. The window this closes is the few microseconds between a
+/// `fork` and the child's `execve`, so the first retry almost always succeeds; the budget
+/// exists so a pathological case gives up rather than hanging an update.
+const BUSY_RETRIES: u32 = 10;
+const BUSY_BACKOFF: Duration = Duration::from_millis(10);
+
+/// `ETXTBSY`, which is not a real failure here.
+///
+/// The kernel refuses to `exec` a file that *any* process has open for writing. We extract a
+/// release — writing `hooks/preinstall` — and then exec it moments later, while also
+/// spawning other children around the same time: the other hook, `systemctl` for `on_apply`,
+/// a command-style health probe. A child inherits a duplicate of the whole fd table at fork
+/// and only drops `O_CLOEXEC` descriptors at its own `execve`, so for a few microseconds
+/// some unrelated child holds a write handle to the hook we are about to run, and the exec
+/// fails with "Text file busy".
+///
+/// Left unhandled that is a failed hook, which fails the update, which rolls back a release
+/// that was fine — rarely, unreproducibly, and reported on the robot as
+/// "failed at RunningPreHook" with nothing anyone can act on. It first showed up as a
+/// intermittently red CI job, which is the same bug wearing a costume.
+///
+/// Retrying is the remedy because nothing else addresses it: the offending descriptor
+/// belongs to a *different* process, so closing or syncing ours changes nothing, and
+/// `rename` keeps the same inode.
+async fn spawn_retrying_busy(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    for attempt in 1..=BUSY_RETRIES {
+        match command.spawn() {
+            Ok(child) => {
+                if attempt > 1 {
+                    tracing::debug!(attempt, "spawned after ETXTBSY");
+                }
+                return Ok(child);
+            }
+            // `raw_os_error`, not `kind`: ETXTBSY has no stable `ErrorKind` — it maps to
+            // `Uncategorized`, which is unstable to match on.
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempt < BUSY_RETRIES => {
+                tracing::debug!(attempt, "hook is busy for exec; retrying");
+                tokio::time::sleep(BUSY_BACKOFF).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns on the final attempt")
+}
+
 /// Run a hook if present.
 ///
 /// A missing hook is success (`ran: false`) — most releases won't have one. A
@@ -145,10 +194,12 @@ pub async fn run(
         command.env(key, value);
     }
 
-    let child = command.spawn().map_err(|e| Error::Hook {
-        hook: hook_name.clone(),
-        detail: format!("could not execute {}: {e}", hook.display()),
-    })?;
+    let child = spawn_retrying_busy(&mut command)
+        .await
+        .map_err(|e| Error::Hook {
+            hook: hook_name.clone(),
+            detail: format!("could not execute {}: {e}", hook.display()),
+        })?;
 
     // `kill_on_drop` plus this timeout is what guarantees a hanging hook is
     // reaped rather than left behind holding the update open.
@@ -304,6 +355,78 @@ mod tests {
                     detail.contains('3'),
                     "exit code should be reported: {detail}"
                 );
+            }
+            other => panic!("expected Hook error, got {other:?}"),
+        }
+    }
+
+    /// The `ETXTBSY` retry, driven deterministically rather than hoped for.
+    ///
+    /// Linux refuses to exec a file that any process has open for writing, tracked on the
+    /// inode, and it counts our own descriptors — so holding one reproduces exactly what an
+    /// unrelated forked child does for a few microseconds during an update. Releasing it
+    /// inside the retry budget must produce a hook that ran, not a failed update.
+    ///
+    /// Linux-only, and deliberately not made portable: macOS permits the exec, so on a Mac
+    /// this would pass without ever provoking the condition — the most expensive kind of
+    /// green test. Its partner below is what keeps it honest: if `ETXTBSY` ever stopped
+    /// being produced, that one fails, so the two cannot both pass vacuously.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_hook_busy_for_exec_is_retried_rather_than_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(dir.path(), HookKind::PostInstall, "#!/bin/sh\nexit 0\n");
+        let path = dir.path().join(HookKind::PostInstall.relative_path());
+
+        let holder = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // Well inside the ~100 ms budget, and long enough that the first attempts do fail.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(holder);
+        });
+
+        let outcome = run(
+            dir.path(),
+            HookKind::PostInstall,
+            &ctx(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a transiently busy hook must be retried, not reported as a failure");
+
+        assert!(outcome.ran);
+        assert_eq!(outcome.exit_code, Some(0));
+        releaser.await.unwrap();
+    }
+
+    /// And the retry is bounded. A file that stays busy must eventually be an error rather
+    /// than hanging the update — the budget exists to give up, not to wait forever.
+    ///
+    /// Also the control for the test above: this failing means the platform is not producing
+    /// `ETXTBSY`, and therefore that the retry test proves nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_hook_busy_forever_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(dir.path(), HookKind::PostInstall, "#!/bin/sh\nexit 0\n");
+        let path = dir.path().join(HookKind::PostInstall.relative_path());
+
+        // Held for the whole call.
+        let _holder = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let err = run(
+            dir.path(),
+            HookKind::PostInstall,
+            &ctx(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        match err {
+            Error::Hook { hook, detail } => {
+                assert_eq!(hook, POST_INSTALL);
+                assert!(detail.contains("could not execute"), "got: {detail}");
             }
             other => panic!("expected Hook error, got {other:?}"),
         }

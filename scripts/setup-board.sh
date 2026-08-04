@@ -179,6 +179,54 @@ install_onnxruntime() {
     rm -rf "$tmp"
 }
 
+# Take the login console off the motor UART.
+#
+# UART2 is the RK3566 debug console, so Armbian runs `serial-getty@ttyS2` on it by default.
+# A getty does not merely hold the port open — it *reads* from it, consuming the Dynamixel
+# replies before `robotd` ever sees them. Every servo then looks absent, which is
+# indistinguishable from hardware that is unpowered or unwired.
+#
+# That is not a hypothetical: it cost an afternoon of staring at
+# `read return_delay_time on 20: Operation timed out` with a correctly wired robot attached
+# and every servo visible to other tools. `fuser -v /dev/ttyS2` naming `agetty` was the
+# first honest evidence.
+#
+# Two halves, because two things write to that UART:
+#
+#  1. The getty, which is masked rather than merely disabled — `getty.target` pulls it back
+#     in otherwise.
+#  2. The kernel's own console. Armbian's `console=both`/`console=serial` puts printk on the
+#     same wires as the servos, so a kernel message mid-transaction corrupts a reply. It is
+#     quiet most of the time, which makes it worse: an intermittent bus fault with no
+#     pattern. `console=display` is the supported Armbian value that keeps a console on HDMI
+#     and takes it off the UART.
+#
+# A UART cannot be both a console and a motor bus. Choosing the motor bus is the whole point
+# of this script.
+free_motor_port() {
+    tty="$(basename "$MOTOR_PORT")"
+    unit="serial-getty@${tty}.service"
+
+    if [ "$(systemctl is-enabled "$unit" 2>/dev/null)" = masked ]; then
+        say "${unit} already masked"
+    else
+        say "masking ${unit} so it stops eating servo replies"
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        if ! systemctl mask "$unit" >/dev/null 2>&1; then
+            warn "could not mask ${unit}; it will keep consuming bytes on ${MOTOR_PORT}"
+        fi
+    fi
+
+    if [ -f "$ENV_TXT" ] && grep -Eq '^console=(both|serial)$' "$ENV_TXT"; then
+        say "taking the kernel console off the motor UART (console=display)"
+        # Two plain substitutions rather than a BRE alternation, which differs between
+        # sed dialects and would fail silently by matching nothing.
+        sed -i 's/^console=both$/console=display/' "$ENV_TXT"
+        sed -i 's/^console=serial$/console=display/' "$ENV_TXT"
+        needs_reboot=1
+    fi
+}
+
 # What the board looks like now. Printed whether or not anything was changed, because "is
 # this board ready" is a question worth being able to ask on its own.
 report() {
@@ -194,6 +242,27 @@ report() {
   is wrong. Check:  dmesg | grep -iE 'ttyS|serial'
   robotd will start, fail to open the bus, and report unhealthy — which is honest, but it
   will not drive anything."
+    fi
+
+    # Named explicitly, because "the port exists" and "the port is usable" are different
+    # questions and only the second one matters.
+    holder=""
+    if command -v fuser >/dev/null 2>&1 && [ -e "$MOTOR_PORT" ]; then
+        holder="$(fuser "$MOTOR_PORT" 2>/dev/null | tr -d ' ')"
+    fi
+    if [ -n "$holder" ]; then
+        printf '  %-22s %s\n' "motor bus owner" "IN USE by pid ${holder}"
+        warn "something else has ${MOTOR_PORT} open. A reader on this port consumes servo
+  replies and every motor will look absent. Identify it with:  sudo fuser -v ${MOTOR_PORT}"
+    else
+        printf '  %-22s %s\n' "motor bus owner" "free"
+    fi
+
+    if grep -qE '(^| )console=tty(S|AMA)' /proc/cmdline 2>/dev/null; then
+        printf '  %-22s %s\n' "kernel console" "still on a serial port"
+        warn "the kernel prints to a UART (see /proc/cmdline). If that is ${MOTOR_PORT},
+  kernel messages will corrupt servo traffic intermittently. Set console=display in
+  ${ENV_TXT} and reboot."
     fi
 
     if [ -f "${ONNX_LIB_DIR}/libonnxruntime.so" ]; then
@@ -249,6 +318,7 @@ main() {
     check_environment
     persist_self
     configure_overlay
+    free_motor_port
     install_onnxruntime
     report
 }

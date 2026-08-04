@@ -544,6 +544,15 @@ MOTOR_PORT="${MOTOR_PORT:-/dev/ttyS2}"
 
 check_board() {
     if [ -e "$MOTOR_PORT" ]; then
+        # Existing is not the same as usable. Armbian runs a login console on this UART by
+        # default, and a getty *reads* the port — so it eats servo replies and every motor
+        # looks absent. Identical symptoms to unwired hardware, and far harder to guess.
+        tty="$(basename "$MOTOR_PORT")"
+        if systemctl is-active --quiet "serial-getty@${tty}.service" 2>/dev/null; then
+            warn "a login console (serial-getty@${tty}) is running on ${MOTOR_PORT}.
+  It will consume servo replies and robotd will report every motor missing. Run
+  scripts/setup-board.sh, which masks it."
+        fi
         return 0
     fi
     warn "${MOTOR_PORT} does not exist, so robotd will have no motor bus.

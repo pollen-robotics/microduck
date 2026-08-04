@@ -20,6 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# For `ETXTBSY` by name in the hook-spawn retry. Already in the tree via tokio, and an errno
+# spelled 26 in our own source is the kind of thing that is fine until it is not.
+libc = "0.2.189"
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
@@ -64,7 +67,6 @@ test-support = { path = "../test-support" }
 async-trait.workspace = true
 axum = "0.8.9"
 clap = { version = "4.6.4", features = ["derive"] }
-libc = "0.2.189"
 minisign = "0.9.1"
 semver.workspace = true
 serde_json.workspace = true
