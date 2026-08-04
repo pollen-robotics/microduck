@@ -24,10 +24,25 @@ lines from `.github/workflows/{release,dev}.yml`.
 Copied from `apirrone/microduck_runtime` at commit `567fdcd`, dereferencing the symlinks that
 repository uses to give stable names to specific training runs:
 
-| here | there | sha256 (first 16) |
-| --- | --- | --- |
-| `alpha_walking.onnx` | `policies/BEST_alpha_walking_flat.onnx` | `f8cdad8a34ee1d95` |
-| `alpha_stand.onnx` | `policies/BEST_alpha_stand.onnx` | `53b8e21ffdc5e523` |
+| here | there | size | used by default |
+| --- | --- | --- | --- |
+| `walking.onnx` | `policies/new_policies/vel_noise_walk.onnx` | 772527 | **yes** |
+| `standing.onnx` | `policies/new_policies/standup_gentle_more_range.onnx` | 772527 | **yes** |
+| `alpha_walking.onnx` | `policies/BEST_alpha_walking_flat.onnx` | 793705 | no |
+| `alpha_stand.onnx` | `policies/BEST_alpha_stand.onnx` | 793695 | no |
+
+Two generations, and the distinction cost a hardware round trip. `walking.onnx` and
+`standing.onnx` are what `microduck_runtime` loads by default — `src/main.rs` has them as the
+`--policy` / `--standing-policy` defaults — so they are the pair with a track record on a real
+robot. The `alpha_*` pair was chosen here first, purely because `deploy/robotd.toml` asked for
+a file of that name and the prototype had one; nothing checked which the working system
+actually ran.
+
+Everything in the prototype's `new_policies/` is exactly 772527 bytes and everything in the
+`BEST_alpha_*` set is ~793700, so the two are clearly distinct generations. Both are shipped
+so a board can A/B them by editing `deploy/robotd.toml` and restarting, rather than waiting on
+a release — `robotd` checks the 61-input/14-output shape at load, but nothing detects "right
+shape, wrong robot", so which family suits alpha is a question only the hardware answers.
 
 The names here are the *roles* — what `deploy/robotd.toml` asks for — not the training runs.
 That indirection is deliberate and worth keeping: swapping which run is "the walking policy"

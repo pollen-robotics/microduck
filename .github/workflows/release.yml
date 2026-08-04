@@ -116,7 +116,9 @@ jobs:
             --include "docs/updater-design.md=docs/updater-design.md" \
             --include "deploy/README.md=docs/deploy.md" \
             --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
-            --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx"
+            --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx" \
+            --include "policies/walking.onnx=policies/walking.onnx" \
+            --include "policies/standing.onnx=policies/standing.onnx"
 
           # The bootstrap binary, published bare alongside the artifact.
           #

@@ -74,8 +74,11 @@ enabled = true
 #
 # Both must be 61-input, 14-output: every alpha policy is obs[1,61] -> actions[1,14], and
 # robotd checks that at load rather than discovering it mid-stride.
-walk = "/opt/robot/daemon/current/policies/alpha_walking.onnx"
-stand = "/opt/robot/daemon/current/policies/alpha_stand.onnx"
+# These two are what microduck_runtime loads by default, so they are the pair with a track
+# record on a real robot. The release also carries alpha_walking.onnx / alpha_stand.onnx, an
+# earlier generation — swap the paths here and restart to A/B them without cutting a release.
+walk = "/opt/robot/daemon/current/policies/walking.onnx"
+stand = "/opt/robot/daemon/current/policies/standing.onnx"
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
