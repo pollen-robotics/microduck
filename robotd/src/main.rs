@@ -517,6 +517,19 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
         tracing::error!(error = %e, "cannot enable torque");
         return ExitCode::FAILURE;
     }
+    // Before the ramp, not after: position_p_gain is a RAM register that survives this
+    // process, so whatever was written last is what the robot stands up with. A previous fall
+    // leaves `gain_limp` (50) there, and `init` would then take the robot to its home pose at
+    // a third of the intended stiffness — soft enough to be a fall risk in the one command
+    // whose whole job is establishing a known state.
+    //
+    // `robotd`'s control loop sets its own gain on the first tick, so this only governs the
+    // ramp and the window before the daemon starts — which is exactly the window where the
+    // robot is standing up unsupported.
+    if let Err(e) = io.set_gain(params.policy.gain) {
+        tracing::error!(error = %e, gain = params.policy.gain, "cannot set the position gain");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = io.interpolate_to(&DEFAULT_POSITION, duration, Duration::from_millis(20)) {
         tracing::error!(error = %e, "interpolation to the home pose failed");
         return ExitCode::FAILURE;
