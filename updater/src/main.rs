@@ -786,6 +786,43 @@ mod tests {
         }
     }
 
+    /// A robot answering in a shape we cannot read is still a robot that is *running*.
+    ///
+    /// `robot_is_answering` guards `install --force`, which swaps a release with no health gate
+    /// behind it. Its own doc comment already states the rule — "anything other than
+    /// `Unreachable` means a robot is running and must not have the release swapped out from
+    /// under it" — but before `Health::Incompatible` existed the code could not keep it: an
+    /// unparseable reply became `Unreachable`, so a live robot whose health shape had drifted
+    /// read as absent and `--force` proceeded. Exactly the robot least worth guessing about.
+    #[tokio::test]
+    async fn a_robot_answering_unreadably_still_counts_as_answering() {
+        struct Unreadable;
+
+        #[async_trait::async_trait]
+        impl updater::robot::RobotClient for Unreadable {
+            async fn safe_to_restart(
+                &self,
+                _: std::time::Duration,
+            ) -> updater::robot::SafeToRestart {
+                updater::robot::SafeToRestart::Unreachable
+            }
+            async fn health(&self, _: std::time::Duration) -> updater::robot::Health {
+                updater::robot::Health::Incompatible("missing field `imu`".into())
+            }
+            async fn model_api(&self, _: std::time::Duration) -> Option<u32> {
+                None
+            }
+            async fn remote_session_active(&self, _: std::time::Duration) -> bool {
+                false
+            }
+        }
+
+        assert!(
+            robot_is_answering(&Unreadable).await,
+            "an unreadable answer is still an answer; --force must refuse"
+        );
+    }
+
     /// The engine emits progress once per network chunk, so a single 3.6 MB download wrote
     /// ~250 journal lines — 13 of them before the first whole percent had even accrued.
     /// That is not just noise: under journald's size cap it evicts the logs someone needs,
