@@ -121,8 +121,8 @@ jobs:
             --include "btd/systemd/btd.service=systemd/btd.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
-            --include "docs/architecture.md=docs/architecture.md" \
-            --include "docs/updater-design.md=docs/updater-design.md" \
+            --include "docs/design/architecture.md=docs/architecture.md" \
+            --include "docs/design/updater-design.md=docs/updater-design.md" \
             --include "deploy/README.md=docs/deploy.md" \
             --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
             --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx"
