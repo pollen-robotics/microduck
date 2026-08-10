@@ -36,8 +36,7 @@ ssh-copy-id radxa@192.168.1.42
 - A **GitHub token**. This repository is private, so its release assets are unreachable without
   one.
 - A **clone of this repo**. The dev key it needs is committed at `deploy/dev-key/team.dev.pub`,
-  so there is nothing to ask anyone for. Your own `~/.duck-keys/team.dev.pub` wins if you have
-  one.
+  so there is nothing to ask anyone for.
 
 ## Install
 
@@ -167,7 +166,7 @@ sudo systemctl restart updaterd
 ```
 
 A token on a *developer's* board is fine. A token on a customer robot is not, and is why
-artifact hosting is still an open question — see `docs/updater-design.md` §6.1.
+artifact hosting is still an open question — see `docs/design/updater-design.md` §6.1.
 
 ## Installing without a network
 

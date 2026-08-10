@@ -43,8 +43,8 @@ branch, `--local` to send this clone's `provision.sh` rather than fetching it, w
 testing an unpushed change to it possible.
 
 `team.dev.pub` is committed at [`dev-key/`](dev-key/), not in `trusted_keys/` — carrying it to a
-board *is* the opt-in, so it must not ship with every robot. The script sends
-`~/.duck-keys/team.dev.pub` if you have one and falls back to the committed copy.
+board *is* the opt-in, so it must not ship with every robot. The script sends the committed copy;
+`--dev-key PATH` overrides it.
 
 ### On the board, without a clone
 
@@ -52,7 +52,7 @@ Three commands, the first from your machine, and what `provision-board.sh` is do
 behalf above:
 
 ```bash
-scp ~/.duck-keys/team.dev.pub radxa@192.168.1.42:/tmp/
+scp deploy/dev-key/team.dev.pub radxa@192.168.1.42:/tmp/
 ```
 
 ```bash
@@ -144,7 +144,7 @@ rather than maintained the day we build an image with NetworkManager in it.
 Armbian's headless image runs netplan + `systemd-networkd` + `wpa_supplicant`, while `configd`
 drives NM over D-Bus — so until the migration runs, `robotctl net status` reports `Unavailable`
 and nothing over Bluetooth can configure wifi. Why NM rather than what the image ships is in
-[`../docs/app-path-design.md`](../docs/design/app-path-design.md) §2.
+[`../docs/design/app-path-design.md`](../docs/design/app-path-design.md) §2.
 
 `provision.sh` runs them in order and holds the state that has to cross the reboot — the token,
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
@@ -277,7 +277,7 @@ no token, so it never reaches that path. Without it `updaterd` would be installe
 and unable to fetch a single update, which is most of what it is for.
 
 Artifact hosting is therefore an open decision, not a settled one —
-[`../docs/updater-design.md`](../docs/design/updater-design.md) §6.1 has the options. The cheap one
+[`../docs/design/updater-design.md`](../docs/design/updater-design.md) §6.1 has the options. The cheap one
 is a second, public repository holding only signed artifacts: signatures are what make an
 artifact safe to serve, not obscurity, and the source stays private.
 
