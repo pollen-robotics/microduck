@@ -62,46 +62,30 @@ robotctl monitor --json --hz 50 > run.jsonl
 
 ### Gamepad (`configd`)
 
-Put the pad in pairing mode first. On an **Xbox** controller: switch it on with a *short* press of
-the Xbox button, then press the small **Sync** button on the top edge next to the USB-C port until
-the Xbox light flashes **quickly**. Holding the Xbox button switches the controller off instead,
-which is the obvious-looking mistake. On a **DualSense**: hold Create and PS together until the light
-bar flashes.
+```
+robotctl pad status
+```
 
 ```
 sudo robotctl pad pair
 ```
 
-No MAC address: the robot looks for a gamepad in pairing mode and takes the one it finds. With two in
-pairing mode it refuses rather than guessing, and prints their addresses so you can name one. A
-failed search also lists what was in range, because a pad advertising no name or class is invisible
-to the guess and pairs fine by address:
-
 ```
 sudo robotctl pad pair 78:86:2E:BB:13:28
-```
-
-**Adding a second pad needs no forgetting.** A pad already bonded is in range and in every sweep, so
-the robot prefers one in pairing mode; both stay paired afterwards and `padd` drives whichever
-connects. The cost is that re-running with nothing new in pairing mode waits out the whole search
-window before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
-
-```
-robotctl pad status
 ```
 
 ```
 sudo robotctl pad forget 78:86:2E:BB:13:28
 ```
 
-`forget` removes **the robot's half** of the bond, which is all a robot can remove. The pad keeps its
-own half, so pair it again with Sync held — otherwise it arrives with a key this robot no longer has
-and the bond is refused.
+Pairing is once per pad and has a page of its own —
+[`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
+pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
+answer more often than anything else).
 
-**Pairing is the only step.** `padd.service` runs from boot, waits for a pad and drives whatever
-connects, so nothing needs starting and nothing dies with your ssh session. On the pad: **Start**
-toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks between body
-and head, **B**/circle stops.
+`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
+pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks
+between body and head, **B**/circle stops.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:
@@ -110,15 +94,6 @@ identical from the outside:
 pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
 padd    active — driving whatever pad connects
 ```
-
-**If pairing fails every time, check `/etc/bluetooth/main.conf` for `Privacy = device`.** Boards
-provisioned before this was understood have it, and with it a pad cannot bond at all: it rejects the
-pairing with `DHKey check failed (0x0b)`, because that check covers both devices' addresses and
-privacy pairs from a resolvable private one. `Privacy = off` is what works. `scripts/setup-board.sh`
-corrects it, and it does not take effect until a reboot.
-
-`paired but NOT trusted` in `pad status` is the other one worth knowing: it looks fine and does not
-reconnect after a reboot; re-run `pad pair` to fix it.
 
 To drive with non-default limits, stop the service first or two processes fight over the sticks:
 

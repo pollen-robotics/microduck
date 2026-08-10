@@ -45,39 +45,11 @@ software
 
 ## Drive it
 
-Put the pad in pairing mode. On an **Xbox** controller that is two presses, and the second one is
-easy to get wrong:
+Switch the pad on and drive — `padd` runs from boot, waits for a pad and drives whatever connects.
 
-1. Switch it on with a **short** press of the Xbox button. Do not hold that button — held, it
-   switches the controller off.
-2. Press the small **Sync** button on the top edge, next to the USB-C port, until the Xbox light
-   **flashes quickly**. Slow blinking means it is on but not pairing.
-
-On a **DualSense**: hold Create and PS together until the light bar flashes.
-
-Then:
-
-```bash
-sudo robotctl pad pair
-```
-
-```
-looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync button on the
-top edge (not the Xbox button, which switches it off)
-paired  Xbox Wireless Controller 78:86:2E:BB:13:28
-padd is driving from it now.
-```
-
-If it reports finding no gamepad, it lists the devices that *were* in range — a pad that
-advertises no name is invisible to the "is this a gamepad" guess and pairs fine by address:
-
-```bash
-sudo robotctl pad pair 78:86:2E:BB:13:28
-```
-
-That is the whole setup. No MAC address to find, and nothing to start afterwards: `padd` runs
-from boot, waits for a pad and drives whatever connects. The pad is *trusted* as well as paired,
-so it comes back by itself after a reboot. `robotctl pad forget <mac>` revokes it.
+Pairing is once per pad and lives in
+[`docs/robot/pair-a-gamepad.md`](docs/robot/pair-a-gamepad.md): `sudo robotctl pad pair` with the pad
+in pairing mode, plus what to do when it will not bond.
 
 ```bash
 robotctl pad status
@@ -87,9 +59,6 @@ robotctl pad status
 pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
 padd    active — driving whatever pad connects
 ```
-
-Two lines because they fail separately: a connected pad with a dead driver looks exactly like a
-working robot ignoring you.
 
 `padd` reads the pad and sends intents over the socket. It has no privileged access — it is an
 ordinary client, sending exactly what the app and the SDK will send, which is why pairing is

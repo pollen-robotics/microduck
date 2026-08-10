@@ -7,6 +7,7 @@ Start at the [README](../README.md) if you have a robot and want to use it.
 | | |
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
+| [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, `btctl`. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |
 
