@@ -26,10 +26,6 @@ software
             last update 0.1.4 → 0.1.5: applied
 ```
 
-One command because that is how the question arrives — a robot that reverted a release an hour
-ago looks exactly like a robot with unpowered servos until both halves are on screen together.
-It exits non-zero when the robot is unhealthy or unreachable, so it can gate a script.
-
 ## Drive it
 
 `padd` reads a gamepad and sends intents over the socket. It has no privileged access — it is
