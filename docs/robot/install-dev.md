@@ -35,9 +35,9 @@ ssh-copy-id radxa@192.168.1.42
   itself, and a password prompt cannot survive that.
 - A **GitHub token**. This repository is private, so its release assets are unreachable without
   one.
-- **`team.dev.pub`**, the public half of the team dev key, at `~/.duck-keys/team.dev.pub`. It is
-  deliberately not in the repository — a robot that trusts it installs anything anyone on the
-  team builds, so that stays a per-board decision. Get it from a team member.
+- A **clone of this repo**. The dev key it needs is committed at `deploy/dev-key/team.dev.pub`,
+  so there is nothing to ask anyone for. Your own `~/.duck-keys/team.dev.pub` wins if you have
+  one.
 
 ## Install
 

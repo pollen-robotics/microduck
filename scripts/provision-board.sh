@@ -24,14 +24,19 @@
 #   --local           send this clone's scripts/provision.sh instead of having the board fetch
 #                     it. What makes testing an unpushed branch possible.
 #   --no-dev-key      do not install the team dev key, for a board that should only take
-#                     releases. The default is to send it when ~/.duck-keys/team.dev.pub exists.
+#                     releases. The default is to send ~/.duck-keys/team.dev.pub, falling back
+#                     to this clone's deploy/dev-key/team.dev.pub.
 #   --dev-key PATH    somewhere else to find it.
 #
 # Needs `ssh` and `scp`, an account on the board that can `sudo`, and nothing else. It expects
 # to be able to prompt for the sudo password, so it allocates a terminal for that one command.
 set -eu
 
+# Your own copy wins, so a key you were handed out of band still overrides the committed one.
+# The fallback is this clone's `deploy/dev-key/team.dev.pub`, which is why a new developer needs
+# nothing from anybody to provision a dev board.
 DEV_KEY_DEFAULT="${HOME}/.duck-keys/team.dev.pub"
+DEV_KEY_FALLBACK="$(dirname "$0")/../deploy/dev-key/team.dev.pub"
 
 HOST=""
 # The host without any `user@`, which is what known_hosts is keyed on.
@@ -224,9 +229,14 @@ elif [ ! -f "$DEV_KEY" ]; then
     if [ "$DEV_KEY" != "$DEV_KEY_DEFAULT" ]; then
         die "--dev-key ${DEV_KEY} is not a readable file"
     fi
-    warn "no ${DEV_KEY_DEFAULT}, so this board will not accept --ref builds. Pass
-  --dev-key PATH if it lives elsewhere, or --no-dev-key to stop saying this."
-    DEV_KEY=""
+    if [ -f "$DEV_KEY_FALLBACK" ]; then
+        DEV_KEY="$DEV_KEY_FALLBACK"
+    else
+        warn "no ${DEV_KEY_DEFAULT} and no committed key in this clone, so this board will
+  not accept --ref builds. Pass --dev-key PATH if it lives elsewhere, or --no-dev-key to
+  stop saying this."
+        DEV_KEY=""
+    fi
 fi
 
 # ── put what the board needs where the board can reach it ────────────────────

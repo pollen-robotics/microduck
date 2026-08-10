@@ -21,10 +21,11 @@ by hand. Shipping the spares now is free; retrofitting them is impossible. See
 what has to be public for anyone to verify what we sign. The private halves live in
 `~/.duck-keys` and a password manager, and only `release-1`'s is in CI.
 
-**`team.dev.pub` is deliberately absent.** A robot that trusts the dev key installs
-anything anyone on the team builds. It belongs only in a developer board's
+**`team.dev.pub` is deliberately not in this directory.** A robot that trusts the dev key
+installs anything anyone on the team builds. It belongs only in a developer board's
 `trusted_keys_dir`, alongside `allow_dev_keys = true` in that board's local
-`updater.toml` — never in this directory, which is what every robot gets.
+`updater.toml` — never here, which is what every robot gets. It is committed at
+[`../dev-key/`](../dev-key/), which nothing installs by default.
 
 ## Adding a rotation key
 

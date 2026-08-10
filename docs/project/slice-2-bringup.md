@@ -125,10 +125,8 @@ installing the key and flipping `allow_dev_keys` — given the path to the publi
 sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
 ```
 
-`team.dev.pub` is deliberately not in the repository — `deploy/trusted_keys/README.md` explains
-why. Get the public half from Pierre, or regenerate it from the secret with
-`minisign -R -s <secret> -p team.dev.pub`. The by-hand equivalent is in
-[`../deploy/README.md`](../../deploy/README.md).
+`team.dev.pub` is committed at `deploy/dev-key/`, outside `trusted_keys/` so nothing installs it
+by default. The by-hand equivalent is in [`../deploy/README.md`](../../deploy/README.md).
 
 Then:
 

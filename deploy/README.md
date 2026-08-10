@@ -42,10 +42,9 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 branch, `--local` to send this clone's `provision.sh` rather than fetching it, which is what makes
 testing an unpushed change to it possible.
 
-`team.dev.pub` is deliberately not in the repository — a robot that trusts it installs anything
-anyone on the team builds, so that stays a per-board decision
-([`trusted_keys/README.md`](trusted_keys/README.md) has the argument). Carrying it to the board
-*is* the opt-in, which is why this script copies yours rather than fetching one.
+`team.dev.pub` is committed at [`dev-key/`](dev-key/), not in `trusted_keys/` — carrying it to a
+board *is* the opt-in, so it must not ship with every robot. The script sends
+`~/.duck-keys/team.dev.pub` if you have one and falls back to the committed copy.
 
 ### On the board, without a clone
 
@@ -254,9 +253,8 @@ appending one would land it inside whichever `[table]` came last. It installs th
 key landing under any other name is trusted as a *release* key, and branch builds would then be
 accepted as reviewed.
 
-`team.dev.pub` is deliberately not in the repository —
-[`trusted_keys/README.md`](trusted_keys/README.md) explains why. Get it from a team member, or
-regenerate it from the secret with `minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub`.
+`team.dev.pub` is committed at [`dev-key/`](dev-key/), deliberately outside `trusted_keys/` —
+[`dev-key/README.md`](dev-key/README.md) explains why that is safe.
 
 The closing report says `DEV BOARD` when this is on, and prints the two commands to undo it.
 Never do it to a robot you ship.
