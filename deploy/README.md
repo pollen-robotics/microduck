@@ -27,9 +27,8 @@ thing with the reasons attached — read it when something disagrees with you, n
 
 ### Dev board, repository private — this is today
 
-One command, from a clone on your own machine. The target is `[user@]host`, and the host can be
-a name or an address — use the address: mDNS on this image is unreliable, so a `.local` name
-resolves when it feels like it and a DHCP lease is the thing you can count on.
+One command from a clone, covered step by step in
+[`docs/robot/install-dev.md`](../docs/robot/install-dev.md):
 
 ```bash
 export DUCK_TOKEN=github_pat_replace_with_your_token
@@ -39,33 +38,9 @@ export DUCK_TOKEN=github_pat_replace_with_your_token
 ./scripts/provision-board.sh radxa@192.168.1.42
 ```
 
-That sends the dev key from `~/.duck-keys/team.dev.pub` if you have one, starts provisioning,
-waits out the reboot, streams the log the unattended half writes, and ends on `robotctl health`.
-
-It is a **viewer**, not the thing doing the work: `provision.sh` installs a systemd unit that
-resumes at boot, so the board finishes whether or not this is still watching. If it loses sight
-of the board — a lease that moved, an ssh session that wedges — Ctrl-C costs you nothing:
-
-```bash
-ssh -t radxa@192.168.1.42 'sudo tail -f /var/lib/robot/provision.log'
-```
-It needs ssh key access, because it has to reconnect by itself after the board reboots — a
-password prompt cannot survive that. `--no-dev-key` for a board that should only take releases,
-`--ref BRANCH` to provision from a branch, `--local` to send this clone's `provision.sh` rather
-than fetching it, which is what makes testing an unpushed change to it possible.
-
-⚠ **After a reflash, ssh to the same address will refuse to connect.** Reflashing regenerates
-the board's host keys, so the address you used last time now presents a different one, and
-`StrictHostKeyChecking=accept-new` does not cover it — the host is not new, its key is. The
-script recognises that failure and names the fix; `--forget-host-key` does it for you:
-
-```bash
-./scripts/provision-board.sh radxa@192.168.1.42 --forget-host-key
-```
-
-Which matters more than it sounds, because a DHCP lease gets reused: the address that was one
-board last week is a different board today, with a different key, and the raw ssh error for that
-is a wall of text about a possible attack.
+`--no-dev-key` for a board that should only take releases, `--ref BRANCH` to provision from a
+branch, `--local` to send this clone's `provision.sh` rather than fetching it, which is what makes
+testing an unpushed change to it possible.
 
 `team.dev.pub` is deliberately not in the repository — a robot that trusts it installs anything
 anyone on the team builds, so that stays a per-board decision

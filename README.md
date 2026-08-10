@@ -169,11 +169,19 @@ Every push needs the apply again.
 
 ## Where next
 
+### Going further with a robot
+
 | | |
 |---|---|
-| [`docs/robot/install-dev.md`](docs/robot/install-dev.md) | Setting up a board for development, from nothing — and the fix when `--ref` is refused. |
-| [`docs/robot/cheatsheet.md`](docs/robot/cheatsheet.md) | Every `robotctl` and `btctl` command on one page: wifi, updates, pinning, rollback, logs. |
-| [`docs/design/robotd-design.md`](docs/design/robotd-design.md) | How the control side works. §3.1 is the fastest way in — who talks to `robotd` and where the crate boundary sits — with the per-tick dataflow in §5.10. |
-| [`docs/design/architecture.md`](docs/design/architecture.md) | The services, the IPC contract, safety and authority. |
-| [`docs/project/roadmap.md`](docs/project/roadmap.md) | What works today versus what is designed. |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Building, testing, and the conventions this repo holds to. |
+| [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: wifi, updates, rollback, pinning, logs. |
+| [Dev board cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, `btctl`, and the restart traps after an update. |
+| [Setting up a dev board](docs/robot/install-dev.md) | From nothing, and the fix when `--ref` is refused. |
+| [How it works](docs/design/) | The control loop, the update engine, the service split, the BLE path. |
+
+### Contributing
+
+| | |
+|---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, repo layout, conventions, releasing. |
+| [Roadmap](docs/project/roadmap.md) | What works today, what is next, and what we are deliberately not doing. |
+| [Open problems](docs/project/) | Records of what has gone wrong and what would close it. |

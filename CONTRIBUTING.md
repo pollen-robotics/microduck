@@ -20,6 +20,23 @@ Each drives the real engine with the fault injected rather than a mock of it, so
 `updater/tests/apply.rs` is the honest answer to "what does this actually guarantee" — more so
 than anything you could run by hand.
 
+One crate at a time, and formatting:
+
+```bash
+cargo test -p <crate>
+```
+
+```bash
+cargo fmt --all
+```
+
+`configd`'s NetworkManager client and `btd`'s BlueZ client are **Linux-only**, so a host build and
+a green test run say nothing about them. Lint against the board's target or the breakage ships:
+
+```bash
+RUSTFLAGS="-D warnings" cargo clippy -p configd --all-targets --target aarch64-unknown-linux-gnu
+```
+
 `scripts/board-test.sh` runs in CI against the userland we ship: it cross-compiles for the board
 and executes 13 checks — rollback, tampered-artifact refusal, boot-counter recovery, socket
 modes, peer-credential authorization — on Debian 13 (Trixie). `BOARD_IMAGES=` runs it against

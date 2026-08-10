@@ -6,8 +6,9 @@ Start at the [README](../README.md) if you have a robot and want to use it.
 
 | | |
 |---|---|
+| [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
+| [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, `btctl`. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |
-| [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` and `btctl` command on one page. |
 
 ## `design/` — you are changing the daemon
 
