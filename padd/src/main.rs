@@ -12,7 +12,7 @@
 //! ## On the robot, this runs itself
 //!
 //! `padd.service` starts at boot and stays up whether or not a pad is present, so driving takes one
-//! step and it is a pairing step: `sudo robotctl pad pair`, with the pad held in pairing mode. The
+//! step and it is a pairing step: `sudo robotctl pad pair`, with the pad in pairing mode. The
 //! pad is bonded *and trusted*, so it reconnects by itself afterwards, and this process picks it up
 //! within a tick.
 //!

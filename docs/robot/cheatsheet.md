@@ -62,16 +62,20 @@ robotctl monitor --json --hz 50 > run.jsonl
 
 ### Gamepad (`configd`)
 
-Hold the pad's pairing button — on an Xbox controller the sync button, whose light flashes quickly —
-then:
+Put the pad in pairing mode first. On an **Xbox** controller: switch it on with a *short* press of
+the Xbox button, then press the small **Sync** button on the top edge next to the USB-C port until
+the Xbox light flashes **quickly**. Holding the Xbox button switches the controller off instead,
+which is the obvious-looking mistake. On a **DualSense**: hold Create and PS together until the light
+bar flashes.
 
 ```
 sudo robotctl pad pair
 ```
 
 No MAC address: the robot looks for a gamepad in pairing mode and takes the one it finds. With two in
-pairing mode it refuses rather than guessing, and prints their addresses so you can name one — which
-is also how to pair hardware it does not recognise as a gamepad:
+pairing mode it refuses rather than guessing, and prints their addresses so you can name one. A
+failed search also lists what was in range, because a pad advertising no name or class is invisible
+to the guess and pairs fine by address:
 
 ```
 sudo robotctl pad pair 78:86:2E:BB:13:28

@@ -274,9 +274,14 @@ enum PadCommand {
 
     /// Pair the gamepad that is in pairing mode now.
     ///
-    /// Hold the pad's pairing button first — on an Xbox controller that is the sync button, and its
-    /// light flashes quickly rather than slowly. Then run this. No MAC address needed: the robot
-    /// looks for a gamepad in pairing mode and takes the one it finds.
+    /// Put the pad in pairing mode first. On an Xbox controller: switch it on with a short press of
+    /// the Xbox button, then press the small **Sync** button on the top edge, next to the USB-C
+    /// port, until the Xbox light flashes quickly. Do NOT hold the Xbox button itself — that
+    /// switches the controller off. On a DualSense: hold Create and PS together until the light bar
+    /// flashes.
+    ///
+    /// Then run this. No MAC address needed: the robot looks for a gamepad in pairing mode and
+    /// takes the one it finds.
     ///
     /// Once paired the pad is also *trusted*, which is what makes it reconnect by itself after a
     /// reboot with nobody logged in. Nothing else is needed — `padd.service` is already running and
@@ -1469,7 +1474,10 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     if let PadCommand::Pair { json: false, .. } = &command {
         // Printed before the call, not after: the call blocks for the whole discovery window, and
         // someone who ran this needs to know *now* that they should be holding the button.
-        eprintln!("looking for a gamepad in pairing mode — hold the pad's pairing button");
+        eprintln!(
+            "looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync \
+             button on the top edge (not the Xbox button, which switches it off)"
+        );
     }
 
     let result = result_of(client.call(&call)?)?;
@@ -1547,8 +1555,10 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
         proto::PadPairResult::Failed { reason, detail } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
-                    "no gamepad in pairing mode. Hold the pad's pairing button until its light \
-                     flashes quickly, then try again"
+                    "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
+                     of the Xbox button, then press the small Sync button on the top edge next to \
+                     the USB-C port until the Xbox light flashes quickly — holding the Xbox button \
+                     switches the controller off instead. Then try again"
                 }
                 proto::PadPairFailure::Ambiguous => {
                     "more than one pad is in pairing mode; name the one you want by its address"

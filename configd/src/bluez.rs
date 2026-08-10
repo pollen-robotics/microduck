@@ -281,6 +281,12 @@ impl Snapshot {
     }
 }
 
+/// The result of one search: what looked like a pad, and everything the radio saw.
+struct Found {
+    matches: Vec<Snapshot>,
+    seen: Vec<Snapshot>,
+}
+
 /// Pads, through bluetoothd.
 pub struct BlueZ {
     bus: zbus::Connection,
@@ -366,26 +372,35 @@ impl BlueZ {
     /// Returns the candidates found in the *last* sweep rather than the first hit, so "two pads are
     /// in pairing mode" can be reported as the refusal it is instead of resolved by whichever
     /// arrived first.
-    async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Vec<Snapshot>> {
+    ///
+    /// Also returns **everything else it saw**, which matters more than it looks: BlueZ reports a
+    /// freshly-discovered device with an address and often nothing else — no `Name`, no `Class`, no
+    /// `Icon` — because those need a further exchange. A pad that never resolves any of them is
+    /// invisible to [`Snapshot::is_gamepad`], and a bare "no gamepad found" would leave someone with
+    /// no way to learn the address that `--mac` needs. So the refusal carries the list.
+    async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Found> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let found: Vec<Snapshot> = self
-                .devices()
-                .await?
-                .into_iter()
+            let seen = self.devices().await?;
+            let matches: Vec<Snapshot> = seen
+                .iter()
                 .filter(|device| match mac {
                     // An explicit address bypasses the heuristic entirely. That is the escape hatch
                     // for hardware this does not recognise, and it must not be second-guessed.
                     Some(wanted) => wanted.eq_ignore_ascii_case(&device.mac),
                     None => device.is_gamepad(),
                 })
+                .cloned()
                 .collect();
 
-            if !found.is_empty() {
-                return Ok(found);
+            if !matches.is_empty() {
+                return Ok(Found { matches, seen });
             }
             if tokio::time::Instant::now() >= deadline {
-                return Ok(Vec::new());
+                return Ok(Found {
+                    matches: Vec::new(),
+                    seen,
+                });
             }
             tokio::time::sleep(DISCOVERY_POLL.min(deadline - tokio::time::Instant::now())).await;
         }
@@ -401,29 +416,52 @@ impl BlueZ {
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
 
         if !device.paired {
-            tokio::time::timeout(BOND_TIMEOUT, proxy.connect())
-                .await
-                .map_err(|_| {
-                    (
-                        proto::PadPairFailure::Timeout,
-                        "the pad did not finish connecting".to_owned(),
-                    )
-                })?
-                .map_err(|e| (proto::PadPairFailure::Rejected, e.to_string()))?;
+            // `Connect()` first, which is the order that works on this board — leading with `Pair()`
+            // on an Xbox controller returns `AuthenticationCanceled`.
+            //
+            // But **soft-failed**, deliberately. A device BlueZ has never bonded with has no known
+            // profile to connect to, so `Connect()` can answer
+            // `br-connection-profile-unavailable` before pairing has happened — and treating that
+            // as the end would refuse a pad that `Pair()` would have bonded a moment later. So the
+            // preferred order is tried first and the fallback is still available, rather than the
+            // order being enforced against the radio.
+            match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!("connected"),
+                Ok(Err(e)) => tracing::info!(error = %e, "connect first failed; trying to pair"),
+                Err(_) => tracing::info!("connect did not answer in time; trying to pair"),
+            }
 
-            // `Pair()` after a successful connect. On a pad that bonded during `Connect()` — which
-            // happens — this returns `AlreadyExists`, and that is success, not a failure to report.
-            match tokio::time::timeout(BOND_TIMEOUT, proxy.pair()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) if is_already_paired(&e) => {
-                    tracing::info!("the pad bonded during connect");
+            // Did that bond it on its own? It often does, and then `Pair()` would only answer
+            // `AlreadyExists`.
+            let paired_now = self
+                .devices()
+                .await
+                .ok()
+                .and_then(|all| {
+                    all.into_iter()
+                        .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
+                })
+                .is_some_and(|d| d.paired);
+
+            if !paired_now {
+                match tokio::time::timeout(BOND_TIMEOUT, proxy.pair()).await {
+                    Ok(Ok(())) => tracing::info!("bonded"),
+                    // Success, not a failure to report: something bonded it between the two calls.
+                    Ok(Err(e)) if is_already_paired(&e) => tracing::info!("already bonded"),
+                    Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                    Err(_) => {
+                        return Err((
+                            proto::PadPairFailure::Timeout,
+                            "the pad did not finish pairing".to_owned(),
+                        ));
+                    }
                 }
-                Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
-                Err(_) => {
-                    return Err((
-                        proto::PadPairFailure::Timeout,
-                        "the pad did not finish pairing".to_owned(),
-                    ));
+
+                // Connect again now that a bond exists, for the case the first attempt failed for
+                // want of one. Soft too: a bonded pad reconnects by itself, so failing here is not
+                // worth refusing a pairing that succeeded.
+                if let Ok(Err(e)) = tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
+                    tracing::info!(error = %e, "bonded but not connected yet");
                 }
             }
         }
@@ -511,16 +549,44 @@ impl Pads for BlueZ {
             tracing::warn!(error = %e, "could not stop discovery");
         }
 
-        let candidates = found?;
-        let device = match candidates.as_slice() {
+        let found = found?;
+        let device = match found.matches.as_slice() {
             [] => {
+                // Name what the radio *did* see, unpaired devices first. Without this the answer is
+                // "no gamepad found" and the only escape — naming an address — needs an address
+                // nobody has. A pad that advertises no name and no class is invisible to the
+                // heuristic and perfectly pairable by address, so this list is the difference
+                // between a dead end and one more command.
+                let mut others: Vec<&Snapshot> =
+                    found.seen.iter().filter(|d| !d.is_gamepad()).collect();
+                others.sort_by(|a, b| a.paired.cmp(&b.paired).then(a.mac.cmp(&b.mac)));
+                let detail = if others.is_empty() {
+                    "nothing at all turned up, not even a device this does not recognise. The pad \
+                     is probably not in pairing mode: its light has to be flashing quickly."
+                        .to_owned()
+                } else {
+                    let listed: Vec<String> = others
+                        .iter()
+                        .take(8)
+                        .map(|d| {
+                            let name = if d.name.is_empty() {
+                                "(no name yet)"
+                            } else {
+                                &d.name
+                            };
+                            format!("{} {name}", d.mac)
+                        })
+                        .collect();
+                    format!(
+                        "nothing that looks like a gamepad turned up. These were in range — if one \
+                         of them is the pad, pair it by address:\n  {}",
+                        listed.join("\n  ")
+                    )
+                };
+                tracing::warn!(seen = found.seen.len(), "no gamepad found");
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
-                    detail: Some(
-                        "nothing that looks like a gamepad turned up. Hold the pad's pairing \
-                         button until its light flashes quickly, then try again."
-                            .to_owned(),
-                    ),
+                    detail: Some(detail),
                 });
             }
             [only] => only.clone(),
