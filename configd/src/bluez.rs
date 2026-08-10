@@ -4,12 +4,32 @@
 //! and this crate already has a pure-Rust D-Bus stack for NetworkManager. Adding `bluer` here would
 //! put a second C dependency in `configd` to make four method calls.
 //!
-//! ## The order is the whole trick
+//! ## The order, and why the state decides rather than the return values
 //!
 //! `connect` **before** `pair`, and `trust` after both. Leading with `Pair()` on an Xbox controller
 //! returns `AuthenticationCanceled`; that ordering comes from `microduck_runtime`'s notes and is the
 //! one that works on this board. It used to live in a provisioning script's comments and in whoever
 //! had done it before; now it is here, once, with the reason attached.
+//!
+//! But the order is **tried, not enforced**, because BlueZ's replies do not describe what happened:
+//!
+//!  - `Connect()` on a device BlueZ has never bonded with can answer
+//!    `br-connection-profile-unavailable` — there is no profile to connect to *yet*. Refusing there
+//!    would reject a pad that `Pair()` would have bonded a moment later, so it is soft-failed.
+//!  - `Connect()` on a pad that *does* bond **returns before the bond has completed.** A HID profile
+//!    requires an encrypted link, so connecting triggers bonding, and it lands a moment afterwards.
+//!  - `Pair()` on a bond already in flight **never answers.** Not `AlreadyExists` — outstanding,
+//!    until the timeout.
+//!
+//! Those last two compose into the failure this was shipped with: read `Paired` straight after
+//! `Connect()`, see `false` about a bond in flight, call `Pair()`, wait 30 seconds for a reply that
+//! is never coming, and return a timeout about a pad that is by then paired — having never reached
+//! `set_trusted`. It presented as "the first pair times out, the second works instantly", the second
+//! being fast because the bond was already there.
+//!
+//! So `Paired` turning true is the ground truth for "this worked". `Connect()` gets
+//! [`BOND_SETTLE`] to produce it on its own, and the `Pair()` that follows is raced against the same
+//! property rather than believed.
 //!
 //! Discovery is stopped before connecting, deliberately: BlueZ will accept a `Connect()` during an
 //! active scan and it fails intermittently, which presents as a pad that pairs on the second
@@ -29,8 +49,11 @@
 //! because a human asked" is the entire authorisation, and narrowing it to the device is the only
 //! part of that this code controls.
 //!
-//! **Untested against a real BlueZ.** It type-checks for aarch64; every claim here is intent until
-//! it runs on the board.
+//! **Run against a real BlueZ on a Radxa Zero 3W with an Xbox Wireless Controller**, which is where
+//! everything above about asynchronous bonding comes from. What has been seen work: discovery finds
+//! the pad and the heuristic identifies it, the bond completes, `Trusted` sticks, `padd` drives from
+//! it, and `pad forget` drops it. What has **not** been exercised on hardware: a DualSense, two pads
+//! in pairing mode at once, and pairing by explicit address.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -56,6 +79,17 @@ const AGENT_CAPABILITY: &str = "NoInputNoOutput";
 /// the device is already in hand. BlueZ's own pairing timeout is 60s; this stays inside it so the
 /// answer comes from here rather than from a dropped D-Bus call.
 const BOND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to let a bond triggered by `Connect()` finish on its own before asking for one.
+///
+/// Bonding is asynchronous and lands a moment after `Connect()` returns, so this is the window in
+/// which "it is already happening" is distinguished from "it is not going to". Measured against a
+/// real Xbox controller, it completes inside a second; five is margin, and the cost of it being too
+/// short is a `Pair()` call on a bond in flight, which never answers.
+const BOND_SETTLE: Duration = Duration::from_secs(5);
+
+/// How often to re-read `Paired` while waiting for a bond.
+const BOND_POLL: Duration = Duration::from_millis(200);
 
 /// How often to re-read the object tree while looking for a pad.
 ///
@@ -406,6 +440,37 @@ impl BlueZ {
         }
     }
 
+    /// Watch `Paired` until it turns true, or `within` elapses.
+    ///
+    /// The property, not a method's return value, because bonding is asynchronous: `Connect()` comes
+    /// back before the bond it triggered has completed, and `Pair()` on a bond already in flight
+    /// simply never answers. `Paired` is the one thing that says whether this worked.
+    async fn wait_until_paired(&self, mac: &str, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let state = self
+                .devices()
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(mac)));
+            if let Some(state) = &state
+                && state.paired
+            {
+                tracing::info!(connected = state.connected, "bonded");
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::info!(
+                    paired = false,
+                    connected = state.is_some_and(|s| s.connected),
+                    "still not bonded"
+                );
+                return false;
+            }
+            tokio::time::sleep(BOND_POLL.min(deadline - tokio::time::Instant::now())).await;
+        }
+    }
+
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
     async fn bond(&self, device: &Snapshot) -> Result<(), (proto::PadPairFailure, String)> {
         let proxy = DeviceProxy::builder(&self.bus)
@@ -431,34 +496,34 @@ impl BlueZ {
                 Err(_) => tracing::info!("connect did not answer in time; trying to pair"),
             }
 
-            // Did that bond it on its own? **It often does**, and this re-read is load-bearing
-            // rather than an optimisation: a HID profile requires an encrypted link, so connecting
-            // triggers the bond, and calling `Pair()` on a device that has just finished bonding
-            // hangs until the timeout instead of answering `AlreadyExists`. That is a 30-second wait
-            // ending in "the pad did not finish pairing" about a pad that is, in fact, paired.
-            let after_connect = self.devices().await.ok().and_then(|all| {
-                all.into_iter()
-                    .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
-            });
-            let paired_now = after_connect.as_ref().is_some_and(|d| d.paired);
-            tracing::info!(
-                paired = paired_now,
-                connected = after_connect.as_ref().is_some_and(|d| d.connected),
-                "state after connect"
-            );
-
-            if !paired_now {
-                match tokio::time::timeout(BOND_TIMEOUT, proxy.pair()).await {
-                    Ok(Ok(())) => tracing::info!("bonded"),
-                    // Success, not a failure to report: something bonded it between the two calls.
-                    Ok(Err(e)) if is_already_paired(&e) => tracing::info!("already bonded"),
-                    Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
-                    Err(_) => {
-                        return Err((
-                            proto::PadPairFailure::Timeout,
-                            "the pad did not finish pairing".to_owned(),
-                        ));
-                    }
+            // Did that bond it on its own? It usually does — a HID profile requires an encrypted
+            // link, so connecting triggers bonding — but **it finishes a moment after `Connect()`
+            // returns**, not before. Reading `Paired` immediately therefore says `false` about a
+            // bond that is already in flight, and the `Pair()` that follows never answers: BlueZ
+            // leaves it outstanding rather than reporting `AlreadyExists`.
+            //
+            // That is the whole of the "first pair times out, second one works instantly" report:
+            // the first call bonded the pad, waited 30s for a reply that was never coming, and
+            // returned a timeout before it could set `Trusted`.
+            if !self.wait_until_paired(&device.mac, BOND_SETTLE).await {
+                // Genuinely not bonding on its own, so ask. **Raced against the state**, not
+                // trusted to answer: `Paired` turning true is the ground truth for "this worked",
+                // and `Pair()`'s reply is only one of the two ways to learn it.
+                let paired = tokio::select! {
+                    outcome = tokio::time::timeout(BOND_TIMEOUT, proxy.pair()) => match outcome {
+                        Ok(Ok(())) => { tracing::info!("bonded"); true }
+                        // Something bonded it between the two calls — success, not a failure.
+                        Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
+                        Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                        Err(_) => false,
+                    },
+                    bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
+                };
+                if !paired {
+                    return Err((
+                        proto::PadPairFailure::Timeout,
+                        "the pad did not finish pairing".to_owned(),
+                    ));
                 }
 
                 // Connect again now that a bond exists, for the case the first attempt failed for
