@@ -129,18 +129,14 @@ Install the latest release:
 sudo robotctl update apply daemon
 ```
 
-And go back if it misbehaves:
+Go back if it misbehaves:
 
 ```bash
 sudo robotctl update rollback daemon
 ```
 
-`daemon` is the component name — one component covering every binary.
-
-`apply daemon` means "install what the stable channel offers", not "install the newest thing".
-That is what you want on a robot. On a **dev board** it is usually a downgrade, because the
-branch builds you have been testing are newer than the last stable release — there, name what you
-want with `--ref`, below.
+`daemon` covers every binary. On a dev board this installs the latest *stable* release, which is
+usually a downgrade — use `--ref` below instead.
 
 ## Put your branch on the robot
 
