@@ -1512,13 +1512,17 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
         let _ = writeln!(out, "pad     none paired — run:  sudo robotctl pad pair");
     }
     for pad in &status.pads {
-        // Three states, because they fail differently: connected and drivable; paired but out of
-        // range or switched off; paired and *not trusted*, which is the one that looks fine and
-        // silently does not come back after a reboot.
+        // Four states, because they fail differently — and *trusted* is reported even when the pad
+        // is connected, which is the case that most looks like everything is fine: it drives now and
+        // does not come back after a reboot, because approving a reconnection needs an agent and at
+        // boot there is none.
         let state = match (pad.connected, pad.trusted) {
-            (true, _) => "connected".to_owned(),
+            (true, true) => "connected".to_owned(),
+            (true, false) => "connected, but NOT trusted — it will not reconnect after a reboot; \
+                              re-run:  sudo robotctl pad pair"
+                .to_owned(),
             (false, true) => "paired, not connected — switch the pad on".to_owned(),
-            (false, false) => "paired but NOT trusted — re-run: sudo robotctl pad pair".to_owned(),
+            (false, false) => "paired but NOT trusted — re-run:  sudo robotctl pad pair".to_owned(),
         };
         let _ = writeln!(out, "pad     {} {}  {}", pad.name, pad.mac, state);
     }

@@ -431,17 +431,21 @@ impl BlueZ {
                 Err(_) => tracing::info!("connect did not answer in time; trying to pair"),
             }
 
-            // Did that bond it on its own? It often does, and then `Pair()` would only answer
-            // `AlreadyExists`.
-            let paired_now = self
-                .devices()
-                .await
-                .ok()
-                .and_then(|all| {
-                    all.into_iter()
-                        .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
-                })
-                .is_some_and(|d| d.paired);
+            // Did that bond it on its own? **It often does**, and this re-read is load-bearing
+            // rather than an optimisation: a HID profile requires an encrypted link, so connecting
+            // triggers the bond, and calling `Pair()` on a device that has just finished bonding
+            // hangs until the timeout instead of answering `AlreadyExists`. That is a 30-second wait
+            // ending in "the pad did not finish pairing" about a pad that is, in fact, paired.
+            let after_connect = self.devices().await.ok().and_then(|all| {
+                all.into_iter()
+                    .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
+            });
+            let paired_now = after_connect.as_ref().is_some_and(|d| d.paired);
+            tracing::info!(
+                paired = paired_now,
+                connected = after_connect.as_ref().is_some_and(|d| d.connected),
+                "state after connect"
+            );
 
             if !paired_now {
                 match tokio::time::timeout(BOND_TIMEOUT, proxy.pair()).await {
