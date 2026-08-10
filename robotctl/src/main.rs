@@ -1575,9 +1575,11 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                      hci0 appears about 73s in"
                 }
                 proto::PadPairFailure::Rejected => {
-                    "Bluetooth refused the pairing. The usual cause is a missing \
-                     `Privacy = device` in /etc/bluetooth/main.conf — run scripts/setup-board.sh \
-                     and reboot"
+                    "Bluetooth refused the pairing. Most often the pad had left pairing mode by \
+                     the time the exchange started: press Sync again and re-run this immediately, \
+                     while its light is still flashing quickly. If it never succeeds, check that \
+                     /etc/bluetooth/main.conf has `Privacy = device` — run scripts/setup-board.sh \
+                     and reboot, since it does not apply until then"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };

@@ -490,11 +490,20 @@ impl BlueZ {
             // as the end would refuse a pad that `Pair()` would have bonded a moment later. So the
             // preferred order is tried first and the fallback is still available, rather than the
             // order being enforced against the radio.
-            match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
-                Ok(Ok(())) => tracing::info!("connected"),
-                Ok(Err(e)) => tracing::info!(error = %e, "connect first failed; trying to pair"),
-                Err(_) => tracing::info!("connect did not answer in time; trying to pair"),
-            }
+            let connected = match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => {
+                    tracing::info!("connected");
+                    true
+                }
+                Ok(Err(e)) => {
+                    tracing::info!(error = %e, "connect first failed; asking to pair");
+                    false
+                }
+                Err(_) => {
+                    tracing::info!("connect did not answer in time; asking to pair");
+                    false
+                }
+            };
 
             // Did that bond it on its own? It usually does — a HID profile requires an encrypted
             // link, so connecting triggers bonding — but **it finishes a moment after `Connect()`
@@ -505,7 +514,17 @@ impl BlueZ {
             // That is the whole of the "first pair times out, second one works instantly" report:
             // the first call bonded the pad, waited 30s for a reply that was never coming, and
             // returned a timeout before it could set `Trusted`.
-            if !self.wait_until_paired(&device.mac, BOND_SETTLE).await {
+            // Wait for a bond to land **only if a connect succeeded**, because that is the only case
+            // where one is in flight. After a failed connect the wait is dead time, and dead time
+            // here does damage: a pad holds pairing mode for a limited window, and spending five
+            // seconds of it waiting for something that was never started is how a fresh pairing ends
+            // in `AuthenticationFailed`.
+            let settle = if connected {
+                BOND_SETTLE
+            } else {
+                Duration::ZERO
+            };
+            if !self.wait_until_paired(&device.mac, settle).await {
                 // Genuinely not bonding on its own, so ask. **Raced against the state**, not
                 // trusted to answer: `Paired` turning true is the ground truth for "this worked",
                 // and `Pair()`'s reply is only one of the two ways to learn it.
