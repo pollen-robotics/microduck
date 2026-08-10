@@ -47,6 +47,9 @@ jobs:
       # and `provision-board.sh` on an operator's machine — so nothing else would catch a typo
       # in one until someone tried to provision a board. shellcheck is on the runner already.
       #
+      # `ci-release-notes.sh` is here despite running only in CI, unlike `ci-cross-deps.sh`: it runs
+      # *during a release*, which is the worst moment to find a typo in a shell script.
+      #
       # `migrate-network.sh` was missing from this list while being the riskiest of them —
       # it is the one step that can make a headless board unreachable, and the one nobody
       # re-runs once their own board is migrated. `board-test.sh` is deliberately absent:
@@ -56,7 +59,7 @@ jobs:
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.

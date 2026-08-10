@@ -19,31 +19,36 @@
 # reaches client robots is byte-identical to what was validated.
 name: release
 
+# One trigger, deliberately.
+#
+# Publishing a release in the UI creates the tag, so this fires for the UI path as well as for
+# `git push --tags` — verified both ways. There *was* also a `release: published` trigger, and it made
+# every UI release start two identical runs; the concurrency group below cancelled one, and a
+# cancelled run counts as a failed check, so a perfectly good release showed a red ✗ on its tag.
+#
+# What one trigger gives up: publishing a release against a tag that *already exists* does nothing.
+# That tag's push already built it, so there is nothing to do — and if a build genuinely needs
+# repeating, re-run it from the Actions tab.
 on:
   push:
     tags:
       - 'daemon-staging-v*'
       - 'daemon-v*'
-  # Publishing a release in the UI creates the tag, so `push` would cover that case on its own — but
-  # only that one. A release published against an *existing* tag fires only this, and that is a door
-  # people will use.
-  release:
-    types: [published]
 
 permissions:
   contents: write
 
-# One run per tag. Publishing a release in the UI fires *both* triggers — the tag `push` and
-# `release: published` — and without this both build, sign and upload to the same release. They race
-# on the upload, and because each build stamps its own `DUCK_BUILD_TIME` the artifacts are not
-# byte-identical, so the release can end up with a manifest from one run and a tarball from another:
-# a sha256 mismatch that no robot could install and nothing would explain.
+# One run per tag, still — a belt to the single trigger's braces. Two runs publishing the same tag
+# would race on the upload, and because each build stamps its own `DUCK_BUILD_TIME` the artifacts are
+# not byte-identical: the release could end up with a manifest from one run and a tarball from
+# another, which is a sha256 mismatch no robot can install and nothing in the release explains.
 #
-# `cancel-in-progress`, because the two runs are the same work and the later event is as good as the
-# earlier one. Nothing is published until the final step, so a cancelled run leaves nothing behind.
+# `cancel-in-progress: false`, because a cancelled run reports as a failed check and there is nothing
+# to cancel for anyway: whoever pushed the same tag twice wants the second attempt to wait, not to
+# make the first look broken.
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.ref_name }}
-  cancel-in-progress: true
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   # Which channel, which version, and whether there is anything to promote.
@@ -61,8 +66,8 @@ jobs:
     # every branch, and those are not release attempts. Anything else beginning with `daemon-` is
     # someone trying to cut a release, and deserves a red X with the answer in it.
     if: >-
-      startsWith(github.event.release.tag_name || github.ref_name, 'daemon-') &&
-      !startsWith(github.event.release.tag_name || github.ref_name, 'daemon-dev-')
+      startsWith(github.ref_name, 'daemon-') &&
+      !startsWith(github.ref_name, 'daemon-dev-')
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       version: ${{ steps.plan.outputs.version }}
@@ -73,7 +78,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -eu
           case "$TAG" in

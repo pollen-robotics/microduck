@@ -356,35 +356,43 @@ jobs:
         run: |
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             title="daemon ${{ inputs.version }} (staging)"
-            notes="Staging build from \`${GITHUB_SHA}\`.
+            provenance="Staging build from \`${GITHUB_SHA}\`.
 
           Not for client robots. Promote it — create a release for tag \`daemon-v${{ inputs.version }}\`,
           or run the \`promote\` workflow — once a canary has run the on-device acceptance checks.
-          Promotion ships these exact bytes.
-          "
+          Promotion ships these exact bytes."
             flag=--prerelease
           else
-            title="daemon ${{ inputs.version }}"
             # Said in the release itself, because it is the one thing that distinguishes this from a
             # promoted release and nothing else would record it. Built here means engine-verified —
             # signature, manifest and a real install, all checked in this job — but not *canaried*:
             # no robot ran these bytes before they became the stable channel.
-            notes="Built directly from \`${GITHUB_SHA}\`, with no staging release to promote.
+            title="daemon ${{ inputs.version }}"
+            provenance="Built directly from \`${GITHUB_SHA}\`, with no staging release to promote.
 
           Verified through the update engine in CI, but **not validated on a robot**. For the
           canaried path, publish a pre-release for \`daemon-staging-v${{ inputs.version }}\` first
-          and then promote it.
-          "
+          and then promote it."
             flag=--prerelease=false
           fi
+
+          notes="$(PROVENANCE="$provenance" TAG="$TAG" ./scripts/ci-release-notes.sh)"
 
           # Create it if absent, fill it in either way — see the note in release.yml on why this is
           # not a single `gh release create`. The flag is re-asserted on a release that already
           # exists: staging must be flagged so a plain `update apply` skips it, and stable must not
           # be, or it ships to nobody.
+          #
+          # Notes are only written when there are none. Anything typed into the UI is somebody's
+          # deliberate description of their own release and outranks a generated one.
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release $TAG exists; filling it in"
             gh release edit "$TAG" "$flag" --title "$title"
+            if [ -z "$(gh release view "$TAG" --json body --jq .body)" ]; then
+              gh release edit "$TAG" --notes "$notes"
+            else
+              echo "keeping the notes it came with"
+            fi
           else
             gh release create "$TAG" "$flag" --title "$title" --notes "$notes"
           fi

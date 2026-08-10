@@ -168,21 +168,43 @@ jobs:
       # `--prerelease=false` is re-asserted rather than assumed: a stable release that is flagged as
       # a prerelease is invisible to a plain `update apply`, so a promotion into a release object
       # someone had drafted would silently ship to nobody.
+      #
+      # Create-then-fill, like _build-release.yml, and re-runnable for the same reason: a promotion
+      # that failed *after* creating the release could not be retried, which is the worst moment for a
+      # step to be one-shot — the stable release would exist, carrying nothing a robot can install,
+      # until someone deleted it by hand.
+      #
+      # `--prerelease=false` is re-asserted rather than assumed: a stable release flagged as a
+      # prerelease is invisible to a plain `update apply`, so a promotion into a release object
+      # somebody had drafted would silently ship to nobody.
+      #
+      # The notes carry a changelog, which they did not use to. "Promoted from
+      # daemon-staging-v0.4.0" was all a stable release said, while the changelog lived on the
+      # staging release — which this workflow then deleted. The release everybody actually reads was
+      # the one with no account of what was in it.
       - name: Publish the stable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="Promoted from \`$staging_tag\`.
-
-          The artifact is the one validated in staging — same bytes, same sha256, checked
-          during promotion. This release is self-contained: manifest, signature, artifact,
-          and the bootstrap binary used by \`scripts/install.sh\` to install from scratch.
-          "
           title="daemon ${{ inputs.version }}"
+          provenance="Promoted from \`$staging_tag\`.
+
+          The artifact is the one validated in staging — same bytes, same sha256, checked during
+          promotion. This release is self-contained: manifest, signature, artifact, and the bootstrap
+          binary used by \`scripts/install.sh\` to install from scratch."
+
+          notes="$(PROVENANCE="$provenance" TAG="$stable_tag" ./scripts/ci-release-notes.sh)"
 
           if gh release view "$stable_tag" >/dev/null 2>&1; then
             echo "release $stable_tag exists; filling it in"
             gh release edit "$stable_tag" --prerelease=false --title "$title"
+            # Only when there are none: notes typed into the UI are somebody's deliberate
+            # description and outrank a generated one.
+            if [ -z "$(gh release view "$stable_tag" --json body --jq .body)" ]; then
+              gh release edit "$stable_tag" --notes "$notes"
+            else
+              echo "keeping the notes it came with"
+            fi
           else
             gh release create "$stable_tag" --title "$title" --notes "$notes"
           fi
@@ -193,13 +215,6 @@ jobs:
             bootstrap/updaterd-bootstrap-aarch64 \
             --clobber
 
-      # Only now — the stable release exists and carries every byte it references, so the
-      # staging release has no readers left. Deleting it is what keeps the release list
-      # honest: a `daemon-staging-*` tag that outlives its promotion is installable via
-      # `--ref`, and is just an older name for what stable already serves.
-      #
-      # `--cleanup-tag`, for the same reason as in `prune-dev-releases.yml`: a surviving
-      # tag keeps resolving.
       - name: Retire the staging release
         env:
           GH_TOKEN: ${{ github.token }}
