@@ -1,7 +1,7 @@
 # Contributing
 
-For working on the daemons themselves. If you have a robot and want to use it, the
-[README](README.md) is the shorter door.
+For working on the daemons themselves. To use a robot rather than change it, see the
+[README](README.md).
 
 ## Building and testing
 

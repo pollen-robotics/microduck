@@ -2,10 +2,6 @@
 
 The software that runs on the robot, and the machinery that ships it there.
 
-If you have a robot on the bench, this page is the whole first hour: check it is alive, drive
-it with a gamepad, watch what it is doing, run your own policy on it, and put a branch of
-`robotd` on it. Everything else is a link at the bottom.
-
 The robot answers on a unix socket, `/run/robotd.sock`, speaking JSON-RPC one object per line.
 `robotctl` is the CLI for that socket and runs on the robot itself.
 
@@ -169,9 +165,9 @@ what you want — `--ref main` or `--ref my-branch` — unless you genuinely mea
 
 | | |
 |---|---|
-| [`docs/install-dev.md`](docs/install-dev.md) | Setting up a board for development, from nothing. Read it when `--ref` fails, or when you have a board and no robot on it yet. |
-| [`docs/cheatsheet.md`](docs/cheatsheet.md) | Every `robotctl` and `btctl` command on one page — wifi, updates, pinning, rollback, logs. Read it when you need a command you have not memorised. |
-| [`docs/robotd-design.md`](docs/robotd-design.md) | How the control side works. §3.1 is the fastest way in — who talks to `robotd` and where the crate boundary sits — with the per-tick dataflow in §5.10. Read it before changing the loop. |
-| [`docs/architecture.md`](docs/architecture.md) | The services, the IPC contract, safety and authority. Read it when your change crosses a daemon boundary. |
-| [`docs/roadmap.md`](docs/roadmap.md) | What actually works today versus what is designed. Read it before assuming a feature exists. |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Building, testing and the conventions this repo holds to. Read it before your first PR. |
+| [`docs/install-dev.md`](docs/install-dev.md) | Setting up a board for development, from nothing — and the fix when `--ref` is refused. |
+| [`docs/cheatsheet.md`](docs/cheatsheet.md) | Every `robotctl` and `btctl` command on one page: wifi, updates, pinning, rollback, logs. |
+| [`docs/robotd-design.md`](docs/robotd-design.md) | How the control side works. §3.1 is the fastest way in — who talks to `robotd` and where the crate boundary sits — with the per-tick dataflow in §5.10. |
+| [`docs/architecture.md`](docs/architecture.md) | The services, the IPC contract, safety and authority. |
+| [`docs/roadmap.md`](docs/roadmap.md) | What works today versus what is designed. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Building, testing, and the conventions this repo holds to. |

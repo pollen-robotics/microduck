@@ -1,10 +1,10 @@
 # Installing on a dev board
 
-Getting a board from nothing to a robot you can push branches to. This is the **developer**
-path: it trusts the team dev key, so the board will install anything anyone on the team builds.
-A customer robot is set up differently and deliberately refuses those builds.
+Getting a board from nothing to a robot you can push branches to.
 
-Everything here assumes a dev board, never a customer robot.
+A dev board trusts the team dev key, so it will install anything anyone on the team builds. A
+customer robot is set up differently and deliberately refuses those builds — everything here
+assumes a dev board, never a customer robot.
 
 ## What you need
 

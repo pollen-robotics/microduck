@@ -17,9 +17,8 @@ loses recent logs on a power cut, which is how a robot is actually switched off.
 under `/var/lib` is therefore the only durable record — which is what `architecture.md` §8.2
 designed it to be.
 
-> **Just want a dev board working?** [`docs/install-dev.md`](../docs/install-dev.md) is the short
-> linear procedure. This page is the reference behind it: what those commands actually do, the
-> trust chain, what ends up where, and where logs go.
+> To just get a dev board working, [`docs/install-dev.md`](../docs/install-dev.md) is the short
+> procedure. Below is the trust chain, what ends up where, and where logs go.
 
 ## Quickstart
 
