@@ -123,6 +123,17 @@ pub trait RobotIo {
     /// a running value of 200.
     fn set_gain(&mut self, kp: u16) -> Result<()>;
 
+    /// Torque on or off, every joint.
+    ///
+    /// On the trait — rather than only on the bus — because bringing the robot up is now something
+    /// the control loop does when a human asks, and everything that reaches a motor goes through
+    /// [`crate::safety::Safety`], which owns the only handle.
+    ///
+    /// **Nothing calls this at startup, and that part has not changed.** A `robotd` restarted by an
+    /// update must leave a standing robot standing: torque comes on when someone enables the policy,
+    /// never because a process began.
+    fn set_torque(&mut self, on: bool) -> Result<()>;
+
     /// Supply voltage and case temperatures, in one extra transaction.
     ///
     /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
@@ -174,6 +185,12 @@ pub struct FakeIo {
     pub slow: Option<SlowSensors>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
+    /// Last torque state commanded, or `None` if nothing ever asked. `None` is the assertion that
+    /// matters most: it is what "a restart did not move the robot" looks like.
+    pub torque: Option<bool>,
+    /// How many times torque was written, so a test can tell "brought up once" from "written every
+    /// tick" — the latter being a bus transaction per joint per tick.
+    pub torque_writes: usize,
 }
 
 impl Default for FakeIo {
@@ -198,6 +215,8 @@ impl FakeIo {
                 temps_c: [32.0; NUM_JOINTS],
             }),
             track_targets: true,
+            torque: None,
+            torque_writes: 0,
         }
     }
 
@@ -256,6 +275,12 @@ impl RobotIo for FakeIo {
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         self.last_gain = Some(kp);
+        Ok(())
+    }
+
+    fn set_torque(&mut self, on: bool) -> Result<()> {
+        self.torque = Some(on);
+        self.torque_writes += 1;
         Ok(())
     }
 

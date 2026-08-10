@@ -70,6 +70,13 @@ const STATE_BUFFER: usize = 256;
 /// ([`publish_slow_sensors`]).
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
+/// How long the ramp to the home pose takes when the policy is first enabled.
+///
+/// The same two seconds `robotd init` uses, and for the same reason: fast enough that nobody wonders
+/// whether the button did anything, slow enough that a robot going from limp to standing does not
+/// snap. Not a parameter yet — one number with no evidence that anyone wants a different one.
+const HOME_RAMP: Duration = Duration::from_secs(2);
+
 /// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
 /// ~10 s time constant, which is what makes the number readable: the raw voltage sags
 /// several tenths of a volt on every step and recovers between them, so an unsmoothed
@@ -212,6 +219,12 @@ struct RobotState {
     fallen: AtomicBool,
     /// The policy is driving and has been asked for a non-zero velocity.
     moving: AtomicBool,
+    /// Torque is on and the joints are at the home pose, so the policy can drive.
+    ///
+    /// False covers two different states on purpose — never brought up, and ramping — because a
+    /// client can act on neither: the answer to both is "wait, or press Start". The journal
+    /// distinguishes them.
+    homed: AtomicBool,
 
     period_us: u64,
     min_achieved_hz: f64,
@@ -254,6 +267,7 @@ impl RobotState {
                 .flatten(),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
+            homed: AtomicBool::new(false),
             period_us: params.period().as_micros() as u64,
             min_achieved_hz: params.update_gate.min_achieved_hz,
             stall_periods: params.update_gate.stall_periods,
@@ -730,6 +744,54 @@ const STARTUP_READ_LOG_EVERY: u32 = 30;
 /// for the one read that happens before the loop starts.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
+/// How far the robot has got towards being drivable.
+///
+/// This is what made pressing Start on a fresh robot do nothing visible: the policy ran, the loop
+/// wrote positions, and the servos ignored them because they had no torque. Torque came from
+/// `robotd init` — a separate subcommand that opens the motor bus itself, so it needs the daemon
+/// stopped, and which appeared in no documentation.
+///
+/// The invariant the old design protected is narrower than "never touch torque", and it survives
+/// intact: **nothing here runs because a process started.** A `robotd` restarted by an update finds
+/// `Limp`, writes nothing new, and leaves a standing robot standing. Only an explicit
+/// `robot.enable` moves it on, which is a human pressing Start.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Bringup {
+    /// No torque asked for yet. The loop still reads, publishes and holds — it just cannot make the
+    /// robot do anything, which is the correct state for a robot nobody has asked to move.
+    Limp,
+    /// Torque is on and the joints are ramping to the home pose. The policy does not drive yet: it
+    /// would be stepping from wherever the robot was slumped, which is exactly the lurch the ramp
+    /// exists to avoid.
+    Homing {
+        from: [f64; NUM_JOINTS],
+        since: Instant,
+    },
+    /// At the home pose with torque on. The policy drives when enabled.
+    Ready,
+}
+
+impl Bringup {
+    /// The interpolated target for this tick, or `None` once the ramp is done.
+    ///
+    /// Linear, like `DynamixelIo::interpolate_to` which `robotd init` uses — same shape, except this
+    /// one is computed per tick instead of blocking the thread, because here the loop is running.
+    fn homing_target(&self, now: Instant) -> Option<[f64; NUM_JOINTS]> {
+        let Bringup::Homing { from, since } = self else {
+            return None;
+        };
+        let t = now.duration_since(*since).as_secs_f64() / HOME_RAMP.as_secs_f64();
+        if t >= 1.0 {
+            return None;
+        }
+        let mut target = [0.0; NUM_JOINTS];
+        for (i, slot) in target.iter_mut().enumerate() {
+            *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
+        }
+        Some(target)
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -872,6 +934,7 @@ async fn control_loop<T: RobotIo>(
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
     let mut was_driving = false;
+    let mut bringup = Bringup::Limp;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
@@ -903,10 +966,67 @@ async fn control_loop<T: RobotIo>(
         let (command, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
+        // Bring the robot up when someone asks it to drive and it has no torque yet.
+        //
+        // Gated on `!safety.fallen()` as well as on the request, and that is not belt-and-braces: a
+        // robot the IMU calls fallen is one `apply` will command at limp gain anyway, so ramping it
+        // would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and
+        // says to stand the robot up first; `robotd init`, with the daemon stopped, is still the way
+        // to do that.
+        //
+        // Needs a sample: `from` is where the joints actually are, and starting a ramp from a
+        // position nobody read would be the lurch this exists to avoid.
+        // `controller.is_some()` as well, because this call means "enable the policy": powering the
+        // joints to run a policy that is disabled or would not load is work towards nothing, and it
+        // would make a release whose bundle is broken stand the robot up and then hold. A robot that
+        // should stand without a policy is what `robotd init` is for.
+        if let (Bringup::Limp, true, true, false, Some(sensors)) = (
+            bringup,
+            snapshot.enabled,
+            controller.is_some(),
+            safety.fallen(),
+            sensors.as_ref(),
+        ) {
+            match safety.set_torque(true) {
+                Ok(()) => {
+                    tracing::warn!(
+                        ?HOME_RAMP,
+                        "enabling the policy: torque on, ramping to home"
+                    );
+                    bringup = Bringup::Homing {
+                        from: sensors.positions,
+                        since: tick_start,
+                    };
+                }
+                // Reported, not fatal, and it stays `Limp` so the next tick tries again: a bus that
+                // dropped one transaction is ordinary, and a robot that refused to ever come up
+                // because of it would be worse than one that keeps asking.
+                Err(e) => tracing::warn!(error = %e, "cannot enable torque; the robot stays limp"),
+            }
+        }
+
+        // The ramp finishing is what makes the policy eligible to drive.
+        if let Bringup::Homing { .. } = bringup
+            && bringup.homing_target(tick_start).is_none()
+        {
+            tracing::warn!("at the home pose; the policy has the robot");
+            bringup = Bringup::Ready;
+            hold = DEFAULT_POSITION;
+        }
+        state
+            .homed
+            .store(bringup == Bringup::Ready, Ordering::Relaxed);
+
         // Drive only with a sample to drive from: a tick whose read failed has no
         // observation to build, and inventing one would feed the policy a stale robot.
-        let driving =
-            snapshot.enabled && controller.is_some() && !safety.fallen() && sensors.is_some();
+        //
+        // And only once the ramp is done, or the policy's first step would come from wherever the
+        // robot was slumped.
+        let driving = snapshot.enabled
+            && bringup == Bringup::Ready
+            && controller.is_some()
+            && !safety.fallen()
+            && sensors.is_some();
 
         if driving && !was_driving {
             // Starting fresh: a stale previous action in the observation, or a filter
@@ -940,6 +1060,16 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
             }
+            // Ramping to the home pose. `moving` is true, because it is: the joints are travelling,
+            // and `safeToRestart` must not say yes in the middle of it.
+            _ if bringup.homing_target(tick_start).is_some() => (
+                bringup
+                    .homing_target(tick_start)
+                    .expect("just checked it is Some"),
+                params.policy.gain,
+                true,
+                "homing",
+            ),
             _ => (hold, params.policy.gain, false, "held"),
         };
         state.moving.store(moving, Ordering::Relaxed);
@@ -2196,6 +2326,17 @@ mod tests {
     /// `control_loop` takes its IO by value, which makes the fake unreachable afterwards.
     /// This borrows instead so a test can inspect what was written.
     async fn control_loop_probe<T: RobotIo>(io: &mut T, state: Arc<RobotState>, period: Duration) {
+        control_loop_probe_with(io, state, Arc::new(Intents::new()), period).await
+    }
+
+    /// As above, with the intents the caller wants to drive — for the tests that need to press
+    /// Start.
+    async fn control_loop_probe_with<T: RobotIo>(
+        io: &mut T,
+        state: Arc<RobotState>,
+        intents: Arc<Intents>,
+        period: Duration,
+    ) {
         struct Borrowed<'a, T>(&'a mut T);
         impl<T: RobotIo> RobotIo for Borrowed<'_, T> {
             fn read(&mut self) -> duck_control::io::Result<duck_control::Sensors> {
@@ -2207,17 +2348,121 @@ mod tests {
             fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
                 self.0.set_gain(kp)
             }
+            fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
+                self.0.set_torque(on)
+            }
             fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
                 self.0.slow_sensors()
             }
         }
-        control_loop(
-            Borrowed(io),
-            state,
-            Arc::new(Intents::new()),
-            Params::default(),
-            period,
-        )
-        .await
+        control_loop(Borrowed(io), state, intents, Params::default(), period).await
+    }
+
+    /// **A restart must not move the robot**, and that is the invariant the old "never touch torque"
+    /// rule existed to protect. It is unchanged: the loop reads, publishes and holds, and asks for no
+    /// torque at all until someone enables the policy.
+    ///
+    /// `torque: None` is the assertion — not `Some(false)`. Nothing wrote to those registers, so an
+    /// update that restarts `robotd` mid-stand leaves the servos exactly as they were.
+    #[tokio::test]
+    async fn a_restart_asks_for_no_torque() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let s = Arc::new(RobotState::new(&Params::default(), false, false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            tx.send((io.torque, io.torque_writes)).unwrap();
+        });
+
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let (torque, writes) = rx.recv().unwrap();
+        assert_eq!(torque, None, "the loop powered the joints on its own");
+        assert_eq!(writes, 0, "torque was written {writes} times at startup");
+        assert!(!s.homed.load(Ordering::Relaxed));
+    }
+
+    /// Enabling a policy that is not there must not power the joints either.
+    ///
+    /// `robot.enable` means "enable the policy", so bringing the robot up to run one that is disabled
+    /// or would not load is work towards nothing — and on a release whose bundle is broken it would
+    /// stand the robot up and then hold it there, which reads as working. A robot that should stand
+    /// without a policy is what `robotd init` is for.
+    #[tokio::test]
+    async fn enabling_without_a_policy_leaves_the_joints_limp() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.set_enabled(true);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send(io.torque).unwrap();
+        });
+
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(rx.recv().unwrap(), None, "powered up with no policy to run");
+        assert!(!s.homed.load(Ordering::Relaxed));
+    }
+
+    /// The ramp itself, which is the part that decides whether a robot stands up or snaps.
+    ///
+    /// Tested directly because the loop cannot reach it in CI: bringing up requires a loaded policy,
+    /// and there is no ONNX Runtime here. What runs on the board is this arithmetic plus one
+    /// `set_torque`.
+    #[test]
+    fn the_home_ramp_starts_where_the_robot_is_and_ends_at_home() {
+        let mut resting = DEFAULT_POSITION;
+        resting[0] = DEFAULT_POSITION[0] + 0.5;
+        let since = Instant::now();
+        let bringup = Bringup::Homing {
+            from: resting,
+            since,
+        };
+
+        // At the start it commands where the robot already is: no step, no lurch.
+        let first = bringup.homing_target(since).expect("ramping");
+        assert_eq!(first, resting);
+
+        // Halfway is halfway, per joint.
+        let mid = bringup
+            .homing_target(since + HOME_RAMP / 2)
+            .expect("still ramping");
+        assert!(
+            (mid[0] - (resting[0] + DEFAULT_POSITION[0]) / 2.0).abs() < 1e-6,
+            "{}",
+            mid[0]
+        );
+
+        // And it ends — `None` is what promotes the state to `Ready`, so a ramp that never
+        // finished would leave the policy permanently locked out.
+        assert!(bringup.homing_target(since + HOME_RAMP).is_none());
+        assert!(
+            bringup
+                .homing_target(since + HOME_RAMP + Duration::from_secs(1))
+                .is_none()
+        );
+
+        // Neither other state ramps anything.
+        assert!(Bringup::Limp.homing_target(since).is_none());
+        assert!(Bringup::Ready.homing_target(since).is_none());
     }
 }

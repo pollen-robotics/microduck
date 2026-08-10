@@ -142,6 +142,23 @@ impl<T: RobotIo> Safety<T> {
         self.fallen
     }
 
+    /// Power the joints, so the positions this writes can actually be held.
+    ///
+    /// Through here because [`Safety`] owns the only [`RobotIo`] handle — the same reason
+    /// [`Self::slow_sensors`] is a passthrough. Unlike that one this *does* affect the robot, so it
+    /// is worth being explicit about what it is and is not:
+    ///
+    ///  - It is called when a human enables the policy on a limp robot, once, not per tick.
+    ///  - It is **not** called at startup. A `robotd` restarted by an update must leave a standing
+    ///    robot standing, and nothing here changes that.
+    ///  - It does not bypass anything. Torque decides whether the motors hold what
+    ///    [`Self::apply`] writes; every clamp, the fall gate and the limp gain still apply to *what*
+    ///    gets written. A fallen robot with torque on is still commanded `hold` at `gain_limp`.
+    pub fn set_torque(&mut self, on: bool) -> Result<(), IoError> {
+        tracing::warn!(on, "torque");
+        self.io.set_torque(on)
+    }
+
     /// The gain last written to the servos, or `None` before the first write. This is what
     /// the robot is running at, which is not always what the caller asked for.
     pub fn gain(&self) -> Option<u16> {
