@@ -2,7 +2,7 @@
 //!
 //! The trust anchor is a *set* of minisign public keys on disk, not one baked-in
 //! key, so a lost or compromised key is survivable
-//! (`docs/updater-design.md` §5.4).
+//! (`docs/design/updater-design.md` §5.4).
 //!
 //! Invariant: **no unsigned bytes are ever extracted to a live path or executed.**
 //! Verification order is manifest signature → artifact hash → artifact
@@ -30,7 +30,7 @@ const CHUNK: usize = 64 * 1024;
 /// Not a security boundary — the signature already established provenance — but a
 /// guard against an accidentally enormous artifact filling the eMMC. Configurable
 /// because a model bundle of several ONNX policies is legitimately much larger than
-/// a daemon binary (`docs/updater-design.md` §5.5), and a too-low ceiling would
+/// a daemon binary (`docs/design/updater-design.md` §5.5), and a too-low ceiling would
 /// reject a genuine release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {

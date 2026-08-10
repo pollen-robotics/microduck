@@ -1,6 +1,6 @@
 //! `robotd` — the robot control daemon.
 //!
-//! **Slice 1** (`docs/robotd-design.md` §4): a control loop that drives the real bus at the
+//! **Slice 1** (`docs/design/robotd-design.md` §4): a control loop that drives the real bus at the
 //! real rate and holds the pose it started in. No observations, no policy, no intents.
 //!
 //! It is not walking yet because that is not what it is for yet. The update engine is
@@ -428,7 +428,7 @@ impl RobotState {
 /// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
 /// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
 /// still running the *previous* binary by design, so which release directory a process came
-/// from cannot be inferred (`docs/architecture.md` §8).
+/// from cannot be inferred (`docs/design/architecture.md` §8).
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,

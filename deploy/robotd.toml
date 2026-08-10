@@ -2,11 +2,11 @@
 #
 # Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
 # anything here needs `systemctl restart robotd`. Live reload is deferred
-# (docs/robotd-design.md §7.2).
+# (docs/design/robotd-design.md §7.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
 # per-robot configuration rather than a shipped default, so it must survive an update
-# *and* a rollback (docs/architecture.md §3). The installer never overwrites it.
+# *and* a rollback (docs/design/architecture.md §3). The installer never overwrites it.
 #
 # Every value below is the built-in default. The file may be deleted entirely — an
 # unprovisioned board comes up on these same numbers rather than refusing to start, which

@@ -3,7 +3,7 @@
 //! Rollback is the feature most likely to be quietly broken, because it only
 //! runs when something else already went wrong. Making failures injectable turns
 //! "rollback presumably works" into a CI assertion
-//! (`docs/updater-design.md` §16.1).
+//! (`docs/design/updater-design.md` §16.1).
 //!
 //! Compiled in unconditionally rather than behind `#[cfg(test)]`, so the same
 //! binary that ships can be exercised on a bench robot. Enabling any of these

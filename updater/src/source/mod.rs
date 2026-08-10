@@ -3,7 +3,7 @@
 //! One trait, three backends: GitHub Releases (daemon), HF Hub (models), and a
 //! local directory. The local backend is not a toy — it is how the engine gets
 //! tested against its real code path with no network
-//! (`docs/updater-design.md` §16.1).
+//! (`docs/design/updater-design.md` §16.1).
 
 use std::path::{Path, PathBuf};
 

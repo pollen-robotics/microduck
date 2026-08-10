@@ -2,7 +2,7 @@
 //!
 //! The engine is generic; everything robot-specific lives here. Adapting to a
 //! different robot should mean a new config file, new signing keys, and possibly
-//! a new health probe — not engine changes. See `docs/updater-design.md` §10.
+//! a new health probe — not engine changes. See `docs/design/updater-design.md` §10.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -18,31 +18,31 @@ pub struct Config {
     /// verifies against *any* key in here.
     ///
     /// A set rather than one key so a lost or compromised key is survivable —
-    /// see `docs/updater-design.md` §5.4.
+    /// see `docs/design/updater-design.md` §5.4.
     pub trusted_keys_dir: PathBuf,
 
     /// Single forward-compatibility guard. An artifact declaring a higher
     /// `min_hw_rev` than this is refused.
     ///
     /// v1 targets one hardware configuration, so this is deliberately one
-    /// integer and not a capability matrix (`docs/updater-design.md` §5.6).
+    /// integer and not a capability matrix (`docs/design/updater-design.md` §5.6).
     pub hw_rev: u32,
 
     /// Engine-owned state: lock file, update log, boot counter. Must NOT be
     /// inside any component's `install_dir` — it has to survive every swap and
-    /// rollback (`docs/updater-design.md` §5.7).
+    /// rollback (`docs/design/updater-design.md` §5.7).
     pub state_dir: PathBuf,
 
     /// Where `robotd` listens. Used by every `health = { probe = "socket" }` component
     /// and by the pre-restart `safeToRestart` query.
     ///
-    /// Absent or silent is a normal state, not an error (`docs/architecture.md` §1.1):
+    /// Absent or silent is a normal state, not an error (`docs/design/architecture.md` §1.1):
     /// `robotd` may legitimately be stopped, crashed, or not yet installed.
     #[serde(default = "default_robot_socket")]
     pub robot_socket: PathBuf,
 
     /// Accept artifacts signed with a key marked dev-only. Off in production.
-    /// See `docs/updater-design.md` §15.
+    /// See `docs/design/updater-design.md` §15.
     #[serde(default)]
     pub allow_dev_keys: bool,
 
@@ -138,7 +138,7 @@ pub struct ComponentConfig {
     #[serde(default = "default_keep_previous")]
     pub keep_previous: usize,
 
-    /// Never-pruned known-good release (`docs/updater-design.md` §8.2).
+    /// Never-pruned known-good release (`docs/design/updater-design.md` §8.2).
     #[serde(default)]
     pub golden: Option<semver::Version>,
 
@@ -199,7 +199,7 @@ impl AutoApply {
 }
 
 /// Where artifacts come from. Per-component because the daemon lives on GitHub
-/// Releases and models on HF Hub (`docs/updater-design.md` §5.1).
+/// Releases and models on HF Hub (`docs/design/updater-design.md` §5.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceConfig {
@@ -240,7 +240,7 @@ pub enum SourceConfig {
     },
     /// A local directory. Not a production source — this is what makes the
     /// engine testable against the real code path with no network, and backs
-    /// the dev sideload flow (`docs/updater-design.md` §16.1).
+    /// the dev sideload flow (`docs/design/updater-design.md` §16.1).
     LocalDir { path: PathBuf },
 }
 
@@ -270,14 +270,14 @@ pub enum ApplyAction {
     /// Full restart. Drops motor control briefly — only for the daemon channel.
     Restart { units: Vec<String> },
     /// Signal in place, no restart. Used for models so a weights swap doesn't
-    /// interrupt motor control (`docs/updater-design.md` §5.5).
+    /// interrupt motor control (`docs/design/updater-design.md` §5.5).
     Reload { unit: String, signal: String },
 }
 
 /// How to decide whether the new release is good.
 ///
 /// This gate is what makes auto-rollback meaningful, so a weak probe here
-/// undermines the whole design — see `docs/updater-design.md` §8.
+/// undermines the whole design — see `docs/design/updater-design.md` §8.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "probe", rename_all = "snake_case")]
 pub enum HealthCheck {

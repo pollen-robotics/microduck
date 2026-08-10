@@ -2,7 +2,7 @@
 //!
 //! A file rather than a wall of CLI flags — the prototype grew 142 of them and most were
 //! variants, dead skills and dead sensors, all of which are gone. **Read once at startup,
-//! not watched**; live reload is deferred (`docs/robotd-design.md` §7.2).
+//! not watched**; live reload is deferred (`docs/design/robotd-design.md` §7.2).
 //!
 //! It lives outside `releases/<ver>/` so it survives an update *and* a rollback: this is
 //! per-robot configuration, not shipped defaults (`architecture.md` §3).
@@ -119,7 +119,7 @@ pub struct Control {
 ///
 /// **Not** the thresholds for everything `robot.health` reports. That answer also describes the
 /// battery, the motor temperatures and the loop counters, and none of those may reach a verdict
-/// (`docs/robotd-design.md` §4.5) — so none of them has a setting here. Naming this section
+/// (`docs/design/robotd-design.md` §4.5) — so none of them has a setting here. Naming this section
 /// `[health]` invited exactly that mistake: it reads like "how the robot is doing", when what it
 /// configures is the one question auto-rollback turns on.
 ///

@@ -7,7 +7,7 @@
 //!   → HEALTH GATE → healthy ? commit+prune : ROLLBACK
 //! ```
 //!
-//! Full description in `docs/updater-design.md` §7. Three rules shape everything
+//! Full description in `docs/design/updater-design.md` §7. Three rules shape everything
 //! here:
 //!
 //!  - **Any failure at or after the swap rolls back.** Hook failure, health
@@ -76,7 +76,7 @@ const EMBEDDED_MANIFEST: &str = ".updater-manifest.json";
 /// Used for hashing, signature verification, extraction and recursive deletes:
 /// all of them run for seconds on a Pi-class board, and leaving them on an async
 /// worker would stall the IPC tasks that must keep serving `status`/`subscribe`
-/// during an update (`docs/architecture.md` §2.3).
+/// during an update (`docs/design/architecture.md` §2.3).
 async fn blocking<T, F>(f: F) -> Result<T, Error>
 where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
@@ -770,7 +770,7 @@ impl Engine {
     /// Revert to the previously installed release.
     ///
     /// Reachable when `robotd` is dead — that is the case it exists for
-    /// (`docs/architecture.md` §1.1).
+    /// (`docs/design/architecture.md` §1.1).
     pub async fn rollback(&mut self, component: &str) -> Result<ApplyResult, Error> {
         let _lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
         let cfg = self.config.component(component)?.clone();
@@ -784,7 +784,7 @@ impl Engine {
     }
 
     /// Revert to the never-pruned known-good release
-    /// (`docs/updater-design.md` §8.2).
+    /// (`docs/design/updater-design.md` §8.2).
     pub async fn reset_to_golden(&mut self, component: &str) -> Result<ApplyResult, Error> {
         let _lock = UpdateLock::try_acquire(&self.config.state_dir)?.ok_or(Error::Busy)?;
         let cfg = self.config.component(component)?.clone();
@@ -944,7 +944,7 @@ impl Engine {
     /// successfully running.
     ///
     /// Best-effort: the log is advisory and must never change what the client is
-    /// told (`docs/updater-design.md` §8.3).
+    /// told (`docs/design/updater-design.md` §8.3).
     fn record(
         &self,
         component: &str,
@@ -1195,9 +1195,9 @@ impl Engine {
     /// Restart or signal, per config.
     ///
     /// Models use `Reload` so a weights swap doesn't interrupt motor control
-    /// (`docs/updater-design.md` §5.5). Note what is *absent* from a daemon
+    /// (`docs/design/updater-design.md` §5.5). Note what is *absent* from a daemon
     /// restart list: `updaterd` never restarts itself, and shouldn't restart
-    /// `btd` either — see `docs/updater-design.md` §4.
+    /// `btd` either — see `docs/design/updater-design.md` §4.
     ///
     /// **One unit per invocation**, and a unit that does not exist on this board is skipped
     /// rather than failing the update. Both halves of that were learned the hard way.
@@ -1574,7 +1574,7 @@ async fn schedule_deferred_restarts() {
 /// `updaterd` is the process performing the update: restarting it kills the operation mid-flight.
 /// `btd` may be the *transport the update was requested over* — restarting it drops the BLE
 /// connection carrying `update.subscribe`, so the phone that started the update never learns the
-/// outcome, which is the entire app-driven flow (`docs/updater-design.md` §4).
+/// outcome, which is the entire app-driven flow (`docs/design/updater-design.md` §4).
 ///
 /// In code rather than in configuration, deliberately. These two are properties of what the daemons
 /// *are*, not choices an operator should be able to get wrong — and a board that got them wrong
@@ -1589,7 +1589,7 @@ const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 /// and every release swaps that daemon's binary while leaving the old process running. The update
 /// reports success, the daemon answers on stale code, and `apply` then says `already_current` and
 /// does nothing. Four correct fixes were diagnosed as broken that way in one afternoon; see
-/// `docs/install-path-gap.md` §4.
+/// `docs/project/install-path-gap.md` §4.
 ///
 /// A release already states which units it provides — it ships them in `systemd/` — so it can say
 /// which to restart. Same realisation that made `hooks/postinstall` the right place to *install*

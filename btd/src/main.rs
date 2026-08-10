@@ -35,7 +35,7 @@ struct Args {
     /// **Off by default, and that is not where this ends up.** Requiring pairing makes the version
     /// read hang on macOS — CoreBluetooth issues the Read Request, BlueZ refuses it for insufficient
     /// encryption, and nothing resolves it — so a robot serving the secure configuration cannot be
-    /// talked to at all (`docs/app-path-design.md` §5.5).
+    /// talked to at all (`docs/design/app-path-design.md` §5.5).
     ///
     /// Between a default that is secure and unusable and one that works and is insecure, this is
     /// pre-shipping development tooling and the usable one wins. The cost is real and unhedged:

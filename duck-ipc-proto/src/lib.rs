@@ -23,7 +23,7 @@
 //! method with another method's parameters.
 //!
 //! Why JSON-RPC, why a unix socket, and what was measured against both:
-//! `docs/architecture.md` §2.2.
+//! `docs/design/architecture.md` §2.2.
 //!
 //! Dependencies stay at serde, serde_json and semver. Every service speaks these types,
 //! including the ones on the recovery path, so nothing here may pull in http, tar, crypto
@@ -295,7 +295,7 @@ pub enum Call {
     /// other call here. BLE cannot express a fixed, printed-on-the-robot passkey — the spec has
     /// the *displaying* side generate a random one, and a headless robot can display nothing — so
     /// the PIN check moved from the link layer to this one, where we define the rules. See
-    /// `docs/app-path-design.md` §5.
+    /// `docs/design/app-path-design.md` §5.
     SystemAuthenticate(AuthenticateParams),
 }
 
@@ -930,7 +930,7 @@ pub struct HelloResult {
 }
 
 /// Where an in-flight update has got to. Mirrors the state machine in
-/// `docs/updater-design.md` §7.
+/// `docs/design/updater-design.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {

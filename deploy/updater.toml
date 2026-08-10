@@ -12,7 +12,7 @@
 # The trust anchor. All three release public keys go in here at install time, even
 # though only `release-1` signs today: a robot can verify only against the set baked
 # into it, so shipping the spares is the one chance to make key rotation possible
-# without physically re-flashing (docs/ci-setup.md).
+# without physically re-flashing (docs/project/ci-setup.md).
 trusted_keys_dir = "/etc/robot/trusted_keys"
 
 hw_rev = 1
@@ -144,7 +144,7 @@ action = "restart"
 # It used to be authoritative, and that is the bug this replaced: the file belongs to the operator
 # and `install.sh` preserves it, so a board provisioned before `configd` existed kept
 # `units = ["robotd"]` forever and every release swapped configd's binary while leaving the old
-# process running. See `docs/install-path-gap.md` §4.
+# process running. See `docs/project/install-path-gap.md` §4.
 units  = ["robotd", "configd"]
 
 # The gate that makes auto-rollback real. 30s is still the placeholder M4 is meant to

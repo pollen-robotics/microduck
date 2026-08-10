@@ -19,7 +19,7 @@
 //! Two audiences, and the second dictates the design rules:
 //!  - support and field recovery, when the app or BLE isn't an option;
 //!  - CI and bench testing, where every operation must be scriptable
-//!    (`docs/updater-design.md` §16.1).
+//!    (`docs/design/updater-design.md` §16.1).
 //!
 //! Therefore:
 //!  - **No prompts, ever.** Nothing here may ask a question.

@@ -5,8 +5,8 @@
 //! through the CLI would conflate wire behaviour with argument parsing and output
 //! formatting.
 //!
-//! The properties under test come from `docs/architecture.md` §1.1 and
-//! `docs/updater-design.md` §7: the socket is group-restricted, `status` stays
+//! The properties under test come from `docs/design/architecture.md` §1.1 and
+//! `docs/design/updater-design.md` §7: the socket is group-restricted, `status` stays
 //! answerable while an update runs, a client disconnecting mid-update does not
 //! cancel it, and error codes survive the round trip so clients can branch on them.
 

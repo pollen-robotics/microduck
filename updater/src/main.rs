@@ -9,7 +9,7 @@
 //! reverting by the time anything can ask it to do something else.
 //!
 //! This process must be resident and must exclude *itself* from the units it
-//! restarts — see `docs/updater-design.md` §4.
+//! restarts — see `docs/design/updater-design.md` §4.
 //!
 //! **Resident is about triggers, not about applying.** Applying an update is a library
 //! call, and mutual exclusion is a file lock in `state_dir` rather than a property of
@@ -40,7 +40,7 @@ struct Args {
     /// `robotd`'s socket, used for the safe-to-restart and health probes.
     ///
     /// Absent or silent is fine — the engine treats an unreachable `robotd` as a
-    /// normal state (`docs/architecture.md` §1.1).
+    /// normal state (`docs/design/architecture.md` §1.1).
     /// Overrides `robot_socket` in the config. For running two updaterd instances on one
     /// dev box, or pointing at a stub robotd; a real deployment sets it in the config.
     #[arg(long, global = true)]
@@ -163,7 +163,7 @@ async fn robot_is_answering(robot: &dyn updater::robot::RobotClient) -> bool {
 /// At `warn` so it survives `RUST_LOG=warn` on a long-running board: identifying the running
 /// build is not a debug-level concern. `exe` is here because after an update `updaterd` is
 /// still running the *previous* binary by design, so which release directory a process came
-/// from cannot be inferred (`docs/architecture.md` §8).
+/// from cannot be inferred (`docs/design/architecture.md` §8).
 fn log_startup_identity(service: &str) {
     tracing::warn!(
         service,

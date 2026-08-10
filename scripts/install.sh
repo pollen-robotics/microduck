@@ -298,7 +298,7 @@ install_config() {
 # Find the bootstrap asset's API download URL on the latest stable release.
 #
 # **Not** `releases/latest/download/<asset>`. On a private repository that browser URL
-# returns 404 with or without a token — see `docs/updater-design.md` §6.1 — which is exactly
+# returns 404 with or without a token — see `docs/design/updater-design.md` §6.1 — which is exactly
 # how this failed the first time it was run against a real board. The engine already
 # re-resolves its own download URLs through the release API (`resolve_download` in
 # `source/github.rs`); this script was the one place that had not caught up, because until a
@@ -867,7 +867,7 @@ install_token_dropin() {
     systemctl try-restart updaterd.service || warn "could not restart updaterd"
     say "wrote ${dir}/token.conf (mode 600) so updaterd can fetch updates"
     warn "that file holds a GitHub token in plaintext. Fine on a developer's board, not on a
-  robot you ship. It is why artifact hosting is still open — docs/updater-design.md §6.1."
+  robot you ship. It is why artifact hosting is still open — docs/design/updater-design.md §6.1."
 }
 
 main() {

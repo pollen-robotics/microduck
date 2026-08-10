@@ -1,6 +1,6 @@
 //! End-to-end tests for the update state machine, over the `LocalDir` source.
 //!
-//! These are the Tier-1 mechanism tests from `docs/updater-design.md` §16.2: they
+//! These are the Tier-1 mechanism tests from `docs/design/updater-design.md` §16.2: they
 //! drive the **real engine code path** with no network and no robot, so they cannot
 //! drift from production behaviour. This is the suite that replaces manually
 //! reverting a robot, applying an update, and eyeballing the result.
@@ -1639,7 +1639,7 @@ async fn rollback_still_works_after_a_failed_select() {
     );
 }
 
-// ── installing by ref (the dev channel, `docs/roadmap.md` M2) ────────────────
+// ── installing by ref (the dev channel, `docs/project/roadmap.md` M2) ────────────────
 
 /// **A ref installs what that branch last built.**
 ///

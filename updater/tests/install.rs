@@ -10,7 +10,7 @@
 //! cargo sets `CARGO_BIN_EXE_updaterd` and **guarantees it is rebuilt** before these
 //! run. Deriving the path any other way is how `robotd`'s gate test once ended up
 //! asserting against a stale binary while appearing to pass (see the M1 notes in
-//! `docs/roadmap.md`).
+//! `docs/project/roadmap.md`).
 
 use std::path::{Path, PathBuf};
 use std::process::Output;

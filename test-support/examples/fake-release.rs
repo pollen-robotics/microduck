@@ -134,7 +134,7 @@ allow_fault_injection = true
 install_dir = "{prefix}/opt/daemon"
 source = {{ type = "local_dir", path = "{prefix}/published" }}
 # `none` because there are no systemd units here. On a robot this restarts robotd/mediad —
-# never updaterd or btd (docs/updater-design.md §4).
+# never updaterd or btd (docs/design/updater-design.md §4).
 on_apply = {{ action = "none" }}
 # `none` because no robotd is answering. A socket probe with nothing to ask does not pass:
 # it polls until the timeout and then fails the gate, which would roll back every release.

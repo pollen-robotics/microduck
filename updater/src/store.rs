@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Atomicity comes from a single `rename(2)` over the symlink, so no partially
-//! written release is ever live. See `docs/updater-design.md` §7.1.
+//! written release is ever live. See `docs/design/updater-design.md` §7.1.
 //!
 //! Nothing in here may touch robot-specific state — calibration, learned state
 //! and user config live outside `install_dir` precisely so that a swap or a
@@ -162,7 +162,7 @@ impl Store {
     /// others, and `golden` unconditionally.
     ///
     /// Golden is exempt from the count so the never-brick guarantee doesn't
-    /// silently expire as versions accumulate (`docs/updater-design.md` §8.2).
+    /// silently expire as versions accumulate (`docs/design/updater-design.md` §8.2).
     pub fn prune(
         &self,
         keep_previous: usize,

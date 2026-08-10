@@ -3,13 +3,13 @@
 //! The engine is robot-agnostic; everything robot-specific lives in
 //! [`config::Config`]. Adapting to another robot should mean a new config file,
 //! new signing keys, and possibly a new health probe — not a fork of this crate.
-//! See `docs/updater-design.md` §10.
+//! See `docs/design/updater-design.md` §10.
 //!
 //! Design docs: [`updater-design.md`] for the update system, [`architecture.md`]
 //! for the surrounding services.
 //!
-//! [`updater-design.md`]: ../../../docs/updater-design.md
-//! [`architecture.md`]: ../../../docs/architecture.md
+//! [`updater-design.md`]: ../../../docs/design/updater-design.md
+//! [`architecture.md`]: ../../../docs/design/architecture.md
 //!
 //! # Deliberate non-goals
 //!

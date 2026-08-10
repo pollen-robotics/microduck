@@ -36,7 +36,7 @@ pub enum Route {
     To(Upstream),
     /// Answered by `btd` itself. Only `system.authenticate`: the PIN check belongs to the
     /// transport, because BLE cannot express a fixed printed passkey and the check therefore had
-    /// to move up a layer (`docs/app-path-design.md` §5).
+    /// to move up a layer (`docs/design/app-path-design.md` §5).
     Local,
     /// Not available over this transport.
     Refused,

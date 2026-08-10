@@ -2,7 +2,7 @@
 #
 # The engine is generic; this file is the only robot-specific part. Adapting to
 # another robot should mean a new copy of this file, new signing keys, and
-# possibly a different health probe. See docs/updater-design.md §10.
+# possibly a different health probe. See docs/design/updater-design.md §10.
 #
 # NOT what ships. `deploy/updater.toml` is the file `scripts/install.sh` installs on a
 # robot; this one documents every option, including several deliberately absent there.

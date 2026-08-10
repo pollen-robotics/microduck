@@ -4,6 +4,23 @@ The software that runs on the robot, and the machinery that ships it there.
 
 `robotctl` is how you talk to a robot. It runs on the robot itself.
 
+Every command describes itself, so you can explore rather than read:
+
+```bash
+robotctl --help
+```
+
+```bash
+robotctl update --help
+```
+
+Tab completion comes with the install — press Tab for the commands a release actually has. For a
+shell it did not set up:
+
+```bash
+eval "$(robotctl completions zsh)"
+```
+
 ## Is it alive
 
 ```bash

@@ -2,7 +2,7 @@
 //!
 //! Files resolve at `https://huggingface.co/{repo}/resolve/{revision}/{file}`.
 //! **HF signs nothing for us**, so we publish our own minisign signature alongside
-//! every artifact and verify that. See `docs/updater-design.md` §5.1.
+//! every artifact and verify that. See `docs/design/updater-design.md` §5.1.
 //!
 //! Two things differ from GitHub Releases and shape the code:
 //!

@@ -3,7 +3,7 @@
 //!
 //! All of it lives in `state_dir`, which must be **outside** every component's
 //! `install_dir`: a symlink swap or rollback must not be able to destroy the
-//! record of what happened (`docs/updater-design.md` §5.7). [`crate::config::Config::validate`]
+//! record of what happened (`docs/design/updater-design.md` §5.7). [`crate::config::Config::validate`]
 //! enforces that.
 
 use std::collections::BTreeMap;
@@ -27,7 +27,7 @@ pub fn now_unix() -> i64 {
 ///
 /// The first thing support asks for when a client says "the update failed", so it
 /// records refused and rolled-back attempts too — not just successes
-/// (`docs/updater-design.md` §8.3).
+/// (`docs/design/updater-design.md` §8.3).
 pub struct Journal {
     path: PathBuf,
     max_entries: usize,
@@ -265,7 +265,7 @@ impl Pins {
 /// Catches the failure the in-process health gate cannot: a release that doesn't
 /// come up at all, or wedges hard enough to take `updaterd` with it. If a pending
 /// update hasn't been confirmed after `max_attempts` boots, revert unconditionally
-/// (`docs/updater-design.md` §8).
+/// (`docs/design/updater-design.md` §8).
 pub struct BootCounter {
     path: PathBuf,
 }

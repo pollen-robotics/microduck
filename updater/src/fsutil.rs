@@ -2,7 +2,7 @@
 //!
 //! The design's crash guarantees rest on two renames being both **durable** and
 //! **ordered**: the boot-counter record must survive a power cut that also made the
-//! symlink swap visible (`docs/updater-design.md` §7). `rename(2)` is atomic but
+//! symlink swap visible (`docs/design/updater-design.md` §7). `rename(2)` is atomic but
 //! not durable — the directory entry can still be in page cache — so every rename
 //! we depend on is followed by an fsync of the containing directory.
 

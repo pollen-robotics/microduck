@@ -17,7 +17,7 @@
 # It has no scan API, and `netplan apply` reports "config applied" rather than whether
 # association actually succeeded. "Show me the networks" and "that password was wrong" are
 # the two things a phone provisioning a robot needs most, so wifi goes to NetworkManager —
-# which `docs/architecture.md` §3 already names as the owner of wifi credentials. Ethernet
+# which `docs/design/architecture.md` §3 already names as the owner of wifi credentials. Ethernet
 # stays with netplan and networkd, untouched.
 #
 # Run it twice, either side of the reboot — the second run retires the backstop:

@@ -9,7 +9,7 @@
 //! `CARGO_BIN_EXE_robotd` and guarantee the binary is rebuilt first — see [`robotd_bin`].
 //!
 //! `on_apply = restart` is deliberately out of scope: there is no systemd in a container,
-//! and stubbing it would test the stub. That lands on hardware (`docs/roadmap.md` M4).
+//! and stubbing it would test the stub. That lands on hardware (`docs/project/roadmap.md` M4).
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};

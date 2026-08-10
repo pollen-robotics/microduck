@@ -1,6 +1,6 @@
 //! The signed manifest describing one release.
 //!
-//! See `docs/updater-design.md` §5.3. Fields that cannot be retrofitted onto
+//! See `docs/design/updater-design.md` §5.3. Fields that cannot be retrofitted onto
 //! already-shipped robots are present from the first release even while unused —
 //! a robot that never learned to read `min_supported` can't be force-upgraded
 //! later.
@@ -37,7 +37,7 @@ pub struct Manifest {
     /// On-disk/config schema this release expects.
     ///
     /// **Not a compatibility gate.** It is context handed to the post-install hook,
-    /// which performs the migration (`docs/updater-design.md` §9). Gating on it would
+    /// which performs the migration (`docs/design/updater-design.md` §9). Gating on it would
     /// be self-defeating: the engine evaluating a manifest is always the *previous*
     /// release's engine, so refusing `schema_version > supported` would make every
     /// schema bump undeliverable — including the release that brings the engine which
@@ -46,18 +46,18 @@ pub struct Manifest {
     pub schema_version: u32,
 
     /// Minimum-version floor: robots below this must upgrade, without waiting
-    /// for a tap in the app. See `docs/updater-design.md` §8.1.
+    /// for a tap in the app. See `docs/design/updater-design.md` §8.1.
     #[serde(default)]
     pub min_supported: Option<semver::Version>,
 
     /// Model channel only: the daemon model-API version this bundle requires.
     /// Loadable when `model_api <= daemon's model_api`
-    /// (`docs/updater-design.md` §5.5).
+    /// (`docs/design/updater-design.md` §5.5).
     #[serde(default)]
     pub model_api: Option<u32>,
 
     /// Git SHA of the build, recorded for provenance
-    /// (`docs/updater-design.md` §16.4).
+    /// (`docs/design/updater-design.md` §16.4).
     #[serde(default)]
     pub source_revision: Option<String>,
 
@@ -126,7 +126,7 @@ impl Manifest {
     ///
     /// True when the robot is running something below `min_supported` — the
     /// mechanism for forcing robots off a known-bad release without waiting for
-    /// someone to tap update (`docs/updater-design.md` §8.1).
+    /// someone to tap update (`docs/design/updater-design.md` §8.1).
     ///
     /// A robot with nothing installed is *not* treated as mandatory: there is no
     /// bad version to escape, and the normal install path applies.

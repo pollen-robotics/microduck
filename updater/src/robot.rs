@@ -1,13 +1,13 @@
 //! The engine's view of `robotd`.
 //!
 //! A trait rather than a concrete client for two reasons: the engine is built
-//! before `robotd` exists (`docs/architecture.md` §9), and the degraded-mode
+//! before `robotd` exists (`docs/design/architecture.md` §9), and the degraded-mode
 //! paths — `robotd` dead, crash-looping, or hung — must be testable without
-//! staging a real crash (`docs/updater-design.md` §16.2).
+//! staging a real crash (`docs/design/updater-design.md` §16.2).
 //!
 //! **Every method here is allowed to fail and must be timeout-bounded.** A dead
 //! or silent `robotd` is a normal, expected answer. That is invariant 1 in
-//! `docs/architecture.md` §1.1: `updaterd` is the recovery path, so it cannot
+//! `docs/design/architecture.md` §1.1: `updaterd` is the recovery path, so it cannot
 //! require the thing it is recovering.
 
 use std::time::Duration;
@@ -59,7 +59,7 @@ impl Health {
 #[async_trait::async_trait]
 pub trait RobotClient: Send + Sync {
     /// Refuse to restart motor control mid-motion
-    /// (`docs/updater-design.md` §7.2).
+    /// (`docs/design/updater-design.md` §7.2).
     async fn safe_to_restart(&self, timeout: Duration) -> SafeToRestart;
 
     /// The post-apply health gate. Must return within `timeout` even if the peer
@@ -67,11 +67,11 @@ pub trait RobotClient: Send + Sync {
     async fn health(&self, timeout: Duration) -> Health;
 
     /// Model API version the running daemon implements, for model compatibility
-    /// checks (`docs/updater-design.md` §5.5). `None` when unreachable.
+    /// checks (`docs/design/updater-design.md` §5.5). `None` when unreachable.
     async fn model_api(&self, timeout: Duration) -> Option<u32>;
 
     /// Is a telepresence/WebRTC session live? Restarting mid-session is a bad
-    /// surprise (`docs/architecture.md` §5).
+    /// surprise (`docs/design/architecture.md` §5).
     ///
     /// Defaults to `false` when unknown: this check is a courtesy, and must never
     /// be the reason a recovery update is refused.

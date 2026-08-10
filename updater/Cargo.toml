@@ -13,7 +13,7 @@ description = "Signed, health-gated, rollback-safe updates for the robot daemon"
 #   - `btd` needs to speak the protocol, or
 #   - this crate gains heavy dependencies (http, tar, zstd, crypto),
 # so that protocol clients don't inherit them. Both are event-triggered, not
-# guesses. See docs/architecture.md §1.1.
+# guesses. See docs/design/architecture.md §1.1.
 [[bin]]
 name = "updaterd"
 path = "src/main.rs"

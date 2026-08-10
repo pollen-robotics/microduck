@@ -1,7 +1,7 @@
 # Publish a signed build for every branch push, so a teammate's work can be installed on a
 # board with `robotctl update apply daemon --ref <branch>`.
 #
-# This is the dev channel from docs/roadmap.md M2. Two properties make it safe to run on
+# This is the dev channel from docs/project/roadmap.md M2. Two properties make it safe to run on
 # every push, and both are enforced somewhere other than this file:
 #
 #   1. **Signed with `team.dev`, not `release-1`.** A customer robot refuses these outright:

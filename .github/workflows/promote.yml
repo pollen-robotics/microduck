@@ -34,7 +34,7 @@ jobs:
     # to a build, so it is the most consequential thing in this repository.
     #
     # ⚠ `environment: release` is NOT a gate — see the same note in release.yml and
-    # docs/ci-setup.md. It scopes the secrets and is the hook for a real gate later; on this
+    # docs/project/ci-setup.md. It scopes the secrets and is the hook for a real gate later; on this
     # plan it stops no one who can push.
     environment: release
     steps:

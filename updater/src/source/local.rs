@@ -2,7 +2,7 @@
 //!
 //! Two jobs:
 //!  - CI tests drive the **real** engine code path with no network, so tests can't
-//!    drift from production behaviour (`docs/updater-design.md` §16.1);
+//!    drift from production behaviour (`docs/design/updater-design.md` §16.1);
 //!  - the dev sideload flow, where a locally-built artifact signed with the dev
 //!    key is applied without touching prod signing (§15).
 //!

@@ -3,7 +3,7 @@
 //! Framing is NDJSON via `tokio_util::codec::LinesCodec`; message shapes live in
 //! [`crate::proto`].
 //!
-//! Requirements that follow from `docs/architecture.md` §1.1:
+//! Requirements that follow from `docs/design/architecture.md` §1.1:
 //!  - Serving never depends on `robotd` being alive.
 //!  - A slow or vanished client must not delay an in-flight update.
 //!  - An update runs to completion even if every client disconnects — the robot
@@ -226,7 +226,7 @@ impl Server {
     /// client attached.
     ///
     /// At the default [`AutoApply::Mandatory`] this is what makes `min_supported`
-    /// (`docs/updater-design.md` §8.1) actually work. Without it the floor is inert: a
+    /// (`docs/design/updater-design.md` §8.1) actually work. Without it the floor is inert: a
     /// robot only learns it exists when someone opens the app, which is precisely what
     /// you cannot rely on when remediating a bad release.
     ///
@@ -416,7 +416,7 @@ impl Server {
     ///
     /// A disconnect mid-operation does **not** cancel the operation: the engine call
     /// is awaited here, but the update's effects are committed to disk as it goes,
-    /// and boot recovery covers an interruption. See `docs/updater-design.md` §7.
+    /// and boot recovery covers an interruption. See `docs/design/updater-design.md` §7.
     async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let peer = stream.peer_cred().ok();
         let (read_half, mut write_half) = stream.into_split();

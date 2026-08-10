@@ -5,7 +5,7 @@
 //! repo-wide, so it breaks the moment a second channel shares the repo, and it
 //! answers "most recently published" rather than "highest version" — which differ as
 //! soon as you publish a patch to an older line.
-//! See `docs/updater-design.md` §6.
+//! See `docs/design/updater-design.md` §6.
 //!
 //! Nothing here is trusted. Tags, release names and asset URLs are all attacker- or
 //! mistake-influenced; the only thing that makes an artifact acceptable is the

@@ -169,7 +169,7 @@ pub async fn serve(sockets: Sockets, name: String, require_pairing: bool) -> blu
                 // `CharacteristicNotify` carries no encryption flags at all.
                 //
                 // NOTE: this is currently the *unencrypted* path in practice — see
-                // `docs/app-path-design.md` §5.5. Requiring encryption here hangs CoreBluetooth.
+                // `docs/design/app-path-design.md` §5.5. Requiring encryption here hangs CoreBluetooth.
                 //
                 // The value matters less than the fact that reading it needs a bond; the API
                 // version is the most useful byte available, and a client that finds a version it

@@ -1,7 +1,7 @@
 //! Preconditions checked before anything is downloaded or changed.
 //!
 //! Every failure here aborts cleanly with **no side effects**. See
-//! `docs/updater-design.md` §7.2.
+//! `docs/design/updater-design.md` §7.2.
 //!
 //! Single-flight is *not* one of these checks: it is enforced by the on-disk lock
 //! [`crate::journal::UpdateLock`], taken before any of this runs, and surfaces as
