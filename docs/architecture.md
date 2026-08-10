@@ -433,6 +433,22 @@ runtime: a shipped robot has no repository. It matters more than it looks: once 
 installs land (roadmap M2) several builds share a version number, and the revision is the
 only thing separating them.
 
+### 8.4 Health is one question, so it is one command
+
+`robotctl health` reports hardware from `robotd` and software from `updaterd` in a single
+answer. That is not a convenience: "what is wrong with this robot" does not divide into
+hardware and software until *after* it is answered, and a robot that reverted a release an
+hour ago looks exactly like a robot with unpowered servos until both halves are on screen
+together. Splitting it would make the caller pick a half before knowing which one is at
+fault.
+
+It **exits non-zero when the robot is unhealthy or unreachable**, so it can gate a script —
+the contract anything built on top depends on. Nothing else affects the exit code: a flat
+pack, a hot motor and a pinned component are reported, not judged. A release must never be
+rolled back for the state of the board it landed on.
+
+`--json` carries the same content for a support bundle.
+
 ## 9. Open questions
 
 1. **Internet-reachable telepresence in v1, or LAN-only?** The big one: the

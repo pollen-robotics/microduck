@@ -122,6 +122,28 @@ A policy that was wanted and could not be loaded reports **unhealthy**, which is
 is what makes the updater roll a bad release back. `robotctl health` and the bottom of `monitor`
 both say so.
 
+## Keep it up to date
+
+What each daemon is running, and what is installed:
+
+```bash
+robotctl version
+```
+
+Install the latest release:
+
+```bash
+sudo robotctl update apply daemon
+```
+
+And go back if it misbehaves:
+
+```bash
+sudo robotctl update rollback daemon
+```
+
+`daemon` is the component name — one component covering every binary.
+
 ## Put your branch on the robot
 
 Make sure the board has been through the [dev install](docs/install-dev.md) first — a board that

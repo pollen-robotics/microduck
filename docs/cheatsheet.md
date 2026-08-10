@@ -26,7 +26,9 @@ like a bug in the fix you just shipped. See "After an update" below.
 robotctl health
 ```
 
-Hardware and software in one report.
+Hardware and software in one report. Exits non-zero when the robot is unhealthy or unreachable, so
+it can gate a script — a hot motor or a pinned component is reported, not judged, and does not
+affect the exit code. `--json` for a support bundle.
 
 ### Watching the loop
 
