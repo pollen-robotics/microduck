@@ -147,8 +147,13 @@ want with `--ref`, below.
 Make sure the board has been through the [dev install](docs/install-dev.md) first — a board that
 has not will refuse branch builds.
 
-Push the branch. CI cross-compiles it, signs it, and publishes it at the moving tag
-`daemon-dev-<branch>`. Then, on the robot:
+Push your branch, then wait for CI to build it:
+
+```bash
+gh run list --branch my-branch
+```
+
+Once it is green, on the robot:
 
 ```bash
 sudo robotctl update apply --ref my-branch daemon
@@ -158,12 +163,13 @@ sudo robotctl update apply --ref my-branch daemon
 robotctl version
 ```
 
+Go back:
+
 ```bash
 sudo robotctl update rollback daemon
 ```
 
-No version numbers to copy — the tag follows the branch. A merge does not publish instantly
-though: CI has to build it first, and `gh run list --branch my-branch` says whether it is done.
+Every push needs the apply again.
 
 ## Where next
 
