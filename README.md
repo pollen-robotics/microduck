@@ -2,8 +2,7 @@
 
 The software that runs on the robot, and the machinery that ships it there.
 
-The robot answers on a unix socket, `/run/robotd.sock`, speaking JSON-RPC one object per line.
-`robotctl` is the CLI for that socket and runs on the robot itself.
+`robotctl` is how you talk to a robot. It runs on the robot itself, over ssh.
 
 ## Is it alive
 
@@ -129,8 +128,11 @@ both say so.
 
 ## Put your branch on the robot
 
-Push the branch. CI cross-compiles it, signs it with the team dev key, and publishes it at the
-moving tag `daemon-dev-<branch>`. Then, on the robot:
+Make sure the board has been through the [dev install](docs/install-dev.md) first — a board that
+has not will refuse branch builds.
+
+Push the branch. CI cross-compiles it, signs it, and publishes it at the moving tag
+`daemon-dev-<branch>`. Then, on the robot:
 
 ```bash
 sudo robotctl update apply --ref my-branch daemon
@@ -152,10 +154,6 @@ done.
 Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
 auto-rollback. The difference is the key, and that is what keeps these builds off customer
 robots.
-
-**A board has to be set up for this once**, which is also what stops it working on a robot that
-should not take dev builds. If `--ref` fails on a board that has never had it,
-[`docs/install-dev.md`](docs/install-dev.md) is the missing step.
 
 One trap worth naming: **a plain `apply daemon` with no `--ref` is usually a downgrade on a dev
 board.** It means "install what the stable channel offers", not "install the newest thing". Name
