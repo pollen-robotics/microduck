@@ -310,7 +310,11 @@ a normal update carries the policy, and a dev points the path at their own `.onn
 iterates without cutting a release.
 
 Everything is validated at **load**, not at inference: observation width, action count, and
-whether ONNX Runtime is present at all. A warm-up inference runs before the loop starts,
+whether ONNX Runtime is present at all. Both files must be **61-input, 14-output** — every
+alpha policy is `obs[1,61] -> actions[1,14]`, checked at load rather than discovered
+mid-stride. `microduck_runtime` also ships a 51-D family, using the legacy 3-value command
+instead of the unified 13; those load only under its `--new-cmd-obs=false` path, and `robotd`
+refuses them with `observation width is 51, expected 61`. A warm-up inference runs before the loop starts,
 which both pays the first-call cost off the hot path — where it would look identical to a
 missed deadline — and proves the dylib resolved.
 
@@ -586,6 +590,10 @@ lets a wedged loop report itself unhealthy instead of hanging the caller.
 A TOML file read at startup, **not watched** — live reload comes later. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Belonging to the board rather than the release is what makes a hand-edited policy path stick:
+the defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside
+the binaries trained against it, and deleting the override goes back to that.
 
 Roughly ten values, not 142: control rate, gains, action scale, low-pass alphas, deadzone,
 max velocities, deadman timeout, policy paths. The flag explosion in the runtime was mostly

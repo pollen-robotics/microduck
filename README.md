@@ -109,18 +109,11 @@ stand = "/home/radxa/my_stand.onnx"
 sudo systemctl restart robotd
 ```
 
-Both files must be **61-input, 14-output** — every alpha policy is `obs[1,61] -> actions[1,14]`,
-and `robotd` checks that at load rather than discovering it mid-stride. A 51-D policy from
-`microduck_runtime`'s legacy family is refused at load with `observation width is 51, expected
-61`.
+Your paths survive updates. Delete the lines to go back to the policy the release ships.
 
-That file belongs to the board and survives updates, so your paths stay put. The defaults point
-inside the release directory, which is how an ordinary update keeps a policy alongside the
-binaries trained against it — delete your lines to go back to them.
-
-A policy that was wanted and could not be loaded reports **unhealthy**, which is deliberate: it
-is what makes the updater roll a bad release back. `robotctl health` and the bottom of `monitor`
-both say so.
+A policy that could not be loaded reports **unhealthy** — `robotctl health` and the bottom of
+`monitor` both name the reason. The shape a policy has to have, and what else is checked at
+load, are in [`docs/robotd-design.md`](docs/robotd-design.md) §5.3.
 
 ## Keep it up to date
 
