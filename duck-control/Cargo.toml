@@ -26,7 +26,11 @@ tracing.workspace = true
 libloading = "0.8"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
-rustypot = "1.4.2"
+# 1.6.0 is a floor, not a preference: it de-stuffs protocol 2.0 status packets whose payload
+# contains `FF FF FD`. Before it, such a read came back oversized and the fixed-size sync
+# reads below — every one of `bus`'s — decoded garbage. A present current of -1 is enough to
+# trigger it, so this is a correctness bound on the bus, not a version bump for its own sake.
+rustypot = "1.6.0"
 # `default-features = false` drops serialport's `libudev` feature, which exists only for
 # enumerating ports (`available_ports`). We open one by path from the params file and never
 # enumerate — and libudev-sys needs a pkg-config sysroot that the board's cross-build does
