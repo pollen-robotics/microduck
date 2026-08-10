@@ -228,7 +228,10 @@ health = {{ probe = "socket", timeout = "3s" }}
         let robot: Box<dyn RobotClient> =
             Box::new(SocketRobotClient::new(config.robot_socket.clone()));
         let keys = KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys).unwrap();
-        Engine::new(config, keys, robot, Faults::none()).unwrap()
+        // As in the updater's own tests: no forks in a binary running engines in parallel.
+        Engine::new(config, keys, robot, Faults::none())
+            .unwrap()
+            .without_deferred_restarts()
     }
 }
 
