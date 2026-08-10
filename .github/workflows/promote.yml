@@ -159,21 +159,39 @@ jobs:
       # Everything a robot needs, under one tag: manifest, signature, the artifact the
       # manifest's `url` names, and the bootstrap binary `scripts/install.sh` fetches
       # from `/releases/latest/download/`.
-      - name: Create the stable release
+      #
+      # Create-then-fill, like release.yml, and re-runnable for the same reason: a promotion that
+      # failed *after* creating the release could not be retried, which is the worst moment for a
+      # step to be one-shot — the stable release would exist, carrying nothing a robot can install,
+      # until someone deleted it by hand.
+      #
+      # `--prerelease=false` is re-asserted rather than assumed: a stable release that is flagged as
+      # a prerelease is invisible to a plain `update apply`, so a promotion into a release object
+      # someone had drafted would silently ship to nobody.
+      - name: Publish the stable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$stable_tag" \
-            --title "daemon ${{ inputs.version }}" \
-            --notes "Promoted from \`$staging_tag\`.
+          notes="Promoted from \`$staging_tag\`.
 
           The artifact is the one validated in staging — same bytes, same sha256, checked
           during promotion. This release is self-contained: manifest, signature, artifact,
           and the bootstrap binary used by \`scripts/install.sh\` to install from scratch.
-          " \
+          "
+          title="daemon ${{ inputs.version }}"
+
+          if gh release view "$stable_tag" >/dev/null 2>&1; then
+            echo "release $stable_tag exists; filling it in"
+            gh release edit "$stable_tag" --prerelease=false --title "$title"
+          else
+            gh release create "$stable_tag" --title "$title" --notes "$notes"
+          fi
+
+          gh release upload "$stable_tag" \
             dist/manifest.json dist/manifest.json.minisig \
             "artifact/$artifact_name" "artifact/$artifact_name.minisig" \
-            bootstrap/updaterd-bootstrap-aarch64
+            bootstrap/updaterd-bootstrap-aarch64 \
+            --clobber
 
       # Only now — the stable release exists and carries every byte it references, so the
       # staging release has no readers left. Deleting it is what keeps the release list
@@ -186,7 +204,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete "$staging_tag" \
-            --repo "${{ github.repository }}" \
-            --cleanup-tag --yes
-          echo "retired $staging_tag"
+          # Tolerant of already being gone, so a re-run of a promotion that got this far does not
+          # fail on the one step whose work is already done.
+          if gh release view "$staging_tag" >/dev/null 2>&1; then
+            gh release delete "$staging_tag" \
+              --repo "${{ github.repository }}" \
+              --cleanup-tag --yes
+            echo "retired $staging_tag"
+          else
+            echo "$staging_tag is already retired"
+          fi

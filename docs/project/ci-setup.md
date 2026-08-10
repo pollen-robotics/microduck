@@ -161,11 +161,21 @@ no benefit.
 ## Cutting a release
 
 ```
-git tag daemon-staging-v0.2.0 && git push --tags
+git tag daemon-staging-v0.4.0 && git push --tags
 ```
+
+Drafting a release in the web UI against a new `daemon-staging-v*` tag does the same thing:
+`release.yml` triggers on both, and its publish step creates the release only if it is not already
+there, then uploads with `--clobber`. It also re-asserts `--prerelease` on a release it finds,
+which matters — a staging release *not* flagged as a prerelease is one a plain `update apply` would
+happily install, and staging exists precisely so unvalidated builds cannot reach robots.
 
 `release.yml` then cross-builds for aarch64, packages, signs, verifies through the real
 engine, and publishes a **prerelease**. Nothing reaches robots on `stable` yet.
+
+Both publish steps are re-runnable. That was not true before: a release job that failed *after*
+creating its release could only be retried by deleting the release and the tag by hand, which is a
+poor thing to discover mid-release.
 
 After a canary robot has run the on-device checks, promote:
 

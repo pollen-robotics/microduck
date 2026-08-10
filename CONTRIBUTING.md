@@ -83,11 +83,15 @@ Releases are signed **in CI**, never locally, behind an approval gate. Cutting o
 promoting one re-signs a manifest over the *same bytes* the canary validated, with no rebuild:
 
 ```bash
-git tag daemon-staging-v0.2.0 && git push --tags
+git tag daemon-staging-v0.4.0 && git push --tags
 ```
 
+Or draft a release in the GitHub UI against a new `daemon-staging-v*` tag — same pipeline, and it
+fills in the release it finds rather than failing on it. Either way the assets, signature and
+manifest come from CI; what you create is the tag.
+
 ```bash
-gh workflow run promote --field version=0.2.0
+gh workflow run promote --field version=0.4.0
 ```
 
 [`docs/project/ci-setup.md`](docs/project/ci-setup.md) covers key custody, the secrets, and rotation.

@@ -1,6 +1,8 @@
 # Publish a signed release to the STAGING channel.
 #
-# Triggered by a `daemon-staging-v*` tag. Staging is where every build lands; nothing
+# Triggered by a `daemon-staging-v*` tag, however that tag comes into being: pushed from a
+# terminal, or created by drafting a release in the GitHub UI. Staging is where every build lands;
+# nothing
 # reaches client robots until it is promoted (see promote.yml and updater-design.md
 # §16.3). That split is the point: robots on `stable` are unaffected by a bad build,
 # and promotion ships the exact bytes staging validated.
@@ -9,6 +11,12 @@ name: release
 on:
   push:
     tags: ['daemon-staging-v*']
+  # Creating a release in the web UI is a supported door, because it is the obvious one. It needs
+  # its own trigger: a release published through the UI does create the tag, but the workflow that
+  # matters is this one, and a release object that already exists is something the publish step has
+  # to fill in rather than choke on — see "Publish the staging release" below.
+  release:
+    types: [published]
 
 permissions:
   contents: write   # create the release and upload assets
@@ -19,6 +27,19 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
+    # **The guard is load-bearing, not tidiness.** `on: release` cannot filter by tag, so without
+    # it this workflow would also fire for the *stable* release `promote.yml` creates — and would
+    # rebuild from source and upload the result over the promoted artifact. Promotion exists
+    # precisely so that the bytes a canary validated are the bytes robots get (updater-design.md
+    # §16.3); republishing a fresh build into that release would quietly destroy the guarantee.
+    # It also keeps `daemon-dev-*` releases from dev.yml out of here.
+    if: startsWith(github.event.release.tag_name || github.ref_name, 'daemon-staging-v')
+
+    # One name for the tag, whichever event carried it. `github.ref_name` is the tag for a push;
+    # for a release event the tag is on the payload.
+    env:
+      TAG: ${{ github.event.release.tag_name || github.ref_name }}
     # Signs with `release-1`, the key customer robots trust. `dev.yml` signs branch builds
     # with `team.dev`, which a customer robot refuses — two keys so "any build" and "a
     # release" are distinguishable by the robot, not by convention.
@@ -39,6 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # The tagged commit, named explicitly rather than left to the default: for a release
+          # event the default is the release's target commitish, which is a branch head when
+          # someone drafts a release against a branch — and that is not necessarily what the tag
+          # points at by the time this runs.
+          ref: ${{ github.event.release.tag_name || github.ref }}
           # Full history so the recorded revision is meaningful.
           fetch-depth: 0
 
@@ -64,9 +90,9 @@ jobs:
         id: version
         run: |
           # daemon-staging-v1.2.3 -> 1.2.3
-          version="${GITHUB_REF_NAME#daemon-staging-v}"
+          version="${TAG#daemon-staging-v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "publishing $version from $GITHUB_REF_NAME"
+          echo "publishing $version from $TAG"
 
       # Same command and same glibc floor as scripts/board-test.sh, so what ships is
       # what was tested rather than a differently-configured build.
@@ -319,16 +345,41 @@ jobs:
           cat "verify/opt/daemon/current/version.toml"
           echo "the updater accepted this release"
 
-      - name: Create the staging release
+      # Create it if it is not there, then fill it in either way.
+      #
+      # Two things made the old single `gh release create ... dist/*` wrong, and they are the same
+      # thing seen from different sides: it only ever worked on a release that did not exist yet.
+      #
+      #   - **It could not be re-run.** If this step failed after creating the release — a network
+      #     blip, a partial upload — every re-run failed identically on "release already exists",
+      #     and the only way out was deleting the release and the tag by hand, mid-release.
+      #   - **It could not follow the UI.** Drafting a release in the web UI is the obvious way to
+      #     cut one, and it creates the release object first, so the pipeline arrived to find its
+      #     own destination already taken and died *after* signing.
+      #
+      # `--clobber` on the upload so a re-run replaces assets rather than refusing them.
+      #
+      # `--prerelease` is re-asserted on a release that already exists, and that is a safety
+      # property rather than cosmetics: staging releases are flagged as prereleases because a plain
+      # `update apply` skips prereleases, which is what keeps an unvalidated build away from robots
+      # on stable. A release drafted in the UI without that box ticked would otherwise be a
+      # candidate every robot could reach.
+      - name: Publish the staging release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --prerelease \
-            --title "daemon ${{ steps.version.outputs.version }} (staging)" \
-            --notes "Staging build from \`${GITHUB_SHA}\`.
+          notes="Staging build from \`${GITHUB_SHA}\`.
 
           Not for client robots. Promote with the \`promote\` workflow once a canary
           has run the on-device acceptance checks — promotion ships these exact bytes.
-          " \
-            dist/*
+          "
+          title="daemon ${{ steps.version.outputs.version }} (staging)"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; filling it in"
+            gh release edit "$TAG" --prerelease --title "$title"
+          else
+            gh release create "$TAG" --prerelease --title "$title" --notes "$notes"
+          fi
+
+          gh release upload "$TAG" dist/* --clobber
