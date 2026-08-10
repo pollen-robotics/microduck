@@ -33,6 +33,18 @@ on:
 permissions:
   contents: write
 
+# One run per tag. Publishing a release in the UI fires *both* triggers — the tag `push` and
+# `release: published` — and without this both build, sign and upload to the same release. They race
+# on the upload, and because each build stamps its own `DUCK_BUILD_TIME` the artifacts are not
+# byte-identical, so the release can end up with a manifest from one run and a tarball from another:
+# a sha256 mismatch that no robot could install and nothing would explain.
+#
+# `cancel-in-progress`, because the two runs are the same work and the later event is as good as the
+# earlier one. Nothing is published until the final step, so a cancelled run leaves nothing behind.
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   # Which channel, which version, and whether there is anything to promote.
   #
@@ -40,12 +52,17 @@ jobs:
   # conditioned on something computed outside themselves.
   decide:
     runs-on: ubuntu-latest
-    # `on: release` cannot filter by tag, so the filtering happens here — and it matters more than it
-    # looks: `dev.yml` publishes a `daemon-dev-*` release on every push to every branch, and without
-    # this, every one of them would try to cut a release.
+    # Everything under `daemon-` reaches this job, and the well-formedness check happens *inside* it
+    # rather than here. That is deliberate, and it is the fix for a real waste of time: a release
+    # published as `daemon-staging-0.4.0` — no `v` — skipped every job, and an all-grey run reads as
+    # "nothing has happened yet" rather than "your tag is wrong".
+    #
+    # What still has to skip silently is `daemon-dev-*`: `dev.yml` publishes one on every push to
+    # every branch, and those are not release attempts. Anything else beginning with `daemon-` is
+    # someone trying to cut a release, and deserves a red X with the answer in it.
     if: >-
-      startsWith(github.event.release.tag_name || github.ref_name, 'daemon-staging-v') ||
-      startsWith(github.event.release.tag_name || github.ref_name, 'daemon-v')
+      startsWith(github.event.release.tag_name || github.ref_name, 'daemon-') &&
+      !startsWith(github.event.release.tag_name || github.ref_name, 'daemon-dev-')
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       version: ${{ steps.plan.outputs.version }}
@@ -76,7 +93,7 @@ jobs:
                   fi
                   ;;
               *)
-                  echo "::error::$TAG is neither a staging nor a release tag"
+                  echo "::error::$TAG is not a release tag. Use daemon-staging-vX.Y.Z for a candidate, published as a pre-release, or daemon-vX.Y.Z for a release. The v is not optional."
                   exit 1
                   ;;
           esac
