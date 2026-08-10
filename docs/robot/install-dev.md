@@ -12,12 +12,27 @@ off customer robots — they refuse a dev key twice over. `allow_dev_keys = fals
 key only counts as a dev key if its filename ends `.dev.pub`. Both halves of the setup below
 exist to flip exactly that.
 
+## Flash the board
+
+Use the [Armbian imager](https://www.armbian.com/radxa-zero-3/). Pick **Radxa Zero 3**, then
+**Armbian 26.2.1 Minimal**.
+
+Before writing, fill in the imager's profile — wifi network and password, and the username and
+password you want. Doing it there saves a serial console later: the board joins your network on
+first boot and is reachable over ssh straight away.
+
+Then add your ssh key, so provisioning can reconnect after it reboots the board:
+
+```bash
+ssh-copy-id radxa@192.168.1.42
+```
+
 ## What you need
 
-- A board you can reach over ssh, **with key access**. Provisioning reboots the board and
-  reconnects by itself, and a password prompt cannot survive that.
-- Its **IP address**. mDNS on this image is unreliable, so a `.local` name resolves when it
-  feels like it — use the address from the DHCP lease.
+- The board's **IP address**. mDNS on this image is unreliable, so a `.local` name resolves when
+  it feels like it — use the address from your router's DHCP lease.
+- **ssh key access**, from the step above. Provisioning reboots the board and reconnects by
+  itself, and a password prompt cannot survive that.
 - A **GitHub token**. This repository is private, so its release assets are unreachable without
   one.
 - **`team.dev.pub`**, the public half of the team dev key, at `~/.duck-keys/team.dev.pub`. It is
