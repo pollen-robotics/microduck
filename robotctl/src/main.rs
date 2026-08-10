@@ -300,6 +300,10 @@ enum PadCommand {
     },
 
     /// Forget a pad, so it stops reconnecting to this robot.
+    ///
+    /// Removes **the robot's half** of the bond, which is all a robot can remove. The pad keeps its
+    /// own half, so pairing it again needs it back in pairing mode — otherwise it arrives with a key
+    /// this robot no longer has and the bond is refused.
     Forget {
         mac: String,
         #[arg(long)]
@@ -1493,6 +1497,12 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
             let forgotten: proto::PadForgetResult = decode(&result)?;
             if forgotten.removed {
                 println!("forgot {mac}");
+                // Said every time, because "forgot" sounds like a clean slate and is not: a bond has
+                // two halves and this removes one. A pad still holding its half refuses to pair
+                // again — reporting `AuthenticationFailed` — until it is put back into pairing mode.
+                println!(
+                    "The pad still has its half of the bond. Press Sync before pairing it again."
+                );
             } else {
                 // Not an error, same contract as `net forget`: asking twice must not look like a
                 // failure.
@@ -1575,11 +1585,12 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                      hci0 appears about 73s in"
                 }
                 proto::PadPairFailure::Rejected => {
-                    "Bluetooth refused the pairing. Most often the pad had left pairing mode by \
-                     the time the exchange started: press Sync again and re-run this immediately, \
-                     while its light is still flashing quickly. If it never succeeds, check that \
-                     /etc/bluetooth/main.conf has `Privacy = device` — run scripts/setup-board.sh \
-                     and reboot, since it does not apply until then"
+                    "Bluetooth refused the pairing. If this fails every time, check \
+                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — it \
+                     rejects the pairing with `DHKey check failed` — and `Privacy = off` is what \
+                     works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
+                     until then. Otherwise the pad had probably left pairing mode: press Sync \
+                     again and re-run this while its light is flashing quickly"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };

@@ -102,10 +102,14 @@ pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
 padd    active — driving whatever pad connects
 ```
 
-A pad that pairs and then drops straight back out means `Privacy = device` is missing from
-`/etc/bluetooth/main.conf`: run `scripts/setup-board.sh` and reboot — it does not take effect until
-then. `paired but NOT trusted` in `pad status` is the other one worth knowing: it looks fine and does
-not reconnect after a reboot; re-run `pad pair` to fix it.
+**If pairing fails every time, check `/etc/bluetooth/main.conf` for `Privacy = device`.** Boards
+provisioned before this was understood have it, and with it a pad cannot bond at all: it rejects the
+pairing with `DHKey check failed (0x0b)`, because that check covers both devices' addresses and
+privacy pairs from a resolvable private one. `Privacy = off` is what works. `scripts/setup-board.sh`
+corrects it, and it does not take effect until a reboot.
+
+`paired but NOT trusted` in `pad status` is the other one worth knowing: it looks fine and does not
+reconnect after a reboot; re-run `pad pair` to fix it.
 
 To drive with non-default limits, stop the service first or two processes fight over the sticks:
 

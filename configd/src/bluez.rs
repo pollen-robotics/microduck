@@ -49,11 +49,38 @@
 //! because a human asked" is the entire authorisation, and narrowing it to the device is the only
 //! part of that this code controls.
 //!
+//! ## The board setting that made all of this impossible
+//!
+//! `Privacy = device` in `/etc/bluetooth/main.conf` stops a pad bonding at all, and nothing in this
+//! file can work around it. The trace, with no key on either side:
+//!
+//! ```text
+//! SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
+//! > ACL Data RX: SMP: Pairing Failed — Reason: DHKey check failed (0x0b)
+//! ```
+//!
+//! The DHKey check is computed over both devices' addresses, and privacy makes the adapter pair from
+//! a resolvable private address rather than its public one, so the two sides compute different
+//! values and the pad refuses. `bluetoothctl pair` fails identically, which is what places this
+//! below anything here. `Privacy = off` — now what `scripts/setup-board.sh` sets — pairs first time.
+//!
+//! Worth knowing because the symptom is indistinguishable from the ones this file *can* cause, and
+//! it cost most of a day: retrying does not help, `JustWorksRepairing` does not help, and neither
+//! does clearing the bond on either side.
+//!
+//! ## Where this has and has not run
+//!
 //! **Run against a real BlueZ on a Radxa Zero 3W with an Xbox Wireless Controller**, which is where
 //! everything above about asynchronous bonding comes from. What has been seen work: discovery finds
-//! the pad and the heuristic identifies it, the bond completes, `Trusted` sticks, `padd` drives from
-//! it, and `pad forget` drops it. What has **not** been exercised on hardware: a DualSense, two pads
-//! in pairing mode at once, and pairing by explicit address.
+//! the pad and the heuristic identifies it, the bond completes, `Trusted` sticks, the pad reconnects
+//! by itself across a reboot, `padd` drives from it, and `pad forget` drops it.
+//!
+//! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
+//! pairing by explicit address.
+//!
+//! And one case that cannot be fixed from here: `pad forget` removes only the robot's half of the
+//! bond. A pad that still holds its half will not pair again until it is put back into pairing mode
+//! or bonded to something else, and it reports the same `AuthenticationFailed` as everything above.
 
 use std::collections::HashMap;
 use std::time::Duration;
