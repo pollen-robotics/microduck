@@ -166,6 +166,12 @@ sudo robotctl update apply --ref <branch> daemon
 `--ref` installs what that branch last built on CI, which is the whole dev workflow. `--version` pins
 an exact release. Give one of them unless you genuinely mean "go to stable".
 
+The tag `daemon-dev-<branch>` moves with the branch, so there is no version number to copy. The
+version *inside* stays unique per build — `0.1.0-dev.42.c719ec8` — so two builds of the same branch
+are never confusable. `--ref main` is how a board goes back to mainline without leaving the dev
+channel; a plain `apply daemon` leaves it, since a prerelease sorts below its release and there is
+no separate opt-out step.
+
 To install a **release candidate** — what `release.yml` published to staging and nobody has promoted
 yet, which is what a canary robot should run before a promotion:
 

@@ -6,6 +6,12 @@ A dev board trusts the team dev key, so it will install anything anyone on the t
 customer robot is set up differently and deliberately refuses those builds — everything here
 assumes a dev board, never a customer robot.
 
+Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
+auto-rollback. The only difference is which key signed it, and that is what keeps these builds
+off customer robots — they refuse a dev key twice over. `allow_dev_keys = false`, and a trusted
+key only counts as a dev key if its filename ends `.dev.pub`. Both halves of the setup below
+exist to flip exactly that.
+
 ## What you need
 
 - A board you can reach over ssh, **with key access**. Provisioning reboots the board and

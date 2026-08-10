@@ -162,17 +162,8 @@ robotctl version
 sudo robotctl update rollback daemon
 ```
 
-No version numbers to copy: the tag moves to whatever that branch last built, while the version
-inside stays unique per build so two builds are never confusable. A merge does not publish
-instantly — CI has to build it first, and `gh run list --branch my-branch` says whether it is
-done.
-
-Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
-auto-rollback. The difference is the key, and that is what keeps these builds off customer
-robots.
-
-`--ref main` puts the board back on what `main` last built. To leave the dev channel altogether,
-a plain `apply daemon` returns it to the stable release.
+No version numbers to copy — the tag follows the branch. A merge does not publish instantly
+though: CI has to build it first, and `gh run list --branch my-branch` says whether it is done.
 
 ## Where next
 
