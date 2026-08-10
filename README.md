@@ -2,7 +2,7 @@
 
 The software that runs on the robot, and the machinery that ships it there.
 
-`robotctl` is how you talk to a robot. It runs on the robot itself, over ssh.
+`robotctl` is how you talk to a robot. It runs on the robot itself.
 
 ## Is it alive
 
