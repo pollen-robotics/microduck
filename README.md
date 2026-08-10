@@ -144,6 +144,11 @@ sudo robotctl update rollback daemon
 
 `daemon` is the component name — one component covering every binary.
 
+`apply daemon` means "install what the stable channel offers", not "install the newest thing".
+That is what you want on a robot. On a **dev board** it is usually a downgrade, because the
+branch builds you have been testing are newer than the last stable release — there, name what you
+want with `--ref`, below.
+
 ## Put your branch on the robot
 
 Make sure the board has been through the [dev install](docs/install-dev.md) first — a board that
@@ -173,9 +178,8 @@ Nothing is relaxed for a dev build: same signature and hash verification, same h
 auto-rollback. The difference is the key, and that is what keeps these builds off customer
 robots.
 
-One trap worth naming: **a plain `apply daemon` with no `--ref` is usually a downgrade on a dev
-board.** It means "install what the stable channel offers", not "install the newest thing". Name
-what you want — `--ref main` or `--ref my-branch` — unless you genuinely mean stable.
+`--ref main` puts the board back on what `main` last built. To leave the dev channel altogether,
+a plain `apply daemon` returns it to the stable release.
 
 ## Where next
 
