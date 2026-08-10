@@ -44,9 +44,11 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
 /// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
 /// because the version's job is to say "these two peers were not built together". During
+/// v6 added `robot.init` and `robot.relax`, so powering the joints stops being a subcommand that
+/// fights the daemon for the motor bus. During
 /// prototyping the wire shape simply changes and this bumps; no accommodation is made for
 /// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 5;
+pub const API_VERSION: u32 = 6;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -147,6 +149,30 @@ pub mod method {
     pub const ROBOT_STOP: &str = "robot.stop";
     /// Turn policy execution on or off.
     pub const ROBOT_ENABLE: &str = "robot.enable";
+
+    // ── power to the joints ──────────────────────────────────────────────────
+    //
+    // The pair, and they are a pair: nothing else in this API turns the motors on or off.
+    // `robot.enable` is about the *policy* — it can bring a limp robot up as a side effect of
+    // being asked to drive, but "stand up" and "let go" are their own decisions and deserve
+    // their own names.
+    //
+    // Both belong to `robotd` rather than to a subcommand, which is the point of adding them:
+    // `robotd init` opens the motor bus itself, so it needs the daemon stopped, and two writers
+    // on one UART corrupt each other's replies. The daemon owns the bus; ask the daemon.
+
+    /// Power the joints and ramp to the home pose.
+    ///
+    /// Unlike [`ROBOT_ENABLE`] this needs no policy: "stand up" is a reasonable thing to ask of a
+    /// robot with no walking network at all, and it is what a bench robot needs before anything
+    /// else can be tested.
+    pub const ROBOT_INIT: &str = "robot.init";
+
+    /// Cut power to the joints. **The robot will collapse** if nothing is holding it.
+    ///
+    /// Named `relax` rather than `limp` because `gain_limp` already means something else — the soft
+    /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
+    pub const ROBOT_RELAX: &str = "robot.relax";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -291,6 +317,10 @@ pub enum Call {
     RobotHead(HeadParams),
     RobotStop,
     RobotEnable(EnableParams),
+    /// Power the joints and ramp to the home pose. No policy needed.
+    RobotInit,
+    /// Cut power to the joints. The robot collapses if nothing holds it.
+    RobotRelax,
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -347,6 +377,8 @@ impl Call {
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotInit => method::ROBOT_INIT,
+            Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -439,7 +471,9 @@ impl Call {
             | Call::RobotHealth
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
-            | Call::RobotStop => Value::Object(serde_json::Map::new()),
+            | Call::RobotStop
+            | Call::RobotInit
+            | Call::RobotRelax => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
             | Call::SystemInfo
@@ -480,6 +514,8 @@ impl Call {
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_INIT => Call::RobotInit,
+            method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1775,6 +1811,8 @@ mod tests {
             }),
             Call::RobotStop,
             Call::RobotEnable(EnableParams { on: true }),
+            Call::RobotInit,
+            Call::RobotRelax,
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -1816,7 +1854,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            33,
+            35,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

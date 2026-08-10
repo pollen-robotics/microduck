@@ -496,6 +496,22 @@ Three conditions gate the bring-up, each for its own reason:
 Torque is *not* dropped when the policy is disabled again: the robot holds its pose, which is what
 "a standing robot stays standing" means on this side too.
 
+`robot.init` and `robot.relax` are the same two transitions, asked for directly — because "stand up"
+and "let go" are decisions of their own, and until now the first was a subcommand that opens the motor
+bus itself and the second did not exist at all. Both are served by `robotd`, so neither needs the
+daemon stopped and neither can write to the bus while the control loop is doing the same. `init`
+deliberately needs no policy: standing up is reasonable to ask of a robot with no walking network, and
+it is what makes the bring-up testable at all, since CI has no ONNX Runtime.
+
+They arrive as a *request* the loop takes once per tick rather than a flag it keeps applying: one
+`set_torque` is a bus transaction per joint, so a level would put sixteen writes into every tick. The
+later request replaces an unread earlier one — asked to stand up and then to let go within 20 ms, the
+second is what was meant. And `relax` clears `enabled`, or the next tick would see a robot that was
+asked to drive and stand it straight back up.
+
+Neither is reachable over BLE. A phone button that drops the robot on the floor is not one to offer,
+and standing up moves every joint at once, which wants whoever asked to be looking at the robot.
+
 ### 5.8 `safeToRestart` becomes real
 
 False while the policy is enabled and the robot is moving. Restarting motor control

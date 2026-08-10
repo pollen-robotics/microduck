@@ -606,6 +606,8 @@ impl Server {
             | Call::RobotHead(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
+            | Call::RobotInit
+            | Call::RobotRelax
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

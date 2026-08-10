@@ -104,6 +104,16 @@ enum Namespace {
         command: SystemCommand,
     },
 
+    /// Power to the joints: stand the robot up, or let it go.
+    ///
+    /// Served by `robotd`, which owns the motor bus — so unlike `robotd init` these need no daemon
+    /// stopped and cannot corrupt the bus by writing to it at the same time as the control loop.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Robot {
+        #[command(subcommand)]
+        command: RobotCommand,
+    },
+
     /// The gamepad. Pair one, see what is paired, forget one.
     ///
     /// Driving is not a command here: `padd.service` runs on its own and picks up whatever pad is
@@ -257,6 +267,37 @@ enum SystemCommand {
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RobotCommand {
+    /// Power the joints and ramp to the home pose, over about two seconds.
+    ///
+    /// **This moves every joint.** Have the robot on its stand, or hold it. Needs no policy — a
+    /// robot with no walking network can still stand — and it is what the gamepad's Start does on
+    /// its way to driving, so running this by hand is for the bench rather than the everyday path.
+    ///
+    /// Refused on a robot that has fallen: the fall gate holds a fallen robot limp on purpose. Stand
+    /// it up by hand first.
+    Init {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Cut power to the joints.
+    ///
+    /// **The robot collapses** if nothing is holding it. This is what you want before picking it up
+    /// or putting it away, and it is the only way back to limp short of cutting power.
+    ///
+    /// Not the same as stopping: `robot.stop` zeroes the velocity and keeps the robot standing, and
+    /// pressing Start again disables the policy while still holding the pose.
+    Relax {
+        /// Let go without asking.
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -1456,6 +1497,49 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
     Ok(())
 }
 
+/// Power to the joints, through `robotd`.
+fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
+    // Asked before connecting, so a robot is not dropped by a command the operator then aborts.
+    // Same shape as `system reboot`, and for a more immediate reason: this one takes effect in
+    // milliseconds and the robot is standing.
+    if let RobotCommand::Relax { yes: false, .. } = &command {
+        return Err(Failure::new(
+            exit::USAGE,
+            "this cuts power to the joints and the robot will collapse. Re-run with --yes if              that is what you want."
+                .to_owned(),
+        ));
+    }
+
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    let (call, json) = match &command {
+        RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
+        RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+    };
+
+    let result = result_of(client.call(&call)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    // An intent is a successful call that may report a refusal, and the exit code has to tell them
+    // apart: a fallen robot refusing to stand up is not the same as a robot that could not be asked.
+    let outcome: proto::IntentResult = decode(&result)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+    match command {
+        RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
+        RobotCommand::Relax { .. } => println!("torque off"),
+    }
+    Ok(())
+}
+
 /// The gamepad, through `configd`.
 ///
 /// `pair` is the only command here that takes a while — discovery is held open while someone holds
@@ -1863,6 +1947,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Pad { command } => {
             return run_pad(&cli.config_socket, command);
+        }
+        Namespace::Robot { command } => {
+            return run_robot(&cli.robot_socket, command);
         }
         Namespace::Update { command } => command,
     };

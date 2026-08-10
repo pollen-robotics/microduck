@@ -13,7 +13,13 @@
 //! "how old is it". That is what the deadman reads.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Encodings for [`Intents::power`]. An `AtomicU8` rather than two bools, so "init" and "relax"
+/// cannot both be pending — they are alternatives, and the last one asked for wins.
+const POWER_NONE: u8 = 0;
+const POWER_INIT: u8 = 1;
+const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -34,6 +40,24 @@ pub struct Intents {
     head: ArcSwap<Stamped<[f64; 4]>>,
     /// Whether the policy should drive. Discrete, so a plain flag rather than a slot.
     enabled: AtomicBool,
+    /// A pending `robot.init` / `robot.relax`, as [`PowerRequest`].
+    ///
+    /// A request rather than a flag, and taken rather than read: powering the joints is an *edge*,
+    /// not a state the loop should keep re-applying. One `set_torque` is a bus transaction per
+    /// joint, so a level here would put sixteen writes into every tick for as long as it stayed set.
+    ///
+    /// It lives with the intents because this is where the loop reads what clients asked for, and
+    /// because the loop is the only thing that may touch the bus — the IPC task cannot do it itself.
+    power: AtomicU8,
+}
+
+/// What a client asked for, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerRequest {
+    /// Torque on, ramp to the home pose.
+    Init,
+    /// Torque off. The robot collapses if nothing holds it.
+    Relax,
 }
 
 /// What the loop reads at the top of a tick.
@@ -69,6 +93,7 @@ impl Intents {
                 at_us: 0,
             }),
             enabled: AtomicBool::new(false),
+            power: AtomicU8::new(POWER_NONE),
         }
     }
 
@@ -97,6 +122,33 @@ impl Intents {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Ask the loop to power the joints and stand up.
+    pub fn request_init(&self) {
+        self.power.store(POWER_INIT, Ordering::Relaxed);
+    }
+
+    /// Ask the loop to cut power to the joints.
+    ///
+    /// Also clears `enabled`: a robot that has been asked to go limp is not one the policy should
+    /// keep driving, and leaving that flag set would have the next tick bring it straight back up.
+    pub fn request_relax(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        self.power.store(POWER_RELAX, Ordering::Relaxed);
+    }
+
+    /// Take the pending request, leaving none.
+    ///
+    /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
+    /// the right resolution: if someone asked to stand up and then to relax within 20 ms, the
+    /// second is what they meant.
+    pub fn take_power_request(&self) -> Option<PowerRequest> {
+        match self.power.swap(POWER_NONE, Ordering::Relaxed) {
+            POWER_INIT => Some(PowerRequest::Init),
+            POWER_RELAX => Some(PowerRequest::Relax),
+            _ => None,
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {

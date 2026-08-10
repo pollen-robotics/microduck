@@ -146,6 +146,12 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         // the first ~73s of a boot is not a control transport.
         RobotMove(_) | RobotHead(_) | RobotEnable(_) => None,
 
+        // Power to the joints. A phone button that drops the robot on the floor is not one to
+        // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
+        // which wants the person doing it to be looking at the robot rather than at a screen. Both
+        // are `robotctl` on the robot, deliberately.
+        RobotInit | RobotRelax => None,
+
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
         // remote — but a stop button that works over an unbonded, high-latency, sometimes-absent
@@ -429,6 +435,8 @@ mod tests {
             }),
             proto::Call::RobotStop,
             proto::Call::RobotEnable(proto::EnableParams { on: true }),
+            proto::Call::RobotInit,
+            proto::Call::RobotRelax,
             proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
             proto::Call::SystemPairingPin,
             proto::Call::SystemSetPairingPin(proto::SetPairingPinParams {

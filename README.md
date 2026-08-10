@@ -98,16 +98,24 @@ And if the pad disconnects, `padd` sends nothing at all — `robotd`'s deadman s
 its own, which is the wanted behaviour and the reason `padd` does not invent a zero command.
 
 The first Start after power-on **moves the robot**: the joints go from wherever they are resting to
-the home pose over two seconds. Hold it, or have it on its stand. A robot the IMU already considers
-fallen is refused — `robot.enable` says to stand it up first, and that still means stopping the
-daemon and running `robotd init` by hand:
+the home pose over two seconds. Hold it, or have it on its stand.
+
+The same two steps by hand, for when there is no pad in the room:
 
 ```bash
-sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
+sudo robotctl robot init
 ```
 
-That command has to stop `robotd` because `init` opens the motor bus itself, and two writers on one
-UART corrupt each other's replies.
+```bash
+sudo robotctl robot relax --yes
+```
+
+`init` powers the joints and ramps to the home pose; `relax` cuts power, and **the robot collapses**
+if nothing is holding it. That is the only way back to limp short of pulling the plug — pressing Start
+again stops the policy but keeps the robot standing.
+
+A robot the IMU already considers fallen refuses both Start and `robot init`: the fall gate holds a
+fallen robot limp on purpose. Stand it up by hand first.
 
 Speeds are conservative by default. `--max-linear` (m/s), `--max-angular` (rad/s) and
 `--max-head` (radians) raise them; `--deadzone` is there because analogue sticks rarely rest at

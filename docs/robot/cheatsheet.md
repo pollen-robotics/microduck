@@ -60,6 +60,34 @@ are in `--json`, which carries the whole state, one object per line:
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
+### Power to the joints (`robotd`)
+
+```
+sudo robotctl robot init
+```
+
+```
+sudo robotctl robot relax --yes
+```
+
+`init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
+so have the robot on its stand. It needs no policy, and it is what the gamepad's Start does on its way
+to driving, so by hand it is a bench thing.
+
+`relax` cuts power and **the robot collapses** if nothing holds it, which is why it wants `--yes`. It
+is the only way back to limp short of pulling the plug: pressing Start again stops the policy and
+keeps the robot standing, and `robot.stop` zeroes the velocity while still standing.
+
+Both go through `robotd`, which owns the motor bus. `robotd init` — the subcommand — still exists for
+a robot whose daemon is not running, and it needs the daemon stopped, because two writers on one UART
+corrupt each other's replies:
+
+```
+sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
+```
+
+A fallen robot refuses `init`: the fall gate holds it limp on purpose. Stand it up by hand first.
+
 ### Gamepad (`configd`)
 
 ```

@@ -966,6 +966,44 @@ async fn control_loop<T: RobotIo>(
         let (command, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
+        // An explicit `robot.init` / `robot.relax`, taken once.
+        //
+        // Before the enable-driven bring-up below, so a `relax` that arrives in the same tick as a
+        // still-set `enabled` flag wins — `request_relax` clears that flag, and reading the request
+        // first means the order cannot invert.
+        match intents.take_power_request() {
+            Some(intents::PowerRequest::Init) => match (bringup, sensors.as_ref()) {
+                // Unlike `enable`, this needs no policy: "stand up" is a reasonable thing to ask of
+                // a robot with no walking network at all, and it is what a bench robot needs before
+                // anything else can be tested.
+                (Bringup::Limp, Some(sensors)) => match safety.set_torque(true) {
+                    Ok(()) => {
+                        tracing::warn!(?HOME_RAMP, "robot.init: torque on, ramping to home");
+                        bringup = Bringup::Homing {
+                            from: sensors.positions,
+                            since: tick_start,
+                        };
+                    }
+                    Err(e) => tracing::warn!(error = %e, "cannot enable torque"),
+                },
+                // Already up, or up and driving: nothing to do, and saying so beats a silent no-op.
+                (state, _) => tracing::info!(?state, "robot.init: already brought up"),
+            },
+            Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
+                Ok(()) => {
+                    tracing::warn!("robot.relax: torque off");
+                    // Back to the start, so the next `init` or Start ramps from wherever the robot
+                    // ends up rather than assuming it is still at the home pose.
+                    bringup = Bringup::Limp;
+                    was_driving = false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot cut torque; the robot is still powered")
+                }
+            },
+            None => {}
+        }
+
         // Bring the robot up when someone asks it to drive and it has no torque yet.
         //
         // Gated on `!safety.fallen()` as well as on the request, and that is not belt-and-braces: a
@@ -1455,6 +1493,34 @@ fn dispatch(
                 proto::IntentResult::accepted()
             };
             proto::Response::ok(Some(id), &result)
+        }
+
+        // Power to the joints, which is the pair `robot.enable` is not: enabling asks the *policy*
+        // to drive and brings a limp robot up on the way, while these two are the decision itself.
+        //
+        // Both only *ask*. The control loop owns the only `RobotIo` handle, so nothing here touches
+        // the bus — which is also why `robotd init` needs the daemon stopped and these do not.
+        proto::Call::RobotInit => {
+            let result = if state.fallen.load(Ordering::Relaxed) {
+                // The same wall `robot.enable` hits, and for the same reason: `Safety::apply`
+                // commands a fallen robot at limp gain and holds it, so a ramp would be writing a
+                // stand-up that cannot happen. Named in the refusal, with the escape hatch, because
+                // "it refused exactly when I needed it" is otherwise the whole experience.
+                proto::IntentResult::refused(
+                    "the robot is down. Stand it up by hand, or stop robotd and run                      `robotd init` — the fall gate holds a fallen robot limp on purpose",
+                )
+            } else {
+                intents.request_init();
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // Never refused. Going limp is always safe *for the robot* — it is the people around it who
+        // need to know, which is why `robotctl` asks for `--yes` and BLE cannot reach this at all.
+        proto::Call::RobotRelax => {
+            intents.request_relax();
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
         proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
@@ -2421,6 +2487,128 @@ mod tests {
 
         assert_eq!(rx.recv().unwrap(), None, "powered up with no policy to run");
         assert!(!s.homed.load(Ordering::Relaxed));
+    }
+
+    /// **`robot.init` powers the joints and ramps, with no policy anywhere.**
+    ///
+    /// This is the path CI could not reach before: `enable` requires a loaded policy, and there is no
+    /// ONNX Runtime here. `init` deliberately does not, because standing up is a reasonable thing to
+    /// ask of a robot with no walking network — which also makes the whole bring-up testable.
+    #[tokio::test]
+    async fn robot_init_powers_the_joints_and_ramps_home() {
+        let mut resting = DEFAULT_POSITION;
+        resting[0] = DEFAULT_POSITION[0] + 0.4;
+        // `frozen`, so reported positions do not chase the targets: the ramp has to be driven by the
+        // clock rather than by the robot appearing to arrive.
+        let io = FakeIo::at(resting).frozen();
+
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send((io.torque, io.torque_writes, io.last_written))
+                .unwrap();
+        });
+
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let (torque, writes, written) = rx.recv().unwrap();
+        assert_eq!(torque, Some(true), "init did not power the joints");
+        assert_eq!(writes, 1, "torque written {writes} times, not once");
+
+        // Mid-ramp: commanded somewhere between where it was and home, not either end. The ramp
+        // being real is the point — a jump straight to home is the lurch it exists to avoid.
+        let written = written.expect("the loop must command something").positions;
+        let (from, to) = (resting[0], DEFAULT_POSITION[0]);
+        assert!(
+            written[0] < from && written[0] > to,
+            "commanded {} outside the ramp {from}..{to}",
+            written[0]
+        );
+    }
+
+    /// **`robot.relax` cuts power and goes back to the start**, so the next bring-up ramps from
+    /// wherever the robot ended up rather than assuming it is still standing at home.
+    #[tokio::test]
+    async fn robot_relax_cuts_power_and_returns_to_limp() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send((io.torque, io.torque_writes)).unwrap();
+        });
+
+        // Let the init land, then let go.
+        while s.ticks.load(Ordering::Relaxed) < 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let ticks_at_relax = s.ticks.load(Ordering::Relaxed);
+        intents.request_relax();
+        while s.ticks.load(Ordering::Relaxed) < ticks_at_relax + 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let (torque, writes) = rx.recv().unwrap();
+        assert_eq!(torque, Some(false), "relax left the joints powered");
+        assert_eq!(writes, 2, "expected one on and one off, got {writes}");
+        assert!(
+            !s.homed.load(Ordering::Relaxed),
+            "still reporting homed after relax"
+        );
+    }
+
+    /// Relaxing clears `enabled` too. Otherwise the very next tick sees a robot that was asked to
+    /// drive, brings it back up, and the robot someone just let go of stands up again.
+    #[test]
+    fn relaxing_stops_the_policy_asking_to_drive() {
+        let intents = Intents::new();
+        intents.set_enabled(true);
+        intents.request_relax();
+        assert!(!intents.snapshot().enabled);
+        assert_eq!(
+            intents.take_power_request(),
+            Some(intents::PowerRequest::Relax)
+        );
+        // Taken once: a bus transaction per joint is not something to repeat every tick.
+        assert_eq!(intents.take_power_request(), None);
+    }
+
+    /// The last request wins. Asking to stand up and then to let go within one tick must not stand
+    /// the robot up.
+    #[test]
+    fn the_later_power_request_replaces_the_earlier_one() {
+        let intents = Intents::new();
+        intents.request_init();
+        intents.request_relax();
+        assert_eq!(
+            intents.take_power_request(),
+            Some(intents::PowerRequest::Relax)
+        );
     }
 
     /// The ramp itself, which is the part that decides whether a robot stands up or snaps.
