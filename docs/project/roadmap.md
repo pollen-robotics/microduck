@@ -14,8 +14,8 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | `duck-control/` | robot model · bus · IMU · `RobotIo` · observations · ONNX policy · safety — **slices 1–2 done, and run on a robot**. A library: no tokio, no sockets, no systemd |
 | `duck-ipc-proto/` | wire contract for `update.*` and `robot.*` — **done**; serde/serde_json/semver only, so nothing on the recovery path pulls the engine's tree |
 | `robotd/` | a real 50 Hz loop driving walk/stand through the safety layer, intents, health from deadline adherence and policy state — **slices 1–2 done, and it walks on a board**; no kinematics |
-| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release; needs libudev, installed by CI and the board cross-build |
-| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
+| `padd/` | gamepad → intents, as an ordinary socket client — **done**, ships in the release and runs as its own unit from boot, so pairing a pad is the only step; needs libudev, installed by CI and the board cross-build |
+| `robotctl/` | the operator CLI — `update`, `health`, `version`, `monitor`, `net`, `system`, `pad`, `completions`; depends on `duck-ipc-proto`, not `updater`, so it stays on the recovery path |
 | `xtask/` | package · sign · promote — **done**, byte-identical promotion verified |
 | `.github/` | ci · release · promote — **all three run for real**: `0.2.0` was tagged to staging, verified through the engine, installed on a board and promoted to stable on 2026-08-05, byte-identical (§16.3) |
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
@@ -224,7 +224,7 @@ bricked release recovers without a laptop.
 ```
 duck-ipc-proto/ wire types — serde/serde_json/semver only; btd/robotd/robotctl depend
                 on this, never on updater
-configd/        wifi (NetworkManager), robot name, pairing PIN, reboot
+configd/        wifi (NetworkManager), robot name, pairing PIN, reboot, gamepad pairing (BlueZ)
 updater/        engine + updaterd
 robotctl/       CLI
 robotd/         control, gait, safety — no kinematics yet

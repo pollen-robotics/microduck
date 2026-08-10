@@ -45,11 +45,46 @@ software
 
 ## Drive it
 
-`padd` reads a gamepad and sends intents over the socket. It has no privileged access — it is
-an ordinary client, sending exactly what the app and the SDK will send.
+Hold the gamepad's pairing button — on an Xbox controller the sync button, whose light flashes
+quickly rather than slowly — and:
 
-The good way to run it is **from your laptop**, with the socket forwarded. Pad in your hands,
-robot on the bench, nothing cross-compiled and nothing installed:
+```bash
+sudo robotctl pad pair
+```
+
+```
+looking for a gamepad in pairing mode — hold the pad's pairing button
+paired  Xbox Wireless Controller 78:86:2E:BB:13:28
+padd is driving from it now.
+```
+
+That is the whole setup. No MAC address to find, and nothing to start afterwards: `padd` runs
+from boot, waits for a pad and drives whatever connects. The pad is *trusted* as well as paired,
+so it comes back by itself after a reboot. `robotctl pad forget <mac>` revokes it.
+
+```bash
+robotctl pad status
+```
+
+```
+pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
+padd    active — driving whatever pad connects
+```
+
+Two lines because they fail separately: a connected pad with a dead driver looks exactly like a
+working robot ignoring you.
+
+`padd` reads the pad and sends intents over the socket. It has no privileged access — it is an
+ordinary client, sending exactly what the app and the SDK will send, which is why pairing is
+`configd`'s job rather than its own.
+
+Driving from **your laptop** works too, with the socket forwarded — pad in your hands, robot on
+the bench, nothing installed. Stop the one on the robot first, or two processes fight over the
+sticks:
+
+```bash
+sudo systemctl stop padd
+```
 
 ```bash
 ssh -L /tmp/robotd.sock:/run/robotd.sock radxa@192.168.1.42
@@ -59,13 +94,6 @@ Leave that open, and in another terminal from this clone:
 
 ```bash
 cargo run -p padd -- --socket /tmp/robotd.sock
-```
-
-On the robot itself it ships with the release, but unlike `robotctl` it is not on `PATH` — so
-give the full path. The default socket is already the right one there:
-
-```bash
-/opt/robot/daemon/current/bin/padd
 ```
 
 The controls:
@@ -85,7 +113,18 @@ its own, which is the wanted behaviour and the reason `padd` does not invent a z
 
 Speeds are conservative by default. `--max-linear` (m/s), `--max-angular` (rad/s) and
 `--max-head` (radians) raise them; `--deadzone` is there because analogue sticks rarely rest at
-exactly zero and the robot creeps without it.
+exactly zero and the robot creeps without it. The unit runs with the defaults, so to use those
+flags on the robot, stop it and run the binary yourself:
+
+```bash
+sudo systemctl stop padd
+```
+
+```bash
+sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+```
+
+`systemctl start padd` puts the default back.
 
 ## Watch what it is doing
 

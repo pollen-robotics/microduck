@@ -104,6 +104,18 @@ enum Namespace {
         command: SystemCommand,
     },
 
+    /// The gamepad. Pair one, see what is paired, forget one.
+    ///
+    /// Driving is not a command here: `padd.service` runs on its own and picks up whatever pad is
+    /// connected, so pairing is the only step. `pad status` is how you find out whether that is
+    /// working, and it answers the two questions separately — is a pad connected, and is `padd`
+    /// running — because a connected pad and a dead driver look identical from the outside.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Pad {
+        #[command(subcommand)]
+        command: PadCommand,
+    },
+
     /// Update and release management.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Update {
@@ -247,6 +259,44 @@ enum SystemCommand {
         /// Reboot without asking.
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PadCommand {
+    /// Which pads this robot is paired to, and whether `padd` is driving. Changes nothing.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Pair the gamepad that is in pairing mode now.
+    ///
+    /// Hold the pad's pairing button first — on an Xbox controller that is the sync button, and its
+    /// light flashes quickly rather than slowly. Then run this. No MAC address needed: the robot
+    /// looks for a gamepad in pairing mode and takes the one it finds.
+    ///
+    /// Once paired the pad is also *trusted*, which is what makes it reconnect by itself after a
+    /// reboot with nobody logged in. Nothing else is needed — `padd.service` is already running and
+    /// starts driving when the pad connects.
+    Pair {
+        /// Which pad, when more than one is in pairing mode — or when it is hardware the robot does
+        /// not recognise as a gamepad. `pad pair` prints the addresses it saw when it refuses.
+        mac: Option<String>,
+
+        /// How long to look, in seconds.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u32>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Forget a pad, so it stops reconnecting to this robot.
+    Forget {
+        mac: String,
         #[arg(long)]
         json: bool,
     },
@@ -1392,6 +1442,137 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The gamepad, through `configd`.
+///
+/// `pair` is the only command here that takes a while — discovery is held open while someone holds
+/// the pad's sync button — and it stays a single blocking call rather than a progress stream: there
+/// is exactly one thing to report, and it arrives at the end.
+fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
+    let mut client = Client::connect_to("configd", socket)?;
+    client.hello()?;
+
+    let (call, json) = match &command {
+        PadCommand::Status { json } => (proto::Call::PadStatus, *json),
+        PadCommand::Pair { mac, timeout, json } => (
+            proto::Call::PadPair(proto::PadPairParams {
+                mac: mac.clone(),
+                timeout_seconds: *timeout,
+            }),
+            *json,
+        ),
+        PadCommand::Forget { mac, json } => (
+            proto::Call::PadForget(proto::PadForgetParams { mac: mac.clone() }),
+            *json,
+        ),
+    };
+
+    if let PadCommand::Pair { json: false, .. } = &command {
+        // Printed before the call, not after: the call blocks for the whole discovery window, and
+        // someone who ran this needs to know *now* that they should be holding the button.
+        eprintln!("looking for a gamepad in pairing mode — hold the pad's pairing button");
+    }
+
+    let result = result_of(client.call(&call)?)?;
+    if json {
+        println!("{}", compact(&result));
+        return Ok(());
+    }
+
+    match command {
+        PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
+        PadCommand::Pair { .. } => return report_pair(&result),
+        PadCommand::Forget { mac, .. } => {
+            let forgotten: proto::PadForgetResult = decode(&result)?;
+            if forgotten.removed {
+                println!("forgot {mac}");
+            } else {
+                // Not an error, same contract as `net forget`: asking twice must not look like a
+                // failure.
+                println!("{mac} was not paired");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
+    use std::fmt::Write;
+    let status: proto::PadStatusResult = decode(result)?;
+
+    let mut out = String::new();
+    if status.pads.is_empty() {
+        let _ = writeln!(out, "pad     none paired — run:  sudo robotctl pad pair");
+    }
+    for pad in &status.pads {
+        // Three states, because they fail differently: connected and drivable; paired but out of
+        // range or switched off; paired and *not trusted*, which is the one that looks fine and
+        // silently does not come back after a reboot.
+        let state = match (pad.connected, pad.trusted) {
+            (true, _) => "connected".to_owned(),
+            (false, true) => "paired, not connected — switch the pad on".to_owned(),
+            (false, false) => "paired but NOT trusted — re-run: sudo robotctl pad pair".to_owned(),
+        };
+        let _ = writeln!(out, "pad     {} {}  {}", pad.name, pad.mac, state);
+    }
+
+    let driver = match status.driver {
+        proto::DriverState::Active => "active — driving whatever pad connects".to_owned(),
+        proto::DriverState::Inactive => {
+            "NOT running — start it:  sudo systemctl start padd".to_owned()
+        }
+        proto::DriverState::Absent => {
+            "not installed — this release predates padd.service".to_owned()
+        }
+        proto::DriverState::Unknown => "unknown — could not ask systemd".to_owned(),
+    };
+    let _ = write!(out, "padd    {driver}");
+    Ok(out)
+}
+
+/// Pairing is a successful call that may report a failed outcome, like a wifi join: the exit status
+/// has to distinguish "the robot refused" from "the robot could not be asked".
+fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
+    match decode::<proto::PadPairResult>(result)? {
+        proto::PadPairResult::Paired { pad } => {
+            println!("paired  {} {}", pad.name, pad.mac);
+            if pad.connected {
+                println!("padd is driving from it now.");
+            } else {
+                // Bonded but not connected yet, which is normal for a second or two. Saying so
+                // beats printing nothing where "it works" should be.
+                println!("bonded; it will connect on its own in a moment.");
+            }
+            Ok(())
+        }
+        proto::PadPairResult::Failed { reason, detail } => {
+            let advice = match reason {
+                proto::PadPairFailure::NotFound => {
+                    "no gamepad in pairing mode. Hold the pad's pairing button until its light \
+                     flashes quickly, then try again"
+                }
+                proto::PadPairFailure::Ambiguous => {
+                    "more than one pad is in pairing mode; name the one you want by its address"
+                }
+                proto::PadPairFailure::Timeout => {
+                    "the pad was found but never finished pairing; try again"
+                }
+                proto::PadPairFailure::NoAdapter => {
+                    "this robot has no Bluetooth adapter yet. Just after a boot that is normal — \
+                     hci0 appears about 73s in"
+                }
+                proto::PadPairFailure::Rejected => {
+                    "Bluetooth refused the pairing. The usual cause is a missing \
+                     `Privacy = device` in /etc/bluetooth/main.conf — run scripts/setup-board.sh \
+                     and reboot"
+                }
+                proto::PadPairFailure::Other => "pairing failed",
+            };
+            let detail = detail.map(|d| format!("\n{d}")).unwrap_or_default();
+            Err(Failure::new(exit::REFUSED, format!("{advice}{detail}")))
+        }
+    }
+}
+
 fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
     use std::fmt::Write;
     let status: proto::NetStatusResult = decode(result)?;
@@ -1647,6 +1828,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::System { command } => {
             return run_system(&cli.config_socket, command);
+        }
+        Namespace::Pad { command } => {
+            return run_pad(&cli.config_socket, command);
         }
         Namespace::Update { command } => command,
     };

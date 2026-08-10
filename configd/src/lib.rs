@@ -5,9 +5,13 @@
 //! live in the control daemon. And because `btd` **owns nothing** (§4.1) — if this lived in the
 //! BLE service, an SDK would absurdly have to go through Bluetooth to set a robot's name.
 //!
-//! So it is a fifth service, deliberately: one socket, four `net.*` methods and three
-//! `system.*` ones, and every transport — BLE, `robotctl`, later `mediad`'s remote gateway —
-//! is a client of it rather than a reimplementation.
+//! So it is a fifth service, deliberately: one socket, the `net.*`, `system.*` and `pad.*`
+//! methods, and every transport — BLE, `robotctl`, later `mediad`'s remote gateway — is a client of
+//! it rather than a reimplementation.
+//!
+//! `pad.*` is here for the same reason `net.*` is: pairing a gamepad is a root-only question about
+//! the radio's configuration, and the process that *reads* the pad — `padd` — has no privileged
+//! access on purpose, because it exercises the same intent API the phone app will. See [`pad`].
 //!
 //! **It stores no credentials.** NetworkManager owns those, persists them root-only and
 //! reconnects on its own; `configd` hands a passphrase over and forgets it. What it does own is
@@ -20,8 +24,12 @@
 //! typed JSON from a peer-credentialled local socket. See `systemd/configd.service` for the
 //! sandbox that goes with it.
 
+#[cfg(target_os = "linux")]
+pub mod bluez;
+pub mod driver;
 pub mod net;
 #[cfg(target_os = "linux")]
 pub mod nm;
+pub mod pad;
 pub mod power;
 pub mod store;

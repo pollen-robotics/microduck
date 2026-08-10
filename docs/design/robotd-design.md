@@ -457,6 +457,13 @@ and any remote client is the one a developer exercises every day, so it cannot q
 For dev, `ssh -L /tmp/robotd.sock:/run/robotd.sock` gives pad-on-laptop, robot-on-board with
 no code.
 
+On the robot it is `padd.service`, running from boot and driving whatever pad connects — safe
+with no pad, because it sends nothing and the deadman holds the robot. It stays **unprivileged**,
+which is the load-bearing part of "the gamepad is a client": its `input` and `robot` group
+membership is all it has. Pairing a pad therefore belongs to `configd` (`architecture.md` §1),
+not here — bonding a device needs root and BlueZ, and a `padd` holding either would no longer be
+exercising the API the app will use.
+
 ### 5.8 `safeToRestart` becomes real
 
 False while the policy is enabled and the robot is moving. Restarting motor control
@@ -471,8 +478,9 @@ restarts it cleanly with the gate passing; and `--unhealthy` still rolls back.
 **Built, not yet run on hardware.** Nothing in slice 2 has met a robot: no policy has been
 loaded on a board, no observation has reached a real ONNX Runtime, and the fall and deadman
 paths have only been exercised against `FakeIo`. The tests establish that the logic is
-self-consistent — not that the robot walks. Note also that `padd` cannot run on the board
-yet (§11.4), so the first hardware driving will be from a laptop over a forwarded socket.
+self-consistent — not that the robot walks. (`padd` on the board was open when this was
+written and is not any more — §11.4 — so driving no longer has to come from a laptop over a
+forwarded socket.)
 
 ### 5.10 The tick, end to end
 

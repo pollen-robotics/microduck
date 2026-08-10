@@ -1,0 +1,89 @@
+# padd — the gamepad, as an intent client.
+#
+# Install to /etc/systemd/system/padd.service.
+#
+# Why this is a unit at all. Driving used to mean: ssh to the board, be a member of two groups
+# (having logged out and back in since), and run a binary by its full path — which died with the ssh
+# session. So the pad worked when someone had done all of that, and the failures were invisible in
+# three separate places. Now pairing a pad (`robotctl pad pair`) is the only step, and this runs from
+# boot waiting for one.
+#
+# It is safe to have running with no pad, which is what makes an always-on unit the simple answer
+# rather than udev rules or device-unit binding: `padd` sends *nothing* when it sees no pad, and
+# robotd's deadman holds the robot on its own. A pad that connects is picked up within a tick.
+#
+# Nothing moves on connection either — the policy is off until someone presses Start. What a paired
+# pad grants is the authority to enable it, and *pairing* is the gate on that: it takes a pad held in
+# pairing mode next to the robot, and `robotctl pad forget` revokes it.
+
+[Unit]
+Description=Robot gamepad intent client
+Documentation=file:///opt/robot/daemon/current/docs/architecture.md
+
+# `After`, not `Requires`: robotd is where the intents go, so starting before it is pointless — but
+# a robotd that is down must not keep this unit from being started. If the socket is not there yet
+# `padd` exits and systemd retries in five seconds, which is how it catches up on a slow boot.
+After=robotd.service local-fs.target
+Wants=robotd.service
+
+# The pad arrives over Bluetooth, and on this board hci0 does not exist until roughly 73 seconds
+# after power-on. Ordering after bluetooth.service is nowhere near sufficient for that and is not
+# meant to be: `padd` polls for a pad forever, so the radio can appear whenever it likes.
+After=bluetooth.service
+
+[Service]
+Type=exec
+ExecStart=/opt/robot/daemon/current/bin/padd
+
+# Unprivileged, and this one is not a hardening choice — it is the point of the process. `padd` has
+# no privileged access to the robot, which is what makes it an honest exercise of the intent API
+# every day (see the crate docs). Its access is two groups and nothing else:
+#
+#   input  — /dev/input/event*, which is root:input 0660. Without it padd sees no pad and says so.
+#   robot  — robotd's 0660 socket, the same way btd and the SDK reach it.
+#
+# The user and group must exist or the unit fails to start; see sysusers.d/padd.conf, installed
+# alongside.
+User=padd
+Group=padd
+SupplementaryGroups=input robot
+
+# Restart=always, not on-failure: `padd` exits cleanly when robotd's socket is not there, and that
+# is a state to retry rather than one to stay down in. Five seconds because the thing being waited
+# for is a boot finishing or a daemon restarting, neither of which is helped by spinning.
+Restart=always
+RestartSec=5s
+
+# Hardening, as far as a process that reads an input device can go.
+#
+# NOT PrivateDevices=yes: that hides /dev/input, which is the one thing this process exists to read.
+# The device nodes it may open are still limited by the `input` group.
+#
+# AF_NETLINK is load-bearing and easy to miss: gilrs enumerates and *watches* devices through
+# libudev, which is a netlink socket. Without it a pad connected after startup is never noticed,
+# which presents as "the pad works only if it was on before the robot booted".
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+# stderr → journal; level via RUST_LOG. `padd` logs at `warn` when it starts driving, when the
+# policy is toggled and when a pad appears or goes away — the events someone reads the journal to
+# find — and nothing per tick.
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

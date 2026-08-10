@@ -60,6 +60,59 @@ are in `--json`, which carries the whole state, one object per line:
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
+### Gamepad (`configd`)
+
+Hold the pad's pairing button — on an Xbox controller the sync button, whose light flashes quickly —
+then:
+
+```
+sudo robotctl pad pair
+```
+
+No MAC address: the robot looks for a gamepad in pairing mode and takes the one it finds. With two in
+pairing mode it refuses rather than guessing, and prints their addresses so you can name one — which
+is also how to pair hardware it does not recognise as a gamepad:
+
+```
+sudo robotctl pad pair 78:86:2E:BB:13:28
+```
+
+```
+robotctl pad status
+```
+
+```
+sudo robotctl pad forget 78:86:2E:BB:13:28
+```
+
+**Pairing is the only step.** `padd.service` runs from boot, waits for a pad and drives whatever
+connects, so nothing needs starting and nothing dies with your ssh session. On the pad: **Start**
+toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks between body
+and head, **B**/circle stops.
+
+`pad status` answers two questions separately, because a connected pad and a dead driver look
+identical from the outside:
+
+```
+pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
+padd    active — driving whatever pad connects
+```
+
+A pad that pairs and then drops straight back out means `Privacy = device` is missing from
+`/etc/bluetooth/main.conf`: run `scripts/setup-board.sh` and reboot — it does not take effect until
+then. `paired but NOT trusted` in `pad status` is the other one worth knowing: it looks fine and does
+not reconnect after a reboot; re-run `pad pair` to fix it.
+
+To drive with non-default limits, stop the service first or two processes fight over the sticks:
+
+```
+sudo systemctl stop padd
+```
+
+```
+sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+```
+
 ### Wifi (`configd`)
 
 ```

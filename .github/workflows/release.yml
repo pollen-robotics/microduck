@@ -120,6 +120,8 @@ jobs:
             --include "configd/systemd/configd.service=systemd/configd.service" \
             --include "btd/systemd/btd.service=systemd/btd.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
+            --include "padd/systemd/padd.service=systemd/padd.service" \
+            --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \

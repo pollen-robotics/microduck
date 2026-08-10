@@ -50,7 +50,7 @@ duck-control/   the control core: model · bus · IMU · observations · policy 
 padd/           gamepad → intents — an ordinary socket client, no privileged access
 updater/        engine + updaterd
 robotd/         control daemon
-configd/        wifi · robot name · pairing PIN · reboot
+configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
 btd/            the BLE front door, plus btctl (a laptop client, never shipped)
 robotctl/       the local CLI
 xtask/          package · sign · promote — build tooling, never shipped

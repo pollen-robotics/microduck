@@ -9,8 +9,24 @@
 //! the way an API only the phone app uses inevitably would. The cost is a socket hop: tens
 //! of microseconds against a 20 ms tick.
 //!
+//! ## On the robot, this runs itself
+//!
+//! `padd.service` starts at boot and stays up whether or not a pad is present, so driving takes one
+//! step and it is a pairing step: `sudo robotctl pad pair`, with the pad held in pairing mode. The
+//! pad is bonded *and trusted*, so it reconnects by itself afterwards, and this process picks it up
+//! within a tick.
+//!
+//! Waiting with no pad is deliberately cheap and deliberately silent — nothing is sent, and
+//! `robotd`'s deadman holds the robot on its own. Inventing a zero command instead would mask a
+//! disconnected pad as someone's decision to stop.
+//!
+//! Pairing is **not** done here, and that is the same decision as everything above: bonding a
+//! device needs root and BlueZ, and a `padd` holding either would stop being the unprivileged client
+//! whose whole value is having no special access. It lives in `configd`, next to wifi.
+//!
 //! For development against a board: `ssh -L /tmp/robotd.sock:/run/robotd.sock duck`, then
 //! point `--socket` at the forwarded path. Pad on your laptop, robot on the bench, no code.
+//! `systemctl stop padd` first, or two processes fight over the sticks.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -51,6 +67,14 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     max_head: f64,
 }
+
+/// How long to wait between checks when there is no pad.
+///
+/// Longer than a control tick on purpose. This process now runs from boot on every robot, and most
+/// of the time there is no pad connected at all — spinning at the control rate to discover that
+/// again is a wakeup every 20 ms, forever, for nothing. Half a second is imperceptible when someone
+/// switches a pad on and is not a background load.
+const IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Sticks drive either the body or the head, never both — the prototype does the same, on
 /// its X button. Two sticks cannot express five degrees of freedom, and a modal toggle is
@@ -96,6 +120,8 @@ fn main() -> std::process::ExitCode {
     let mut mode = Mode::Body;
     let mut enabled = false;
     let mut next_id = 1u64;
+    // Whether a pad was there last tick, so appearing and disappearing are each logged once.
+    let mut driving = false;
 
     loop {
         let tick = Instant::now();
@@ -120,9 +146,22 @@ fn main() -> std::process::ExitCode {
             // No pad. Send nothing: `robotd`'s deadman stops the robot on its own, which is
             // exactly the wanted behaviour, and inventing a zero command here would mask a
             // disconnected pad as a deliberate stop.
-            std::thread::sleep(period);
+            //
+            // Logged once per transition, at `warn` so it survives `RUST_LOG=warn` on a board.
+            // "The pad went away" is the single most useful line in the journal when the robot
+            // stops responding mid-drive, and one line per tick would bury it.
+            if driving {
+                tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
+                driving = false;
+            }
+            std::thread::sleep(IDLE_POLL);
             continue;
         };
+
+        if !driving {
+            tracing::warn!(pad = pad.name(), "pad connected — driving");
+            driving = true;
+        }
 
         if toggle_mode {
             mode = match mode {

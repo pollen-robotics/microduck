@@ -301,7 +301,7 @@ kill $DAEMON2 2>/dev/null || true
 # the point here is the socket, the authorisation and the outcome codes rather than D-Bus.
 mkdir -p /var/lib/robot/config
 setpriv --regid robot --clear-groups \
-    /bin/robot/configd --fake-net --socket /run/c.sock \
+    /bin/robot/configd --fake-net --fake-pads --socket /run/c.sock \
     --state-dir /var/lib/robot/config --allow-user member \
     >/tmp/c.log 2>&1 &
 CONFIGD=$!
@@ -371,6 +371,46 @@ su member -s /bin/sh -c \
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock system pin" \
     | grep -q "012345"
 echo "    [ok] a pairing PIN keeps its leading zero"
+
+# ── the gamepad, through the same socket ──
+#
+# `pad.*` is the surface that replaced pairing a controller by hand with bluetoothctl, and it is
+# mutating: a bonded pad can enable the walking policy afterwards. So the authorisation matters as
+# much as the outcome, and it is checked the same way — a named user may, a group member may not.
+#
+# `--fake-pads` serves an in-memory set: there is no bluetoothd in a container, and what is under
+# test here is the socket, the gating and the answers rather than BlueZ.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status" \
+    | grep -q "none paired"
+echo "    [ok] pad status reports no pad on a fresh robot"
+
+code=0
+su bystander -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 6 || { echo "    [FAIL] pairing a pad should be denied (6), got $code"; exit 1; }
+echo "    [ok] an unnamed group member cannot pair a pad (exit 6)"
+
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" \
+    | grep -q "paired  Xbox Wireless Controller"
+echo "    [ok] a named user pairs the pad that is in pairing mode"
+
+# Trusted, not merely paired. An untrusted pad looks right and does not reconnect after a reboot,
+# because approving a reconnection needs an agent and at boot there is none.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status --json" \
+    | grep -q "\"trusted\":true"
+echo "    [ok] the paired pad is trusted, so it reconnects by itself"
+
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "forgot"
+echo "    [ok] a pad can be forgotten"
+
+# Forgetting again is not an error — the same contract as `net forget`, and a client must not
+# present it as a failure.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "was not paired"
+echo "    [ok] forgetting an unknown pad is not an error"
 
 # The passphrase must not be in the journal. NetConnectParams has a hand-written Debug that
 # redacts it, and this is the check that keeps it honest on the shipped binary rather than in
@@ -467,8 +507,15 @@ grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
 
-# The gamepad settings, which are the kind that fail silently: a pad that pairs and drops, or
-# a padd that reads nothing because the user is not in `input`.
+# The gamepad setting, which is the kind that fails silently: without it a pad pairs and drops
+# straight back out, presenting as an endless connect/disconnect loop rather than as a setting.
+#
+# It is the only part of gamepad readiness left in this script: reading the pad belongs to
+# padd.service and its `input` group now, and pairing one is `robotctl pad pair`.
+#
+# No apostrophes anywhere in this string. It is passed to the container single-quoted, so one
+# would end it early and run the rest on the host — which is exactly what happened, and it
+# presented as this grep failing on a file the fixture had just written.
 grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
 echo "    [ok] setup-board sets Privacy = device for gamepad pairing"
 

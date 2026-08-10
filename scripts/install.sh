@@ -368,7 +368,7 @@ stop_for_reinstall() {
     # Absent units are not a problem to report: a board running an older release simply has no
     # configd or btd, and warning about them on every forced re-install trains people to ignore
     # the warnings that matter.
-    for unit in btd.service configd.service robotd.service updaterd.service; do
+    for unit in padd.service btd.service configd.service robotd.service updaterd.service; do
         [ -f "${UNIT_DIR}/${unit}" ] || continue
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
@@ -461,33 +461,39 @@ EOF
 # Taken from the installed release rather than from the repository, so it is the copy a
 # signature was checked against.
 create_group() {
-    say "creating the robot group"
-    src="${INSTALL_DIR}/current/systemd/sysusers.d/robot.conf"
-    if [ -f "$src" ]; then
+    say "creating the robot group and the service accounts"
+
+    # Every sysusers file the release ships, read from the directory rather than named one by
+    # one. `hooks/postinstall` already installs them this way on update, and the two lists
+    # drifting apart is precisely how a new daemon's account arrives on updated boards and not
+    # on freshly provisioned ones — which is the harder failure to find, because the fresh board
+    # is the one nobody suspects.
+    if [ -d "${INSTALL_DIR}/current/systemd/sysusers.d" ]; then
         mkdir -p /usr/lib/sysusers.d
-        install -m 644 "$src" /usr/lib/sysusers.d/robot.conf
+        for src in "${INSTALL_DIR}"/current/systemd/sysusers.d/*.conf; do
+            [ -f "$src" ] || continue
+            install -m 644 "$src" "/usr/lib/sysusers.d/$(basename "$src")"
+        done
         if command -v systemd-sysusers >/dev/null 2>&1; then
             systemd-sysusers
         fi
     fi
-    src="${INSTALL_DIR}/current/systemd/sysusers.d/btd.conf"
-    if [ -f "$src" ]; then
-        install -m 644 "$src" /usr/lib/sysusers.d/btd.conf
-        if command -v systemd-sysusers >/dev/null 2>&1; then
-            systemd-sysusers
-        fi
-    fi
-    # btd runs unprivileged because it is the process parsing bytes from anyone in radio range.
-    # Without this user its unit fails to start, and the failure reads as a broken radio.
+
+    # The accounts those units name, for a board where systemd-sysusers is not available. Both
+    # daemons run unprivileged for reasons that matter — btd parses bytes from anyone in radio
+    # range, padd is meant to have no privileged access to the robot — and a unit naming a
+    # missing `User=` fails to start with an error that reads as a broken daemon.
     #
-    # Only when the release actually ships btd. Creating a system account for a service that
-    # does not exist on this board is not harmful, but it is a lie about what is installed, and
-    # the next person reading /etc/passwd should not have to work out which.
-    if [ -f "${INSTALL_DIR}/current/systemd/btd.service" ] \
-        && ! getent passwd btd >/dev/null; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin btd \
-            || warn "could not create the btd user; btd.service will not start"
-    fi
+    # Only when the release actually ships the service. Creating a system account for something
+    # that does not exist on this board is not harmful, but it is a lie about what is installed,
+    # and the next person reading /etc/passwd should not have to work out which.
+    for daemon in btd padd; do
+        [ -f "${INSTALL_DIR}/current/systemd/${daemon}.service" ] || continue
+        if ! getent passwd "$daemon" >/dev/null; then
+            useradd --system --no-create-home --shell /usr/sbin/nologin "$daemon" \
+                || warn "could not create the ${daemon} user; ${daemon}.service will not start"
+        fi
+    done
 
     if ! getent group robot >/dev/null; then
         groupadd --system robot
@@ -656,13 +662,25 @@ install_units() {
   The robot works without it — only the phone path is unavailable."
     fi
 
+    # padd waits for a gamepad and drives when one connects, so it is safe to have running with
+    # no pad paired: it sends nothing, and robotd's deadman holds the robot. Enabling it here is
+    # what makes `robotctl pad pair` the only step between a board and driving it.
+    #
+    # Allowed to fail like btd. It needs the `padd` user and the `input` group, and a robot that
+    # cannot read a gamepad is still a robot that updates and walks.
+    if [ -f "${UNIT_DIR}/padd.service" ]; then
+        systemctl enable --now padd.service || warn "padd did not start; check:
+    journalctl -u padd -b
+  The robot works without it — only the gamepad is unavailable."
+    fi
+
     # Anything the release ships that this script does not know how to start. Reported rather
     # than started blindly: a unit may be a template, or something another unit pulls in, and
     # guessing is how a robot ends up running a service nobody chose. Named, so adding a daemon
     # is one line here and never a silent omission.
     for unit in $shipped; do
         case "$unit" in
-            updaterd.service|robotd.service|configd.service|btd.service) ;;
+            updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
             *) warn "${unit} was installed but not enabled — this script does not know where
   it belongs in the start order. Add it to install_units, or start it by hand." ;;
         esac
@@ -781,6 +799,7 @@ EOF
   robotctl update status              update state per component
   robotctl update check               is a newer release available
   sudo robotctl update apply daemon   update now (mutations are root-only by design)
+  sudo robotctl pad pair              pair a gamepad, then drive it — that is the only step
 
 This robot polls for updates on its own and will apply a *mandatory* release without
 waiting to be asked. Ordinary releases wait for a client.

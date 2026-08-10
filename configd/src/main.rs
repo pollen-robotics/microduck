@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use configd::net::{FakeNet, Net};
+use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
+use configd::{driver, pad};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -59,6 +61,17 @@ struct Args {
     /// real access point — a wrong passphrase especially — without a board or a radio.
     #[arg(long)]
     fake_net: bool,
+
+    /// Serve an in-memory set of gamepads instead of BlueZ.
+    ///
+    /// The whole `pad.*` surface, including the cases that need hardware to arrange — two pads in
+    /// pairing mode at once, or none at all.
+    ///
+    /// Separate from `--fake-net` rather than one `--fake`: faking the radio while driving a real
+    /// NetworkManager is a combination worth having, and a single flag would make bench work choose
+    /// between them.
+    #[arg(long)]
+    fake_pads: bool,
 }
 
 /// Who may change this robot's configuration.
@@ -140,6 +153,7 @@ fn resolve_gid(name: &str) -> Option<u32> {
 
 struct Service {
     net: Arc<dyn Net>,
+    pads: Arc<dyn Pads>,
     store: Store,
     policy: PeerPolicy,
 }
@@ -186,8 +200,21 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Unlike wifi, an unreachable radio is **not** a reason to refuse to start. `configd` answers
+    // `net.*` and `system.*` too, and a board whose Bluetooth has not appeared yet — which on this
+    // one takes about 73 seconds — must not lose its wifi provisioning path over it. So a failure
+    // here degrades to "no pads" and says why.
+    let pads: Arc<dyn Pads> = match pad_backend(args.fake_pads).await {
+        Ok(pads) => pads,
+        Err(e) => {
+            tracing::warn!(error = %e, "no gamepad backend; pad.* will report no pads");
+            Arc::new(FakePads::with(Vec::new(), Vec::new()))
+        }
+    };
+
     let service = Arc::new(Service {
         net,
+        pads,
         store: Store::new(args.state_dir.join("config.json"), hostname()),
         policy: PeerPolicy {
             owner_uid: unsafe { libc::getuid() },
@@ -246,6 +273,26 @@ async fn backend(_fake: bool) -> Result<Arc<dyn Net>, String> {
     // laptop anyway.
     tracing::warn!("not Linux: serving a FAKE wifi stack");
     Ok(Arc::new(FakeNet::new()))
+}
+
+#[cfg(target_os = "linux")]
+async fn pad_backend(fake: bool) -> Result<Arc<dyn Pads>, String> {
+    if fake {
+        tracing::warn!("serving FAKE gamepads; nothing here touches a real radio");
+        return Ok(Arc::new(FakePads::new()));
+    }
+    configd::bluez::BlueZ::new()
+        .await
+        .map(|bluez| Arc::new(bluez) as Arc<dyn Pads>)
+        .map_err(|e| format!("cannot reach bluetoothd on the system bus ({e})"))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn pad_backend(_fake: bool) -> Result<Arc<dyn Pads>, String> {
+    // BlueZ is Linux-only. Same reasoning as the wifi backend: the fake is how `pad.*` is exercised
+    // from a laptop, so serving it is more useful than refusing.
+    tracing::warn!("not Linux: serving FAKE gamepads");
+    Ok(Arc::new(FakePads::new()))
 }
 
 async fn serve(service: Arc<Service>, socket_path: PathBuf) -> std::io::Result<()> {
@@ -429,6 +476,26 @@ async fn dispatch(
                 ),
             }
         }
+        proto::Call::PadStatus => match service.pads.status().await {
+            Ok(pads) => proto::Response::ok(
+                Some(id),
+                &proto::PadStatusResult {
+                    pads,
+                    driver: driver::state().await,
+                },
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "backend failed");
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
+            }
+        },
+        proto::Call::PadPair(params) => {
+            let timeout = pad::pair_timeout(params.timeout_seconds);
+            tracing::info!(mac = ?params.mac, ?timeout, "pairing a gamepad");
+            reply(id, service.pads.pair(params.mac.as_deref(), timeout).await)
+        }
+        proto::Call::PadForget(params) => reply(id, service.pads.forget(&params.mac).await),
+
         proto::Call::SystemReboot => {
             power::schedule();
             proto::Response::ok(

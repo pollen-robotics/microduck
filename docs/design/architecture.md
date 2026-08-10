@@ -22,7 +22,7 @@ rewritten). v1 targets a **single, well-specified hardware configuration**.
 | `robotd` | motor control, kinematics, gait policies, sensor loop, safety | RT-ish core; authoritative on anything that can hurt the robot |
 | `mediad` | camera/mic, encode, perception, WebRTC + remote gateway | Heaviest service; also the remote API front door (§5.2) |
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
-| `configd` | wifi, robot identity, power | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own |
+| `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |
 | `updaterd` | update engine | See `updater-design.md` |
 
 Splitting `mediad` from `robotd` is deliberate: a media/perception crash must not

@@ -41,10 +41,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// v2 added `HelloResult::revision`. v3 added the `net.*` and `system.*` namespaces. v4 added
 /// `system.authenticate`, which a BLE client must now pass before anything else is served — a v3
-/// client would otherwise have every call refused with no idea why. During
+/// client would otherwise have every call refused with no idea why. v5 added the `pad.*`
+/// namespace, which is additive — a v4 client loses nothing by not knowing it — and bumps anyway,
+/// because the version's job is to say "these two peers were not built together". During
 /// prototyping the wire shape simply changes and this bumps; no accommodation is made for
 /// peers that predate a field, because there are none in the field yet.
-pub const API_VERSION: u32 = 4;
+pub const API_VERSION: u32 = 5;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
@@ -186,6 +188,24 @@ pub mod method {
     pub const SYSTEM_SET_PAIRING_PIN: &str = "system.setPairingPin";
     /// Prove knowledge of the pairing PIN. Answered by the transport, not by a service.
     pub const SYSTEM_AUTHENTICATE: &str = "system.authenticate";
+
+    // ── pad.* ────────────────────────────────────────────────────────────────
+    //
+    // A gamepad, as a *thing paired to the robot* rather than as a control transport. `padd`
+    // reads the pad and sends intents; this namespace only decides which pad the board knows
+    // about, which is a Bluetooth question and therefore `configd`'s (it is the service that
+    // already owns the radio's configuration side, and the one running as root).
+    //
+    // Pairing is deliberately not `padd`'s own job: `padd` is an *unprivileged intent client*,
+    // and the whole point of it having no privileged access is that it exercises the same API the
+    // phone app will. Letting it configure BlueZ would have undone that.
+
+    /// Which pads this robot knows, and whether `padd` is driving from one.
+    pub const PAD_STATUS: &str = "pad.status";
+    /// Pair the gamepad that is in pairing mode now.
+    pub const PAD_PAIR: &str = "pad.pair";
+    /// Forget a pad, so it stops reconnecting.
+    pub const PAD_FORGET: &str = "pad.forget";
 }
 
 /// JSON-RPC error codes.
@@ -297,6 +317,11 @@ pub enum Call {
     /// the PIN check moved from the link layer to this one, where we define the rules. See
     /// `docs/design/app-path-design.md` §5.
     SystemAuthenticate(AuthenticateParams),
+
+    // ── pad.* ────────────────────────────────────────────────────────────────
+    PadStatus,
+    PadPair(PadPairParams),
+    PadForget(PadForgetParams),
 }
 
 impl Call {
@@ -333,6 +358,9 @@ impl Call {
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
+            Call::PadStatus => method::PAD_STATUS,
+            Call::PadPair(_) => method::PAD_PAIR,
+            Call::PadForget(_) => method::PAD_FORGET,
         }
     }
 
@@ -355,6 +383,11 @@ impl Call {
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
                 | Call::SystemSetPairingPin(_)
+                // Bonding a pad to this robot changes what may drive it, which is the most
+                // consequential thing in this namespace — a paired pad can enable the policy.
+                // `pad.status` is a read and stays ungated.
+                | Call::PadPair(_)
+                | Call::PadForget(_)
         )
     }
 
@@ -398,6 +431,8 @@ impl Call {
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
+            Call::PadPair(p) => encode(p),
+            Call::PadForget(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -409,7 +444,8 @@ impl Call {
             | Call::NetScan
             | Call::SystemInfo
             | Call::SystemReboot
-            | Call::SystemPairingPin => Value::Object(serde_json::Map::new()),
+            | Call::SystemPairingPin
+            | Call::PadStatus => Value::Object(serde_json::Map::new()),
         }
     }
 
@@ -455,6 +491,17 @@ impl Call {
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
+            method::PAD_STATUS => Call::PadStatus,
+            // The only method here whose parameters are *all* optional, so an absent `params`
+            // member has to mean "defaults" rather than a parse error: `{"method":"pad.pair"}` is
+            // the everyday call, and a hand-written client will send exactly that. Every other
+            // method either needs its parameters or takes none at all, which is why this is one
+            // line here rather than a change to `decode`.
+            method::PAD_PAIR => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::PadPair(decode(params.or(Some(&empty)))?)
+            }
+            method::PAD_FORGET => Call::PadForget(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -915,6 +962,37 @@ pub struct AuthenticateResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetPairingPinParams {
     pub pin: String,
+}
+
+// ── pad.* parameters ─────────────────────────────────────────────────────────
+
+/// Pair the gamepad that is in pairing mode now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadPairParams {
+    /// Which pad, when the address is already known. **Omit it in the normal case**: the point of
+    /// this call is not having to find a MAC address first, so the robot looks for a pad that
+    /// is in pairing mode and takes it. Supplying one narrows the search to that address, which
+    /// is what a room with several pads in it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+
+    /// How long to look, in seconds. `None` means the service's own default.
+    ///
+    /// A parameter because the caller knows something the robot does not: whoever typed this is
+    /// standing there holding the pad's pairing button, and a phone app offering "keep looking"
+    /// needs a longer window than a script does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+}
+
+/// Forget one pad, by address.
+///
+/// The address, not "the connected one": forgetting is what you do to a pad that is *not* in the
+/// room any more — a colleague's controller that still steals the bond on boot — so identifying it
+/// by its current connection state would name the wrong thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadForgetParams {
+    pub mac: String,
 }
 
 // ── results ──────────────────────────────────────────────────────────────────
@@ -1494,6 +1572,94 @@ pub struct RebootResult {
     pub in_seconds: u64,
 }
 
+// ── pad.* results ────────────────────────────────────────────────────────────
+
+/// A gamepad this robot knows about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pad {
+    /// `78:86:2E:BB:13:28`. The identity everything else here is keyed on.
+    pub mac: String,
+    /// As the pad calls itself — "Xbox Wireless Controller". Empty when BlueZ has no name for it
+    /// yet, which happens between discovery and pairing.
+    pub name: String,
+    /// Bonded: keys exchanged, so it can reconnect without pairing again.
+    pub paired: bool,
+    /// Trusted: BlueZ accepts its connection **without anyone approving it**, which is what makes
+    /// the pad work after a reboot with nobody logged in. A paired-but-untrusted pad looks paired
+    /// and does not reconnect, which is why this is reported separately rather than folded in.
+    pub trusted: bool,
+    /// Connected right now. This is the one that answers "why is the robot not moving".
+    pub connected: bool,
+}
+
+/// Whether `padd` — the process that turns a pad into intents — is running.
+///
+/// Reported alongside the pads because a connected pad and a dead `padd` is the failure that looks
+/// like working hardware, and it is not otherwise visible without knowing to ask systemd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverState {
+    /// Running. With a connected pad, the robot is drivable.
+    Active,
+    /// The unit exists and is not running. Someone stopped it, or it is failed.
+    Inactive,
+    /// No `padd.service` on this board — a release older than the one that added it.
+    Absent,
+    /// Could not ask: no systemd, or the query failed. Distinct from `Absent`, because "I do not
+    /// know" must not read as "it is not installed".
+    Unknown,
+}
+
+/// Answer to [`Call::PadStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadStatusResult {
+    /// Every pad the robot is bonded to, connected first.
+    pub pads: Vec<Pad>,
+    pub driver: DriverState,
+}
+
+/// Why pairing a pad failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadPairFailure {
+    /// Nothing that looks like a gamepad turned up. Usually the pad is not in pairing mode — on an
+    /// Xbox controller that is the sync button, and the light flashes fast rather than slow.
+    NotFound,
+    /// Several pads were in pairing mode, so the robot refused to guess. Retry with `mac`.
+    Ambiguous,
+    /// Found and then lost: it appeared in discovery but did not finish bonding in time.
+    Timeout,
+    /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
+    /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
+    NoAdapter,
+    /// BlueZ refused the bond. The classic cause on this board is `Privacy = device` missing from
+    /// `/etc/bluetooth/main.conf` — the pad pairs and drops straight back out.
+    Rejected,
+    Other,
+}
+
+/// Answer to [`Call::PadPair`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PadPairResult {
+    Paired {
+        pad: Pad,
+    },
+    Failed {
+        reason: PadPairFailure,
+        /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
+        detail: Option<String>,
+    },
+}
+
+/// Answer to [`Call::PadForget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadForgetResult {
+    /// False when no such pad was bonded — not an error, and a client should not present it as
+    /// one. Same contract as [`ForgetResult`].
+    pub removed: bool,
+}
+
 /// Re-exported so consumers spell version types with the *same* `semver` this crate
 /// compiled against. Without it, a crate depending on `semver` separately can end up with
 /// two incompatible copies of `Version` and a type error that reads as nonsense.
@@ -1631,6 +1797,14 @@ mod tests {
             Call::SystemAuthenticate(AuthenticateParams {
                 pin: "000000".into(),
             }),
+            Call::PadStatus,
+            Call::PadPair(PadPairParams {
+                mac: Some("78:86:2E:BB:13:28".into()),
+                timeout_seconds: Some(20),
+            }),
+            Call::PadForget(PadForgetParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
         ]
     }
 
@@ -1642,9 +1816,22 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            30,
+            33,
             "a Call variant was added or removed — update every_call() and this count"
         );
+    }
+
+    /// `pad.pair` with nothing in it is the *normal* call — "pair whatever pad is in pairing
+    /// mode" — and its fields are `skip_serializing_if`, so it is different bytes on the wire from
+    /// the populated form `every_call` covers. Both shapes have to survive.
+    #[test]
+    fn pairing_a_pad_needs_no_parameters() {
+        let call = Call::PadPair(PadPairParams::default());
+        let params = call.params();
+        assert_eq!(params, Value::Object(serde_json::Map::new()), "{params}");
+        assert_eq!(Call::parse(call.method(), Some(&params)).unwrap(), call);
+        // And an omitted `params` entirely, which is what a hand-written client sends.
+        assert_eq!(Call::parse(call.method(), None).unwrap(), call);
     }
 
     /// Every call must survive the wire unchanged.
@@ -1747,6 +1934,11 @@ mod tests {
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
                 method::SYSTEM_SET_PAIRING_PIN,
+                // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
+                // list: reading which pads are paired is exactly the kind of inspection support
+                // needs on a robot it is not allowed to reconfigure.
+                method::PAD_PAIR,
+                method::PAD_FORGET,
             ]
         );
     }

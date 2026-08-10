@@ -273,9 +273,9 @@ decision rather than a bug:
   to recover and buys nothing. Client-newer-than-daemon must stay a hard failure: there the client
   may ask for something that genuinely is not there.
 
-  The handshake is still an exact `!=`. `API_VERSION` has since reached 4, and the failure was
-  observed again at v4-against-v3 — so this keeps recurring on every additive bump, just for seconds
-  at a time now instead of until a reboot.
+  The handshake is still an exact `!=`. `API_VERSION` has since reached 5 — v5 added `pad.*`, which
+  is purely additive and still bumps — and the failure was observed at v4-against-v3, so this keeps
+  recurring on every additive bump, just for seconds at a time now instead of until a reboot.
 
 That change would also make `API_VERSION` mean what it should — "the newest contract I understand"
 rather than "the only contract I will speak" — and additive protocol growth would stop being a
