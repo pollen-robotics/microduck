@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "btd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bluer",
  "btleplug",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "configd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "duck-control"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "duck-ipc-proto",
  "libloading 0.8.9",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "semver",
  "serde",
@@ -2338,7 +2338,7 @@ checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
 name = "padd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -2805,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2819,7 +2819,7 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "clap",
@@ -3438,7 +3438,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "minisign",
@@ -3860,7 +3860,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -4425,7 +4425,7 @@ checksum = "636f85e5ca6488e96401b61eb7de54f4e44755c988af0f52cf90230c312a1a89"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "minisign",
