@@ -1310,6 +1310,15 @@ impl Engine {
                             return Ok(());
                         }
                         crate::robot::Health::Unhealthy(reason) => last = reason,
+                        // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
+                        // about a robot that is serving its socket sends the reader to the wrong
+                        // half of the system for an hour; see `docs/install-path-gap.md`.
+                        crate::robot::Health::Incompatible(reason) => {
+                            last = format!(
+                                "answered in a shape this updaterd cannot read ({reason}) — \
+                                 the robot may be fine and the contract is what disagrees"
+                            );
+                        }
                         crate::robot::Health::Unreachable => {
                             last = "unreachable".into();
                         }

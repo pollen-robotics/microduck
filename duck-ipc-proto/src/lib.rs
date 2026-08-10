@@ -1267,7 +1267,12 @@ pub struct LoopHealth {
 }
 
 /// The motor bus, as the loop sees it.
+///
+/// `#[serde(default)]` for the reason spelled out on [`ImuHealth`], and it applies here even more
+/// plainly: these are failure counters whose zero the doc comments below already call meaningful.
+/// An older `robotd` that omits one is saying "no failures", not "unknown".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BusHealth {
     /// Consecutive failed reads; any success resets it. One is ordinary on a serial bus,
     /// which is why the cumulative count is not what is reported.
@@ -1279,7 +1284,23 @@ pub struct BusHealth {
 }
 
 /// The IMU board, which rides the motor bus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `#[serde(default)]` on the struct, not on each field, and for the same reason the parent
+/// [`HealthResult`] carries `Default`: **a field added here must not make a newer reader reject
+/// an older `robotd` outright.** It did once. `consecutive_stale_blocks` was added below and
+/// released, and a branch predating it sent an `imu` section without the field — so a resident
+/// `updaterd` failed to parse the whole reply, `health` collapsed it to `Unreachable`, and the
+/// gate reverted a release from a robot that was serving its socket and running its loop at
+/// 50 Hz. An hour to find, because nothing in "not healthy within 30s: unreachable" points at a
+/// missing JSON field.
+///
+/// Sound here because every zero is *honest*: not converged, no stale reads, no run. Each one
+/// reads as "nothing to report", which is exactly what an older sender is saying. That argument
+/// is what makes this safe, and it is why the sibling sections carrying measurements —
+/// [`Battery`], [`MotorThermal`], [`LoopHealth`] — do **not** get the same treatment: a
+/// defaulted `percent: 0.0` would render as a flat pack on a robot with a full one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ImuHealth {
     /// Has the orientation filter converged?
     pub ready: bool,
@@ -2152,6 +2173,45 @@ mod tests {
         let line = serde_json::to_string(&bench).unwrap();
         assert!(line.contains(r#""degraded":true"#), "{line}");
         assert_eq!(serde_json::from_str::<HealthResult>(&line).unwrap(), bench);
+    }
+
+    /// An `imu` section from a `robotd` that predates a field must still parse.
+    ///
+    /// The regression this exists for reverted a good release. `consecutive_stale_blocks` was
+    /// added below and released; a branch that had merged `main` before that sent the section
+    /// without it, and the resident `updaterd` rejected the whole reply — so a robot serving its
+    /// socket with the loop at 50 Hz was reported as "not healthy within 30s: unreachable".
+    ///
+    /// Literal JSON rather than a struct with a field omitted, because a struct cannot express
+    /// "this field does not exist", which is the entire failure.
+    #[test]
+    fn an_imu_section_missing_its_newest_field_still_parses() {
+        let answer: HealthResult =
+            serde_json::from_str(r#"{"healthy":true,"imu":{"ready":true,"stale_blocks":3}}"#)
+                .unwrap();
+
+        let imu = answer
+            .imu
+            .expect("the section was sent, so it must survive");
+        assert_eq!(imu.stale_blocks, 3, "what was sent must be kept");
+        assert_eq!(
+            imu.consecutive_stale_blocks, 0,
+            "and what was not sent reads as nothing to report"
+        );
+        assert!(
+            !imu.frozen(),
+            "a default run must never look like a dead IMU"
+        );
+    }
+
+    /// Same for the bus counters, where a missing counter means "no failures" by construction.
+    #[test]
+    fn a_bus_section_missing_a_counter_still_parses() {
+        let answer: HealthResult =
+            serde_json::from_str(r#"{"healthy":true,"bus":{"consecutive_errors":2}}"#).unwrap();
+
+        assert_eq!(answer.bus.consecutive_errors, 2);
+        assert_eq!(answer.bus.startup_failures, 0);
     }
 
     /// An absent battery must stay absent, not become zero volts.

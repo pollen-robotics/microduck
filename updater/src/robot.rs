@@ -42,6 +42,20 @@ pub enum Health {
     Degraded(String),
     /// Came up and reported a problem.
     Unhealthy(String),
+    /// Answered, in a shape this `updaterd` cannot read. Fails the gate — an unreadable
+    /// verdict is not a healthy one — but says so in different words, which is the point.
+    ///
+    /// Distinct from [`Self::Unreachable`] because the two ask for opposite things from
+    /// whoever reads the outcome. "Unreachable" sends you to look at a daemon that is
+    /// probably dead; this sends you to look at a *contract*, and the robot is likely fine.
+    /// Reusing `Unreachable` for it cost an hour: the gate reported "not healthy within 30s:
+    /// unreachable" about a `robotd` that was serving its socket and running its loop at
+    /// 50 Hz, and had merely omitted one JSON field a newer parser required. See
+    /// `docs/install-path-gap.md`.
+    ///
+    /// Carries serde's own message. It names the missing or unexpected field, which is the
+    /// single most useful string available at that moment.
+    Incompatible(String),
     /// Did not answer within the timeout — includes crash-looping and hung
     /// (socket open, no reply). Fails the gate: unproven is not healthy.
     Unreachable,
@@ -173,7 +187,7 @@ impl RobotClient for SocketRobotClient {
             ),
             Err(e) => {
                 tracing::warn!(error = %e, "robotd answered health in an unexpected shape");
-                Health::Unreachable
+                Health::Incompatible(e.to_string())
             }
         }
     }
@@ -244,5 +258,87 @@ mod tests {
                 .await
                 .is_healthy()
         );
+    }
+
+    /// Serve one canned `robot.health` result on a unix socket and ask about it.
+    ///
+    /// A real socket rather than a fake `RobotClient`, because the behaviour under test lives in
+    /// `SocketRobotClient::health` — the deserialization step. A double implementing the trait
+    /// would replace exactly the code that has the bug.
+    async fn health_of(reply: serde_json::Value) -> Health {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("robot.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read_half, mut write_half) = stream.into_split();
+
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let mut request = String::new();
+            tokio::io::BufReader::new(read_half)
+                .read_line(&mut request)
+                .await
+                .expect("read request");
+
+            let response = crate::proto::Response::ok(Some(crate::proto::Id::Number(1)), &reply);
+            let mut line = serde_json::to_vec(&response).expect("encode");
+            line.push(b'\n');
+            write_half.write_all(&line).await.expect("write");
+            write_half.flush().await.expect("flush");
+        });
+
+        let health = SocketRobotClient::new(path)
+            .health(Duration::from_secs(5))
+            .await;
+        server.await.expect("server");
+        health
+    }
+
+    /// The reply an older `robotd` sends must still parse.
+    ///
+    /// This exact shape reverted a good release: `consecutive_stale_blocks` had been added to
+    /// `ImuHealth` and released, and a branch that merged `main` before that sent an `imu`
+    /// section without it. `robotd` was entirely healthy — socket served, both policies loaded,
+    /// loop at 50 Hz — and the resident `updaterd` could not read `healthy: true`.
+    ///
+    /// Written as literal JSON, not as a struct with a field left out, because a struct cannot
+    /// express "this field does not exist" — and that is the whole failure.
+    #[tokio::test]
+    async fn an_older_robotd_that_omits_a_health_field_is_still_healthy() {
+        let health = health_of(serde_json::json!({
+            "healthy": true,
+            "bus": { "consecutive_errors": 0 },
+            "imu": { "ready": true, "stale_blocks": 3 },
+        }))
+        .await;
+
+        assert_eq!(health, Health::Healthy, "got {health:?}");
+    }
+
+    /// And an answer that genuinely cannot be read must not claim the robot is absent.
+    ///
+    /// `Unreachable` sends whoever reads the outcome to look at a daemon that is probably dead.
+    /// When the daemon answered and the *contract* is what disagrees, that is an hour spent in
+    /// the wrong place — which is what happened. The reason string carries serde's own message
+    /// so the field is named.
+    #[tokio::test]
+    async fn an_unreadable_answer_is_incompatible_not_unreachable() {
+        let health = health_of(serde_json::json!({ "healthy": "yes, very" })).await;
+
+        match health {
+            Health::Incompatible(reason) => assert!(!reason.is_empty(), "must name the problem"),
+            other => panic!("expected Incompatible, got {other:?}"),
+        }
+    }
+
+    /// Failing the gate is not negotiable: an unreadable verdict is not a healthy one.
+    ///
+    /// Split from the test above deliberately. The point of `Incompatible` is that it reads
+    /// differently, not that it decides differently, and a future edit that softened it into a
+    /// pass would be the worst possible reading of "the robot was probably fine".
+    #[tokio::test]
+    async fn incompatible_still_fails_the_gate() {
+        assert!(!Health::Incompatible("missing field `imu`".into()).is_healthy());
     }
 }
