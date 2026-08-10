@@ -82,9 +82,9 @@ cargo run -q -p test-support --example fake-release -- "$FIXTURE" --prefix /tmp/
 # A real artifact, for the installer checks at the end.
 #
 # `xtask package` from the binaries just cross-compiled, with the staging and `--include` lists
-# read out of release.yml — so this is the artifact production builds, not an approximation of
-# one. The fixture releases above deliberately carry no systemd units, and units are the whole
-# subject of those checks.
+# read out of the packaging workflow — so this is the artifact production builds, not an
+# approximation of one. The fixture releases above deliberately carry no systemd units, and units
+# are the whole subject of those checks.
 #
 # Unpacked here rather than in the container because the zstd *binary* is the one tool the
 # target image lacks, and an apt-get in the middle of a hermetic check buys a network
@@ -95,8 +95,25 @@ mkdir -p "$INSTALL_STAGED" "$INSTALL_RELEASE"
 
 # Both lists parsed from the workflow, for the reason xtask/tests/artifact.rs exists: a copy
 # kept here would be a third hand-maintained list to drift from the other two.
-for binary in $(grep -o -- 'release/[a-z]* staged/' .github/workflows/release.yml \
-    | sed 's|release/||; s| staged/||' | sort -u); do
+#
+# `_build-release.yml`, because that is where the recipe lives: `release.yml` decides which channel
+# is being published and calls it, and holds no `cp` or `--include` line of its own. Parsing the
+# entry point instead produced an empty list and a failure two hundred lines later —
+# "the installed release has no systemd/updaterd.service" — so the emptiness is now checked here,
+# where it can name its own cause.
+PACKAGING_WORKFLOW=.github/workflows/_build-release.yml
+
+staged_binaries="$(grep -o -- 'release/[a-z]* staged/' "$PACKAGING_WORKFLOW" \
+    | sed 's|release/||; s| staged/||' | sort -u)"
+if [ -z "$staged_binaries" ]; then
+    echo "error: no staged binaries found in ${PACKAGING_WORKFLOW}." >&2
+    echo "       The parse has stopped matching its 'cp ... staged/' lines, so the artifact" >&2
+    echo "       would carry no binaries and the installer checks would fail 200 lines later" >&2
+    echo "       with 'the installed release has no systemd/updaterd.service'." >&2
+    exit 1
+fi
+
+for binary in $staged_binaries; do
     cp "$TARGET_DIR/$binary" "$INSTALL_STAGED/"
 done
 
@@ -107,8 +124,15 @@ set --
 while IFS= read -r pair; do
     set -- "$@" --include "$pair"
 done <<INCLUDES
-$(grep -o -- '--include "[^"]*"' .github/workflows/release.yml | sed 's/--include //; s/"//g')
+$(grep -o -- '--include "[^"]*"' "$PACKAGING_WORKFLOW" | sed 's/--include //; s/"//g')
 INCLUDES
+
+if [ "$#" -eq 0 ]; then
+    echo "error: no --include pairs found in ${PACKAGING_WORKFLOW}." >&2
+    echo "       The artifact would carry no units, and the installer checks below are" >&2
+    echo "       entirely about units." >&2
+    exit 1
+fi
 
 # Level 1: this artifact is unpacked once and thrown away. The shipping default of 19 is
 # single-threaded and would cost more than every check below put together.
@@ -592,7 +616,7 @@ echo "    [ok] preinstall refuses an old runtime it cannot replace, naming the f
 # on a script that installed a unit into the wrong directory.
 #
 # The release is a real artifact, built by xtask package from the cross-compiled binaries and
-# the include list read out of release.yml. Not the fixture releases the engine checks use:
+# the include list read out of the packaging workflow. Not the fixture releases the engine uses:
 # those carry no systemd units by design, and units are the whole subject here.
 
 mkdir -p /stub
