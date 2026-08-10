@@ -134,6 +134,8 @@ health = {{ probe = "socket", timeout = "2s" }}
         ))
         .unwrap();
         let keys = KeyRing::load(&config.trusted_keys_dir, false).unwrap();
+        // `without_deferred_restarts` for the same reason as `apply.rs`: engines run in parallel here
+        // and a fork in one holds another's update lock until it execs.
         Engine::new(
             config,
             keys,
@@ -143,6 +145,7 @@ health = {{ probe = "socket", timeout = "2s" }}
             faults,
         )
         .unwrap()
+        .without_deferred_restarts()
     }
 
     /// Serve in the background and return once the socket accepts connections.

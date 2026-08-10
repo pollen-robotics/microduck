@@ -187,8 +187,11 @@ impl DynamixelIo {
         Ok(out)
     }
 
-    /// Torque on every servo. Not used by the control loop, which deliberately never
-    /// touches torque so that a restart mid-update leaves a standing robot standing.
+    /// Torque on every servo.
+    ///
+    /// One transaction per joint, so this is not something to call per tick — the control loop calls
+    /// it once, when someone enables the policy on a limp robot. See [`RobotIo::set_torque`] for what
+    /// has *not* changed: nothing touches torque because a process started.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         for &id in &JOINT_IDS {
             self.controller
@@ -291,6 +294,11 @@ impl RobotIo for DynamixelIo {
         self.controller
             .sync_write_goal_position(&JOINT_IDS, &targets.positions)
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
+    }
+
+    fn set_torque(&mut self, on: bool) -> Result<()> {
+        // The inherent method, which predates the trait and is still what `robotd init` uses.
+        DynamixelIo::set_torque(self, on)
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {

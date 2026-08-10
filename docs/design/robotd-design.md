@@ -464,6 +464,38 @@ membership is all it has. Pairing a pad therefore belongs to `configd` (`archite
 not here — bonding a device needs root and BlueZ, and a `padd` holding either would no longer be
 exercising the API the app will use.
 
+### 5.7.1 Enabling the policy brings the robot up
+
+`robot.enable` used to flip a flag and nothing else. Torque came from `robotd init`, a separate
+subcommand that opens the motor bus itself — so it needs the daemon stopped, it appeared in no
+documentation, and pressing Start on a fresh robot did nothing visible: the policy ran, the loop
+wrote positions, and the servos ignored them.
+
+So the loop has a bring-up state, and an explicit `robot.enable` is what advances it:
+
+```
+Limp ──enable (policy loaded, not fallen)──▶ Homing (torque on, 2s ramp) ──▶ Ready ──▶ policy drives
+```
+
+**The invariant the old rule protected is unchanged: nothing here happens because a process
+started.** A `robotd` restarted by an update finds `Limp`, asks for no torque, and leaves a standing
+robot standing — `a_restart_asks_for_no_torque` asserts exactly that, on the absence of any write
+rather than on a write of `false`. What changed is that "never touch torque" was a broader rule than
+the property it was defending, and it put a manual step in front of every drive.
+
+Three conditions gate the bring-up, each for its own reason:
+
+- **A loaded policy.** `enable` means "enable the policy"; powering the joints to run one that is
+  disabled or would not load would stand a robot up on a broken release and then hold it.
+- **Not fallen.** `Safety::apply` commands a fallen robot at limp gain and holds it, so a ramp there
+  would be writing a stand-up that cannot happen. `robot.enable` refuses in that state and says to
+  stand the robot up first; `robotd init`, with the daemon stopped, is still how.
+- **A fresh sample.** The ramp starts from where the joints are. Starting from a position nobody read
+  is the lurch the ramp exists to avoid.
+
+Torque is *not* dropped when the policy is disabled again: the robot holds its pose, which is what
+"a standing robot stays standing" means on this side too.
+
 ### 5.8 `safeToRestart` becomes real
 
 False while the policy is enabled and the robot is moving. Restarting motor control

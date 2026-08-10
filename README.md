@@ -86,7 +86,7 @@ The controls:
 
 | | |
 |---|---|
-| **Start** | enable / disable the policy — nothing moves until this is on |
+| **Start** | enable / disable the policy — nothing moves until this is on. On a limp robot this is also what powers the joints: torque on, two seconds to the home pose, then it drives |
 | **Y** / triangle | switch between driving the **body** and posing the **head** |
 | **B** / circle | stop |
 | left stick | body: forward/back and strafe · head: neck pitch and roll |
@@ -96,6 +96,18 @@ Two things worth knowing before the robot surprises you. Sticks drive the body o
 never both, so switching to head mode zeroes the body velocity rather than leaving it walking.
 And if the pad disconnects, `padd` sends nothing at all — `robotd`'s deadman stops the robot on
 its own, which is the wanted behaviour and the reason `padd` does not invent a zero command.
+
+The first Start after power-on **moves the robot**: the joints go from wherever they are resting to
+the home pose over two seconds. Hold it, or have it on its stand. A robot the IMU already considers
+fallen is refused — `robot.enable` says to stand it up first, and that still means stopping the
+daemon and running `robotd init` by hand:
+
+```bash
+sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
+```
+
+That command has to stop `robotd` because `init` opens the motor bus itself, and two writers on one
+UART corrupt each other's replies.
 
 Speeds are conservative by default. `--max-linear` (m/s), `--max-angular` (rad/s) and
 `--max-head` (radians) raise them; `--deadzone` is there because analogue sticks rarely rest at

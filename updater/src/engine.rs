@@ -101,6 +101,11 @@ pub struct Engine {
     boot_counter: BootCounter,
     pins: Pins,
     faults: Faults,
+    /// Whether an applied release schedules the deferred `updaterd`/`btd` restarts.
+    ///
+    /// On a robot, always. Off only in the test binaries, and for a reason that is about processes
+    /// rather than about restarts — see [`Engine::without_deferred_restarts`].
+    deferred_restarts: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,7 +132,33 @@ impl Engine {
             boot_counter,
             pins,
             faults,
+            deferred_restarts: true,
         })
+    }
+
+    /// Stop this engine spawning anything when a release is applied.
+    ///
+    /// **For test binaries, and what it removes is a `fork`, not a behaviour.** `flock` belongs to an
+    /// open file description, so a forked child inherits a *copy* of every lock the process holds and
+    /// keeps it alive until it execs. `apply` already drops its own update lock before spawning for
+    /// exactly this reason — but in a binary running engines in parallel, the child also inherits
+    /// copies of every *other* engine's lock, and those it cannot drop.
+    ///
+    /// So one test scheduling restarts made a concurrent test's `try_acquire` answer `Busy`, and the
+    /// test that noticed it was whichever one happened to be in a lock at that moment:
+    ///
+    /// ```text
+    /// ref "sub/dir" must be refused, got Busy
+    /// ```
+    ///
+    /// It needs a runner with systemd for the spawn to take long enough to matter, so it failed in CI
+    /// and never on a laptop — the worst shape a flake can have. Suppressing the spawn removes the
+    /// race rather than widening a window, and the restart path itself stays covered by
+    /// `restart_tests`, which drives it against a stub `systemctl` and asserts what it was asked.
+    #[doc(hidden)]
+    pub fn without_deferred_restarts(mut self) -> Self {
+        self.deferred_restarts = false;
+        self
     }
 
     // ── queries ──────────────────────────────────────────────────────────────
@@ -316,7 +347,7 @@ impl Engine {
         // parallel, copies of *other* engines' locks too. It surfaced as unrelated operations
         // failing with `Busy`. Nothing below this point touches the store.
         drop(lock);
-        schedule_restarts_if_applied(&outcome).await;
+        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -849,7 +880,7 @@ impl Engine {
             .transition_to(component, &cfg, &store, version, current)
             .await;
         drop(lock);
-        schedule_restarts_if_applied(&outcome).await;
+        schedule_restarts_if_applied(self.deferred_restarts, &outcome).await;
         outcome
     }
 
@@ -1520,7 +1551,12 @@ async fn self_test_updaterd(release_dir: &Path) -> Result<(), Error> {
 /// Only on `Applied`. A rollback leaves the resident `updaterd` already matching `current` — it was
 /// never restarted, so it is still the binary belonging to the release being returned to — and
 /// restarting there would be churn with nothing to fix.
-async fn schedule_restarts_if_applied(outcome: &Result<ApplyResult, Error>) {
+async fn schedule_restarts_if_applied(enabled: bool, outcome: &Result<ApplyResult, Error>) {
+    if !enabled {
+        // A test binary. See `Engine::without_deferred_restarts` for why this is about forking.
+        tracing::debug!("deferred restarts suppressed");
+        return;
+    }
     if matches!(outcome, Ok(ApplyResult::Applied { .. })) {
         schedule_deferred_restarts().await;
     }
