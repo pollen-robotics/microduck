@@ -79,19 +79,28 @@ process. [`docs/project/roadmap.md`](docs/project/roadmap.md) has what actually 
 
 ## Releasing
 
-Releases are signed **in CI**, never locally, behind an approval gate. Cutting one is a tag;
-promoting one re-signs a manifest over the *same bytes* the canary validated, with no rebuild:
+Releases are signed **in CI**, never locally. The entry point is the GitHub releases page, and the
+tag decides what happens:
+
+| you create | what CI does |
+|---|---|
+| a **pre-release** tagged `daemon-staging-v0.4.0` | builds, signs, verifies through the real update engine, publishes to **staging** |
+| a **release** tagged `daemon-v0.4.0` | **promotes** staging 0.4.0 if it exists — the same bytes, re-signed — otherwise builds 0.4.0 directly |
+
+Pushing either tag from a terminal does the same thing:
 
 ```bash
 git tag daemon-staging-v0.4.0 && git push --tags
 ```
 
-Or draft a release in the GitHub UI against a new `daemon-staging-v*` tag — same pipeline, and it
-fills in the release it finds rather than failing on it. Either way the assets, signature and
-manifest come from CI; what you create is the tag.
+The canaried path is two steps on purpose: publish the pre-release, install it on a robot, then
+create the release. Creating a release with no staging build to promote is allowed and says so in its
+own notes — verified in CI, never run on a robot.
 
-```bash
-gh workflow run promote --field version=0.4.0
-```
+Bump the workspace version first. `xtask package` refuses a tag that disagrees with `Cargo.toml`,
+which is what stops a robot reporting a version it is not running.
+
+`gh workflow run promote --field version=0.4.0` is the same promotion without a release to create
+first, and is where `min_supported` lives.
 
 [`docs/project/ci-setup.md`](docs/project/ci-setup.md) covers key custody, the secrets, and rotation.

@@ -1,0 +1,392 @@
+# Build, sign, verify and publish a release. Called, never triggered.
+#
+# The one place the release recipe lives, so the staging and stable paths cannot drift apart in what
+# they ship — this repository has been bitten more than once by two lists that were supposed to agree.
+# `release.yml` decides which channel is being published and calls this; nothing else should.
+#
+# `xtask`'s packaging tripwires read THIS file for the `--include` list, so a unit, hook or sysusers
+# file that is not named here fails a test rather than a robot.
+name: _build-release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to publish under, e.g. daemon-staging-v1.2.3'
+        required: true
+        type: string
+      version:
+        description: 'Semver being published, e.g. 1.2.3'
+        required: true
+        type: string
+      prerelease:
+        description: 'True for staging, false for stable. Decides the GitHub flag a robot reads.'
+        required: true
+        type: boolean
+
+permissions:
+  contents: write   # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Signs with `release-1`, the key customer robots trust. `dev.yml` signs branch builds with
+    # `team.dev`, which a customer robot refuses — two keys so "any build" and "a release" are
+    # distinguishable by the robot, not by convention.
+    #
+    # ⚠ `environment: release` is NOT a gate. On this plan the environment cannot carry required
+    # reviewers or a branch policy — see docs/project/ci-setup.md. It scopes the secrets and is the
+    # hook that turns a real gate on with one settings change.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tagged commit, named explicitly rather than left to the default: for a release
+          # event the default is the release's target commitish, which is a branch head when
+          # someone drafts a release against a branch — and that is not necessarily what the tag
+          # points at by the time this runs.
+          ref: ${{ inputs.tag }}
+          # Full history so the recorded revision is meaningful.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      # v2, and the zig version pinned. Two separate reasons:
+      #   - v1's mirror list 404s for current zig releases, which is how this first
+      #     surfaced — every mirror failed and the job never got a compiler.
+      #   - "latest" would let the glibc floor move under us between runs. The floor is
+      #     the whole point of building with zig (see .cargo/config.toml), so the
+      #     toolchain that sets it must be a fixed input.
+      - name: Cross-compilation C dependencies
+        run: ./scripts/ci-cross-deps.sh
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - run: cargo install cargo-zigbuild --locked
+
+      - name: Derive version from the tag
+        id: version
+        run: |
+          # daemon-staging-v1.2.3 -> 1.2.3
+          # The caller resolved this from the tag; recorded here so the log shows it.
+          version="${{ inputs.version }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publishing $version from ${{ inputs.tag }} (prerelease=${{ inputs.prerelease }})"
+
+      # Same command and same glibc floor as scripts/board-test.sh, so what ships is
+      # what was tested rather than a differently-configured build.
+      #
+      # DUCK_REVISION and DUCK_BUILD_TIME are compiled into the binaries, so every daemon
+      # can state which commit it came from in its first log line and over IPC. Read at
+      # compile time because a shipped robot has no git repository. A build without them
+      # still works and reports "rev unknown" — which is exactly what a local build should
+      # say, and why they are not required.
+      - name: Build for the board
+        env:
+          DUCK_REVISION: ${{ github.sha }}
+          # libudev-sys (via gilrs, via padd) resolves the target's C library through
+          # pkg-config, which refuses to answer for another architecture unless told to.
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+        run: |
+          export DUCK_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cargo board --bins
+
+      - name: Package
+        run: |
+          mkdir -p staged
+          # Every daemon that ships in this artifact. robotd is not optional: `on_apply`
+          # restarts it, so an artifact without it would fail its own restart step and roll
+          # itself back.
+          cp target/aarch64-unknown-linux-gnu/release/updaterd staged/
+          cp target/aarch64-unknown-linux-gnu/release/robotctl staged/
+          cp target/aarch64-unknown-linux-gnu/release/robotd staged/
+          # configd (wifi, identity) and btd (the BLE front door). Their units are packaged
+          # alongside; a unit whose ExecStart binary is missing fails with 203/EXEC, which
+          # reads as a broken daemon rather than an incomplete artifact.
+          cp target/aarch64-unknown-linux-gnu/release/configd staged/
+          cp target/aarch64-unknown-linux-gnu/release/btd staged/
+          # padd is the gamepad intent client. Shipped because a dev board is where
+          # anyone drives the robot from, and the intent API only stays honest if the
+          # thing exercising it daily is actually on the robot.
+          cp target/aarch64-unknown-linux-gnu/release/padd staged/
+
+          cargo run -p xtask -- package \
+            --version "${{ inputs.version }}" \
+            --channel daemon \
+            --bin-dir staged \
+            --out dist \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}" \
+            --revision "${GITHUB_SHA}" \
+            --include "updater/systemd/updaterd.service=systemd/updaterd.service" \
+            --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
+            --include "robotd/systemd/robotd.service=systemd/robotd.service" \
+            --include "hooks/postinstall=hooks/postinstall" \
+            --include "configd/systemd/configd.service=systemd/configd.service" \
+            --include "btd/systemd/btd.service=systemd/btd.service" \
+            --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
+            --include "padd/systemd/padd.service=systemd/padd.service" \
+            --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
+            --include "docs/design/architecture.md=docs/architecture.md" \
+            --include "docs/design/updater-design.md=docs/updater-design.md" \
+            --include "deploy/README.md=docs/deploy.md" \
+            --include "policies/alpha_walking.onnx=policies/alpha_walking.onnx" \
+            --include "policies/alpha_stand.onnx=policies/alpha_stand.onnx"
+
+          # The bootstrap binary, published bare alongside the artifact.
+          #
+          # A fresh robot has no way to open a `.tar.zst`: extraction happens *inside*
+          # updaterd (tar + zstd are linked in), and the `zstd` binary is not on a stock
+          # Armbian image. So `scripts/install.sh` downloads this one file and runs
+          # `updaterd install --from <dir>` to land the first release through the real
+          # engine.
+          #
+          # Byte-identical to `bin/updaterd` inside the artifact, because it is the same
+          # file — which is what lets the installer verify it after the fact by comparing
+          # its sha256 against the copy that came out of the signature-verified tarball.
+          cp staged/updaterd "dist/updaterd-bootstrap-aarch64"
+
+      # Written to a file rather than passed as an argument: a key on a command line is
+      # visible in the process list to anything else on the runner.
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          # Lengths, not values: a key length is not sensitive, and "is not set" could not
+          # distinguish an absent secret from a present-but-empty one — which is exactly how
+          # the first real run failed, after `gh secret set` was fed stdin through a wrapper
+          # that did not forward it. A secret can be written but empty, and it still lists.
+          echo "key length: ${#MINISIGN_SECRET_KEY}, password length: ${#MINISIGN_PASSWORD}"
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is empty or unset — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          # A minisign secret key is two lines: a comment and the base64 payload. One line
+          # means the newline was lost in transit, which fails later inside minisign with a
+          # parse error that says nothing about the cause.
+          if [ "$(printf '%s' "$MINISIGN_SECRET_KEY" | wc -l)" -lt 1 ]; then
+            echo "::error::MINISIGN_SECRET_KEY looks like a single line — its newline was lost"
+            exit 1
+          fi
+          umask 077
+          # '%s', not '%s\n': the key file ends with a newline, so the stored secret already
+          # contains it. Adding another would leave a trailing blank line nobody has tested
+          # minisign against.
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/secret.key"
+          # MINISIGN_PASSWORD reaches xtask through clap's `env`, so an encrypted key
+          # needs no extra flag here.
+          cargo run -p xtask -- sign --dir dist --key "$RUNNER_TEMP/secret.key"
+          shred -u "$RUNNER_TEMP/secret.key" 2>/dev/null || rm -f "$RUNNER_TEMP/secret.key"
+
+      # Verify with the *robot's* own code path before publishing. If the updater
+      # cannot accept this release, nobody should be able to download it.
+      #
+      # Uses the sideload manifest `xtask package` already emitted and `xtask sign`
+      # already signed, so this step needs no access to the key. Re-signing here would
+      # mean handling the signing key twice in one job for no benefit.
+      - name: Verify the way a robot would
+        run: |
+          version="${{ inputs.version }}"
+          artifact="daemon-${version}.tar.zst"
+
+          mkdir -p verify/published verify/keys verify/opt verify/var
+          cp "dist/${version}.manifest.json"          verify/published/
+          cp "dist/${version}.manifest.json.minisig"  verify/published/
+          cp "dist/${artifact}"                       verify/published/
+          cp "dist/${artifact}.minisig"               verify/published/
+
+          # The public key is not a secret, but keeping it in CI config means the
+          # verification uses the same trust anchor a robot would.
+          printf '%s\n' "${{ vars.MINISIGN_PUBLIC_KEY }}" > verify/keys/release-1.pub
+
+          # The production `on_apply` and `health`, not inert placeholders. `updaterd
+          # install` overrides both for the duration of a bootstrap — see its doc comment
+          # — so this config also checks that those overrides are still in place. Writing
+          # `action = "none"` here would have tested nothing but the engine.
+          cat > verify/updater.toml <<EOF
+          trusted_keys_dir = "$PWD/verify/keys"
+          hw_rev = 1
+          state_dir = "$PWD/verify/var"
+
+          [component.daemon]
+          install_dir = "$PWD/verify/opt/daemon"
+          source = { type = "github_releases", repo = "${{ github.repository }}", tag_prefix = "daemon-v" }
+          on_apply = { action = "restart", units = ["robotd"] }
+          health = { probe = "socket", timeout = "30s" }
+          EOF
+
+          # The release ships a `preinstall` hook asserting the machine can run it, and
+          # `updaterd install` runs hooks on a bootstrap install too — correctly, since a
+          # fresh board is exactly when a missing ONNX Runtime has to be installed. This
+          # runner is not a board: it is x86_64, so the aarch64 dylib the hook would fetch
+          # could never be loaded here, and fetching ~100 MB to prove that would only make
+          # every release slower.
+          #
+          # So declare the precondition satisfied and let the hook take its "already fine"
+          # branch, touching nothing. Faking the *file* rather than skipping the hook keeps
+          # this step's claim honest: hooks still run, and a hook that started failing for
+          # any other reason would still fail the release. The hook's own logic — accepting
+          # a runtime at the floor, refusing one it cannot replace — is covered on emulated
+          # aarch64, as root, in scripts/board-test.sh.
+          #
+          # The version comes from [workspace.metadata.onnxruntime], never a literal: that
+          # table is the single source of truth the hook itself is generated from, and a
+          # second copy here would be free to drift below the floor and turn this step red
+          # for a reason that has nothing to do with the release.
+          onnx_target="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.metadata.onnxruntime.target')"
+          sudo touch "/usr/local/lib/libonnxruntime.so.${onnx_target}"
+          sudo ln -sfn "libonnxruntime.so.${onnx_target}" /usr/local/lib/libonnxruntime.so
+
+          # The same command `scripts/install.sh` runs on a fresh robot, against the same
+          # files it would download. A host-native build, because the packaged binaries are
+          # aarch64 and this runner is x86_64 — what is under test is the bootstrap logic,
+          # not the cross-compile, which `scripts/board-test.sh` covers.
+          #
+          # Note this reaches `--from`, never the `github_releases` source above: an
+          # install that silently fell back to the network would be publishing a release
+          # by fetching some *other* release, and would pass while proving nothing.
+          #
+          # As root, because that is what a robot's `updaterd` is. The release now carries a
+          # `postinstall` hook that installs unit files into /etc/systemd/system and sysusers
+          # files into /usr/lib/sysusers.d, and it fails the update when it cannot — correctly,
+          # since a release whose units never arrive is a release that does not work. Running
+          # the engine unprivileged made this step reject a perfectly good release, which is
+          # the same mismatch the preinstall hook exposed one release earlier: a step claiming
+          # to verify "the way a robot would" has to have the privilege a robot has.
+          #
+          # Built first and then run under sudo, rather than `sudo cargo run`: cargo as root
+          # would write root-owned files into the cached target directory and poison it for
+          # every later step and every later run.
+          #
+          # The hook then enables the units it installed, and they fail to start here — they
+          # are aarch64 and this is x86_64. Expected, and only a warning by design: a unit that
+          # cannot start must not fail an otherwise good update. Failure lines from
+          # btd/configd/robotd in this step's log are the runner being a runner.
+          cargo build -p updater --bin updaterd
+          sudo ./target/debug/updaterd install \
+            --config verify/updater.toml \
+            --from verify/published
+
+          # Everything the robot needs must be present in the installed release, checked
+          # through the symlink the units actually resolve.
+          #
+          # `bin/robotd` is on this list because it was once missing: the release shipped
+          # only updaterd and robotctl while `on_apply` restarted robotd, so the first real
+          # release would have failed its own restart step and rolled itself back. An
+          # artifact that is missing a binary is indistinguishable from a good one until it
+          # is installed, which is exactly why this is asserted rather than assumed.
+          #
+          # Not executed, only checked: these are aarch64 binaries and the runner is x86_64.
+          # `scripts/board-test.sh` is what runs them.
+          for required in \
+            bin/updaterd \
+            bin/robotd \
+            bin/robotctl \
+            systemd/updaterd.service \
+            systemd/robotd.service \
+            systemd/sysusers.d/robot.conf \
+            deploy/journald.conf.d/10-robot.conf \
+            version.toml
+          do
+            if [ ! -e "verify/opt/daemon/current/$required" ]; then
+              echo "::error::release is missing $required"
+              exit 1
+            fi
+          done
+          test -x "verify/opt/daemon/current/bin/updaterd"
+          test -x "verify/opt/daemon/current/bin/robotd"
+
+          # The bootstrap asset must be the same bytes as the copy inside the artifact.
+          #
+          # This is what makes the installer's chain of trust close. The bootstrap binary
+          # is downloaded bare and run *before* anything has verified it, so on its own it
+          # is only as trustworthy as the TLS connection that fetched it. After the install
+          # the script compares its digest against `current/bin/updaterd`, which came out
+          # of a signature-verified tarball — equal digests mean the unverified binary was
+          # genuine. That check is worthless if the two are allowed to differ here.
+          boot_sum=$(sha256sum "dist/updaterd-bootstrap-aarch64" | cut -d' ' -f1)
+          installed_sum=$(sha256sum "verify/opt/daemon/current/bin/updaterd" | cut -d' ' -f1)
+          if [ "$boot_sum" != "$installed_sum" ]; then
+            echo "::error::updaterd-bootstrap-aarch64 does not match bin/updaterd in the artifact"
+            exit 1
+          fi
+          echo "bootstrap binary matches the artifact ($boot_sum)"
+
+          # The revision must have made it in, or support cannot tell two builds of the
+          # same version apart.
+          if ! grep -q "revision" "verify/opt/daemon/current/version.toml"; then
+            echo "::error::version.toml records no revision"
+            exit 1
+          fi
+          cat "verify/opt/daemon/current/version.toml"
+          echo "the updater accepted this release"
+
+      # Create it if it is not there, then fill it in either way.
+      #
+      # Two things made the old single `gh release create ... dist/*` wrong, and they are the same
+      # thing seen from different sides: it only ever worked on a release that did not exist yet.
+      #
+      #   - **It could not be re-run.** If this step failed after creating the release — a network
+      #     blip, a partial upload — every re-run failed identically on "release already exists",
+      #     and the only way out was deleting the release and the tag by hand, mid-release.
+      #   - **It could not follow the UI.** Drafting a release in the web UI is the obvious way to
+      #     cut one, and it creates the release object first, so the pipeline arrived to find its
+      #     own destination already taken and died *after* signing.
+      #
+      # `--clobber` on the upload so a re-run replaces assets rather than refusing them.
+      #
+      # `--prerelease` is re-asserted on a release that already exists, and that is a safety
+      # property rather than cosmetics: staging releases are flagged as prereleases because a plain
+      # `update apply` skips prereleases, which is what keeps an unvalidated build away from robots
+      # on stable. A release drafted in the UI without that box ticked would otherwise be a
+      # candidate every robot could reach.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            title="daemon ${{ inputs.version }} (staging)"
+            notes="Staging build from \`${GITHUB_SHA}\`.
+
+          Not for client robots. Promote it — create a release for tag \`daemon-v${{ inputs.version }}\`,
+          or run the \`promote\` workflow — once a canary has run the on-device acceptance checks.
+          Promotion ships these exact bytes.
+          "
+            flag=--prerelease
+          else
+            title="daemon ${{ inputs.version }}"
+            # Said in the release itself, because it is the one thing that distinguishes this from a
+            # promoted release and nothing else would record it. Built here means engine-verified —
+            # signature, manifest and a real install, all checked in this job — but not *canaried*:
+            # no robot ran these bytes before they became the stable channel.
+            notes="Built directly from \`${GITHUB_SHA}\`, with no staging release to promote.
+
+          Verified through the update engine in CI, but **not validated on a robot**. For the
+          canaried path, publish a pre-release for \`daemon-staging-v${{ inputs.version }}\` first
+          and then promote it.
+          "
+            flag=--prerelease=false
+          fi
+
+          # Create it if absent, fill it in either way — see the note in release.yml on why this is
+          # not a single `gh release create`. The flag is re-asserted on a release that already
+          # exists: staging must be flagged so a plain `update apply` skips it, and stable must not
+          # be, or it ships to nobody.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; filling it in"
+            gh release edit "$TAG" "$flag" --title "$title"
+          else
+            gh release create "$TAG" "$flag" --title "$title" --notes "$notes"
+          fi
+
+          gh release upload "$TAG" dist/* --clobber

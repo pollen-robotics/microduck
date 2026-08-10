@@ -1,0 +1,216 @@
+# Promote a validated staging release to the STABLE channel. Called, never triggered.
+#
+# This is §16.3's promotion step, and the important property is what it does *not* do: it never
+# rebuilds. It copies the artifact already published in staging — same sha256, checked here and again
+# on the robot — so what reaches client robots is byte-identical to what the canary validated.
+# Promotion is a decision, not a build.
+#
+# The stable release is **self-contained**: manifest, signature, artifact and bootstrap binary all
+# hang off `daemon-v<version>`. That is why the last step can delete the staging release outright.
+# Previously the stable manifest pointed back at the staging release to avoid a second copy of the
+# bytes, which quietly made a tag named like scaffolding load-bearing for the customer channel — and
+# deleting the v0.1.x staging releases duly left three stable releases pointing at a 404.
+#
+# Two callers: `release.yml`, when a stable release appears and a staging one exists to promote, and
+# `promote.yml` for the manual path.
+name: _promote-release
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to promote, e.g. 1.2.3'
+        required: true
+        type: string
+      min_supported:
+        description: >
+          Optional: force robots below this version to update without waiting for a client. Use only
+          when remediating a bad release (§8.1).
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # Signs with `release-1`. Promotion is the step that actually exposes customer robots to a build,
+    # so it is the most consequential thing in this repository.
+    #
+    # ⚠ `environment: release` is NOT a gate — see the same note in _build-release.yml.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the staging manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          staging_tag="daemon-staging-v${{ inputs.version }}"
+          mkdir -p staging
+          # Fails loudly if that staging release does not exist — promoting something
+          # unbuilt should not be possible.
+          gh release download "$staging_tag" \
+            --repo "${{ github.repository }}" \
+            --pattern 'manifest.json' \
+            --dir staging
+          echo "staging_tag=$staging_tag" >> "$GITHUB_ENV"
+          echo "stable_tag=daemon-v${{ inputs.version }}" >> "$GITHUB_ENV"
+
+      # The artifact itself, so the stable release can carry it. This is the copy that
+      # makes staging disposable; the sha256 check below is what makes it safe.
+      - name: Carry the artifact forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_name="$(jq -r '.url | split("/") | last' staging/manifest.json)"
+          mkdir -p artifact
+          gh release download "$staging_tag" \
+            --repo "${{ github.repository }}" \
+            --pattern "$artifact_name" \
+            --pattern "$artifact_name.minisig" \
+            --dir artifact
+
+          # The manifest that ships names this digest, and the robot re-checks it before
+          # installing (`updater::verify::verify_sha256`). Checking it here too means a
+          # bad copy fails in CI rather than on a board.
+          expected="$(jq -r .sha256 staging/manifest.json)"
+          actual="$(sha256sum "artifact/$artifact_name" | cut -d' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::artifact sha256 $actual does not match staging manifest $expected"
+            exit 1
+          fi
+          echo "artifact $artifact_name sha256 $actual (matches staging)"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_ENV"
+
+      # The bootstrap binary has to exist on the *stable* release, because that is what
+      # `https://github.com/<repo>/releases/latest/download/...` resolves to — and that
+      # URL is the whole of `scripts/install.sh`'s bootstrap step. A fresh robot cannot
+      # discover a staging tag, and should not be installing from one.
+      #
+      # Like the artifact above, this is copied rather than referenced, and for the same
+      # reason: a stable release that depends on assets living under another tag is only
+      # as durable as that tag. The digest below is what keeps this copy honest.
+      - name: Carry the bootstrap binary forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p bootstrap
+          gh release download "$staging_tag" \
+            --repo "${{ github.repository }}" \
+            --pattern 'updaterd-bootstrap-aarch64' \
+            --dir bootstrap
+
+          # `release.yml` already asserted this file is byte-identical to `bin/updaterd`
+          # inside the signed artifact. Recording the digest here means a promotion that
+          # somehow picked up different bytes is visible in the log rather than silently
+          # breaking the installer's post-install self-check.
+          sha256sum bootstrap/updaterd-bootstrap-aarch64
+
+      - name: Build the stable manifest
+        run: |
+          cargo run -p xtask -- promote \
+            --version "${{ inputs.version }}" \
+            --staging-tag "$staging_tag" \
+            --stable-tag "$stable_tag" \
+            --repo "${{ github.repository }}" \
+            --staging-manifest staging/manifest.json \
+            --out dist \
+            ${{ inputs.min_supported && format('--min-supported {0}', inputs.min_supported) || '' }}
+
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # Required: the release key is encrypted, and `xtask sign` reads this through
+          # clap's `env`. Without it, signing fails with "Key might be encrypted".
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          # Lengths, not values: a key length is not sensitive, and "is not set" could not
+          # distinguish an absent secret from a present-but-empty one — which is exactly how
+          # the first real run failed, after `gh secret set` was fed stdin through a wrapper
+          # that did not forward it. A secret can be written but empty, and it still lists.
+          echo "key length: ${#MINISIGN_SECRET_KEY}, password length: ${#MINISIGN_PASSWORD}"
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::MINISIGN_SECRET_KEY is empty or unset — refusing to publish unsigned artifacts"
+            exit 1
+          fi
+          # A minisign secret key is two lines: a comment and the base64 payload. One line
+          # means the newline was lost in transit, which fails later inside minisign with a
+          # parse error that says nothing about the cause.
+          if [ "$(printf '%s' "$MINISIGN_SECRET_KEY" | wc -l)" -lt 1 ]; then
+            echo "::error::MINISIGN_SECRET_KEY looks like a single line — its newline was lost"
+            exit 1
+          fi
+          umask 077
+          # '%s', not '%s\n': the key file ends with a newline, so the stored secret already
+          # contains it. Adding another would leave a trailing blank line nobody has tested
+          # minisign against.
+          printf '%s' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/secret.key"
+          cargo run -p xtask -- sign --dir dist --key "$RUNNER_TEMP/secret.key"
+          shred -u "$RUNNER_TEMP/secret.key" 2>/dev/null || rm -f "$RUNNER_TEMP/secret.key"
+
+      # Everything a robot needs, under one tag: manifest, signature, the artifact the
+      # manifest's `url` names, and the bootstrap binary `scripts/install.sh` fetches
+      # from `/releases/latest/download/`.
+      #
+      # Create-then-fill, like release.yml, and re-runnable for the same reason: a promotion that
+      # failed *after* creating the release could not be retried, which is the worst moment for a
+      # step to be one-shot — the stable release would exist, carrying nothing a robot can install,
+      # until someone deleted it by hand.
+      #
+      # `--prerelease=false` is re-asserted rather than assumed: a stable release that is flagged as
+      # a prerelease is invisible to a plain `update apply`, so a promotion into a release object
+      # someone had drafted would silently ship to nobody.
+      - name: Publish the stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Promoted from \`$staging_tag\`.
+
+          The artifact is the one validated in staging — same bytes, same sha256, checked
+          during promotion. This release is self-contained: manifest, signature, artifact,
+          and the bootstrap binary used by \`scripts/install.sh\` to install from scratch.
+          "
+          title="daemon ${{ inputs.version }}"
+
+          if gh release view "$stable_tag" >/dev/null 2>&1; then
+            echo "release $stable_tag exists; filling it in"
+            gh release edit "$stable_tag" --prerelease=false --title "$title"
+          else
+            gh release create "$stable_tag" --title "$title" --notes "$notes"
+          fi
+
+          gh release upload "$stable_tag" \
+            dist/manifest.json dist/manifest.json.minisig \
+            "artifact/$artifact_name" "artifact/$artifact_name.minisig" \
+            bootstrap/updaterd-bootstrap-aarch64 \
+            --clobber
+
+      # Only now — the stable release exists and carries every byte it references, so the
+      # staging release has no readers left. Deleting it is what keeps the release list
+      # honest: a `daemon-staging-*` tag that outlives its promotion is installable via
+      # `--ref`, and is just an older name for what stable already serves.
+      #
+      # `--cleanup-tag`, for the same reason as in `prune-dev-releases.yml`: a surviving
+      # tag keeps resolving.
+      - name: Retire the staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Tolerant of already being gone, so a re-run of a promotion that got this far does not
+          # fail on the one step whose work is already done.
+          if gh release view "$staging_tag" >/dev/null 2>&1; then
+            gh release delete "$staging_tag" \
+              --repo "${{ github.repository }}" \
+              --cleanup-tag --yes
+            echo "retired $staging_tag"
+          else
+            echo "$staging_tag is already retired"
+          fi

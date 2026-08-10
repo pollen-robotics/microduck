@@ -846,6 +846,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The workflows that *package* a release, which is where the `--include` list and the staged
+    /// binaries live.
+    ///
+    /// Named once, because the tests below all read the same files and the recipe has moved before:
+    /// it used to sit in `release.yml`, and now lives in the reusable `_build-release.yml` that both
+    /// the staging and stable paths call. A test that kept reading the old name would pass while
+    /// guarding nothing, which is worse than failing.
+    const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "_build-release.yml"];
+
+    /// Where promotion happens: the stable manifest, the artifact carried forward, the retire step.
+    const PROMOTE_WORKFLOW: &str = "_promote-release.yml";
     /// Every unit `install.sh` installs must actually be in the artifact.
     ///
     /// The packaging workflows name each shipped file with an explicit `--include`, and
@@ -877,7 +888,7 @@ mod tests {
         units.dedup();
         assert!(units.len() >= 4, "expected several units, found {units:?}");
 
-        for workflow in ["dev.yml", "release.yml"] {
+        for workflow in PACKAGING_WORKFLOWS {
             let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
             for unit in &units {
@@ -904,22 +915,22 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask/ has a parent");
-        let yml = std::fs::read_to_string(root.join(".github/workflows/promote.yml"))
-            .expect(".github/workflows/promote.yml must exist");
+        let yml = std::fs::read_to_string(root.join(".github/workflows").join(PROMOTE_WORKFLOW))
+            .unwrap_or_else(|e| panic!("{PROMOTE_WORKFLOW}: {e}"));
 
         assert!(
             yml.contains("--stable-tag"),
-            "promote.yml must pass --stable-tag, or the manifest url is built from the \
+            "the promote workflow must pass --stable-tag, or the manifest url is built from the \
              wrong release"
         );
         assert!(
             yml.contains("\"artifact/$artifact_name\""),
-            "promote.yml must upload the artifact to the stable release — the manifest's \
+            "the promote workflow must upload the artifact to the stable release — the manifest's \
              url points there"
         );
         assert!(
             yml.contains("\"artifact/$artifact_name.minisig\""),
-            "promote.yml must upload the artifact signature too — `sig_url` is derived \
+            "the promote workflow must upload the artifact signature too — `sig_url` is derived \
              from `url` and points at the same release"
         );
 
@@ -927,7 +938,7 @@ mod tests {
         // removes them, this assertion is the one that should look wrong.
         assert!(
             yml.contains("gh release delete \"$staging_tag\""),
-            "promote.yml should retire the staging release once stable is self-contained"
+            "the promote workflow should retire the staging release once stable is self-contained"
         );
     }
 
@@ -964,7 +975,7 @@ mod tests {
                     continue;
                 }
                 found += 1;
-                for workflow in ["dev.yml", "release.yml"] {
+                for workflow in PACKAGING_WORKFLOWS {
                     let text =
                         std::fs::read_to_string(root.join(".github/workflows").join(workflow))
                             .unwrap_or_else(|e| panic!("{workflow}: {e}"));
@@ -1001,7 +1012,7 @@ mod tests {
                 continue;
             }
 
-            for workflow in ["dev.yml", "release.yml"] {
+            for workflow in PACKAGING_WORKFLOWS {
                 let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
                     .unwrap_or_else(|e| panic!("{workflow}: {e}"));
                 let expected = format!("=hooks/{name}");
@@ -1031,7 +1042,7 @@ mod tests {
             .parent()
             .expect("xtask/ has a parent");
 
-        for workflow in ["dev.yml", "release.yml"] {
+        for workflow in PACKAGING_WORKFLOWS {
             let text = std::fs::read_to_string(root.join(".github/workflows").join(workflow))
                 .unwrap_or_else(|e| panic!("{workflow}: {e}"));
 

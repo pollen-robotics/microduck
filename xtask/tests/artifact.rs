@@ -36,7 +36,7 @@
 //! packaging recipe — reproducing the list here by hand would recreate exactly the drift these
 //! tests exist to catch. What is no longer taken on trust is the result.
 //!
-//! **Both workflows, not just `release.yml`.** `dev.yml` maintains its own copy of the staging and
+//! **Both workflows.** `dev.yml` maintains its own copy of the staging and
 //! `--include` lists, and says in a comment why they must match:
 //!
 //! > Same contents as a real release: a dev build that omitted the units or robotd would fail its
@@ -46,8 +46,8 @@
 //! Nothing enforced that. Two hand-maintained parallel lists is the same drift class as a list that
 //! disagrees with `install.sh`, and it matters more than it looks: every bug in
 //! `install-path-gap.md` was found while installing a **dev** build onto a board, because that is
-//! the artifact a branch actually ships. A test that covered only `release.yml` would have watched
-//! all four of them go past.
+//! the artifact a branch actually ships. A test that covered only the release path would have
+//! watched all four of them go past.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,11 @@ const STAGED: &str = " staged/";
 ///
 /// `dev.yml` first, deliberately: it is the one that runs on every push and the one whose output
 /// reaches a board during development.
-const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "release.yml"];
+/// `_build-release.yml` rather than `release.yml`: the recipe moved into the reusable workflow that
+/// both the staging and the stable path call, and `release.yml` is now only the entry point that
+/// decides between them. A constant that kept naming the old file would have left every assertion
+/// here vacuous — which is why the parse below fails loudly when it matches nothing.
+const PACKAGING_WORKFLOWS: [&str; 2] = ["dev.yml", "_build-release.yml"];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

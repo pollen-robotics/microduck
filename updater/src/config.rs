@@ -490,7 +490,16 @@ mod tests {
         // board in exactly the same way as a release missing it — `systemctl restart robotd`
         // with no such unit — and a teammate hitting that would have no reason to suspect the
         // packaging rather than their own branch.
-        let workflows = [".github/workflows/release.yml", ".github/workflows/dev.yml"].map(|w| {
+        //
+        // `_build-release.yml`, not `release.yml`: the packaging recipe lives in the reusable
+        // workflow that both the staging and the stable path call, and `release.yml` is now only the
+        // entry point choosing between them. The assertion below fails loudly on a file it cannot
+        // parse, which is what caught this rename rather than silently passing.
+        let workflows = [
+            ".github/workflows/_build-release.yml",
+            ".github/workflows/dev.yml",
+        ]
+        .map(|w| {
             (
                 w,
                 std::fs::read_to_string(repo.join(w)).unwrap_or_else(|_| panic!("{w} must exist")),
