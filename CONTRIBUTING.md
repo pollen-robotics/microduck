@@ -40,15 +40,15 @@ xtask/          package · sign · promote — build tooling, never shipped
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
 scripts/        provision-board.sh (from your machine) · provision.sh → setup-board.sh ·
                 migrate-network.sh · install.sh (on the board) · board-test.sh (CI)
-docs/           architecture · update design · robotd design · app path · roadmap · CI setup · cheat sheet
+docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records)
 ```
 
 Services talk over unix sockets, JSON-RPC 2.0 one object per line. The contract lives in
 `duck-ipc-proto`, which depends on serde and semver and nothing else — so `btd` and `robotd`
 never inherit the update engine's http/tar/crypto tree.
 
-[`docs/architecture.md`](docs/architecture.md) §1 has what each service is and why it is its own
-process. [`docs/roadmap.md`](docs/roadmap.md) has what actually works today.
+[`docs/design/architecture.md`](docs/design/architecture.md) §1 has what each service is and why it is its own
+process. [`docs/project/roadmap.md`](docs/project/roadmap.md) has what actually works today.
 
 ## Conventions
 
@@ -73,4 +73,4 @@ git tag daemon-staging-v0.2.0 && git push --tags
 gh workflow run promote --field version=0.2.0
 ```
 
-[`docs/ci-setup.md`](docs/ci-setup.md) covers key custody, the secrets, and rotation.
+[`docs/project/ci-setup.md`](docs/project/ci-setup.md) covers key custody, the secrets, and rotation.

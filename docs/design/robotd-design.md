@@ -3,7 +3,7 @@
 Status: draft · Date: 2026-07-29 · Owner: pierre
 
 Implements the `robotd` row of [`architecture.md`](architecture.md) §1 and covers
-[`roadmap.md`](roadmap.md) M3. Scoped deliberately to the first two increments; everything
+[`roadmap.md`](../project/roadmap.md) M3. Scoped deliberately to the first two increments; everything
 beyond them is in §10.
 
 The prototype being absorbed is

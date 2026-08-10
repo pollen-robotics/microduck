@@ -17,7 +17,7 @@ loses recent logs on a power cut, which is how a robot is actually switched off.
 under `/var/lib` is therefore the only durable record — which is what `architecture.md` §8.2
 designed it to be.
 
-> To just get a dev board working, [`docs/install-dev.md`](../docs/install-dev.md) is the short
+> To just get a dev board working, [`docs/robot/install-dev.md`](../docs/robot/install-dev.md) is the short
 > procedure. Below is the trust chain, what ends up where, and where logs go.
 
 ## Quickstart
@@ -170,7 +170,7 @@ rather than maintained the day we build an image with NetworkManager in it.
 Armbian's headless image runs netplan + `systemd-networkd` + `wpa_supplicant`, while `configd`
 drives NM over D-Bus — so until the migration runs, `robotctl net status` reports `Unavailable`
 and nothing over Bluetooth can configure wifi. Why NM rather than what the image ships is in
-[`../docs/app-path-design.md`](../docs/app-path-design.md) §2.
+[`../docs/app-path-design.md`](../docs/design/app-path-design.md) §2.
 
 `provision.sh` runs them in order and holds the state that has to cross the reboot — the token,
 a dev-key path, and the boot id it uses to tell whether you have actually rebooted. It has no
@@ -304,7 +304,7 @@ no token, so it never reaches that path. Without it `updaterd` would be installe
 and unable to fetch a single update, which is most of what it is for.
 
 Artifact hosting is therefore an open decision, not a settled one —
-[`../docs/updater-design.md`](../docs/updater-design.md) §6.1 has the options. The cheap one
+[`../docs/updater-design.md`](../docs/design/updater-design.md) §6.1 has the options. The cheap one
 is a second, public repository holding only signed artifacts: signatures are what make an
 artifact safe to serve, not obscurity, and the source stays private.
 

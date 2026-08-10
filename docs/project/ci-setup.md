@@ -2,7 +2,7 @@
 
 Status: draft · Date: 2026-07-28 · Owner: pierre
 
-One-time setup for the release pipeline. See [`updater-design.md`](updater-design.md)
+One-time setup for the release pipeline. See [`updater-design.md`](../design/updater-design.md)
 §5.4 for key custody and §16.3 for the staging → stable model.
 
 ## Decision: two keys, two triggers, and no gate on this plan

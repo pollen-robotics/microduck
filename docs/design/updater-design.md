@@ -12,7 +12,7 @@ must be triggerable from a companion mobile app with a few taps.
 
 We need a way to update the shipped software safely in the field.
 
-Sequencing and milestones live in [`roadmap.md`](roadmap.md).
+Sequencing and milestones live in [`roadmap.md`](../project/roadmap.md).
 
 The surrounding system — service split, IPC, state ownership, the robot API and
 remote/WebRTC access — is covered in [`architecture.md`](architecture.md). This
@@ -315,7 +315,7 @@ Three things this table encodes, each easy to get wrong:
    against a leaked key file. ≥128 bits, e.g. `openssl rand -base64 24`.
 
 Releases are signed **in CI**, not locally — a deliberate choice, with the approval gate
-that compensates for it documented in [`ci-setup.md`](ci-setup.md).
+that compensates for it documented in [`ci-setup.md`](../project/ci-setup.md).
 
 The dev key is deliberately unencrypted: CI signs non-interactively, and a passphrase
 stored beside the key it protects adds little. Its real protection is structural — it is

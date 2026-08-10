@@ -2,7 +2,7 @@
 
 Status: draft · Date: 2026-07-22 · Owner: pierre
 
-Sequencing and milestones live in [`roadmap.md`](roadmap.md).
+Sequencing and milestones live in [`roadmap.md`](../project/roadmap.md).
 
 Companion to [`updater-design.md`](updater-design.md), which covers the update
 system in detail. This document covers the service split, how services talk to
@@ -365,7 +365,7 @@ Cross-cutting, because a robot in someone's home cannot be debugged by attaching
 debugger. What support can ask for has to already be on the robot.
 
 Deployment specifics — the journald drop-in, install steps, verification commands — live in
-[`../deploy/README.md`](../deploy/README.md). This section is the contract every service
+[`../deploy/README.md`](../../deploy/README.md). This section is the contract every service
 must satisfy.
 
 ### 8.1 Every service logs to stderr

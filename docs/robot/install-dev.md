@@ -190,6 +190,6 @@ else — signatures, hashes and compatibility are still checked, and
 
 ## Going deeper
 
-[`deploy/README.md`](../deploy/README.md) is the reference for what all of this actually does:
+[`deploy/README.md`](../../deploy/README.md) is the reference for what all of this actually does:
 the trust chain, what ends up where, the other ways in (on the board without a clone, by hand
 step by step), where logs go and what survives a reboot.

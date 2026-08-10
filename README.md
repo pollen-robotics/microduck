@@ -113,7 +113,7 @@ Your paths survive updates. Delete the lines to go back to the policy the releas
 
 A policy that could not be loaded reports **unhealthy** — `robotctl health` and the bottom of
 `monitor` both name the reason. The shape a policy has to have, and what else is checked at
-load, are in [`docs/robotd-design.md`](docs/robotd-design.md) §5.3.
+load, are in [`docs/design/robotd-design.md`](docs/design/robotd-design.md) §5.3.
 
 ## Keep it up to date
 
@@ -140,7 +140,7 @@ usually a downgrade — use `--ref` below instead.
 
 ## Put your branch on the robot
 
-Make sure the board has been through the [dev install](docs/install-dev.md) first — a board that
+Make sure the board has been through the [dev install](docs/robot/install-dev.md) first — a board that
 has not will refuse branch builds.
 
 Push your branch, then wait for CI to build it:
@@ -171,9 +171,9 @@ Every push needs the apply again.
 
 | | |
 |---|---|
-| [`docs/install-dev.md`](docs/install-dev.md) | Setting up a board for development, from nothing — and the fix when `--ref` is refused. |
-| [`docs/cheatsheet.md`](docs/cheatsheet.md) | Every `robotctl` and `btctl` command on one page: wifi, updates, pinning, rollback, logs. |
-| [`docs/robotd-design.md`](docs/robotd-design.md) | How the control side works. §3.1 is the fastest way in — who talks to `robotd` and where the crate boundary sits — with the per-tick dataflow in §5.10. |
-| [`docs/architecture.md`](docs/architecture.md) | The services, the IPC contract, safety and authority. |
-| [`docs/roadmap.md`](docs/roadmap.md) | What works today versus what is designed. |
+| [`docs/robot/install-dev.md`](docs/robot/install-dev.md) | Setting up a board for development, from nothing — and the fix when `--ref` is refused. |
+| [`docs/robot/cheatsheet.md`](docs/robot/cheatsheet.md) | Every `robotctl` and `btctl` command on one page: wifi, updates, pinning, rollback, logs. |
+| [`docs/design/robotd-design.md`](docs/design/robotd-design.md) | How the control side works. §3.1 is the fastest way in — who talks to `robotd` and where the crate boundary sits — with the per-tick dataflow in §5.10. |
+| [`docs/design/architecture.md`](docs/design/architecture.md) | The services, the IPC contract, safety and authority. |
+| [`docs/project/roadmap.md`](docs/project/roadmap.md) | What works today versus what is designed. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Building, testing, and the conventions this repo holds to. |

@@ -15,7 +15,7 @@ against **any** key here.
 only against the set baked into it, so a robot carrying one key whose private half is
 later lost or leaked cannot be given a replacement over the air — it has to be re-flashed
 by hand. Shipping the spares now is free; retrofitting them is impossible. See
-[`../../docs/ci-setup.md`](../../docs/ci-setup.md) for custody.
+[`../../docs/ci-setup.md`](../../docs/project/ci-setup.md) for custody.
 
 **Public keys are not secrets.** Committing them is correct and intended: they are exactly
 what has to be public for anyone to verify what we sign. The private halves live in

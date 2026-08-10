@@ -2,8 +2,8 @@
 
 Status: draft · Date: 2026-08-05 · Owner: pierre
 
-Companion to [`architecture.md`](architecture.md) (what we're building) and
-[`updater-design.md`](updater-design.md) (how it ships). This is *order and sequencing*
+Companion to [`architecture.md`](../design/architecture.md) (what we're building) and
+[`updater-design.md`](../design/updater-design.md) (how it ships). This is *order and sequencing*
 — it will change; the design docs shouldn't.
 
 ## Where we are
@@ -21,7 +21,7 @@ Companion to [`architecture.md`](architecture.md) (what we're building) and
 | bootstrap | `updaterd install` + `scripts/install.sh` — a robot installs its first release through the **ordinary engine**, so there is no bootstrap-only code path to drift |
 | `deploy/` | shipped `updater.toml`, `robotd.toml`, trust anchor, journald retention drop-in |
 | `scripts/` | `install.sh` provisioning · `board-test.sh` — **passing in CI**: 13 checks on emulated aarch64, Debian 13 (Trixie) |
-| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](app-path-design.md) §5.5 |
+| `btd/` | BLE transport adapter — framing, the routed subset, the BlueZ backend, a pairing agent, plus `btctl` for a laptop. **Works on hardware**, unencrypted by default — the blocker, [`app-path-design.md`](../design/app-path-design.md) §5.5 |
 | `configd/` | wifi over NetworkManager, robot name, pairing PIN, reboot. **Drives a real NetworkManager on a board**: provisioned over BLE, joined, and rejoined by itself after a reboot. `--fake-net` still serves the whole surface off-board |
 | tests | **458 passing**, including the health gate, the battery+thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | missing | `mediad`, app, SDK |
@@ -122,7 +122,7 @@ has none. See `updater-design.md` §6.1.
 
 ### M3 — `robotd` for real  ·  **done**, in two slices
 
-Designed in [`robotd-design.md`](robotd-design.md). `robotd` **replaces**
+Designed in [`robotd-design.md`](../design/robotd-design.md). `robotd` **replaces**
 `microduck_runtime`, by extracting its control core into `duck-control` rather than
 reimplementing it — so the prototype keeps running while the daemon grows, and parity
 arrives as a consequence of the extraction instead of as a race against a moving target.

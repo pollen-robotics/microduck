@@ -17,7 +17,7 @@ then ran with inference in the tick, and `0.2.0` — the first release containin
 installed from the stable channel.
 
 Nothing links to this file any more. It is kept as the record of what the board actually said;
-the reusable half is the recipe below, and [`cheatsheet.md`](cheatsheet.md) is where a command
+the reusable half is the recipe below, and [`cheatsheet.md`](../robot/cheatsheet.md) is where a command
 someone needs again should end up.
 
 ## What already works, verified on the board
@@ -128,7 +128,7 @@ sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
 `team.dev.pub` is deliberately not in the repository — `deploy/trusted_keys/README.md` explains
 why. Get the public half from Pierre, or regenerate it from the secret with
 `minisign -R -s <secret> -p team.dev.pub`. The by-hand equivalent is in
-[`../deploy/README.md`](../deploy/README.md).
+[`../deploy/README.md`](../../deploy/README.md).
 
 Then:
 
