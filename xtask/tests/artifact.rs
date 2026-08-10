@@ -4,7 +4,7 @@
 //! `.github/workflows/*.yml` against `scripts/install.sh`, or a unit's `ExecStart` against a `cp`
 //! line. Those are worth having and they are the weaker form: they describe packaging without
 //! observing it, so they pass whenever the description is self-consistent, including when the
-//! description is wrong. `docs/install-path-gap.md` option A is this file.
+//! description is wrong. `docs/project/install-path-gap.md` option A is this file.
 //!
 //! Two bugs reached a board through that gap on the same afternoon. A release shipped units its
 //! artifact did not contain, and then — two commits after a test was added to stop the first one

@@ -523,7 +523,7 @@ echo "    [ok] preinstall refuses an old runtime it cannot replace, naming the f
 
 # ── installing a real artifact: scripts/install.sh and hooks/postinstall ──
 #
-# The gap docs/install-path-gap.md option B names. Everything above drives the engine, which
+# The gap docs/project/install-path-gap.md option B names. Everything above drives the engine, which
 # lands a release; nothing ran the 892 lines that turn a landed release into a working board,
 # and nothing ran the hook that does the same job unattended inside the update gate. Four bugs
 # reached a board through that, and the two file-placing scripts were the only part of the
