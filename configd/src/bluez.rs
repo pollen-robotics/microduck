@@ -430,9 +430,20 @@ impl BlueZ {
 
     /// Look for a gamepad until `deadline`, then give up.
     ///
-    /// Returns the candidates found in the *last* sweep rather than the first hit, so "two pads are
-    /// in pairing mode" can be reported as the refusal it is instead of resolved by whichever
-    /// arrived first.
+    /// **An unbonded pad wins, and the search waits for one.** A robot that already has a pad bonded
+    /// still sees it in every sweep — it is in BlueZ's cache whether or not anyone touched it — so
+    /// returning on the first match would answer "you already have a pad" to someone standing there
+    /// with a second one in pairing mode. That made adding a pad impossible without forgetting the
+    /// first, which is the wrong shape: a robot may have several pads bonded, and `padd` drives
+    /// whichever connects.
+    ///
+    /// So with no address given, the sweep only ends early on a candidate that is **not yet paired**;
+    /// otherwise it runs to the deadline and reports what it has, which may be the pad already
+    /// bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
+    /// window before saying "already paired" — `--timeout` shortens it.
+    ///
+    /// An explicit address ends the sweep as soon as it appears, paired or not: the caller has named
+    /// what they want and there is nothing to prefer.
     ///
     /// Also returns **everything else it saw**, which matters more than it looks: BlueZ reports a
     /// freshly-discovered device with an address and often nothing else — no `Name`, no `Class`, no
@@ -454,14 +465,12 @@ impl BlueZ {
                 .cloned()
                 .collect();
 
-            if !matches.is_empty() {
+            let worth_stopping_for = match mac {
+                Some(_) => !matches.is_empty(),
+                None => matches.iter().any(|device| !device.paired),
+            };
+            if worth_stopping_for || tokio::time::Instant::now() >= deadline {
                 return Ok(Found { matches, seen });
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(Found {
-                    matches: Vec::new(),
-                    seen,
-                });
             }
             tokio::time::sleep(DISCOVERY_POLL.min(deadline - tokio::time::Instant::now())).await;
         }
@@ -628,24 +637,14 @@ impl Pads for BlueZ {
             });
         };
 
-        // Already bonded and trusted? Say so and change nothing. `robotctl` is documented to be
-        // idempotent, and re-pairing a working pad by re-running a command would be a way to break
-        // one.
-        if let Some(existing) = self
-            .devices()
-            .await?
-            .into_iter()
-            .filter(|d| d.paired && d.trusted)
-            .find(|d| match mac {
-                Some(wanted) => wanted.eq_ignore_ascii_case(&d.mac),
-                None => d.is_gamepad(),
-            })
-        {
-            tracing::info!(mac = %existing.mac, "already paired and trusted");
-            return Ok(proto::PadPairResult::Paired {
-                pad: existing.as_pad(),
-            });
-        }
+        // No short-circuit on "a pad is already bonded", deliberately. That reads as an obvious
+        // optimisation and it made **adding a second pad impossible**: the bonded one is in BlueZ's
+        // cache every sweep, so it always won, and the only way to pair a new pad was to forget the
+        // working one first. A robot may have several pads bonded — `padd` drives whichever connects
+        // — so the search runs, and `find` prefers a pad that is not yet paired.
+        //
+        // Idempotence is kept where it belongs instead: if the pad that turns up is already bonded,
+        // `bond` skips connecting and pairing and only re-asserts `Trusted`.
 
         // Discovery has to be running for a first-time bond to resolve an address. A failure here
         // is worth reporting rather than working around: without it the search below can only ever
@@ -705,18 +704,36 @@ impl Pads for BlueZ {
                 });
             }
             [only] => only.clone(),
-            many => {
-                let names: Vec<String> = many
-                    .iter()
-                    .map(|d| format!("{} ({})", d.name, d.mac))
-                    .collect();
-                return Ok(proto::PadPairResult::Failed {
-                    reason: proto::PadPairFailure::Ambiguous,
-                    detail: Some(format!(
-                        "more than one pad is in pairing mode: {}",
-                        names.join(", ")
-                    )),
-                });
+            several => {
+                // Prefer the pads that are **not** already bonded: those are the ones someone just
+                // put into pairing mode, and a pad this robot already has is not a competing answer.
+                // Without this, adding a second pad in a room where the first is in range would be
+                // refused as ambiguous forever.
+                let fresh: Vec<&Snapshot> = several.iter().filter(|d| !d.paired).collect();
+                match fresh.as_slice() {
+                    [only] => (*only).clone(),
+                    // Nothing new: report the bonded one, and let `bond` re-assert `Trusted`. This is
+                    // the idempotent re-run, and the one case where several bonded pads are in range
+                    // — either is a correct answer, so take the first by address for determinism.
+                    [] => several
+                        .iter()
+                        .min_by(|a, b| a.mac.cmp(&b.mac))
+                        .expect("several is non-empty")
+                        .clone(),
+                    _ => {
+                        let names: Vec<String> = fresh
+                            .iter()
+                            .map(|d| format!("{} ({})", d.name, d.mac))
+                            .collect();
+                        return Ok(proto::PadPairResult::Failed {
+                            reason: proto::PadPairFailure::Ambiguous,
+                            detail: Some(format!(
+                                "more than one pad is in pairing mode: {}",
+                                names.join(", ")
+                            )),
+                        });
+                    }
+                }
             }
         };
 

@@ -81,6 +81,11 @@ to the guess and pairs fine by address:
 sudo robotctl pad pair 78:86:2E:BB:13:28
 ```
 
+**Adding a second pad needs no forgetting.** A pad already bonded is in range and in every sweep, so
+the robot prefers one in pairing mode; both stay paired afterwards and `padd` drives whichever
+connects. The cost is that re-running with nothing new in pairing mode waits out the whole search
+window before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
+
 ```
 robotctl pad status
 ```
@@ -88,6 +93,10 @@ robotctl pad status
 ```
 sudo robotctl pad forget 78:86:2E:BB:13:28
 ```
+
+`forget` removes **the robot's half** of the bond, which is all a robot can remove. The pad keeps its
+own half, so pair it again with Sync held — otherwise it arrives with a key this robot no longer has
+and the bond is refused.
 
 **Pairing is the only step.** `padd.service` runs from boot, waits for a pad and drives whatever
 connects, so nothing needs starting and nothing dies with your ssh session. On the pad: **Start**

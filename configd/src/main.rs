@@ -208,7 +208,7 @@ async fn main() -> ExitCode {
         Ok(pads) => pads,
         Err(e) => {
             tracing::warn!(error = %e, "no gamepad backend; pad.* will report no pads");
-            Arc::new(FakePads::with(Vec::new(), Vec::new()))
+            Arc::new(FakePads::with(Vec::new()))
         }
     };
 

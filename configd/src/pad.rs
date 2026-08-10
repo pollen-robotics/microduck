@@ -147,35 +147,51 @@ pub struct FakePads {
 }
 
 struct FakeState {
-    /// Pads already bonded to this robot.
-    bonded: Vec<proto::Pad>,
-    /// Pads in pairing mode right now, as discovery would report them.
-    discoverable: Vec<proto::Pad>,
+    /// Every pad the radio can see, bonded or not — which is the shape BlueZ reports and the reason
+    /// this is one list rather than two.
+    ///
+    /// Modelling "in pairing mode" and "already bonded" separately looked tidier and hid the bug
+    /// that mattered: a bonded pad shows up in *every* sweep, so the selection rule has to prefer an
+    /// unbonded one or a robot can never be given a second pad.
+    visible: Vec<proto::Pad>,
 }
 
 impl FakePads {
     /// One pad in pairing mode, nothing bonded — a fresh robot next to a controller with its sync
     /// light flashing.
     pub fn new() -> Self {
-        Self::with(
-            Vec::new(),
-            vec![proto::Pad {
-                mac: "78:86:2E:BB:13:28".into(),
-                name: "Xbox Wireless Controller".into(),
-                paired: false,
-                trusted: false,
-                connected: false,
-            }],
-        )
+        Self::with(vec![unpaired(
+            "78:86:2E:BB:13:28",
+            "Xbox Wireless Controller",
+        )])
     }
 
-    pub fn with(bonded: Vec<proto::Pad>, discoverable: Vec<proto::Pad>) -> Self {
+    pub fn with(visible: Vec<proto::Pad>) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(FakeState {
-                bonded,
-                discoverable,
-            }),
+            inner: tokio::sync::Mutex::new(FakeState { visible }),
         }
+    }
+}
+
+/// A pad in pairing mode: seen, not bonded.
+pub fn unpaired(mac: &str, name: &str) -> proto::Pad {
+    proto::Pad {
+        mac: mac.to_owned(),
+        name: name.to_owned(),
+        paired: false,
+        trusted: false,
+        connected: false,
+    }
+}
+
+/// A pad this robot already has, in range and connected.
+pub fn bonded(mac: &str, name: &str) -> proto::Pad {
+    proto::Pad {
+        mac: mac.to_owned(),
+        name: name.to_owned(),
+        paired: true,
+        trusted: true,
+        connected: true,
     }
 }
 
@@ -188,31 +204,48 @@ impl Default for FakePads {
 #[async_trait]
 impl Pads for FakePads {
     async fn status(&self) -> PadResult<Vec<proto::Pad>> {
-        Ok(self.inner.lock().await.bonded.clone())
+        let state = self.inner.lock().await;
+        Ok(state
+            .visible
+            .iter()
+            .filter(|pad| pad.paired)
+            .cloned()
+            .collect())
     }
 
     async fn pair(&self, mac: Option<&str>, _timeout: Duration) -> PadResult<proto::PadPairResult> {
         let mut state = self.inner.lock().await;
 
         let candidates: Vec<proto::Pad> = state
-            .discoverable
+            .visible
             .iter()
             .filter(|pad| mac.is_none_or(|wanted| wanted.eq_ignore_ascii_case(&pad.mac)))
             .cloned()
             .collect();
 
-        let pad = match candidates.as_slice() {
-            [] => {
+        // The same rule as `crate::bluez`: an unbonded pad wins, because that is the one someone
+        // just put into pairing mode. A pad the robot already has is not a competing answer, and
+        // treating it as one is what made a second pad impossible to add.
+        let fresh: Vec<&proto::Pad> = candidates.iter().filter(|pad| !pad.paired).collect();
+        let pad = match (fresh.as_slice(), candidates.as_slice()) {
+            ([only], _) => (*only).clone(),
+            ([], []) => {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
                     detail: None,
                 });
             }
-            [only] => only.clone(),
-            _ => {
+            // Nothing new in pairing mode, so the answer is the pad already bonded: an idempotent
+            // re-run, which is also how a lost `Trusted` is repaired.
+            ([], already) => already
+                .iter()
+                .min_by(|a, b| a.mac.cmp(&b.mac))
+                .expect("non-empty")
+                .clone(),
+            (several, _) => {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::Ambiguous,
-                    detail: Some(format!("{} pads are in pairing mode", candidates.len())),
+                    detail: Some(format!("{} pads are in pairing mode", several.len())),
                 });
             }
         };
@@ -223,18 +256,19 @@ impl Pads for FakePads {
             connected: true,
             ..pad
         };
-        state.discoverable.retain(|p| p.mac != paired.mac);
-        state.bonded.retain(|p| p.mac != paired.mac);
-        state.bonded.push(paired.clone());
+        state.visible.retain(|p| p.mac != paired.mac);
+        state.visible.push(paired.clone());
         Ok(proto::PadPairResult::Paired { pad: paired })
     }
 
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult> {
         let mut state = self.inner.lock().await;
-        let before = state.bonded.len();
-        state.bonded.retain(|p| !p.mac.eq_ignore_ascii_case(mac));
+        let before = state.visible.len();
+        // `RemoveDevice` drops the object, not just the keys, so the pad is no longer visible at all
+        // until something rediscovers it.
+        state.visible.retain(|p| !p.mac.eq_ignore_ascii_case(mac));
         Ok(proto::PadForgetResult {
-            removed: state.bonded.len() != before,
+            removed: state.visible.len() != before,
         })
     }
 }
@@ -326,7 +360,7 @@ mod tests {
     /// from "something broke" — the answer to it is "hold the sync button", not "file a bug".
     #[tokio::test]
     async fn an_absent_pad_is_not_found_rather_than_an_error() {
-        let pads = FakePads::with(Vec::new(), Vec::new());
+        let pads = FakePads::with(Vec::new());
         assert!(matches!(
             pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
             proto::PadPairResult::Failed {
@@ -336,29 +370,54 @@ mod tests {
         ));
     }
 
+    /// **A pad already bonded must not block pairing a new one.**
+    ///
+    /// The bonded pad is in range and in every sweep, so a selection rule that took the first match
+    /// would keep answering "you already have a pad" to someone holding a second one in pairing
+    /// mode — and the only workaround would be to forget the working pad first, which is a bad
+    /// trade for a robot two people want to drive.
+    #[tokio::test]
+    async fn a_bonded_pad_does_not_block_pairing_a_new_one() {
+        let pads = FakePads::with(vec![
+            bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller"),
+            unpaired("A4:AE:11:00:22:33", "DualSense Wireless Controller"),
+        ]);
+
+        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let proto::PadPairResult::Paired { pad } = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(pad.mac, "A4:AE:11:00:22:33", "the new pad must win");
+
+        // And the robot now has both. `padd` drives whichever connects.
+        let bonded_now = pads.status().await.unwrap();
+        assert_eq!(bonded_now.len(), 2, "{bonded_now:?}");
+    }
+
+    /// Re-running with nothing new in pairing mode answers with the pad already bonded rather than
+    /// failing. That is what repairs a lost `Trusted`, and what makes the command idempotent.
+    #[tokio::test]
+    async fn re_running_with_nothing_new_reports_the_pad_already_bonded() {
+        let mut untrusted = bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller");
+        untrusted.trusted = false;
+        let pads = FakePads::with(vec![untrusted]);
+
+        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let proto::PadPairResult::Paired { pad } = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(pad.mac, "78:86:2E:BB:13:28");
+        assert!(pad.trusted, "the re-run must restore trust: {pad:?}");
+    }
+
     /// Two pads in pairing mode: refuse rather than guess, because guessing bonds the robot to
     /// whichever one BlueZ happened to report first.
     #[tokio::test]
     async fn two_pads_in_pairing_mode_are_refused_not_guessed() {
-        let pads = FakePads::with(
-            Vec::new(),
-            vec![
-                proto::Pad {
-                    mac: "78:86:2E:BB:13:28".into(),
-                    name: "Xbox Wireless Controller".into(),
-                    paired: false,
-                    trusted: false,
-                    connected: false,
-                },
-                proto::Pad {
-                    mac: "A4:AE:11:00:22:33".into(),
-                    name: "DualSense Wireless Controller".into(),
-                    paired: false,
-                    trusted: false,
-                    connected: false,
-                },
-            ],
-        );
+        let pads = FakePads::with(vec![
+            unpaired("78:86:2E:BB:13:28", "Xbox Wireless Controller"),
+            unpaired("A4:AE:11:00:22:33", "DualSense Wireless Controller"),
+        ]);
 
         assert!(matches!(
             pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),

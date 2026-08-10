@@ -283,6 +283,11 @@ enum PadCommand {
     /// Then run this. No MAC address needed: the robot looks for a gamepad in pairing mode and
     /// takes the one it finds.
     ///
+    /// **A pad already paired does not get in the way.** The robot prefers one in pairing mode, so a
+    /// second pad can be added without forgetting the first, and both stay bonded — `padd` drives
+    /// whichever connects. With nothing new in pairing mode this reports the pad already bonded, and
+    /// re-asserts its trust, after waiting out the search window; `--timeout` shortens that.
+    ///
     /// Once paired the pad is also *trusted*, which is what makes it reconnect by itself after a
     /// reboot with nobody logged in. Nothing else is needed — `padd.service` is already running and
     /// starts driving when the pad connects.
