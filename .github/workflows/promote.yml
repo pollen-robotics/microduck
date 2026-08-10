@@ -1,9 +1,16 @@
 # Promote a validated staging release to the STABLE channel.
 #
 # This is §16.3's promotion step, and the important property is what it does *not* do:
-# it never rebuilds. The stable manifest points at the artifact already published in
-# staging — same URL, same sha256 — so what reaches client robots is byte-identical to
-# what the canary validated. Promotion is a decision, not a build.
+# it never rebuilds. It copies the artifact already published in staging — same sha256,
+# checked here and again on the robot — so what reaches client robots is byte-identical
+# to what the canary validated. Promotion is a decision, not a build.
+#
+# The stable release is **self-contained**: manifest, signature, artifact and bootstrap
+# binary all hang off `daemon-v<version>`. That is why the last step can delete the
+# staging release outright. Previously the stable manifest pointed back at the staging
+# release to avoid a second copy of the bytes, which quietly made a tag named like
+# scaffolding load-bearing for the customer channel — and deleting the v0.1.x staging
+# releases duly left three stable releases pointing at a 404.
 #
 # Manual by design. A human decides that staging looked good; the machine does the
 # rest identically every time.
@@ -55,17 +62,42 @@ jobs:
             --pattern 'manifest.json' \
             --dir staging
           echo "staging_tag=$staging_tag" >> "$GITHUB_ENV"
+          echo "stable_tag=daemon-v${{ inputs.version }}" >> "$GITHUB_ENV"
+
+      # The artifact itself, so the stable release can carry it. This is the copy that
+      # makes staging disposable; the sha256 check below is what makes it safe.
+      - name: Carry the artifact forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_name="$(jq -r '.url | split("/") | last' staging/manifest.json)"
+          mkdir -p artifact
+          gh release download "$staging_tag" \
+            --repo "${{ github.repository }}" \
+            --pattern "$artifact_name" \
+            --pattern "$artifact_name.minisig" \
+            --dir artifact
+
+          # The manifest that ships names this digest, and the robot re-checks it before
+          # installing (`updater::verify::verify_sha256`). Checking it here too means a
+          # bad copy fails in CI rather than on a board.
+          expected="$(jq -r .sha256 staging/manifest.json)"
+          actual="$(sha256sum "artifact/$artifact_name" | cut -d' ' -f1)"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::artifact sha256 $actual does not match staging manifest $expected"
+            exit 1
+          fi
+          echo "artifact $artifact_name sha256 $actual (matches staging)"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_ENV"
 
       # The bootstrap binary has to exist on the *stable* release, because that is what
       # `https://github.com/<repo>/releases/latest/download/...` resolves to — and that
       # URL is the whole of `scripts/install.sh`'s bootstrap step. A fresh robot cannot
       # discover a staging tag, and should not be installing from one.
       #
-      # This is a second copy of those bytes, which promotion deliberately avoids for the
-      # *artifact* (§16.3: referencing the validated bytes cannot diverge, copying them
-      # can). The distinction is that this is a throwaway tool, not what gets installed:
-      # the release a robot ends up running still comes from the single staging artifact,
-      # verified by signature. The digest check below is what keeps this copy honest.
+      # Like the artifact above, this is copied rather than referenced, and for the same
+      # reason: a stable release that depends on assets living under another tag is only
+      # as durable as that tag. The digest below is what keeps this copy honest.
       - name: Carry the bootstrap binary forward
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,6 +119,7 @@ jobs:
           cargo run -p xtask -- promote \
             --version "${{ inputs.version }}" \
             --staging-tag "$staging_tag" \
+            --stable-tag "$stable_tag" \
             --repo "${{ github.repository }}" \
             --staging-manifest staging/manifest.json \
             --out dist \
@@ -123,20 +156,37 @@ jobs:
           cargo run -p xtask -- sign --dir dist --key "$RUNNER_TEMP/secret.key"
           shred -u "$RUNNER_TEMP/secret.key" 2>/dev/null || rm -f "$RUNNER_TEMP/secret.key"
 
-      # The manifest, its signature, and the bootstrap binary. The *artifact* deliberately
-      # stays where staging put it: copying those bytes would create a second copy that
-      # could diverge, while referencing the validated one cannot.
+      # Everything a robot needs, under one tag: manifest, signature, the artifact the
+      # manifest's `url` names, and the bootstrap binary `scripts/install.sh` fetches
+      # from `/releases/latest/download/`.
       - name: Create the stable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "daemon-v${{ inputs.version }}" \
+          gh release create "$stable_tag" \
             --title "daemon ${{ inputs.version }}" \
             --notes "Promoted from \`$staging_tag\`.
 
-          The artifact is the one published in staging — same bytes, same sha256. This
-          release carries the stable manifest, its signature, and the bootstrap binary
-          used by \`scripts/install.sh\` to install a robot from scratch.
+          The artifact is the one validated in staging — same bytes, same sha256, checked
+          during promotion. This release is self-contained: manifest, signature, artifact,
+          and the bootstrap binary used by \`scripts/install.sh\` to install from scratch.
           " \
             dist/manifest.json dist/manifest.json.minisig \
+            "artifact/$artifact_name" "artifact/$artifact_name.minisig" \
             bootstrap/updaterd-bootstrap-aarch64
+
+      # Only now — the stable release exists and carries every byte it references, so the
+      # staging release has no readers left. Deleting it is what keeps the release list
+      # honest: a `daemon-staging-*` tag that outlives its promotion is installable via
+      # `--ref`, and is just an older name for what stable already serves.
+      #
+      # `--cleanup-tag`, for the same reason as in `prune-dev-releases.yml`: a surviving
+      # tag keeps resolving.
+      - name: Retire the staging release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$staging_tag" \
+            --repo "${{ github.repository }}" \
+            --cleanup-tag --yes
+          echo "retired $staging_tag"

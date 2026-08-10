@@ -20,3 +20,8 @@ sha2 = "0.11"
 tar = "0.4"
 toml = "1"
 zstd = "0.13"
+
+# Only `tests/artifact.rs`, which packages into a scratch directory. `tar`, `zstd` and `toml`
+# come from the dependencies above: Cargo links those into test targets too.
+[dev-dependencies]
+tempfile = "3.27.0"

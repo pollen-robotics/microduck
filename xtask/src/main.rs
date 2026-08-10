@@ -14,13 +14,23 @@
 //!   cargo xtask package --version 1.2.3 --channel daemon --bin-dir <dir> --out dist/
 //!   cargo xtask sign    --dir dist/ --key secret.key
 //!   cargo xtask promote --version 1.2.3 --staging-tag daemon-staging-v1.2.3 \
+//!                       --stable-tag daemon-v1.2.3 \
 //!                       --repo ORG/REPO --out dist/ --key secret.key
 //! ```
 //!
 //! `promote` is what makes §16.3's `staging → stable` real: it emits a *stable*
-//! manifest pointing at the **same artifact bytes** already validated in staging —
-//! same URL, same sha256 — rather than rebuilding. Promotion is therefore a
-//! re-signing, and what ships is provably what was tested.
+//! manifest carrying the **same artifact bytes** already validated in staging —
+//! same sha256 — rather than rebuilding. Promotion is therefore a re-signing, and
+//! what ships is provably what was tested.
+//!
+//! The stable manifest points at the artifact on the *stable* release, which
+//! `promote.yml` uploads alongside it. It used to point back at the staging release
+//! instead, to avoid a second copy of the bytes. That made every stable release
+//! depend on a tag named as if it were disposable — and it was duly disposed of:
+//! deleting the `daemon-staging-v0.1.x` releases left three stable releases pointing
+//! at nothing. The sha256 in the manifest is verified on the robot before install
+//! (`updater::verify::verify_sha256`), so a copy that diverged could never install
+//! silently, which is what the single-copy rule was protecting against.
 
 use std::path::{Path, PathBuf};
 
@@ -169,6 +179,11 @@ enum Command {
         #[arg(long)]
         staging_tag: String,
 
+        /// Tag of the stable release being created. The manifest's `url` points here,
+        /// so the release that `promote.yml` creates must carry the artifact itself.
+        #[arg(long)]
+        stable_tag: String,
+
         /// `ORG/REPO`, used to build the download URL.
         #[arg(long)]
         repo: String,
@@ -238,6 +253,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Promote {
             version,
             staging_tag,
+            stable_tag,
             repo,
             staging_manifest,
             out,
@@ -245,6 +261,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => promote(
             &version,
             &staging_tag,
+            &stable_tag,
             &repo,
             &staging_manifest,
             &out,
@@ -675,12 +692,13 @@ fn sign_dir(
 
 /// Carry a validated staging artifact into the stable channel.
 ///
-/// The artifact is **not** rebuilt: URL and sha256 come from the staging manifest, so
-/// the stable channel serves the same bytes that passed staging. That is the whole
-/// point of §16.3 — promotion is a decision, not a build.
+/// The artifact is **not** rebuilt: the sha256 comes from the staging manifest, so the
+/// stable channel serves the same bytes that passed staging. That is the whole point of
+/// §16.3 — promotion is a decision, not a build.
 fn promote(
     version: &semver::Version,
     staging_tag: &str,
+    stable_tag: &str,
     repo: &str,
     staging_manifest: &Path,
     out: &Path,
@@ -701,10 +719,11 @@ fn promote(
         .and_then(|u| u.rsplit('/').next())
         .ok_or("staging manifest has no usable url")?;
 
-    // Point at the artifact on the *staging* release. Copying the file into a second
-    // release would create two sets of bytes that could diverge; referencing the
-    // validated one cannot.
-    let url = format!("https://github.com/{repo}/releases/download/{staging_tag}/{artifact_name}");
+    // Point at the artifact on the *stable* release — which makes that release
+    // self-contained, and staging disposable once promotion succeeds. `promote.yml`
+    // uploads these exact bytes under this tag; the two have to agree, and the test
+    // `promote_yml_uploads_the_artifact_it_points_at` is what keeps them agreeing.
+    let url = format!("https://github.com/{repo}/releases/download/{stable_tag}/{artifact_name}");
 
     let mut manifest = staging.clone();
     manifest["url"] = serde_json::json!(url);
@@ -870,6 +889,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The stable manifest names an artifact URL under the stable tag — so the workflow
+    /// that creates that release must actually upload the artifact to it.
+    ///
+    /// These two halves live in different languages and different files, and the failure
+    /// mode when they disagree is invisible until a robot tries to update: the release
+    /// looks complete, is correctly signed, and its `url` 404s. That is not hypothetical.
+    /// It is exactly the state `daemon-v0.1.0`, `v0.1.1` and `v0.1.4` were left in when
+    /// the manifest pointed at a staging release someone later deleted.
+    #[test]
+    fn promote_yml_uploads_the_artifact_it_points_at() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let yml = std::fs::read_to_string(root.join(".github/workflows/promote.yml"))
+            .expect(".github/workflows/promote.yml must exist");
+
+        assert!(
+            yml.contains("--stable-tag"),
+            "promote.yml must pass --stable-tag, or the manifest url is built from the \
+             wrong release"
+        );
+        assert!(
+            yml.contains("\"artifact/$artifact_name\""),
+            "promote.yml must upload the artifact to the stable release — the manifest's \
+             url points there"
+        );
+        assert!(
+            yml.contains("\"artifact/$artifact_name.minisig\""),
+            "promote.yml must upload the artifact signature too — `sig_url` is derived \
+             from `url` and points at the same release"
+        );
+
+        // Retiring staging is only safe because of the two uploads above. If someone
+        // removes them, this assertion is the one that should look wrong.
+        assert!(
+            yml.contains("gh release delete \"$staging_tag\""),
+            "promote.yml should retire the staging release once stable is self-contained"
+        );
     }
 
     /// A hook that exists in the repository must be in the artifact.

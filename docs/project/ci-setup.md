@@ -173,10 +173,12 @@ After a canary robot has run the on-device checks, promote:
 gh workflow run promote --field version=0.2.0
 ```
 
-`promote.yml` re-signs a stable manifest pointing at the **same artifact bytes** staging
-validated — no rebuild. Add `--field min_supported=0.2.0` only when remediating a bad
-release (§8.1); it forces robots below that version to update without waiting for a
-client.
+`promote.yml` re-signs a stable manifest carrying the **same artifact bytes** staging
+validated — no rebuild; the sha256 is checked during promotion and again on the robot.
+The stable release ends up self-contained (manifest, signature, artifact, bootstrap
+binary), so the staging release is deleted once promotion succeeds. Add
+`--field min_supported=0.2.0` only when remediating a bad release (§8.1); it forces
+robots below that version to update without waiting for a client.
 
 ## Rotating a key
 

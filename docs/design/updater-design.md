@@ -1016,7 +1016,7 @@ pass/fail + the update log. Repeatable because reset-to-golden and
 |---|---|
 | `ci.yml` | fmt, clippy, tests, plus `board-test.sh` — the only job that proves the binaries run on aarch64 Linux |
 | `release.yml` | on a `daemon-staging-v*` tag: cross-build, package, sign, **verify with the robot's own code path**, publish a prerelease |
-| `promote.yml` | manual: re-sign a *stable* manifest pointing at the staging artifact |
+| `promote.yml` | manual: re-sign a *stable* manifest, copy the validated artifact onto the stable release, retire staging |
 
 The publisher is a Rust `xtask` rather than a shell script for one reason: it reuses the
 exact `minisign`, `tar`, `zstd` and `sha2` crates the updater verifies with. A shell
@@ -1027,9 +1027,19 @@ links the *full* `minisign` crate (which can sign) while the daemon links only
 
 Three properties worth stating, because each is asserted rather than assumed:
 
-- **Promotion never rebuilds.** The stable manifest carries the staging `sha256` and
-  points at the staging artifact URL, so the bytes clients receive are the bytes the
-  canary validated; a test asserts the digest is unchanged.
+- **Promotion never rebuilds.** The stable manifest carries the staging `sha256`, and
+  promotion copies the staging artifact onto the stable release after checking that
+  digest, so the bytes clients receive are the bytes the canary validated; a test asserts
+  the digest is unchanged.
+
+  The manifest used to point back at the *staging* release rather than copy, on the
+  reasoning that one set of bytes cannot diverge while two can. What that overlooked is
+  that the robot verifies `sha256` before installing, so a diverged copy could never
+  install silently — while a stable channel whose artifacts live under a tag named like
+  scaffolding is one cleanup away from breaking. It broke: deleting the
+  `daemon-staging-v0.1.x` releases left `daemon-v0.1.0`, `v0.1.1` and `v0.1.4` correctly
+  signed and pointing at a 404. Stable releases are now self-contained and staging is
+  retired by `promote.yml` itself.
 - **Artifacts are reproducible.** Fixed mtimes in the tar mean the same inputs produce
   the same archive, so a rebuild can be compared against what shipped; a test asserts two
   packages of the same inputs hash identically.
