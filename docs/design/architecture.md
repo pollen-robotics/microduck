@@ -368,6 +368,10 @@ Deployment specifics — the journald drop-in, install steps, verification comma
 [`../deploy/README.md`](../../deploy/README.md). This section is the contract every service
 must satisfy.
 
+What a service logs about *itself* is here. What it logs about the messages it exchanges with
+the others — the tap, correlation across services, the trace and the meter — is
+[`monitor-design.md`](monitor-design.md).
+
 ### 8.1 Every service logs to stderr
 
 `tracing` → stderr → journald, level via `RUST_LOG` (`info` in the shipped units). No

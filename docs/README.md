@@ -22,6 +22,7 @@ the bug.
 | [`robotd-design.md`](design/robotd-design.md) | The control loop: model, bus, sensing, observations, policy, safety. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
+| [`monitor-design.md`](design/monitor-design.md) | Seeing the messages the services exchange: the tap, correlation, the trace and the meter. |
 
 ## `project/` — you are running the project
 
