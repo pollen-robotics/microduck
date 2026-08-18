@@ -1858,8 +1858,8 @@ pub enum PadPairFailure {
     /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
     /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
     NoAdapter,
-    /// BlueZ refused the bond. The classic cause on this board is `Privacy = device` missing from
-    /// `/etc/bluetooth/main.conf` — the pad pairs and drops straight back out.
+    /// BlueZ refused the bond. The classic cause on this board is the `Privacy` setting in
+    /// `/etc/bluetooth/main.conf` — see `configd::bluez` for which value and why.
     Rejected,
     Other,
 }

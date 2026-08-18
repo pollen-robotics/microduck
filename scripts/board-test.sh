@@ -531,10 +531,10 @@ grep -q "^console=display$" /boot/armbianEnv.txt
 test "$(grep -c uart2-m0 /boot/armbianEnv.txt)" = 1
 echo "    [ok] setup-board is idempotent on a second run"
 
-# The gamepad setting, which is the kind that fails silently — and which this script had
-# BACKWARDS until a board proved it. `Privacy = device` makes an Xbox controller reject LE Secure
-# Connections pairing with `DHKey check failed (0x0b)`, because that check covers both addresses
-# and privacy pairs from a resolvable private one. See `configure_bluetooth`.
+# The gamepad setting, which is the kind that fails silently — and whose polarity this script has
+# now had both ways round. `Privacy = device` is what a Radxa Zero 3W was measured bonding an Xbox
+# controller under on 2026-08-18, and what microduck_runtime ships; see `configure_bluetooth` for
+# the earlier DHKey-check observation that argued the other way.
 #
 # It is the only part of gamepad readiness left in this script: reading the pad belongs to
 # padd.service and its `input` group now, and pairing one is `robotctl pad pair`.
@@ -542,22 +542,22 @@ echo "    [ok] setup-board is idempotent on a second run"
 # No apostrophes and no single quotes anywhere in this string. It is passed to the container
 # single-quoted, so one would end it early and run the rest on the host — which is exactly what
 # happened once, and it presented as a grep failing on a file the fixture had just written.
-grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
-echo "    [ok] setup-board sets Privacy = off, which is what lets a pad bond"
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
+echo "    [ok] setup-board sets Privacy = device, which is what lets a pad bond"
 
 # Idempotent too: the second run above must not have added a duplicate key, which BlueZ
 # would read as a conflicting setting.
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
 echo "    [ok] Privacy is set exactly once"
 
-# The upgrade case, which is every board provisioned so far: the wrong value is already in the
-# file and has to be corrected rather than left alone. An absent setting and a wrong one need
-# different work, and only the first was ever tested.
-sed -i "s|^Privacy = off|Privacy = device|" /etc/bluetooth/main.conf
+# The upgrade case, which is every board provisioned while this script set the other value: the
+# wrong value is already in the file and has to be corrected rather than left alone. An absent
+# setting and a wrong one need different work, and only the first was ever tested.
+sed -i "s|^Privacy = device|Privacy = off|" /etc/bluetooth/main.conf
 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board3.log 2>&1
-grep -qE "^Privacy = off$" /etc/bluetooth/main.conf
+grep -qE "^Privacy = device$" /etc/bluetooth/main.conf
 test "$(grep -cE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
-echo "    [ok] a board carrying Privacy = device is corrected to off"
+echo "    [ok] a board carrying Privacy = off is corrected to device"
 
 # ── the generated preinstall hook ──
 #

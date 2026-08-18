@@ -113,8 +113,8 @@ sudo robotctl pad forget 78:86:2E:BB:13:28
 
 Pairing is once per pad and has a page of its own —
 [`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
-pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
-answer more often than anything else).
+pad without forgetting the first, and what to do when it will not bond (the `Privacy` setting in
+`/etc/bluetooth/main.conf` is the answer more often than anything else).
 
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
 pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks

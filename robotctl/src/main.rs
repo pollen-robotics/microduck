@@ -1845,11 +1845,11 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                 }
                 proto::PadPairFailure::Rejected => {
                     "Bluetooth refused the pairing. If this fails every time, check \
-                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — it \
-                     rejects the pairing with `DHKey check failed` — and `Privacy = off` is what \
-                     works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
-                     until then. Otherwise the pad had probably left pairing mode: press Sync \
-                     again and re-run this while its light is flashing quickly"
+                     /etc/bluetooth/main.conf: the `Privacy` setting decides whether a pad can \
+                     bond at all, and it should read `Privacy = device`. Fix it with \
+                     scripts/setup-board.sh and reboot, since it does not apply until then. \
+                     Otherwise the pad had probably left pairing mode: press Sync again and \
+                     re-run this while its light is flashing quickly"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };

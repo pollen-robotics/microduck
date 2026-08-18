@@ -217,16 +217,16 @@ section_stack() {
 
     field bluetoothd "$(systemctl is-active bluetooth 2>/dev/null || echo unknown)"
 
-    # The one BlueZ setting that decides whether a pad can bond at all. `device` is what boards
-    # provisioned before this was understood have, and with it pairing fails every time with a DHKey
-    # check error — see `setup-board.sh`. Fingerprinted because it is invisible everywhere else and
-    # differs between boards flashed months apart.
+    # The one BlueZ setting that decides whether a pad can bond at all. `device` is what
+    # `setup-board.sh` sets and what a board was measured bonding under; `off` is what boards
+    # provisioned during the spell described there carry. Fingerprinted because it is invisible
+    # everywhere else and differs between boards flashed months apart.
     if [ -r "$BT_CONF" ]; then
         if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" 2>/dev/null; then
             f_privacy="$(grep -E '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" | head -1 \
                 | cut -d= -f2- | tr -d ' ')"
         else
-            f_privacy="unset (BlueZ defaults to off, which works)"
+            f_privacy="unset (BlueZ defaults to off; setup-board.sh sets device)"
         fi
     else
         f_privacy="no ${BT_CONF}"

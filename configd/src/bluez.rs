@@ -51,10 +51,18 @@
 //! because a human asked" is the entire authorisation, and narrowing it to the device is the only
 //! part of that this code controls.
 //!
-//! ## The board setting that made all of this impossible
+//! ## The board setting that decides whether any of this can work
 //!
-//! `Privacy = device` in `/etc/bluetooth/main.conf` stops a pad bonding at all, and nothing in this
-//! file can work around it. The trace, with no key on either side:
+//! `Privacy` in `/etc/bluetooth/main.conf` decides whether a pad bonds at all, and nothing in this
+//! file can work around whichever value is wrong for a given board. `scripts/setup-board.sh` sets
+//! `device`, which is what `microduck_runtime` ships and what a Radxa Zero 3W was measured bonding
+//! under on 2026-08-18: `bluetoothctl connect` bonds first try, `/dev/input/js0` appears, and the
+//! pad survives a power cycle. With `Privacy = off` on the same card the connect gives up with
+//! `le-connection-abort-by-local` and `Paired` stays false.
+//!
+//! An earlier round saw the opposite, and the trace is worth carrying because the failure is
+//! specific enough to recognise — pairing reaches the last step and the pad rejects it, with no key
+//! on either side:
 //!
 //! ```text
 //! SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check
@@ -62,13 +70,13 @@
 //! ```
 //!
 //! The DHKey check is computed over both devices' addresses, and privacy makes the adapter pair from
-//! a resolvable private address rather than its public one, so the two sides compute different
-//! values and the pad refuses. `bluetoothctl pair` fails identically, which is what places this
-//! below anything here. `Privacy = off` — now what `scripts/setup-board.sh` sets — pairs first time.
+//! a resolvable private address rather than its public one, so a board that fails *that* way is one
+//! to try `Privacy = off` on. A board that fails without reaching SMP at all is the other case.
 //!
-//! Worth knowing because the symptom is indistinguishable from the ones this file *can* cause, and
-//! it cost most of a day: retrying does not help, `JustWorksRepairing` does not help, and neither
-//! does clearing the bond on either side.
+//! Worth knowing because either symptom is indistinguishable from the ones this file *can* cause,
+//! and between them they have cost days: retrying does not help, `JustWorksRepairing` does not help,
+//! and neither does clearing the bond on either side. `bluetoothctl` fails identically, which is
+//! what places this below anything here — reach for a `btmon` capture rather than a code change.
 //!
 //! It is also the first clue about which transport is in play: resolvable private addresses are an LE
 //! mechanism, so a setting that breaks bonding this way can only be breaking an LE bond.

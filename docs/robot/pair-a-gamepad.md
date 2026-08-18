@@ -73,10 +73,13 @@ no longer has and the bond is refused.
 
 ## When pairing fails every time
 
-Check `/etc/bluetooth/main.conf` for `Privacy = device`. Boards provisioned before this was
-understood have it, and with it **a pad cannot bond at all**: it rejects the pairing with `DHKey
-check failed (0x0b)`, because that check is computed over both devices' addresses and privacy pairs
-from a resolvable private one. `Privacy = off` is what works.
+Check `/etc/bluetooth/main.conf` for the `Privacy` setting. It should read `Privacy = device`.
+A board that carries `Privacy = off` may refuse to bond a pad at all — the connect gives up with
+`le-connection-abort-by-local` and the pad never reaches `Paired: yes`.
+
+If instead a capture shows the pairing reaching `DHKey check failed (0x0b)`, that is the opposite
+fault and `Privacy = off` is the value to try on that board. Take a `btmon` capture before changing
+the value, because both have been seen and they need different answers.
 
 ```bash
 sudo sh scripts/setup-board.sh
