@@ -102,8 +102,62 @@ untouched. Neither is what decides whether a pad bonds.
 | Provisioned board (`Privacy = device` confirmed at line 99), `padd` and `btd` stopped, manual `connect` | `Request authorization` accepted, then `ServicesResolved: no` — the pad drops immediately, no `js0` |
 
 The third row is the open one: the same card image and the same `Privacy` value fail once the
-board has been provisioned, with every daemon stopped. So it is something provisioning changes
-about the system rather than a process that is running.
+board has been provisioned. So it is something provisioning changes rather than a process that
+happens to be running — stopping `padd` and `btd` did not bring pairing back.
+
+## Making a bond and keeping one are different
+
+On a fully provisioned board with everything running, a pad that is **already bonded** connects
+and drives. A **fresh** `robotctl pad pair`, after `pad forget` and with the pad held in pairing
+mode, fails.
+
+So nothing here breaks an existing bond. Something in the installed system stops a new one being
+made. `configd` and `btd` logs say nothing useful about it.
+
+## Tomorrow: add one thing at a time
+
+From a board reflashed and confirmed working by the sequence at the top of this page, add one
+layer, reboot, and try a fresh pairing before adding the next.
+
+Copy the scripts to `~`, **not** `/tmp` — every step here reboots, and `/tmp` does not survive
+one. Same for any `btmon` capture worth keeping.
+
+```bash
+scp scripts/setup-board.sh scripts/migrate-network.sh pierre@BOARD:~/
+```
+
+| step | what it adds | pad pairs? | notes |
+|---|---|---|---|
+| 0 | nothing — the minimal sequence above | yes | the control |
+| 1 | `sudo sh ~/setup-board.sh` — overlays, `console=display`, getty mask, onnxruntime | | |
+| 2 | `sudo sh ~/migrate-network.sh` — netplan → NetworkManager | | |
+| 3 | `sudo -E sh ~/install.sh`, then `systemctl disable --now updaterd robotd configd btd padd` | | |
+| 4 | `systemctl enable --now updaterd` | | |
+| 5 | `... robotd` | | |
+| 6 | `... configd` | | |
+| 7 | `... btd` | | |
+| 8 | `... padd` | | |
+
+Reboot after each step, and clear **both** halves of the bond before each attempt: `pad forget`
+or `bluetoothctl remove` on the board, and the pad held in pairing mode. An Xbox pad keeps one
+host bond, and a half-completed attempt leaves it holding a key the board no longer has — which
+looks exactly like the fault.
+
+Step 3 needs the environment `install.sh` reads:
+
+```bash
+export DUCK_TOKEN=github_pat_replace_with_your_token
+```
+
+```bash
+export DUCK_REF=pad-privacy-device-not-off
+```
+
+```bash
+export DUCK_DEV_KEY=$HOME/team.dev.pub
+```
+
+Steps 1 and 2 need neither a token nor the network.
 
 ## Untested differences against `microduck_runtime`
 
