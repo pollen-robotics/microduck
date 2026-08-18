@@ -567,7 +567,8 @@ impl BlueZ {
     /// BlueZ finishes the link after `Pair()` returns — so the first sample is a starting point, not
     /// a drop.
     async fn watch_hold(&self, mac: &str, within: Duration) -> proto::PadHold {
-        let deadline = tokio::time::Instant::now() + within;
+        let started = tokio::time::Instant::now();
+        let deadline = started + within;
         let mut connected = self.is_connected(mac).await;
         let mut drops = 0;
         while tokio::time::Instant::now() < deadline {
@@ -576,12 +577,23 @@ impl BlueZ {
             if connected && !now {
                 drops += 1;
                 tracing::warn!(mac, drops, "the pad dropped");
+                // Called early, and only ever in this direction. An affected board drops the link
+                // about once a second, so by here the answer has been the same for several seconds
+                // running and the rest of the window would only repeat it — at the cost of keeping
+                // someone standing there holding a pad. A *hold* gets no such shortcut: it is the
+                // absence of an event, and only time is evidence of it.
+                if drops >= proto::PadHold::DECISIVE {
+                    break;
+                }
             }
             connected = now;
         }
 
         let hold = proto::PadHold {
-            watched_seconds: within.as_secs() as u32,
+            // What it actually watched, not what was asked for — the two differ whenever the loop
+            // above breaks early, and a drop count against a window it did not run for is a lie.
+            // Rounded up so a verdict reached in milliseconds does not report "0s".
+            watched_seconds: started.elapsed().as_secs_f64().ceil() as u32,
             drops,
             connected,
         };
@@ -664,6 +676,9 @@ impl BlueZ {
                         Ok(Ok(())) => { tracing::info!("bonded"); true }
                         // Something bonded it between the two calls — success, not a failure.
                         Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
+                        Ok(Err(e)) if did_not_answer(&e) => {
+                            return Err((proto::PadPairFailure::NoAnswer, e.to_string()));
+                        }
                         Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
                         Err(_) => false,
                     },
@@ -694,6 +709,22 @@ impl BlueZ {
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
         Ok(())
     }
+}
+
+/// Did the device simply not answer?
+///
+/// `org.bluez.Error.ConnectionAttemptFailed` is BlueZ saying it could not reach the device at all,
+/// as distinct from the device or the stack turning the bond down. On a board this arrived as
+/// `Page Timeout` against a pad that was switched off but still in BlueZ's cache from an earlier
+/// scan — and the refusal advice sent whoever read it to `/etc/bluetooth/main.conf`, which had
+/// nothing to do with it.
+///
+/// Worth noting for the transport question this repo keeps circling: **`Page Timeout` is BR/EDR**.
+/// Paging is the classic connection procedure, so a pad believed to be LE-only produced a classic
+/// failure — either from a cache entry typed as BR/EDR, or because discovery runs on `auto`.
+fn did_not_answer(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::MethodError(name, _, _)
+        if name.as_str() == "org.bluez.Error.ConnectionAttemptFailed")
 }
 
 /// Did BlueZ refuse this because the bond already exists?

@@ -64,8 +64,17 @@ RestartSec=2s
 
 # A narrow root. Everything here is deliberate:
 #   - ProtectSystem=strict makes the whole filesystem read-only except ReadWritePaths.
-#   - The state dir is the ONLY writable path: it holds the robot's name and must survive an
-#     update and a rollback, which is why it is under /var/lib and not in a release directory.
+#   - The state dir holds the robot's name and must survive an update and a rollback, which is
+#     why it is under /var/lib and not in a release directory.
+#   - The two /etc directories are for `pad.fallback` and nothing else, and they are named
+#     individually rather than by granting /etc. They are the files BlueZ and modprobe read, so
+#     there is nowhere else they could live: a setting written anywhere but
+#     /etc/bluetooth/main.conf is a setting bluetoothd will not read.
+#
+#     Leading `-` so a board missing either directory still *starts*. Without it systemd refuses
+#     to start the unit at all, which would trade "pad.fallback cannot write" — one command
+#     failing with a clear message — for a config service that does not come up, on the very
+#     boards whose whole problem is that they need reconfiguring.
 #   - AF_NETLINK is absent: configd asks NetworkManager over D-Bus (a unix socket) and never
 #     touches an interface itself.
 #   - CAP_SYS_BOOT is NOT granted, because logind performs the reboot; configd only asks. A
@@ -74,7 +83,7 @@ RestartSec=2s
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/robot/config /run
+ReadWritePaths=/var/lib/robot/config /run -/etc/bluetooth -/etc/modprobe.d
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

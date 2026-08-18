@@ -316,6 +316,11 @@ impl Pads for FakePads {
 
         // No sleeping: the fake answers about a link it is describing, not one it is watching, and a
         // suite that waited out the real window would take half a minute per test.
+        //
+        // It therefore does not model the early exit in `crate::bluez` either — with no clock there
+        // is no elapsed time to report — so a fake may describe more drops than a real watch would
+        // have stayed around to count. What it is for is the wire shape and the words a client
+        // prints, and both are exercised by any flapping observation.
         let watched = (!hold.is_zero()).then(|| proto::PadHold {
             watched_seconds: hold.as_secs() as u32,
             drops: state.flaps,
@@ -572,6 +577,41 @@ mod tests {
             panic!("{result:?}");
         };
         assert!(hold.is_none(), "{hold:?}");
+    }
+
+    /// The early-exit threshold has to be above the ordinary reasons a link goes down once: a pad
+    /// switched off is one drop, and switched off and back on is two. Three is the first count that
+    /// cannot be a person.
+    #[test]
+    fn one_drop_does_not_settle_the_question() {
+        const { assert!(proto::PadHold::DECISIVE > 2) };
+
+        let switched_off = proto::PadHold {
+            watched_seconds: 30,
+            drops: 1,
+            connected: false,
+        };
+        assert!(!switched_off.held(), "a dropped link is not a hold");
+        assert!(
+            switched_off.drops < proto::PadHold::DECISIVE,
+            "one drop must not end the watch early"
+        );
+    }
+
+    /// A watch that ends early must not be reported against the window it was asked for. The drop
+    /// count is only meaningful next to the time it was counted over.
+    #[test]
+    fn an_early_verdict_reports_the_time_it_actually_watched() {
+        let called_early = proto::PadHold {
+            watched_seconds: 4,
+            drops: proto::PadHold::DECISIVE,
+            connected: false,
+        };
+        assert!(!called_early.held());
+        assert!(
+            called_early.watched_seconds < DEFAULT_HOLD.as_secs() as u32,
+            "an early verdict cannot claim the whole window"
+        );
     }
 
     /// The same clamping contract as the search window, including that zero is a real answer.

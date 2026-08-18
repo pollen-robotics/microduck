@@ -1924,6 +1924,14 @@ pub enum PadPairFailure {
     /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
     /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
     NoAdapter,
+    /// The pad was in BlueZ's list and did not answer when it was reached for.
+    ///
+    /// Separate from [`Self::Rejected`] because the fix is different and the advice for a refusal
+    /// sends people to the wrong place entirely. Nothing turned it down — it was not there. The
+    /// usual cause is a device BlueZ still has cached from an earlier scan: it satisfies the
+    /// gamepad heuristic, so a short `--timeout` picks it over waiting for the pad someone is
+    /// actually holding, and pairing then pages hardware that is switched off.
+    NoAnswer,
     /// BlueZ refused the bond. One known cause is `Privacy = device` *present* in
     /// `/etc/bluetooth/main.conf`, which can stop a pad bonding: the DHKey check is computed over
     /// both addresses, and privacy pairs from a resolvable private one, so the pad refuses with
@@ -1945,8 +1953,12 @@ pub enum PadPairFailure {
 /// difference between "paired" and "paired and still there half a minute later".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadHold {
-    /// How long the bond was watched for. The caller asked for this, so it is echoed rather than
-    /// assumed: a `drops` count means nothing without the window it was counted over.
+    /// How long the bond was actually watched for, which is **not** always what the caller asked
+    /// for: a link that is clearly flapping is called early (see [`Self::DECISIVE`]).
+    ///
+    /// Measured rather than echoed, and that is the whole reason it is on the wire: a `drops` count
+    /// means nothing without the window it was counted over, and "31 drops" reported against a
+    /// window it did not run for would be worse than not reporting it.
     pub watched_seconds: u32,
     /// Connected-to-disconnected transitions seen in that window.
     pub drops: u32,
@@ -1955,6 +1967,18 @@ pub struct PadHold {
 }
 
 impl PadHold {
+    /// Drops that settle the question before the window is up.
+    ///
+    /// **Only the failure verdict can be reached early, and the asymmetry is the point.** A flap
+    /// proves itself — on an affected board the link goes down about once a second, so a few
+    /// seconds is already conclusive and waiting out the rest of the window teaches nothing. A
+    /// *hold* cannot be proved early: it is the absence of an event, and the only evidence for it
+    /// is time.
+    ///
+    /// Three rather than one, because one drop is someone switching the pad off, and two is that
+    /// plus switching it back on. Nobody does it three times in the seconds this takes.
+    pub const DECISIVE: u32 = 3;
+
     /// Did the link survive? Connected at the end, having never dropped.
     ///
     /// A pad that never connected at all is **not** a hold, and is deliberately not distinguished

@@ -2002,6 +2002,14 @@ fn report_pair(
                 proto::PadPairFailure::Timeout => {
                     "the pad was found but never finished pairing; try again"
                 }
+                proto::PadPairFailure::NoAnswer => {
+                    "the pad did not answer. It is switched off, out of range, or it left pairing \
+                     mode — BlueZ still had it from an earlier scan, which is why it was reached \
+                     for at all. Press Sync until the light flashes quickly and re-run without a \
+                     short --timeout, so the search waits for a pad that is really there rather \
+                     than taking one out of the cache. If the same address keeps failing, clear \
+                     the stale entry:  sudo bluetoothctl remove <mac>"
+                }
                 proto::PadPairFailure::NoAdapter => {
                     "this robot has no Bluetooth adapter yet. Just after a boot that is normal — \
                      hci0 appears about 73s in"
