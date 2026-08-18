@@ -113,6 +113,18 @@ pub fn upstream_for(call: &proto::Call) -> Option<Upstream> {
         PadPair(_) => Some(Upstream::Config),
         PadForget(_) => Some(Upstream::Config),
 
+        // The temporary workaround for boards that cannot keep an Xbox pad bonded, and it is
+        // reachable for the same reason `pad.pair` is: the phone is the path someone will actually
+        // use to pair a controller, and on roughly half the boards that path currently ends in a pad
+        // that works for seconds. Routing the fix to ssh only would leave the app inheriting a
+        // robot-side fault it cannot do anything about.
+        //
+        // It reboots the board, which sounds like more authority than it is — `system.reboot` is
+        // already routed two screens up, on the same physical-presence-plus-PIN argument. It is also
+        // gated in front of that, by `configd`'s peer policy, and the board has to be one whose pad
+        // is already bonded for it to be worth sending at all.
+        PadFallback(_) => Some(Upstream::Config),
+
         // Answered by `btd`, so it has no upstream. See `route_for`.
         SystemAuthenticate(_) => None,
 

@@ -31,6 +31,7 @@ pub mod net;
 #[cfg(target_os = "linux")]
 pub mod nm;
 pub mod pad;
+pub mod padfallback;
 pub mod power;
 pub mod store;
 pub mod units;

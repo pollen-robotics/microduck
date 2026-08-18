@@ -40,6 +40,18 @@ pub type PadResult<T> = Result<T, String>;
 /// than a spinner.
 pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long to keep watching a fresh bond when the caller does not say.
+///
+/// Thirty seconds because of what it is looking for: on the boards that cannot keep an Xbox pad, the
+/// bond completes and then the link flaps at roughly 1.4 times a second, so a window this long sees
+/// dozens of drops rather than inferring one. It is also about as long as someone will hold a pad
+/// waiting to be told whether it worked, and the alternative — reporting success and letting them
+/// find out while driving — is what this whole path exists to stop.
+pub const DEFAULT_HOLD: Duration = Duration::from_secs(30);
+
+/// Longest watch a caller may ask for. The adapter is not held open, but the call is.
+pub const MAX_HOLD: Duration = Duration::from_secs(300);
+
 /// Longest window a caller may ask for.
 ///
 /// A cap rather than a courtesy: discovery is on for the whole window, and a client that asked for
@@ -51,13 +63,24 @@ pub trait Pads: Send + Sync {
     /// Every pad this robot is bonded to, connected first.
     async fn status(&self) -> PadResult<Vec<proto::Pad>>;
 
-    /// Pair whatever pad is in pairing mode, or the one at `mac`.
+    /// Pair whatever pad is in pairing mode, or the one at `mac`, then watch the bond for `hold`.
     ///
     /// A *refusal* — nothing found, two candidates, BlueZ said no — is an `Ok` carrying
     /// [`proto::PadPairResult::Failed`]. `Err` is reserved for the machinery being broken, which is
     /// the same split [`crate::net::Net`] uses and the same one the dispatcher turns into either a
     /// result or an `INTERNAL_ERROR`.
-    async fn pair(&self, mac: Option<&str>, timeout: Duration) -> PadResult<proto::PadPairResult>;
+    ///
+    /// **A bond that flaps is still `Paired`.** The watch reports what it saw in
+    /// [`proto::PadPairResult::Paired::hold`] and does not turn a successful pairing into a failure,
+    /// because the pairing did succeed — the keys are stored and the pad is trusted, and undoing
+    /// that would throw away the bond the fallback in [`crate::padfallback`] then needs to exist.
+    /// Judging the observation is the caller's, and `PadHold::held` is the judgement.
+    async fn pair(
+        &self,
+        mac: Option<&str>,
+        timeout: Duration,
+        hold: Duration,
+    ) -> PadResult<proto::PadPairResult>;
 
     /// Drop the bond, so this pad stops reconnecting.
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult>;
@@ -70,6 +93,14 @@ pub fn pair_timeout(requested: Option<u32>) -> Duration {
         // whether a pad is there right now without holding discovery open.
         Some(seconds) => Duration::from_secs(u64::from(seconds)).min(MAX_PAIR_TIMEOUT),
         None => DEFAULT_PAIR_TIMEOUT,
+    }
+}
+
+/// Clamp a caller's hold window. Zero means "do not watch", which is a real answer.
+pub fn hold_window(requested: Option<u32>) -> Duration {
+    match requested {
+        Some(seconds) => Duration::from_secs(u64::from(seconds)).min(MAX_HOLD),
+        None => DEFAULT_HOLD,
     }
 }
 
@@ -156,6 +187,13 @@ struct FakeState {
     /// that mattered: a bonded pad shows up in *every* sweep, so the selection rule has to prefer an
     /// unbonded one or a robot can never be given a second pad.
     visible: Vec<proto::Pad>,
+    /// How many times a freshly-bonded pad drops before the watch window ends.
+    ///
+    /// Here because the whole reason [`crate::padfallback`] exists is a bond that succeeds and then
+    /// will not stay up, and that is not a state anyone can arrange on demand with real hardware —
+    /// it belongs to particular boards. Without it the flapping path could only ever be exercised by
+    /// carrying the right board to the desk.
+    flaps: u32,
 }
 
 impl FakePads {
@@ -170,7 +208,17 @@ impl FakePads {
 
     pub fn with(visible: Vec<proto::Pad>) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(FakeState { visible }),
+            inner: tokio::sync::Mutex::new(FakeState { visible, flaps: 0 }),
+        }
+    }
+
+    /// A robot whose radio bonds a pad and then cannot keep it — one of the affected boards.
+    pub fn that_flaps(drops: u32) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(FakeState {
+                visible: vec![unpaired("78:86:2E:BB:13:28", "Xbox Wireless Controller")],
+                flaps: drops,
+            }),
         }
     }
 }
@@ -215,7 +263,12 @@ impl Pads for FakePads {
             .collect())
     }
 
-    async fn pair(&self, mac: Option<&str>, _timeout: Duration) -> PadResult<proto::PadPairResult> {
+    async fn pair(
+        &self,
+        mac: Option<&str>,
+        _timeout: Duration,
+        hold: Duration,
+    ) -> PadResult<proto::PadPairResult> {
         let mut state = self.inner.lock().await;
 
         let candidates: Vec<proto::Pad> = state
@@ -260,7 +313,18 @@ impl Pads for FakePads {
         };
         state.visible.retain(|p| p.mac != paired.mac);
         state.visible.push(paired.clone());
-        Ok(proto::PadPairResult::Paired { pad: paired })
+
+        // No sleeping: the fake answers about a link it is describing, not one it is watching, and a
+        // suite that waited out the real window would take half a minute per test.
+        let watched = (!hold.is_zero()).then(|| proto::PadHold {
+            watched_seconds: hold.as_secs() as u32,
+            drops: state.flaps,
+            connected: state.flaps == 0,
+        });
+        Ok(proto::PadPairResult::Paired {
+            pad: paired,
+            hold: watched,
+        })
     }
 
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult> {
@@ -344,8 +408,11 @@ mod tests {
         let pads = FakePads::new();
         assert!(pads.status().await.unwrap().is_empty());
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
-        let proto::PadPairResult::Paired { pad } = result else {
+        let result = pads
+            .pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+            .await
+            .unwrap();
+        let proto::PadPairResult::Paired { pad, .. } = result else {
             panic!("{result:?}");
         };
         // Trusted, not merely paired. A paired-but-untrusted pad looks right and does not
@@ -365,7 +432,9 @@ mod tests {
     async fn an_absent_pad_is_not_found_rather_than_an_error() {
         let pads = FakePads::with(Vec::new());
         assert!(matches!(
-            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
+            pads.pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+                .await
+                .unwrap(),
             proto::PadPairResult::Failed {
                 reason: proto::PadPairFailure::NotFound,
                 ..
@@ -386,8 +455,11 @@ mod tests {
             unpaired("A4:AE:11:00:22:33", "DualSense Wireless Controller"),
         ]);
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
-        let proto::PadPairResult::Paired { pad } = result else {
+        let result = pads
+            .pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+            .await
+            .unwrap();
+        let proto::PadPairResult::Paired { pad, .. } = result else {
             panic!("{result:?}");
         };
         assert_eq!(pad.mac, "A4:AE:11:00:22:33", "the new pad must win");
@@ -405,8 +477,11 @@ mod tests {
         untrusted.trusted = false;
         let pads = FakePads::with(vec![untrusted]);
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
-        let proto::PadPairResult::Paired { pad } = result else {
+        let result = pads
+            .pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+            .await
+            .unwrap();
+        let proto::PadPairResult::Paired { pad, .. } = result else {
             panic!("{result:?}");
         };
         assert_eq!(pad.mac, "78:86:2E:BB:13:28");
@@ -423,7 +498,9 @@ mod tests {
         ]);
 
         assert!(matches!(
-            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
+            pads.pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+                .await
+                .unwrap(),
             proto::PadPairResult::Failed {
                 reason: proto::PadPairFailure::Ambiguous,
                 ..
@@ -432,13 +509,78 @@ mod tests {
 
         // And naming one resolves it, which is what the refusal tells the caller to do.
         let result = pads
-            .pair(Some("a4:ae:11:00:22:33"), DEFAULT_PAIR_TIMEOUT)
+            .pair(
+                Some("a4:ae:11:00:22:33"),
+                DEFAULT_PAIR_TIMEOUT,
+                Duration::ZERO,
+            )
             .await
             .unwrap();
-        let proto::PadPairResult::Paired { pad } = result else {
+        let proto::PadPairResult::Paired { pad, .. } = result else {
             panic!("{result:?}");
         };
         assert_eq!(pad.mac, "A4:AE:11:00:22:33");
+    }
+
+    /// The failure the whole fallback exists for: a pairing that **succeeds** and a link that then
+    /// will not stay up. It must still be reported as `Paired`, because it is — the keys are stored
+    /// and the pad is trusted, and that bond is what the workaround then preserves.
+    #[tokio::test]
+    async fn a_bond_that_flaps_is_still_paired_and_says_so() {
+        let pads = FakePads::that_flaps(41);
+
+        let result = pads
+            .pair(None, DEFAULT_PAIR_TIMEOUT, DEFAULT_HOLD)
+            .await
+            .unwrap();
+        let proto::PadPairResult::Paired { pad, hold } = result else {
+            panic!("a flapping link is not a failed pairing: {result:?}");
+        };
+        assert!(pad.paired && pad.trusted, "{pad:?}");
+
+        let hold = hold.expect("a watched window must report");
+        assert_eq!(hold.drops, 41);
+        assert_eq!(hold.watched_seconds, DEFAULT_HOLD.as_secs() as u32);
+        assert!(!hold.held(), "{hold:?}");
+    }
+
+    /// A link that holds says so with the window it held for. Without the window the drop count
+    /// means nothing, so the two travel together.
+    #[tokio::test]
+    async fn a_bond_that_holds_reports_the_window_it_held_for() {
+        let hold = match FakePads::new()
+            .pair(None, DEFAULT_PAIR_TIMEOUT, DEFAULT_HOLD)
+            .await
+            .unwrap()
+        {
+            proto::PadPairResult::Paired { hold, .. } => hold.expect("watched"),
+            other => panic!("{other:?}"),
+        };
+        assert!(hold.held() && hold.drops == 0, "{hold:?}");
+        assert_eq!(hold.watched_seconds, 30);
+    }
+
+    /// Asking for no watch reports no observation, rather than an empty one that reads as "watched,
+    /// and it was fine". A caller that did not look must not be able to claim it did.
+    #[tokio::test]
+    async fn skipping_the_watch_reports_nothing_rather_than_a_clean_bill() {
+        let result = FakePads::new()
+            .pair(None, DEFAULT_PAIR_TIMEOUT, Duration::ZERO)
+            .await
+            .unwrap();
+        let proto::PadPairResult::Paired { hold, .. } = result else {
+            panic!("{result:?}");
+        };
+        assert!(hold.is_none(), "{hold:?}");
+    }
+
+    /// The same clamping contract as the search window, including that zero is a real answer.
+    #[test]
+    fn a_requested_hold_is_clamped() {
+        assert_eq!(hold_window(None), DEFAULT_HOLD);
+        assert_eq!(hold_window(Some(60)), Duration::from_secs(60));
+        assert_eq!(hold_window(Some(0)), Duration::ZERO);
+        assert_eq!(hold_window(Some(9_999)), MAX_HOLD);
     }
 
     /// A caller cannot hold the adapter in discovery for as long as it likes, and zero means "look

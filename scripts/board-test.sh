@@ -436,6 +436,50 @@ su member -s /bin/sh -c \
     | grep -q "was not paired"
 echo "    [ok] forgetting an unknown pad is not an error"
 
+# ── the temporary fallback for boards that cannot keep an Xbox pad ──
+#
+# The order is the whole of it: Privacy = device stops a pad bonding at all, so applying this to a
+# board with nothing bonded leaves it unable to pair the pad the setting was for. That is not a
+# mistake a retry fixes, so it is refused — and the refusal is what this checks, on the shipped
+# binary rather than in a unit test of the check alone.
+#
+# Everything below writes to this container /etc, which is why it runs here and not on a board.
+code=0
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 5 || {
+    echo "    [FAIL] the fallback should be refused with no pad bonded (5), got $code"; exit 1; }
+echo "    [ok] the pad fallback is refused while no pad is bonded (exit 5)"
+
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" >/dev/null
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
+    | grep -q "sudo reboot"
+echo "    [ok] with a pad bonded it applies, and says the board has to reboot"
+grep -Eq "^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device" /var/lib/robot/config/bluetooth/main.conf
+grep -q "disable_ertm=1" /var/lib/robot/config/modprobe.d/bluetooth.conf
+echo "    [ok] both halves of the runtime settings are on disk"
+
+# Visible in `pad status`, because the end state is every board off this, and finding the ones still
+# on it must not depend on remembering which they were.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status" \
+    | grep -q "fallbck on"
+echo "    [ok] a board wearing the fallback says so in pad status"
+
+# Idempotent in the direction that matters for a script: asking again reports no change rather than
+# a second reboot instruction.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
+    | grep -q "nothing changed"
+echo "    [ok] re-applying the fallback changes nothing and says so"
+
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback off" \
+    >/dev/null
+grep -Eq "^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*off" /var/lib/robot/config/bluetooth/main.conf
+test ! -e /var/lib/robot/config/modprobe.d/bluetooth.conf
+echo "    [ok] taking it off restores Privacy = off and removes the modprobe file"
+
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" >/dev/null
+
 # The passphrase must not be in the journal. NetConnectParams has a hand-written Debug that
 # redacts it, and this is the check that keeps it honest on the shipped binary rather than in
 # a unit test of the type alone.

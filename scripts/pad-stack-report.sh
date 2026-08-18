@@ -45,6 +45,9 @@ BT_LIB="${PAD_BT_LIB:-/var/lib/bluetooth}"
 SYS_BT="${PAD_SYS_BT:-/sys/class/bluetooth}"
 OS_RELEASE="${PAD_OS_RELEASE:-/etc/os-release}"
 MODULES="${PAD_PROC_MODULES:-/proc/modules}"
+BT_MODULE="${PAD_BT_MODULE:-/sys/module/bluetooth}"
+ERTM_PARAM="${PAD_ERTM_PARAM:-${BT_MODULE}/parameters/disable_ertm}"
+MODPROBE_D="${PAD_MODPROBE_D:-/etc/modprobe.d}"
 
 # Bluetooth, in /proc/bus/input/devices terms; USB is 0003. A pad on a cable is worth naming rather
 # than reporting as "no pad": there is no radio stack under it to compare.
@@ -141,6 +144,7 @@ f_kernel=unknown
 f_os=unknown
 f_bluez=absent
 f_privacy="unset"
+f_ertm="unknown"
 f_modules=
 f_hci=unreadable
 f_settings=unreadable
@@ -217,10 +221,13 @@ section_stack() {
 
     field bluetoothd "$(systemctl is-active bluetooth 2>/dev/null || echo unknown)"
 
-    # The one BlueZ setting that decides whether a pad can bond at all. `device` is what boards
-    # provisioned before this was understood have, and with it pairing fails every time with a DHKey
-    # check error — see `setup-board.sh`. Fingerprinted because it is invisible everywhere else and
-    # differs between boards flashed months apart.
+    # The one BlueZ setting that decides whether a pad can bond at all. With `device`, pairing fails
+    # every time with a DHKey check error — see `setup-board.sh`. Two different boards read `device`
+    # for opposite reasons, and the report cannot tell them apart: one provisioned before this was
+    # understood, and one deliberately put there by `robotctl pad fallback on` *after* its pad was
+    # bonded, because it cannot otherwise keep an Xbox pad. `robotctl pad status` is what
+    # distinguishes them. Fingerprinted because it is invisible everywhere else and differs between
+    # boards flashed months apart.
     if [ -r "$BT_CONF" ]; then
         if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" 2>/dev/null; then
             f_privacy="$(grep -E '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" | head -1 \
@@ -232,6 +239,42 @@ section_stack() {
         f_privacy="no ${BT_CONF}"
     fi
     field privacy "$f_privacy"
+
+    # ERTM, from the running kernel and from what would be applied at the next boot.
+    #
+    # Two sources because they disagree in the case that matters: `robotctl pad fallback on` writes
+    # the modprobe file and the board has not rebooted yet, so the file says one thing and the loaded
+    # module another. A single value would have to pick one and would be wrong half the time it was
+    # interesting.
+    #
+    # Worth having even though it probably changes nothing here: ERTM is an L2CAP *classic* feature
+    # and every pad seen on these robots is LE-only, so this is on the report to be ruled out rather
+    # than because it is suspected. It is what `microduck_runtime`'s installer sets, and until now
+    # nothing in this repo set it either way — which made it invisible when comparing a board that
+    # once ran the runtime against one that never did.
+    ertm_live=unreadable
+    if [ -r "$ERTM_PARAM" ]; then
+        case "$(cat "$ERTM_PARAM" 2>/dev/null)" in
+            Y|y|1) ertm_live="disabled" ;;
+            N|n|0) ertm_live="enabled" ;;
+            *)     ertm_live="unreadable" ;;
+        esac
+    elif [ ! -d "$BT_MODULE" ]; then
+        ertm_live="no bluetooth module loaded"
+    fi
+    ertm_conf="not set"
+    if grep -rEl '^[[:space:]]*options[[:space:]]+bluetooth[[:space:]].*disable_ertm=1' \
+        "$MODPROBE_D" 2>/dev/null | head -1 | grep -q .; then
+        ertm_conf="disable_ertm=1 in ${MODPROBE_D}"
+    fi
+    if [ "$ertm_live" = "disabled" ] && [ "$ertm_conf" = "not set" ]; then
+        f_ertm="disabled now, nothing on disk — will come back at the next boot"
+    elif [ "$ertm_live" = "enabled" ] && [ "$ertm_conf" != "not set" ]; then
+        f_ertm="enabled now, $ertm_conf — needs a reboot to apply"
+    else
+        f_ertm="$ertm_live ($ertm_conf)"
+    fi
+    field ertm "$f_ertm"
 
     # Named individually, present or not: which of `hidp` and `uhid` is loaded is the difference
     # between the kernel carrying classic HID and BlueZ carrying LE HID, and that is the single most
@@ -639,6 +682,7 @@ section_fingerprint() {
     field os "${f_os:-unknown}"
     field bluez "$f_bluez"
     field privacy "$f_privacy"
+    field ertm "$f_ertm"
     field modules "$f_modules"
     field hci "$f_hci"
     field settings "$f_settings"

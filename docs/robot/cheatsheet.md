@@ -111,10 +111,21 @@ sudo robotctl pad pair 78:86:2E:BB:13:28
 sudo robotctl pad forget 78:86:2E:BB:13:28
 ```
 
+For a board that pairs the pad and then drops it every second — about half of them do, with an Xbox
+pad. Pair first, then this, then reboot:
+
+```
+sudo robotctl pad fallback on
+```
+
+```
+sudo robotctl pad fallback off
+```
+
 Pairing is once per pad and has a page of its own —
 [`pair-a-gamepad.md`](pair-a-gamepad.md): which button puts a pad in pairing mode, adding a second
-pad without forgetting the first, and what to do when it will not bond (`Privacy = device` is the
-answer more often than anything else).
+pad without forgetting the first, what to do when it will not bond (`Privacy = device` is the
+answer more often than anything else), and what to do when it bonds and will not stay.
 
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. On the
 pad: **Start** toggles the policy — nothing moves until it is on — **Y**/triangle switches the sticks

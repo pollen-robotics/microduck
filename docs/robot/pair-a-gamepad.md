@@ -23,9 +23,15 @@ sudo robotctl pad pair
 ```
 looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync button on the
 top edge (not the Xbox button, which switches it off)
+then keep it on and in range: once bonded, the link is watched for a while before this
+reports, because a bond that does not hold looks identical to one that does at the moment
+it is made
 paired  Xbox Wireless Controller 78:86:2E:BB:13:28
-padd is driving from it now.
+held for 30s without dropping. padd is driving from it now.
 ```
+
+**Keep the pad on for the whole command.** It keeps running for half a minute after the pad
+connects, watching the link. `--hold 0` skips that.
 
 No MAC address needed: the robot looks for a gamepad in pairing mode and takes the one it finds. The
 pad is *trusted* as well as paired, which is what makes it reconnect by itself after a reboot with
@@ -60,6 +66,61 @@ working robot ignoring you.
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
 to fix it.
+
+## When it pairs and then will not stay connected
+
+```
+paired  Xbox Wireless Controller 78:86:2E:BB:13:28
+the bond did NOT hold: 41 drops in 30s, disconnected now.
+```
+
+About half the boards do this with an Xbox controller. The pairing is fine and the radio cannot keep
+the link. Put the board on the Bluetooth settings the old runtime used:
+
+```bash
+sudo robotctl pad fallback on
+```
+
+```bash
+sudo reboot
+```
+
+The pad is already paired and trusted, so it comes back by itself after the reboot. Check it:
+
+```bash
+robotctl pad status
+```
+
+```
+pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
+padd    active — driving whatever pad connects
+fallbck on — microduck_runtime's Bluetooth settings (Privacy = device, ERTM off)
+        temporary, for boards that cannot keep an Xbox pad bonded — remove it with:
+        sudo robotctl pad fallback off
+```
+
+**Pair the pad before running this, not after.** With these settings on, a pad cannot bond at all —
+`pad fallback on` refuses while nothing is paired, for that reason. To pair another pad on a board
+that is already on it:
+
+```bash
+sudo robotctl pad fallback off
+```
+
+```bash
+sudo reboot
+```
+
+Then pair, then turn it back on and reboot again.
+
+To have `pad pair` offer this at the end instead of printing it:
+
+```bash
+sudo robotctl pad pair --interactive
+```
+
+This is a workaround for a hardware problem being investigated, not a setting. Every board is meant
+to end up with `pad fallback off` — `pad status` is how you find the ones that still have it.
 
 ## Forget one
 

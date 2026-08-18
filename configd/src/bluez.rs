@@ -160,6 +160,14 @@ const BOND_POLL: Duration = Duration::from_millis(200);
 /// someone is retrying — stays in the cache and never announces itself again.
 const DISCOVERY_POLL: Duration = Duration::from_millis(500);
 
+/// How often to look at `Connected` while watching a fresh bond.
+///
+/// Fast enough to count a link flapping at roughly 1.4 times a second, which is the rate the
+/// affected boards drop an Xbox pad at. Sampling at, say, one second would turn dozens of drops into
+/// a handful and could miss a reconnect entirely — and "it dropped twice" invites a retry where
+/// "it dropped 41 times in 30 seconds" does not.
+const HOLD_POLL: Duration = Duration::from_millis(200);
+
 #[zbus::proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 trait Adapter {
     fn start_discovery(&self) -> zbus::Result<()>;
@@ -542,6 +550,53 @@ impl BlueZ {
         }
     }
 
+    /// Watch `Connected` for `within`, counting the times the link goes down.
+    ///
+    /// **This is the only thing that distinguishes an affected board from a working one**, and it
+    /// has to run here rather than in a caller polling `pad.status`: the flap is faster than a
+    /// second, so a client sampling over IPC would see a link that is sometimes up and sometimes
+    /// down and have no way to tell that from a pad being switched on and off.
+    ///
+    /// Counted as *falling edges*, not as time spent disconnected, because that is the number that
+    /// names the fault. A pad someone switches off mid-window contributes one drop and stays down; a
+    /// board that cannot hold the bond contributes dozens and is still trying. Both are reported
+    /// with `connected`, so the two are told apart by whoever reads them rather than guessed at
+    /// here.
+    ///
+    /// A bond that is not connected at all when the window opens is normal for a second or two —
+    /// BlueZ finishes the link after `Pair()` returns — so the first sample is a starting point, not
+    /// a drop.
+    async fn watch_hold(&self, mac: &str, within: Duration) -> proto::PadHold {
+        let deadline = tokio::time::Instant::now() + within;
+        let connected_now = |this: &Self, mac: String| async move {
+            this.devices()
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(&mac)))
+                .is_some_and(|d| d.connected)
+        };
+
+        let mut connected = connected_now(self, mac.to_owned()).await;
+        let mut drops = 0;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(HOLD_POLL.min(deadline - tokio::time::Instant::now())).await;
+            let now = connected_now(self, mac.to_owned()).await;
+            if connected && !now {
+                drops += 1;
+                tracing::warn!(mac, drops, "the pad dropped");
+            }
+            connected = now;
+        }
+
+        let hold = proto::PadHold {
+            watched_seconds: within.as_secs() as u32,
+            drops,
+            connected,
+        };
+        tracing::info!(mac, ?hold, held = hold.held(), "watched the bond");
+        hold
+    }
+
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
     async fn bond(&self, device: &Snapshot) -> Result<(), (proto::PadPairFailure, String)> {
         let proxy = DeviceProxy::builder(&self.bus)
@@ -659,7 +714,12 @@ impl Pads for BlueZ {
         Ok(pads)
     }
 
-    async fn pair(&self, mac: Option<&str>, timeout: Duration) -> PadResult<proto::PadPairResult> {
+    async fn pair(
+        &self,
+        mac: Option<&str>,
+        timeout: Duration,
+        hold: Duration,
+    ) -> PadResult<proto::PadPairResult> {
         let _one_at_a_time = self.pairing.lock().await;
 
         let Some(adapter) = self.adapter().await? else {
@@ -822,8 +882,19 @@ impl Pads for BlueZ {
             });
         }
 
+        // The bond exists. Now find out whether it survives, which on some of these boards it does
+        // not — and which nothing before this line could have noticed.
+        let watched = if hold.is_zero() {
+            None
+        } else {
+            tracing::info!(?hold, "watching the bond");
+            Some(self.watch_hold(&device.mac, hold).await)
+        };
+
         // Re-read rather than assume: what BlueZ ended up with is what the caller should be told,
-        // including a pad that bonded but has not connected yet.
+        // including a pad that bonded but has not connected yet. **After** the watch, not before,
+        // so `connected` describes the link the caller is about to be told about rather than the one
+        // it had half a minute ago.
         let pad = self
             .devices()
             .await?
@@ -836,7 +907,7 @@ impl Pads for BlueZ {
                 ..device.as_pad()
             });
         tracing::warn!(mac = %pad.mac, name = %pad.name, "gamepad paired and trusted");
-        Ok(proto::PadPairResult::Paired { pad })
+        Ok(proto::PadPairResult::Paired { pad, hold: watched })
     }
 
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult> {
