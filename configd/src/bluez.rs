@@ -29,9 +29,19 @@
 //! `set_trusted`. It presented as "the first pair times out, the second works instantly", the second
 //! being fast because the bond was already there.
 //!
-//! So `Paired` turning true is the ground truth for "this worked". `Connect()` gets
-//! [`BOND_SETTLE`] to produce it on its own, and the `Pair()` that follows is raced against the same
-//! property rather than believed.
+//! So `Paired` turning true is the ground truth for "this worked", and **what `Connect()` returned
+//! decides whether `Pair()` is issued at all**:
+//!
+//!  - `Connect()` succeeded — a bond is in flight, so wait for `Paired` and never call `Pair()`.
+//!    This is the whole of the flow proven by hand on 2026-08-18 and the one `microduck_runtime`
+//!    prescribes: `scan on`, `connect`, `trust`, with no `pair` anywhere.
+//!  - `Connect()` failed — nothing is in flight, so `Pair()` is the only way left. It is raced
+//!    against `Paired` rather than believed, because its reply is only one of the two ways to
+//!    learn the answer.
+//!
+//! The version before this one asked `Paired` after a short settle window and called `Pair()` when
+//! it was still false, which put the two cases through the same path and could still land a
+//! `Pair()` on a slow bond.
 //!
 //! Discovery is stopped before connecting, deliberately: BlueZ will accept a `Connect()` during an
 //! active scan and it fails intermittently, which presents as a pad that pairs on the second
@@ -149,14 +159,6 @@ const AGENT_CAPABILITY: &str = "NoInputNoOutput";
 /// the device is already in hand. BlueZ's own pairing timeout is 60s; this stays inside it so the
 /// answer comes from here rather than from a dropped D-Bus call.
 const BOND_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long to let a bond triggered by `Connect()` finish on its own before asking for one.
-///
-/// Bonding is asynchronous and lands a moment after `Connect()` returns, so this is the window in
-/// which "it is already happening" is distinguished from "it is not going to". Measured against a
-/// real Xbox controller, it completes inside a second; five is margin, and the cost of it being too
-/// short is a `Pair()` call on a bond in flight, which never answers.
-const BOND_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
@@ -585,27 +587,28 @@ impl BlueZ {
                 }
             };
 
-            // Did that bond it on its own? It usually does — a HID profile requires an encrypted
-            // link, so connecting triggers bonding — but **it finishes a moment after `Connect()`
-            // returns**, not before. Reading `Paired` immediately therefore says `false` about a
-            // bond that is already in flight, and the `Pair()` that follows never answers: BlueZ
-            // leaves it outstanding rather than reporting `AlreadyExists`.
-            //
-            // That is the whole of the "first pair times out, second one works instantly" report:
-            // the first call bonded the pad, waited 30s for a reply that was never coming, and
-            // returned a timeout before it could set `Trusted`.
-            // Wait for a bond to land **only if a connect succeeded**, because that is the only case
-            // where one is in flight. After a failed connect the wait is dead time, and dead time
-            // here does damage: a pad holds pairing mode for a limited window, and spending five
-            // seconds of it waiting for something that was never started is how a fresh pairing ends
-            // in `AuthenticationFailed`.
-            let settle = if connected {
-                BOND_SETTLE
+            if connected {
+                // A bond is in flight. A HID profile requires an encrypted link, so `Connect()`
+                // triggered bonding — but **it finishes a moment after `Connect()` returns**, not
+                // before. So wait for it, and do not call `Pair()`: BlueZ leaves a `Pair()` on a
+                // bond already in flight outstanding rather than reporting `AlreadyExists`, and
+                // that is the whole of the "first pair times out, the second works instantly"
+                // report — the first call bonded the pad, waited for a reply that was never
+                // coming, and returned a timeout before it could set `Trusted`.
+                //
+                // It is also the flow proven by hand: `connect` then `trust`, no `pair` at any
+                // point, which is what `microduck_runtime` prescribes and what bonds an Xbox
+                // controller on a Radxa Zero 3W.
+                if !self.wait_until_paired(&device.mac, BOND_TIMEOUT).await {
+                    return Err((
+                        proto::PadPairFailure::Timeout,
+                        "the pad connected but never finished pairing".to_owned(),
+                    ));
+                }
+                tracing::info!("bonded");
             } else {
-                Duration::ZERO
-            };
-            if !self.wait_until_paired(&device.mac, settle).await {
-                // Genuinely not bonding on its own, so ask. **Raced against the state**, not
+                // `Connect()` did not work at all, so nothing is in flight and there is no bond to
+                // wait for — asking for one is the only way left. **Raced against the state**, not
                 // trusted to answer: `Paired` turning true is the ground truth for "this worked",
                 // and `Pair()`'s reply is only one of the two ways to learn it.
                 let paired = tokio::select! {
