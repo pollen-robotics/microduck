@@ -82,18 +82,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// and a `robotctl` that asks an older `padd` for it finds no socket at all rather than a refusal.
 /// The bump still lands on `updaterd`'s exact `!=` check, so every binary on a board must come from
 /// one release — which was already the rule.
-/// # v9 — `pad.fallback`, and a `pad.pair` that watches
+/// # v9 — a `pad.pair` that watches the bond it made
 ///
-/// A namespace addition like v5 and v8, plus two field additions that are **not** merely additive in
-/// effect and are the reason this bumps rather than relying on serde tolerance:
+/// Two additions to an existing method, and the first is why this bumps rather than relying on
+/// serde tolerance:
 ///
 ///  - [`PadPairParams::hold_seconds`] asks the robot to keep watching after the bond is made. A v8
 ///    `configd` would parse the field, ignore it, and answer immediately — reporting a successful
-///    pairing on exactly the board this was built to catch. Silently getting the old behaviour is
-///    the failure mode; refusing the call is what this constant is for.
-///  - [`PadStatusResult::fallback`] tells an operator which boards are still on the temporary
-///    settings. A v8 daemon omits it, and `#[serde(default)]` would render that as "not on the
-///    fallback" — a wrong answer to the one question the field exists to answer.
+///    pairing on exactly the board this was built to catch. **Silently getting the old behaviour is
+///    the failure mode**, and it is the failure mode that made this necessary in the first place;
+///    refusing the call is what this constant is for.
+///  - [`PadPairFailure::NoAnswer`] splits "the pad was not there" out of "the bond was refused". An
+///    older client rendering it as an unknown variant is a cosmetic loss, not a wrong answer.
 ///
 /// **What it costs.** The usual: every binary on a board must come from one release, which was
 /// already the rule. `robotctl` is a symlink into `current` so it follows an update immediately,
@@ -316,14 +316,6 @@ pub mod method {
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
 
-    /// Put this board on — or take it off — `microduck_runtime`'s Bluetooth settings.
-    ///
-    /// **Temporary, and named so it can be found and removed.** It exists because roughly half of
-    /// the boards built so far cannot hold an Xbox pad's LE bond: pairing completes, the pad drives
-    /// for seconds, and every reconnect then dies at `Encryption Change: PIN or Key Missing (0x06)`.
-    /// The end state is every board on plain BLE with nothing set here.
-    pub const PAD_FALLBACK: &str = "pad.fallback";
-
     /// Subscribe to the raw input stream of the pad `padd` is driving from.
     ///
     /// **The one method in this namespace `padd` answers itself**, on [`super::socket::PAD`]
@@ -461,7 +453,6 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
-    PadFallback(PadFallbackParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
 }
@@ -506,7 +497,6 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
-            Call::PadFallback(_) => method::PAD_FALLBACK,
             Call::PadInput => method::PAD_INPUT,
         }
     }
@@ -535,9 +525,6 @@ impl Call {
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
                 | Call::PadForget(_)
-                // Rewrites two files under /etc and needs a reboot to take effect. As mutating as
-                // anything here.
-                | Call::PadFallback(_)
         )
     }
 
@@ -583,7 +570,6 @@ impl Call {
             Call::SystemAuthenticate(p) => encode(p),
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
-            Call::PadFallback(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -660,7 +646,6 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
-            method::PAD_FALLBACK => Call::PadFallback(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             other => {
                 return Err(Error::new(
@@ -1191,19 +1176,6 @@ pub struct PadPairParams {
     /// is accepted, or a re-run whose only purpose is to restore `Trusted`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_seconds: Option<u32>,
-}
-
-/// Put this board on `microduck_runtime`'s Bluetooth settings, or take it back off.
-///
-/// See [`method::PAD_FALLBACK`] for what this is and why it is temporary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PadFallbackParams {
-    /// True applies the settings, false restores the ones `scripts/setup-board.sh` sets.
-    ///
-    /// Not a toggle. A toggle cannot be run twice by a script without asking what state the board
-    /// was in first, and "which of these ten boards is on the crutch" is a question that has to be
-    /// answerable by looking, not by remembering.
-    pub enable: bool,
 }
 
 /// Forget one pad, by address.
@@ -1901,13 +1873,6 @@ pub struct PadStatusResult {
     /// Every pad the robot is bonded to, connected first.
     pub pads: Vec<Pad>,
     pub driver: UnitState,
-    /// Whether this board is on the temporary Xbox-pad settings, and which halves of them.
-    ///
-    /// Reported by `pad status` rather than by a command of its own, because the question it
-    /// answers is asked about a fleet: these settings are meant to be removed from every board, and
-    /// finding the ones still carrying them must not require remembering which they were.
-    #[serde(default)]
-    pub fallback: PadFallback,
 }
 
 /// Why pairing a pad failed.
@@ -1932,14 +1897,12 @@ pub enum PadPairFailure {
     /// gamepad heuristic, so a short `--timeout` picks it over waiting for the pad someone is
     /// actually holding, and pairing then pages hardware that is switched off.
     NoAnswer,
-    /// BlueZ refused the bond. One known cause is `Privacy = device` *present* in
-    /// `/etc/bluetooth/main.conf`, which can stop a pad bonding: the DHKey check is computed over
-    /// both addresses, and privacy pairs from a resolvable private one, so the pad refuses with
-    /// `DHKey check failed (0x0b)`. `scripts/setup-board.sh` sets `Privacy = off` for that reason.
-    ///
-    /// It is not universal — a fresh pad has been seen to bond with `device` set, on one of the
-    /// boards [`method::PAD_FALLBACK`] exists for. So this reason means "check the setting", not
-    /// "the setting is wrong".
+    /// BlueZ refused the bond. The cause to check first is `Privacy = device` in
+    /// `/etc/bluetooth/main.conf`, which stops a pad bonding at all — measured on two boards now,
+    /// arriving as `DHKey check failed (0x0b)` on one and `AuthenticationCanceled` on the other.
+    /// The check is computed over both devices' addresses and privacy pairs from a resolvable
+    /// private one, so the two sides compute different values. `scripts/setup-board.sh` sets
+    /// `Privacy = off` for exactly this reason.
     Rejected,
     Other,
 }
@@ -2005,59 +1968,6 @@ pub enum PadPairResult {
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
     },
-}
-
-/// Which halves of `microduck_runtime`'s Bluetooth settings this board currently has.
-///
-/// Two independent booleans rather than one flag, because they are two files and either can be
-/// changed by hand, by an old copy of a provisioning script, or by an install that predates this.
-/// Reporting a single "on" would turn a half-applied board into a lie.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PadFallback {
-    /// `Privacy = device` in `/etc/bluetooth/main.conf`.
-    ///
-    /// The likelier of the two to be the one that matters: `microduck_runtime`'s installer credits
-    /// it with fixing an Xbox controller that pairs and then drops straight back out, which is the
-    /// symptom on these boards. `scripts/setup-board.sh` deliberately sets the opposite, on a
-    /// measurement from a different board where `device` stopped a pad bonding at all. Both hold —
-    /// on different units — so neither value is right for every board.
-    pub privacy_device: bool,
-    /// `options bluetooth disable_ertm=1` in `/etc/modprobe.d/bluetooth.conf`.
-    ///
-    /// The less likely of the two, kept because the working configuration was never bisected. ERTM
-    /// is an L2CAP **classic** feature and every pad this robot has met is LE-only, so it is hard to
-    /// see how it bites here — but what is known is that the runtime's *whole* stack works on an
-    /// affected board, not which part of it does. This repo sets it nowhere, which is what made it
-    /// invisible when comparing a board that once ran the runtime against one that never did.
-    pub ertm_disabled: bool,
-}
-
-impl PadFallback {
-    /// Both halves applied.
-    pub fn is_on(&self) -> bool {
-        self.privacy_device && self.ertm_disabled
-    }
-
-    /// Neither half applied — a board on what `scripts/setup-board.sh` sets.
-    pub fn is_off(&self) -> bool {
-        !self.privacy_device && !self.ertm_disabled
-    }
-}
-
-/// Answer to [`Call::PadFallback`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PadFallbackResult {
-    /// The board's state after the call. Idempotent: asking for what is already set is success.
-    pub fallback: PadFallback,
-    /// Whether anything on disk actually changed.
-    pub changed: bool,
-    /// Whether the board has to reboot for this to take effect.
-    ///
-    /// It nearly always does, and the reason is specific to this hardware: `Privacy` is read by
-    /// bluetoothd at startup, and restarting `bluetooth.service` on these boards leaves the kernel
-    /// holding `hci0` while bluetoothd reports "No default controller available" — a state only a
-    /// reboot clears. `scripts/setup-board.sh` takes the same position for the same reason.
-    pub reboot_required: bool,
 }
 
 /// Answer to [`Call::PadForget`].
@@ -2651,7 +2561,6 @@ mod tests {
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
-            Call::PadFallback(PadFallbackParams { enable: true }),
         ]
     }
 
@@ -2663,7 +2572,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            37,
+            36,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -2818,7 +2727,6 @@ mod tests {
                 // needs on a robot it is not allowed to reconfigure.
                 method::PAD_PAIR,
                 method::PAD_FORGET,
-                method::PAD_FALLBACK,
             ]
         );
     }

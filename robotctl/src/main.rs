@@ -364,39 +364,6 @@ enum PadCommand {
         #[arg(long, value_name = "SECONDS")]
         hold: Option<u32>,
 
-        /// Offer the temporary fallback, and apply it if you say yes, when the bond does not hold.
-        ///
-        /// **The only thing in `robotctl` that asks a question**, and it is off by default for that
-        /// reason: everything here has to be scriptable. Without it the same finding is printed with
-        /// the command to run next, which is the same decision made a line later.
-        #[arg(long)]
-        interactive: bool,
-
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Put this board on `microduck_runtime`'s Bluetooth settings, or take it back off.
-    ///
-    /// **A temporary workaround for a hardware problem under investigation, not a setting.**
-    /// Roughly half the boards built so far cannot keep an Xbox pad's LE bond: pairing succeeds, the
-    /// pad drives for seconds, and every reconnect then dies with `PIN or Key Missing`. It is not a
-    /// dead radio — another make of LE pad bonds and reconnects fine on the same board — so it is an
-    /// interop problem with one controller on some units.
-    ///
-    /// `on` writes `Privacy = device` to /etc/bluetooth/main.conf and `options bluetooth
-    /// disable_ertm=1` to /etc/modprobe.d/bluetooth.conf, which is what the runtime this daemon
-    /// replaced installs. `off` restores what scripts/setup-board.sh sets. Either way the board has
-    /// to reboot.
-    ///
-    /// **Pair the pad first.** `Privacy = device` stops a pad bonding at all, so a board given this
-    /// with nothing bonded cannot then pair one — which is why `on` refuses unless a pad is already
-    /// paired. `robotctl pad status` says whether a board is on it.
-    Fallback {
-        /// `on` to apply the runtime's settings, `off` to restore this repo's.
-        #[arg(value_enum)]
-        state: FallbackState,
-
         #[arg(long)]
         json: bool,
     },
@@ -411,16 +378,6 @@ enum PadCommand {
         #[arg(long)]
         json: bool,
     },
-}
-
-/// Which way `pad fallback` is being asked to go.
-///
-/// Two named states rather than a bare `--enable` flag or a toggle: whoever runs this is looking at
-/// ten boards and needs to be able to say what a board should be in, not what to change about it.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-enum FallbackState {
-    On,
-    Off,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1780,33 +1737,6 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
 
-    // A warning rather than a refusal, and the reason is that the two boards disagree.
-    //
-    // On the board `scripts/setup-board.sh` was measured against, `Privacy = device` stops a pad
-    // bonding at all — pairing fails every time with `DHKey check failed (0x0b)` — which makes
-    // "apply this with nothing bonded" a mistake that leaves the board unable to pair the pad the
-    // setting was for. That was the case this refused outright.
-    //
-    // But on an affected board, running `microduck_runtime`'s stack **bonded a fresh pad with these
-    // settings already in place**. So bonding under `Privacy = device` is not universally impossible,
-    // and refusing here would block the sequence that is known to work on exactly the hardware this
-    // exists for. Neither observation cancels the other, so the command does what it is told and
-    // says what may happen.
-    if let PadCommand::Fallback {
-        state: FallbackState::On,
-        json: false,
-        ..
-    } = &command
-        && !any_pad_paired(&mut client)?
-    {
-        eprintln!(
-            "warning: no pad is bonded yet. On the board this was first measured on, a pad could \
-             not bond at all with these settings on — on an affected board, the old runtime bonded \
-             one fresh with them on. If pairing fails after the reboot, run `pad fallback off`, \
-             pair, then put it back on: a bond made without these settings survives them."
-        );
-    }
-
     let (call, json) = match &command {
         PadCommand::Status { json } => (proto::Call::PadStatus, *json),
         PadCommand::Pair {
@@ -1820,12 +1750,6 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
                 mac: mac.clone(),
                 timeout_seconds: *timeout,
                 hold_seconds: *hold,
-            }),
-            *json,
-        ),
-        PadCommand::Fallback { state, json } => (
-            proto::Call::PadFallback(proto::PadFallbackParams {
-                enable: *state == FallbackState::On,
             }),
             *json,
         ),
@@ -1863,10 +1787,7 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
 
     match command {
         PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
-        PadCommand::Pair { interactive, .. } => {
-            return report_pair(&result, interactive, &mut client);
-        }
-        PadCommand::Fallback { state, .. } => return report_fallback(&result, state),
+        PadCommand::Pair { .. } => return report_pair(&result),
         PadCommand::Forget { mac, .. } => {
             let forgotten: proto::PadForgetResult = decode(&result)?;
             if forgotten.removed {
@@ -1921,47 +1842,12 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
     };
     let _ = write!(out, "padd    {driver}");
 
-    // Printed only when the board is not on plain BLE, so a healthy board's status keeps its two
-    // lines. The end state is every board silent here, and a line that appeared on all of them
-    // would stop being read long before that.
-    let fallback = status.fallback;
-    if !fallback.is_off() {
-        let what = if fallback.is_on() {
-            "on — microduck_runtime's Bluetooth settings (Privacy = device, ERTM off)".to_owned()
-        } else {
-            // Half-applied. Reported as its own state rather than rounded to on or off: a board
-            // with one of the two is running a combination nobody chose, and that is worth seeing
-            // before someone spends a day comparing it against a board that is on neither.
-            format!(
-                "PARTLY applied — privacy {}, ertm {}. Run:  sudo robotctl pad fallback on  (or off)",
-                if fallback.privacy_device {
-                    "device"
-                } else {
-                    "off"
-                },
-                if fallback.ertm_disabled {
-                    "disabled"
-                } else {
-                    "default"
-                },
-            )
-        };
-        let _ = write!(
-            out,
-            "\nfallbck {what}\n        temporary, for boards that cannot keep an Xbox pad bonded — \
-             remove it with:  sudo robotctl pad fallback off"
-        );
-    }
     Ok(out)
 }
 
 /// Pairing is a successful call that may report a failed outcome, like a wifi join: the exit status
 /// has to distinguish "the robot refused" from "the robot could not be asked".
-fn report_pair(
-    result: &serde_json::Value,
-    interactive: bool,
-    client: &mut Client,
-) -> Result<(), Failure> {
+fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
     match decode::<proto::PadPairResult>(result)? {
         proto::PadPairResult::Paired { pad, hold } => {
             println!("paired  {} {}", pad.name, pad.mac);
@@ -1985,7 +1871,7 @@ fn report_pair(
                     );
                     Ok(())
                 }
-                Some(hold) => unstable_bond(&hold, interactive, client),
+                Some(hold) => unstable_bond(&hold),
             }
         }
         proto::PadPairResult::Failed { reason, detail } => {
@@ -2016,9 +1902,9 @@ fn report_pair(
                 }
                 proto::PadPairFailure::Rejected => {
                     "Bluetooth refused the pairing. If this fails every time, check \
-                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — it \
-                     rejects the pairing with `DHKey check failed` — and `Privacy = off` is what \
-                     works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
+                     /etc/bluetooth/main.conf: `Privacy = device` stops a pad bonding at all — \
+                     measured on two boards, arriving as `DHKey check failed` on one and \
+                     `AuthenticationCanceled` on the other — and `Privacy = off` is what works. Fix it with scripts/setup-board.sh and reboot, since it does not apply \
                      until then. Otherwise the pad had probably left pairing mode: press Sync \
                      again and re-run this while its light is flashing quickly"
                 }
@@ -2036,11 +1922,7 @@ fn report_pair(
 /// **flapped** is the board-specific failure this whole path exists for, while one that **never
 /// connected** is much more ordinary — a pad that went back to sleep, or walked out of range — and
 /// sending someone to change board settings over it would be wrong.
-fn unstable_bond(
-    hold: &proto::PadHold,
-    interactive: bool,
-    client: &mut Client,
-) -> Result<(), Failure> {
+fn unstable_bond(hold: &proto::PadHold) -> Result<(), Failure> {
     let window = hold.watched_seconds;
     if hold.drops == 0 {
         return Err(Failure::new(
@@ -2063,100 +1945,27 @@ fn unstable_bond(
         "the bond did NOT hold: {} drops in {window}s, {still}.",
         hold.drops
     );
-    println!(
-        "This is the failure some of these boards have — the pairing is fine and the radio cannot \
-         keep the link. The pad stays bonded and trusted either way."
-    );
 
-    // The offer, and then the same thing as an instruction. A person who says no still needs to
-    // know what they said no to, and a person who is not being asked needs it more.
-    if interactive && ask("apply the temporary fallback and reboot this board?")? {
-        let applied = result_of(client.call(&proto::Call::PadFallback(
-            proto::PadFallbackParams { enable: true },
-        ))?)?;
-        return report_fallback(&applied, FallbackState::On);
-    }
-
+    // **No workaround is offered, because none is known.** Three were tried on an affected board
+    // and all three failed: `Privacy = device` (which stops the pad bonding at all), a live
+    // `disable_ertm=1`, and pairing the way `microduck_runtime` does — `connect` then `trust`,
+    // never `Pair()`. Printing "try this" here would be inventing a remedy to fill the space where
+    // one belongs, which is worse than an honest dead end.
+    //
+    // So it reports the measurement and points at the one thing that does help: the same numbers
+    // from a board that works, which is what turns "this one is broken" into a difference.
     Err(Failure::new(
         exit::UNSTABLE,
-        "the temporary workaround puts this board on the Bluetooth settings microduck_runtime \
-         used, which needs a reboot:\n\n    sudo robotctl pad fallback on\n    sudo reboot\n\n\
-         The pad is already bonded and trusted, so it reconnects by itself afterwards. This is a \
-         crutch for hardware under investigation — `robotctl pad status` says which boards are \
-         wearing it, and `pad fallback off` takes it back off."
+        "The pairing is fine and the radio will not keep the link. Some of these boards do this \
+         with an Xbox pad, the pad stays bonded and trusted, and the cause is not yet known — \
+         re-running this will not change the answer.\n\n\
+         What helps is the same measurement from a board that works:\n\n    \
+         sudo sh /tmp/pad-stack-report.sh --fingerprint\n\n\
+         Run it on both and diff them; docs/robot/pair-a-gamepad.md has the steps. A different make \
+         of pad is also worth trying — one has been seen to bond and hold on a board no Xbox pad \
+         will stay on."
             .to_owned(),
     ))
-}
-
-/// What changed, and whether the board has to reboot for it to mean anything.
-fn report_fallback(result: &serde_json::Value, asked: FallbackState) -> Result<(), Failure> {
-    let applied: proto::PadFallbackResult = decode(result)?;
-
-    let state = match asked {
-        FallbackState::On => "on",
-        FallbackState::Off => "off",
-    };
-    if !applied.changed {
-        // Idempotent, and said as such rather than reported as an action. Re-running must not read
-        // as having done something, or "which boards did I touch" stops being answerable.
-        println!("fallback {state} already — nothing changed.");
-        return Ok(());
-    }
-
-    println!("fallback {state}");
-    println!(
-        "  privacy      {}",
-        if applied.fallback.privacy_device {
-            "device — microduck_runtime's setting"
-        } else {
-            "off — what scripts/setup-board.sh sets"
-        }
-    );
-    println!(
-        "  ertm         {}",
-        if applied.fallback.ertm_disabled {
-            "disabled"
-        } else {
-            "kernel default"
-        }
-    );
-    if applied.reboot_required {
-        // Not a suggestion. bluetoothd reads Privacy at startup, and restarting it on this board
-        // wedges hci0 — so until the reboot the board is running neither setting cleanly.
-        println!("\nReboot for this to take effect:\n\n    sudo reboot");
-    }
-    Ok(())
-}
-
-/// Is any pad bonded to this robot?
-///
-/// Asked over the same connection rather than inferred, because the answer gates a change that
-/// cannot be walked back by retrying.
-fn any_pad_paired(client: &mut Client) -> Result<bool, Failure> {
-    let status: proto::PadStatusResult =
-        decode(&result_of(client.call(&proto::Call::PadStatus)?)?)?;
-    Ok(status.pads.iter().any(|pad| pad.paired))
-}
-
-/// Ask a yes/no question on the terminal.
-///
-/// **The only prompt in this binary**, reachable only through `pad pair --interactive`, and it
-/// refuses to ask when stdin is not a terminal: a script that passes the flag by accident gets the
-/// printed instruction and a non-zero exit rather than a process that hangs for ever waiting on a
-/// pipe. Default no, because the answer applies board settings and reboots a robot.
-fn ask(question: &str) -> Result<bool, Failure> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    eprint!("{question} [y/N] ");
-    let _ = std::io::stderr().flush();
-
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| Failure::new(exit::FAILED, format!("cannot read the answer: {e}")))?;
-    Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {

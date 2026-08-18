@@ -631,8 +631,7 @@ impl Server {
             // working.
             | Call::PadStatus
             | Call::PadPair(_)
-            | Call::PadForget(_)
-            | Call::PadFallback(_) => Response::err(
+            | Call::PadForget(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

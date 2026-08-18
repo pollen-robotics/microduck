@@ -30,8 +30,9 @@ paired  Xbox Wireless Controller 78:86:2E:BB:13:28
 held for 30s without dropping. padd is driving from it now.
 ```
 
-**Keep the pad on for the whole command.** It keeps running for half a minute after the pad
-connects, watching the link. `--hold 0` skips that.
+**Keep the pad on for the whole command.** It keeps running for up to half a minute after the pad
+connects, watching the link — and stops early the moment the link has clearly failed. `--hold 0`
+skips the watch.
 
 No MAC address needed: the robot looks for a gamepad in pairing mode and takes the one it finds. The
 pad is *trusted* as well as paired, which is what makes it reconnect by itself after a reboot with
@@ -71,54 +72,42 @@ to fix it.
 
 ```
 paired  Xbox Wireless Controller 78:86:2E:BB:13:28
-the bond did NOT hold: 41 drops in 30s, disconnected now.
+the bond did NOT hold: 3 drops in 8s, disconnected now.
 ```
 
-About half the boards do this with an Xbox controller. The pairing is fine and the radio cannot keep
-the link. Put the board on the Bluetooth settings the old runtime used:
+About half the boards do this with an Xbox pad. **There is no fix yet.** The pairing is fine, the
+pad is bonded and trusted, and the radio will not keep the link — re-running `pad pair` reports the
+same thing.
+
+Three things have been tried on an affected board and none of them helped:
+
+| Tried | Result |
+|---|---|
+| `Privacy = device` in `/etc/bluetooth/main.conf` | the pad cannot bond at all |
+| `disable_ertm=1`, applied live and verified | 3 drops in 8s |
+| pairing with `bluetoothctl connect` + `trust`, never `pair` | 3 drops in 10s |
+
+What does help is comparing the board against one that works:
 
 ```bash
-sudo robotctl pad fallback on
-```
-
-```bash
-sudo reboot
-```
-
-The pad is already paired and trusted, so it comes back by itself after the reboot. Check it:
-
-```bash
-robotctl pad status
-```
-
-```
-pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
-padd    active — driving whatever pad connects
-fallbck on — microduck_runtime's Bluetooth settings (Privacy = device, ERTM off)
-        temporary, for boards that cannot keep an Xbox pad bonded — remove it with:
-        sudo robotctl pad fallback off
-```
-
-If pairing fails **after** the reboot — `DHKey check failed` — take it off, pair, and put it back:
-
-```bash
-sudo robotctl pad fallback off
+scp scripts/pad-stack-report.sh radxa@<board>:/tmp/
 ```
 
 ```bash
-sudo reboot
+ssh radxa@<good-board> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/good.fp
 ```
-
-Then pair, then `pad fallback on` and reboot again. The bond survives it.
-
-To have `pad pair` offer this at the end instead of printing it:
 
 ```bash
-sudo robotctl pad pair --interactive
+ssh radxa@<bad-board> sudo sh /tmp/pad-stack-report.sh --fingerprint > /tmp/bad.fp
 ```
 
-This is a workaround for a hardware problem being investigated, not a setting. Every board is meant
-to end up with `pad fallback off` — `pad status` is how you find the ones that still have it.
+```bash
+diff /tmp/good.fp /tmp/bad.fp
+```
+
+**Try a different pad.** One non-Xbox BLE pad has bonded and held on a board no Xbox pad will stay
+on, so this is an interop problem with one make of controller rather than a dead radio. If you have
+another pad, that is the fastest way to keep working.
 
 ## Forget one
 
@@ -132,20 +121,11 @@ no longer has and the bond is refused.
 
 ## When pairing fails every time
 
-First check whether the board is on the pad fallback:
-
-```bash
-robotctl pad status
-```
-
-If it says `fallbck on`, that is deliberate and it sets `Privacy = device` — see above for pairing
-on a board that has it.
-
-Otherwise check `/etc/bluetooth/main.conf` for `Privacy = device` you did not put there. Boards
-provisioned before this was understood have it, and on some boards it stops a pad bonding: it
-rejects the pairing with `DHKey check failed (0x0b)`, because that check is computed over both
-devices' addresses and privacy pairs from a resolvable private one. `Privacy = off` is what works
-there.
+Check `/etc/bluetooth/main.conf` for `Privacy = device`. Boards provisioned before this was
+understood have it, and with it **a pad cannot bond at all** — measured on two boards, arriving as
+`DHKey check failed (0x0b)` on one and `AuthenticationCanceled` on the other. The check is computed
+over both devices' addresses and privacy pairs from a resolvable private one, so the two sides
+compute different values. `Privacy = off` is what works.
 
 ```bash
 sudo sh scripts/setup-board.sh

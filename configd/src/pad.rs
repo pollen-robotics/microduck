@@ -72,9 +72,9 @@ pub trait Pads: Send + Sync {
     ///
     /// **A bond that flaps is still `Paired`.** The watch reports what it saw in
     /// [`proto::PadPairResult::Paired::hold`] and does not turn a successful pairing into a failure,
-    /// because the pairing did succeed — the keys are stored and the pad is trusted, and undoing
-    /// that would throw away the bond the fallback in [`crate::padfallback`] then needs to exist.
-    /// Judging the observation is the caller's, and `PadHold::held` is the judgement.
+    /// because the pairing did succeed: the keys are stored and the pad is trusted. Throwing that
+    /// away would also destroy the evidence — a bonded pad is what the drop count is measured
+    /// against. Judging the observation is the caller's, and `PadHold::held` is the judgement.
     async fn pair(
         &self,
         mac: Option<&str>,
@@ -189,10 +189,10 @@ struct FakeState {
     visible: Vec<proto::Pad>,
     /// How many times a freshly-bonded pad drops before the watch window ends.
     ///
-    /// Here because the whole reason [`crate::padfallback`] exists is a bond that succeeds and then
-    /// will not stay up, and that is not a state anyone can arrange on demand with real hardware —
-    /// it belongs to particular boards. Without it the flapping path could only ever be exercised by
-    /// carrying the right board to the desk.
+    /// Here because a bond that succeeds and then will not stay up is not a state anyone can
+    /// arrange on demand: it belongs to particular boards. Without this the flapping path — the
+    /// whole reason the watch exists — could only ever be exercised by carrying one of those boards
+    /// to the desk.
     flaps: u32,
 }
 

@@ -222,12 +222,9 @@ section_stack() {
     field bluetoothd "$(systemctl is-active bluetooth 2>/dev/null || echo unknown)"
 
     # The one BlueZ setting that decides whether a pad can bond at all. With `device`, pairing fails
-    # every time with a DHKey check error — see `setup-board.sh`. Two different boards read `device`
-    # for opposite reasons, and the report cannot tell them apart: one provisioned before this was
-    # understood, and one deliberately put there by `robotctl pad fallback on` *after* its pad was
-    # bonded, because it cannot otherwise keep an Xbox pad. `robotctl pad status` is what
-    # distinguishes them. Fingerprinted because it is invisible everywhere else and differs between
-    # boards flashed months apart.
+    # every time — measured on two boards, as a DHKey check error on one and `AuthenticationCanceled`
+    # on the other. See `setup-board.sh`. Fingerprinted because it is invisible everywhere else and
+    # differs between boards flashed months apart.
     if [ -r "$BT_CONF" ]; then
         if grep -Eq '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" 2>/dev/null; then
             f_privacy="$(grep -E '^[[:space:]]*Privacy[[:space:]]*=' "$BT_CONF" | head -1 \
@@ -242,16 +239,18 @@ section_stack() {
 
     # ERTM, from the running kernel and from what would be applied at the next boot.
     #
-    # Two sources because they disagree in the case that matters: `robotctl pad fallback on` writes
-    # the modprobe file and the board has not rebooted yet, so the file says one thing and the loaded
-    # module another. A single value would have to pick one and would be wrong half the time it was
-    # interesting.
+    # Two sources because they disagree, and on these boards they *always* disagree in one
+    # direction: `CONFIG_BT=y` here, so Bluetooth is built into the kernel and `/etc/modprobe.d`
+    # is never consulted at all. A board carrying that file has ERTM enabled regardless, and a
+    # report that read only the file would say the opposite. Setting it for real needs
+    # `bluetooth.disable_ertm=1` on the kernel command line, or a live write to the parameter that
+    # a reboot then undoes.
     #
-    # Worth having even though it probably changes nothing here: ERTM is an L2CAP *classic* feature
-    # and every pad seen on these robots is LE-only, so this is on the report to be ruled out rather
-    # than because it is suspected. It is what `microduck_runtime`'s installer sets, and until now
-    # nothing in this repo set it either way — which made it invisible when comparing a board that
-    # once ran the runtime against one that never did.
+    # On the report to be ruled out rather than because it is suspected — and it has now been ruled
+    # out: with the parameter verified at `Y`, an affected board still dropped the pad three times
+    # in eight seconds. ERTM is an L2CAP *classic* feature and these pads connect `LE Public`, so
+    # there was never a mechanism for it to matter. `microduck_runtime`'s installer writes the same
+    # inert file, which is worth knowing before crediting it with anything.
     ertm_live=unreadable
     if [ -r "$ERTM_PARAM" ]; then
         case "$(cat "$ERTM_PARAM" 2>/dev/null)" in

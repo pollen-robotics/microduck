@@ -54,7 +54,9 @@
 //! ## The board setting that made all of this impossible
 //!
 //! `Privacy = device` in `/etc/bluetooth/main.conf` stops a pad bonding at all, and nothing in this
-//! file can work around it. The trace, with no key on either side:
+//! file can work around it. Measured on two boards, which failed differently and for the same
+//! reason: `DHKey check failed (0x0b)` on one, `org.bluez.Error.AuthenticationCanceled` on the
+//! other. The trace from the first, with no key on either side:
 //!
 //! ```text
 //! SMP: Pairing Public Key ×2 · Confirm · Random ×2 · DHKey Check

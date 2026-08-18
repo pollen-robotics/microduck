@@ -9,7 +9,6 @@ use std::sync::Arc;
 use clap::Parser;
 use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
-use configd::padfallback::PadFallback;
 use configd::power;
 use configd::store::Store;
 use configd::{pad, units};
@@ -165,10 +164,6 @@ fn resolve_gid(name: &str) -> Option<u32> {
 struct Service {
     net: Arc<dyn Net>,
     pads: Arc<dyn Pads>,
-    /// The two board settings the affected boards need, as files. Not behind a trait like
-    /// [`Pads`]: it is two paths under `/etc`, and its tests point it at a `tempdir` instead of at a
-    /// fake.
-    pad_fallback: PadFallback,
     store: Store,
     policy: PeerPolicy,
     /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
@@ -243,19 +238,6 @@ async fn main() -> ExitCode {
     let service = Arc::new(Service {
         net,
         pads,
-        // Under `--fake-pads` these move into the state directory. Not a nicety: on a laptop
-        // `--fake-pads` must not rewrite the developer's own `/etc/bluetooth/main.conf`, and in the
-        // container suite `configd` runs as `robot` and could not write `/etc` at all — so pointing
-        // at the real paths there would test a permission error rather than the change.
-        pad_fallback: if args.fake_pads {
-            PadFallback::at(
-                args.state_dir.join("bluetooth/main.conf"),
-                args.state_dir.join("modprobe.d/bluetooth.conf"),
-                args.state_dir.join("disable_ertm"),
-            )
-        } else {
-            PadFallback::new()
-        },
         store: Store::new(args.state_dir.join("config.json"), default_name),
         serial,
         policy: PeerPolicy {
@@ -537,7 +519,6 @@ async fn dispatch(
                 &proto::PadStatusResult {
                     pads,
                     driver: units::state(units::PADD).await,
-                    fallback: service.pad_fallback.state(),
                 },
             ),
             Err(e) => {
@@ -558,19 +539,6 @@ async fn dispatch(
             )
         }
         proto::Call::PadForget(params) => reply(id, service.pads.forget(&params.mac).await),
-
-        // Deliberately does **not** check that a pad is bonded first. The order matters — privacy
-        // has to go on after the bond exists, or nothing can bond at all — but enforcing it here
-        // would also refuse the case this has to serve: a board that needs the settings taken back
-        // off, and one whose pad was bonded by something other than this daemon. `robotctl` is what
-        // sequences it, and `pad status` is what shows whether the board got out of step.
-        proto::Call::PadFallback(params) => match service.pad_fallback.set(params.enable) {
-            Ok(result) => proto::Response::ok(Some(id), &result),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not change the pad fallback");
-                proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
-            }
-        },
 
         proto::Call::SystemReboot => {
             power::schedule();
