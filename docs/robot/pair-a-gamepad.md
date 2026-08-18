@@ -99,9 +99,7 @@ fallbck on — microduck_runtime's Bluetooth settings (Privacy = device, ERTM of
         sudo robotctl pad fallback off
 ```
 
-**Pair the pad before running this, not after.** With these settings on, a pad cannot bond at all —
-`pad fallback on` refuses while nothing is paired, for that reason. To pair another pad on a board
-that is already on it:
+If pairing fails **after** the reboot — `DHKey check failed` — take it off, pair, and put it back:
 
 ```bash
 sudo robotctl pad fallback off
@@ -111,7 +109,7 @@ sudo robotctl pad fallback off
 sudo reboot
 ```
 
-Then pair, then turn it back on and reboot again.
+Then pair, then `pad fallback on` and reboot again. The bond survives it.
 
 To have `pad pair` offer this at the end instead of printing it:
 
@@ -134,10 +132,20 @@ no longer has and the bond is refused.
 
 ## When pairing fails every time
 
-Check `/etc/bluetooth/main.conf` for `Privacy = device`. Boards provisioned before this was
-understood have it, and with it **a pad cannot bond at all**: it rejects the pairing with `DHKey
-check failed (0x0b)`, because that check is computed over both devices' addresses and privacy pairs
-from a resolvable private one. `Privacy = off` is what works.
+First check whether the board is on the pad fallback:
+
+```bash
+robotctl pad status
+```
+
+If it says `fallbck on`, that is deliberate and it sets `Privacy = device` — see above for pairing
+on a board that has it.
+
+Otherwise check `/etc/bluetooth/main.conf` for `Privacy = device` you did not put there. Boards
+provisioned before this was understood have it, and on some boards it stops a pad bonding: it
+rejects the pairing with `DHKey check failed (0x0b)`, because that check is computed over both
+devices' addresses and privacy pairs from a resolvable private one. `Privacy = off` is what works
+there.
 
 ```bash
 sudo sh scripts/setup-board.sh

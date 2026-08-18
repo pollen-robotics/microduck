@@ -1780,24 +1780,31 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
 
-    // Applying the fallback to a board with nothing bonded is the one sequencing mistake that
-    // cannot be undone by trying again: `Privacy = device` stops a pad bonding at all, so the board
-    // is left unable to pair the pad the setting was for. `configd` does not enforce this — taking
-    // the settings *off* must work in any state, and a pad may have been bonded by something else —
-    // so the order is enforced here, where the person who typed it can be told why.
+    // A warning rather than a refusal, and the reason is that the two boards disagree.
+    //
+    // On the board `scripts/setup-board.sh` was measured against, `Privacy = device` stops a pad
+    // bonding at all — pairing fails every time with `DHKey check failed (0x0b)` — which makes
+    // "apply this with nothing bonded" a mistake that leaves the board unable to pair the pad the
+    // setting was for. That was the case this refused outright.
+    //
+    // But on an affected board, running `microduck_runtime`'s stack **bonded a fresh pad with these
+    // settings already in place**. So bonding under `Privacy = device` is not universally impossible,
+    // and refusing here would block the sequence that is known to work on exactly the hardware this
+    // exists for. Neither observation cancels the other, so the command does what it is told and
+    // says what may happen.
     if let PadCommand::Fallback {
         state: FallbackState::On,
+        json: false,
         ..
     } = &command
         && !any_pad_paired(&mut client)?
     {
-        return Err(Failure::new(
-            exit::REFUSED,
-            "no pad is paired, and this setting stops one bonding at all. Pair the pad first \
-             (`sudo robotctl pad pair`), then apply this — the bond survives it, which is the \
-             whole reason the order is this way round."
-                .to_owned(),
-        ));
+        eprintln!(
+            "warning: no pad is bonded yet. On the board this was first measured on, a pad could \
+             not bond at all with these settings on — on an affected board, the old runtime bonded \
+             one fresh with them on. If pairing fails after the reboot, run `pad fallback off`, \
+             pair, then put it back on: a bond made without these settings survives them."
+        );
     }
 
     let (call, json) = match &command {

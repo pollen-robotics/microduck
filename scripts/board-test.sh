@@ -438,18 +438,20 @@ echo "    [ok] forgetting an unknown pad is not an error"
 
 # ── the temporary fallback for boards that cannot keep an Xbox pad ──
 #
-# The order is the whole of it: Privacy = device stops a pad bonding at all, so applying this to a
-# board with nothing bonded leaves it unable to pair the pad the setting was for. That is not a
-# mistake a retry fixes, so it is refused — and the refusal is what this checks, on the shipped
-# binary rather than in a unit test of the check alone.
+# Applying it with nothing bonded warns and proceeds. It used to refuse, on the strength of the
+# board where Privacy = device stopped a pad bonding at all — but on an affected board the old
+# runtime bonds a fresh pad with these settings already on, so refusing would block the sequence
+# that is known to work on exactly the hardware this exists for. The warning is what this checks.
 #
-# Everything below writes to this container /etc, which is why it runs here and not on a board.
-code=0
+# Everything below writes under the state dir, not /etc: with --fake-pads the two files move there,
+# which is also the only way this can work at all, since configd runs as robot here.
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
-    >/dev/null 2>&1 || code=$?
-test "$code" -eq 5 || {
-    echo "    [FAIL] the fallback should be refused with no pad bonded (5), got $code"; exit 1; }
-echo "    [ok] the pad fallback is refused while no pad is bonded (exit 5)"
+    2>&1 >/dev/null | grep -q "no pad is bonded yet"
+echo "    [ok] applying the fallback with no pad bonded warns rather than refusing"
+
+# Back off, so the apply below is measured from a clean board rather than from the warning case.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback off" \
+    >/dev/null
 
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" >/dev/null
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \

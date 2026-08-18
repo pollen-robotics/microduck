@@ -1924,11 +1924,14 @@ pub enum PadPairFailure {
     /// No Bluetooth adapter. On this board `hci0` does not exist until roughly 73 seconds after
     /// power-on, so this is a real answer early in a boot and not necessarily broken hardware.
     NoAdapter,
-    /// BlueZ refused the bond. The classic cause on this board is `Privacy = device` *present* in
-    /// `/etc/bluetooth/main.conf`, which stops a pad bonding at all: the DHKey check is computed
-    /// over both addresses, and privacy pairs from a resolvable private one, so the pad refuses with
-    /// `DHKey check failed (0x0b)`. `scripts/setup-board.sh` sets `Privacy = off`, and
-    /// [`method::PAD_FALLBACK`] is the one thing allowed to put it back — after the bond exists.
+    /// BlueZ refused the bond. One known cause is `Privacy = device` *present* in
+    /// `/etc/bluetooth/main.conf`, which can stop a pad bonding: the DHKey check is computed over
+    /// both addresses, and privacy pairs from a resolvable private one, so the pad refuses with
+    /// `DHKey check failed (0x0b)`. `scripts/setup-board.sh` sets `Privacy = off` for that reason.
+    ///
+    /// It is not universal — a fresh pad has been seen to bond with `device` set, on one of the
+    /// boards [`method::PAD_FALLBACK`] exists for. So this reason means "check the setting", not
+    /// "the setting is wrong".
     Rejected,
     Other,
 }
@@ -1989,17 +1992,19 @@ pub enum PadPairResult {
 pub struct PadFallback {
     /// `Privacy = device` in `/etc/bluetooth/main.conf`.
     ///
-    /// The half that plausibly bites. `microduck_runtime`'s installer credits it with fixing an Xbox
-    /// controller that pairs and then drops straight back out, which is the symptom on these boards
-    /// — and `scripts/setup-board.sh` deliberately sets the opposite, because with it set a pad
-    /// cannot bond in the first place. Both are true, which is why it goes on *after* the bond.
+    /// The likelier of the two to be the one that matters: `microduck_runtime`'s installer credits
+    /// it with fixing an Xbox controller that pairs and then drops straight back out, which is the
+    /// symptom on these boards. `scripts/setup-board.sh` deliberately sets the opposite, on a
+    /// measurement from a different board where `device` stopped a pad bonding at all. Both hold —
+    /// on different units — so neither value is right for every board.
     pub privacy_device: bool,
     /// `options bluetooth disable_ertm=1` in `/etc/modprobe.d/bluetooth.conf`.
     ///
-    /// The half that probably does nothing here, kept because it costs nothing to be sure. ERTM is
-    /// an L2CAP **classic** feature, and every pad this robot has met is LE-only — so on the
-    /// hardware in the building this cannot be what is failing. It is what `microduck_runtime`
-    /// installs, this repo sets it nowhere, and "the runtime's settings" means both of them.
+    /// The less likely of the two, kept because the working configuration was never bisected. ERTM
+    /// is an L2CAP **classic** feature and every pad this robot has met is LE-only, so it is hard to
+    /// see how it bites here — but what is known is that the runtime's *whole* stack works on an
+    /// affected board, not which part of it does. This repo sets it nowhere, which is what made it
+    /// invisible when comparing a board that once ran the runtime against one that never did.
     pub ertm_disabled: bool,
 }
 

@@ -21,37 +21,51 @@
 //! plain BLE with neither of these files set, so both halves are reversible and
 //! [`crate::pad::Pads::status`] reports which boards still carry them.
 //!
-//! ## The two settings, and why one of them is probably inert
+//! ## What is known, and what is not
 //!
-//! Both come from `microduck_runtime`'s `install.sh`, which is the stack these robots ran before
-//! this daemon existed and the one place an Xbox pad is known to have worked for a while.
+//! **Known: the whole runtime stack works on an affected board.** A board that cannot keep a pad
+//! under this daemon was run on `microduck_runtime` as it ships — its installer, its settings, its
+//! own `bluetoothctl scan/connect/trust` pairing — and a pad that had never been bonded to it paired
+//! and stayed. That is the observation this module exists to make reproducible.
+//!
+//! **Not known: which part of that stack is responsible.** It was not bisected, and the runtime
+//! differs from this daemon in at least three ways at once — the two settings below, and a pairing
+//! sequence that never calls `Pair()`. So both settings are applied together. Applying one and
+//! calling it "the runtime's settings" would be a claim nobody has earned.
 //!
 //!  - **`Privacy = device`** in `/etc/bluetooth/main.conf`. The runtime's notes credit it with
 //!    fixing "an Xbox controller that pairs and then drops straight back out — an endless
 //!    connect/disconnect loop", which is this symptom almost word for word.
 //!  - **`options bluetooth disable_ertm=1`** in `/etc/modprobe.d/bluetooth.conf`. ERTM is an L2CAP
 //!    **classic** feature, and every pad this robot has met is LE-only ([`crate::bluez`] has the
-//!    bond dump), so on the hardware in the building this cannot be what is failing. It is applied
-//!    anyway because it is free, because this repo sets it nowhere at all, and because "the
-//!    runtime's settings" is a claim that should not quietly mean "one of them".
+//!    bond dump), so on the hardware in the building this is the least likely of the two to matter.
+//!    It is applied anyway because it is free and because this repo sets it nowhere at all — which
+//!    is what made it invisible when comparing a board that once ran the runtime against one that
+//!    never did.
 //!
-//! ## The order is the whole trick
+//! To bisect it: `scripts/pad-stack-report.sh --fingerprint` now carries both values, so a board
+//! made to work under the runtime and the same board under this daemon can be diffed directly.
 //!
-//! `Privacy = device` **stops a pad bonding at all** on these boards. That is measured, not
-//! inferred: LE Secure Connections pairing reaches the last step and the pad rejects it with `DHKey
-//! check failed (0x0b)`, because the check is computed over both devices' addresses and privacy
-//! pairs from a resolvable private one. `scripts/setup-board.sh` sets `Privacy = off` for exactly
-//! that reason and says so at length.
+//! ## Two boards disagree about whether a pad can bond with privacy on
 //!
-//! So the two facts are in genuine tension, and `setup-board.sh` already wrote down the way out:
+//! `scripts/setup-board.sh` sets `Privacy = off` on the strength of a measurement: with `device`, LE
+//! Secure Connections pairing reaches the last step and the pad rejects it with `DHKey check failed
+//! (0x0b)` — the check is computed over both devices' addresses, and privacy pairs from a resolvable
+//! private one, so the two sides compute different values. On that board a pad could not bond at all.
+//!
+//! On an affected board, a fresh pad **did** bond with the runtime's settings in place. Both
+//! observations stand; they are about different units, which is the same shape as the fault itself.
+//!
+//! So this module enforces no order. `setup-board.sh` already wrote down a sequence that is safe
+//! either way —
 //!
 //! > *"If a pad ever does start dropping on connect, the two are in genuine tension and the answer
 //! > is to pair with privacy off and then re-enable it — not to set `device` and lose the ability to
 //! > pair at all."*
 //!
-//! That is what this implements. The bond is made under `Privacy = off`, where it can succeed; then
-//! privacy goes on and the board reboots, and the pad reconnects to the bond it already has. Nothing
-//! here may run before a pad is bonded, and `robotctl` is what enforces the sequence.
+//! — and a bond made under `Privacy = off` survives the flip, so pairing first always works. But
+//! pairing *after* the settings are on evidently also works on the boards that need them, and
+//! `robotctl` therefore warns rather than refusing.
 //!
 //! ## Why a reboot rather than a restart
 //!
