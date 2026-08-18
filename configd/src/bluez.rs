@@ -568,19 +568,11 @@ impl BlueZ {
     /// a drop.
     async fn watch_hold(&self, mac: &str, within: Duration) -> proto::PadHold {
         let deadline = tokio::time::Instant::now() + within;
-        let connected_now = |this: &Self, mac: String| async move {
-            this.devices()
-                .await
-                .ok()
-                .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(&mac)))
-                .is_some_and(|d| d.connected)
-        };
-
-        let mut connected = connected_now(self, mac.to_owned()).await;
+        let mut connected = self.is_connected(mac).await;
         let mut drops = 0;
         while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(HOLD_POLL.min(deadline - tokio::time::Instant::now())).await;
-            let now = connected_now(self, mac.to_owned()).await;
+            let now = self.is_connected(mac).await;
             if connected && !now {
                 drops += 1;
                 tracing::warn!(mac, drops, "the pad dropped");
@@ -595,6 +587,19 @@ impl BlueZ {
         };
         tracing::info!(mac, ?hold, held = hold.held(), "watched the bond");
         hold
+    }
+
+    /// Is this pad connected right now?
+    ///
+    /// A method rather than a closure inside [`Self::watch_hold`], which is where it started: a
+    /// closure taking `&self` and returning an async block has to name a lifetime it cannot, and
+    /// `bluez.rs` is Linux-only so the borrow checker never says so on a laptop.
+    async fn is_connected(&self, mac: &str) -> bool {
+        self.devices()
+            .await
+            .ok()
+            .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(mac)))
+            .is_some_and(|d| d.connected)
     }
 
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
