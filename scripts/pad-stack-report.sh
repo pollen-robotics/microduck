@@ -153,6 +153,7 @@ f_chip=unreadable
 f_pad_id=none
 f_pad_transport=none
 f_pad_bond=none
+f_pad_pairing=none
 f_pad_input=none
 f_daemon=absent
 
@@ -533,6 +534,51 @@ section_pads() {
         fi
         field bond "$bond"
 
+        # **How the two sides agreed on a key**, which is the difference no version number shows and
+        # the one worth having when a pad holds on one board and flaps on its twin.
+        #
+        # `Authenticated` is the SMP method BlueZ recorded: `0` is legacy Just Works, `2` is LE
+        # Secure Connections. `EDiv`/`Rand` are zero for an LESC bond and non-zero for a legacy one,
+        # so the three together say which of the two protocols actually ran — and on this hardware
+        # that has already split one way: an Xbox pad that will not stay bonded negotiated LESC,
+        # while a different make that holds on the same board negotiated legacy Just Works.
+        #
+        # Zero/non-zero rather than the values. `EDiv` and `Rand` are not the key, but they are
+        # half of a legacy bond's material and a report gets pasted into tickets.
+        pairing=""
+        if [ -n "$bond_file" ] && [ -r "$bond_file" ]; then
+            for section in LongTermKey PeripheralLongTermKey SlaveLongTermKey LinkKey; do
+                body="$(sed -n "/^\[${section}\]/,/^\[.*\]$/p" "$bond_file" 2>/dev/null || true)"
+                [ -n "$body" ] || continue
+                auth="$(printf '%s\n' "$body" | sed -n 's/^Authenticated=//p' | head -1 || true)"
+                one="${section} auth=${auth:-unset}"
+                ediv="$(printf '%s\n' "$body" | sed -n 's/^EDiv=//p' | head -1 || true)"
+                rand="$(printf '%s\n' "$body" | sed -n 's/^Rand=//p' | head -1 || true)"
+                case "$ediv" in
+                    "") one="${one} ediv=unset" ;;
+                    0)  one="${one} ediv=zero" ;;
+                    *)  one="${one} ediv=nonzero" ;;
+                esac
+                case "$rand" in
+                    "") one="${one} rand=unset" ;;
+                    0)  one="${one} rand=zero" ;;
+                    *)  one="${one} rand=nonzero" ;;
+                esac
+                pairing="${pairing}${pairing:+; }${one}"
+            done
+        fi
+        # Distinguished from "no key sections at all", which `bond` above already reports: an empty
+        # answer here means the file was unreadable, and that needs root rather than a bug report.
+        if [ -z "$pairing" ]; then
+            if [ -n "$bond_file" ] && [ -r "$bond_file" ]; then
+                pairing="no key section in the bond"
+            else
+                pairing="unreadable — root reads /var/lib/bluetooth"
+            fi
+        fi
+        f_pad_pairing="$pairing"
+        field pairing "$f_pad_pairing"
+
         # The live link. `hcitool con` is the one command that says LE or ACL for a connection that
         # exists right now, which is a different question from what the bond was made over — a pad
         # can be bonded over LE and, on a board with a classic HID stack, reconnect over BR/EDR.
@@ -690,6 +736,7 @@ section_fingerprint() {
     field pad "$f_pad_id"
     field transport "$f_pad_transport"
     field bond "$f_pad_bond"
+    field pairing "$f_pad_pairing"
     field input "$f_pad_input"
     field daemon "$f_daemon"
 }
