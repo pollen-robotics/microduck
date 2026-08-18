@@ -250,11 +250,20 @@ diff /tmp/a.fp /tmp/b.fp
 No output means the same stack. The fingerprint carries no timestamps and no addresses, so anything
 `diff` prints is a real difference.
 
-Two lines to read before the rest. `transport` is `LE` on every pad tried so far, and a board that
-says `BR/EDR` is putting the pad through the kernel's classic HID path instead of BlueZ's — a
-different driver, different button numbering. `input` is the `Bus`/`Vendor`/`Product`/`Version`
-quadruple that SDL and `gilrs` hash into a mapping GUID: two boards differing there have different
-axis and button mappings, whatever else matches.
+Three lines to read before the rest.
+
+`pairing` is the one to read first when a pad holds on one board and drops on the other, because it
+is the only line that says what the two radios actually *agreed*, rather than which versions they
+run. `auth=2 ediv=zero rand=zero` is LE Secure Connections; `auth=0 ediv=nonzero rand=nonzero` is
+legacy Just Works. That has already split one way here: the Xbox pad that will not stay bonded
+negotiated LESC, and a different make that holds on the same board negotiated legacy.
+
+`transport` is `LE` on every pad tried so far, and a board that says `BR/EDR` is putting the pad
+through the kernel's classic HID path instead of BlueZ's — a different driver, different button
+numbering.
+
+`input` is the `Bus`/`Vendor`/`Product`/`Version` quadruple that SDL and `gilrs` hash into a mapping
+GUID: two boards differing there have different axis and button mappings, whatever else matches.
 
 ---
 
