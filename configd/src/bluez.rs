@@ -47,13 +47,23 @@
 //! active scan and it fails intermittently, which presents as a pad that pairs on the second
 //! attempt and looks like flaky hardware.
 //!
-//! ## The agent, and why it is not the default one
+//! ## The agent, and why it claims the default role
 //!
 //! Pairing needs an agent — something for bluetoothd to ask "is this allowed" — and `btd` already
-//! registers one as the **default** agent for the phone path. This registers a second, *non-default*
-//! agent, which works because bluetoothd picks the agent belonging to the D-Bus connection that
-//! called `Pair()` and only falls back to the default. So `configd` answers for the pairings it
-//! starts and `btd` keeps answering for everything else; neither has to know about the other.
+//! registers one as the **default** agent for the phone path. This registers a second agent scoped
+//! to the pad being paired, and takes the default role for the length of the pairing window.
+//!
+//! Taking the role is not optional here, for two reasons that compound. bluetoothd pushes an IO
+//! capability down to the adapter from the default agent only, so a non-default `NoInputNoOutput`
+//! leaves the adapter declaring input and display, which puts MITM in the pairing request and makes
+//! SMP choose numeric comparison over just-works. And bluetoothd prefers the agent belonging to the
+//! connection that called `Pair()` — which, since the bond is now driven by `Connect()` and `Pair()`
+//! is never issued on the path that works, is nobody. So the confirmation would be raised against
+//! the default agent, and a `configd` that had not claimed the role would never see it: the pad
+//! waits out the link supervision timeout and BlueZ reports `AuthenticationCanceled`.
+//!
+//! `unregister_agent` hands the role back, and `btd` only holds it when pairing is required at all,
+//! so `configd` answers for the pairings it starts and `btd` keeps answering for everything else.
 //!
 //! It is scoped to one device path and rejects anything else, so a pairing request arriving from an
 //! unrelated device while the window is open is refused rather than auto-accepted. A pad is
