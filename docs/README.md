@@ -45,6 +45,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`ci-setup.md`](project/ci-setup.md) | One-time setup for the release pipeline: keys, secrets, rotation. |
 | [`install-path-gap.md`](project/install-path-gap.md) | Why four install-path bugs reached a board, and what closed it. Closed. |
 | [`slice-2-bringup.md`](project/slice-2-bringup.md) | What a real Radxa Zero 3W did with slice 2. |
+| [`assessment-2026-08-18.md`](project/assessment-2026-08-18.md) | What blocks shipping, what is missing, and what has accumulated. |
 
 ## Elsewhere
 
