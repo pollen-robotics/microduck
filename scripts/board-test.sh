@@ -424,42 +424,26 @@ su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad sta
     | grep -q "\"trusted\":true"
 echo "    [ok] the paired pad is trusted, so it reconnects by itself"
 
-su member -s /bin/sh -c \
-    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
-    | grep -q "forgot"
-echo "    [ok] a pad can be forgotten"
-
-# Forgetting again is not an error — the same contract as `net forget`, and a client must not
-# present it as a failure.
-su member -s /bin/sh -c \
-    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
-    | grep -q "was not paired"
-echo "    [ok] forgetting an unknown pad is not an error"
-
 # ── the temporary fallback for boards that cannot keep an Xbox pad ──
 #
-# Applying it with nothing bonded warns and proceeds. It used to refuse, on the strength of the
-# board where Privacy = device stopped a pad bonding at all — but on an affected board the old
-# runtime bonds a fresh pad with these settings already on, so refusing would block the sequence
-# that is known to work on exactly the hardware this exists for. The warning is what this checks.
+# Here rather than after the forget checks below, and the ordering is the point: the fake models
+# forget as RemoveDevice, so a forgotten pad leaves its view entirely and cannot be paired again
+# without restarting configd. This half needs the pad the pairing check above bonded.
 #
-# Everything below writes under the state dir, not /etc: with --fake-pads the two files move there,
-# which is also the only way this can work at all, since configd runs as robot here.
-su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
-    2>&1 >/dev/null | grep -q "no pad is bonded yet"
-echo "    [ok] applying the fallback with no pad bonded warns rather than refusing"
-
-# Back off, so the apply below is measured from a clean board rather than from the warning case.
-su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback off" \
-    >/dev/null
-
-su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad pair" >/dev/null
+# Everything it writes goes under the state dir, not /etc: with --fake-pads the two files move
+# there, which is also the only way this can work at all, since configd runs as robot here.
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
     | grep -q "sudo reboot"
-echo "    [ok] with a pad bonded it applies, and says the board has to reboot"
+echo "    [ok] with a pad bonded the fallback applies, and says the board has to reboot"
 grep -Eq "^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device" /var/lib/robot/config/bluetooth/main.conf
 grep -q "disable_ertm=1" /var/lib/robot/config/modprobe.d/bluetooth.conf
 echo "    [ok] both halves of the runtime settings are on disk"
+
+# No warning with a pad bonded — the sequencing note is for the case it applies to, and one that
+# fires every time is one nobody reads.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
+    2>&1 >/dev/null | grep -q "no pad is bonded yet" \
+    && { echo "    [FAIL] warned about an unbonded pad while one is bonded"; exit 1; }
 
 # Visible in `pad status`, because the end state is every board off this, and finding the ones still
 # on it must not depend on remembering which they were.
@@ -480,7 +464,30 @@ test ! -e /var/lib/robot/config/modprobe.d/bluetooth.conf
 echo "    [ok] taking it off restores Privacy = off and removes the modprobe file"
 
 su member -s /bin/sh -c \
-    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" >/dev/null
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "forgot"
+echo "    [ok] a pad can be forgotten"
+
+# Forgetting again is not an error — the same contract as `net forget`, and a client must not
+# present it as a failure.
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \
+    | grep -q "was not paired"
+echo "    [ok] forgetting an unknown pad is not an error"
+
+# With the pad forgotten, the other half of the fallback: it warns and proceeds rather than
+# refusing. It used to refuse, on the strength of the board where Privacy = device stopped a pad
+# bonding at all — but on an affected board the old runtime bonds a fresh pad with these settings
+# already on, so refusing would block the sequence known to work on the hardware this exists for.
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback on" \
+    2>&1 >/dev/null | grep -q "no pad is bonded yet"
+echo "    [ok] applying the fallback with no pad bonded warns rather than refusing"
+grep -Eq "^[[:space:]]*Privacy[[:space:]]*=[[:space:]]*device" /var/lib/robot/config/bluetooth/main.conf
+echo "    [ok] and applies anyway, rather than refusing"
+
+su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad fallback off" \
+    >/dev/null
+
 
 # The passphrase must not be in the journal. NetConnectParams has a hand-written Debug that
 # redacts it, and this is the check that keeps it honest on the shipped binary rather than in
