@@ -9,6 +9,8 @@ contract. This covers the two services that landed together, because **they are 
 every decision in one constrains the other: `btd` owns nothing, so `configd` exists; `configd`
 serves a PIN, so `btd` can pair; a method routed in `btd` is a method `configd` must answer.
 
+The robot side, that is. The phone at the other end of it is [`mobile-app.md`](mobile-app.md).
+
 Sections marked **measured** were established on a Radxa Zero 3W rather than reasoned about.
 
 **The path works end to end on hardware** (2026-08-05): a Mac discovered the robot, bonded,

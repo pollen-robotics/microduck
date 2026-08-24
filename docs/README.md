@@ -34,6 +34,7 @@ own the mechanism is the bug.
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
 | [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |
 | [`app-path-design.md`](design/app-path-design.md) | `btd` and `configd` — how a phone configures a robot over BLE. |
+| [`mobile-app.md`](design/mobile-app.md) | The phone app itself: stack, what it reuses, and what the robot still owes it. |
 | [`boot-recovery-net.md`](design/boot-recovery-net.md) | Falling back to golden when the release that booted cannot start its daemons. |
 
 ## `project/` — you are running the project
