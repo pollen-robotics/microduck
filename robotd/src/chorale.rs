@@ -542,7 +542,7 @@ impl Chorale {
         // holding the beat, and two beacons carrying a piece would be two conductors.
         let idle = self.beacon(proto::ChoraleBeacon::IDLE, self.heartbeat(now), Vec::new());
         let advertise = self.publish(Some(idle), true);
-        let singing = position.and_then(|at| self.my_part(&roster).map(|part| (part, at)));
+        let singing = self.my_part(&roster).zip(position);
         Tick {
             advertise,
             joining: singing.is_none(),
@@ -630,7 +630,6 @@ pub fn head_expression(beats: f64, reach: f64) -> [f64; 4] {
     ]
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;

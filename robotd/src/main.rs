@@ -1832,11 +1832,13 @@ async fn control_loop<T: RobotIo>(
         // still-set `enabled` flag wins — `request_relax` clears that flag, and reading the request
         // first means the order cannot invert.
         match intents.take_power_request() {
-            // The power-off has been asked for and torque is off. Standing the robot up now would
-            // hand the poweroff a robot mid-ramp, stiff, which is the outcome the sit exists to
-            // avoid.
-            Some(intents::PowerRequest::Init) if powered_off => {
-                tracing::warn!("robot.init ignored: the robot is powering off")
+            // Shutdown owns the robot: sitting, or already cutting power. Standing the robot
+            // up now would hand the poweroff a robot mid-ramp, stiff, which is the outcome
+            // the sit exists to avoid. `init` during the sit is also how the duck stood
+            // back up — the sequence went limp and the same tick (or the next `robot.init`)
+            // ramped it home. #159.
+            Some(intents::PowerRequest::Init) if powered_off || shutdown_sit.is_some() => {
+                tracing::warn!("robot.init ignored: shutdown is in progress")
             }
             Some(intents::PowerRequest::Init) => match (bringup, sensors.as_ref()) {
                 // Unlike `enable`, this needs no policy: "stand up" is a reasonable thing to ask of
@@ -2336,7 +2338,9 @@ async fn control_loop<T: RobotIo>(
         // of it — so without the guard, the very tick that cut torque for the poweroff turned it
         // back on and started ramping the robot to home. Seen on the robot as "sits, stands back
         // up, switches off", or when the poweroff was quicker, "sits, switches off, stiff".
+        // Same while the sit is still in flight: `powered_off` is not set yet. #159.
         if !powered_off
+            && shutdown_sit.is_none()
             && let (Bringup::Limp, true, true, Some(sensors)) = (
                 bringup,
                 snapshot.enabled,
@@ -2823,12 +2827,28 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
-        // The mouth is not part of any policy; the intent is the only thing that moves it.
+        // The mouth is not part of any policy. The pad's analog triggers already write
+        // `snapshot.mouth`; a one-shot (`robotctl quack`, the greet, a peck) has no
+        // trigger, so the player says how open the beak should be while it calls.
+        //
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
-        // a restart cannot snap a mouth.
-        if driving && theremin_state.is_none() && chorale_state.is_none() {
-            targets[duck_control::model::MOUTH_INDEX] =
-                duck_control::model::mouth_target(snapshot.mouth);
+        // a restart cannot snap a mouth. A CLI quack on a sitting-but-torqued robot is the
+        // exception: that is how you tell which duck answered when several are in earshot,
+        // and gating on `driving` made the visible half silently absent, the same way it
+        // did for the theremin.
+        let quack_open = voice.as_mut().map(sound::Sound::quack_mouth).unwrap_or(0.0);
+        if theremin_state.is_none() && chorale_state.is_none() {
+            if driving {
+                targets[duck_control::model::MOUTH_INDEX] =
+                    duck_control::model::mouth_target(snapshot.mouth.max(quack_open));
+            } else if quack_open > 0.0
+                && snapshot.enabled
+                && bringup == Bringup::Ready
+                && !powered_off
+            {
+                targets[duck_control::model::MOUTH_INDEX] =
+                    duck_control::model::mouth_target(quack_open);
+            }
         }
 
         match safety.apply(targets, hold, gain) {
