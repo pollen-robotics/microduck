@@ -275,6 +275,38 @@ mode = "walk"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
 
+[maploc]
+# Mapping & localization. Off by default: it is the most CPU-hungry thing the robot can
+# do, and a duck that is not being asked to map should not pay for it. When on, robotd
+# builds an occupancy map from the head ToF (needs tofd running) and contact odometry,
+# persists it across restarts, and serves it live to `robotctl monitor` — the path panel
+# becomes the map (`m` makes it fullscreen).
+# enabled = false
+
+# When scans are painted into the map. "stop_and_scan" (default) integrates only while
+# the robot stands still — a stop's frames are voted against each other before any of
+# them ink the map, which keeps walking passers-by and sensor noise out of the walls.
+# "continuous" also paints while walking: more coverage, blurrier walls.
+# mode = "stop_and_scan"
+
+# Where the session (submaps + pose graph + last pose) persists. Autosaved once a minute
+# while mapping and on shutdown; restored on boot.
+# map_path = "/var/lib/robot/maploc.session"
+
+# Start from a clean slate instead of restoring the saved session.
+# wipe_on_boot = false
+
+# Sweep the head slowly at every stop while mapping (and whenever the pose is suspect —
+# after a sit, a fall, a reboot, or scans that contradict the map): each stop then captures
+# a ~150° arc instead of a 45° wedge, which is where both map quality and relocalization
+# reliability come from. The commanded head pose comes back as soon as the robot moves.
+# search_sweep = true
+
+# Record everything the mapper consumes (odometry ticks + raw depth frames) to a
+# timestamped .mdlg file in this directory — replayable offline through the maploc
+# crate's `evaluate` bench, byte-for-byte the way the robot saw it. ~6 KB/s while
+# mapping, and nothing cleans the directory up: an experiment switch, not a default.
+# record_dir = "/var/lib/robot/maploc-logs"
 [theremin]
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
 # opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this

@@ -1324,6 +1324,7 @@ mod tests {
                 "detect",
                 "chorale",
                 "theremin",
+                "maploc",
                 "audio",
                 "media"
             ]

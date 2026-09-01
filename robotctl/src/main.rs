@@ -405,6 +405,14 @@ enum RobotCommand {
     /// the closest gaze the joints allow, and says so.
     // `allow_negative_numbers`, or `look 0.3 0 -0.3` reads `-0.3` as a flag —
     // and looking down is the single most common thing to ask a duck.
+    /// Reset the mapping session: map, pose graph and localization state, and
+    /// the saved session file on the robot. Mapping starts over from wherever
+    /// the robot stands. Needs `[maploc] enabled = true`.
+    MapWipe {
+        #[arg(long)]
+        json: bool,
+    },
+
     #[command(allow_negative_numbers = true)]
     Look {
         x: f64,
@@ -2174,6 +2182,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             *json,
         ),
         RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
+        RobotCommand::MapWipe { json } => (proto::Call::RobotMapWipe, *json),
         RobotCommand::Look {
             x,
             y,
@@ -2235,6 +2244,9 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::MapWipe { .. } => {
+            println!("map wiped — mapping starts fresh from where the robot stands")
+        }
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())

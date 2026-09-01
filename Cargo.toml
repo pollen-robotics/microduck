@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "duckctl", "kinematics", "maploc", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # Everything except `duckctl`, and that exception is the whole reason this key exists.
 #
@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "d
 # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
 #
 # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
-default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "maploc", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh

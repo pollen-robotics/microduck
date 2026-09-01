@@ -1,0 +1,29 @@
+# Ground truth for the lab room — units: CENTIMETRES and DEGREES.
+#
+# Room frame: origin at the CAD sketch's origin (the "Top" marker on the
+# left wall), x to the right, y up — matching the drawing this was
+# digitized from. Yaw is counter-clockwise from +x.
+#
+# The two corridor walls at the bottom end at undimensioned sketch points;
+# their -115 ends are scaled off the drawing, not measured.
+
+walls = [
+    [0.0, -115.0, 0.0, 88.0],        # left wall
+    [0.0, 88.0, 127.5, 88.0],        # upper-left wall
+    [127.5, 88.0, 127.5, 128.0],     # notch, left side
+    [127.5, 128.0, 138.0, 128.0],    # the 10.5 pillar top
+    [138.0, 128.0, 138.0, 88.0],     # recess, left side
+    [138.0, 88.0, 180.0, 88.0],      # recess bottom (42)
+    [180.0, 88.0, 180.0, 128.0],     # recess, right side
+    [180.0, 128.0, 231.0, 128.0],    # top edge (51)
+    [231.0, 128.0, 231.0, 0.0],      # right wall (128)
+    [231.0, 0.0, 89.0, 0.0],         # lower wall (142)
+    [89.0, 0.0, 89.0, -115.0],       # corridor right wall
+]
+
+# Boot pose (the red arrow) — measure and correct these! The map frame is
+# anchored here, so every reported error inherits any error in this pose.
+start = [47.0, 5.0, 90.0]
+
+# Post-carry pose (the blue arrow) — measure and correct too.
+kidnap = [217.0, 48.0, 180.0]

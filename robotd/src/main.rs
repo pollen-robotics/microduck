@@ -21,6 +21,7 @@
 mod chorale;
 mod control;
 mod intents;
+mod maploc;
 mod params;
 mod soc;
 mod sound;
@@ -374,6 +375,16 @@ struct RobotState {
     shutdown: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
+    /// Fan-out for `robot.map` — populated by the maploc worker when
+    /// `[maploc]` is enabled, quiet otherwise. Small buffer: frames arrive
+    /// at ~1 Hz and only the newest matters.
+    map_tx: tokio::sync::broadcast::Sender<proto::MapFrame>,
+    /// The mapping worker's handle, when maploc is enabled — set once by the
+    /// control loop at spawn so the IPC side can ask for a wipe.
+    maploc: std::sync::OnceLock<maploc::Host>,
+    /// What `robot.map`'s answer says about this robot's mapping.
+    maploc_enabled: bool,
+    maploc_mode: &'static str,
     /// What `btd` should be advertising, published when it changes.
     ///
     /// A broadcast channel like the state stream, and for the same reason: `btd` subscribes, and a
@@ -458,6 +469,13 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            map_tx: tokio::sync::broadcast::Sender::new(4),
+            maploc: std::sync::OnceLock::new(),
+            maploc_enabled: params.maploc.enabled,
+            maploc_mode: match params.maploc.mode {
+                crate::params::MaplocMode::StopAndScan => "stop_and_scan",
+                crate::params::MaplocMode::Continuous => "continuous",
+            },
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
@@ -733,6 +751,12 @@ async fn main() -> ExitCode {
     // mid-transaction and leaving a half-written packet on the bus.
     state.shutdown.store(true, Ordering::Relaxed);
     let _ = control.join();
+    // The mapping worker's channel never closes on its own (the tofd feed
+    // and the IPC handle keep senders alive), so tell it to save and stop —
+    // this is what makes the session's save-on-shutdown real.
+    if let Some(host) = state.maploc.get() {
+        host.shutdown();
+    }
     let _ = std::fs::remove_file(&args.socket);
     code
 }
@@ -1214,6 +1238,9 @@ async fn control_loop<T: RobotIo>(
     let head_alpha = params.control.head_alpha.clamp(0.0, 1.0);
     let mut twist_ema = [0.0f64; 3];
     let mut head_ema = [0.0f64; 4];
+    // The relocalize head sweep's clock; runs only while the mapper is
+    // searching and the robot stands.
+    let mut sweep_t = 0.0f64;
     let mut body_ema = [0.0f64; 3];
 
     // Coasting over a dropped bus read, and where the robot actually is.
@@ -1230,6 +1257,18 @@ async fn control_loop<T: RobotIo>(
     // read — the prototype ran it at 100 Hz on extra bus reads, which is exactly the
     // bus pressure the spasms investigation taught this loop not to add.
     let mut odometry = odometry::Odometry::alpha();
+
+    // Mapping, when asked for: a niced worker thread fed by this loop's own
+    // samples, plus a sibling thread pumping tofd's depth stream to it (its
+    // own thread with its own IO-enabled runtime — THIS runtime is
+    // deliberately time-only, and a socket task spawned on it dies at the
+    // first connect). The loop's entire cost is one `try_send` per tick.
+    let maploc_host = params.maploc.enabled.then(|| {
+        tracing::info!(mode = state.maploc_mode, "maploc enabled");
+        let host = maploc::spawn(params.maploc.clone(), state.map_tx.clone());
+        let _ = state.maploc.set(host.clone());
+        host
+    });
 
     // The sit-then-power-off sequence.
     let mut shutdown_sit: Option<Instant> = None;
@@ -1372,6 +1411,29 @@ async fn control_loop<T: RobotIo>(
             // into the estimator would tell it the robot froze, which it did not.
             if safety.imu_ready() {
                 odometry.update(&fresh.positions, fresh.imu.quat);
+                if let Some(host) = &maploc_host {
+                    let position = odometry.position();
+                    host.observe(maploc::OdomSample {
+                        odom: (
+                            position[0] as f32,
+                            position[1] as f32,
+                            odometry.yaw() as f32,
+                        ),
+                        gravity: fresh.imu.gravity,
+                        trunk_z: position[2],
+                        head: [
+                            fresh.positions[5],
+                            fresh.positions[6],
+                            fresh.positions[7],
+                            fresh.positions[8],
+                        ],
+                        // Last tick's verdict — 20 ms stale, and the stillness
+                        // window on the worker side absorbs far more than that.
+                        moving: state.moving.load(Ordering::Relaxed),
+                        sitting: controller.as_ref().is_some_and(|c| c.is_sitting()),
+                        fallen: safety.fallen(),
+                    });
+                }
             }
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
@@ -1753,7 +1815,41 @@ async fn control_loop<T: RobotIo>(
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
             *ema += cmd_alpha * (target - *ema);
         }
-        for (ema, target) in head_ema.iter_mut().zip(gated.head) {
+        // While the mapper cannot vouch for its pose and the robot is
+        // standing, sweep the head: relocalization through one static 45°
+        // wedge aliases (measured — see maploc::mapper); a slow pan hands
+        // the accumulator a 150°-wide composite instead. Overrides only
+        // head yaw, only while searching; the EMA below glides both the
+        // takeover and the handback.
+        let mut head_target = gated.head;
+        // Sweep while searching — AND at every stop-and-scan stop: the
+        // prototype panned the head at every stop (130–230° spans), and
+        // that width is where its map quality came from. A static stop
+        // keeps whatever 45° wedge the head happens to face and throws
+        // the rest of the stop away.
+        let sweeping = params.maploc.search_sweep
+            && maploc_host.as_ref().is_some_and(|host| {
+                host.searching() || params.maploc.mode == params::MaplocMode::StopAndScan
+            })
+            && !state.moving.load(Ordering::Relaxed)
+            && !in_limp_fall
+            && controller.as_ref().is_some_and(|c| !c.is_sitting());
+        if sweeping {
+            sweep_t += dt;
+            // A triangle wave, ±0.9 rad over 6 s, starting from centre:
+            // slow enough that every wall cell stays in view for the
+            // accumulator's 3-frame vote, wide enough to triple the FOV.
+            let phase = (sweep_t / 6.0 + 0.25).fract();
+            let tri = if phase < 0.5 {
+                4.0 * phase - 1.0
+            } else {
+                3.0 - 4.0 * phase
+            };
+            head_target[2] = 0.9 * tri;
+        } else {
+            sweep_t = 0.0;
+        }
+        for (ema, target) in head_ema.iter_mut().zip(head_target) {
             *ema += head_alpha * (target - *ema);
         }
         if snapshot.pose.active {
@@ -1972,8 +2068,14 @@ async fn control_loop<T: RobotIo>(
                     Ok(step) => (
                         step.targets,
                         step.gain,
-                        // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
+                        // A scripted move is motion whatever the twist says; so is
+                        // walking. But "walking" is the policy's own standing
+                        // decision (the label), not `twist > 0.0`: a gamepad twist
+                        // idles at a not-quite-zero value below the standing
+                        // threshold, which once latched `moving` true through an
+                        // entire stop-and-scan lap — the robot stood, odometry
+                        // read zero, and mapping still refused every stop.
+                        step.busy || step.label == "walk",
                         step.label,
                     ),
                     Err(e) => {
@@ -2475,87 +2577,75 @@ async fn handle(
     let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
+    let mut maps: Option<tokio::sync::broadcast::Receiver<proto::MapFrame>> = None;
 
     loop {
-        // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
-        // beacon is due for `btd`. Written as nested selects rather than one, because the two
-        // streams are independent options and a client normally has neither.
-        let line = match (states.as_mut(), beacons.as_mut()) {
-            (None, None) => lines.next_line().await?,
-            (None, Some(rx)) => {
-                tokio::select! {
-                    line = lines.next_line() => line?,
-                    received = rx.recv() => {
-                        match received {
-                            Ok(advertise) => {
-                                write_line(
-                                    &mut write_half,
-                                    &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
-                                )
-                                .await?;
-                            }
-                            // Lagged: `btd` fell behind on beats. The newest beacon is the only
-                            // one worth having — an old beat is a beat that has already passed.
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(dropped = n, "chorale subscriber fell behind");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                        }
-                        continue;
-                    }
-                }
+        // Absent subscriptions pend forever, so one select covers every
+        // combination of the three streams without a match ladder per case.
+        async fn next_from<T: Clone>(
+            rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+        ) -> Result<T, tokio::sync::broadcast::error::RecvError> {
+            match rx {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
             }
-            (Some(rx), beacon_rx) => {
-                let mut pending = beacon_rx;
-                tokio::select! {
-                    line = lines.next_line() => line?,
-                    received = async {
-                        match pending.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            // Never resolves, so the select falls to the other arms.
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        match received {
-                            Ok(advertise) => {
-                                write_line(
-                                    &mut write_half,
-                                    &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
-                                )
+        }
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            received = next_from(&mut states) => {
+                match received {
+                    Ok(state) => {
+                        // Decimate per subscriber: a dashboard asking for 10 Hz
+                        // should not cost what a digital twin asking for 50 does.
+                        let due = last_sent
+                            .map(|at| at.elapsed() >= decimate)
+                            .unwrap_or(true);
+                        if due {
+                            last_sent = Some(Instant::now());
+                            write_line(&mut write_half, &proto::Request::notify_state(&state))
                                 .await?;
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(dropped = n, "chorale subscriber fell behind");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                         }
-                        continue;
                     }
-                    received = rx.recv() => {
-                        match received {
-                            Ok(state) => {
-                                // Decimate per subscriber: a dashboard asking for 10 Hz
-                                // should not cost what a digital twin asking for 50 does.
-                                let due = last_sent
-                                    .map(|at| at.elapsed() >= decimate)
-                                    .unwrap_or(true);
-                                if due {
-                                    last_sent = Some(Instant::now());
-                                    write_line(&mut write_half, &proto::Request::notify_state(&state))
-                                        .await?;
-                                }
-                            }
-                            // Lagged: the client fell behind and lost frames. That is the
-                            // designed behaviour — state is advisory and must never apply
-                            // backpressure to the control loop — so carry on from the newest.
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                tracing::debug!(dropped = n, "state subscriber fell behind");
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                        }
-                        continue;
+                    // Lagged: the client fell behind and lost frames. That is the
+                    // designed behaviour — state is advisory and must never apply
+                    // backpressure to the control loop — so carry on from the newest.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "state subscriber fell behind");
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
+                continue;
+            }
+            received = next_from(&mut maps) => {
+                match received {
+                    Ok(frame) => {
+                        write_line(&mut write_half, &proto::Request::notify_map_frame(&frame))
+                            .await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "map subscriber fell behind");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                continue;
+            }
+            received = next_from(&mut beacons) => {
+                match received {
+                    Ok(advertise) => {
+                        write_line(
+                            &mut write_half,
+                            &proto::Request::notify(&proto::Call::ChoraleBeaconSet(advertise)),
+                        )
+                        .await?;
+                    }
+                    // Lagged: `btd` fell behind on beats. The newest beacon is the
+                    // only one worth having — an old beat has already passed.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!(dropped = n, "chorale subscriber fell behind");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+                continue;
             }
         };
         let Some(line) = line else { return Ok(()) };
@@ -2596,6 +2686,10 @@ async fn handle(
             continue;
         };
 
+        if let Ok(proto::Call::RobotMap) = &call {
+            // Subscribing again just re-arms the stream.
+            maps = Some(state.map_tx.subscribe());
+        }
         if let Ok(proto::Call::ChoraleSubscribe) = &call {
             // `btd` asking what to put on the air. One connection carries both directions: this
             // stream down, and `chorale.heard` notifications up.
@@ -2891,6 +2985,30 @@ fn dispatch(
             },
         ),
 
+        // The subscription itself was armed by the connection handler; this
+        // is the answer that says whether frames will mean anything.
+        proto::Call::RobotMap => proto::Response::ok(
+            Some(id),
+            &proto::MapStreamResult {
+                accepted: true,
+                enabled: state.maploc_enabled,
+                mode: state.maploc_enabled.then(|| state.maploc_mode.to_owned()),
+            },
+        ),
+
+        proto::Call::RobotMapWipe => match state.maploc.get() {
+            Some(host) if host.wipe() => {
+                proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+            }
+            Some(_) => proto::Response::ok(
+                Some(id),
+                &proto::IntentResult::refused("the mapper is overloaded; try again"),
+            ),
+            None => proto::Response::ok(
+                Some(id),
+                &proto::IntentResult::refused("mapping is not enabled on this robot"),
+            ),
+        },
         proto::Call::RobotSubscribe(_) => {
             let policies = state.policies.load();
             proto::Response::ok(

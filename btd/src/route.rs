@@ -219,6 +219,11 @@ fn permits(call: &proto::Call) -> bool {
         // phone asking for it is asking for something that does not exist for it.
         ChoraleSubscribe | ChoraleBeaconSet(_) | ChoraleHeard(_) => false,
 
+        // A 40 KB map frame is not a 20-byte BLE notification's business; the
+        // app path reads maps over WebRTC when it exists (§5.2). The wipe
+        // rides the same refusal: it destroys a map no phone can even see.
+        RobotMap | RobotMapWipe => false,
+
         // Powering the machine off from a phone in the room is `system.reboot` without the
         // coming back. The sit-then-power-off flow wants whoever asked to be watching the
         // robot, and that is `robotctl` or the pad's long-press, deliberately.
