@@ -138,7 +138,43 @@ and asymmetric links a knob rather than a staging problem; and `from` is documen
 for de-duplication only, so rotating it on a timer turns the address-rotation bug that cost a day
 into a regression test.
 
-## 5. Architecture follows the host
+## 5. The radio has to be bad, or the bug hides
+
+A perfect ether hides the bugs a real one causes, and this is measured rather than argued. Four ducks
+in the twin converged on one piece every time — simultaneous starts, staggered starts, no difference
+— because every duck was visible to every other instantly and losslessly. The one property that
+causes the field bug was the one the simulator did not model.
+
+`duck-ether --discovery <s> --loss <f> --seed <n>` makes it a bad radio: a duck takes a while to be
+*noticed*, per pair and timed from when it goes on the air, and a fraction of deliveries is dropped.
+Per pair because it is the asymmetry that splits a flock — one delay shared by everybody cannot
+produce it. Seeded, because a flaky radio is only useful for debugging if its flakiness repeats.
+
+**The reproduction**, four ducks, `a` and `b` singing twelve seconds before `c` and `d` join:
+
+```
+duck-ether --discovery 90 --loss 0.3 --seed 3
+```
+
+On main's chorale:
+
+| duck | part | bar | roster |
+|---|---|---|---|
+| a | *not singing* | — | 1 in range |
+| b | bass | 4 | 3 voices |
+| c | alto | 4 | 2 voices |
+| d | bass | 2 | 2 voices |
+
+Which is the field report — "sometimes nothing happens, sometimes two different songs" — with
+disagreeing rosters and a duplicated part as well.
+
+**What it does not yet prove.** With `chorale-election` merged the same scenario still splits (bars
+5, 12 and 8: three timelines). But at `--discovery 20 --loss 0.4` *both* converge, so ninety seconds
+of discovery is harsher than that branch was written for, and this is not evidence the fix fails on a
+robot. The experiment worth running is a sweep — the discovery value at which each version stops
+converging — which is now a loop over a number rather than four robots and a room.
+
+## 6. Architecture follows the host
 
 Every artifact this project builds is aarch64. The attractive idea was to run the board's own
 binaries on an x86 laptop under `qemu-user` — same bytes, perfect provenance. It was measured, twice,
@@ -182,7 +218,7 @@ end to end — preflight, signature, artifact hash, compatibility, health gate, 
 that is how `dev-push.sh` installs. What an x86 twin cannot do is install a *published* release.
 `board-test.sh` already covers the real artifact on the real architecture in CI.
 
-## 6. What it is and is not a twin of
+## 7. What it is and is not a twin of
 
 Identical, because it is the same code on the same path: the control loop, policies, safety, fall
 detection, kinematics, odometry, maploc, the whole IPC surface and its clients, the chorale's
@@ -201,7 +237,7 @@ auto-exposure loop that converges once and stops; an INT8 head whose score chann
 values; a servo bus dropping reads. The twin would have caught **none** of them. That is not a flaw
 in the design, it is the boundary of it — and hardware stays the only place the drivers are real.
 
-## 7. The harness
+## 8. The harness
 
 One MuJoCo process, one window, N duck bodies in one scene, so ducks share physics and can bump into
 each other. `microduck_rl` owns that half: it already has the scenes, the BAM actuator models and
@@ -222,7 +258,7 @@ more than N fifteen-DoF bodies, so cameras should be opt-in per duck. The 45 Hz 
 both a hard edge rather than a soft one — too many ducks and they do not get slow, they go
 *unhealthy* and the updater starts rolling releases back.
 
-## 8. Three ways to pick the wrong model
+## 9. Three ways to pick the wrong model
 
 Each of these presents as "the duck is on its back", and each cost an hour.
 
@@ -244,7 +280,7 @@ simulator that starts limp has its duck on the floor before the first read.
 The boot the daemon is actually written for is `--keyframe SIT`: a duck found folded, which it
 recognises and stands up with the sitstand policy.
 
-## 9. Known material to reuse
+## 10. Known material to reuse
 
 `~/MISC/microduck_maploc` (outdated in every other respect) has two things worth taking: a simulated
 VL53L5CX in `sim/tof_sensor.py` — 8×8 zones, 45° square FoV, 4 m range, noise that grows with
