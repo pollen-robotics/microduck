@@ -74,6 +74,10 @@ mode = "stop_and_scan"
 map_path = "$STATE/maploc.session"
 wipe_on_boot = true
 search_sweep = true
+# Every odometry tick and depth frame the mapper consumes, appended to a
+# timestamped .mdlg. maploc's `evaluate` example replays one byte-for-byte,
+# so the debugging loop stops being "re-run the simulator and hope".
+record_dir = "$STATE/rec"
 TOML
 
     echo "== body_server + map overlay (viewer) on $PORT"

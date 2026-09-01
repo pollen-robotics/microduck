@@ -76,5 +76,31 @@ for (tx, ty) in ROUTE:
     x, y, _ = pose()
     print(f"stop: truth ({t[0]:+.2f},{t[1]:+.2f}) z={tz:.3f} "
           f"odom ({x:+.2f},{y:+.2f})", flush=True)
+
+# Walk back to where we booted and stand there. maploc's `evaluate` bench
+# scores return-to-start: tracked pose vs raw odometry at a pose it already
+# knows, which separates "the mapper drifted" from "the odometry drifted".
+# Without this leg that whole half of the report is empty.
+print("returning to start", flush=True)
+leg = time.time() + 90
+while time.time() < leg:
+    x, y, yaw = pose()
+    if math.hypot(-x, -y) < 0.20:
+        break
+    e = math.atan2(math.sin(math.atan2(-y, -x) - yaw),
+                   math.cos(math.atan2(-y, -x) - yaw))
+    move(0.30, max(-0.7, min(0.7, 1.2 * e)))
+    time.sleep(0.1)
+
+# Stand still ~12 s: long enough for a still-window to form and settle at the
+# start pose, which is what the return-to-start number is read from.
+t_end = time.time() + 12
+while time.time() < t_end:
+    move(0.0, 0.0)
+    time.sleep(0.1)
+(t, tz) = truth()
+x, y, _ = pose()
+print(f"back at start: truth ({t[0]:+.2f},{t[1]:+.2f}) odom ({x:+.2f},{y:+.2f})",
+      flush=True)
 move(0.0, 0.0)
 print("route done", flush=True)

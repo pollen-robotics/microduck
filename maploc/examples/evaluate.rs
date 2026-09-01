@@ -167,7 +167,18 @@ fn main() {
     let mut t_end = 0.0f32;
 
     for record in SessionReplayer::open(&session).expect("open session") {
-        let record = record.expect("read record");
+        // A recording is cut off wherever the robot stopped, so a partial
+        // trailing record is the normal case, not a corrupt file. Stop
+        // reading and score what we have -- panicking here threw away a
+        // whole session's report over the last few bytes of it.
+        let record = match record {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("(session ends mid-record — scoring what was written)");
+                break;
+            }
+            Err(e) => panic!("read record: {e:?}"),
+        };
         let t = record.ts_us() as f32 / 1e6;
         t_end = t;
         match record {
