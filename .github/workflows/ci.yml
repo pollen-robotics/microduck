@@ -95,14 +95,29 @@ jobs:
       #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
+      #
+      # `setup-npu.sh` and `setup-rkaiq.sh` are fetched standalone with curl, exactly like
+      # `setup-gstreamer.sh` two names to the left, and the update hook runs both. `robot-boot-check`
+      # runs on every boot. `hooks/postinstall` runs on every board on every update, which
+      # CONTRIBUTING calls the only thing that does. Each of those is the reason `robot-rescue` is on
+      # this list, and none of them was.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/setup-npu.sh scripts/setup-rkaiq.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/robot-boot-check scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh hooks/postinstall; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
             test -x "$script"
           done
+
+      # `hooks/preinstall.in` is the same shell, checked the same way, minus the `test -x`: it is a
+      # template `xtask package` renders into the hook, so the file in the tree is not the file that
+      # runs and is not executable. The placeholders it carries are bare words to `sh`, so they
+      # parse and lint like anything else.
+      - name: Lint the preinstall template
+        run: |
+          sh -n hooks/preinstall.in
+          shellcheck --shell=sh hooks/preinstall.in
 
       # `board-test.sh` separately, because it needs different flags and was excluded for it.
       #

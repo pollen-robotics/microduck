@@ -238,7 +238,9 @@ printf '  duck-bench --model /var/tmp/duck.rknn --frames /var/tmp/frames\n'
 if [ -n "${NEEDS_REBOOT:-}" ]; then
     printf '\nREBOOT FIRST. The NPU node was just enabled and binds on the next boot:\n'
     printf '  sudo reboot\n'
+    # shellcheck disable=SC2016  # the backticks are for the reader, not the shell
     printf 'Then `dmesg | grep rknpu` should say the driver initialised.\n'
 elif [ -z "$DRIVER" ]; then
+    # shellcheck disable=SC2016  # same, and single quotes are what keeps them literal
     printf '\nExpect `rknn_init` to fail until the NPU driver is there.\n'
 fi
