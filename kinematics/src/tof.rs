@@ -81,6 +81,18 @@ impl Default for Posture {
     }
 }
 
+/// A depth frame as a 2D scan — what a mapper consumes. See
+/// [`Reprojector::flatten`].
+#[derive(Debug, Clone)]
+pub struct FlatScan {
+    /// Beam azimuths about the levelled body Z, radians.
+    pub angles_body: Vec<f32>,
+    /// Horizontal range from the sensor, metres. Parallel to `angles_body`.
+    pub ranges: Vec<f32>,
+    /// The sensor's levelled body-frame position the ranges start at.
+    pub sensor_xy: (f32, f32),
+}
+
 pub struct Reprojector {
     fk: HeadFk,
     /// Unit beam directions in the sensor frame (+x forward, +y left, +z up),
@@ -140,6 +152,45 @@ impl Reprojector {
     /// consumer that wants the raw geometry (a point-cloud view, a map).
     pub fn sensor_in_trunk(&self, head_joints: [f64; 4]) -> Pose {
         self.fk.tof_in_trunk(head_joints)
+    }
+
+    /// One frame flattened to a 2D scan for mapping: per-obstacle azimuth
+    /// and horizontal range measured **from the sensor**, in the
+    /// gravity-levelled body frame — the frame odometry's yaw lives in, so
+    /// a mapper can compose the two without caring how the trunk leans or
+    /// where on the head the sensor sits. Floor and too-close returns are
+    /// already filtered out; `sensor_xy` is the levelled body-frame sensor
+    /// position the ranges start at.
+    pub fn flatten(
+        &self,
+        ranges_m: &[Option<f64>; N_ZONES],
+        head_joints: [f64; 4],
+        posture: &Posture,
+    ) -> FlatScan {
+        let zones = self.project(ranges_m, head_joints, posture);
+        let level = level_from_gravity(posture.gravity);
+        let sensor = level.rotate(self.fk.tof_in_trunk(head_joints).pos);
+
+        let mut angles = Vec::with_capacity(N_ZONES);
+        let mut ranges = Vec::with_capacity(N_ZONES);
+        for zone in zones {
+            let Zone::Hit { point, .. } = zone else {
+                continue;
+            };
+            let p = level.rotate(point);
+            let (dx, dy) = (p[0] - sensor[0], p[1] - sensor[1]);
+            let range = (dx * dx + dy * dy).sqrt();
+            if range <= 0.0 {
+                continue;
+            }
+            angles.push(dy.atan2(dx) as f32);
+            ranges.push(range as f32);
+        }
+        FlatScan {
+            angles_body: angles,
+            ranges,
+            sensor_xy: (sensor[0] as f32, sensor[1] as f32),
+        }
     }
 
     /// Reproject one frame.
@@ -321,6 +372,32 @@ mod tests {
         let zones = rp.project(&one_return(CENTRE, 0.05), LEVEL, &Posture::default());
         assert_eq!(zones[CENTRE], Zone::TooClose);
         assert_eq!(zones[0], Zone::Empty, "no return is no zone");
+    }
+
+    /// The flattened scan measures from the sensor, drops non-obstacles,
+    /// and keeps azimuths near the beam's own: a mapper composing it with
+    /// odometry must get the wall where the wall is.
+    #[test]
+    fn flatten_measures_from_the_sensor_and_keeps_only_obstacles() {
+        let rp = Reprojector::alpha();
+        let mut ranges = one_return(CENTRE, 1.0);
+        ranges[CENTRE + 1] = Some(0.05); // too close — must not survive
+        let flat = rp.flatten(&ranges, LEVEL, &Posture::default());
+
+        assert_eq!(flat.angles_body.len(), 1, "only the obstacle survives");
+        let sensor = rp.sensor_in_trunk(LEVEL).pos;
+        assert!((flat.sensor_xy.0 - sensor[0] as f32).abs() < 1e-3);
+        // Levelled-frame horizontal range from the sensor: close to the
+        // slant range for a near-axis beam.
+        assert!(
+            (0.9..=1.0).contains(&flat.ranges[0]),
+            "range {} should be the horizontal projection of 1.0",
+            flat.ranges[0]
+        );
+        assert!(
+            flat.angles_body[0].abs() < 0.2,
+            "near-axis beam stays near-axis"
+        );
     }
 
     /// A level head on a trunk *leaned* forward stares at the floor even

@@ -1,0 +1,39 @@
+# Mapping & localization: submap pose-graph SLAM over the head ToF, absorbed
+# from the `microduck_maploc_rs` satellite (already Rust — this port is about
+# integration and about fixing why it underperformed, not translation).
+#
+# A library, not a daemon: robotd hosts it on a worker thread because its
+# inputs — odometry and the reprojected depth frames — are exactly what the
+# control loop already holds, and `[maploc]` in robotd.toml turns it on. Off
+# by default: mapping is the most CPU-hungry thing the robot can do, and a
+# duck that is not being asked to map should not pay for it.
+#
+# Differences from the satellite, deliberately:
+#   - no TCP telemetry (`wire`/`stream`): the monitor reads the map over
+#     robotd's own socket like every other stream; the laptop-viewer protocol
+#     can come back when something speaks it.
+#   - no `rand`/`rayon`: a pinned xoshiro (determinism is how a relocalize
+#     run gets replayed and debugged) and `std::thread::scope` for the one
+#     parallel search.
+#   - no `mount`: beam projection comes from `kinematics::tof`, which knows
+#     the head pose per frame and the trunk's lean — the fixed-mount model
+#     was one of the reasons the maps were noisy.
+[package]
+name = "maploc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+# Session persistence. bincode 1.x is schema-frozen — the on-disk session
+# format must survive daemon updates.
+bincode = "1.3"
+
+[dev-dependencies]
+# The replay bench reprojects recorded frames through the real head FK.
+kinematics = { path = "../kinematics" }
+# The evaluate bench's ground-truth file is TOML — the units a human with a
+# tape measure writes. Bench-only; nothing of this ships to the robot.
+toml = "0.9"

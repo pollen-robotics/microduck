@@ -10,6 +10,7 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
 robotd-params = { path = "../robotd-params" }
 kinematics = { path = "../kinematics" }
+maploc = { path = "../maploc" }
 odometry = { path = "../odometry" }
 pet-detect = { path = "../pet-detect" }
 # The voice, for the live synth the theremin plays through. The bank's wavs cover every

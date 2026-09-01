@@ -65,6 +65,9 @@ const HEADER_HEIGHT: u16 = 10;
 /// follows it on the same connection.
 const SUBSCRIBE_ID: u64 = 1;
 
+/// Request id for the `robot.map` subscription on the same connection.
+const MAP_SUBSCRIBE_ID: u64 = 2;
+
 /// Rows the pad block occupies while it is open: two borders, the cadence, the gap trace, three
 /// rows of axes and the buttons.
 ///
@@ -238,6 +241,10 @@ enum Update {
     State(Box<proto::RobotState>),
     /// The subscribe acknowledgement, which names the policy this `robotd` is running.
     Policy(Box<proto::SubscribeResult>),
+    /// One rendered occupancy map from robotd's maploc worker.
+    Map(Box<proto::MapFrame>),
+    /// The `robot.map` acknowledgement: whether this robot maps at all.
+    MapInfo(Box<proto::MapStreamResult>),
     /// The stream ended. Carries the sentence to exit with.
     Ended(String),
     /// One report from `padd`'s raw pad tap.
@@ -284,6 +291,8 @@ pub fn run(
             }),
         )
     };
+    let subscribe_map =
+        || proto::Request::call(proto::Id::Number(MAP_SUBSCRIBE_ID), &proto::Call::RobotMap);
 
     // A pipe or `--json` is a stream *of robot state*, so there it stays an error: emitting
     // nothing forever is not a useful answer to `monitor > log`.
@@ -303,7 +312,10 @@ pub fn run(
     // The reason is carried rather than discarded, so the frame says which of "no robotd" and "no
     // state yet" it is looking at instead of showing one sentence for both.
     let (robot, no_robot) = match Client::connect_to("robotd", robot_socket) {
-        Ok(mut client) => match client.send(&subscribe()) {
+        Ok(mut client) => match client
+            .send(&subscribe())
+            .and_then(|()| client.send(&subscribe_map()))
+        {
             Ok(()) => (Some(client), None),
             Err(e) => (None, Some(e.message)),
         },
@@ -452,9 +464,21 @@ fn read_states(mut reader: impl BufRead, tx: &mpsc::Sender<Update>) {
 /// because a `robotd` newer than this build may say things this one has no use for.
 fn decode(line: &str) -> Option<Update> {
     if let Ok(request) = serde_json::from_str::<proto::Request>(line) {
-        return request.as_state().map(|s| Update::State(Box::new(s)));
+        if let Some(state) = request.as_state() {
+            return Some(Update::State(Box::new(state)));
+        }
+        return request.as_map_frame().map(|m| Update::Map(Box::new(m)));
     }
     let response = serde_json::from_str::<proto::Response>(line).ok()?;
+    if response.id == Some(proto::Id::Number(MAP_SUBSCRIBE_ID)) {
+        // A robotd that predates `robot.map` answers METHOD_NOT_FOUND;
+        // silence is the right rendering for that — the path panel simply
+        // never switches to map mode.
+        return response
+            .result_as::<proto::MapStreamResult>()
+            .ok()
+            .map(|r| Update::MapInfo(Box::new(r)));
+    }
     if response.id != Some(proto::Id::Number(SUBSCRIBE_ID)) {
         return None;
     }
@@ -874,6 +898,11 @@ fn live(
                         view.toggle_duck();
                         fresh = true;
                     }
+                    // The map (or the odometry path), over the whole terminal.
+                    KeyCode::Char('m') => {
+                        view.toggle_fullscreen_map();
+                        fresh = true;
+                    }
                     KeyCode::Char('[') | KeyCode::Left => {
                         view.orbit_duck(-0.25);
                         fresh = true;
@@ -1152,6 +1181,19 @@ struct View {
     show_duck: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
+    /// The *tracked* (map-frame) pose history, fed from map frames. The map
+    /// view overlays this one, not the odometry track: after a session
+    /// resume or a loop closure the two live in different frames, and an
+    /// odometry path drawn over the map diverges from the robot marker by
+    /// exactly that frame offset — which reads as a bug, not a frame.
+    tracked_path: path_map::PathMap,
+    /// The latest rendered occupancy map, when robotd's maploc is on.
+    map: Option<proto::MapFrame>,
+    map_arrived: Option<Instant>,
+    /// What `robot.map`'s answer said — gates the panel's mode.
+    mapping_enabled: bool,
+    /// The map, over the whole terminal. Toggled with `m`.
+    fullscreen_map: bool,
     /// ToF beams through the head FK, so the depth grid can name the floor.
     reprojector: kinematics::tof::Reprojector,
     /// The last depth frame, and when it arrived by this view's clock — the frame's
@@ -1194,6 +1236,11 @@ impl View {
             duck: duck::DuckView::new(),
             show_duck: true,
             path: path_map::PathMap::new(),
+            tracked_path: path_map::PathMap::new(),
+            map: None,
+            map_arrived: None,
+            mapping_enabled: false,
+            fullscreen_map: false,
             reprojector: kinematics::tof::Reprojector::alpha(),
             tof: None,
             tof_arrived: None,
@@ -1279,6 +1326,16 @@ impl View {
                 self.pad.trouble = Some(why);
                 Ok(self.show_pad)
             }
+            Update::Map(frame) => {
+                self.tracked_path.observe(frame.x, frame.y, frame.yaw);
+                self.map = Some(*frame);
+                self.map_arrived = Some(Instant::now());
+                Ok(true)
+            }
+            Update::MapInfo(info) => {
+                self.mapping_enabled = info.enabled;
+                Ok(false)
+            }
             Update::Health(health) => {
                 self.health = Some(*health);
                 self.health_at = Some(Instant::now());
@@ -1324,6 +1381,14 @@ impl View {
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+
+        // Fullscreen map/path: the whole terminal is the panel. Everything
+        // else waits behind `m`.
+        if self.fullscreen_map {
+            self.render_path(frame, area);
+            return;
+        }
+
         let Some(rows) = self.latest.as_ref().map(joint_rows) else {
             // No robot state — either `robotd` has not sent one yet, or there is no `robotd` to
             // connect to. Either way the pad block is still drawn when it is open: it reads a
@@ -1493,15 +1558,69 @@ impl View {
     /// The odometry track, top-down: boot-forward is up, the origin is `+`, the
     /// robot is `●` with a heading ray. See [`path_map`].
     fn render_path(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let block = Block::bordered().title(" path ").title_bottom(
-            // The zoom level, or the caption is a shape with no size.
-            Line::from(format!(" {:.1} m across ", self.path.extent_m()))
-                .dim()
-                .right_aligned(),
-        );
+        // With maploc on and frames flowing, the panel is the live map; the
+        // odometry track is what it shows the rest of the time.
+        if let Some(map) = self.live_map() {
+            // "seated" outranks "searching": a seated robot will not even
+            // try to relocalize, and a caption that only said "searching"
+            // once cost a field test three minutes of confusion.
+            let searching = match (map.tracking, map.seated) {
+                (_, true) => " · seated — stand the robot to map",
+                (false, false) => " · searching",
+                (true, false) => "",
+            };
+            let standing = if map.still { " · scanning" } else { "" };
+            let hint = if self.fullscreen_map {
+                " m back "
+            } else {
+                " m fills the screen "
+            };
+            let block = Block::bordered()
+                .title(" map ")
+                .title_bottom(Line::from(hint).dim().right_aligned())
+                .title_bottom(
+                    Line::from(format!(
+                        " {} windows · {} submaps · {} loops{standing}{searching} ",
+                        map.windows, map.n_submaps, map.n_loops
+                    ))
+                    .dim(),
+                );
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            path_map::draw_map(&map, &self.tracked_path, inner, frame.buffer_mut());
+            return;
+        }
+        let hint = if self.fullscreen_map {
+            " m back "
+        } else {
+            " m fills the screen "
+        };
+        let block = Block::bordered()
+            .title(" path ")
+            .title_bottom(Line::from(hint).dim().right_aligned())
+            .title_bottom(
+                // The zoom level, or the caption is a shape with no size.
+                Line::from(format!(" {:.1} m across ", self.path.extent_m())).dim(),
+            );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.path.draw(inner, frame.buffer_mut());
+    }
+
+    /// The map to draw, when there is a live one: maploc enabled, a frame
+    /// received, and not so stale that it lies (the worker publishes at 1 Hz;
+    /// 5 s of silence means it stopped).
+    fn live_map(&self) -> Option<proto::MapFrame> {
+        if !self.mapping_enabled {
+            return None;
+        }
+        self.map_arrived
+            .filter(|at| at.elapsed() <= Duration::from_secs(5))
+            .and_then(|_| self.map.clone())
+    }
+
+    fn toggle_fullscreen_map(&mut self) {
+        self.fullscreen_map = !self.fullscreen_map;
     }
 
     /// The whole-robot block: what was asked of it, what it did, and what it can feel.

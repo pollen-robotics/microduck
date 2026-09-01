@@ -127,7 +127,7 @@ safety authority sits (§6).
 
 | Service | Owns | Notes |
 |---|---|---|
-| `robotd` | motor control, kinematics, odometry, gait policies, sensor loop, safety | RT-ish core; authoritative on anything that can hurt the robot. Odometry is a struct in the loop, not a service: its inputs are exactly the sample the loop already read |
+| `robotd` | motor control, kinematics, odometry, gait policies, sensor loop, safety, mapping (opt-in) | RT-ish core; authoritative on anything that can hurt the robot. Odometry is a struct in the loop, not a service: its inputs are exactly the sample the loop already read. Mapping (`[maploc]`, off by default) is a niced worker thread fed by the loop's samples and tofd's stream — the loop pays one `try_send` per tick |
 | `mediad` | camera/mic, encode, perception, WebRTC + remote gateway | Heaviest service; also the remote API front door (§5.2) |
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
 | `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |

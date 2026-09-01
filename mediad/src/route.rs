@@ -73,6 +73,10 @@ fn permits(call: &proto::Call) -> bool {
         // Telemetry at up to the control rate. BLE called this "a firehose into a 20-byte pipe",
         // which it is; here it is a stream on a channel built for streams.
         RobotSubscribe(_) => true,
+        // The live map, which btd's refusal names this transport as the home
+        // for — 40 KB frames at 1 Hz are nothing to a datachannel. The wipe
+        // rides along: the peer holding it can see the map it is erasing.
+        RobotMap | RobotMapWipe => true,
 
         // Power to the joints, and standing up — both of which move every joint at once, and both
         // of which BLE refuses because they want "the person doing it to be looking at the robot
