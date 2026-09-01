@@ -30,6 +30,20 @@
 //! **The address rotates.** `from` is documented as an identity for de-duplication only, and a real
 //! duck's BLE address changes underneath it — a fact that cost this project a day when something
 //! keyed on it. `--rotate` makes that happen on a timer, which turns the bug into a test.
+//!
+//! ## Being a bad radio on purpose
+//!
+//! **A perfect ether hides the bugs a real one causes**, and that is not a hypothetical. Four ducks
+//! in the twin converge on one piece every time, staggered starts included — because every duck is
+//! visible to every other from the moment it boots, instantly and losslessly. On hardware, BLE
+//! discovery is slow and lossy, so two ducks can be singing before the other two have seen them,
+//! which is exactly the split-brain the chorale's election has to survive.
+//!
+//! So `--discovery` makes a duck take a while to be *noticed*, per pair rather than globally,
+//! because it is the asymmetry that splits a flock: A and B finding each other quickly while C and D
+//! are still deaf is the scenario, and one global delay cannot produce it. `--loss` drops a fraction
+//! of deliveries. Both are driven by a seeded PRNG, so a split that happens once can be made to
+//! happen again — a flaky radio is only useful for debugging if its flakiness repeats.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,6 +82,39 @@ struct Args {
     /// Rotate each duck's address every N seconds, as a real one does. 0 leaves it alone.
     #[arg(long, default_value_t = 0)]
     rotate: u64,
+
+    /// Take up to this many seconds to notice each duck, per pair. 0 is an instant, perfect radio.
+    #[arg(long, default_value_t = 0)]
+    discovery: u64,
+
+    /// Drop this fraction of deliveries, 0.0 to 1.0. A real advertisement is missed often.
+    #[arg(long, default_value_t = 0.0)]
+    loss: f64,
+
+    /// Seed for the discovery delays and the losses, so a split can be reproduced.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+}
+
+/// A radio's imperfections, as numbers.
+#[derive(Debug, Clone, Copy)]
+struct Weather {
+    discovery: Duration,
+    loss: f64,
+    seed: u64,
+}
+
+/// Deterministic noise from a name and a counter — a splitmix step, which is short, well distributed
+/// and needs no dependency. Deterministic is the point: a radio that is flaky differently every run
+/// cannot be used to chase a bug.
+fn noise(seed: u64, key: &str, salt: u64) -> u64 {
+    let mut x = seed ^ salt;
+    for byte in key.as_bytes() {
+        x = x.wrapping_mul(0x100_0000_01b3) ^ u64::from(*byte);
+    }
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +147,9 @@ struct OnAir {
     listening: bool,
     /// Where this duck is standing, from its simulator.
     at: [f64; 3],
+    /// When this duck first had something to advertise — discovery is timed from there, because a
+    /// scanner cannot notice a duck that is not yet on the air.
+    since: Option<Instant>,
     /// What its radio calls itself today.
     address: String,
 }
@@ -138,14 +188,26 @@ async fn main() -> std::process::ExitCode {
         }
     }
 
-    tracing::info!(ducks = ducks.len(), range = args.range, "the ether is open");
+    let weather = Weather {
+        discovery: Duration::from_secs(args.discovery),
+        loss: args.loss.clamp(0.0, 1.0),
+        seed: args.seed,
+    };
+    tracing::info!(
+        ducks = ducks.len(),
+        range = args.range,
+        discovery_s = args.discovery,
+        loss = weather.loss,
+        seed = args.seed,
+        "the ether is open"
+    );
 
     let mut tasks = Vec::new();
     for duck in &ducks {
-        let (duck, air, range) = (duck.clone(), air.clone(), args.range);
+        let (duck, air, range, weather) = (duck.clone(), air.clone(), args.range, weather);
         tasks.push(tokio::spawn(async move {
             loop {
-                if let Err(e) = serve(&duck, &air, range).await {
+                if let Err(e) = serve(&duck, &air, range, weather).await {
                     tracing::warn!(duck = %duck.name, error = %e, "lost the duck; retrying");
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -183,7 +245,7 @@ fn address_for(index: usize, generation: u64) -> String {
 }
 
 /// One duck's connection: `btd`'s half of the conversation, without a radio underneath it.
-async fn serve(duck: &Duck, air: &Air, range: f64) -> std::io::Result<()> {
+async fn serve(duck: &Duck, air: &Air, range: f64, weather: Weather) -> std::io::Result<()> {
     let stream = UnixStream::connect(&duck.socket).await?;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -196,6 +258,7 @@ async fn serve(duck: &Duck, air: &Air, range: f64) -> std::io::Result<()> {
 
     let mut deliveries = tokio::time::interval(DELIVERY);
     let mut delivered = usize::MAX;
+    let mut tick = 0u64;
     loop {
         tokio::select! {
             line = lines.next_line() => {
@@ -206,6 +269,12 @@ async fn serve(duck: &Duck, air: &Air, range: f64) -> std::io::Result<()> {
                 if let Some(entry) = on_air.get_mut(&duck.name) {
                     let changed = entry.listening != want.listening
                         || entry.beacon.is_some() != want.beacon.is_some();
+                    if entry.beacon.is_none() && want.beacon.is_some() {
+                        entry.since = Some(Instant::now());
+                    }
+                    if want.beacon.is_none() {
+                        entry.since = None;
+                    }
                     entry.beacon = want.beacon.clone();
                     entry.listening = want.listening;
                     if changed {
@@ -219,7 +288,8 @@ async fn serve(duck: &Duck, air: &Air, range: f64) -> std::io::Result<()> {
                 }
             }
             _ = deliveries.tick() => {
-                let heard = nearby(duck, air, range).await;
+                tick += 1;
+                let heard = nearby(duck, air, range, weather, tick).await;
                 if heard.len() != delivered {
                     delivered = heard.len();
                     tracing::info!(duck = %duck.name, hears = delivered, "who is in range");
@@ -238,7 +308,13 @@ async fn serve(duck: &Duck, air: &Air, range: f64) -> std::io::Result<()> {
 }
 
 /// Every beacon this duck is close enough to hear.
-async fn nearby(duck: &Duck, air: &Air, range: f64) -> Vec<proto::ChoraleHeard> {
+async fn nearby(
+    duck: &Duck,
+    air: &Air,
+    range: f64,
+    weather: Weather,
+    tick: u64,
+) -> Vec<proto::ChoraleHeard> {
     let on_air = air.lock().await;
     let Some(me) = on_air.get(&duck.name) else {
         return Vec::new();
@@ -259,6 +335,29 @@ async fn nearby(duck: &Duck, air: &Air, range: f64) -> Vec<proto::ChoraleHeard> 
         let distance = ((other.at[0] - here[0]).powi(2) + (other.at[1] - here[1]).powi(2)).sqrt();
         if distance > range {
             continue;
+        }
+
+        // Not noticed yet. Per pair, and timed from when the other duck went on the air: it is the
+        // asymmetry that splits a flock, so one delay shared by everybody would not produce it.
+        if !weather.discovery.is_zero() {
+            let pair = format!("{}<-{}", duck.name, name);
+            let wait = Duration::from_millis(
+                noise(weather.seed, &pair, 0) % (weather.discovery.as_millis() as u64).max(1),
+            );
+            match other.since {
+                Some(since) if since.elapsed() >= wait => {}
+                _ => continue,
+            }
+        }
+
+        // And an advertisement is missed often. Seeded by the pair and the tick, so the same run
+        // drops the same frames.
+        if weather.loss > 0.0 {
+            let pair = format!("{}<-{}", duck.name, name);
+            let roll = (noise(weather.seed, &pair, tick) % 10_000) as f64 / 10_000.0;
+            if roll < weather.loss {
+                continue;
+            }
         }
         heard.push(proto::ChoraleHeard {
             beacon: beacon.clone(),
