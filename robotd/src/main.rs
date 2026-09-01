@@ -1295,7 +1295,11 @@ async fn control_loop<T: RobotIo>(
     // first connect). The loop's entire cost is one `try_send` per tick.
     let maploc_host = params.maploc.enabled.then(|| {
         tracing::info!(mode = state.maploc_mode, "maploc enabled");
-        let host = maploc::spawn(params.maploc.clone(), state.map_tx.clone());
+        let host = maploc::spawn(
+            params.maploc.clone(),
+            state.map_tx.clone(),
+            params.theremin.socket.clone(),
+        );
         let _ = state.maploc.set(host.clone());
         host
     });
