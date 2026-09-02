@@ -1016,6 +1016,19 @@ fn mode_switch_bringup(
     }
 }
 
+/// One low-pass step toward `target`.
+///
+/// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
+/// tick and on every tick after, because nothing finite can climb back out of it. The wire
+/// can produce one — JSON parses `1e400` as infinity — and the safety layer below refuses
+/// non-finite joint targets rather than clamping them, so a single bad `robot.move` would
+/// otherwise freeze the robot on its hold pose until reboot.
+fn slew(ema: &mut f64, target: f64, alpha: f64) {
+    if target.is_finite() {
+        *ema += alpha * (target - *ema);
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -1778,14 +1791,14 @@ async fn control_loop<T: RobotIo>(
             twist_ema = [0.0; 3];
         }
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
-            *ema += cmd_alpha * (target - *ema);
+            slew(ema, target, cmd_alpha);
         }
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            *ema += head_alpha * (target - *ema);
+            slew(ema, target, head_alpha);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
-                *ema += cmd_alpha * (target - *ema);
+                slew(ema, target, cmd_alpha);
             }
         } else {
             body_ema = [0.0; 3];
@@ -4722,5 +4735,21 @@ mod tests {
             mode_switch_bringup(Bringup::Ready, Some(from), now),
             Some(Bringup::Homing { from, since: now })
         );
+    }
+
+    /// `1e400` on the wire parses as infinity. Folded into the EMA it is permanent — nothing
+    /// finite climbs back out — and with the safety layer refusing non-finite targets, one bad
+    /// `robot.move` would freeze the robot on its hold pose until reboot. Dropped instead.
+    #[test]
+    fn a_non_finite_command_does_not_poison_the_filter() {
+        let mut ema = 0.5;
+        slew(&mut ema, f64::INFINITY, 0.3);
+        slew(&mut ema, f64::NEG_INFINITY, 0.3);
+        slew(&mut ema, f64::NAN, 0.3);
+        assert_eq!(ema, 0.5, "non-finite targets are dropped, not folded in");
+
+        // And the filter still works afterwards: the next real command slews as always.
+        slew(&mut ema, 1.0, 0.3);
+        assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
     }
 }
