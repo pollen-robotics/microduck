@@ -1120,6 +1120,9 @@ impl Engine {
         hook?;
 
         rec.phase(Phase::Applying, None);
+        if self.faults.fail_apply_action {
+            return Err(Error::Internal("injected apply-action failure".into()));
+        }
         self.run_apply_action(&cfg.on_apply, release_dir, rec)
             .await?;
 
@@ -1437,20 +1440,28 @@ impl Engine {
             rec.finish(&failed);
             return failed;
         }
+        // The swap has already happened, so a failed apply action means what a failed gate
+        // means: the board is on the new release with its daemons not demonstrably running.
+        // Take the same revert-and-journal path as the gate, as `apply` does for everything
+        // past the swap. Returning early here disarmed the trial and left no log entry, so
+        // the board stayed on an unverified release with no boot-counter protection and no
+        // record of it.
         rec.phase(Phase::Applying, None);
-        if let Err(e) = self
-            .run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
-            .await
-        {
-            let _ = self.boot_counter.confirm(component);
-            let failed = Err(e);
-            rec.finish(&failed);
-            return failed;
-        }
-
-        rec.phase(Phase::HealthGate, None);
-        let gate = self.health_gate(cfg).await;
-        record_gate(rec, &gate);
+        let apply_action = if self.faults.fail_apply_action {
+            Err(Error::Internal("injected apply-action failure".into()))
+        } else {
+            self.run_apply_action(&cfg.on_apply, &store.release_dir(to), rec)
+                .await
+        };
+        let gate = match apply_action {
+            Ok(()) => {
+                rec.phase(Phase::HealthGate, None);
+                let gate = self.health_gate(cfg).await;
+                record_gate(rec, &gate);
+                gate.map(|_| ())
+            }
+            Err(e) => Err(e),
+        };
 
         let outcome = match gate {
             Ok(_) => {
