@@ -239,7 +239,7 @@ mapping is the prototype's, so muscle memory carries over:
 | --- | --- |
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
-| **Start** | toggle the policy — nothing moves until it is on |
+| **Start** | first press: torque on and a 2 s ramp to the home pose, then hold (`robot.init`). Second press: the policy drives. Further presses toggle the policy. After Select / DPad-Up / a reboot, the next Start is an init again. |
 | **Y** / triangle | head mode: sticks pose the head (body holds still) |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |

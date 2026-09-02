@@ -252,9 +252,10 @@ fn main() -> std::process::ExitCode {
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB curious head, RB peck, DPad-Left kick left, DPad-Right reboot servos, DPad-Down sit, \
-         triggers mouth, DPad-Up (3s) walk/roller, Select = soft release, Select (3s) shutdown"
+        "driving — Start once = stand up (init), Start again = policy on/off, Y head mode, \
+         B body pose, A ground pick, LB curious head, RB peck, DPad-Left kick left, \
+         DPad-Right reboot servos, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
+         Select = soft release, Select (3s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -273,6 +274,18 @@ fn main() -> std::process::ExitCode {
     // intent for its duration; the sticks keep driving underneath. One at a time: a bumper
     // pressed mid-expression restarts with the new one.
     let mut expression: Option<Expression> = None;
+    // Whether this pad believes the robot is up (torque on, at the home pose). Start on a robot
+    // that is not up sends `robot.init` — torque on and a two-second ramp to home, and the robot
+    // then just stands there — and only the next Start hands it to the policy. Without this, the
+    // first Start on a freshly booted duck held in the air started the gait straight out of the
+    // ramp, legs going everywhere.
+    //
+    // A belief rather than a query, because nothing on the wire says "homed" today. It starts
+    // false (padd starts with the robot, and a robotd restart takes padd down with it, so a fresh
+    // padd always meets a limp robot), goes true on the init this pad sent, and false on the
+    // soften / recover / shutdown it sent. If it is ever wrong the cost is the old behaviour
+    // (one Start does both) or one harmless extra re-home ramp — never a fall.
+    let mut up = false;
 
     loop {
         let tick = Instant::now();
@@ -377,7 +390,18 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        if toggle_enable {
+        if toggle_enable && !up {
+            tracing::warn!(
+                "Start — robot.init: torque on, ramping to the home pose over 2 s; press Start again to drive"
+            );
+            match request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
+                Err(e) => {
+                    tracing::error!(error = %e, "init failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                Ok(_) => up = true,
+            }
+        } else if toggle_enable {
             // The robot owns the toggle. A local on/off belief here drifts from the
             // robot's the moment anything else moves it — robot.relax, the shutdown
             // sequence, either side restarting — and a stale belief turns Start into a
@@ -441,6 +465,7 @@ fn main() -> std::process::ExitCode {
         }
 
         if reboot_motors {
+            up = false;
             tracing::warn!(
                 "DPad-Right — asking the robot to reboot its servos (robot.rebootMotors)"
             );
@@ -455,6 +480,7 @@ fn main() -> std::process::ExitCode {
         // then torque off. The pad's emergency release for a robot forcing against something.
         // Answered, because "refused" is worth a log line here of all places.
         if soften {
+            up = false;
             tracing::warn!("Select pressed — asking the robot to let go softly (robot.soften)");
             if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotSoften) {
                 tracing::error!(error = %e, "soften request failed");
@@ -470,6 +496,7 @@ fn main() -> std::process::ExitCode {
             let held = select_held_since.get_or_insert(tick);
             if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
                 shutdown_sent = true;
+                up = false;
                 tracing::warn!("Select held — asking the robot to sit and power off");
                 if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
                     tracing::error!(error = %e, "shutdown request failed");
