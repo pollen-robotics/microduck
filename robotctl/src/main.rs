@@ -1680,6 +1680,10 @@ fn render_units(units: &[proto::ServiceUnit], indent: usize) -> String {
         let name = unit.unit.strip_suffix(".service").unwrap_or(&unit.unit);
         let state = match unit.state {
             proto::UnitState::Active => "active",
+            // Not "active": a daemon systemd is restarting every five seconds is not one that is
+            // running, whatever its `ActiveState` says. See [`proto::UnitState::Restarting`].
+            proto::UnitState::Restarting => "restarting",
+            proto::UnitState::Failed => "failed",
             proto::UnitState::Inactive => "stopped",
             proto::UnitState::Absent => "not installed",
             proto::UnitState::Unknown => "unknown",
@@ -1701,10 +1705,21 @@ fn render_units(units: &[proto::ServiceUnit], indent: usize) -> String {
                     None => format!(" · {build}"),
                 }
             }
-            // Nothing published. For a stopped unit that is expected — systemd removes the runtime
-            // directory with the unit. For a running one it means a build too old to publish, and
-            // saying so beats inferring a version from somewhere else.
-            None if unit.state == proto::UnitState::Active => " · build unknown (old)".to_owned(),
+            // Nothing published, and what that means is the unit state's to say rather than this
+            // arm's to guess.
+            //
+            // It used to read `build unknown (old)` for anything active, which was the wrong story
+            // told confidently: systemd deletes the runtime directory holding `identity.json` on
+            // every stop, so a crash-looping daemon has none either — and a crash-looping daemon
+            // was `active` here until `Restarting` existed. `mediad` on a board with the camera
+            // flex unplugged reported `active · build unknown (old)` indefinitely, of a build from
+            // minutes earlier that publishes its identity on its first line.
+            //
+            // A restarting or failed unit says nothing about a build, because there is no running
+            // process to have one. What is left for `build unknown` is a daemon that is genuinely
+            // running and published nothing: a build predating the mechanism, or the milliseconds
+            // between `exec` and that first line.
+            None if unit.state == proto::UnitState::Active => " · build unknown".to_owned(),
             None => String::new(),
         };
         let _ = writeln!(out, "{:indent$}{name:<9} {state}{detail}", "");
@@ -1723,16 +1738,49 @@ fn render_units(units: &[proto::ServiceUnit], indent: usize) -> String {
 /// next to its name, and a robot whose owner has no gamepad and disabled `padd` should not be told
 /// off about it on every health check. A version disagreement is different: nobody chooses that, and
 /// it is invisible without being pointed at.
+///
+/// **A daemon that cannot start is warned about, and that is the same rule rather than an exception
+/// to it.** Nobody chooses a crash loop either. It is also the one thing here a `units` line cannot
+/// convey on its own: `restarting` beside a name is a word, while the fix is a journal command, and
+/// the robot this exists for is one whose camera stopped working and whose owner has no reason to
+/// suspect a daemon.
 fn unit_warnings(
     units: &[proto::ServiceUnit],
     socket_reported: &[ServiceReport],
     installed: Option<&semver::Version>,
 ) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // Before every filter below, and before the `installed` gate, because none of them bear on
+    // this: a daemon that is not running has no release to compare, no socket to have answered,
+    // and is worth saying whether or not `updaterd` could name what is installed.
+    for unit in units {
+        let name = unit.unit.strip_suffix(".service").unwrap_or(&unit.unit);
+        match unit.state {
+            // Deliberately phrased for both readings, because this state cannot tell them apart —
+            // see [`proto::UnitState::Restarting`]. An ordinary restart shows here for a few
+            // seconds; a daemon that cannot start shows here forever, and `mediad` with `Restart=
+            // always` and `RestartSec=5s` never trips systemd's start-rate limit, so it never
+            // progresses to `failed` on its own.
+            proto::UnitState::Restarting => warnings.push(format!(
+                "{name} exited and systemd is restarting it.\n  \
+                 During an ordinary restart this shows for a few seconds. If it persists,\n  \
+                 the daemon cannot start and nothing it does is happening — for mediad that\n  \
+                 is the camera and the WebRTC control channel. The journal has why it exits:\n  \
+                 sudo journalctl -u {name} -b | tail -30"
+            )),
+            proto::UnitState::Failed => warnings.push(format!(
+                "{name} could not start and systemd has given up on it.\n  \
+                 sudo journalctl -u {name} -b | tail -30"
+            )),
+            _ => {}
+        }
+    }
+
     let Some(installed) = installed else {
-        return Vec::new();
+        return warnings;
     };
 
-    let mut warnings = Vec::new();
     for unit in units {
         let name = unit.unit.strip_suffix(".service").unwrap_or(&unit.unit);
         if socket_reported.iter().any(|service| service.name == name) {
@@ -2482,6 +2530,15 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
 
     let driver = match status.driver {
         proto::UnitState::Active => "active — driving whatever pad connects".to_owned(),
+        // The state that most looks like the pad's fault: the light on the controller is on, the
+        // robot ignores it, and `padd` is dying and being restarted a few seconds later. Named
+        // rather than folded into either neighbour, which is the whole point of the variant.
+        proto::UnitState::Restarting => "restarting — it keeps exiting; check:  \
+                                         sudo journalctl -u padd -b | tail -30"
+            .to_owned(),
+        proto::UnitState::Failed => "FAILED to start — check:  \
+                                     sudo journalctl -u padd -b | tail -30"
+            .to_owned(),
         proto::UnitState::Inactive => {
             "NOT running — start it:  sudo systemctl start padd".to_owned()
         }
@@ -3948,9 +4005,12 @@ mod tests {
     }
 
     /// **A daemon too old to publish an identity, which is the case that made this design possible.**
-    /// It is allowed to simply not answer: saying `unknown (old)` beats inferring a version from
-    /// somewhere else and presenting the guess as fact — and it must not read as a disagreement,
-    /// because there is no version to disagree with.
+    /// It is allowed to simply not answer: saying the build is unknown beats inferring a version
+    /// from somewhere else and presenting the guess as fact — and it must not read as a
+    /// disagreement, because there is no version to disagree with.
+    ///
+    /// It used to read `build unknown (old)`, and the parenthesis was a diagnosis this arm is in no
+    /// position to make — see the case below, which is where that wording ended up being wrong.
     #[test]
     fn a_daemon_that_published_nothing_says_so() {
         let silent = proto::ServiceUnit {
@@ -3961,8 +4021,87 @@ mod tests {
         let installed = semver::Version::parse("0.4.0").unwrap();
 
         let rendered = render_units(std::slice::from_ref(&silent), 2);
-        assert!(rendered.contains("build unknown (old)"), "{rendered}");
+        assert!(rendered.contains("build unknown"), "{rendered}");
+        assert!(!rendered.contains("(old)"), "{rendered}");
         assert!(unit_warnings(&[silent], &[], Some(&installed)).is_empty());
+    }
+
+    /// **The report a robot with an unplugged camera flex gave for as long as it stayed unplugged:
+    /// `mediad    active · build unknown (old)`.**
+    ///
+    /// Every part of it was wrong. `mediad` was crash-looping, not active; it had published an
+    /// identity minutes earlier, and systemd had deleted the runtime directory holding it on the
+    /// stop; and `(old)` named the one cause that could not apply, since `mediad` has published its
+    /// identity since the commit that introduced it. The state has to carry this, because the
+    /// missing identity file cannot.
+    #[test]
+    fn a_crash_loop_is_not_reported_as_a_running_daemon() {
+        let looping = proto::ServiceUnit {
+            unit: "mediad.service".into(),
+            state: proto::UnitState::Restarting,
+            identity: None,
+        };
+
+        let rendered = render_units(std::slice::from_ref(&looping), 2);
+        assert!(rendered.contains("mediad    restarting"), "{rendered}");
+        assert!(!rendered.contains("active"), "{rendered}");
+        // No build claim of any kind: there is no running process to have one.
+        assert!(!rendered.contains("build unknown"), "{rendered}");
+    }
+
+    /// A crash loop is warned about, unlike a stopped unit, because nobody chose it — and the
+    /// warning has to carry the journal command, which is the whole of what to do next.
+    ///
+    /// With `installed` absent, because that gate has nothing to do with this: a board whose
+    /// `updaterd` could not name the installed release still deserves to hear that its camera
+    /// daemon is dying.
+    #[test]
+    fn a_crash_loop_warns_without_needing_a_release_to_compare() {
+        let units = vec![proto::ServiceUnit {
+            unit: "mediad.service".into(),
+            state: proto::UnitState::Restarting,
+            identity: None,
+        }];
+
+        let warnings = unit_warnings(&units, &[], None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("mediad exited"), "{warnings:?}");
+        assert!(warnings[0].contains("journalctl -u mediad"), "{warnings:?}");
+    }
+
+    /// A daemon systemd has given up on is not a daemon somebody stopped, and the two must not
+    /// print the same word.
+    #[test]
+    fn a_failed_unit_is_not_a_stopped_one() {
+        let units = vec![proto::ServiceUnit {
+            unit: "mediad.service".into(),
+            state: proto::UnitState::Failed,
+            identity: None,
+        }];
+
+        let rendered = render_units(&units, 2);
+        assert!(rendered.contains("mediad    failed"), "{rendered}");
+        assert_eq!(unit_warnings(&units, &[], None).len(), 1);
+    }
+
+    /// A daemon that answers its own socket is still warned about when it is crash-looping. The
+    /// double-warning rule this exempts is about *version* disagreement, where the socket's answer
+    /// is the better one; a socket that answered at all did so from a process that has since died.
+    #[test]
+    fn a_crash_loop_is_warned_about_even_with_a_socket_answer() {
+        let units = vec![proto::ServiceUnit {
+            unit: "robotd.service".into(),
+            state: proto::UnitState::Restarting,
+            identity: None,
+        }];
+        let reported = vec![service("robotd", "0.4.0")];
+        let installed = semver::Version::parse("0.4.0").unwrap();
+
+        assert_eq!(
+            unit_warnings(&units, &reported, Some(&installed)).len(),
+            1,
+            "a crash loop is not the case the socket answers better"
+        );
     }
 
     /// A revision is what distinguishes two builds of one version, so the line has to carry it —

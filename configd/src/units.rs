@@ -131,20 +131,48 @@ async fn query(unit: &str) -> Result<proto::UnitState, String> {
         .try_into()
         .map_err(|e: zbus::zvariant::Error| e.to_string())?;
 
-    let state = match active.as_str() {
-        // `activating` counts as active: `padd` spends its first moments connecting to `robotd`, and
-        // reporting that as "not running" would make a robot mid-boot look broken.
+    // A second property on the connection and object path already in hand, so it costs one more
+    // round trip on the same bus. It buys the only distinction systemd makes between a daemon
+    // coming up and a daemon that keeps dying: both are `ActiveState=activating`.
+    let sub: String = property(&bus, &path, "org.freedesktop.systemd1.Unit", "SubState")
+        .await?
+        .try_into()
+        .map_err(|e: zbus::zvariant::Error| e.to_string())?;
+
+    Ok(state_of(&active, &sub, unit))
+}
+
+/// What one `ActiveState`/`SubState` pair means.
+///
+/// Pure, and separated from the bus call for the reason `reconcile::verdict_for` is: the mapping is
+/// the part that can be wrong, and the states worth checking are the ones a test cannot arrange —
+/// a crash loop needs a daemon that will not start, and asking systemd for one on a board means
+/// breaking the robot.
+///
+/// **`SubState` is read first**, because `auto-restart` is the answer `ActiveState` cannot give.
+/// systemd reports a unit waiting out its `RestartSec=` as `activating`, exactly as it reports one
+/// starting for the first time; taking `activating` for `Active` is what let `mediad` crash-loop on
+/// an unplugged camera flex while `robotctl health` called it active. `auto-restart-queued` is the
+/// same state one systemd version later, hence the prefix rather than an equality.
+pub fn state_of(active: &str, sub: &str, unit: &str) -> proto::UnitState {
+    if sub.starts_with("auto-restart") {
+        return proto::UnitState::Restarting;
+    }
+
+    match active {
+        // `activating` still counts as active: `padd` spends its first moments connecting to
+        // `robotd`, and reporting that as "not running" would make a robot mid-boot look broken.
+        // With `auto-restart` taken out above, that is all this arm now catches.
         "active" | "activating" | "reloading" => proto::UnitState::Active,
-        // `failed` is inactive with a reason, and the reason is in the journal rather than here.
-        // Collapsing them keeps this a status line rather than a diagnosis.
-        "inactive" | "deactivating" | "failed" => proto::UnitState::Inactive,
+        // Reported apart from `inactive`, because a daemon that could not start and a daemon
+        // somebody stopped are different news even though neither is running.
+        "failed" => proto::UnitState::Failed,
+        "inactive" | "deactivating" => proto::UnitState::Inactive,
         other => {
             tracing::warn!(state = other, unit, "unfamiliar unit state");
             proto::UnitState::Unknown
         }
-    };
-
-    Ok(state)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -168,4 +196,60 @@ async fn property(
     .map(|value| value.try_to_owned().map(Into::into))
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pair a crash loop presents as, and the whole reason [`state_of`] reads `SubState`.
+    #[test]
+    fn auto_restart_is_not_active() {
+        assert_eq!(
+            state_of("activating", "auto-restart", "mediad.service"),
+            proto::UnitState::Restarting
+        );
+        // The same state on a systemd new enough to queue the job separately.
+        assert_eq!(
+            state_of("activating", "auto-restart-queued", "mediad.service"),
+            proto::UnitState::Restarting
+        );
+    }
+
+    /// A daemon coming up for the first time is `activating` too, and must keep reading as running
+    /// — `padd` is `activating` while it connects to `robotd` on every boot.
+    #[test]
+    fn starting_still_counts_as_active() {
+        assert_eq!(
+            state_of("activating", "start", "padd.service"),
+            proto::UnitState::Active
+        );
+        assert_eq!(
+            state_of("active", "running", "padd.service"),
+            proto::UnitState::Active
+        );
+    }
+
+    /// `failed` and a deliberate stop both mean "not running" and are not the same news.
+    #[test]
+    fn failed_is_not_a_stop() {
+        assert_eq!(
+            state_of("failed", "failed", "mediad.service"),
+            proto::UnitState::Failed
+        );
+        assert_eq!(
+            state_of("inactive", "dead", "padd.service"),
+            proto::UnitState::Inactive
+        );
+    }
+
+    /// An unfamiliar `ActiveState` reports "I do not know" rather than guessing at one of the
+    /// answers that would be acted on.
+    #[test]
+    fn an_unknown_state_stays_unknown() {
+        assert_eq!(
+            state_of("maintenance", "whatever", "robotd.service"),
+            proto::UnitState::Unknown
+        );
+    }
 }
