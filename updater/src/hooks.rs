@@ -174,7 +174,16 @@ pub async fn run(
 
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    text.truncate(MAX_OUTPUT);
+    if text.len() > MAX_OUTPUT {
+        // Cut on a char boundary: `from_utf8_lossy` can place a multi-byte character (often a
+        // 3-byte U+FFFD for invalid input) straddling the cap, and a bare `truncate` panics on
+        // that — inside `Engine::apply`, where it kills the unattended-update task for good.
+        let mut end = MAX_OUTPUT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 
     if !output.status.success() {
         return Err(Error::Hook {
@@ -377,6 +386,43 @@ mod tests {
         assert!(outcome.ran);
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.output.contains("migrated"));
+    }
+
+    /// Hook output is capped at [`MAX_OUTPUT`], and the cap used to be a bare
+    /// `String::truncate` — which panics when the cut lands mid-character, easily reachable
+    /// because `from_utf8_lossy` pads invalid bytes into 3-byte U+FFFD runs. The panic
+    /// unwound through `Engine::apply`, killing the unattended-update task with no journal
+    /// entry. The cut must retreat to a char boundary instead.
+    #[tokio::test]
+    async fn oversized_output_is_cut_on_a_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        // 8191 ASCII bytes, then a two-byte `é` straddling byte 8192, then a failure so the
+        // output travels inside the error — the path the panic used to abort.
+        write_hook(
+            dir.path(),
+            HookKind::PostInstall,
+            "#!/bin/sh\nhead -c 8191 /dev/zero | tr '\\0' 'a'\nprintf 'é'\nexit 1\n",
+        );
+
+        let err = run(
+            dir.path(),
+            HookKind::PostInstall,
+            &ctx(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("the hook failed; its output must come back as an error, not a panic");
+
+        let Error::Hook { detail, .. } = err else {
+            panic!("expected Error::Hook, got {err:?}");
+        };
+        let output = detail
+            .strip_prefix("exited with 1: ")
+            .expect("the exit status is reported with the output");
+        assert!(
+            output.trim().chars().all(|c| c == 'a'),
+            "the é straddling the cap must be cut away whole, not split: {output:?}"
+        );
     }
 
     /// A non-zero exit is a failed update — the caller turns this into a rollback.
