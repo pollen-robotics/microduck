@@ -992,6 +992,30 @@ impl Bringup {
     }
 }
 
+/// Where an accepted mode switch leaves the bring-up state, or `None` to refuse it this tick.
+///
+/// Two cases matter:
+///
+/// - **`Limp` stays `Limp`.** Torque is off there, so there is nothing to ramp from yet — and
+///   the ramp must not start: the enable path below turns the motors on and starts the homing
+///   ramp itself, and the queued switch completes when that ramp does. Jumping to `Homing`
+///   here would skip `set_torque`, the ramp would "finish" over dead motors, and the other
+///   mode's policies would load onto a robot lying on the floor while reporting `Ready`.
+/// - **No position sample refuses.** The ramp starts from the joints' actual positions, so a
+///   tick without a read cannot arm it. Queuing the switch anyway would leave it in
+///   `mode_change` forever — its only consumer is the ramp finishing — and every later switch
+///   would be refused as already in flight.
+fn mode_switch_bringup(
+    bringup: Bringup,
+    positions: Option<[f64; NUM_JOINTS]>,
+    now: Instant,
+) -> Option<Bringup> {
+    match bringup {
+        Bringup::Limp => Some(Bringup::Limp),
+        _ => positions.map(|from| Bringup::Homing { from, since: now }),
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -1544,7 +1568,9 @@ async fn control_loop<T: RobotIo>(
                 );
             } else if mode_change.is_some() {
                 tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
-            } else {
+            } else if let Some(next) =
+                mode_switch_bringup(bringup, sensors.as_ref().map(|s| s.positions), tick_start)
+            {
                 tracing::warn!(
                     from = policy_params.mode.as_str(),
                     to = target.as_str(),
@@ -1560,13 +1586,14 @@ async fn control_loop<T: RobotIo>(
                 }
                 mode_change = Some(target);
                 // Home the robot with the machinery `init` and a fall recovery already use: it
-                // ramps per tick, and `driving` is false until it reaches Ready.
-                if let Some(sensors) = sensors.as_ref() {
-                    bringup = Bringup::Homing {
-                        from: sensors.positions,
-                        since: tick_start,
-                    };
-                }
+                // ramps per tick, and `driving` is false until it reaches Ready. From `Limp`
+                // this is a no-op — the enable path below owns the torque and the ramp.
+                bringup = next;
+            } else {
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch refused: no position sample this tick"
+                );
             }
         }
 
@@ -4650,5 +4677,50 @@ mod tests {
         // Neither other state ramps anything.
         assert!(Bringup::Limp.homing_target(since).is_none());
         assert!(Bringup::Ready.homing_target(since).is_none());
+    }
+
+    /// A mode switch requested while `Limp` must stay `Limp`: the enable path owns
+    /// `set_torque`, and jumping straight to `Homing` would run the whole ramp over dead
+    /// motors — finishing "successfully", loading the other mode's policies, and reporting
+    /// `Ready` for a robot still lying on the floor.
+    #[test]
+    fn a_mode_switch_from_limp_waits_for_the_enable_path() {
+        let now = Instant::now();
+        assert_eq!(
+            mode_switch_bringup(Bringup::Limp, Some([0.0; NUM_JOINTS]), now),
+            Some(Bringup::Limp)
+        );
+    }
+
+    /// A tick without a position sample cannot arm the ramp. Queuing the switch anyway would
+    /// leave it in `mode_change` forever — its only consumer is the ramp finishing — and every
+    /// later switch would be refused as already in flight. Refusing beats wedging.
+    #[test]
+    fn a_mode_switch_without_a_position_sample_is_refused() {
+        let now = Instant::now();
+        assert_eq!(mode_switch_bringup(Bringup::Ready, None, now), None);
+        assert_eq!(
+            mode_switch_bringup(
+                Bringup::Homing {
+                    from: [0.0; NUM_JOINTS],
+                    since: now
+                },
+                None,
+                now
+            ),
+            None
+        );
+    }
+
+    /// The ordinary case: re-home from wherever the joints are, so the other mode's policies
+    /// load at a known pose with the robot standing still.
+    #[test]
+    fn a_mode_switch_restarts_the_homing_ramp() {
+        let now = Instant::now();
+        let from = [0.1; NUM_JOINTS];
+        assert_eq!(
+            mode_switch_bringup(Bringup::Ready, Some(from), now),
+            Some(Bringup::Homing { from, since: now })
+        );
     }
 }
