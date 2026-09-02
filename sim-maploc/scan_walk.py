@@ -15,9 +15,34 @@ SOCK = "/tmp/dsm/a.sock"
 WALK, STOP = 5.0, 6.0
 
 s = socket.socket(socket.AF_UNIX); s.connect(SOCK)
-sf = s.makefile("rw")
-sf.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "robot.subscribe",
-                     "params": {}}) + "\n"); sf.flush(); sf.readline()
+s.sendall((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "robot.subscribe",
+                       "params": {}}) + "\n").encode())
+_buf = b""
+
+
+def _lines(block: bool):
+    """Complete lines waiting on the subscription. With `block`, wait for at
+    least one; otherwise return whatever has already arrived, possibly none."""
+    global _buf
+    s.setblocking(block)
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except BlockingIOError:
+            break
+        if not chunk:
+            raise EOFError("robotd closed the subscription")
+        _buf += chunk
+        if block and b"\n" in _buf:
+            break
+        if not block:
+            continue
+    s.setblocking(True)
+    *done, _buf = _buf.split(b"\n")
+    return done
+
+
+_lines(True)  # the subscribe reply
 
 c = socket.socket(socket.AF_UNIX); c.connect(SOCK)
 cf = c.makefile("w")
@@ -34,11 +59,25 @@ def truth():
 
 
 def pose():
+    # The subscription pushes state faster than this loop reads it, and during
+    # a stop nothing reads at all. Reading one line per call therefore returned
+    # a pose from further and further in the past -- by the second stop the
+    # "odom" printed here was the truth of the stop before, and the legs were
+    # steered on it. Drain the backlog and use the newest sample.
+    block = False
     while True:
-        m = json.loads(sf.readline())
-        od = (m.get("params") or {}).get("odom")
-        if od:
-            return od["position"][0], od["position"][1], od["yaw"]
+        latest = None
+        for line in _lines(block):
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            od = (m.get("params") or {}).get("odom")
+            if od:
+                latest = (od["position"][0], od["position"][1], od["yaw"])
+        if latest is not None:
+            return latest
+        block = True  # nothing waiting yet: wait for the next sample
 
 
 def move(vx, vyaw):
