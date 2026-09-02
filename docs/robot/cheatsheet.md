@@ -246,6 +246,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **X** / square | roulade — one forward roll; hold to chain rolls |
 | **LB** | curious: a slow head tilt right, then left, with a small dip of the neck (about 2 s) |
 | **RB** | peck: the head goes forward twice (about 1.7 s) |
+| **R3** (right stick click) | startled: head up at once, a step back, head settles (2 s). Add the scream with RT |
 | **DPad-Left** | left kick (the right kick has no button while the bumpers are expressions) |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |

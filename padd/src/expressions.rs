@@ -19,6 +19,8 @@ use duck_ipc_proto as proto;
 pub enum Kind {
     Curious,
     Peck,
+    /// Startled: the head snaps up and the duck backs away a step. The scream is on the trigger.
+    Startled,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +38,16 @@ const PECK_NECK: f64 = 1.5;
 const PECK_HEAD: f64 = 0.6;
 /// Curious: tilt right, tilt left, centre. Each leg this long.
 const CURIOUS_LEG: f64 = 0.7;
+/// Startled: head up at once, then back away from `STARTLED_BACK_FROM` to `STARTLED_BACK_TO`
+/// (the calmest backward walk command the alpha gait has), head settling by the end.
+const STARTLED_LEN: f64 = 2.0;
+const STARTLED_BACK_FROM: f64 = 0.3;
+const STARTLED_BACK_TO: f64 = 1.5;
+const STARTLED_BACK: proto::MoveParams = proto::MoveParams {
+    vx: -0.35,
+    vy: 0.0,
+    vyaw: 0.22,
+};
 
 impl Expression {
     pub fn start(kind: Kind, now: Instant) -> Self {
@@ -46,7 +58,14 @@ impl Expression {
         Duration::from_secs_f64(match kind {
             Kind::Peck => PECK_PERIOD * PECK_COUNT as f64,
             Kind::Curious => CURIOUS_LEG * 3.0,
+            Kind::Startled => STARTLED_LEN,
         })
+    }
+
+    /// The twist this expression wants at `now`: `None` when it leaves the sticks in charge.
+    pub fn twist_at(&self, now: Instant) -> Option<proto::MoveParams> {
+        let t = now.duration_since(self.started).as_secs_f64();
+        twist_at(self.kind, t)
     }
 
     /// The head intent at `now`, or `None` once the expression is over.
@@ -65,8 +84,28 @@ fn ramp(t: f64, len: f64) -> f64 {
     0.5 - 0.5 * (std::f64::consts::PI * x).cos()
 }
 
+pub fn twist_at(kind: Kind, t: f64) -> Option<proto::MoveParams> {
+    match kind {
+        Kind::Startled if (STARTLED_BACK_FROM..STARTLED_BACK_TO).contains(&t) => {
+            Some(STARTLED_BACK)
+        }
+        _ => None,
+    }
+}
+
 pub fn head_at(kind: Kind, t: f64) -> proto::HeadParams {
     match kind {
+        Kind::Startled => {
+            // Head pitch negative is beak up (measured on the shipped policies). Up fast, back
+            // to level over the last half second.
+            let up = ramp(t, 0.15) * (1.0 - ramp(t - (STARTLED_LEN - 0.5), 0.5));
+            proto::HeadParams {
+                neck_pitch: 0.0,
+                head_pitch: -up,
+                head_yaw: 0.0,
+                head_roll: 0.0,
+            }
+        }
         Kind::Peck => {
             let phase = t % PECK_PERIOD;
             // Forward = the neck pitched down (it tracks only about half, so it is asked for
@@ -153,8 +192,32 @@ mod tests {
     }
 
     #[test]
+    fn startled_looks_up_then_backs_away_then_settles() {
+        assert!(
+            head_at(Kind::Startled, 0.2).head_pitch < -0.9,
+            "head up at once"
+        );
+        assert_eq!(
+            twist_at(Kind::Startled, 0.1),
+            None,
+            "no walking before the head is up"
+        );
+        assert_eq!(twist_at(Kind::Startled, 1.0), Some(STARTLED_BACK));
+        assert_eq!(twist_at(Kind::Startled, 1.8), None);
+        assert!(
+            head_at(Kind::Startled, STARTLED_LEN - 0.01)
+                .head_pitch
+                .abs()
+                < 0.05,
+            "level at the end"
+        );
+        assert_eq!(twist_at(Kind::Peck, 0.5), None);
+        assert_eq!(twist_at(Kind::Curious, 0.5), None);
+    }
+
+    #[test]
     fn no_expression_touches_the_yaw_or_the_body() {
-        for kind in [Kind::Peck, Kind::Curious] {
+        for kind in [Kind::Peck, Kind::Curious, Kind::Startled] {
             for i in 0..300 {
                 let h = head_at(kind, i as f64 / 100.0);
                 assert_eq!(h.head_yaw, 0.0);

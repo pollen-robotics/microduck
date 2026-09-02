@@ -253,7 +253,7 @@ fn main() -> std::process::ExitCode {
         hz = args.hz,
         roller,
         "driving — Start once = stand up (init), Start again = policy on/off, Y head mode, \
-         B body pose, A ground pick, LB curious head, RB peck, DPad-Left kick left, \
+         B body pose, A ground pick, LB curious head, RB peck, R3 startled, DPad-Left kick left, \
          DPad-Right reboot servos, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
          Select = soft release, Select (3s) shutdown"
     );
@@ -319,6 +319,8 @@ fn main() -> std::process::ExitCode {
                     // has no button on this pad: D-pad right reboots the servos).
                     Button::LeftTrigger => start_expression = Some(Kind::Curious),
                     Button::RightTrigger => start_expression = Some(Kind::Peck),
+                    // R3 (right stick click): startled — head up, a step back. Scream on RT.
+                    Button::RightThumb => start_expression = Some(Kind::Startled),
                     Button::DPadLeft => kick_left = true,
                     Button::DPadDown => sit_toggle = true,
                     // Reboot the servos: the way back from a tripped overload without pulling
@@ -645,6 +647,11 @@ fn main() -> std::process::ExitCode {
                 vy: 0.0,
                 vyaw: -right_x * ROLLER_YAW,
             }),
+            // An expression that walks (startled backs away) takes the twist over from the
+            // sticks while it does.
+            Mode::Drive if expression.and_then(|e| e.twist_at(tick)).is_some() => {
+                proto::Call::RobotMove(expression.and_then(|e| e.twist_at(tick)).expect("checked"))
+            }
             Mode::Drive => proto::Call::RobotMove(proto::MoveParams {
                 vx: left_y
                     * if left_y >= 0.0 {
