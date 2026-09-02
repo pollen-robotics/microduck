@@ -279,12 +279,6 @@ fn main() -> std::process::ExitCode {
         let mut roulade = false;
         let mut reboot_motors = false;
         while let Some(event) = gilrs.next_event() {
-            // D-pad up pressed and released short of the mode-switch hold: reboot the servos
-            // (`robot.rebootMotors`), the way back from a tripped overload without pulling the
-            // battery. On the release, so a hold that reached the switch does not also reboot.
-            if let gilrs::EventType::ButtonReleased(Button::DPadUp, _) = event.event {
-                reboot_motors = !mode_switch_sent;
-            }
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
@@ -299,6 +293,9 @@ fn main() -> std::process::ExitCode {
                     Button::LeftTrigger => kick_left = true,
                     Button::RightTrigger => kick_right = true,
                     Button::DPadDown => sit_toggle = true,
+                    // Reboot the servos: the way back from a tripped overload without pulling
+                    // the battery.
+                    Button::DPadUp => reboot_motors = true,
                     _ => {}
                 }
             }
@@ -426,9 +423,7 @@ fn main() -> std::process::ExitCode {
         }
 
         if reboot_motors {
-            tracing::warn!(
-                "DPad-Up released — asking the robot to reboot its servos (robot.rebootMotors)"
-            );
+            tracing::warn!("DPad-Up — asking the robot to reboot its servos (robot.rebootMotors)");
             let call = proto::Call::RobotRebootMotors(proto::RebootMotorsParams::default());
             if let Err(e) = request(&mut stream, &mut next_id, &call) {
                 tracing::error!(error = %e, "reboot request failed");

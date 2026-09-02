@@ -246,7 +246,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
-| **DPad-Up**, short press | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
+| **DPad-Up** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **Select**, held 2 s | sit down, then power off |
 
