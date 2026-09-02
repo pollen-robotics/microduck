@@ -125,6 +125,16 @@ down() {
 
 # ── starting ──────────────────────────────────────────────────────────────────
 
+# Always build, never "unless the binary exists". `target/debug` is shared by every branch checked
+# out in this tree, so a robotd that is present is not a robotd that was built from here: one built
+# on another branch that afternoon installed cleanly, connected to the body, and had no idea what a
+# simulated body was — its `--sim` was the older robot-made-of-nothing — and every duck "would not
+# enable". cargo returns in a moment when nothing changed, which is the only case the guard saved.
+build_daemons() {
+    say "building the daemons from $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds)
+}
+
 up() {
     [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
@@ -134,10 +144,7 @@ up() {
     down
     mkdir -p "$STATE"
 
-    if [ ! -x "$REPO/target/debug/robotd" ] || [ ! -x "$REPO/target/debug/robotctl" ]; then
-        say "building robotd and robotctl"
-        (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
-    fi
+    build_daemons
 
     # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
     # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
@@ -595,7 +602,7 @@ boot() {
     # one is `rootfs`'s job, and guarding the call on the directory existing is what stopped a
     # changed package list from ever being noticed. It returns in a moment when nothing has changed.
     rootfs
-    [ -x "$REPO/target/debug/robotd" ] || (cd "$REPO" && cargo build --quiet -p robotd -p robotctl)
+    build_daemons
     stage
     start_body
 
