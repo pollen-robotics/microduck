@@ -1442,6 +1442,33 @@ async fn control_loop<T: RobotIo>(
             None => {}
         }
 
+        // `robot.rebootMotors`: torque off everywhere, then REBOOT the named servos (every servo
+        // when none are named). The rebooted servos are off the bus for a few hundred milliseconds
+        // — the reads fail and the loop coasts through it — and come back with torque off and
+        // EEPROM gains; the forgotten gain cache makes the next write restore the gains, and the
+        // robot is back at limp, so the next `init` or Start brings it up like a fresh boot. Torque
+        // off first on purpose: a tripped servo is usually a leg, and a robot standing on the other
+        // leg while one reboots is not a robot to leave standing.
+        if let Some(ids) = intents.take_reboot_motors() {
+            let ids: Vec<u8> = if ids.is_empty() {
+                duck_control::model::JOINT_IDS.to_vec()
+            } else {
+                ids
+            };
+            if let Err(e) = safety.set_torque(false) {
+                tracing::warn!(error = %e, "robot.rebootMotors: torque off failed on a servo; rebooting anyway");
+            }
+            match safety.reboot_motors(&ids) {
+                Ok(()) => tracing::warn!(
+                    ?ids,
+                    "robot.rebootMotors: rebooted; init or Start brings the robot up"
+                ),
+                Err(e) => tracing::warn!(error = %e, ?ids, "robot.rebootMotors: failed part-way"),
+            }
+            bringup = Bringup::Limp;
+            was_driving = false;
+        }
+
         // One-shot skill requests, taken once per tick like the power request. They need a
         // driving robot — the prototype's buttons likewise did nothing until the policy ran.
         let requests = intents.take_skills();
@@ -2975,6 +3002,12 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Never refused: a robot with a tripped servo is exactly the one that needs it.
+        proto::Call::RobotRebootMotors(p) => {
+            intents.request_reboot_motors(p.ids.clone());
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
         proto::Call::RobotHealth => proto::Response::ok(Some(id), &state.health()),
         proto::Call::RobotSafeToRestart => proto::Response::ok(Some(id), &state.safe_to_restart()),
         proto::Call::RobotModelApi => proto::Response::ok(
@@ -4407,6 +4440,9 @@ mod tests {
             fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
                 self.0.set_torque(on)
             }
+            fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
+                self.0.reboot(id)
+            }
             fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
                 self.0.slow_sensors()
             }
@@ -4577,6 +4613,58 @@ mod tests {
         assert!(
             !s.homed.load(Ordering::Relaxed),
             "still reporting homed after relax"
+        );
+    }
+
+    /// **`robot.rebootMotors` cuts torque, reboots the named servos and returns to limp.**
+    #[tokio::test]
+    async fn robot_reboot_motors_reboots_the_named_servos_and_returns_to_limp() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send((io.torque, io.reboots.clone(), io.last_gain))
+                .unwrap();
+        });
+        while s.ticks.load(Ordering::Relaxed) < 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let at = s.ticks.load(Ordering::Relaxed);
+        intents.request_reboot_motors(vec![7]);
+        while s.ticks.load(Ordering::Relaxed) < at + 4 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        let (torque, reboots, last_gain) = rx.recv().unwrap();
+        assert_eq!(
+            torque,
+            Some(false),
+            "the joints must be unpowered after a reboot"
+        );
+        assert_eq!(reboots, vec![7], "only the named servo is rebooted");
+        assert_eq!(
+            last_gain,
+            Some(params.policy.gain),
+            "the gain is written again after the reboot"
+        );
+        assert!(
+            !s.homed.load(Ordering::Relaxed),
+            "still reporting homed after a reboot"
+        );
+        assert!(
+            !intents.snapshot().enabled,
+            "a reboot must stop the policy asking to drive"
         );
     }
 

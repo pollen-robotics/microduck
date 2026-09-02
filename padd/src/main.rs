@@ -247,8 +247,8 @@ fn main() -> std::process::ExitCode {
         hz = args.hz,
         roller,
         "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
-         Select (2s) shutdown"
+         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up reboot servos, DPad-Up (3s) \
+         walk/roller, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -277,7 +277,14 @@ fn main() -> std::process::ExitCode {
         let mut kick_right = false;
         let mut sit_toggle = false;
         let mut roulade = false;
+        let mut reboot_motors = false;
         while let Some(event) = gilrs.next_event() {
+            // D-pad up pressed and released short of the mode-switch hold: reboot the servos
+            // (`robot.rebootMotors`), the way back from a tripped overload without pulling the
+            // battery. On the release, so a hold that reached the switch does not also reboot.
+            if let gilrs::EventType::ButtonReleased(Button::DPadUp, _) = event.event {
+                reboot_motors = !mode_switch_sent;
+            }
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
@@ -416,6 +423,17 @@ fn main() -> std::process::ExitCode {
         {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
+        }
+
+        if reboot_motors {
+            tracing::warn!(
+                "DPad-Up released — asking the robot to reboot its servos (robot.rebootMotors)"
+            );
+            let call = proto::Call::RobotRebootMotors(proto::RebootMotorsParams::default());
+            if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                tracing::error!(error = %e, "reboot request failed");
+                return std::process::ExitCode::FAILURE;
+            }
         }
 
         // Select held two seconds: sit down, then power off. Sent once per hold — the

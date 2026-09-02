@@ -301,6 +301,15 @@ impl RobotIo for DynamixelIo {
         DynamixelIo::set_torque(self, on)
     }
 
+    fn reboot(&mut self, id: u8) -> Result<()> {
+        // The status packet is a courtesy the servo may not manage before it resets, so only a
+        // failure to send is an error here.
+        self.controller
+            .reboot(id)
+            .map(|_| ())
+            .map_err(|e| IoError::Bus(format!("reboot {id}: {e}")))
+    }
+
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         // I and D are written too, at zero — the prototype's `--ki`/`--kd` defaults, which
         // its startup writes to every motor. These are RAM registers, so every power-up
