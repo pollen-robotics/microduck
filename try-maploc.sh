@@ -75,15 +75,16 @@ map_path = "$STATE/maploc.session"
 wipe_on_boot = true
 search_sweep = true
 # Every odometry tick and depth frame the mapper consumes, appended to a
-# timestamped .mdlg. maploc's `evaluate` example replays one byte-for-byte,
+# timestamped .mdlg. maploc's evaluate example replays one byte-for-byte,
 # so the debugging loop stops being "re-run the simulator and hope".
-record_dir = "$STATE/rec"
+# Kept inside the worktree, not /tmp, so a reboot does not eat the sessions.
+record_dir = "$REPO/recordings"
 TOML
 
     echo "== body_server + map overlay (viewer) on $PORT"
     ( cd $RL && PYTHONPATH=src MAP_FALLBACK= \
         detach $STATE/body.log $RL/.venv/bin/mjpython \
-        $REPO/sim-maploc/body_with_map.py --port $PORT --ducks 1 --keyframe STAND \
+        $REPO/sim-maploc/body_with_map.py --port $PORT --ducks 1 --keyframe SIT \
         --scene $RL/src/mjlab_microduck/robot/microduck/scene_apartment.xml \
         --robot-socket $SOCK ) > $STATE/body.pid
     for i in $(seq 1 120); do
