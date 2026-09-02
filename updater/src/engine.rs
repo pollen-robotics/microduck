@@ -1816,27 +1816,16 @@ impl Engine {
 
             rec.finish(&Ok(outcome.clone()));
 
-            let logged = LogEntry {
-                at: now_unix(),
-                component: ComponentId::new(pending.component.clone()),
-                from: Some(pending.version.clone()),
-                to: match &outcome {
-                    ApplyResult::RolledBack { reverted_to, .. } => reverted_to.clone(),
-                    _ => None,
-                },
-                outcome: match &outcome {
-                    ApplyResult::Stuck { reason, .. } => Outcome::Aborted {
-                        reason: reason.clone(),
-                    },
-                    _ => Outcome::RolledBack {
-                        reason: reason.clone(),
-                    },
-                },
-                run: rec.run(),
-            };
-            if let Err(e) = self.journal.append(&logged) {
-                tracing::error!(error = %e, "could not write the update log");
-            }
+            // Through `record`, like every other outcome: the hand-built entry this replaces
+            // put the *reverted-to* version in `to` for a `RolledBack`, which `known_bad`
+            // reads as "the version that failed" — it blacklisted the release now running
+            // and never the one that actually failed. See `journal_outcome`.
+            self.record(
+                &pending.component,
+                Some(pending.version.clone()),
+                &Ok(outcome.clone()),
+                rec.run(),
+            );
 
             outcomes.push(outcome);
         }
@@ -1945,7 +1934,11 @@ impl Engine {
                     at: crate::journal::now_unix(),
                     component: crate::proto::ComponentId(name.clone()),
                     from: crumb.from.as_deref().and_then(|v| v.parse().ok()),
-                    to: crumb.to.as_deref().and_then(|v| v.parse().ok()),
+                    // A `RolledBack` entry's `to` names the version that *failed* — the one
+                    // the rescue moved off of — never the golden it landed on. `known_bad`
+                    // reads this field; naming golden here would blacklist the release the
+                    // board is successfully running. See `Engine::record`.
+                    to: crumb.from.as_deref().and_then(|v| v.parse().ok()),
                     outcome: crate::proto::Outcome::RolledBack { reason: because },
                     run: rec.run(),
                 };
