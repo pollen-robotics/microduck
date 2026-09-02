@@ -246,6 +246,15 @@ fn main() {
                         }
                     }
                 }
+                // MAPLOC_MIRROR_COLS=1 replays every frame with its columns
+                // reversed. A recording whose sensor numbered its columns the
+                // other way round -- the MuJoCo twin's did -- scores far
+                // better mirrored than straight, and that is how it showed.
+                if std::env::var_os("MAPLOC_MIRROR_COLS").is_some() {
+                    for row in ranges.chunks_mut(8) {
+                        row.reverse();
+                    }
+                }
                 let flat = rp.flatten(&ranges, head, &posture);
                 if flat.angles_body.is_empty() {
                     continue;
