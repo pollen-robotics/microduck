@@ -93,6 +93,16 @@ struct Args {
     #[arg(long)]
     no_auto_exposure: bool,
 
+    /// Take frames from a duck in MuJoCo at `host:port` instead of a camera.
+    ///
+    /// The geometry has to match the simulator's camera — `--width 640 --height 360 --fps 15` for
+    /// its defaults — because the frames arrive raw and length-prefixed with no handshake, and a
+    /// mismatch is a picture nobody can read rather than an error the pipeline can recover from.
+    /// `mediad` says so and refuses the frame if the sizes disagree.
+    /// Takes precedence over `[media] camera`, which is a fact about a robot and not about this.
+    #[arg(long)]
+    sim_camera: Option<String>,
+
     /// Rotate in the pipeline as well, so the *encoded stream* comes out upright.
     ///
     /// **Off by default because it is expensive in a way that does not look like rotation.** It
@@ -211,7 +221,9 @@ fn main() -> ExitCode {
             "producing as"
         );
 
-        let source = if media.camera {
+        let source = if let Some(addr) = args.sim_camera.clone() {
+            mediad::pipeline::Source::Sim(addr)
+        } else if media.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),
                 exposure: args.exposure,
@@ -275,6 +287,8 @@ fn main() -> ExitCode {
                 None
             }
             (mediad::pipeline::Source::Test, _) => None,
+            // A simulated camera has no sensor to write, and its brightness is the renderer's.
+            (mediad::pipeline::Source::Sim(_), _) => None,
         };
 
         // **The duck detector, from the same config file as everything else.** `[detect]` lives in

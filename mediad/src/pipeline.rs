@@ -189,6 +189,13 @@ pub enum Source {
     Test,
     /// The head camera, through the rkisp capture path.
     Camera(Camera),
+    /// A simulated head camera, at `host:port`: what a duck in MuJoCo sees.
+    ///
+    /// Frames arrive length-prefixed and raw rather than as JSON, unlike the rest of the simulator
+    /// links — 640x360 UYVY is 460,800 bytes, and at 15 fps that is 6.9 MB/s. There is no handshake,
+    /// because there is nothing to negotiate that both ends do not already have to agree on to be
+    /// useful: the geometry is `--width`/`--height` on both sides or nothing works.
+    Sim(String),
 }
 
 /// The head camera, and the two things it will not work without.
@@ -307,6 +314,7 @@ pub fn start(
             src
         }
         Source::Camera(camera) => camera_source(camera, fps)?,
+        Source::Sim(addr) => sim_source(addr, width, height, fps)?,
     };
 
     // Pinned rather than negotiated, because both branches of the tee depend on the answer, and a
@@ -786,6 +794,97 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
         "head camera"
     );
     Ok(src)
+}
+
+/// A simulated camera as an `appsrc`, fed by a thread reading frames off a socket.
+///
+/// **`is-live` and `do-timestamp`, both of them.** A camera is live by construction; an `appsrc` is
+/// not, and without saying so the pipeline races ahead of the clock and `webrtcsink` sees a source
+/// that can be pulled faster than real time. And without timestamps every downstream element has to
+/// invent them, which shows up as a stream that plays at the wrong speed rather than as an error.
+///
+/// The reader owns the reconnect: MuJoCo restarts whenever the number of ducks changes, and a
+/// camera that goes away must not take the pipeline with it — the encoder simply has no new frames
+/// until it comes back, which is what a real camera being unplugged looks like too.
+fn sim_source(addr: &str, width: u32, height: u32, fps: u32) -> Result<gst::Element> {
+    use gst_app::prelude::*;
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", CAPTURE_FORMAT)
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let expected = (width as usize) * (height as usize) * 2;
+    let announce = addr.to_owned();
+    let addr = addr.to_owned();
+    let pushable = src.clone();
+    std::thread::Builder::new()
+        .name("sim-camera".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                match read_frames(&addr, expected, &pushable) {
+                    Ok(()) => tracing::warn!(%addr, "the simulated camera closed"),
+                    Err(e) if !complained => {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated camera; retrying");
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(
+            |e| tracing::error!(error = %e, "no reader thread for the simulated camera"),
+        );
+
+    tracing::info!(addr = %announce, width, height, fps, "simulated head camera");
+    Ok(src.upcast())
+}
+
+/// Length-prefixed frames from the simulator into an `appsrc`, until it stops or the frames stop.
+fn read_frames(addr: &str, expected: usize, src: &gst_app::AppSrc) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut header = [0u8; 4];
+    let mut frame = vec![0u8; expected];
+    tracing::info!(%addr, "the simulated camera is feeding the pipeline");
+
+    loop {
+        reader.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header) as usize;
+        // A frame of the wrong size means the two ends disagree about the geometry, and pushing it
+        // would be a picture nobody can read. Said once, loudly, rather than a stream of noise.
+        if len != expected {
+            return Err(std::io::Error::other(format!(
+                "the simulator sent a {len}-byte frame and this pipeline is set up for {expected}                  — `--width`/`--height` must match the simulator's camera"
+            )));
+        }
+        reader.read_exact(&mut frame)?;
+        let mut buffer = gst::Buffer::with_size(len).map_err(std::io::Error::other)?;
+        buffer
+            .get_mut()
+            .expect("a fresh buffer is writable")
+            .map_writable()
+            .map_err(std::io::Error::other)?
+            .copy_from_slice(&frame);
+        if src.push_buffer(buffer).is_err() {
+            return Ok(()); // the pipeline is gone
+        }
+    }
 }
 
 /// What the tee carries, and what both branches therefore see.
