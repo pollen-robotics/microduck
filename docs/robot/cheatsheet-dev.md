@@ -80,8 +80,10 @@ robotctl health
 ```
 
 The `units` block prints one line per daemon with the release its process was launched from, and a
-warning naming the restart when that disagrees with what is installed. `build unknown (old)` means
-that daemon predates the release which taught it to say — restart it and it will answer.
+warning naming the restart when that disagrees with what is installed. `build unknown` means that
+daemon is running and published no identity — an old build, most likely; restart it and it will
+answer. `restarting` means it exited and systemd is bringing it back: ordinary for a few seconds
+after an update, and a daemon that cannot start at all if it stays that way.
 
 If a daemon is genuinely stale, restart it — this should not be necessary, so it is worth reading the
 journal for why it was:

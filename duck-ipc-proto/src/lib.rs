@@ -161,7 +161,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
-pub const API_VERSION: u32 = 16;
+/// # v17 — a unit state that can say "crash loop"
+///
+/// [`UnitState`] gains `Restarting` and `Failed`, which `system.services` can now answer with.
+/// Not additive in the way a new method is: an older client deserialising a `Vec<ServiceUnit>`
+/// rejects a member it has no variant for, and `robotctl` reads that reply with `.ok()` — so an
+/// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
+/// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
+/// update does; a board left mid-update sees a missing block, not a lie.
+pub const API_VERSION: u32 = 17;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -2861,15 +2869,35 @@ pub struct Pad {
 
 /// Whether one of the robot's units is running, as systemd sees it.
 ///
-/// Named for the unit rather than for `padd`, which is where it started: the same four answers are
-/// what [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
+/// Named for the unit rather than for `padd`, which is where it started: the same answers are what
+/// [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
 /// serialise as their own names, not as the type's.
+///
+/// **`Restarting` and `Failed` are here because folding them into their neighbours made a robot
+/// with an unplugged camera report a healthy one.** `mediad` exits when it cannot build a pipeline
+/// and `Restart=always` brings it back five seconds later, forever; systemd calls that
+/// `ActiveState=activating`, `SubState=auto-restart`. Read as `Active` — which is what happened,
+/// for `padd`'s good reason about a daemon still connecting at boot — it printed as a running
+/// daemon, and because systemd deletes `RuntimeDirectory=` on every stop there was no
+/// [`Identity`] to name a build either. The whole of a crash loop reached the operator as
+/// `active · build unknown (old)`: the one explanation that could not be true, since every daemon
+/// in this workspace has published its identity since the commit that introduced it.
+///
+/// `Failed` splits out for the smaller version of the same complaint: it read as `Inactive`, which
+/// is also what a deliberate `systemctl stop` reads as, and those are not the same news.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitState {
     /// Running. With a connected pad, the robot is drivable.
     Active,
-    /// The unit exists and is not running. Someone stopped it, or it is failed.
+    /// Between processes: it exited and systemd is starting it again. Once for an ordinary restart,
+    /// or every `RestartSec=` for a daemon that cannot start at all — this state cannot tell those
+    /// apart, and nothing that reads it should pretend otherwise.
+    Restarting,
+    /// It could not start, and systemd has stopped trying.
+    Failed,
+    /// The unit exists and is not running, because something stopped it. A robot whose owner has no
+    /// gamepad and disabled `padd` is the ordinary case, which is why this is not a fault.
     Inactive,
     /// No such unit on this board — a release older than the one that added it.
     Absent,

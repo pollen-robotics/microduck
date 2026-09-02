@@ -421,7 +421,9 @@ Two version numbers are legitimately different at once, and which pair it is dec
 | `updaterd` or `btd` behind the installed release, for a few seconds after an update | expected — the deferred restart has not fired yet |
 | `btd`, `robotd`, `configd`, `padd`, `mediad` or `tofd` disagreeing with `current` at all, persistently | the restart did not take effect *and* §5 did not fix it — so either `updaterd` has not restarted since, or its restart failed (journal, at `error`) |
 | `updaterd` behind it, persistently | the deferred restart never landed, and §5 will not fix this one. `robotctl update apply daemon` repairs it — it reports `already_current` with `updaterd` in `stale` and schedules the restart. `systemctl restart updaterd` is the same fix by hand; either way the journal has why it did not land |
-| any daemon reporting `build unknown (old)` | it predates the identity mechanism, so §5 leaves it alone. One update makes it answerable |
+| any daemon reporting `restarting` | it exited and systemd is bringing it back. For a few seconds after an update, that is the restart itself. Persistently, the daemon cannot start at all — `mediad` with the camera flex unplugged is the case this row exists for — and §5 leaves it alone, since a daemon that is not running has no identity to compare. `journalctl -u <name> -b` has why it exits |
+| any daemon reporting `failed` | it could not start and systemd has stopped retrying. Same journal, and unlike `stopped` nobody chose it |
+| any daemon reporting `build unknown` | it is running, and published no identity: a build predating the mechanism, or the instant between `exec` and its first line. §5 leaves it alone. One update makes an old one answerable |
 
 Ask the robot rather than inferring:
 
