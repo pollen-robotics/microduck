@@ -184,6 +184,9 @@ pub struct FakeIo {
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
     pub last_gain: Option<u16>,
+    /// Lowest gain ever commanded, so a test can tell a ramp reached the bottom even after the
+    /// running gain was restored.
+    pub min_gain: Option<u16>,
     /// Whether the orientation filter reports converged. False models the first seconds after
     /// startup, when projected gravity is not yet a measurement.
     pub imu_ready: bool,
@@ -219,6 +222,7 @@ impl FakeIo {
             reads: 0,
             writes: 0,
             last_gain: None,
+            min_gain: None,
             imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
@@ -286,6 +290,7 @@ impl RobotIo for FakeIo {
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         self.last_gain = Some(kp);
+        self.min_gain = Some(self.min_gain.map_or(kp, |m| m.min(kp)));
         Ok(())
     }
 

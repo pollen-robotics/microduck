@@ -391,6 +391,16 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Let go softly, then cut power: gain to the limp value at once, to zero over a second,
+    /// torque off at the end. The gamepad's Select press.
+    ///
+    /// **The robot still ends up on the floor**, just without the snap. Same as `relax` otherwise:
+    /// the next `init` or Start brings it back up from wherever it lies.
+    Soften {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run a one-shot skill: `ground-pick`, `kick-left`, `kick-right`, `roulade`, or
     /// `sit` (toggle).
     ///
@@ -2232,6 +2242,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: ids.clone() }),
             *json,
         ),
+        RobotCommand::Soften { json } => (proto::Call::RobotSoften, *json),
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
                 skill: skill.as_skill(),
@@ -2305,6 +2316,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::RebootMotors { ids, .. } => {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
+        RobotCommand::Soften { .. } => println!("letting go softly — torque off in about a second"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }

@@ -185,6 +185,7 @@ sudo robotctl robot init
 ```
 sudo robotctl robot relax --yes
 sudo robotctl robot reboot-motors           # every servo; or `reboot-motors 3 11` for just those. Torque off, then init / Start
+sudo robotctl robot soften          # the gentle version: 1 s gain ramp to zero, then torque off
 ```
 
 `init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
@@ -243,12 +244,15 @@ mapping is the prototype's, so muscle memory carries over:
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |
-| **LB / RB** | left / right kick |
+| **LB** | curious: a slow head tilt right, then left, with a small dip of the neck (about 2 s) |
+| **RB** | peck: the head goes forward twice (about 1.7 s) |
+| **DPad-Left** | left kick (the right kick has no button while the bumpers are expressions) |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
-| **Select**, held 2 s | sit down, then power off |
+| **Select** | soft release: gain to the limp value at once, to zero over 1 s, then torque off (`robot.soften`). The robot folds to the floor. |
+| **Select**, held 3 s | power off (the robot is already down from the press above) |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller

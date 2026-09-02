@@ -91,6 +91,35 @@ const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// snap. Not a parameter yet — one number with no evidence that anyone wants a different one.
 const HOME_RAMP: Duration = Duration::from_secs(2);
 
+/// How long `robot.soften` takes to bring the gain from `gain_limp` down to zero before it cuts
+/// torque. One second: long enough that a standing robot folds rather than drops, short enough
+/// that a joint forcing against something is released at once — the gain is already at the limp
+/// value on the first tick.
+const SOFTEN_RAMP: Duration = Duration::from_secs(1);
+
+/// `robot.soften` in flight: the joints are commanded where they were when it started, at a gain
+/// that runs linearly from `gain_limp` to zero over [`SOFTEN_RAMP`]; then torque is cut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Softening {
+    since: Instant,
+    from: [f64; NUM_JOINTS],
+}
+
+impl Softening {
+    /// The gain for this tick, or `None` once the ramp is over and torque should be cut.
+    fn gain_at(&self, now: Instant, gain_limp: u16) -> Option<u16> {
+        let t = now.duration_since(self.since).as_secs_f64() / SOFTEN_RAMP.as_secs_f64();
+        if t >= 1.0 {
+            return None;
+        }
+        // In steps of five: the gain is a register write to every servo, and a value that changes
+        // on every tick is fourteen extra transactions per tick for the whole second. Ten steps
+        // are indistinguishable from a straight line at this rate.
+        let raw = f64::from(gain_limp) * (1.0 - t);
+        Some(((raw / 5.0).round() * 5.0) as u16)
+    }
+}
+
 /// Smoothing on the reported battery voltage. At one sample per [`RATE_WINDOW`] this is a
 /// ~10 s time constant, which is what makes the number readable: the raw voltage sags
 /// several tenths of a volt on every step and recovers between them, so an unsmoothed
@@ -1251,6 +1280,7 @@ async fn control_loop<T: RobotIo>(
     let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
     let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
     let mut limp_fall = LimpFall::Idle;
+    let mut softening: Option<Softening> = None;
 
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
@@ -1434,11 +1464,37 @@ async fn control_loop<T: RobotIo>(
                     // ends up rather than assuming it is still at the home pose.
                     bringup = Bringup::Limp;
                     was_driving = false;
+                    softening = None;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "cannot cut torque; the robot is still powered")
                 }
             },
+            // The soft version: nothing is written here beyond remembering where the joints are.
+            // From the next target selection on, the gain is `gain_limp` and falling, and the
+            // ramp's end (below, every tick) is what cuts torque. Only from a powered robot: a
+            // limp one has nothing to let go of.
+            Some(intents::PowerRequest::Soften) => {
+                if bringup == Bringup::Limp {
+                    tracing::info!("robot.soften: already limp");
+                } else if softening.is_none() {
+                    let from = coast.known_positions(hold);
+                    tracing::warn!(
+                        gain = params.safety.gain_limp,
+                        ramp_ms = SOFTEN_RAMP.as_millis(),
+                        "robot.soften: gain to limp now, to zero over the ramp, then torque off"
+                    );
+                    softening = Some(Softening {
+                        since: tick_start,
+                        from,
+                    });
+                    // Whatever else was in flight is over: a fall recovery would fight this, and
+                    // the hold target is now where the robot is, not where it was driving to.
+                    limp_fall = LimpFall::Idle;
+                    falling.reset();
+                    hold = from;
+                }
+            }
             None => {}
         }
 
@@ -1467,6 +1523,24 @@ async fn control_loop<T: RobotIo>(
             }
             bringup = Bringup::Limp;
             was_driving = false;
+        }
+
+        // The end of a soften: the gain has reached zero, cut torque and go back to the start —
+        // exactly what `robot.relax` does, a second later and a lot more gently.
+        if let Some(s) = softening
+            && s.gain_at(tick_start, params.safety.gain_limp).is_none()
+        {
+            match safety.set_torque(false) {
+                Ok(()) => {
+                    tracing::warn!("robot.soften: ramp done, torque off");
+                    bringup = Bringup::Limp;
+                    was_driving = false;
+                    softening = None;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "robot.soften: cannot cut torque; retrying next tick")
+                }
+            }
         }
 
         // One-shot skill requests, taken once per tick like the power request. They need a
@@ -1911,6 +1985,8 @@ async fn control_loop<T: RobotIo>(
             // The limp-fall sequence owns the robot for its duration: the whole point is
             // that the policy is *not* driving while the robot falls, lands and is posed.
             && !in_limp_fall
+            // So does a soften: the robot is being let go of.
+            && softening.is_none()
             && sensors.is_some()
             && imu_warm
             && !powered_off;
@@ -1961,6 +2037,17 @@ async fn control_loop<T: RobotIo>(
         };
 
         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
+            // A soften, before everything: the joints where they were when it started, at a gain
+            // running from limp to zero. `moving` is true — the robot is folding.
+            _ if softening.is_some() => {
+                let s = softening.expect("checked above");
+                (
+                    s.from,
+                    s.gain_at(tick_start, params.safety.gain_limp).unwrap_or(0),
+                    true,
+                    "soften",
+                )
+            }
             // The limp-fall sequence, before anything else — `driving` is false throughout,
             // so without this it would fall through to the hold branch and the robot would
             // be commanded its pre-fall pose at walking gain, which is precisely the thing
@@ -3005,6 +3092,12 @@ fn dispatch(
         // Never refused: a robot with a tripped servo is exactly the one that needs it.
         proto::Call::RobotRebootMotors(p) => {
             intents.request_reboot_motors(p.ids.clone());
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // Never refused either: the soft way to the same place.
+        proto::Call::RobotSoften => {
+            intents.request_soften();
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
@@ -4614,6 +4707,80 @@ mod tests {
             !s.homed.load(Ordering::Relaxed),
             "still reporting homed after relax"
         );
+    }
+
+    /// **`robot.soften` lets go over a second and only then cuts power.** Torque is still on
+    /// right after the request, the gain has dropped to the limp value, and after the ramp the
+    /// joints are off exactly once, as with `relax`.
+    #[tokio::test]
+    async fn robot_soften_ramps_the_gain_down_then_cuts_power() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send((io.torque, io.torque_writes, io.min_gain)).unwrap();
+        });
+
+        while s.ticks.load(Ordering::Relaxed) < 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let ticks_at_soften = s.ticks.load(Ordering::Relaxed);
+        intents.request_soften();
+        while s.ticks.load(Ordering::Relaxed) < ticks_at_soften + 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Mid-ramp: the robot is folding, which the loop reports as moving (so `safeToRestart`
+        // says no while it happens); torque itself is checked at the end.
+        assert!(
+            s.moving.load(Ordering::Relaxed),
+            "a softening robot must report moving"
+        );
+        tokio::time::sleep(SOFTEN_RAMP + Duration::from_millis(100)).await;
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let (torque, writes, min_gain) = rx.recv().unwrap();
+        assert_eq!(
+            torque,
+            Some(false),
+            "soften left the joints powered after the ramp"
+        );
+        assert_eq!(writes, 2, "expected one on and one off, got {writes}");
+        // The lowest gain ever written: the ramp must have reached zero before torque was cut.
+        // (`last_gain` is the running gain again by then — the held branch restores it, as it
+        // does after a plain relax.)
+        assert_eq!(
+            min_gain,
+            Some(0),
+            "the gain never reached zero during the ramp"
+        );
+        assert!(
+            !s.homed.load(Ordering::Relaxed),
+            "still reporting homed after soften"
+        );
+    }
+
+    /// The ramp arithmetic on its own: limp gain on the first tick, zero at the end, `None` after.
+    #[test]
+    fn the_soften_ramp_starts_at_limp_gain_and_ends_at_zero() {
+        let since = Instant::now();
+        let s = Softening {
+            since,
+            from: DEFAULT_POSITION,
+        };
+        assert_eq!(s.gain_at(since, 50), Some(50));
+        assert_eq!(s.gain_at(since + SOFTEN_RAMP / 2, 50), Some(25));
+        assert_eq!(s.gain_at(since + SOFTEN_RAMP, 50), None);
     }
 
     /// **`robot.rebootMotors` cuts torque, reboots the named servos and returns to limp.**

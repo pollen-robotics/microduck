@@ -74,6 +74,9 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use duck_ipc_proto as proto;
+
+mod expressions;
+use expressions::{Expression, Kind};
 use gilrs::{Axis, Button, Gilrs};
 
 #[cfg(target_os = "linux")]
@@ -154,7 +157,10 @@ struct Args {
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
 /// Select held this long sits the robot down and powers it off.
-const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
+///
+/// Three seconds, since the press itself now does something (`robot.soften`): the shutdown must
+/// be a hold nobody reaches by pressing the release button a moment too long.
+const SHUTDOWN_HOLD: Duration = Duration::from_secs(3);
 
 /// D-pad up held this long switches drive mode, walk ⇄ roller.
 ///
@@ -247,8 +253,8 @@ fn main() -> std::process::ExitCode {
         hz = args.hz,
         roller,
         "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right reboot servos, DPad-Up (3s) \
-         walk/roller, Select (2s) shutdown"
+         LB curious head, RB peck, DPad-Left kick left, DPad-Right reboot servos, DPad-Down sit, \
+         triggers mouth, DPad-Up (3s) walk/roller, Select = soft release, Select (3s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -263,6 +269,10 @@ fn main() -> std::process::ExitCode {
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
     let mut prev_lt = 0.0f64;
+    // The bumpers play a scripted head expression (`expressions.rs`) that overrides the head
+    // intent for its duration; the sticks keep driving underneath. One at a time: a bumper
+    // pressed mid-expression restarts with the new one.
+    let mut expression: Option<Expression> = None;
 
     loop {
         let tick = Instant::now();
@@ -274,10 +284,12 @@ fn main() -> std::process::ExitCode {
         let mut toggle_body = false;
         let mut ground_pick = false;
         let mut kick_left = false;
-        let mut kick_right = false;
+        let kick_right = false; // no button on this pad: D-pad right reboots the servos
         let mut sit_toggle = false;
         let mut roulade = false;
         let mut reboot_motors = false;
+        let mut start_expression: Option<Kind> = None;
+        let mut soften = false;
         while let Some(event) = gilrs.next_event() {
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
@@ -289,13 +301,19 @@ fn main() -> std::process::ExitCode {
                     // which the resend below carries.
                     Button::West => roulade = true,
                     // gilrs names the bumpers `LeftTrigger`/`RightTrigger`; the analog
-                    // triggers are `LeftTrigger2`/`RightTrigger2`.
-                    Button::LeftTrigger => kick_left = true,
-                    Button::RightTrigger => kick_right = true,
+                    // triggers are `LeftTrigger2`/`RightTrigger2`. The bumpers are the
+                    // expression buttons; the left kick moved to D-pad left (the right one
+                    // has no button on this pad: D-pad right reboots the servos).
+                    Button::LeftTrigger => start_expression = Some(Kind::Curious),
+                    Button::RightTrigger => start_expression = Some(Kind::Peck),
+                    Button::DPadLeft => kick_left = true,
                     Button::DPadDown => sit_toggle = true,
                     // Reboot the servos: the way back from a tripped overload without pulling
                     // the battery.
                     Button::DPadRight => reboot_motors = true,
+                    // The release button: on the press itself, not the release, so it is
+                    // immediate. Held on, it becomes the shutdown below.
+                    Button::Select => soften = true,
                     _ => {}
                 }
             }
@@ -433,8 +451,21 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        // Select held two seconds: sit down, then power off. Sent once per hold — the
+        // Select pressed: let go softly — gain to the limp value at once, to zero over a second,
+        // then torque off. The pad's emergency release for a robot forcing against something.
+        // Answered, because "refused" is worth a log line here of all places.
+        if soften {
+            tracing::warn!("Select pressed — asking the robot to let go softly (robot.soften)");
+            if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotSoften) {
+                tracing::error!(error = %e, "soften request failed");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+
+        // Select held three seconds: sit down, then power off. Sent once per hold — the
         // robot owns the sequence from there, and a second request would be a no-op anyway.
+        // The press above already softened the robot, so the sit is skipped by the daemon
+        // (it needs a driving robot) and the machine simply powers off where it lies.
         if pad.is_pressed(Button::Select) {
             let held = select_held_since.get_or_insert(tick);
             if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
@@ -549,6 +580,31 @@ fn main() -> std::process::ExitCode {
             }
         }
 
+        if let Some(kind) = start_expression {
+            tracing::info!(?kind, "expression");
+            expression = Some(Expression::start(kind, tick));
+        }
+        // The expression's head intent for this tick, if one is playing. `None` when it has
+        // just ended: one explicit zero head is sent below so the head does not stay parked
+        // where the last frame left it until the intent expires.
+        let expression_head = match expression {
+            Some(e) => match e.head_at(tick) {
+                Some(head) => Some(head),
+                None => {
+                    expression = None;
+                    Some(proto::HeadParams::default())
+                }
+            },
+            None => None,
+        };
+        if let Some(head) = expression_head
+            && mode != Mode::Head
+            && let Err(e) = notify(&mut stream, &proto::Call::RobotHead(head))
+        {
+            tracing::error!(error = %e, "send failed");
+            return std::process::ExitCode::FAILURE;
+        }
+
         let call = match mode {
             Mode::Drive if roller => proto::Call::RobotMove(proto::MoveParams {
                 // The prototype's roller shaping: push harder than you can brake, no
@@ -589,12 +645,16 @@ fn main() -> std::process::ExitCode {
                 // The prototype's alpha mapping, signs included (its head_pitch/head_yaw
                 // joint axes are inverted relative to stick direction — verified on
                 // hardware there, kept verbatim here).
-                proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: right_y * args.max_head,
-                    head_pitch: -left_y * args.max_head,
-                    head_yaw: -left_x * args.max_head,
-                    head_roll: right_x * args.max_head,
-                })
+                match expression_head {
+                    // A bumper expression takes the head over from the sticks while it plays.
+                    Some(head) => proto::Call::RobotHead(head),
+                    None => proto::Call::RobotHead(proto::HeadParams {
+                        neck_pitch: right_y * args.max_head,
+                        head_pitch: -left_y * args.max_head,
+                        head_yaw: -left_x * args.max_head,
+                        head_roll: right_x * args.max_head,
+                    }),
+                }
             }
             Mode::BodyPose => {
                 if let Err(e) = notify(

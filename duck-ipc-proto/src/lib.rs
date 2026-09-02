@@ -353,6 +353,11 @@ pub mod method {
     /// Torque is cut on every joint first and the robot is back at limp afterwards, so `robot.init`
     /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
     pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
+    /// Let go softly, then cut power: the gain drops to `gain_limp` at once, ramps linearly to
+    /// zero over one second while the joints are commanded where they are, and torque is cut
+    /// at the end. The gamepad's Select press. **The robot still ends up on the floor** — it just
+    /// gets there without a snap, which is what a robot forcing against a limit needs.
+    pub const ROBOT_SOFTEN: &str = "robot.soften";
 
     // ── skills ───────────────────────────────────────────────────────────────
     //
@@ -634,6 +639,8 @@ pub enum Call {
     RobotRelax,
     /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
     RobotRebootMotors(RebootMotorsParams),
+    /// Let go softly over a second, then cut power. See [`method::ROBOT_SOFTEN`].
+    RobotSoften,
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -775,6 +782,7 @@ impl Call {
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
+            Call::RobotSoften => method::ROBOT_SOFTEN,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -897,6 +905,7 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotRebootMotors(_)
+            | Call::RobotSoften
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -1012,6 +1021,7 @@ impl Call {
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotSoften
             | Call::RobotShutdown
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
@@ -1063,6 +1073,7 @@ impl Call {
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
+            method::ROBOT_SOFTEN => Call::RobotSoften,
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
@@ -1196,6 +1207,7 @@ pub mod test_support {
             Call::RobotInit,
             Call::RobotRelax,
             Call::RobotRebootMotors(RebootMotorsParams { ids: vec![3, 11] }),
+            Call::RobotSoften,
             Call::RobotDo(DoParams {
                 skill: Skill::GroundPick,
             }),
@@ -3893,7 +3905,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            47,
+            48,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
