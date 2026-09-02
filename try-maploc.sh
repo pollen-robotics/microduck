@@ -127,7 +127,10 @@ print(f.readline().strip())'
     echo "walking (pid $(cat $STATE/scan.pid)); tail -f $STATE/scan.log"
     ;;
 
-monitor) exec $REPO/target/debug/robotctl --robot-socket $SOCK monitor ;;
+# --tof-socket, or the depth panel looks for /run/tofd/tof.sock -- the
+# board's path, which macOS has no such thing as, and the panel then
+# reads "no depth stream" as if no sensor were fitted.
+monitor) exec $REPO/target/debug/robotctl --robot-socket $SOCK --tof-socket $TOFSOCK monitor ;;
 map)     exec $RL/.venv/bin/python $REPO/sim-maploc/mapdump.py ${2:-1} ;;
 health)  ctl health ;;
 
