@@ -75,12 +75,15 @@ struct Args {
 
     /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
-    /// **90, because the head camera is mounted a quarter turn off**, and this is the one place that
-    /// fact is written down. It no longer means "rotate the pixels": it is told to whoever displays
-    /// the video, and they rotate for free — the console with a CSS transform on the GPU. Rotating
-    /// here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
-    #[arg(long, default_value_t = 90)]
-    rotate: u32,
+    /// **90 by default, because the head camera is mounted a quarter turn off**, and this is the one
+    /// place that fact is written down. It no longer means "rotate the pixels": it is told to
+    /// whoever displays the video, and they rotate for free — the console with a CSS transform on
+    /// the GPU. Rotating here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
+    ///
+    /// True of a simulated camera too: the one in MuJoCo is rolled to match the mount, so a frame
+    /// from a duck in the twin needs the same quarter turn as a frame from a duck on the desk.
+    #[arg(long)]
+    rotate: Option<u32>,
 
     /// Leave the exposure where `--exposure` and `--analogue-gain` put it, instead of metering.
     ///
@@ -140,7 +143,12 @@ fn main() -> ExitCode {
     // should say so rather than opening a camera first.
     // Validated even when the pipeline will not use it, because it is still what every consumer is
     // told about the mount — a typo should not reach the console as a rotation nobody can apply.
-    let mount = match mediad::pipeline::Rotation::from_degrees(args.rotate) {
+    // 90 whatever the source. The head camera is mounted a quarter turn off and every consumer is
+    // told so — and the *simulated* camera is rolled the same way on purpose, so that a frame from a
+    // duck in MuJoCo needs the same turn as a frame from a duck on the desk. Overridable, because a
+    // scene could mount it differently, but there is one default and it is the robot's.
+    let rotate = args.rotate.unwrap_or(90);
+    let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
         Ok(rotation) => rotation,
         Err(e) => {
             tracing::error!(error = %e, "mediad cannot start");
@@ -170,17 +178,17 @@ fn main() -> ExitCode {
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
     // resampling it already does, which is why nothing in the pipeline has to.
-    let turn = match duck_detect::Turn::from_degrees(args.rotate) {
+    let turn = match duck_detect::Turn::from_degrees(rotate) {
         Some(turn) => turn,
         None => {
-            tracing::error!(degrees = args.rotate, "mediad cannot start");
+            tracing::error!(degrees = rotate, "mediad cannot start");
             return ExitCode::FAILURE;
         }
     };
 
     let rotation = if args.flip_in_pipeline {
         tracing::warn!(
-            degrees = args.rotate,
+            degrees = rotate,
             "--flip-in-pipeline: rotating in the pipeline costs the encoder its zero-copy path"
         );
         mount
@@ -334,7 +342,7 @@ fn main() -> ExitCode {
         let video = mediad::session::Video {
             width: media.quality.width(),
             height: media.quality.height(),
-            rotate: args.rotate,
+            rotate,
         };
 
         // One session per peer, each with its own connections to the services it talks to. Per
