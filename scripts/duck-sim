@@ -42,6 +42,13 @@ DUCKS="${DUCK_SIM_DUCKS:-1}"
 # asymmetry is what lets a pose be disambiguated from a 45-degree forward field of view, which is
 # exactly what the duck has. The default is a bare floor, where there is nothing to see.
 SCENE="${DUCK_SIM_SCENE:-}"
+
+# Which ducks have an eye. `a`, `a,c`, or `all`; empty for none, which is the default because a
+# rendered frame costs 12 ms against 0.3 ms to step four ducks' physics — one camera is a third of a
+# core and four is most of one. Each duck with a camera also gets a `mediad`, and its console is at
+# 8080 + its index.
+CAMERAS="${DUCK_SIM_CAMERAS:-}"
+FRAME_PORT="${DUCK_SIM_FRAME_PORT:-7901}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -108,6 +115,7 @@ down() {
     while [ "$i" -lt 16 ]; do
         stop_one "$(duck_name "$i")" robotd
         stop_one "$(duck_name "$i")-tof" tofd
+        stop_one "$(duck_name "$i")-media" mediad
         i=$((i + 1))
     done
     # The container-mode radio is a unit, not a pidfile — see `boot`.
@@ -166,9 +174,11 @@ accept = true
 
 [audio]
 bank = "$STATE/sounds/DUCK"
-# `plughw:aic3104` is the board's codec, and `robotd` passes it to `aplay` as `-D` — so on anything
-# that is not a robot every sound fails before ALSA's default is ever consulted. That failure is
-# logged and skipped by design, which is why a silent duck looks like a sound bug.
+# plughw:aic3104 is the board's codec, and robotd passes it to aplay with -D, so on anything that is
+# not a robot every sound fails before ALSA's default is ever consulted. That failure is logged and
+# skipped by design, which is why a silent duck looks like a sound bug. No backticks in this comment:
+# the heredoc is unquoted so that $REPO expands, which means backticks run as commands — these three
+# words were being executed, and "plughw:aic3104: not found" is a confusing thing to read.
 device = "default"
 
 # Its own depth sensor. On a board this is /run/tofd/tof.sock and needs no saying; here every duck
@@ -232,6 +242,28 @@ TOML
     ln -sf "$STATE/$(duck_name 0).sock" "$SOCK"
     ln -sf "$STATE/$(duck_name 0).log" "$STATE/robotd.log"
     wait_for_socket || die "robotd did not come up. $STATE/$(duck_name 0).log has why."
+
+    # A `mediad` for every duck with an eye. On the host rather than in a container even in
+    # container mode: `webrtcsink` here is a local build at /opt/gst-plugins-rs, and a Debian
+    # container has no packaged one — so the console is served from the host, pointed at the
+    # simulator's frame port. `360p30` is exactly the 640x360 the renderer produces.
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        if has_camera "$i"; then
+            name="$(duck_name "$i")"
+            [ -x "$REPO/target/debug/mediad" ] || (cd "$REPO" && cargo build --quiet -p mediad)
+            printf '[media]\nquality = "360p30"\n' > "$STATE/mediad-$name.toml"
+            DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" \
+                setsid nohup "$REPO/target/debug/mediad" \
+                --sim-camera "127.0.0.1:$((FRAME_PORT + i))" \
+                --config "$STATE/mediad-$name.toml" \
+                --port $((8443 + i)) --web-port $((8080 + i)) \
+                > "$STATE/$name-media.log" 2>&1 &
+            echo $! > "$STATE/$name-media.pid"
+            say "$name can see — console at http://127.0.0.1:$((8080 + i))"
+        fi
+        i=$((i + 1))
+    done
 
     # The radio, once there is more than one duck to hear. It is a client of each `robotd` exactly
     # as `btd` is, so nothing above the socket knows the difference.
@@ -349,6 +381,16 @@ WHY
     return 1
 }
 
+# Does this duck have an eye? `all`, or its letter in the list.
+has_camera() {
+    case "$CAMERAS" in
+        "")   return 1 ;;
+        all)  return 0 ;;
+        *)    case ",$CAMERAS," in *",$(printf %s "$LETTERS" | cut -c$(($1 + 1))),"*) return 0 ;; esac
+              return 1 ;;
+    esac
+}
+
 # The body, on the host in both modes: MuJoCo is not going in a container, and the container shares
 # the host's network namespace so localhost is the same localhost either way.
 start_body() {
@@ -371,6 +413,7 @@ start_body() {
     # shellcheck disable=SC2086
     setsid nohup "$RL/.venv/bin/python" -m mjlab_microduck.sim.body_server \
         --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
+        --cameras "$CAMERAS" --frame-port "$FRAME_PORT" \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
