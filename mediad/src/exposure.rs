@@ -229,6 +229,8 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
         .spawn(move || {
             let mut ae = Ae::starting_at(exposure_lines, analogue_gain_reg);
             let mut proven = false;
+            // What this run knows about the ISP's digital gain. See `Digital`.
+            let mut digital = Digital::Unknown;
             let mut waiting_logged = false;
             // Ticks since the last write, for the re-assert heartbeat.
             let mut quiet = 0u32;
@@ -286,7 +288,13 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     Some(controls) => controls,
                     // Nothing to change — but say it to the sensor again every so often, in case
                     // something else has been talking to it. See `REASSERT_TICKS`.
-                    None if quiet >= REASSERT_TICKS => ae.current(),
+                    None if quiet >= REASSERT_TICKS => {
+                        // Including the digital gain, and including 1x. What this run last wrote
+                        // is not evidence of what the node holds now, which is the whole reason
+                        // the heartbeat exists.
+                        digital.forget();
+                        ae.current()
+                    }
                     None => {
                         quiet += 1;
                         continue;
@@ -294,7 +302,7 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                 };
                 quiet = 0;
 
-                match write(&device, controls) {
+                match write(&device, controls, &mut digital) {
                     Err(e) if proven => {
                         // At debug, not an error twice a second for as long as the daemon runs: the
                         // first one already said what is wrong.
@@ -355,7 +363,7 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
 /// ISP, and `v4l2-ctl` fails a whole `--set-ctrl` if any name in it is unknown on the node. One
 /// call would mean a board that spells digital gain differently loses its shutter as well, which is
 /// the entire picture rather than the last stop of brightness.
-fn write(device: &str, controls: Controls) -> std::io::Result<()> {
+fn write(device: &str, controls: Controls, digital: &mut Digital) -> std::io::Result<()> {
     let Controls {
         exposure,
         analogue_gain,
@@ -365,12 +373,73 @@ fn write(device: &str, controls: Controls) -> std::io::Result<()> {
         device,
         &format!("exposure={exposure},analogue_gain={analogue_gain}"),
     )?;
-    // Only when it is doing something: at 1x this is a no-op write, and skipping it means a node
-    // with no digital gain never reports an error at all.
-    if gain > 256 {
-        set(device, &format!("gain={gain}"))?;
+    if worth_writing_gain(gain, *digital) {
+        match set(device, &format!("gain={gain}")) {
+            Ok(()) => *digital = Digital::Told(gain),
+            // A node that does not carry `gain` refuses every one of these, and failing the whole
+            // write over it would take the shutter down with the last stop of brightness. Said
+            // once, recorded, and not asked again.
+            Err(e) => {
+                *digital = Digital::Absent;
+                tracing::warn!(
+                    %device, error = %e,
+                    "this node has no digital gain; steering the shutter and the analogue gain only"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// What this run knows about the ISP's digital gain.
+///
+/// Three states rather than a boolean, because "we have not said anything yet" and "we have said
+/// 1x" are different facts and only one of them is evidence. [`crate::pipeline`] pins `exposure`
+/// and `analogue_gain` through `extra-controls` at every open and pins no digital gain, so a
+/// `mediad` that has just restarted is looking at whatever the previous run left on the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Digital {
+    /// Nothing said this run. The node may be holding anything.
+    Unknown,
+    /// What this run last wrote, and the node took.
+    Told(u32),
+    /// The node refused a gain write, so there is no such control here to steer.
+    Absent,
+}
+
+impl Digital {
+    /// Drop what this run believes, so the next write states the gain again.
+    ///
+    /// `Absent` survives it: a node with no digital gain will not have grown one.
+    fn forget(&mut self) {
+        if !matches!(self, Self::Absent) {
+            *self = Self::Unknown;
+        }
+    }
+}
+
+/// Whether the ISP's digital gain has to go out with this step.
+///
+/// 1x is the ISP's own default, so a settled loop that keeps asking for 1x can say nothing, which
+/// is what keeps this cheap. Everything else has to be written, for three separate reasons.
+///
+/// A gain the loop put up has to come back down. Dropping that step as a no-op, which is what
+/// `gain > 256` did, leaves the ISP amplifying a picture the loop believes it stopped amplifying,
+/// and the loop then pays the difference out of the shutter, which is the control it spends first
+/// on purpose.
+///
+/// At startup 1x is an assumption rather than a fact, for the reason on [`Digital`], so the first
+/// write of a run states it whatever it is.
+///
+/// And the heartbeat re-states it, on `REASSERT_TICKS`' own argument: what we wrote is not evidence
+/// that it is still there. That costs one more `v4l2-ctl` every ten seconds, against the tenth of a
+/// core writing every tick cost.
+fn worth_writing_gain(gain: u32, digital: Digital) -> bool {
+    match digital {
+        Digital::Absent => false,
+        Digital::Unknown => true,
+        Digital::Told(last) => gain > 256 || last != gain,
+    }
 }
 
 fn set(device: &str, controls: &str) -> std::io::Result<()> {
@@ -538,6 +607,79 @@ mod tests {
             "{pinned:?}"
         );
         assert!(pinned.gain as f64 <= MAX_DIGITAL * 256.0, "{pinned:?}");
+    }
+
+    /// The bug this catches: `gain=256` is 1x, so it was dropped as a no-op, including the one
+    /// step that takes the ISP back to 1x after a dark room put it up. The picture stays
+    /// amplified and the loop, which believes it is not, spends the shutter making up for it.
+    #[test]
+    fn the_digital_gain_is_written_on_the_way_back_down() {
+        assert!(
+            worth_writing_gain(4096, Digital::Told(256)),
+            "putting it up"
+        );
+        assert!(
+            worth_writing_gain(256, Digital::Told(4096)),
+            "and taking it back down, which is the one that was dropped"
+        );
+        assert!(
+            !worth_writing_gain(256, Digital::Told(256)),
+            "1x it was already told, which is what keeps a settled loop quiet"
+        );
+    }
+
+    /// A restart is the other way the two can disagree, and it is why this is not a boolean.
+    /// `pipeline` pins the shutter and the analogue gain at every open and pins no digital gain,
+    /// so a `mediad` that has just come back inherits whatever the last run left on the node.
+    #[test]
+    fn a_run_that_has_said_nothing_yet_states_the_gain() {
+        assert!(worth_writing_gain(256, Digital::Unknown), "1x is a claim");
+        assert!(worth_writing_gain(4096, Digital::Unknown));
+    }
+
+    /// The heartbeat's own argument, from `REASSERT_TICKS`: what we wrote is not evidence that it
+    /// is still there. Forgetting is how the gain gets re-stated with the rest.
+    #[test]
+    fn the_heartbeat_forgets_a_value_but_not_a_missing_control() {
+        let mut told = Digital::Told(256);
+        told.forget();
+        assert_eq!(told, Digital::Unknown);
+        assert!(worth_writing_gain(256, told), "so 1x goes out again");
+
+        let mut absent = Digital::Absent;
+        absent.forget();
+        assert_eq!(absent, Digital::Absent, "a node does not grow the control");
+    }
+
+    /// And a node without the control is left alone entirely, which is what the original
+    /// `gain > 256` was protecting: writing it would fail every time and take the shutter, which
+    /// is the brightness that matters, down with it.
+    #[test]
+    fn a_node_without_a_digital_gain_is_not_written_to() {
+        assert!(!worth_writing_gain(256, Digital::Absent));
+        assert!(!worth_writing_gain(4096, Digital::Absent));
+    }
+
+    /// The loop's own arithmetic reaches the step above; it is not a shape only a test can build.
+    /// Dark enough and it reaches for digital gain, bright enough and it hands it back.
+    #[test]
+    fn a_room_that_gets_brighter_asks_for_1x_digital_gain_back() {
+        let mut ae = Ae::starting_at(600, 1024);
+        let mut put_up = false;
+        for _ in 0..50 {
+            if let Some(step) = ae.step(1.0) {
+                put_up |= step.gain > 256;
+            }
+        }
+        assert!(put_up, "a dark room must reach for digital gain");
+
+        let mut handed_back = false;
+        for _ in 0..50 {
+            if let Some(step) = ae.step(250.0) {
+                handed_back |= step.gain == 256;
+            }
+        }
+        assert!(handed_back, "a bright room must ask for 1x back");
     }
 
     #[test]
