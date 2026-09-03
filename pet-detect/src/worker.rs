@@ -13,12 +13,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::{PettingDetector, PettingDetectorConfig, PettingEvent, i16_to_f32};
+use crate::beat::{BeatState, BeatTracker};
 
 /// Ambient sound events, from the same stream the petting classifier consumes. Pure
 /// RMS-envelope heuristics — no ML:
@@ -154,8 +156,9 @@ impl SoundSentry {
 pub struct PetConfig {
     /// ALSA capture device passed to arecord.
     pub alsa_device: String,
-    /// Path to the trained ONNX model.
-    pub model_path: PathBuf,
+    /// Path to the trained ONNX model. `None` runs capture + sentry + beat with no CNN —
+    /// dance must not inherit petting's "model on disk or no mic" coupling.
+    pub model_path: Option<PathBuf>,
     /// Probability above which petting starts.
     pub enter_threshold: f32,
     /// Probability below which petting ends.
@@ -167,7 +170,7 @@ impl Default for PetConfig {
         let lib = PettingDetectorConfig::default();
         Self {
             alsa_device: "plughw:aic3104,0".into(),
-            model_path: PathBuf::from("/opt/robot/daemon/current/models/pet_detect.onnx"),
+            model_path: Some(PathBuf::from("/opt/robot/daemon/current/models/pet_detect.onnx")),
             enter_threshold: lib.enter_threshold,
             exit_threshold: lib.exit_threshold,
         }
@@ -178,6 +181,8 @@ impl Default for PetConfig {
 pub struct PetHandle {
     rx: Receiver<PettingEvent>,
     rx_sound: Receiver<SoundEvent>,
+    beat: Arc<Mutex<BeatState>>,
+    quarantine: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -188,32 +193,46 @@ impl PetHandle {
         // caller sees instead of a worker that dies quietly on its first breath. Behind a
         // panic catch, because `ort` panics on failures it considers unrecoverable — a
         // missing libonnxruntime must read as "no mic worker", not a dead daemon.
-        let detector = std::panic::catch_unwind(|| {
-            PettingDetector::new(
-                &config.model_path,
-                PettingDetectorConfig {
-                    stride: PettingDetectorConfig::default().stride,
-                    enter_threshold: config.enter_threshold,
-                    exit_threshold: config.exit_threshold,
-                },
-            )
-        })
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("the ONNX runtime is not loadable")))?;
+        //
+        // Dance capture has no model: skip the CNN entirely rather than inventing a
+        // dummy path that then fails to load.
+        let detector = match &config.model_path {
+            Some(path) => Some(
+                std::panic::catch_unwind(|| {
+                    PettingDetector::new(
+                        path,
+                        PettingDetectorConfig {
+                            stride: PettingDetectorConfig::default().stride,
+                            enter_threshold: config.enter_threshold,
+                            exit_threshold: config.exit_threshold,
+                        },
+                    )
+                })
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("the ONNX runtime is not loadable")))?,
+            ),
+            None => None,
+        };
 
         let shutdown = Arc::new(AtomicBool::new(false));
+        let quarantine = Arc::new(AtomicBool::new(false));
+        let beat = Arc::new(Mutex::new(BeatState::default()));
         let (tx, rx) = mpsc::channel();
         let (tx_sound, rx_sound) = mpsc::channel();
         let sd = shutdown.clone();
+        let q = quarantine.clone();
+        let beat_slot = beat.clone();
         let dev = config.alsa_device.clone();
 
         let join = thread::Builder::new()
             .name("pet-worker".into())
-            .spawn(move || worker_loop(&dev, detector, &tx, &tx_sound, &sd))
+            .spawn(move || worker_loop(&dev, detector, &tx, &tx_sound, &beat_slot, &q, &sd))
             .expect("spawn pet worker");
 
         Ok(Self {
             rx,
             rx_sound,
+            beat,
+            quarantine,
             shutdown,
             join: Some(join),
         })
@@ -227,6 +246,16 @@ impl PetHandle {
     /// Non-blocking; the next ambient sound event if one is queued.
     pub fn try_recv_sound(&self) -> Option<SoundEvent> {
         self.rx_sound.try_recv().ok()
+    }
+
+    /// Last-value-wins beat snapshot. Cheap to copy; the mapper treats a frozen `t` as stale.
+    pub fn beat(&self) -> BeatState {
+        self.beat.lock().map(|g| *g).unwrap_or_default()
+    }
+
+    /// Self-audio / self-motion: the tracker must drop the lock, not just the mapper.
+    pub fn set_quarantine(&self, on: bool) {
+        self.quarantine.store(on, Ordering::Release);
     }
 
     pub fn shutdown(mut self) {
@@ -256,24 +285,63 @@ const RESTART_QUIET_AFTER: u32 = 5;
 
 fn worker_loop(
     alsa_device: &str,
-    mut detector: PettingDetector,
+    mut detector: Option<PettingDetector>,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
+    beat_slot: &Mutex<BeatState>,
+    quarantine: &Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
 ) {
     let mut sentry = SoundSentry::new();
+    let mut beat = BeatTracker::new();
+    let mut quarantined = false;
     let mut failures: u32 = 0;
     while !shutdown.load(Ordering::Acquire) {
+        let now_q = quarantine.load(Ordering::Acquire);
+        if now_q && !quarantined {
+            beat.quarantine();
+            if let Ok(mut slot) = beat_slot.lock() {
+                *slot = beat.state();
+            }
+        } else if !now_q && quarantined {
+            beat.end_quarantine();
+            if let Ok(mut slot) = beat_slot.lock() {
+                *slot = beat.state();
+            }
+        }
+        quarantined = now_q;
+
         let started = Instant::now();
         match spawn_arecord(alsa_device) {
             Ok(mut c) => {
-                if let Err(e) = pump(&mut c, &mut detector, &mut sentry, tx, tx_sound, shutdown) {
+                if let Err(e) = pump(
+                    &mut c,
+                    detector.as_mut(),
+                    &mut sentry,
+                    &mut beat,
+                    beat_slot,
+                    quarantine,
+                    tx,
+                    tx_sound,
+                    shutdown,
+                ) {
                     log_restart(failures, &e.to_string());
                 }
                 let _ = c.kill();
                 let _ = c.wait();
+                // EOF, kill, or a gap: the last locked sample must not keep posing.
+                beat.capture_lost();
+                if let Ok(mut slot) = beat_slot.lock() {
+                    *slot = beat.state();
+                }
             }
-            Err(e) => log_restart(failures, &e.to_string()),
+            Err(e) => {
+                log_restart(failures, &e.to_string());
+                beat.capture_lost();
+                if let Ok(mut slot) = beat_slot.lock() {
+                    *slot = beat.state();
+                }
+            }
         }
         if started.elapsed() >= RESTART_HEALTHY {
             failures = 0;
@@ -331,8 +399,11 @@ fn spawn_arecord(device: &str) -> Result<Child> {
 
 fn pump(
     child: &mut Child,
-    detector: &mut PettingDetector,
+    mut detector: Option<&mut PettingDetector>,
     sentry: &mut SoundSentry,
+    beat: &mut BeatTracker,
+    beat_slot: &Mutex<BeatState>,
+    quarantine: &AtomicBool,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
     shutdown: &Arc<AtomicBool>,
@@ -357,25 +428,128 @@ fn pump(
             i16_buf.push(i16::from_le_bytes(*chunk));
         }
         let samples = i16_to_f32(&i16_buf);
-        let (events, _p) = detector.push_samples(&samples)?;
-        for ev in events {
-            if tx.send(ev).is_err() {
-                // Receiver dropped — the daemon is shutting down.
-                return Ok(());
-            }
+        if quarantine.load(Ordering::Acquire) {
+            beat.quarantine();
+        } else {
+            beat.end_quarantine();
         }
-        // Ambient sound events off the same stream, muted while petting (head scratches
-        // are LOUD on this mic) + a short hangover. Read off the detector rather than
-        // tracked here: a Start..End session spans many seconds, and `arecord` can flap
-        // inside one. The detector survives a restart (it is owned by `worker_loop`), so a
-        // local copy would come back `false` mid-session — and no second `Start` would ever
-        // re-arm it, leaving the sentry emitting head-scratch noise as `Voice` events until
-        // the probability finally fell below the exit threshold.
-        let mut sounds = Vec::new();
-        sentry.push(&samples, detector.is_petting(), &mut sounds);
-        for sev in sounds {
-            let _ = tx_sound.send(sev);
+        if !push_pcm(
+            &samples,
+            detector.as_deref_mut(),
+            sentry,
+            beat,
+            beat_slot,
+            tx,
+            tx_sound,
+        ) {
+            return Ok(());
         }
     }
     Ok(())
 }
+
+/// One PCM block into petting (optional), sentry, and beat. Shared so tests can drive the
+/// same path without a second `arecord`.
+fn push_pcm(
+    samples: &[f32],
+    detector: Option<&mut PettingDetector>,
+    sentry: &mut SoundSentry,
+    beat: &mut BeatTracker,
+    beat_slot: &Mutex<BeatState>,
+    tx: &Sender<PettingEvent>,
+    tx_sound: &Sender<SoundEvent>,
+) -> bool {
+    let petting = if let Some(detector) = detector {
+        match detector.push_samples(samples) {
+            Ok((events, _)) => {
+                for ev in events {
+                    if tx.send(ev).is_err() {
+                        return false;
+                    }
+                }
+                detector.is_petting()
+            }
+            Err(_) => detector.is_petting(),
+        }
+    } else {
+        false
+    };
+
+    let mut sounds = Vec::new();
+    sentry.push(samples, petting, &mut sounds);
+    for sev in sounds {
+        let _ = tx_sound.send(sev);
+    }
+
+    let state = beat.push(samples);
+    if let Ok(mut slot) = beat_slot.lock() {
+        *slot = state;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beat::click_train;
+
+    /// Capture + beat must work with no pet ONNX. The CNN is opt-in; dance cannot inherit
+    /// "model on disk or no mic".
+    #[test]
+    fn pumps_pcm_and_beat_with_no_pet_model() {
+        let (tx, rx) = mpsc::channel();
+        let (tx_sound, _rx_sound) = mpsc::channel();
+        let beat_slot = Mutex::new(BeatState::default());
+        let mut sentry = SoundSentry::new();
+        let mut beat = BeatTracker::new();
+        let pcm = click_train(100.0, 6.0);
+        for chunk in pcm.chunks(crate::beat::FRAME) {
+            assert!(push_pcm(
+                chunk,
+                None,
+                &mut sentry,
+                &mut beat,
+                &beat_slot,
+                &tx,
+                &tx_sound,
+            ));
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no detector means no petting events"
+        );
+        let state = beat_slot.lock().map(|g| *g).unwrap_or_default();
+        assert!(
+            state.locked,
+            "beat tracker must lock from the worker path with no CNN: {state:?}"
+        );
+        assert!(state.t > 0);
+    }
+
+    /// One PCM slice feeds beat (and would feed the CNN if loaded). Not two `arecord`s.
+    #[test]
+    fn one_pcm_slice_reaches_beat_and_the_petting_slot() {
+        let (tx, rx) = mpsc::channel();
+        let (tx_sound, rx_sound) = mpsc::channel();
+        let beat_slot = Mutex::new(BeatState::default());
+        let mut sentry = SoundSentry::new();
+        let mut beat = BeatTracker::new();
+        let pcm = click_train(110.0, 0.05);
+        assert!(push_pcm(
+            &pcm,
+            None,
+            &mut sentry,
+            &mut beat,
+            &beat_slot,
+            &tx,
+            &tx_sound,
+        ));
+        // Detector is the other consumer of this same slice. Absent, it emits nothing —
+        // the slot is still the one `push_pcm` writes, not a second capture.
+        assert!(rx.try_recv().is_err());
+        let _ = rx_sound.try_recv();
+        let state = beat_slot.lock().map(|g| *g).unwrap_or_default();
+        assert!(state.t > 0, "beat saw the same slice, t={}", state.t);
+    }
+}
+

@@ -8,8 +8,11 @@
 //! Ported from `apirrone/microduck_pet_detect` unchanged in every number: the mel layout is
 //! the training contract, and the `pet-features` binary exists precisely so training and
 //! inference share this file. The arecord worker and the ambient sound sentry from the
-//! prototype's `pet_worker.rs` live in [`worker`].
+//! prototype's `pet_worker.rs` live in [`worker`]. The beat tracker and the pose mapper
+//! that turn a heard pulse into a stand-policy crouch live in [`beat`] and [`mapper`].
 
+pub mod beat;
+pub mod mapper;
 pub mod worker;
 
 use std::f32::consts::PI;

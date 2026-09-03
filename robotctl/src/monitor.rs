@@ -4214,6 +4214,7 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,
+            beat: None,
         }
     }
 }

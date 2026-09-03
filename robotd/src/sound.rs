@@ -649,6 +649,21 @@ impl Sound {
         self.voice()
     }
 
+    /// True while the speaker is putting energy into the air: a one-shot, the wheee,
+    /// the theremin, or the chorale. The beat tracker quarantines on this, not on who
+    /// owns the capture device.
+    pub fn emitting(&mut self) -> bool {
+        if self.ride == Ride::Off {
+            if let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => self.child = None,
+                    Ok(None) => {}
+                }
+            }
+        }
+        self.ride != Ride::Off || self.child.is_some()
+    }
+
     /// This robot's voice, from the seed its own bank was rendered with.
     ///
     /// The bank's marker rather than the hardware id, and deliberately: the marker is the

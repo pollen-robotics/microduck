@@ -426,6 +426,20 @@ pub struct AudioParams {
     /// Probability above which petting starts, and below which it ends (hysteresis).
     pub pet_enter_threshold: f32,
     pub pet_exit_threshold: f32,
+    /// Run the mic worker (capture + sentry + beat) without requiring the pet CNN.
+    /// Off by default — a camera-class privacy choice. Dance and petting can each
+    /// start capture on their own; this is the third reason, so listening for a
+    /// beat does not have to turn the mapper or the coo on.
+    pub listen: bool,
+    /// Map a locked beat onto this tick's stand-policy body command. Off by default;
+    /// no `robot.dance` RPC. Requires `[audio] enabled`. Capture starts without a
+    /// pet model.
+    pub dance: bool,
+    /// Use the dedicated dance gait's command encoding (`body_x`/`body_y`/`body_yaw`)
+    /// instead of the stand-policy crouch overlay. Off by default. Only set this
+    /// when `[policy] stand` is the dance ONNX — stuffing a beat into alpha stand
+    /// weights is out of distribution. Still requires `dance = true`.
+    pub dance_gait: bool,
 }
 
 impl Default for AudioParams {
@@ -439,6 +453,9 @@ impl Default for AudioParams {
             pet_model: None,
             pet_enter_threshold: 0.95,
             pet_exit_threshold: 0.85,
+            listen: false,
+            dance: false,
+            dance_gait: false,
         }
     }
 }
@@ -451,6 +468,13 @@ impl AudioParams {
         // head scratch turned out to be more annoying than charming in daily use. The mode is
         // still passed so flipping this back is a one-line change, not a signature change.
         self.pet_detect.unwrap_or(false)
+    }
+
+    /// Whether the single `arecord` worker should run. Capture must not require the pet
+    /// ONNX: listen and dance are enough, and petting still needs a model on disk at
+    /// spawn time.
+    pub fn mic_wanted(&self, mode: Mode) -> bool {
+        self.listen || self.dance || self.pet_detect_resolved(mode)
     }
 
     /// The capture PCM for the mic worker: the playback device with subdevice 0. Only
@@ -1089,6 +1113,29 @@ mod tests {
             ..AudioParams::default()
         };
         assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
+    }
+
+    /// Dance / listen start the mic without the pet CNN; petting still needs a model
+    /// at spawn, which is a separate check.
+    #[test]
+    fn listen_or_dance_wants_the_mic_without_petting() {
+        let off = AudioParams::default();
+        assert!(!off.mic_wanted(Mode::Walk));
+        assert!(!off.listen);
+        assert!(!off.dance);
+
+        let listen = AudioParams {
+            listen: true,
+            ..AudioParams::default()
+        };
+        assert!(listen.mic_wanted(Mode::Walk));
+        assert!(!listen.pet_detect_resolved(Mode::Walk));
+
+        let dance = AudioParams {
+            dance: true,
+            ..AudioParams::default()
+        };
+        assert!(dance.mic_wanted(Mode::Walk));
     }
 
     /// An unprovisioned board must still come up. A daemon that refuses to start because a

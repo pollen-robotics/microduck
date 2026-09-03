@@ -24,19 +24,21 @@
 //! ```text
 //! 48..51      3  vx, vy, vyaw
 //! 51..55      4  neck_pitch, head_pitch, head_yaw, head_roll
-//! 55..57      2  body x, y      — always zero, unbound in training
+//! 55..57      2  body x, y      — zero on every *alpha* policy; a dance gait may fill them
 //! 57          1  body z
 //! 58          1  body roll
 //! 59          1  body pitch
-//! 60          1  body yaw       — always zero, unbound in training
+//! 60          1  body yaw       — zero on every *alpha* policy; a dance gait may fill it
 //! ```
 //!
 //! Two things about that block are easy to get wrong and were confirmed against
 //! `microduck_runtime`'s `control_step` rather than assumed:
 //!
-//!  1. **Body x, y and yaw are hardcoded zero.** They are unbound in the training
-//!     environment, so an all-zero body command is the *nominal* encoding, not a
-//!     placeholder standing in for something better.
+//!  1. **Body x, y and yaw default to zero.** They are unbound in the *alpha* training
+//!     environments, so an all-zero body command is the nominal encoding for those
+//!     nets. A dedicated dance gait is trained to read beat phase/energy there;
+//!     stuffing a beat into today's stand weights is out of distribution. The
+//!     fields exist so that gait can be fed without widening obs past 61.
 //!  2. **Head targets ride in the command, and are not added on top of the policy output.**
 //!     The prototype does both, in different modes, and gates the post-hoc addition behind
 //!     `if !new_cmd_obs` with the note "head_offsets are a COMMAND fed via the obs vector
@@ -80,13 +82,19 @@ impl Command {
     }
 }
 
-/// Standing body pose offsets. Not commandable in slice 2 — carried so the layout is
-/// complete and so the field exists when a `pose` intent lands.
+/// Standing body pose offsets. `z`/`roll`/`pitch` are the alpha stand box.
+/// `x`/`y`/`yaw` stay 0 on those nets; a dance gait reads beat there.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct BodyPose {
     pub z: f64,
     pub roll: f64,
     pub pitch: f64,
+    /// Unbound on alpha policies. Dance gait: `sin(2π phase)`.
+    pub x: f64,
+    /// Unbound on alpha policies. Dance gait: `cos(2π phase)`.
+    pub y: f64,
+    /// Unbound on alpha policies. Dance gait: beat energy in `[0, 1]`.
+    pub yaw: f64,
 }
 
 /// The joints a policy sees, in order, with the mouth skipped.
@@ -201,12 +209,12 @@ impl Observation {
                 command.head[1],
                 command.head[2],
                 command.head[3],
-                0.0, // body x — unbound in training
-                0.0, // body y — unbound
+                command.body.x,
+                command.body.y,
                 command.body.z,
                 command.body.roll,
                 command.body.pitch,
-                0.0, // body yaw — unbound
+                command.body.yaw,
             ],
         );
 
@@ -250,6 +258,7 @@ mod tests {
                 z: 0.8,
                 roll: 0.9,
                 pitch: 1.0,
+                ..BodyPose::default()
             },
         }
     }
@@ -298,15 +307,36 @@ mod tests {
         assert_eq!(&d[51..55], &[0.4, 0.5, 0.6, 0.7], "head");
     }
 
-    /// Body x, y and yaw are unbound in training. They must be zero regardless of what the
-    /// caller supplies, or the policy sees a signal it was never trained on.
+    /// Alpha stand/walk leave these at zero. A dance gait fills them through BodyPose.
     #[test]
-    fn unbound_body_axes_are_always_zero() {
+    fn unbound_body_axes_default_to_zero() {
         let obs = build_with(DEFAULT_POSITION, [0.0; ACTION_LEN]);
         let d = obs.as_slice();
         assert_eq!(d[55], 0.0, "body x");
         assert_eq!(d[56], 0.0, "body y");
         assert_eq!(d[60], 0.0, "body yaw");
+    }
+
+    /// The dance gait's command encoding: x=sin, y=cos, yaw=energy, at the documented indices.
+    #[test]
+    fn dance_gait_slots_land_at_body_x_y_yaw() {
+        let mut cmd = command();
+        cmd.body.x = 0.11;
+        cmd.body.y = -0.22;
+        cmd.body.yaw = 0.77;
+        let obs = Observation::build(
+            &imu(),
+            &DEFAULT_POSITION,
+            &[0.0; NUM_JOINTS],
+            &DEFAULT_POSITION,
+            &[0.0; ACTION_LEN],
+            &cmd,
+        );
+        let d = obs.as_slice();
+        assert!((d[55] - 0.11).abs() < 1e-6, "body x");
+        assert!((d[56] + 0.22).abs() < 1e-6, "body y");
+        assert_eq!(d[57], 0.8, "body z must not move");
+        assert!((d[60] - 0.77).abs() < 1e-6, "body yaw");
     }
 
     /// The body block is ordered z, roll, pitch — *not* z, pitch, roll. The prototype maps
@@ -381,6 +411,7 @@ mod tests {
             z: 1.0,
             roll: 1.0,
             pitch: 1.0,
+            ..BodyPose::default()
         };
         assert_eq!(c.twist_magnitude(), 0.0, "only the twist counts");
 

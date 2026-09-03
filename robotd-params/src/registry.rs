@@ -365,6 +365,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::TriBool,
         "Coo when petted; unset means off — an opt-in",
     ),
+    feature(
+        "audio.listen",
+        Kind::Bool,
+        "Hold the mic for capture + beat, without the pet CNN or the dance mapper",
+    ),
+    feature(
+        "audio.dance",
+        Kind::Bool,
+        "Bob the standing body to a heard beat; off by default, no robot.dance RPC",
+    ),
+    feature(
+        "audio.dance_gait",
+        Kind::Bool,
+        "Feed beat into body_x/y/yaw for the dance ONNX; keep off with alpha stand",
+    ),
     entry(
         "audio.pet_model",
         Kind::OptionalPath,
@@ -579,6 +594,9 @@ mod tests {
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
+                "audio.listen",
+                "audio.dance",
+                "audio.dance_gait",
                 "media.camera",
                 "media.quality",
             ]

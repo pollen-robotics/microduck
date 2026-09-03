@@ -196,6 +196,10 @@ impl Controller {
         self.policy.has_sitstand()
     }
 
+    pub fn has_standing(&self) -> bool {
+        self.policy.has_standing()
+    }
+
     pub fn is_sitting(&self) -> bool {
         self.sit == Sit::Sitting
     }

@@ -161,15 +161,21 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
+/// # v18 — optional `beat` on `robot.state`
+///
+/// The onboard mic worker publishes a last-value-wins beat snapshot so a client can see
+/// whether the duck is locked onto a pulse. Additive and absent while nobody is listening,
+/// so a v17 client sees the frame it saw before.
+///
 /// # v17 — a unit state that can say "crash loop"
 ///
 /// [`UnitState`] gains `Restarting` and `Failed`, which `system.services` can now answer with.
 /// Not additive in the way a new method is: an older client deserialising a `Vec<ServiceUnit>`
 /// rejects a member it has no variant for, and `robotctl` reads that reply with `.ok()` — so an
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
-/// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
-/// update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 17;
+/// Both come out of the same release and an apply restarts both, so the skew lasts as long as
+/// the update does; a board left mid-update sees a missing block, not a lie.
+pub const API_VERSION: u32 = 18;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -2594,6 +2600,11 @@ pub struct RobotState {
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chorale: Option<ChoraleState>,
+    /// What the onboard beat tracker last heard, when a mic worker is running. Absent
+    /// otherwise — see [`BeatState`]. `t` is the tracker's frame counter; a frozen value
+    /// means the capture has gone quiet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beat: Option<BeatState>,
 }
 
 /// What the duck chorale is doing, in [`RobotState`].
@@ -2616,6 +2627,40 @@ pub struct ChoraleState {
     pub beats: Option<f64>,
     /// How many ducks are singing, this one included.
     pub voices: u32,
+}
+
+/// Last-value-wins beat snapshot from the onboard mic worker, in [`RobotState`].
+///
+/// Small enough to log. A mapper treats a missing or stale `t` as unlocked — capture EOF
+/// bumps `t` so a frozen `locked: true` cannot keep posing.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BeatState {
+    /// Frame counter. Advances on analysed audio *and* on capture-loss.
+    pub t: u64,
+    /// True only after a stable period estimate and a fresh `t`.
+    pub locked: bool,
+    /// Held period, beats per minute.
+    pub bpm: f32,
+    /// 0..1 through the current beat; 0 is a beat onset.
+    pub phase: f32,
+    /// Incremented on an onset; not a sticky boolean.
+    pub onset_seq: u32,
+    /// Short-window RMS above a slow floor, 0..1.
+    pub energy: f32,
+}
+
+impl Default for BeatState {
+    fn default() -> Self {
+        Self {
+            t: 0,
+            locked: false,
+            bpm: 0.0,
+            phase: 0.0,
+            onset_seq: 0,
+            energy: 0.0,
+        }
+    }
 }
 
 /// The contact-odometry estimate: trunk pose in the world frame the IMU chose
@@ -4459,9 +4504,11 @@ mod tests {
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
+            beat: None,
         };
         let down = serde_json::to_string(&state).unwrap();
         assert!(!down.contains("theremin"), "{down}");
+        assert!(!down.contains("beat"), "{down}");
 
         state.theremin = Some(ThereminState {
             hand_range_m: Some(0.31),
@@ -4516,6 +4563,7 @@ mod tests {
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
+            beat: None,
         };
 
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();

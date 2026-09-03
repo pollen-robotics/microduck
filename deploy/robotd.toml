@@ -109,6 +109,8 @@ mode = "walk"
 # Walk-mode defaults, spelled out:
 # walk        = ".../current/policies/alpha_walking.onnx"     the velstand gait
 # stand       = ".../current/policies/alpha_stand.onnx"       standing + body pose
+# To try the dance gait: point stand at dance_gait_iter14999.onnx and set
+# [audio] dance = true, dance_gait = true. Leave alpha_stand for the crouch overlay.
 # sitstand    = ".../current/policies/alpha_sitstand.onnx"    sit <-> stand, posture flag
 # ground_pick = ".../current/policies/alpha_ground_pick.onnx" A-button pick
 # kick_left   = ".../current/policies/ball_kick_left.onnx"
@@ -274,6 +276,24 @@ mode = "walk"
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
+
+# Hold the onboard mic (capture + ambient sentry + beat tracker) without the
+# pet CNN. Off by default — a camera-class privacy choice. Dance and petting
+# can each start capture on their own; this is so a beat can be published
+# without turning the coo or the mapper on.
+# listen = false
+
+# Map a locked beat onto this tick's stand-policy crouch. Off by default; no
+# `robot.dance` RPC. Capture starts even if the pet model is missing. A
+# publishing pad, leftover BodyPose, a fall, a skill, or the duck's own
+# speaker omit the overlay.
+# dance = false
+#
+# Dedicated dance gait (trained ONNX). Off by default. When true *and* dance
+# is on, beat fills body_x=sin, body_y=cos, body_yaw=energy and z stays 0 —
+# only with `[policy] stand` pointing at that ONNX. Do not combine with
+# alpha_stand.onnx.
+# dance_gait = false
 
 [theremin]
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth

@@ -1215,6 +1215,9 @@ async fn control_loop<T: RobotIo>(
     let mut twist_ema = [0.0f64; 3];
     let mut head_ema = [0.0f64; 4];
     let mut body_ema = [0.0f64; 3];
+    // BeatState.t is a frame counter. The mapper treats a frozen t as a dead capture.
+    let mut last_beat_t = 0u64;
+    let mut last_beat_at = Instant::now();
 
     // Coasting over a dropped bus read, and where the robot actually is.
     //
@@ -1259,25 +1262,34 @@ async fn control_loop<T: RobotIo>(
         .audio
         .enabled
         .then(|| sound::Sound::new(params.audio.bank.clone(), params.audio.device.clone()));
+    let pet_on = params.audio.pet_detect_resolved(params.policy.mode);
+    let pet_model = params
+        .audio
+        .pet_model_resolved()
+        .filter(|p| p.exists());
+    // Capture starts for listen, dance, or petting-with-a-model. Dance must not inherit
+    // petting's "ONNX on disk or no mic" coupling.
     let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
-        && params.audio.pet_detect_resolved(params.policy.mode)
-        && let Some(model) = params.audio.pet_model_resolved()
-        && model.exists()
+        && (params.audio.listen || params.audio.dance || (pet_on && pet_model.is_some()))
     {
+        let model_path = if pet_on { pet_model.clone() } else { None };
         match pet_detect::worker::PetHandle::spawn(pet_detect::worker::PetConfig {
             alsa_device: params.audio.capture_device(),
-            model_path: model.clone(),
+            model_path: model_path.clone(),
             enter_threshold: params.audio.pet_enter_threshold,
             exit_threshold: params.audio.pet_exit_threshold,
         }) {
             Ok(handle) => {
-                tracing::warn!(model = %model.display(), "petting detection listening");
+                match model_path {
+                    Some(model) => tracing::warn!(model = %model.display(), "mic worker listening (pet + beat)"),
+                    None => tracing::warn!("mic worker listening (beat, no pet CNN)"),
+                }
                 Some(handle)
             }
             Err(e) => {
                 // Not unhealthy: the classifier is a feature, not the robot. A missing
                 // model on a release that ships one is caught by the packaging tripwires.
-                tracing::warn!(error = %e, "petting detection unavailable");
+                tracing::warn!(error = %e, "mic worker unavailable");
                 None
             }
         }
@@ -1756,9 +1768,57 @@ async fn control_loop<T: RobotIo>(
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
             *ema += head_alpha * (target - *ema);
         }
+        // Dance overlay: chorale-sway style, this tick's command only. Shared pose/head
+        // slots stay with clients. A publishing pad or leftover BodyPose omits it.
+        let beat = pet.as_ref().map(|p| p.beat()).unwrap_or_default();
+        if beat.t != last_beat_t {
+            last_beat_t = beat.t;
+            last_beat_at = Instant::now();
+        }
+        let t_fresh = beat.t > 0
+            && last_beat_at.elapsed() <= pet_detect::mapper::stale_after(beat.bpm);
+        let walking = gated.twist.iter().map(|v| v * v).sum::<f64>().sqrt() > 1e-3;
+        let skill_busy = controller.as_ref().is_some_and(|c| c.busy());
+        let sitting = controller.as_ref().is_some_and(|c| c.is_sitting());
+        let self_audio = voice.as_mut().is_some_and(|v| v.emitting());
+        if let Some(handle) = pet.as_ref() {
+            handle.set_quarantine(walking || skill_busy || in_limp_fall || self_audio);
+        }
+        let dance_gate = pet_detect::mapper::OverlayGate {
+            opt_in: params.audio.dance,
+            walk_mode: policy_params.mode == Mode::Walk,
+            enabled: snapshot.enabled,
+            has_standing: controller.as_ref().is_some_and(|c| c.has_standing()),
+            fallen: safety.fallen(),
+            limp_fall: in_limp_fall,
+            skill_busy: skill_busy || sitting,
+            self_audio,
+            tracker_quarantined: walking || skill_busy || in_limp_fall || self_audio,
+            locked: beat.locked,
+            t_fresh,
+            twist_fresh: snapshot.twist_age
+                < Duration::from_millis(params.safety.deadman_ms),
+            pose_active: snapshot.pose.active,
+        };
+        let mut dance_mouth = None;
+        let mut gait = pet_detect::mapper::GaitCommand::default();
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
                 *ema += cmd_alpha * (target - *ema);
+            }
+        } else if dance_gate.overlay_applies() {
+            if params.audio.dance_gait {
+                // Dance net: beat in unbound slots, z/roll/pitch stay 0 (as trained).
+                gait = pet_detect::mapper::map_beat_gait(&beat);
+                body_ema = [0.0; 3];
+            } else {
+                let overlay = pet_detect::mapper::map_beat(&beat);
+                let (z, roll, pitch) =
+                    pet_detect::mapper::clamp_body(overlay.z, overlay.roll, overlay.pitch);
+                body_ema[0] += cmd_alpha * (z - body_ema[0]);
+                body_ema[1] += cmd_alpha * (roll - body_ema[1]);
+                body_ema[2] += cmd_alpha * (pitch - body_ema[2]);
+                dance_mouth = Some(overlay.mouth);
             }
         } else {
             body_ema = [0.0; 3];
@@ -1778,6 +1838,9 @@ async fn control_loop<T: RobotIo>(
                 z: body_ema[0],
                 roll: body_ema[1],
                 pitch: body_ema[2],
+                x: gait.x,
+                y: gait.y,
+                yaw: gait.yaw,
             },
         };
 
@@ -2174,7 +2237,7 @@ async fn control_loop<T: RobotIo>(
         // a restart cannot snap a mouth.
         if driving && theremin_state.is_none() && chorale_state.is_none() {
             targets[duck_control::model::MOUTH_INDEX] =
-                duck_control::model::mouth_target(snapshot.mouth);
+                duck_control::model::mouth_target(dance_mouth.unwrap_or(snapshot.mouth));
         }
 
         match safety.apply(targets, hold, gain) {
@@ -2218,6 +2281,17 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 chorale: chorale_state.clone(),
+                beat: pet.as_ref().map(|p| {
+                    let b = p.beat();
+                    proto::BeatState {
+                        t: b.t,
+                        locked: b.locked,
+                        bpm: b.bpm,
+                        phase: b.phase,
+                        onset_seq: b.onset_seq,
+                        energy: b.energy,
+                    }
+                }),
             });
         }
 
