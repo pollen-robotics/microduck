@@ -34,6 +34,23 @@ duck-detect = { path = "../duck-detect" }
 # tracing middleware are all weight for routes that do not exist.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { workspace = true, features = ["derive"] }
+# The relay's half of the bridge: HTTPS to the rendezvous service — SSE inbound, `POST /send`
+# outbound. Same line `updater` uses, minus `form` (nothing here posts a form), so the TLS stack
+# and its version are the ones already resolved for this workspace and its cross build.
+# `stream` is what makes the SSE body readable as it arrives rather than at the end.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2", "charset"] }
+# Server-Sent Events framing — `event:`/`data:` lines, multi-line data, comments and the
+# reconnection field. Sixty lines to hand-roll and one of them would be the bug: a `data:` split
+# across two TCP reads.
+eventsource-stream = "0.2.3"
+# `StreamExt`, for the byte stream `reqwest` hands over. Already in the lock via `updater`.
+futures-util = "0.3.33"
+# Jitter on the reconnect backoff, so a fleet coming back after a service restart does not arrive
+# in lockstep. Already in the lock.
+rand = "0.10.2"
+# The relay's message types. `serde_json` was enough while every JSON object here was forwarded
+# verbatim; the rendezvous protocol is the first one this daemon has to *write*.
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tracing.workspace = true
@@ -69,4 +86,8 @@ glib = "0.21"
 duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }
 # Fake daemons on real unix sockets, which is how the pipe is tested without a WebRTC peer.
 tempfile = "3"
+# The fake rendezvous service the relay is tested against: `axum` needs a `Stream` to serve SSE
+# from, and one `async_stream::stream!` is what a hand-written `Stream` impl would be.
+async-stream = "0.3.6"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

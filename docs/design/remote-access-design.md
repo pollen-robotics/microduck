@@ -416,6 +416,15 @@ into a cadence slower than our own eviction. `reachy_mini`'s ladder has a middle
 publishes no `lease_seconds`**, so that rung is unreachable here; it is not worth reproducing a
 negotiation step for a field nothing sends.
 
+**`POST /send` before `GET /events` is a 400, so the order is not a preference.** The peer does
+not exist until the stream does — identity comes from the bearer token, and the token is bound to
+a peer by the `/events` connection. §3.4 wanted registration before anything reported the robot
+reachable for a different reason; the service enforces the same order for its own.
+
+**The rate limit is 1200 requests per 60 s per peer**, sliding. A 10 s heartbeat and a 30 s poll
+are nine requests a minute, so it constrains nothing here — it is a ceiling to know about before
+somebody shortens an interval to "be safe".
+
 **The SSE side has its own keepalive to size against.** After 30 s with nothing to deliver the
 server emits an `event: ping`, whose only job is to stop the HTTP/2 proxy in front of the Space
 from killing an idle connection. A read timeout on our side therefore has to be comfortably more
@@ -439,6 +448,16 @@ Four, each cheap to build in now and expensive to rediscover:
   yet know the robot exists.
 - **Backoff with jitter, capped.** 5 s growing to 60 s, plus ~10%. A fleet reconnecting in lockstep
   after a service restart is a self-inflicted outage.
+- **A 401 is not a case for backoff.** No number of retries fixes a token the service refuses; a
+  login does. So that path waits on the token file at the same 30 s cadence as a robot nobody has
+  signed in, rather than posting a doomed request every five seconds into somebody else's Space.
+
+Two more from their source, about what the server does rather than what to do about it. **Only
+producers carrying `meta.hardware_id` are swept**, so one without it is never evicted — a crashed
+daemon would haunt its owner's robot list until the Space restarted. That turns §3.7's "should"
+into a "must". And **a second `/events` on the same token supersedes the connection without
+evicting the peer**, so a daemon restarting while its previous socket is half-open reconnects
+cleanly — which is what makes a 60 s read timeout safe rather than merely brave.
 
 What we do **not** copy is their `RobotAppLock`: it arbitrates a local *app* against a remote session,
 and a duck has no app. `remote-webrtc.md` §9 owns the equivalent question here (a pad and a peer both
@@ -480,7 +499,13 @@ fills it in arbitrarily gets subtly wrong behaviour rather than a clear failure:
   So a duck **must** put something stable there, and the obvious candidate already exists:
   `producer.rs` reads the SoC serial for the local `meta`, which is exactly "stable per physical
   robot across reinstalls and renames". Leaving the key out means a robot that reconnects with a
-  fresh token is listed twice; putting the *name* there means renaming a robot forks its identity.
+  fresh token is listed twice — and, since the sweep keys on this field, never evicted at all;
+  putting the *name* there means renaming a robot forks its identity.
+
+  Where there is no serial to read — a developer's laptop, a board whose device tree has none — it
+  falls back to `/etc/machine-id`, stable per *install* rather than per robot. Weaker and still
+  correct for the purpose: one machine is listed once, and the producer stays sweepable. `sounds`
+  already makes exactly this substitution for exactly this reason.
 - **`name`** is what the listing shows a person, and the consumer's `name` is what the server
   reports back as `activeApp` to the owner's other devices. `transport` (`"wifi"` / `"usb"`) is a
   mini-ism a duck can leave alone; a `kind` of `microduck` is what lets one client list both
@@ -601,8 +626,10 @@ Five slices, and the first two are independently useful and need no client:
    three calls, three transports, two CLIs, and a token that renews itself. Verifiable on its own,
    which is what made it the first slice: it prints the Hugging Face username.
 2. **The relay, registering only** — producer registration, the negotiated heartbeat, reconnect and
-   backoff, the split-brain poll. `mediad`. Verifiable with no client at all: the service's dashboard
-   counts a producer and `/api/robot-status` lists the duck.
+   backoff, the split-brain poll. `mediad`. **Done**: `mediad::relay`, a task with no GStreamer in
+   it, inert until `/etc/robot/hf-token` exists and picking it up without a restart when it does.
+   Verifiable with no client at all: the service's dashboard counts a producer and
+   `/api/robot-status` lists the duck.
 3. **Session translation** — a remote consumer gets video and the `control` channel. The first slice
    that needs something to connect *with*.
 4. **The client, hosted.** §5.
