@@ -1142,6 +1142,9 @@ async fn control_loop<T: RobotIo>(
             deadman: Duration::from_millis(params.safety.deadman_ms),
             gain_running: policy_cfg.gain,
             gain_limp: params.safety.gain_limp,
+            // The external per-joint stream's deadman and step clamp default here; wiring them
+            // to dedicated params is a `robotd-params` follow-up (see the RFC's External mode).
+            ..SafetyConfig::default()
         },
     );
 
@@ -1198,6 +1201,10 @@ async fn control_loop<T: RobotIo>(
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
     let mut was_driving = false;
+    // Whether External drive actually drove last tick, so its falling edge can clear the safety
+    // layer's external step-baseline (a later re-entry then rate-limits from the current pose,
+    // not a stale target from this session).
+    let mut was_external_drive = false;
     let mut bringup = Bringup::Limp;
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
     // the time, which is nearly always.
@@ -1878,6 +1885,17 @@ async fn control_loop<T: RobotIo>(
         // And only once the ramp is done, or the policy's first step would come from wherever the
         // robot was slumped. A fall does not stop the driving, as the prototype does not
         // stop it: the policy keeps going and the humans stay in charge.
+        //
+        // External drive: an off-robot controller streaming absolute joint targets
+        // (robot.setJoints) in place of the policy. It owns the joints when engaged AND the robot
+        // can hold them — torque on and homed (Ready), not mid limp-fall, not powered off. It
+        // needs no IMU warmup and no policy: the tick *is* the supplied targets, clamped by
+        // Safety::apply_external (anatomical limits, per-tick step, external deadman). The
+        // dispatch door refuses setJoints unless homed, so a stale frame cannot arrive here.
+        let external = snapshot.external;
+        let external_drive =
+            external.is_some() && bringup == Bringup::Ready && !in_limp_fall && !powered_off;
+
         let driving = snapshot.enabled
             && bringup == Bringup::Ready
             && controller.is_some()
@@ -1886,7 +1904,10 @@ async fn control_loop<T: RobotIo>(
             && !in_limp_fall
             && sensors.is_some()
             && imu_warm
-            && !powered_off;
+            && !powered_off
+            // External drive supersedes the policy: while a controller streams joints, the
+            // on-device policy must not also be producing targets for the same servos.
+            && external.is_none();
 
         if driving && !was_driving {
             // Starting fresh: a stale previous action in the observation, or a filter
@@ -1922,6 +1943,14 @@ async fn control_loop<T: RobotIo>(
             }
         }
         was_driving = driving;
+
+        if was_external_drive && !external_drive {
+            // Left the External stream — forget the last written target, so a later re-entry
+            // rate-limits from the robot's current pose rather than a stale command from this
+            // session (Safety::clear_external drops the step baseline).
+            safety.clear_external();
+        }
+        was_external_drive = external_drive;
 
         // Voltage adaptation: the servos' effective kP tracks their supply, so scaling the
         // action by (nominal / measured) holds the robot's response steady as the pack
@@ -1966,6 +1995,18 @@ async fn control_loop<T: RobotIo>(
                 ),
                 LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
             },
+            // External drive, ahead of the policy arms: `driving` is already false while a
+            // controller streams (it yields to External above), so the tick is simply the
+            // supplied targets. `moving` is true — the joints are travelling to a commanded
+            // pose and a restart mid-stream would drop the robot, so `safeToRestart` must not
+            // say yes here. The gain is the client's per-frame ask, or the mode's running gain.
+            // Everything the frame can violate is clamped downstream by apply_external.
+            _ if external_drive => {
+                let ext = external.expect("external_drive implies Some");
+                let step =
+                    control::Step::external(ext.targets, ext.gain.unwrap_or(policy_cfg.gain));
+                (step.targets, step.gain, true, step.label)
+            }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
@@ -2177,7 +2218,17 @@ async fn control_loop<T: RobotIo>(
                 duck_control::model::mouth_target(snapshot.mouth);
         }
 
-        match safety.apply(targets, hold, gain) {
+        // The External stream goes through the dedicated chokepoint: apply_external adds the
+        // per-joint anatomical clamp, the per-tick step limit and the external deadman (which
+        // holds `hold` and drops toward limp on a dropped controller) on top of the ordinary
+        // actuator clamp. Everything else — policy, homing, limp-fall, hold — uses apply.
+        let written = if external_drive {
+            let age = external.map(|e| e.age).unwrap_or_default();
+            safety.apply_external(targets, hold, age, gain)
+        } else {
+            safety.apply(targets, hold, gain)
+        };
+        match written {
             Ok(applied) => limits.extend(applied.limits),
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
@@ -2352,6 +2403,7 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
     match limit {
         Limit::Deadman => "deadman",
         Limit::Range => "joint_range",
+        Limit::Step => "external_step",
         Limit::NotFinite => "not_finite",
     }
 }
@@ -2809,19 +2861,35 @@ fn dispatch(
         // state and that state is what they get, and a pad held a beat too long should not report
         // an error.
         proto::Call::RobotSetMode(p) => {
-            let target = match p.mode.as_str() {
-                "walk" => Some(Mode::Walk),
-                "roller" => Some(Mode::Roller),
-                _ => None,
-            };
-            let result = match target {
-                None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
-                Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
-                    "no policy on this robot, so there is nothing to switch between",
-                ),
-                Some(mode) => {
-                    intents.request_mode_switch(mode_code(mode));
-                    proto::IntentResult::accepted()
+            // "external" is a drive *source*, not a policy mode: it hands the joints to an
+            // off-robot controller via robot.setJoints, needs no policy loaded, and does not
+            // touch the walk/roller mode machinery. walk/roller leave External and hand the
+            // joints back to the policy.
+            let result = if p.mode.as_str() == "external" {
+                intents.set_external_mode(true);
+                proto::IntentResult::accepted()
+            } else {
+                let target = match p.mode.as_str() {
+                    "walk" => Some(Mode::Walk),
+                    "roller" => Some(Mode::Roller),
+                    _ => None,
+                };
+                match target {
+                    None => proto::IntentResult::refused(
+                        "mode must be \"walk\", \"roller\" or \"external\"",
+                    ),
+                    Some(_) if state.policies.load().walk.is_none() => {
+                        proto::IntentResult::refused(
+                            "no policy on this robot, so there is nothing to switch between",
+                        )
+                    }
+                    Some(mode) => {
+                        // Handing back to the policy: leave External first, so the loop stops
+                        // driving external targets the moment the switch is requested.
+                        intents.set_external_mode(false);
+                        intents.request_mode_switch(mode_code(mode));
+                        proto::IntentResult::accepted()
+                    }
                 }
             };
             proto::Response::ok(Some(id), &result)
@@ -2830,9 +2898,15 @@ fn dispatch(
         proto::Call::RobotMode => proto::Response::ok(
             Some(id),
             &proto::ModeResult {
-                mode: mode_of(state.mode.load(Ordering::Relaxed))
-                    .as_str()
-                    .to_owned(),
+                // External is a drive source layered over the policy mode: while it is engaged
+                // it is what is actually driving the joints, so it is what `robot.mode` reports.
+                mode: if intents.external_engaged() {
+                    "external".to_owned()
+                } else {
+                    mode_of(state.mode.load(Ordering::Relaxed))
+                        .as_str()
+                        .to_owned()
+                },
             },
         ),
 
@@ -2921,6 +2995,41 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // Stream absolute joint targets from an off-robot controller. Accepting a frame enters
+        // External drive implicitly (the RFC's `setMode external` is the explicit door). Refused,
+        // with a named reason, when the request cannot be honoured safely:
+        //  - the wrong number of targets — the vector is positional (`JOINT_NAMES` order), so a
+        //    short or long one is a client bug, refused rather than zero-padded into a lurch;
+        //  - a non-finite target — refused here for a clear error, and again in the safety layer;
+        //  - the joints not powered and at home (`homed`) — a limp robot cannot hold a commanded
+        //    position, so streaming to it is a silent no-op dressed as motion; `robot.init` first.
+        // Everything the frame *can* violate once accepted — anatomical limits, per-tick step,
+        // the external deadman — is the safety layer's job (`Safety::apply_external`), not this
+        // door's.
+        proto::Call::RobotSetJoints(p) => {
+            use duck_control::NUM_JOINTS;
+            let result = if p.targets.len() != NUM_JOINTS {
+                proto::IntentResult::refused(format!(
+                    "robot.setJoints needs exactly {NUM_JOINTS} joint targets in JOINT_NAMES \
+                     order, got {}",
+                    p.targets.len()
+                ))
+            } else if p.targets.iter().any(|v| !v.is_finite()) {
+                proto::IntentResult::refused("robot.setJoints targets must all be finite")
+            } else if !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused(
+                    "robot.setJoints needs the joints powered and at the home pose — call \
+                     robot.init first (a limp robot cannot hold a commanded position)",
+                )
+            } else {
+                let mut targets = [0.0f64; NUM_JOINTS];
+                targets.copy_from_slice(&p.targets);
+                intents.set_external(targets, p.gain);
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         // A refusal here is a normal answer with a reason, not an error: the client asked
         // something reasonable and the daemon declined. Gravity is never one of those
         // reasons — see below.
@@ -2929,6 +3038,12 @@ fn dispatch(
             // in the client, because a client-side belief drifts (relax, shutdown, either
             // side restarting) and a stale one turns Start into a no-op every other press.
             let on = if p.toggle { !intents.enabled() } else { p.on };
+            // Enabling the policy hands the joints back from any External drive — the two are
+            // alternatives, and a stale external target must not shadow the policy that is now
+            // asked to drive.
+            if on {
+                intents.set_external_mode(false);
+            }
             // Never refused for being down. Start on a robot lying on the floor is exactly
             // how someone asks it to stand back up, and it brings the robot up and hands it
             // to the standing policy like any other enable.
@@ -3257,6 +3372,21 @@ mod tests {
             "a refused switch must not reach the loop"
         );
 
+        // "external" is a drive source, not a policy mode: accepted, engages External, and
+        // does NOT queue a walk/roller mode switch.
+        assert!(set("external").accepted, "external is a valid mode");
+        assert!(intents.external_engaged(), "external must engage the mode");
+        assert_eq!(
+            intents.take_mode_switch(),
+            None,
+            "external is not a policy-mode switch"
+        );
+
+        // Switching back to a policy mode leaves External and hands the joints back.
+        assert!(set("walk").accepted);
+        assert!(!intents.external_engaged(), "walk must leave External");
+        assert_eq!(intents.take_mode_switch(), Some(mode_code(Mode::Walk)));
+
         // A robot with no policy at all: nothing to switch between, and saying so beats homing
         // the robot for a swap that would load nothing.
         let mut bare = Params::default();
@@ -3277,6 +3407,75 @@ mod tests {
             result.reason.unwrap_or_default().contains("no policy"),
             "the reason must name the cause"
         );
+    }
+
+    /// `robot.setJoints`: the dispatch door for the External stream. It engages External and
+    /// stores the frame only when the request is well-formed AND the robot can hold it (powered
+    /// and homed); otherwise it refuses with a named reason and touches nothing. Everything the
+    /// frame can violate once accepted is the safety layer's job, not this test's.
+    #[test]
+    fn robot_set_joints_gates_the_external_stream() {
+        use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
+
+        let s = RobotState::new(&Params::default(), false, false);
+        let intents = Arc::new(Intents::new());
+        let id = || proto::Id::Number(1);
+        let call = |targets: Vec<f64>, gain: Option<u16>| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                id(),
+                &proto::Call::RobotSetJoints(proto::SetJointsParams { targets, gain }),
+            )
+            .result_as()
+            .expect("IntentResult")
+        };
+
+        // A limp robot (not homed) refuses — a commanded position it cannot hold is a silent
+        // no-op, so say so rather than pretend to move.
+        assert!(!s.homed.load(Ordering::Relaxed));
+        let limp = call(DEFAULT_POSITION.to_vec(), None);
+        assert!(!limp.accepted);
+        assert!(
+            limp.reason.unwrap_or_default().contains("robot.init"),
+            "the refusal must point at the fix"
+        );
+        assert!(
+            !intents.external_engaged(),
+            "a refused frame must not engage External"
+        );
+
+        // Power and home it; now the door is open.
+        s.homed.store(true, Ordering::Relaxed);
+
+        // Wrong arity is refused, with both counts, and still engages nothing.
+        let short = call(vec![0.0; NUM_JOINTS - 1], None);
+        assert!(!short.accepted);
+        let reason = short.reason.unwrap_or_default();
+        assert!(reason.contains(&NUM_JOINTS.to_string()), "{reason}");
+        assert!(!intents.external_engaged());
+
+        // A non-finite target is refused at the door too.
+        let mut poisoned = DEFAULT_POSITION.to_vec();
+        poisoned[3] = f64::NAN;
+        let nan = call(poisoned, None);
+        assert!(!nan.accepted);
+        assert!(nan.reason.unwrap_or_default().contains("finite"));
+        assert!(!intents.external_engaged());
+
+        // A well-formed frame on a ready robot is accepted, engages External implicitly, and the
+        // targets + gain reach the snapshot the loop reads.
+        let mut targets = DEFAULT_POSITION;
+        targets[0] += 0.1;
+        let ok = call(targets.to_vec(), Some(180));
+        assert!(ok.accepted, "a valid frame on a ready robot is accepted");
+        assert!(
+            intents.external_engaged(),
+            "accepting a frame enters External implicitly"
+        );
+        let ext = intents.snapshot().external.expect("External is engaged");
+        assert_eq!(ext.targets, targets);
+        assert_eq!(ext.gain, Some(180));
     }
 
     /// Roller mode has no standing network, and the published set must say so.
@@ -4535,6 +4734,69 @@ mod tests {
             written[0] < from && written[0] > to,
             "commanded {} outside the ramp {from}..{to}",
             written[0]
+        );
+    }
+
+    /// **External drive reaches the bus.** Once the robot is powered and homed, a client
+    /// streaming `robot.setJoints` supersedes the policy: the loop writes the supplied joint
+    /// targets (through `Safety::apply_external`) rather than a policy or hold pose. The head_yaw
+    /// target is chosen past one tick's step so the ramp is real; the other joints must stay at
+    /// home, proving it is the external frame — not a policy — driving.
+    #[tokio::test]
+    async fn external_drive_streams_joint_targets_to_the_bus() {
+        // Not frozen: reported positions follow the writes, so the external step-limiter advances
+        // its baseline toward the target tick by tick, as it would on the real bus.
+        let io = FakeIo::at(DEFAULT_POSITION);
+        let mut params = Params::default();
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let intents = Arc::new(Intents::new());
+        intents.request_init();
+
+        let mut target = DEFAULT_POSITION;
+        const HEAD_YAW: usize = 7; // wide range (±1.4), home 0.0
+        target[HEAD_YAW] = 0.5; // past external_max_step (0.2), so it takes a few ticks
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let loop_intents = Arc::clone(&intents);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe_with(&mut io, loop_state, loop_intents, Duration::from_millis(2))
+                .await;
+            tx.send(io.last_written).unwrap();
+        });
+
+        // Wait for the 2 s home ramp to complete — external drive requires a powered, homed robot.
+        let homed_by = Instant::now() + Duration::from_secs(6);
+        while !s.homed.load(Ordering::Relaxed) {
+            assert!(Instant::now() < homed_by, "robot never homed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Stream the frame for well over the external deadman (150 ms) so the step-limited ramp
+        // reaches the target — a real controller re-sends every tick.
+        let stream_until = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < stream_until {
+            intents.set_external(target, None);
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        let written = rx.recv().unwrap().expect("the loop must command something");
+        assert!(
+            (written.positions[HEAD_YAW] - target[HEAD_YAW]).abs() < 0.05,
+            "external drive did not reach the head_yaw target: wrote {}, wanted {}",
+            written.positions[HEAD_YAW],
+            target[HEAD_YAW]
+        );
+        // The joints the client did not move stay home — it is the external frame driving, not a
+        // policy that would have moved the legs.
+        assert!(
+            (written.positions[0] - DEFAULT_POSITION[0]).abs() < 0.05,
+            "a non-commanded joint drifted: hip_yaw wrote {}",
+            written.positions[0]
         );
     }
 

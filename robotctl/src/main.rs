@@ -416,6 +416,39 @@ enum RobotCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Stream a sine sweep on one joint in **External** drive — the reference client for
+    /// `robot.setJoints`.
+    ///
+    /// External drive hands the joints to an off-robot controller: instead of the on-device
+    /// policy, whatever you stream is what the servos hold, clamped by the safety layer (each
+    /// joint to its anatomical limit, each tick to a maximum step, and a dead controller held
+    /// then dropped to limp by the external deadman). This sweeps ONE joint around its current
+    /// angle with a sine and holds every other joint where it is.
+    ///
+    /// **Stand the robot up first** (`robotctl robot init`): a limp robot cannot hold a commanded
+    /// position, so `robot.setJoints` is refused until the joints are powered and homed. On the
+    /// way out the sweep settles the joint back and hands control to the walking policy; a Ctrl-C
+    /// instead relies on the external deadman, which holds and then limps within ~150 ms.
+    External {
+        /// Joint to sweep: a `JOINT_NAMES` name (e.g. `head_yaw`) or an index `0..14`.
+        joint: String,
+        /// Peak amplitude of the sweep, radians. The safety layer clamps to the joint's limit.
+        #[arg(long, default_value_t = 0.3)]
+        amplitude: f64,
+        /// Sweep frequency, Hz.
+        #[arg(long, default_value_t = 0.5)]
+        hz: f64,
+        /// How long to stream, seconds.
+        #[arg(long, default_value_t = 5.0)]
+        seconds: f64,
+        /// Command rate, Hz — how often a frame is sent.
+        #[arg(long, default_value_t = 50.0)]
+        rate: f64,
+        /// Hold gain (position P gain). Omit for the mode's running gain.
+        #[arg(long)]
+        gain: Option<u16>,
+    },
 }
 
 /// `robotctl quack` — the loudest way to tell ducks apart. SSH into one, quack it, and the
@@ -2198,6 +2231,19 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
 
 /// Power to the joints, through `robotd`.
 fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
+    // The External sweep is a streaming client, not a single call/response — it has its own path.
+    if let RobotCommand::External {
+        joint,
+        amplitude,
+        hz,
+        seconds,
+        rate,
+        gain,
+    } = &command
+    {
+        return run_robot_external(socket, joint, *amplitude, *hz, *seconds, *rate, *gain);
+    }
+
     // Asked before connecting, so a robot is not dropped by a command the operator then aborts.
     // Same shape as `system reboot`, and for a more immediate reason: this one takes effect in
     // milliseconds and the robot is standing.
@@ -2237,6 +2283,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        RobotCommand::External { .. } => unreachable!("streaming path handled above"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -2284,8 +2331,176 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Relax { .. } => println!("torque off"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
+        RobotCommand::External { .. } => unreachable!("streaming path handled above"),
     }
     Ok(())
+}
+
+/// `robotctl robot external <joint>` — the reference External-drive client. Streams a sine sweep
+/// on one joint through `robot.setJoints`, holding the rest of the pose where it is, then hands
+/// control back to the policy. It is what a downstream driver (an RL policy over the socket) does
+/// in miniature: read the pose, enter External, stream absolute joint targets, leave cleanly.
+#[allow(clippy::too_many_arguments)]
+fn run_robot_external(
+    socket: &Path,
+    joint: &str,
+    amplitude: f64,
+    hz: f64,
+    seconds: f64,
+    rate: f64,
+    gain: Option<u16>,
+) -> Result<(), Failure> {
+    let index = resolve_joint(joint)?;
+    if !(rate > 0.0 && rate <= 200.0) {
+        return Err(Failure::new(
+            exit::USAGE,
+            format!("--rate must be in (0, 200] Hz, got {rate}"),
+        ));
+    }
+    if seconds <= 0.0 {
+        return Err(Failure::new(
+            exit::USAGE,
+            "--seconds must be positive".to_owned(),
+        ));
+    }
+
+    // The base pose is wherever the robot is right now: read one state frame so the sweep
+    // oscillates around the current angle and every other joint is held where it stands.
+    let base = read_pose(socket)?;
+
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+
+    // Announce the mode explicitly. `setJoints` would enter it implicitly, but this makes
+    // `robot.mode` report `external` and reads clearly.
+    result_of(
+        client.call(&proto::Call::RobotSetMode(proto::SetModeParams {
+            mode: "external".to_owned(),
+        }))?,
+    )?;
+
+    // From here a Ctrl-C leaves the loop; if we cannot hand back cleanly the external deadman
+    // holds the robot and drops it to limp within ~150 ms. Installed after the mode is set, so an
+    // interrupt before this simply kills the process with nothing to unwind.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+
+    println!(
+        "external sweep: {} (joint {index}) ±{amplitude:.2} rad @ {hz:.2} Hz for {seconds:.1}s, \
+         {rate:.0} Hz · Ctrl-C to stop",
+        proto::JOINT_NAMES[index]
+    );
+
+    let period = std::time::Duration::from_secs_f64(1.0 / rate);
+    let start = std::time::Instant::now();
+    let mut frames = 0u64;
+    let outcome = loop {
+        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            break Ok(());
+        }
+        let t = start.elapsed().as_secs_f64();
+        if t >= seconds {
+            break Ok(());
+        }
+        let mut targets = base.clone();
+        targets[index] = base[index] + amplitude * (std::f64::consts::TAU * hz * t).sin();
+
+        let result: proto::IntentResult = decode(&result_of(client.call(
+            &proto::Call::RobotSetJoints(proto::SetJointsParams { targets, gain }),
+        )?)?)?;
+        if !result.accepted {
+            break Err(result.reason.unwrap_or_else(|| {
+                "the robot refused the frame — is it powered and homed? (`robotctl robot init`)"
+                    .to_owned()
+            }));
+        }
+        frames += 1;
+        std::thread::sleep(period);
+    };
+
+    // Settle the swept joint back to its base angle (best-effort), then hand the joints to the
+    // walking policy so the robot is not left in External with a dead client.
+    let _ = client.call(&proto::Call::RobotSetJoints(proto::SetJointsParams {
+        targets: base.clone(),
+        gain,
+    }));
+    let _ = client.call(&proto::Call::RobotSetMode(proto::SetModeParams {
+        mode: "walk".to_owned(),
+    }));
+
+    match outcome {
+        Err(reason) => Err(Failure::new(exit::REFUSED, reason)),
+        Ok(()) => {
+            let how = if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                "interrupted"
+            } else {
+                "done"
+            };
+            println!("{how} — {frames} frames streamed, handed back to the policy (mode: walk)");
+            Ok(())
+        }
+    }
+}
+
+/// Resolve a joint argument: a [`proto::JOINT_NAMES`] name, or a bare index into it.
+fn resolve_joint(joint: &str) -> Result<usize, Failure> {
+    if let Some(i) = proto::JOINT_NAMES.iter().position(|n| *n == joint) {
+        return Ok(i);
+    }
+    if let Ok(i) = joint.parse::<usize>()
+        && i < proto::JOINT_NAMES.len()
+    {
+        return Ok(i);
+    }
+    Err(Failure::new(
+        exit::USAGE,
+        format!(
+            "unknown joint {joint:?} — expected a name ({}) or an index 0..{}",
+            proto::JOINT_NAMES.join(", "),
+            proto::JOINT_NAMES.len() - 1
+        ),
+    ))
+}
+
+/// Read one measured joint pose from `robotd`'s state stream — the base the sweep oscillates
+/// around. A short-lived subscription, dropped as soon as the first full frame arrives.
+fn read_pose(socket: &Path) -> Result<Vec<f64>, Failure> {
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(30) }),
+    ))?;
+
+    let mut line = String::new();
+    for _ in 0..200 {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+        }
+        if let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+            && state.joints.len() == proto::JOINT_NAMES.len()
+        {
+            return Ok(state.joints);
+        }
+    }
+    Err(Failure::new(
+        exit::UNREACHABLE,
+        "no joint state from robotd — is the control loop running?".to_owned(),
+    ))
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].

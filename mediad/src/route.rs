@@ -61,6 +61,13 @@ fn permits(call: &proto::Call) -> bool {
         // transport". A datachannel is a control transport, so this is the transport those
         // refusals were pointing at.
         RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_) => true,
+        // Raw per-joint targets from an off-robot controller — the External drive stream. This is
+        // exactly the case the doc's "the calls BLE refuses on capacity grounds are the ones this
+        // transport exists to carry" points at: a joint stream is high-rate teleop, and the
+        // datachannel is its transport. The peer holding the session has the camera — it is
+        // looking at the robot — and the safety layer (anatomical clamp, per-tick step, external
+        // deadman) bounds every frame regardless. Refused over BLE, permitted here.
+        RobotSetJoints(_) => true,
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,

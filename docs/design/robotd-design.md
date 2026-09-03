@@ -552,6 +552,43 @@ that is what the deadman reads.
 `look` (gaze direction) is deferred; both gaze forms will be exposed, and arbitration between
 them is last-writer-wins with no blending.
 
+#### External drive — `robot.setMode "external"` + `robot.setJoints`
+
+The intents above ask the *policy* to walk, look and pose; **External drive** takes the policy
+out of the loop entirely and lets an off-robot controller command the servos directly. It is the
+path a mid-training RL policy or a teleoperation rig takes to drive the physical robot without
+running on it.
+
+```jsonc
+{"jsonrpc":"2.0","id":9,"method":"robot.setMode","params":{"mode":"external"}}
+// absolute joint angles, radians, in JOINT_NAMES order; length must equal NUM_JOINTS
+{"jsonrpc":"2.0","id":10,"method":"robot.setJoints","params":{"targets":[/*15*/],"gain":180}}
+```
+
+Three properties make this safe to expose:
+
+- **It is a drive *source*, not a policy mode.** `external` sits alongside `walk`/`roller` in
+  `robot.setMode`, but it loads no policy and does no homing — the tick *is* the supplied targets.
+  `robot.setJoints` enters it implicitly (a single frame both supplies targets and takes the
+  joints from the policy); `robot.enable on`, `robot.relax` and `setMode walk|roller` leave it and
+  hand the servos back. `robot.mode` reports `external` while it is engaged.
+- **Its clock is separate.** External targets are stamped on their own slot, so a streamed joint
+  command never refreshes — nor is refreshed by — the twist deadman, and each has a deadman that
+  reads the right question.
+- **The safety envelope is the whole point.** Every frame passes through `Safety::apply_external`,
+  which is stricter than the policy path: each joint is clamped to its **anatomical limit**, each
+  tick to a **maximum step** from the last written target (so a jump is rate-limited, not snapped),
+  and a controller that stops streaming trips a dedicated **external deadman** — the robot holds
+  the fallback pose and drops toward limp, the joint-space equivalent of the twist deadman zeroing
+  a velocity. `robot.setJoints` is refused at the door on the wrong number of targets, a non-finite
+  value, or a robot that is not powered and homed (a limp robot cannot hold a commanded position).
+
+External drive is refused over BLE for the same capacity reasons `robot.move` is (§1.2) and then
+some — a joint stream is the most direct motor control there is — and permitted over the WebRTC
+`control` channel, which is the transport it is for. `robotctl robot external <joint>` is the
+reference client: it reads the current pose, enters External, streams a sine sweep on one joint,
+and hands back cleanly.
+
 ### 3.2 State out
 
 One stream, subscribable, decimated per subscriber. It must report what was **refused**, not
@@ -699,6 +736,9 @@ control mid-stride is how a robot falls over (`updater-design.md` §7.2).
 
 `init`, emergency torque-off, calibration and raw joint writes are not intents. They live in their
 own namespace so the relay's per-transport allow-list can keep them off remote transports.
+(External drive's `robot.setJoints` is different: it *is* an intent — a live joint stream the
+control loop clamps through `Safety::apply_external` — and is gated per transport in the route
+files, refused over BLE and permitted over WebRTC, rather than living in the maintenance namespace.)
 Signaling gating decides *who connects*; it does not say a teleoperator is also a mechanic — and
 `update.*` reaching a DataChannel would mean a remote peer can trigger a rollback.
 

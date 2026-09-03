@@ -205,6 +205,13 @@ fn permits(call: &proto::Call) -> bool {
         RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotEnable(_) | RobotDo(_) | RobotPose(_)
         | RobotMouth(_) => false,
 
+        // Raw per-joint targets streamed from an off-robot controller (the External drive path).
+        // This is the most direct motor control there is — it bypasses the policy and commands the
+        // servos straight — so it is refused over BLE for every reason `robot.move` is, and then
+        // some: a 20-byte, ~73-s-late notification link is exactly the wrong transport for a joint
+        // stream. External drive belongs on the local socket / a trusted controller over WebRTC.
+        RobotSetJoints(_) => false,
+
         // Harmless and rather charming from a phone — but it rides the same refusal as the
         // rest of robot.* until the app path exists to want it: opening one call to the
         // radio ahead of a client that can use it buys nothing and widens the surface.

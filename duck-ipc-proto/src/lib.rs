@@ -324,6 +324,17 @@ pub mod method {
     /// Turn policy execution on or off.
     pub const ROBOT_ENABLE: &str = "robot.enable";
 
+    /// Stream absolute joint targets from an off-robot controller. Continuous; send as a
+    /// notification, like [`ROBOT_MOVE`].
+    ///
+    /// Honoured **only** in the `External` drive mode ([`ROBOT_SET_MODE`] `external`), and
+    /// refused by name in any other mode — the on-device policy owns the joints otherwise.
+    /// The targets are absolute joint angles in radians, in [`super::JOINT_NAMES`] order, and
+    /// still pass through `duck-control`'s safety layer: per-joint anatomical limits, a
+    /// per-tick step clamp, and a dedicated external deadman. See
+    /// `docs/rfc/0001-external-per-joint-write.md`.
+    pub const ROBOT_SET_JOINTS: &str = "robot.setJoints";
+
     // ── power to the joints ──────────────────────────────────────────────────
     //
     // The pair, and they are a pair: nothing else in this API turns the motors on or off.
@@ -622,6 +633,9 @@ pub enum Call {
     RobotLook(LookParams),
     RobotStop,
     RobotEnable(EnableParams),
+    /// Stream absolute joint targets from an off-robot controller. Continuous; send as a
+    /// notification. Honoured only in `External` mode. See [`method::ROBOT_SET_JOINTS`].
+    RobotSetJoints(SetJointsParams),
     /// Power the joints and ramp to the home pose. No policy needed.
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
@@ -764,6 +778,7 @@ impl Call {
             Call::RobotLook(_) => method::ROBOT_LOOK,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotSetJoints(_) => method::ROBOT_SET_JOINTS,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotDo(_) => method::ROBOT_DO,
@@ -885,6 +900,7 @@ impl Call {
             | Call::RobotLook(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
+            | Call::RobotSetJoints(_)
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotDo(_)
@@ -975,6 +991,7 @@ impl Call {
             Call::RobotHead(p) => encode(p),
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
+            Call::RobotSetJoints(p) => encode(p),
             Call::RobotDo(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
@@ -1049,6 +1066,23 @@ impl Call {
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_SET_JOINTS => {
+                let p: SetJointsParams = decode(params)?;
+                // The joint vector is positional and indexed as `JOINT_NAMES`, so a vector of
+                // any other length is not a partial command — it is a command whose slot 5 the
+                // sender and the robot disagree about. Refused here, at the door, by name.
+                if p.targets.len() != JOINT_NAMES.len() {
+                    return Err(Error::new(
+                        code::INVALID_PARAMS,
+                        format!(
+                            "robot.setJoints needs exactly {} targets, got {}",
+                            JOINT_NAMES.len(),
+                            p.targets.len()
+                        ),
+                    ));
+                }
+                Call::RobotSetJoints(p)
+            }
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
@@ -1180,6 +1214,13 @@ pub mod test_support {
             Call::RobotEnable(EnableParams {
                 on: true,
                 toggle: false,
+            }),
+            Call::RobotSetJoints(SetJointsParams {
+                targets: vec![
+                    0.0, -0.087, -0.458, -0.005, 0.453, 0.349, 0.349, 0.0, 0.0, 0.0, 0.087, 0.458,
+                    0.005, -0.453, 0.0,
+                ],
+                gain: Some(180),
             }),
             Call::RobotInit,
             Call::RobotRelax,
@@ -1830,6 +1871,32 @@ pub struct EnableParams {
     /// ended in.
     #[serde(default)]
     pub toggle: bool,
+}
+
+/// Absolute joint targets streamed from an off-robot controller — see
+/// [`method::ROBOT_SET_JOINTS`].
+///
+/// A **notification** like [`MoveParams`], sent at the control rate; last-writer-wins, and
+/// expiring through a dedicated external deadman. The targets are absolute joint angles in
+/// **radians**, indexed exactly as [`JOINT_NAMES`], so `targets.len()` must equal
+/// [`JOINT_NAMES`]`.len()` — a shorter or longer vector is refused on parse rather than read
+/// as a partial command, because the vector is positional and a length mismatch means the two
+/// sides disagree about which number drives which joint.
+///
+/// Absolute rather than offsets from `DEFAULT_POSITION`, because the safety clamp's bounds are
+/// absolute — clamping an absolute target to an absolute anatomical limit needs no reference
+/// pose to be agreed first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetJointsParams {
+    /// Absolute joint angles, radians, in [`JOINT_NAMES`] order. Length must equal
+    /// [`JOINT_NAMES`]`.len()`.
+    pub targets: Vec<f64>,
+    /// Position P gain to hold the targets at. `None` uses the running gain the mode was
+    /// configured with, which is the ordinary case — a controller streaming targets rarely
+    /// wants to think about stiffness per frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain: Option<u16>,
 }
 
 /// What an apply should move to.
@@ -3873,7 +3940,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            46,
+            47,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -3948,6 +4015,59 @@ mod tests {
             !line.contains("from_dir"),
             "an apply that names no directory must not mention one: {line}"
         );
+    }
+
+    /// `robot.setJoints` is a notification carrying an absolute joint vector, and it goes on
+    /// the wire exactly as the RFC draws it: `targets` present, `gain` omitted when unset.
+    #[test]
+    fn set_joints_is_a_notification_on_the_wire() {
+        let call = Call::RobotSetJoints(SetJointsParams {
+            targets: vec![0.0; JOINT_NAMES.len()],
+            gain: None,
+        });
+        let line = serde_json::to_string(&Request::notify(&call)).unwrap();
+
+        assert!(line.contains(r#""jsonrpc":"2.0""#), "{line}");
+        assert!(line.contains(r#""method":"robot.setJoints""#), "{line}");
+        assert!(line.contains(r#""targets":["#), "{line}");
+        // A notification carries no id, like every other continuous intent.
+        assert!(!line.contains("\"id\""), "{line}");
+        // The gain is omitted when unset, so the common streamed frame stays small.
+        assert!(!line.contains("gain"), "{line}");
+
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert!(back.is_notification());
+        assert_eq!(back.as_call().unwrap(), call);
+
+        // And the gain reaches the wire when set, round-tripping unchanged.
+        let with_gain = Call::RobotSetJoints(SetJointsParams {
+            targets: vec![0.1; JOINT_NAMES.len()],
+            gain: Some(180),
+        });
+        let line = serde_json::to_string(&Request::notify(&with_gain)).unwrap();
+        assert!(line.contains(r#""gain":180"#), "{line}");
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.as_call().unwrap(), with_gain);
+    }
+
+    /// The joint vector is positional, so a length other than `JOINT_NAMES.len()` is refused
+    /// on parse — by name, with `INVALID_PARAMS` — rather than read as a partial command.
+    #[test]
+    fn set_joints_rejects_a_wrong_length_vector() {
+        for wrong in [0usize, 14, 16] {
+            let params = serde_json::json!({ "targets": vec![0.0f64; wrong] });
+            let error = Call::parse(method::ROBOT_SET_JOINTS, Some(&params))
+                .expect_err(&format!("{wrong} targets were accepted"));
+            assert_eq!(error.code, code::INVALID_PARAMS, "{wrong} targets");
+            assert!(
+                error.message.contains(&JOINT_NAMES.len().to_string()),
+                "the refusal names the required count: {}",
+                error.message
+            );
+        }
+        // The one right length parses.
+        let ok = serde_json::json!({ "targets": vec![0.0f64; JOINT_NAMES.len()] });
+        assert!(Call::parse(method::ROBOT_SET_JOINTS, Some(&ok)).is_ok());
     }
 
     /// `from_dir` survives the wire, and only appears when it was asked for.

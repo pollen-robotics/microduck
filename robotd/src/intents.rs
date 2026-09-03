@@ -37,6 +37,7 @@ const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use duck_control::NUM_JOINTS;
 use duck_control::obs::{BodyPose, Command};
 
 /// A value and when it arrived.
@@ -64,6 +65,30 @@ impl Default for PoseIntent {
             active: false,
         }
     }
+}
+
+/// External per-joint targets, as they sit in [`Intents`] — the raw payload of
+/// `robot.setJoints`, kept on its own [`Stamped`] clock (see [`Intents::external`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ExternalTargets {
+    /// Absolute joint angles, radians, in `JOINT_NAMES` order.
+    targets: [f64; NUM_JOINTS],
+    /// The hold gain the client asked for, or `None` to use the mode's running gain.
+    gain: Option<u16>,
+}
+
+/// The External drive intent, as the loop consumes it: the streamed joint targets, how old
+/// the newest frame is (on the external clock, *not* the twist deadman's), and the gain to
+/// hold them at. Present in a [`Snapshot`] only while External mode is engaged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExternalDrive {
+    pub targets: [f64; NUM_JOINTS],
+    /// Age of the newest external frame, for [`duck_control::safety::Safety::apply_external`]'s
+    /// dedicated external deadman. Measured on the external slot's own stamp, so streaming
+    /// joints never refreshes — nor is refreshed by — the twist's deadman clock.
+    pub age: Duration,
+    /// The per-frame hold gain, or `None` for the mode default.
+    pub gain: Option<u16>,
 }
 
 /// Pending one-shot skill requests, taken once per tick.
@@ -168,6 +193,13 @@ pub struct Intents {
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
     /// and the loop reads value + age so a dead client's ride decays instead of looping.
     wheee: ArcSwap<Stamped<bool>>,
+    /// The newest external joint targets (`robot.setJoints`), on their own stamp — see
+    /// [`ExternalDrive::age`] for why the clock is separate from the twist's.
+    external: ArcSwap<Stamped<ExternalTargets>>,
+    /// Whether the External drive mode is engaged. Set by `robot.setJoints` (which enters the
+    /// mode implicitly) and by `robot.setMode "external"`; cleared when the policy is handed
+    /// back control (`robot.setMode walk|roller`, `robot.enable on`, `robot.relax`).
+    external_active: AtomicBool,
 }
 
 /// What a client asked for, once.
@@ -192,6 +224,10 @@ pub struct Snapshot {
     pub pose: PoseIntent,
     /// Mouth opening, 0..1.
     pub mouth: f64,
+    /// The External drive intent, present only while External mode is engaged. When `Some`,
+    /// the control loop drives these joint targets in place of the policy, through
+    /// [`duck_control::safety::Safety::apply_external`].
+    pub external: Option<ExternalDrive>,
 }
 
 impl Default for Intents {
@@ -232,6 +268,17 @@ impl Intents {
                 value: false,
                 at_us: 0,
             }),
+            // Stamped at zero so, before any frame arrives, an engaged External mode reads as
+            // maximally stale and the external deadman holds the robot rather than driving it
+            // to a zero pose.
+            external: ArcSwap::from_pointee(Stamped {
+                value: ExternalTargets {
+                    targets: [0.0; NUM_JOINTS],
+                    gain: None,
+                },
+                at_us: 0,
+            }),
+            external_active: AtomicBool::new(false),
         }
     }
 
@@ -349,6 +396,32 @@ impl Intents {
         self.mode_switch.store(code, Ordering::Relaxed);
     }
 
+    /// Store the newest external joint targets and enter External drive.
+    ///
+    /// `robot.setJoints`' sink. Stamps on the external clock — never the twist's — and sets
+    /// the mode active, so a single `setJoints` both supplies a frame and takes the joints
+    /// from the policy (the RFC's "setJoints implicitly enables External"). `gain` is the
+    /// per-frame hold gain, `None` for the mode default.
+    pub fn set_external(&self, targets: [f64; NUM_JOINTS], gain: Option<u16>) {
+        self.external.store(Arc::new(Stamped {
+            value: ExternalTargets { targets, gain },
+            at_us: self.now_us(),
+        }));
+        self.external_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Engage or leave External drive without supplying a frame — `robot.setMode "external"`
+    /// on, and the policy-handback paths off. Engaging with no frame yet is safe: the newest
+    /// external stamp stays old, so the external deadman holds the robot until targets arrive.
+    pub fn set_external_mode(&self, on: bool) {
+        self.external_active.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether External drive is engaged — what `robot.mode` reports as `external`.
+    pub fn external_engaged(&self) -> bool {
+        self.external_active.load(Ordering::Relaxed)
+    }
+
     /// Take a pending mode switch. Taken, so the sequence runs once per request.
     pub fn take_mode_switch(&self) -> Option<u8> {
         match self.mode_switch.swap(MODE_NONE, Ordering::Relaxed) {
@@ -388,6 +461,9 @@ impl Intents {
     /// keep driving, and leaving that flag set would have the next tick bring it straight back up.
     pub fn request_relax(&self) {
         self.enabled.store(false, Ordering::Relaxed);
+        // A robot asked to go limp is not being driven by anyone — leave External too, so the
+        // next frame does not silently resume it and torque comes back up under a stale target.
+        self.external_active.store(false, Ordering::Relaxed);
         self.power.store(POWER_RELAX, Ordering::Relaxed);
     }
 
@@ -469,6 +545,16 @@ impl Intents {
         let twist = self.twist.load();
         let head = self.head.load();
         let pose = **self.pose.load();
+        let external = if self.external_active.load(Ordering::Relaxed) {
+            let e = self.external.load();
+            Some(ExternalDrive {
+                targets: e.value.targets,
+                age: Duration::from_micros(now.saturating_sub(e.at_us)),
+                gain: e.value.gain,
+            })
+        } else {
+            None
+        };
         Snapshot {
             command: Command {
                 twist: twist.value,
@@ -482,6 +568,7 @@ impl Intents {
             enabled: self.enabled.load(Ordering::Relaxed),
             pose,
             mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
+            external,
         }
     }
 }
@@ -597,5 +684,91 @@ mod tests {
         let intents = Intents::new();
         intents.set_twist([1.0, 0.0, 0.0]);
         assert_eq!(intents.snapshot().command.body, BodyPose::default());
+    }
+
+    // ── external drive (robot.setJoints) ─────────────────────────────────────
+
+    /// Nothing is external until something asks: a fresh `Intents` has no external drive.
+    #[test]
+    fn there_is_no_external_drive_until_asked() {
+        let intents = Intents::new();
+        assert!(!intents.external_engaged());
+        assert!(intents.snapshot().external.is_none());
+    }
+
+    /// `set_external` supplies the targets, records the gain and engages the mode in one step —
+    /// the RFC's "setJoints implicitly enables External".
+    #[test]
+    fn setting_external_targets_engages_the_mode_and_snapshots_them() {
+        let intents = Intents::new();
+        let mut targets = [0.0; NUM_JOINTS];
+        targets[0] = 0.3;
+        targets[NUM_JOINTS - 1] = -0.2;
+
+        intents.set_external(targets, Some(175));
+        assert!(intents.external_engaged());
+
+        let ext = intents.snapshot().external.expect("external is engaged");
+        assert_eq!(ext.targets, targets);
+        assert_eq!(ext.gain, Some(175));
+    }
+
+    /// The external clock is the deadman-critical invariant: streaming joints must not refresh
+    /// the twist's deadman (a stalled controller cannot mask itself by looking like a live
+    /// gamepad), and driving the twist must not refresh the external frame's age.
+    #[test]
+    fn the_external_clock_is_independent_of_the_twist_deadman() {
+        let intents = Intents::new();
+
+        // Age the twist, then write an external frame.
+        intents.set_twist([0.5, 0.0, 0.0]);
+        std::thread::sleep(Duration::from_millis(10));
+        intents.set_external([0.0; NUM_JOINTS], None);
+
+        let snap = intents.snapshot();
+        assert!(
+            snap.twist_age >= Duration::from_millis(10),
+            "an external write must not refresh the twist's deadman clock"
+        );
+        let ext = snap.external.expect("engaged");
+        assert!(
+            ext.age < snap.twist_age,
+            "the fresh external frame must be younger than the aged twist"
+        );
+
+        // And the reverse: a twist write does not touch the external frame's age.
+        std::thread::sleep(Duration::from_millis(10));
+        intents.set_twist([0.1, 0.0, 0.0]);
+        let ext_after = intents.snapshot().external.expect("still engaged");
+        assert!(
+            ext_after.age >= Duration::from_millis(10),
+            "a twist write must not refresh the external frame's clock"
+        );
+    }
+
+    /// Leaving External mode removes it from the snapshot at once — the loop's cue to hand the
+    /// joints back to the policy.
+    #[test]
+    fn leaving_external_mode_clears_the_snapshot() {
+        let intents = Intents::new();
+        intents.set_external([0.0; NUM_JOINTS], None);
+        assert!(intents.snapshot().external.is_some());
+
+        intents.set_external_mode(false);
+        assert!(!intents.external_engaged());
+        assert!(intents.snapshot().external.is_none());
+    }
+
+    /// `robot.relax` leaves External: a robot told to go limp is not being driven, and the mode
+    /// must not silently resume torque under a stale target on the next frame.
+    #[test]
+    fn relax_leaves_external() {
+        let intents = Intents::new();
+        intents.set_external([0.0; NUM_JOINTS], Some(200));
+        assert!(intents.external_engaged());
+
+        intents.request_relax();
+        assert!(!intents.external_engaged(), "relax must leave External");
+        assert!(intents.snapshot().external.is_none());
     }
 }

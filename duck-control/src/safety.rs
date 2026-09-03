@@ -34,7 +34,7 @@
 use std::time::Duration;
 
 use crate::io::{IoError, JointTargets, RobotIo, Sensors};
-use crate::model::NUM_JOINTS;
+use crate::model::{MOUTH_CLOSED, MOUTH_OPEN, NUM_JOINTS};
 use crate::obs::Command;
 
 /// The XL330's position range: one turn, centred, from the count↔radian conversion.
@@ -47,6 +47,43 @@ use crate::obs::Command;
 pub const ACTUATOR_MIN: f64 = -std::f64::consts::PI;
 pub const ACTUATOR_MAX: f64 = std::f64::consts::PI;
 
+/// Conservative per-joint anatomical limits, radians, indexed as [`crate::model::JOINT_NAMES`].
+///
+/// **This closes the gap the module admits above and [`ACTUATOR_MIN`]/[`ACTUATOR_MAX`] cannot.**
+/// The actuator clamp catches a `NaN`, an absurd action scale or a garbage tensor; it does not
+/// stop a joint being driven somewhere mechanically unwise, because ±π is the servo's whole
+/// travel, not the leg's. A trained policy stays inside the real limits implicitly, since it was
+/// trained in the MJCF that has them — but an *arbitrary external target* (the whole point of
+/// `robot.setJoints`) has no such guarantee, so external write needs real per-joint bounds.
+///
+/// **These are placeholders, deliberately tighter than the servo travel and wide enough to
+/// contain the home pose and ordinary gaits, pending the real numbers.**
+/// TODO: source these from the alpha MJCF's `<joint range=…>` rather than hand-picking them —
+/// the MJCF is not vendored in this repo yet (same note as `microduck_rl`'s env). Until it is,
+/// every bound here is a safe under-approximation: it will refuse travel a real joint has before
+/// it will allow travel a real joint does not. Mirror joints (left/right) use mirrored bounds.
+///
+/// The mouth (index [`crate::model::MOUTH_INDEX`]) is bounded to its own travel
+/// ([`crate::model::MOUTH_CLOSED`]..[`crate::model::MOUTH_OPEN`]); whether external write may
+/// move it at all is a masking decision `robotd` makes, not this table's.
+pub const ANATOMICAL_LIMITS: [(f64, f64); NUM_JOINTS] = [
+    (-0.80, 0.80),              // left_hip_yaw   (home  0.0000)
+    (-0.90, 0.70),              // left_hip_roll  (home -0.0873)
+    (-1.60, 0.70),              // left_hip_pitch (home -0.4579)
+    (-1.80, 0.20),              // left_knee      (home -0.0049)
+    (-0.60, 1.40),              // left_ankle     (home  0.4530)
+    (-0.70, 1.30),              // neck_pitch     (home  0.3491)
+    (-0.70, 1.30),              // head_pitch     (home  0.3491)
+    (-1.40, 1.40),              // head_yaw       (home  0.0000)
+    (-0.80, 0.80),              // head_roll      (home  0.0000)
+    (MOUTH_CLOSED, MOUTH_OPEN), // mouth  (home 0.0000; -5°..+30°)
+    (-0.80, 0.80),              // right_hip_yaw  (home  0.0000)
+    (-0.70, 0.90),              // right_hip_roll (home  0.0873)
+    (-0.70, 1.60),              // right_hip_pitch(home  0.4579)
+    (-0.20, 1.80),              // right_knee     (home  0.0049)
+    (-1.40, 0.60),              // right_ankle    (home -0.4530)
+];
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SafetyConfig {
     /// Projected-gravity z above which the robot counts as falling. Upright reads about
@@ -57,6 +94,22 @@ pub struct SafetyConfig {
     pub fall_debounce: Duration,
     /// Intent age past which the velocity command is zeroed.
     pub deadman: Duration,
+    /// Intent age past which a streamed *external* joint command ([`Safety::apply_external`])
+    /// is dropped: the robot holds its last safe pose and drops toward the limp gain.
+    ///
+    /// Tighter than [`Self::deadman`] on purpose. The twist deadman guards a velocity a human
+    /// keeps refreshing from a gamepad, and 500 ms of a held stick is nothing; an external
+    /// controller streams *positions* at the control rate, so a gap of even a few frames means
+    /// the controller stalled, and a stalled controller must not leave a live joint command. At
+    /// 50 Hz, 150 ms is seven or eight missed frames — long enough not to trip on jitter, short
+    /// enough that a dropped controller cannot walk the robot into anything.
+    pub external_deadman: Duration,
+    /// The most a single external target may move in one tick, radians per joint —
+    /// [`Safety::apply_external`]'s rate limit. The policy path is inherently smooth; raw
+    /// external targets are not, so a single bad frame is bounded to this rather than being
+    /// allowed to snap a joint across its travel. ~0.2 rad/tick is ~10 rad/s at 50 Hz, above any
+    /// gait and well below a hardware slam.
+    pub external_max_step: f64,
     /// Gain while running.
     pub gain_running: u16,
     /// Gain to yield at rather than fight the floor. Nothing here applies it — `robotd`
@@ -72,6 +125,8 @@ impl Default for SafetyConfig {
             fall_gravity_z: -0.5,
             fall_debounce: Duration::from_millis(200),
             deadman: Duration::from_millis(500),
+            external_deadman: Duration::from_millis(150),
+            external_max_step: 0.2,
             gain_running: 200,
             gain_limp: 50,
         }
@@ -82,10 +137,15 @@ impl Default for SafetyConfig {
 /// rather than watching the robot ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
-    /// Intents went stale; the velocity was zeroed.
+    /// Intents went stale; the velocity was zeroed (or an external stream stopped and the
+    /// robot was held and dropped toward limp — see [`Safety::apply_external`]).
     Deadman,
-    /// A target was outside the actuator's travel.
+    /// A target was outside its bound — the actuator's travel on the policy path, or a joint's
+    /// anatomical limit ([`ANATOMICAL_LIMITS`]) on the external path.
     Range,
+    /// An external target moved more in one tick than [`SafetyConfig::external_max_step`]
+    /// allows, and was rate-limited toward it.
+    Step,
     /// A target was `NaN` or infinite.
     NotFinite,
 }
@@ -111,6 +171,11 @@ pub struct Safety<T: RobotIo> {
     /// Tracks the last gain written so an unchanged one is not rewritten every tick — that
     /// would be fifteen bus writes per tick for no reason.
     gain: Option<u16>,
+    /// The last external target actually written, for [`Self::apply_external`]'s per-tick step
+    /// clamp. `None` before the first external command and after [`Self::clear_external`], so
+    /// the first frame of a stream rate-limits from the pose the robot is already in rather than
+    /// from a stale one.
+    last_external: Option<[f64; NUM_JOINTS]>,
 }
 
 impl<T: RobotIo> Safety<T> {
@@ -121,6 +186,7 @@ impl<T: RobotIo> Safety<T> {
             falling_for: Duration::ZERO,
             fallen: false,
             gain: None,
+            last_external: None,
         }
     }
 
@@ -276,6 +342,105 @@ impl<T: RobotIo> Safety<T> {
         self.io.set_gain(kp)?;
         self.gain = Some(kp);
         Ok(())
+    }
+
+    /// Apply a streamed external joint command — the sink for `robot.setJoints`.
+    ///
+    /// The same chokepoint as [`Self::apply`], with the guarantees raw off-robot targets need
+    /// on top of the ones the policy path already has, in order:
+    ///
+    ///  1. **External deadman.** If `external_age` exceeds [`SafetyConfig::external_deadman`],
+    ///     the stream is treated as dropped: the robot is commanded to `hold` and dropped to the
+    ///     limp gain, reported as [`Limit::Deadman`]. A stalled off-robot controller must not
+    ///     leave a live joint command.
+    ///  2. **Non-finite refusal.** A `NaN`/inf anywhere in the vector refuses the whole frame and
+    ///     holds — identical to [`Self::apply`], never a clamp to a plausible-looking boundary.
+    ///  3. **Per-joint anatomical clamp** to [`ANATOMICAL_LIMITS`], reported as [`Limit::Range`] —
+    ///     the bound the actuator-travel clamp cannot give, and the reason external write is safe.
+    ///  4. **Per-tick step clamp** to [`SafetyConfig::external_max_step`], reported as
+    ///     [`Limit::Step`], measured against the last external target actually written (or `hold`
+    ///     on the first frame), so one bad frame cannot snap a joint.
+    ///
+    /// The conditioned targets are then written through [`Self::apply`], so the actuator-travel
+    /// clamp, the gain write and the single motor-write path are exactly the ones every other
+    /// command goes through — nothing here reaches a servo on its own.
+    ///
+    /// `running_gain` is what to hold the targets at while the stream is live (the mode's gain, or
+    /// a per-frame `gain` the client asked for). `hold` is the fallback pose used when the stream
+    /// is stale or refused, normally the pose the robot is already in.
+    pub fn apply_external(
+        &mut self,
+        targets: [f64; NUM_JOINTS],
+        hold: [f64; NUM_JOINTS],
+        external_age: Duration,
+        running_gain: u16,
+    ) -> Result<Applied, IoError> {
+        // 1. External deadman: a dropped controller must not leave a live command. Hold the
+        //    fallback pose and drop toward limp — the joint equivalent of the twist deadman
+        //    zeroing a velocity, and stricter, because a stale *position* is a held command.
+        if external_age > self.config.external_deadman {
+            let mut applied = self.apply(hold, hold, self.config.gain_limp)?;
+            if !applied.limited_by(Limit::Deadman) {
+                applied.limits.push(Limit::Deadman);
+            }
+            // The baseline for a resumed stream is the pose we are now holding, not a stale
+            // pre-dropout target.
+            self.last_external = Some(hold);
+            return Ok(applied);
+        }
+
+        // 2. Non-finite is refused outright, before any clamp — delegating to `apply` so the
+        //    refusal-and-hold behaviour is defined in exactly one place.
+        if targets.iter().any(|v| !v.is_finite()) {
+            let applied = self.apply(targets, hold, running_gain)?;
+            self.last_external = Some(hold);
+            return Ok(applied);
+        }
+
+        let mut applied = Applied::default();
+        let baseline = self.last_external.unwrap_or(hold);
+        let mut safe = targets;
+
+        for (j, value) in safe.iter_mut().enumerate() {
+            // 3. Anatomical clamp — the per-joint bound ±π cannot express.
+            let (lo, hi) = ANATOMICAL_LIMITS[j];
+            let clamped = value.clamp(lo, hi);
+            if clamped != *value {
+                if !applied.limited_by(Limit::Range) {
+                    applied.limits.push(Limit::Range);
+                }
+                *value = clamped;
+            }
+
+            // 4. Per-tick step clamp against the last written external target.
+            let step = *value - baseline[j];
+            if step.abs() > self.config.external_max_step {
+                *value = baseline[j] + self.config.external_max_step.copysign(step);
+                if !applied.limited_by(Limit::Step) {
+                    applied.limits.push(Limit::Step);
+                }
+            }
+        }
+
+        self.last_external = Some(safe);
+
+        // Write through the ordinary chokepoint. The actuator clamp there is a no-op given the
+        // anatomical bounds already sit inside ±π, but the single write path and the gain-change
+        // bookkeeping are what we want to share rather than duplicate.
+        let inner = self.apply(safe, hold, running_gain)?;
+        for limit in inner.limits {
+            if !applied.limits.contains(&limit) {
+                applied.limits.push(limit);
+            }
+        }
+        Ok(applied)
+    }
+
+    /// Forget the last external target, so the next [`Self::apply_external`] rate-limits from the
+    /// robot's current pose rather than a target from a previous session. `robotd` calls this when
+    /// it leaves the External drive mode, so switching back to a policy leaves no residual command.
+    pub fn clear_external(&mut self) {
+        self.last_external = None;
     }
 
     /// Borrow the wrapped IO. Test-only, and deliberately not public: handing this out in
@@ -576,5 +741,237 @@ mod tests {
         assert_eq!(s.io().writes, 3);
         assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
         assert_eq!(s.gain, Some(SafetyConfig::default().gain_running));
+    }
+
+    // ── external per-joint write (robot.setJoints) ───────────────────────────
+
+    /// A fresh, in-range, small-step external command goes straight through: the targets are
+    /// written unchanged and nothing is reported. Any clamp firing here would mean the whole
+    /// external path is mangling ordinary commands.
+    #[test]
+    fn a_fresh_external_command_passes_through() {
+        let mut s = safety();
+        // Seed the step baseline so the first frame is not itself rate-limited from home.
+        s.clear_external();
+        // A tiny nudge from the home pose — well inside every limit and the per-tick step.
+        let mut wanted = DEFAULT_POSITION;
+        wanted[0] += 0.05;
+        // First frame rate-limits from `hold` (= wanted's neighbour, DEFAULT_POSITION here).
+        let applied = s
+            .apply_external(
+                wanted,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
+        assert!(applied.limits.is_empty(), "{:?}", applied.limits);
+        assert_eq!(s.io().last_written.unwrap().positions, wanted);
+        assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
+    }
+
+    /// A `NaN` in an external vector is refused outright and the robot holds — never clamped to
+    /// a boundary, exactly as on the policy path.
+    #[test]
+    fn a_non_finite_external_target_is_refused_not_clamped() {
+        let mut s = safety();
+        let mut poisoned = DEFAULT_POSITION;
+        poisoned[4] = f64::INFINITY;
+        let applied = s
+            .apply_external(
+                poisoned,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                SafetyConfig::default().gain_running,
+            )
+            .unwrap();
+        assert!(applied.limited_by(Limit::NotFinite));
+        assert!(!applied.limited_by(Limit::Range), "must not be clamped");
+        assert_eq!(s.io().last_written.unwrap().positions, DEFAULT_POSITION);
+    }
+
+    /// A target outside a joint's anatomical limit is clamped to that limit — the bound the
+    /// actuator-travel clamp (±π) cannot give — and reported.
+    #[test]
+    fn an_out_of_limit_external_target_is_clamped_to_the_joint_bound() {
+        // A generous per-tick step budget isolates the anatomical clamp from the step clamp:
+        // left_knee (index 3) limit is [-1.80, 0.20], right_hip_pitch (12) is [-0.70, 1.60].
+        let cfg = SafetyConfig {
+            external_max_step: 100.0,
+            ..SafetyConfig::default()
+        };
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), cfg);
+
+        let mut wild = DEFAULT_POSITION;
+        wild[3] = 2.0; // well past the +0.20 knee limit
+        wild[12] = -2.0; // right_hip_pitch limit is [-0.70, 1.60]; well past the -0.70 bound
+        let applied = s
+            .apply_external(
+                wild,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
+            .unwrap();
+
+        assert!(applied.limited_by(Limit::Range));
+        let written = s.io().last_written.unwrap().positions;
+        assert_eq!(
+            written[3], ANATOMICAL_LIMITS[3].1,
+            "clamped to the knee's max"
+        );
+        assert_eq!(
+            written[12], ANATOMICAL_LIMITS[12].0,
+            "clamped to the hip pitch min"
+        );
+    }
+
+    /// A target that jumps further than the per-tick step allows is rate-limited toward it,
+    /// not applied whole — one bad frame cannot snap a joint across its travel.
+    #[test]
+    fn an_over_fast_external_step_is_rate_limited() {
+        let cfg = SafetyConfig::default();
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), cfg);
+        let max = cfg.external_max_step;
+
+        // First frame establishes the baseline at (near) the home pose without tripping the
+        // step clamp: ask for exactly one max-step move on joint 0.
+        let mut f1 = DEFAULT_POSITION;
+        f1[0] = DEFAULT_POSITION[0] + max;
+        let a1 = s
+            .apply_external(
+                f1,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
+            .unwrap();
+        assert!(!a1.limited_by(Limit::Step), "exactly max is allowed");
+        let after_first = s.io().last_written.unwrap().positions[0];
+
+        // Second frame demands a jump ten times the budget; only one step of it lands.
+        let mut f2 = DEFAULT_POSITION;
+        f2[0] = after_first + 10.0 * max;
+        let a2 = s
+            .apply_external(
+                f2,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
+            .unwrap();
+        assert!(a2.limited_by(Limit::Step));
+        let written = s.io().last_written.unwrap().positions[0];
+        assert!(
+            (written - (after_first + max)).abs() < 1e-9,
+            "expected one step of {max} from {after_first}, got {written}"
+        );
+    }
+
+    /// A stalled off-robot controller — external targets older than the external deadman — must
+    /// not leave a live command: the robot holds the fallback pose and drops toward the limp gain.
+    #[test]
+    fn stale_external_targets_hold_and_go_limp() {
+        let cfg = SafetyConfig::default();
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), cfg);
+
+        // A perfectly reasonable target, but it arrived too long ago.
+        let mut wanted = DEFAULT_POSITION;
+        wanted[0] = 0.3;
+        let applied = s
+            .apply_external(
+                wanted,
+                DEFAULT_POSITION,
+                cfg.external_deadman + Duration::from_millis(1),
+                cfg.gain_running,
+            )
+            .unwrap();
+
+        assert!(applied.limited_by(Limit::Deadman));
+        assert_eq!(
+            s.io().last_written.unwrap().positions,
+            DEFAULT_POSITION,
+            "a dropped stream holds the fallback pose, not the stale target"
+        );
+        assert_eq!(
+            s.io().last_gain,
+            Some(cfg.gain_limp),
+            "and drops toward the limp gain"
+        );
+    }
+
+    /// The external deadman is genuinely tighter than the twist deadman — a gap that is fine for
+    /// a held gamepad stick already drops a streamed joint command.
+    #[test]
+    fn the_external_deadman_is_tighter_than_the_twist_deadman() {
+        let cfg = SafetyConfig::default();
+        assert!(cfg.external_deadman < cfg.deadman);
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), cfg);
+
+        // Older than the external deadman, younger than the twist deadman.
+        let age = (cfg.external_deadman + cfg.deadman) / 2;
+        let mut wanted = DEFAULT_POSITION;
+        wanted[0] = 0.3;
+        let applied = s
+            .apply_external(wanted, DEFAULT_POSITION, age, cfg.gain_running)
+            .unwrap();
+        assert!(
+            applied.limited_by(Limit::Deadman),
+            "an age the twist deadman would pass must still drop a joint stream"
+        );
+    }
+
+    /// `clear_external` drops the step baseline, so re-entering the External path rate-limits
+    /// from the robot's current pose rather than a target from a previous session.
+    #[test]
+    fn clearing_external_resets_the_step_baseline() {
+        let cfg = SafetyConfig::default();
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), cfg);
+        let max = cfg.external_max_step;
+
+        // Drive the baseline far from home over several ticks.
+        let mut far = DEFAULT_POSITION;
+        far[0] = DEFAULT_POSITION[0] + 5.0 * max;
+        for _ in 0..20 {
+            s.apply_external(far, far, Duration::from_millis(20), cfg.gain_running)
+                .unwrap();
+        }
+
+        // Leaving External and coming back must forget that baseline.
+        s.clear_external();
+        let mut home = DEFAULT_POSITION;
+        home[0] = DEFAULT_POSITION[0] + max; // one step from home
+        let applied = s
+            .apply_external(
+                home,
+                DEFAULT_POSITION,
+                Duration::from_millis(20),
+                cfg.gain_running,
+            )
+            .unwrap();
+        assert!(
+            !applied.limited_by(Limit::Step),
+            "a fresh session rate-limits from the current pose, so one step is allowed"
+        );
+    }
+
+    /// The limit table must contain the home pose: a bound that clamped `DEFAULT_POSITION` would
+    /// mean the robot could not even be commanded to stand at home through the external path.
+    #[test]
+    fn the_home_pose_is_inside_the_anatomical_limits() {
+        for (j, &(lo, hi)) in ANATOMICAL_LIMITS.iter().enumerate() {
+            assert!(lo < hi, "joint {j}: empty limit [{lo}, {hi}]");
+            assert!(
+                DEFAULT_POSITION[j] >= lo && DEFAULT_POSITION[j] <= hi,
+                "home pose {} for joint {j} is outside [{lo}, {hi}]",
+                DEFAULT_POSITION[j]
+            );
+            // And every anatomical bound sits inside the actuator travel, or the clamp order
+            // in `apply_external` would be wrong.
+            assert!(
+                lo >= ACTUATOR_MIN && hi <= ACTUATOR_MAX,
+                "joint {j} exceeds actuator travel"
+            );
+        }
     }
 }

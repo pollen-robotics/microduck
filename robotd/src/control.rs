@@ -120,13 +120,39 @@ impl Default for SkillTuning {
 pub struct Step {
     pub targets: [f64; NUM_JOINTS],
     /// Which network drove, as the wire label: `walk`, `stand`, `ground_pick`, `kick_left`,
-    /// `kick_right`, `sit`, `rise`.
+    /// `kick_right`, `sit`, `rise` — or `external` when an off-robot controller is driving the
+    /// joints directly ([`Step::external`]).
     pub label: &'static str,
     /// What the gain should be for this tick.
     pub gain: u16,
     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
     /// restarting the daemon now would put it on the floor.
     pub busy: bool,
+}
+
+impl Step {
+    /// The **External** drive path: joint targets streamed by an off-robot controller (via
+    /// `robot.setJoints`) in place of the on-device policy's output.
+    ///
+    /// External mode skips the whole policy stage — `observe → infer → scatter → scale →
+    /// low-pass` — so there is nothing to run here: the tick *is* the supplied targets. They are
+    /// carried straight to the safety layer's external chokepoint,
+    /// [`duck_control::safety::Safety::apply_external`], which owns the per-joint anatomical
+    /// limits, the per-tick step clamp and the dedicated external deadman. Nothing is clamped
+    /// here — this is a decision object, and like every other producer in this module it holds
+    /// no IO handle: it proposes targets, it does not command a motor.
+    ///
+    /// `busy` is false: External is a drive mode a client enters and leaves deliberately, not a
+    /// scripted move mid-flight, so it does not block a restart the way a roulade does — the mode
+    /// gate, not this flag, is what refuses `robot.setJoints` outside External.
+    pub fn external(targets: [f64; NUM_JOINTS], gain: u16) -> Self {
+        Self {
+            targets,
+            label: "external",
+            gain,
+            busy: false,
+        }
+    }
 }
 
 /// Where the robot is in the sit↔stand cycle.
@@ -534,5 +560,34 @@ mod tests {
     fn the_ground_pick_cutoff_is_the_prototypes() {
         assert_eq!(GROUND_PICK_END_PHASE, 0.7);
         assert_eq!(RISE_SECS, 1.0);
+    }
+
+    /// The External branch produces exactly the supplied targets — the whole point of a
+    /// passthrough is that it does not reinterpret them. The clamping (anatomical limits, the
+    /// per-tick step, the deadman) is the safety layer's job downstream, verified there; here
+    /// what matters is that the Runtime hands the joint vector through untouched, labels the
+    /// tick `external`, carries the caller's gain, and is not `busy`.
+    ///
+    /// Tested via `Step::external` rather than a full `Controller`, because constructing a
+    /// `Controller` needs a loaded `Policy` (ONNX Runtime + a model file), which the External
+    /// path deliberately never touches — skipping the policy stage is the point of the mode.
+    #[test]
+    fn the_external_branch_returns_the_supplied_targets() {
+        let mut targets = DEFAULT_POSITION;
+        targets[0] = 0.3;
+        targets[duck_control::model::MOUTH_INDEX] = 0.2;
+
+        let step = Step::external(targets, 175);
+
+        assert_eq!(
+            step.targets, targets,
+            "the joint vector passes through unchanged"
+        );
+        assert_eq!(step.label, "external");
+        assert_eq!(step.gain, 175);
+        assert!(
+            !step.busy,
+            "External is a mode, not a scripted move mid-flight"
+        );
     }
 }
