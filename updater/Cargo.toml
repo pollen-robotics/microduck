@@ -60,7 +60,9 @@ tar = "0.4.46"
 zstd = "0.13.3"
 toml = "1.1.3"
 futures-util = "0.3.33"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2", "charset"] }
+# `form` is for `account.rs`: OAuth token endpoints take `application/x-www-form-urlencoded`
+# bodies, not JSON, and RFC 8628 is no exception. It pulls in `serde_urlencoded` and nothing else.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream", "http2", "charset", "form"] }
 
 [dev-dependencies]
 test-support = { path = "../test-support" }

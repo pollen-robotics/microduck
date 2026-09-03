@@ -105,6 +105,16 @@ robotctl monitor --json --hz 50 > run.jsonl
 sudo robotctl configure
 ```
 
+What has been changed on this robot, and nothing else:
+
+```
+robotctl configure --list
+```
+
+A robot nobody has touched prints nothing — that is the answer. Add `--json` for a support
+bundle. It needs no root and no terminal, which is the point: it is the first question to ask
+about a robot behaving oddly, and until now answering it meant a full-screen editor over ssh.
+
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
@@ -154,27 +164,244 @@ than failing. `robotctl monitor` reports the achieved rate on the bottom border,
 journalctl -u mediad -b | grep streaming
 ```
 
-#### Your own policy
+### Policies and skills
 
-You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
-board, in `/etc/robot/robotd.toml`:
+A **slot** is what the robot runs by default — the walking gait, the standing network. A
+**skill** is what it runs when asked: a kick, the roulade, a bow. Both are files on the Hub, both
+change without a daemon release, and nothing below needs a restart.
+
+What this robot is running right now:
+
+```
+robotctl policy list
+```
+
+Two tables: the seven slots, then the skills — what runs by default, and what runs when asked.
+
+```text
+   SKILL        RUNS FOR  POLICY
+   kick_left       0.5 s  ball_kick_left.onnx
+   roulade           1 s  roulade.onnx
+ * polite-bow        4 s  fffiloni/microduck-polite-bow-b1d864/main/policy.onnx
+   ground_pick         —  driven by the robot itself
+   sit_toggle          —  driven by the robot itself
+```
+
+A `*` marks every row config has an opinion about, with a count at the bottom. A slot you switched
+off says `switched off` rather than looking like one the robot never had. The directory comes off
+the path because the `ORIGIN` column already says which one it was.
+
+`ground_pick` and `sit_toggle` have no length because the robot drives them itself — they answer
+to `robot do` like the rest, but they are not entries you can change.
+
+#### A newer official set
+
+The set the robot walks with lives on the Hub and versions on its own line:
+
+```
+robotctl policy check
+```
+
+```
+sudo robotctl policy update
+```
+
+`check` prints what is installed, what is newest, and what else the repo offers; it changes
+nothing and says so plainly when the Hub cannot be reached. `update` takes the newest unless you
+name one — `--version v1` is how to go back. The robot returns to its home pose, re-reads every
+slot and drives again, and **a slot you loaded yourself is left alone**, because it points
+somewhere else entirely.
+
+#### Trying your own file
+
+No release, no file to edit, no restart:
+
+```
+sudo robotctl policy load walk /home/radxa/my_walking.onnx
+```
+
+If the robot is walking, it goes to its home pose, loads it, and drives again. If it is doing
+something else — sitting, standing still — nothing moves: the network being replaced is not the
+one running, and the swap happens underneath. `sudo robotctl policy reset walk` puts that slot
+back; with no slot, it puts all seven back.
+
+#### Trying somebody else's
+
+Other people publish policies for this robot:
+
+```
+robotctl policy search microduck
+```
+
+```
+sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+```
+
+The repo name is enough — it is fetched and loaded in one step. Add `@v2` for a revision and
+`:policy.onnx` for a repo carrying more than one. `policy list` marks it `community`.
+
+**Nothing a stranger publishes is verified by anybody.** What makes it safe to try is the joint
+clamps, the fall reflex and the shape gate — not the description. Have the robot on its stand the
+first time.
+
+A policy whose manifest says it will not run here — wrong observation width, a newer daemon, a
+different robot — is refused before it downloads. One with no manifest is accepted and checked
+the usual way, at load.
+
+#### Adding a skill
+
+A policy in the walk slot replaces the gait. A policy added as a *skill* sits alongside it and
+runs when asked, which is what most published one-shots want:
+
+```
+sudo robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864
+```
+
+```
+robotctl robot do polite-bow
+```
+
+The length comes from the repo's manifest. A policy that holds until told otherwise — a
+one-footed stand, say — has no length of its own, so give it one, and the twist it reads:
+
+```
+sudo robotctl policy add flamingo RemiFabre/microduck-flamingo-cycle --hold 5 --command 1,1,0
+```
+
+`--command` is what the network is fed while it runs. Most skills need none: they are trained on
+an all-zero command and being selected *is* the trigger. A policy that reads its twist as
+something else — flamingo's is `[flag, side, 0]` — needs it spelled out, and its README says
+what the slots mean.
+
+`sudo robotctl policy remove <name>` takes one out. A skill this robot's release ships comes back
+when you do, since removing the entry only removes the override.
+
+The robot must be driving for a skill to run — press **Start** on the pad first, or the request
+is refused saying so.
+
+#### Putting a skill on a button
+
+```
+robotctl pad bindings
+```
+```text
+a           ground_pick
+x           roulade
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+
+`robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
+```
+
+```
+sudo robotctl pad bind x polite-bow
+```
+```text
+a           ground_pick
+x           polite-bow
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+```
+
+That writes one line, and only the button you named:
 
 ```toml
-[policy]
-walk = "/home/radxa/my_walking.onnx"
-stand = "/home/radxa/my_stand.onnx"
+[pad]
+x = "polite-bow"
 ```
 
+Put it back:
+
 ```
-sudo systemctl restart robotd
+sudo robotctl pad reset
 ```
 
-Your paths survive updates — a release replaces the binaries and the policies it ships, not the
-file that points elsewhere. Delete the lines to go back to the ones the release carries.
+**Nothing restarts** — `padd` notices within a second.
 
-A policy that could not be loaded reports **unhealthy**, and `robotctl health` and the bottom
-border of `monitor` both name the reason. The shape a policy has to have, and what else is
-checked at load, are in [`../design/robotd-design.md`](../design/robotd-design.md) §2.3.
+A binding naming a skill this robot does not have is marked in the listing rather than
+silently doing nothing when you press it.
+
+Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
+the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
+`pad reset <button>` puts one back. The defaults are the mapping the prototype had, so a robot
+with no `[pad]` section behaves exactly as it always has.
+
+The rest of the pad is not bindable: Start toggles the policy, Y and B change what the sticks
+mean, and held Select powers the robot off — the button that stops a robot is the one worth not
+being able to lose to a config edit. A name is checked against what the robot actually has, so a
+typo is refused with the list rather than becoming a dead button.
+
+#### Putting it all back
+
+```
+sudo robotctl policy reset
+```
+```
+sudo robotctl pad reset
+```
+```
+robotctl configure --list
+```
+
+The last one prints what this robot changes from the defaults and nothing else — a robot nobody
+has touched prints one line saying so. It is the first thing to run when a robot is behaving
+oddly and you are not sure what was left set.
+
+#### The slots, and four things worth knowing
+
+The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
+`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
+survives updates — a release replaces the binaries and the policies it ships, not the line that
+points elsewhere.
+
+- **Resetting something already reset does nothing, and says so.** No homing, no reload, and no
+  `sudo` needed when there is also nothing to write.
+- **A policy that is not `obs[1,61] -> actions[1,14]` is refused before anything changes.** The
+  file is opened and checked while the robot is still running the old one.
+- **A load that fails anyway keeps the policy that was running.** Trying a gait cannot cost you
+  the one you had.
+- **A file that has gone missing by the next boot costs its slot, not the robot.** The slot falls
+  back to this robot's own policy, `robotctl health` reports *degraded* and names the file, and
+  `policy reset <slot>` clears it. An official policy that will not load is still **unhealthy** —
+  that is a broken release, and the updater rolls it back.
+
+`none` switches a slot off — every slot except `walk`, which is what the others fall back to and
+cannot be empty. Some policies need that: one that does its own standing wants the standing
+network out of the way, or the robot hands itself to that whenever the command is zero.
+
+#### Publishing a policy for every robot
+
+A policy in the official set reaches every robot, and adding one is four steps with no daemon
+release:
+
+1. Upload the `.onnx` to `pollen-robotics/microduck-policies`.
+2. Add an entry to its `manifest.json`:
+   ```json
+   { "file": "polite-bow.onnx", "kind": "episodic", "duration_s": 4.0 }
+   ```
+   The set's manifest is `schema_version: 2`; a plain one-shot needs no more than those three.
+3. Tag it — `hf repos tag create pollen-robotics/microduck-policies v4`.
+4. On a robot: `sudo robotctl policy update`.
+
+That entry is what a one-shot needs and nothing more: **`episodic` with a `duration_s`, on the
+all-zero command it was trained against, becomes a skill the robot answers to by name** — ready
+for `robot do` and a button, with nothing else edited. A **`perpetual`** one is a gait and needs
+a slot pointed at it instead.
+
+A policy the daemon has to *drive* — writing a phase over time, or flipping a posture flag —
+declares that under `command.encoding`, and its numbers become that arm's timing rather than a
+new skill. The ground pick and the sit↔stand are the two, and getting one of those entries wrong
+is the one mistake here worth being careful about.
+
+The manifest in full, every field, and what each one changes on the robot:
+[`../policy-manifest.md`](../policy-manifest.md).
+
+The shape a policy has to have and what else is checked at load are in
+[`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from, what
+`official` means, and how a skill declares itself are in
+[`../design/policy-channel-design.md`](../design/policy-channel-design.md).
 
 ### Power to the joints (`robotd`)
 
@@ -208,6 +435,9 @@ or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp
 `init`/`enable`/skills until it is stood up.
 
 ### Gamepad (`configd`)
+
+What each button *does* — and how to change it — is under **Policies and skills** above
+(`robotctl pad bindings`). This section is about getting a pad connected at all.
 
 ```
 robotctl pad status
@@ -523,6 +753,50 @@ box for the lifetime of the command. Prefer it on anything shared.
 Joining a network **disconnects the robot from the one it is on**, so an ssh session over wifi will
 drop. That is the operation working. A scan takes a few seconds — it waits for the radio to sweep
 rather than returning the previous scan's results.
+
+### The Hugging Face account (`updaterd`)
+
+Signing the robot in is what will let you reach it from outside its own network. Nothing else
+needs it yet.
+
+```
+sudo robotctl account login
+```
+
+That prints a code. Open <https://hf.co/oauth/device> on any device, type the code, and the
+command finishes:
+
+```
+Open https://hf.co/oauth/device and enter this code:
+
+    A6MY-0314
+
+Waiting for approval…
+Signed in as PierreRouanet.
+```
+
+```
+robotctl account status
+```
+
+```
+sudo robotctl account logout
+```
+
+Ctrl-C while it is waiting costs nothing — the robot keeps polling, and `account status` says
+whether it was approved. The code is good for five minutes; after that, run `login` again.
+
+A robot that is already signed in refuses, and names the account:
+
+```
+sudo robotctl account login --force
+```
+
+The same flag abandons a code that is still waiting for approval — the case where somebody started
+a login and walked away. The old code stops working; approving it after that does nothing.
+
+The token lasts thirty days and the robot renews it on its own. A robot switched off for longer
+than that comes back needing `login` again, which `account status` says in as many words.
 
 ### Identity and power (`configd`)
 

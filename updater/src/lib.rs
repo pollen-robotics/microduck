@@ -29,6 +29,9 @@
 //! - **No hardware capability matrix.** v1 targets one hardware configuration
 //!   (§5.6).
 
+/// Which Hugging Face account this robot belongs to — the credential a remote session needs
+/// before it can exist. `docs/design/remote-access-design.md` §2.
+pub mod account;
 pub mod config;
 pub mod engine;
 pub mod faults;
@@ -38,6 +41,7 @@ pub mod ipc;
 pub mod journal;
 pub mod manifest;
 pub mod orphan;
+pub mod policy;
 pub mod preflight;
 pub mod reconcile;
 /// The IPC contract, re-exported from the [`duck_ipc_proto`] crate. Re-exported under this
@@ -48,6 +52,8 @@ pub mod source;
 mod spawn;
 pub mod store;
 pub mod transcript;
+/// Names to numbers, for the two lookups this crate makes against the user database.
+pub mod unix;
 pub mod verify;
 
 use std::path::PathBuf;
@@ -109,6 +115,32 @@ pub enum Error {
 
     #[error("another update is already in progress")]
     Busy,
+
+    /// A second `account.login` while one is still waiting for approval.
+    ///
+    /// Shares [`code::BUSY`] with the update above — a client should retry or wait either way —
+    /// but not its message: two logins collide during setup, when a console page and a phone are
+    /// both pointed at the same robot, and telling that person an *update* is in progress sends
+    /// them looking in the wrong place. What they need is that a code is already out and where to
+    /// read it.
+    #[error(
+        "a login is already waiting for approval — `account status` has the code, or --force to \
+         start a new one"
+    )]
+    LoginInFlight,
+
+    /// `account.login` on a robot that already belongs to somebody, without `--force`.
+    ///
+    /// A refusal rather than a silent replacement, because this call is routed to BLE and to a
+    /// datachannel: on a LAN, anybody who can reach the robot can start a login, and one that
+    /// quietly rebound the robot would turn "was on the wifi" into remote access that outlives
+    /// being there. The message names the account and the flag, because the legitimate case —
+    /// a robot changing hands — is common enough to deserve the instruction rather than a hunt.
+    #[error(
+        "this robot already belongs to {0}. Sign that account out first, or pass --force to \
+         replace it"
+    )]
+    AlreadySignedIn(String),
 
     #[error("config error: {0}")]
     Config(String),
@@ -221,7 +253,10 @@ impl Error {
             // target is older than what is installed" — and what a person needs is the message.
             // A new code would be an `API_VERSION` bump for a refusal no client branches on.
             Error::StagingBehind { .. } => code::WOULD_DOWNGRADE,
-            Error::Busy => code::BUSY,
+            Error::Busy | Error::LoginInFlight => code::BUSY,
+            // The request is well-formed and refused because of what it did not say, which is
+            // what `INVALID_PARAMS` is: passing `force` is the fix, and it is a parameter.
+            Error::AlreadySignedIn(_) => code::INVALID_PARAMS,
             Error::Network(_) => code::NETWORK,
             // Shares the network code rather than adding one, for the reason `StagingBehind`
             // shares the downgrade code above — with a second reason here. To a client this is

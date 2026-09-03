@@ -54,6 +54,9 @@ impl RobotClient for FakeRobot {
     async fn remote_session_active(&self, _t: Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: Duration) -> bool {
+        true
+    }
 }
 
 struct Harness {
@@ -1141,4 +1144,339 @@ async fn an_allowed_uid_may_mutate() {
         .await;
     assert!(response.error.is_none(), "{:?}", response.error);
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+// ── account.* ────────────────────────────────────────────────────────────────
+//
+// The login is a device-code flow, so the interesting property is not "the call works" but the
+// *shape* it works in: `account.login` answers with a code and hands the waiting to the daemon,
+// and a client that goes away — which is what a phone does when it opens a browser — comes back
+// to `account.status` to find out what happened. These drive that over a real socket against a
+// stand-in for huggingface.co, because every part of it that can be wrong is in the wiring
+// between the three.
+
+/// A stand-in for huggingface.co: a device code, then pending, then a token.
+///
+/// One state machine rather than a fixed script, so a test observes the same sequence a real
+/// login does — including the `authorization_pending` the robot has to keep polling through.
+struct FakeHub {
+    base: String,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeHub {
+    /// `approve_after` is how many `authorization_pending` answers to give before the token.
+    async fn start(approve_after: usize) -> Self {
+        use axum::extract::Form;
+        use axum::routing::{get, post};
+
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&polls);
+
+        let app = axum::Router::new()
+            .route(
+                "/oauth/device",
+                // Hugging Face sends no `verification_uri_complete`, so this does not either —
+                // what falls out of that is part of what these tests cover. It *does* send an
+                // `interval` HF omits, and only to keep the suite quick: the robot sleeps one
+                // interval before its first poll, so the real five seconds would make every
+                // login test five seconds long. That HF's omission falls back to five is pinned
+                // in `account::tests::a_device_code_response_is_normalised`, where it costs
+                // nothing.
+                post(|| async {
+                    axum::Json(serde_json::json!({
+                        "device_code": "device-abc",
+                        "user_code": "A6MY-0314",
+                        "verification_uri": "https://hf.co/oauth/device",
+                        "expires_in": 300,
+                        "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/oauth/token",
+                post(
+                    move |Form(form): Form<std::collections::HashMap<String, String>>| {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            assert_eq!(
+                                form.get("client_id").map(String::as_str),
+                                Some(updater::account::CLIENT_ID),
+                                "the device flow must identify itself as the public client"
+                            );
+                            let n = counter.fetch_add(1, Ordering::SeqCst);
+                            if n < approve_after {
+                                return axum::Json(serde_json::json!({
+                                    "error": "authorization_pending"
+                                }));
+                            }
+                            axum::Json(serde_json::json!({
+                                "access_token": "an-access-token",
+                                "refresh_token": "a-refresh-token",
+                                "expires_in": 2_591_999u64,
+                                "token_type": "bearer"
+                            }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/oauth/userinfo",
+                get(|| async {
+                    axum::Json(serde_json::json!({
+                        "name": "Rouanet",
+                        "preferred_username": "PierreRouanet"
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Self {
+            base,
+            polls,
+            _task: task,
+        }
+    }
+}
+
+/// Serve with the account pointed at a temp file and a fake hub.
+async fn serve_with_account(fx: &Harness, hub: &FakeHub) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    serve_with_account_as(fx, hub, None).await
+}
+
+/// As [`serve_with_account`], with an owning uid the test process is not.
+///
+/// `None` means the ordinary case: the socket's owner is whoever ran the test, so mutating calls
+/// are authorised. `Some(uid)` is how a test asks what an *unlisted* peer sees, which for
+/// `account.*` is the whole point of one call being a read.
+async fn serve_with_account_as(
+    fx: &Harness,
+    hub: &FakeHub,
+    owner_uid: Option<u32>,
+) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    let token_path = fx.root.join("etc/robot/hf-token");
+    std::fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+    let engine = fx.engine(true, Faults::none());
+    let server = match owner_uid {
+        None => Server::new(engine),
+        Some(uid) => Server::with_policy_for_test(engine, uid, Vec::new(), Vec::new()),
+    };
+    let server = Arc::new(server.with_account_for_test(token_path.clone(), hub.base.clone()));
+    let handle = fx.serve_with(server).await;
+    (token_path, handle)
+}
+
+/// The whole flow: a code comes back, the daemon polls, and the token lands on disk.
+///
+/// The three assertions that matter are ordered as a client experiences them — the code arrives
+/// *before* anyone has approved anything, the account appears without the client asking Hugging
+/// Face anything itself, and what is written is a credential that can be renewed.
+#[tokio::test]
+async fn a_device_code_login_completes_without_the_client_waiting() {
+    let fx = Harness::new();
+    let hub = FakeHub::start(2).await;
+    let (token_path, _server) = serve_with_account(&fx, &hub).await;
+
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+
+    // 1. `login` answers immediately, with something to show a person.
+    let response = client
+        .call(method::ACCOUNT_LOGIN, serde_json::json!({}))
+        .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["user_code"], "A6MY-0314");
+    assert_eq!(result["verification_uri"], "https://hf.co/oauth/device");
+    assert_eq!(
+        result["verification_uri_complete"], "https://hf.co/oauth/device",
+        "the plain URI, because Hugging Face sends no complete one and its device page ignores a \
+         `?user_code=` query — so no URL carries the code and a client has to show it"
+    );
+    assert_eq!(
+        result["interval"], 1,
+        "the server's interval, passed through for a client that wants to show a countdown"
+    );
+    assert!(
+        !token_path.exists(),
+        "nothing is stored until somebody approves it"
+    );
+
+    // A second client, because the first one is allowed to have gone away by now — this is the
+    // property the whole shape exists for.
+    let mut watcher = Client::connect(&fx.socket).await;
+    watcher.hello().await;
+
+    // While it is in flight, `status` carries the code so a client that reconnected can show it
+    // again rather than starting a second login.
+    let pending = watcher
+        .call(method::ACCOUNT_STATUS, serde_json::json!({}))
+        .await;
+    let pending = pending.result.unwrap();
+    assert_eq!(pending["login"]["user_code"], "A6MY-0314");
+    assert!(pending["account"].is_null(), "not signed in yet");
+
+    // 2. The daemon is doing the polling. `FakeHub` approves on the third ask and answers with a
+    // one-second interval, so this is the one place the test has to wait for real time — a few
+    // seconds of it. Bounded rather than a bare loop: a login that never lands should fail here
+    // saying so, not hang until whatever is running the suite gives up on it.
+    let mut signed_in = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let status = watcher
+            .call(method::ACCOUNT_STATUS, serde_json::json!({}))
+            .await
+            .result
+            .unwrap();
+        assert!(
+            status["last_error"].is_null(),
+            "the login failed: {status:?}"
+        );
+        if !status["account"].is_null() {
+            signed_in = Some(status);
+            break;
+        }
+    }
+    let signed_in = signed_in.expect("the login never completed");
+
+    assert_eq!(signed_in["account"]["username"], "PierreRouanet");
+    assert!(
+        signed_in["login"].is_null(),
+        "the pending login is cleared once it resolves"
+    );
+    assert_eq!(
+        signed_in["account"]["refreshable"], true,
+        "a refresh token came back, so the robot can renew this itself"
+    );
+    assert!(
+        hub.polls.load(Ordering::SeqCst) >= 3,
+        "the daemon must have polled through the pending answers"
+    );
+
+    // 3. What is on disk is the pair, not just the access token: a 30-day token with no way to
+    // renew it is a robot that silently stops being reachable next month.
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&token_path).unwrap()).unwrap();
+    assert_eq!(stored["access_token"], "an-access-token");
+    assert_eq!(stored["refresh_token"], "a-refresh-token");
+    assert_eq!(stored["username"], "PierreRouanet");
+    assert!(stored["expires_at"].as_i64().unwrap() > 0);
+
+    // And signing out forgets it, naming who it was — which is what lets a robot change hands.
+    let out = client
+        .call(method::ACCOUNT_LOGOUT, serde_json::json!({}))
+        .await
+        .result
+        .unwrap();
+    assert_eq!(out["was"], "PierreRouanet");
+    assert!(!token_path.exists(), "the credential is gone from disk");
+}
+
+/// A robot that already belongs to somebody refuses, by name, and does not start a login.
+///
+/// `INVALID_PARAMS` rather than a generic failure because the fix is a parameter, and a client
+/// should be able to offer "replace it?" without parsing English.
+#[tokio::test]
+async fn a_second_login_needs_force() {
+    let fx = Harness::new();
+    let hub = FakeHub::start(0).await;
+    let (token_path, _server) = serve_with_account(&fx, &hub).await;
+
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+    client
+        .call(method::ACCOUNT_LOGIN, serde_json::json!({}))
+        .await;
+    // Wait for the first login to land, since that is what the second one collides with.
+    for _ in 0..100 {
+        if token_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(token_path.exists(), "the first login did not complete");
+    let polls_after_first = hub.polls.load(Ordering::SeqCst);
+
+    let refused = client
+        .call(method::ACCOUNT_LOGIN, serde_json::json!({}))
+        .await;
+    let error = refused.error.expect("must refuse");
+    assert_eq!(error.code, proto::code::INVALID_PARAMS);
+    assert!(
+        error.message.contains("PierreRouanet") && error.message.contains("--force"),
+        "the refusal must name the account and the way past it: {}",
+        error.message
+    );
+    assert_eq!(
+        hub.polls.load(Ordering::SeqCst),
+        polls_after_first,
+        "the refusal must come before anything reaches Hugging Face — a device code burned to \
+         arrive at the same answer is a code somebody might have been typing"
+    );
+
+    // With `force`, it starts.
+    let forced = client
+        .call(method::ACCOUNT_LOGIN, serde_json::json!({ "force": true }))
+        .await;
+    assert!(forced.error.is_none(), "{:?}", forced.error);
+    assert_eq!(forced.result.unwrap()["user_code"], "A6MY-0314");
+}
+
+/// `account.status` is a read, so it answers without the privilege the other two need.
+///
+/// The gate is `Call::is_mutating`, and this drives it from the outside against a server whose
+/// owning uid the test process is not: `login` and `logout` are refused, and `status` still
+/// answers. Both halves matter — a support engineer has to be able to ask which account a robot
+/// thinks it belongs to, and nobody who merely reached the socket may rebind it.
+#[tokio::test]
+async fn status_is_not_a_privileged_call() {
+    let fx = Harness::new();
+    let hub = FakeHub::start(0).await;
+    // Owner uid set to something the test process is not, and no allowances — the shape
+    // `an_unlisted_peer_cannot_mutate` uses for the update calls.
+    let (token_path, _server) = serve_with_account_as(&fx, &hub, Some(u32::MAX)).await;
+
+    assert!(
+        !proto::Call::AccountStatus.is_mutating(),
+        "account.status must never require change authority"
+    );
+    assert!(
+        proto::Call::AccountLogin(proto::AccountLoginParams { force: false }).is_mutating()
+            && proto::Call::AccountLogout.is_mutating(),
+        "binding a robot to an account, and unbinding it, must both be authorised"
+    );
+
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+
+    for (method, params) in [
+        (method::ACCOUNT_LOGIN, serde_json::json!({})),
+        (method::ACCOUNT_LOGOUT, serde_json::json!({})),
+    ] {
+        let error = client
+            .call(method, params)
+            .await
+            .error
+            .unwrap_or_else(|| panic!("{method} should be denied"));
+        assert_eq!(
+            error.code,
+            proto::code::PERMISSION_DENIED,
+            "{method}: {error:?}"
+        );
+    }
+    assert!(
+        !token_path.exists(),
+        "a denied login must not have reached Hugging Face, let alone stored anything"
+    );
+
+    let status = client
+        .call(method::ACCOUNT_STATUS, serde_json::json!({}))
+        .await;
+    assert!(status.error.is_none(), "{:?}", status.error);
+    assert!(status.result.unwrap()["account"].is_null());
 }

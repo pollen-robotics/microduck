@@ -19,6 +19,11 @@ description = "Gamepad → robot intents"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# Which button runs which skill, from the same `robotd.toml` everything else is configured in —
+# so `robotctl configure` stays the one editor, and a robot's configuration is one file to back
+# up. Pure serde and toml, and read once at startup: this daemon still holds no privileged access
+# and still knows nothing about what a skill *is*, only that a button names one.
+robotd-params = { path = "../robotd-params" }
 clap = { workspace = true, features = ["derive"] }
 gilrs = "0.11"
 # Only to serialise the tap's own lines; the wire types themselves live in duck-ipc-proto.

@@ -41,6 +41,21 @@ target = "1.28.0"
 [workspace.metadata.rknpu]
 runtime = "v2.3.2"
 
+# The official policy set, which `robotd` runs and which lives on the Hugging Face Hub rather
+# than in this repository — a gait retrain should not need a daemon release, and a daemon fix
+# should not re-ship six megabytes of unchanged weights.
+#
+# Same shape as the three pins above and for the same reason: `scripts/seed-policies.sh` runs from
+# inside a release and cannot read this file, so it carries the literals and a test asserts the
+# two agree.
+#
+# `version` is a tag in the Hub repo, and it is a *floor*: it decides what a freshly provisioned
+# board installs, not what every board runs. Moving past it is `robotctl policy update`, which
+# needs no daemon release — bumping this does, since it ships inside one.
+[workspace.metadata.policies]
+repo    = "pollen-robotics/microduck-policies"
+version = "v1"
+
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
 # Rockchip MPP) and `webrtcsink`/`webrtcsrc`, neither of which exists in any Debian suite.

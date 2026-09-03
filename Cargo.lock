@@ -2830,6 +2830,7 @@ dependencies = [
  "evdev",
  "gilrs",
  "libc",
+ "robotd-params",
  "serde",
  "serde_json",
  "tracing",
@@ -3302,6 +3303,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -3391,6 +3393,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "toml 0.9.12+spec-1.1.0",
+ "toml_edit 0.23.10+spec-1.0.0",
  "tracing",
 ]
 
@@ -5117,6 +5120,7 @@ version = "0.10.0"
 dependencies = [
  "clap",
  "minisign",
+ "robotd-params",
  "semver",
  "serde",
  "serde_json",

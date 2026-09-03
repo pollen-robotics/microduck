@@ -337,6 +337,13 @@ absent from customer robots' trusted sets, and gated there by `allow_dev_keys = 
 There are several models — walk, jump, stand, ground-pick — **each versioned
 independently**, and all loaded at once rather than one selected from many.
 
+**The control policies went the other way, and this section is the general rule rather than
+what they do.** They are produced as a family by one training run and the slot→file mapping
+depends on the drive mode, so they ship as a single `policies` component and a per-slot override
+covers the rest — see [`policy-channel-design.md`](policy-channel-design.md) §9. What stays true
+here is the shape: a component is a thing with its own version line, and a robot may have as many
+as it has such things.
+
 That is exactly what a *component* is: a thing with its own version line. So each
 model is its own entry in `updater.toml`, and no special store layout is needed:
 

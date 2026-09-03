@@ -36,7 +36,7 @@ const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use duck_control::obs::{BodyPose, Command};
 
 /// A value and when it arrived.
@@ -73,27 +73,45 @@ impl Default for PoseIntent {
 /// single last-writer slot would lose.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkillRequests {
+    /// Phase-scripted, and still its own thing until the descriptor grows a command generator.
     pub ground_pick: bool,
-    pub kick_left: bool,
-    pub kick_right: bool,
+    /// Latched, and driven internally by the shutdown sit and the seated-boot rise as well as
+    /// by a button, which is why it is not one of the configurable one-shots either.
     pub sit_toggle: bool,
-    /// Start a roll — or, arriving while one runs, chain another. Clients hold a button
-    /// down by sending this every tick, so unlike the others it is a *level* in practice.
-    pub roulade: bool,
+    /// The configurable one-shots, as a mask over the resolved skill list.
+    ///
+    /// A mask and not a queue for the same reason the whole set was one before: two buttons in
+    /// one tick should both arrive, and the priority order decides which wins. A chaining skill
+    /// is a *level* in practice — a client holds the button by re-sending every tick.
+    pub skills: u32,
 }
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
+        self.ground_pick || self.sit_toggle || self.skills != 0
+    }
+
+    /// The indices requested, lowest first — which is priority order, since the skill list is
+    /// ordered by config.
+    pub fn requested(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..MAX_SKILLS).filter(move |i| self.skills & (1 << i) != 0)
     }
 }
 
-// Bit positions for the skill-request mask.
+// Bit positions for the two skills that are not in the configurable list.
 const SKILL_GROUND_PICK: u32 = 1 << 0;
-const SKILL_KICK_LEFT: u32 = 1 << 1;
-const SKILL_KICK_RIGHT: u32 = 1 << 2;
-const SKILL_SIT_TOGGLE: u32 = 1 << 3;
-const SKILL_ROULADE: u32 = 1 << 4;
+const SKILL_SIT_TOGGLE: u32 = 1 << 1;
+
+/// How many configurable one-shots a robot may have, bounded by the mask being a `u32`.
+///
+/// Not a number anybody should reach: every skill's network is loaded and warmed at startup, so
+/// thirty of them is thirty ONNX sessions and thirty warm-up inferences before the first tick.
+/// The ceiling is here so that exceeding it is a refusal with a reason rather than a silently
+/// ignored button.
+pub const MAX_SKILLS: usize = 30;
+
+/// Bits the two non-configurable skills occupy at the bottom of the mask.
+const SKILL_BITS: usize = 2;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -163,11 +181,46 @@ pub struct Intents {
     /// request wins — two arriving in the same tick means somebody pressed twice, and the second
     /// answer is the one they are waiting for.
     mode_switch: AtomicU8,
+    /// A pending policy change, or `None` — which is nearly always.
+    ///
+    /// An `ArcSwapOption` rather than the `AtomicU8` `mode_switch` uses, because the request
+    /// carries a path and a mode code does not. Same last-writer-wins semantics for the same
+    /// reason: two loads in one tick means somebody changed their mind, and the second is the
+    /// answer they are waiting for.
+    ///
+    /// Unlike `mode_switch` this does name a domain type, [`crate::params::Slot`]. The mode code
+    /// exists because `Mode` lives in `main.rs` and this module should not reach into it; `Slot`
+    /// lives in the shared params crate that owns the config keys it names, and encoding one as
+    /// a number here would only move the parse somewhere with less to check it against.
+    policy_change: ArcSwapOption<PolicyChange>,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
     /// and the loop reads value + age so a dead client's ride decays instead of looping.
     wheee: ArcSwap<Stamped<bool>>,
+}
+
+/// A pending policy change, as [`Intents::request_policy_change`] took it.
+///
+/// An enum and not the wire type's pair of `Option`s, because there are three things to say and
+/// two `Option`s can only say four — one of which is meaningless and one of which was, briefly,
+/// wrong. [`Self::Reload`] and [`Self::ResetAll`] both name no slot and no path, and conflating
+/// them wiped every override on a board whenever a newer policy set was installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyChange {
+    /// Put one slot on a file, or — with `path: None` — back to its default.
+    Slot {
+        slot: crate::params::Slot,
+        path: Option<std::path::PathBuf>,
+    },
+    /// Every slot back to its default. `robotctl policy reset`.
+    ResetAll,
+    /// Re-resolve and rebuild, changing no configuration at all.
+    ///
+    /// For when the *files* moved and the paths did not: installing a policy set swaps
+    /// `current` underneath every slot, so the config is already right and only the loaded
+    /// sessions are stale.
+    Reload,
 }
 
 /// What a client asked for, once.
@@ -227,6 +280,7 @@ impl Intents {
             skills: std::sync::atomic::AtomicU32::new(0),
             shutdown: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
+            policy_change: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
@@ -267,17 +321,27 @@ impl Intents {
             .store(open.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Queue a one-shot skill for the loop's next tick.
-    pub fn request_skill(&self, skill: duck_ipc_proto::Skill) {
-        let bit = match skill {
-            duck_ipc_proto::Skill::GroundPick => SKILL_GROUND_PICK,
-            duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
-            duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
-            duck_ipc_proto::Skill::SitToggle => SKILL_SIT_TOGGLE,
-            duck_ipc_proto::Skill::Roulade => SKILL_ROULADE,
-        };
+    /// Queue the ground pick, which is not one of the configurable one-shots.
+    pub fn request_ground_pick(&self) {
         self.skills
-            .fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+            .fetch_or(SKILL_GROUND_PICK, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue the sit toggle, likewise.
+    pub fn request_sit_toggle(&self) {
+        self.skills
+            .fetch_or(SKILL_SIT_TOGGLE, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queue a configurable one-shot by its index in the resolved skill list.
+    pub fn request_skill(&self, index: usize) {
+        if index >= MAX_SKILLS {
+            return;
+        }
+        self.skills.fetch_or(
+            1 << (index + SKILL_BITS),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Take the pending skill requests, leaving none. Once per tick, like the power request.
@@ -285,10 +349,8 @@ impl Intents {
         let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
         SkillRequests {
             ground_pick: bits & SKILL_GROUND_PICK != 0,
-            kick_left: bits & SKILL_KICK_LEFT != 0,
-            kick_right: bits & SKILL_KICK_RIGHT != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
-            roulade: bits & SKILL_ROULADE != 0,
+            skills: bits >> SKILL_BITS,
         }
     }
 
@@ -355,6 +417,24 @@ impl Intents {
             MODE_NONE => None,
             code => Some(code),
         }
+    }
+
+    /// Ask for a policy change: one slot to a file, one slot back to its default, or all of
+    /// them back to theirs.
+    ///
+    /// The caller has already validated the file — see `duck_control::policy::validate` — so
+    /// reaching here means the load is expected to succeed. It can still fail at the home pose
+    /// seconds later, which is why the loop keeps the controller it has until the new one is
+    /// built.
+    pub fn request_policy_change(&self, change: PolicyChange) {
+        self.policy_change.store(Some(Arc::new(change)));
+    }
+
+    /// Take a pending policy change. Taken, so the sequence runs once per request.
+    pub fn take_policy_change(&self) -> Option<PolicyChange> {
+        self.policy_change
+            .swap(None)
+            .map(|change| PolicyChange::clone(&change))
     }
 
     /// Ask for the sit-then-power-off sequence.

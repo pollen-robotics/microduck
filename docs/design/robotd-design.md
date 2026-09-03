@@ -66,7 +66,7 @@ deliberately:
 
 ```text
    ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
-   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │  padd    │──(notifications, ≤50 Hz)──────►│                     │
    │ gamepad  │   robot.stop / robot.enable    │                     │
    └──────────┘───(requests, answered)────────►│                     │
                                                │   /run/robotd.sock  │
@@ -393,6 +393,11 @@ until the next walk; here scale and gain are recomputed from the active state ev
 Policy files come from paths in the params file, defaulting into the release directory — so a
 normal update carries the policy trained against the binary, and a dev points a path at their
 own `.onnx` and iterates without cutting a release.
+
+*Which* file fills a slot — the release's copy, a component from the Hub, or something a dev
+dropped on the board — is [`policy-channel-design.md`](policy-channel-design.md)'s, along with
+the commands that change it and what happens when a load fails. This section owns what a policy
+is and how it is validated and run, and stops there.
 
 Everything is validated at **load**, not at inference: observation width, action count, and
 whether ONNX Runtime is present at all. Every net must be 61-input, 14-output, checked at load

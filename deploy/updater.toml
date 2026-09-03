@@ -59,6 +59,15 @@ auto_apply = "mandatory"
 # narrow the claim is: "btd may relay an update request from the app", not "anything in the
 # robot group may replace the firmware".
 #
+# `mediad` is listed for the mutating calls its route table permits: `account.login` and
+# `account.logout` — a console page is where somebody signs a robot in — and `policy.install` and
+# `policy.fetch`, which were routed to WebRTC without this line and therefore answered
+# PERMISSION_DENIED, so the console could offer a Hub browser whose install button could not work. The claim is exactly as narrow, and it is held narrow by
+# a test rather than by this comment: `mediad::route`'s
+# `only_these_mutating_calls_are_reachable_over_webrtc` names every mutating method that
+# transport may carry, so routing a new one has to change that list deliberately. Nothing here
+# grants `mediad` the update path — `update.apply` is refused on that side.
+#
 # By NAME, not by uid: systemd-sysusers allocates dynamically, so a number written here would
 # be right on one board and wrong on the next. `allow_uids`/`allow_gids` still exist for a
 # bench override, and a test asserts the shipped config uses neither.
@@ -67,7 +76,7 @@ auto_apply = "mandatory"
 # a process as far as *talking* to updaterd; granting it change authority too would collapse
 # the two layers into one, and anything that could read status could replace the firmware.
 # There is a test for that as well.
-allow_users = ["btd"]
+allow_users = ["btd", "mediad"]
 
 
 # ── daemon ────────────────────────────────────────────────────────────────────

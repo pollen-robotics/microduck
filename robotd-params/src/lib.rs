@@ -16,15 +16,36 @@
 //! test that walks [`Params`]'s own serialization, so a new section cannot be added without
 //! the registry (and therefore the editor) learning about it.
 
+pub mod edit;
 pub mod registry;
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Where a release is mounted. Policy paths default under here, so an ordinary update
-/// carries the policy with the binaries that were trained against it.
+/// Where a release is mounted.
 pub const RELEASE_DIR: &str = "/opt/robot/daemon/current";
+
+/// Where the official policy set lives — **outside the release directory**, on purpose.
+///
+/// A gait retrain should not need a daemon release, and a daemon fix should not re-download six
+/// megabytes of unchanged weights. So the two version independently, and the daemon reads its
+/// policies from one place regardless of what put them there.
+///
+/// Today what puts them there is the daemon's own postinstall hook, which seeds this directory
+/// from the copies the release still carries. That is a bootstrap, not the destination: it stops
+/// the moment anything installs a real set here and repoints `current`, and `current` being a
+/// symlink beside a `releases/` directory is exactly the shape the updater already swaps
+/// atomically. See `docs/design/policy-channel-design.md` §9.
+pub const POLICY_DIR: &str = "/opt/robot/policies/current";
+
+/// Where policies fetched from the Hub one at a time live — `robotctl policy load <slot> <repo>`.
+///
+/// Outside every release directory, per `updater-design.md` §5.7: a policy somebody chose has to
+/// survive an update and a rollback. The layout mirrors the repo — `<org>/<name>/<revision>/` —
+/// which is what makes the path in `robotd.toml` say where a policy came from without anything
+/// having to look it up. `updater::policy::LIBRARY_ROOT` is the same string on the writing side.
+pub const POLICY_LIBRARY: &str = "/var/lib/robot/policies";
 
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
@@ -42,6 +63,88 @@ pub struct Params {
     pub chorale: ChoraleParams,
     pub media: MediaParams,
     pub detect: DetectParams,
+    /// Which pad button runs which skill. `padd` reads this, not `robotd`.
+    pub pad: PadParams,
+}
+
+/// Which pad button runs which skill.
+///
+/// **The five one-shot buttons, and only those.** `Start` toggles the policy, `Y` and `B` switch
+/// what the sticks mean, held `Select` powers the robot off and held `D-pad up` changes drive
+/// mode — none of those is a `robot.do`, and turning them into a general button-to-action
+/// vocabulary is a larger thing than binding a skill needs. It would also put "the button that
+/// stops the robot" behind a config key, which is the one binding worth not being able to lose.
+///
+/// Empty means the mapping the prototype had and muscle memory expects. A named button is
+/// rebound; the rest stay as they were. The pad is full — every face button already does
+/// something — so binding a new skill nearly always means taking a button from an old one, which
+/// is why every one of the five is nameable rather than only the free ones.
+///
+/// A name here is not checked against anything at parse time: which skills exist is a property of
+/// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
+/// with the list it does know, which is a better error than a config file could give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadParams {
+    /// A (South). The ground pick, by default.
+    pub a: String,
+    /// B (East) is body-pose mode and is not bindable; X (West) is the roulade.
+    pub x: String,
+    /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
+    pub lb: String,
+    /// The right bumper, likewise.
+    pub rb: String,
+    /// D-pad down. The sit toggle, by default.
+    pub dpad_down: String,
+}
+
+impl Default for PadParams {
+    fn default() -> Self {
+        Self {
+            a: "ground_pick".to_owned(),
+            x: "roulade".to_owned(),
+            lb: "kick_left".to_owned(),
+            rb: "kick_right".to_owned(),
+            dpad_down: "sit_toggle".to_owned(),
+        }
+    }
+}
+
+impl PadParams {
+    /// The bindable buttons, in the order a listing should print them.
+    pub const BUTTONS: [&'static str; 5] = ["a", "x", "lb", "rb", "dpad_down"];
+
+    /// What a button runs, or `None` for a name this build has no button for.
+    pub fn skill(&self, button: &str) -> Option<&str> {
+        Some(match button {
+            "a" => &self.a,
+            "x" => &self.x,
+            "lb" => &self.lb,
+            "rb" => &self.rb,
+            "dpad_down" => &self.dpad_down,
+            _ => return None,
+        })
+    }
+
+    /// Bind a button to a skill. `false` for a button this build does not have.
+    pub fn bind(&mut self, button: &str, skill: &str) -> bool {
+        let slot = match button {
+            "a" => &mut self.a,
+            "x" => &mut self.x,
+            "lb" => &mut self.lb,
+            "rb" => &mut self.rb,
+            "dpad_down" => &mut self.dpad_down,
+            _ => return false,
+        };
+        *slot = skill.to_owned();
+        true
+    }
+
+    /// Every button name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Self::BUTTONS.join(", ")
+    }
 }
 
 /// The one video mode a robot streams in, as a name rather than four numbers.
@@ -540,22 +643,24 @@ pub struct PolicyParams {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
-    /// One ground-pick cycle, seconds. The move ends at 70% of the cycle, as the prototype
-    /// does. Absent resolves per mode: 4.0 walking, 3.0 roller (the crouch).
+    /// One ground-pick cycle, seconds. The move ends at the set's `end_phase` (70% of the
+    /// cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
+    /// entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
     pub ground_pick_period: Option<f64>,
-    /// Action scale while the ground pick runs. Absent: 1.0 walking, 0.8 roller.
+    /// Action scale while the ground pick runs. Absent: the set's entry, else 1.0 walking,
+    /// 0.8 roller.
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
-    /// How long a kick window stays on the kick network, seconds.
-    pub kick_duration: f64,
-    /// One roulade — one forward roll, seconds. Holding the button chains rolls; this is
-    /// the length of each. The prototype's measured single-roll time.
-    pub roulade_duration: f64,
-    /// Action scale while a roulade runs.
-    pub roulade_action_scale: f64,
-    /// Gain multiplier while a roulade runs.
-    pub roulade_gain_ratio: f64,
+    /// The one-shot skills this robot has, in priority order.
+    ///
+    /// Empty means the built-in three — kicks and roulade, with the numbers they have always
+    /// had — so a board that updates onto this keeps working with nothing written. An entry
+    /// merges by name: naming `roulade` changes that one, naming anything else adds a skill.
+    /// The file stays a list of decisions rather than a copy of the defaults, which is what
+    /// `robotctl configure` promises about every other key here.
+    #[serde(default, rename = "skill", skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillDef>,
     /// Scale actions with battery voltage: effective scale × (nominal / measured). The
     /// servos' effective kP tracks their supply, so this holds the robot's response steady
     /// as the pack sags. Off by default, as in the prototype.
@@ -565,8 +670,530 @@ pub struct PolicyParams {
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
-fn is_none_sentinel(path: &std::path::Path) -> bool {
+///
+/// Public because three places need to agree on it: this crate resolving config, `robotctl`
+/// accepting `policy load <slot> none`, and `robotd` recognising it on the wire. A second spelling
+/// of it somewhere would be a slot that looks disabled in a file and is not.
+pub fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
+}
+
+/// A one-shot skill: a network, how long it drives, and what it changes while it does.
+///
+/// **The thing this replaces was three hardcoded arms that differed in four numbers.** Kicks and
+/// roulade wrote the same all-zero command into the same kind of window; they differed in
+/// duration, action scale, gain ratio, and whether holding the button chained another. A
+/// community policy like `polite-bow` — zero command, four seconds, selecting it is the trigger —
+/// is a fifth set of the same four numbers, and could not be added without a daemon release.
+///
+/// Deliberately *only* the zero-command family. `walk` and `stand` are the fallback pair chosen
+/// by command magnitude, `sitstand` is latched and driven internally by the shutdown sit and the
+/// seated-boot rise, and `ground_pick` writes a scripted phase rather than a constant. Those stay
+/// where they are until something needs them not to; see `docs/ideas/policy-moves.md`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillDef {
+    /// What a client asks for — `robot.do {skill: "roulade"}` — and what a pad button binds to.
+    pub name: String,
+
+    /// The `.onnx`. Absent means this robot's own copy, by convention `<name>.onnx` in the
+    /// policy directory, so a built-in needs no path and a fetched one carries the path
+    /// `robotctl policy load` wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+
+    /// Seconds the network drives before handing back to walk or stand — or, when `unwind_s`
+    /// is set, before it starts coming back.
+    pub duration: f64,
+
+    /// The twist this skill's network is fed while it runs.
+    ///
+    /// Zeros for most of them, which is what a policy trained with `zero_command_padding`
+    /// expects and what made kicks, roulade and `polite-bow` the same arm. A non-zero constant
+    /// is how a policy with its own command encoding becomes a one-shot: the published flamingo
+    /// reads `[flag, side, 0]`, so `[1, 1, 0]` is "lift the left leg".
+    ///
+    /// Head and body stay zeroed either way. Every one-shot published so far declares them
+    /// unused, and a skill that wanted them live would be a different shape than this.
+    #[serde(default)]
+    pub command: [f64; 3],
+
+    /// The twist fed for `unwind_s` after the window, before handing back.
+    ///
+    /// **This is what lets a policy with no ending of its own be a one-shot.** An episodic
+    /// policy returns itself to a safe pose — `polite-bow` is standing again after its four
+    /// seconds — so handing straight back to walk is fine. A perpetual one does not: it holds
+    /// until told otherwise, and handing back mid-hold gives walk a robot balanced on one foot.
+    /// Driving the idle command for a moment first is the daemon supplying the ending the policy
+    /// does not have, which is exactly what the sit toggle already does on its way up.
+    #[serde(default)]
+    pub unwind: [f64; 3],
+
+    /// Seconds spent on `unwind` before handing back. Zero — the default — means the policy ends
+    /// itself and the window simply expires.
+    #[serde(default)]
+    pub unwind_s: f64,
+
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot. Roulade does; a kick does not.
+    #[serde(default)]
+    pub chain: bool,
+
+    /// What this skill changes about the robot while it runs, and only while it runs.
+    #[serde(default)]
+    pub params: SkillOverrides,
+}
+
+/// Parameters a skill changes for its duration, restored when it ends.
+///
+/// **Raw parameter names, not a vocabulary of our own.** `cmd_alpha` rather than an invented
+/// `smoothing = "off"`: one set of names for a person to learn, and `robotctl configure` already
+/// documents every one of them.
+///
+/// **No fall-gate override here either, and for a sharper reason: a running skill already has
+/// the fall reflex switched off.** The limp-fall predictor is only consulted while the
+/// controller is not `busy()`, and any active skill makes it busy — so a move that leans past
+/// the gate cannot trip it, and a field to raise the gate would have been decoration. What that
+/// *does* mean is that the reflex is off for the whole of a skill, which was uncontroversial for
+/// a half-second kick and is worth a second look for anything long.
+///
+/// **No `cmd_alpha` here, and its absence is the point.** Smoothing is applied to the *client's*
+/// command on its way in, and a skill never reads that: the loop builds a fresh command block
+/// from `command` or `unwind` and feeds it straight to the network. So a skill's twist is
+/// unsmoothed by construction — which is exactly what a policy reading a flag rather than a
+/// velocity needs, and the reason driving one through `robot.move` into the walk slot needed
+/// `cmd_alpha = 1.0` set globally and remembered afterwards.
+///
+/// **A named set rather than "any key".** A skill that could widen a joint limit or lengthen the
+/// deadman would be reaching past the layer that makes a stranger's policy safe to try at all —
+/// which is the entire argument for allowing one on the robot. Everything here is tuning or a
+/// threshold that a *move* legitimately owns for its own duration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillOverrides {
+    /// Scales raw policy output into a joint offset, as `[policy] action_scale` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+
+    /// Multiplier on the running gain, so a move can be softer or stiffer than the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+}
+
+impl SkillDef {
+    /// The file this skill runs, resolved the way every other policy path resolves.
+    pub fn resolved_path(&self) -> Option<PathBuf> {
+        match &self.path {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(POLICY_DIR).join(format!("{}.onnx", self.name))),
+        }
+    }
+}
+
+/// What the official policy set says about itself, installed beside the `.onnx` files.
+///
+/// The set is fetched from the Hub and versioned there, so what it contains — and how long each
+/// one-shot runs — is a property of the set rather than of this build. Without this, adding a
+/// tenth policy to the set meant a daemon release: one edit to the seeder's download list so it
+/// arrives, and another here so it is a skill. That is the same coupling this whole exercise
+/// removed for a stranger's policy, still in place for our own.
+///
+/// Absent is normal and not an error: a board seeded before the set carried one, or one where
+/// the fetch has not happened yet. The three built-ins below are the fallback.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetManifest {
+    pub policies: Vec<SetPolicy>,
+}
+
+/// One policy in the official set.
+///
+/// **The same field names a single-policy repo uses**, plus `file` to say which `.onnx` it
+/// describes. That is deliberate: the community convention is one repo per policy with a flat
+/// manifest, and the official set is nine policies in one repo. Sharing the vocabulary means
+/// asking a publisher to *add fields*, not to adopt a second format, and it means one reader
+/// understands both.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetPolicy {
+    /// The `.onnx`, as it is named in the repo and on disk. The only field a standalone manifest
+    /// has no use for, since a repo with one policy has nothing to disambiguate.
+    pub file: String,
+    /// What a client asks for, when this is a one-shot. Absent means the file's stem, so
+    /// `roulade.onnx` needs no name while `ball_kick_left.onnx` says `kick_left` — the names are
+    /// roles and the files are training runs, an indirection worth keeping.
+    pub name: Option<String>,
+    /// `"episodic"`, `"perpetual"` or `"scripted"`, and the difference is who supplies the
+    /// ending.
+    ///
+    /// An episodic policy runs for `duration_s` and returns itself to a safe pose. On a constant
+    /// command it is a skill on its own; on a phase command (`command.encoding = "phase"`) it is
+    /// the ground pick — the daemon writes the phase, and the numbers here are how fast. A
+    /// perpetual one has no length of its own — how long to hold a foot up is a person's choice,
+    /// so it takes a config entry rather than appearing. A scripted one is episodic but
+    /// interruptible: the daemon drives it through a command it can change mid-flight, which is
+    /// what the sit↔stand posture flag is.
+    pub kind: Option<String>,
+    /// Seconds it runs, for a policy that ends itself. For a phase policy this is
+    /// `period_s × end_phase`, recorded so a reader need not multiply.
+    pub duration_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes — how a
+    /// client maps "the button is held" onto a one-shot.
+    pub chain: bool,
+    /// Scales raw output into a joint offset, when this policy wants its own.
+    pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command — or, for the sit↔stand,
+    /// how long the rise on posture flag 0 gets before the gait takes over.
+    pub unwind_s: Option<f64>,
+    /// Seconds the network takes to reach its commanded posture after the flag flips. The
+    /// sit↔stand is trained on a 2 s slewed target, so the seat is a ~2 s glide; the shutdown sit
+    /// waits twice that before cutting torque.
+    pub ramp_s: Option<f64>,
+    /// Which drive mode this policy belongs to. Absent means walking. The roller crouch is the
+    /// ground pick of `"roller"` mode, and the two must not be confused with each other.
+    pub mode: Option<Mode>,
+    /// The command block: how the daemon is meant to drive this network.
+    pub command: Option<SetCommand>,
+}
+
+/// The machine-readable half of a manifest's command block.
+///
+/// Three encodings exist in the set, and `encoding` names which one this is:
+///
+/// - absent or `"constant"`: the skill family — a fixed twist for the window, `idle` on the way
+///   back. Every kick, the roulade, and every community one-shot so far.
+/// - `"phase"`: `[cos 2πφ, sin 2πφ, 0]` with φ advancing from 0 over `period_s` seconds and the
+///   move handing back at `end_phase`. The ground pick, and the roller crouch.
+/// - `"posture_flag"`: one slot carries `sit` or `stand`. The sit↔stand.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SetCommand {
+    pub encoding: Option<String>,
+    /// The twist that means "stop doing the thing".
+    pub idle: Option<[f64; 3]>,
+    /// Phase encoding: seconds per full cycle.
+    pub period_s: Option<f64>,
+    /// Phase encoding: the fraction of the cycle at which the move hands back. The pick's rise
+    /// is over well before 1.0, and running to 1.0 replays the reach on the way out.
+    pub end_phase: Option<f64>,
+    /// Posture flag: the value that means "sit".
+    pub sit: Option<f64>,
+    /// Posture flag: the value that means "stand".
+    pub stand: Option<f64>,
+}
+
+/// The ground pick's cycle: what a phase-encoded set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhaseTiming {
+    /// Seconds per full cycle.
+    pub period_s: f64,
+    /// Fraction of the cycle at which the move hands back.
+    pub end_phase: f64,
+    /// Action scale while it runs, if the entry says.
+    pub action_scale: Option<f64>,
+}
+
+/// The sit↔stand's timing: what the scripted set entry declares.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SitStandTiming {
+    /// Seconds the rise runs on the sitstand network before the gait takes over.
+    pub rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub ramp_s: f64,
+}
+
+impl SetPolicy {
+    pub fn skill_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| {
+            std::path::Path::new(&self.file)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.file.clone())
+        })
+    }
+
+    pub fn is_episodic(&self) -> bool {
+        self.kind.as_deref() == Some("episodic")
+    }
+
+    pub fn is_scripted(&self) -> bool {
+        self.kind.as_deref() == Some("scripted")
+    }
+
+    fn encoding(&self) -> Option<&str> {
+        self.command.as_ref().and_then(|c| c.encoding.as_deref())
+    }
+
+    /// The daemon writes this policy's command as a phase. A `period_s` with no `encoding` is
+    /// taken the same way — the field has no other meaning.
+    pub fn is_phase(&self) -> bool {
+        self.encoding() == Some("phase")
+            || self.command.as_ref().is_some_and(|c| c.period_s.is_some())
+    }
+
+    /// The daemon writes this policy's command as a posture flag.
+    pub fn is_posture_flag(&self) -> bool {
+        self.encoding() == Some("posture_flag")
+    }
+
+    /// The mode this policy belongs to; absent means walking.
+    pub fn mode(&self) -> Mode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// **An episodic policy on a constant command**: what becomes a skill on its own.
+    ///
+    /// A phase-encoded one does not — it is the ground pick, whose command the daemon generates,
+    /// and loading it as a generic one-shot would feed it all-zeros: a robot moving plausibly and
+    /// wrongly, which `duck_control::obs`'s header calls the hardest failure to see.
+    pub fn is_zero_command_skill(&self) -> bool {
+        self.is_episodic() && !self.is_phase() && !self.is_posture_flag()
+    }
+
+    /// The phase timing, for an episodic policy the daemon drives through a phase.
+    pub fn phase_timing(&self) -> Option<PhaseTiming> {
+        if !self.is_episodic() || !self.is_phase() {
+            return None;
+        }
+        let command = self.command.as_ref()?;
+        Some(PhaseTiming {
+            period_s: command.period_s?,
+            end_phase: command.end_phase.unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            action_scale: self.action_scale,
+        })
+    }
+
+    /// The sit↔stand timing, for the scripted posture-flag policy.
+    pub fn sitstand_timing(&self) -> Option<SitStandTiming> {
+        if !self.is_scripted() || !self.is_posture_flag() {
+            return None;
+        }
+        Some(SitStandTiming {
+            rise_s: self.unwind_s.unwrap_or(DEFAULT_SITSTAND_RISE_S),
+            ramp_s: self.ramp_s.unwrap_or(DEFAULT_SITSTAND_RAMP_S),
+        })
+    }
+}
+
+impl SetManifest {
+    /// The ground pick of one mode, if the set declares it: the phase-encoded episodic entry
+    /// tagged with that mode (walking when untagged). The first one wins, and a set that lists
+    /// two for the same mode has made a mistake this cannot see.
+    pub fn ground_pick(&self, mode: Mode) -> Option<PhaseTiming> {
+        self.policies
+            .iter()
+            .filter(|p| p.mode() == mode)
+            .find_map(|p| p.phase_timing())
+    }
+
+    /// The sit↔stand's timing, if the set declares it. The sitstand is mode-independent — both
+    /// presets load the same network — so the first scripted posture-flag entry is it.
+    pub fn sitstand(&self) -> Option<SitStandTiming> {
+        self.policies.iter().find_map(|p| p.sitstand_timing())
+    }
+
+    /// The entries that are skills on their own: episodic, constant-command, and not named as
+    /// something the daemon drives itself.
+    ///
+    /// **A set cannot claim a name the daemon drives itself.** The ground pick and the sit toggle
+    /// live in their own arm of the cascade, and a second entry answering to the same name would
+    /// shadow one with a network fed an all-zero command it was never trained on. The manifest
+    /// lives on the Hub and cannot be checked from here, so the guard belongs on the board.
+    ///
+    /// It guards the *name* and the *encoding*, not the file. A set that marks
+    /// `alpha_ground_pick.onnx` episodic with neither a name nor a phase command still produces a
+    /// skill — called `alpha_ground_pick`, running a phase-scripted network on zeros. That is a
+    /// publisher's mistake rather than a trap: it shadows nothing, it is plainly visible in
+    /// `robotctl policy list`, and nothing invokes it unless somebody asks for it by that name.
+    /// Catching it would mean a hardcoded list of our own filenames, which is the coupling this
+    /// whole manifest exists to remove.
+    pub fn skills(&self) -> impl Iterator<Item = &SetPolicy> {
+        self.policies
+            .iter()
+            .filter(|p| p.is_zero_command_skill())
+            .filter(|p| !DAEMON_OWNED_SKILLS.contains(&p.skill_name().as_str()))
+    }
+}
+
+/// Skill names the daemon implements itself, which nothing else may take over.
+///
+/// Public because there are three ways to add a skill — a set's manifest, `robotctl policy add`
+/// and `robot.setSkill` — and a list only one of them checks is a guard for one of them. Each
+/// has its own arm of the control cascade, so a table entry answering to either name is
+/// unreachable: `robot.do` matches the built-in first, and the entry sits in the list being
+/// offered and never run.
+pub const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+
+/// The ground pick hands back at this fraction of its cycle when the set does not say — the
+/// prototype's cutoff. Ending at 100% replays the reach on the way out.
+pub const DEFAULT_GROUND_PICK_END_PHASE: f64 = 0.7;
+/// How long the sitstand network rises (posture flag 0) before the gait takes over, when the
+/// set does not say. 1 s is enough on the robot — velstand owns the tail of the rise fine.
+pub const DEFAULT_SITSTAND_RISE_S: f64 = 1.0;
+/// How long the seat takes after the flag flips, when the set does not say: the ~2 s glide the
+/// sit↔stand is trained on (`POSTURE_RAMP_S`).
+pub const DEFAULT_SITSTAND_RAMP_S: f64 = 2.0;
+
+/// Read the installed set's manifest, if it has one.
+pub fn set_manifest() -> Option<SetManifest> {
+    let text = std::fs::read_to_string(PathBuf::from(POLICY_DIR).join("manifest.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The skills a robot has when its config says nothing.
+///
+/// From the installed set where it says, and from the three below where it does not.
+///
+/// A board whose set predates the manifest keeps its kicks and its roulade with no config
+/// written and no migration run, which is the whole reason absence resolves to something rather
+/// than nothing. This goes when every tagged set carries one.
+fn builtin_skills(manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+    // What the set itself declares. A policy is a skill only if it says it is episodic, drives on
+    // a constant command, and how long it runs — a gait is not something to ask for by name, a
+    // perpetual one needs a hold length that only a person can choose, and a phase-encoded one
+    // is the ground pick.
+    if let Some(manifest) = manifest {
+        let from_set: Vec<SkillDef> = manifest
+            .skills()
+            .filter_map(|p| {
+                Some(SkillDef {
+                    name: p.skill_name(),
+                    path: Some(PathBuf::from(POLICY_DIR).join(&p.file)),
+                    duration: p.duration_s?,
+                    chain: p.chain,
+                    unwind: p.command.as_ref().and_then(|c| c.idle).unwrap_or_default(),
+                    unwind_s: p.unwind_s.unwrap_or(0.0),
+                    params: SkillOverrides {
+                        action_scale: p.action_scale,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            })
+            .collect();
+        if !from_set.is_empty() {
+            return from_set;
+        }
+    }
+
+    fallback_skills()
+}
+
+/// The three skills every robot has had since the prototype, for a board whose set says nothing
+/// about itself — and the timing a skill slot borrows when it names one the set left out.
+fn fallback_skills() -> Vec<SkillDef> {
+    let kick = |name: &str, file: &str| SkillDef {
+        name: name.to_owned(),
+        // The kick files are `ball_kick_*.onnx`, which is not `<name>.onnx` — the names are the
+        // roles and the files are the training runs. The set's manifest keeps that indirection
+        // in its own `name` field; this is the same thing for a set that predates it.
+        path: Some(PathBuf::from(POLICY_DIR).join(file)),
+        duration: 0.5,
+        chain: false,
+        command: [0.0; 3],
+        unwind: [0.0; 3],
+        unwind_s: 0.0,
+        params: SkillOverrides::default(),
+    };
+    vec![
+        // Order is priority, replacing the hardcoded `roulade > kick` precedence.
+        SkillDef {
+            name: "roulade".to_owned(),
+            path: None,
+            duration: 1.0,
+            // Holding the button chains rolls, which is how the prototype maps a held trigger
+            // onto a one-shot.
+            chain: true,
+            command: [0.0; 3],
+            unwind: [0.0; 3],
+            unwind_s: 0.0,
+            params: SkillOverrides::default(),
+        },
+        kick("kick_left", "ball_kick_left.onnx"),
+        kick("kick_right", "ball_kick_right.onnx"),
+    ]
+}
+
+fn fallback_skill(name: &str) -> Option<SkillDef> {
+    fallback_skills().into_iter().find(|s| s.name == name)
+}
+
+/// One policy slot, named — the seven `[policy]` path keys as a value rather than a field name.
+///
+/// It exists because three places now need to turn the string `"ground_pick"` into *that
+/// particular key*: `robot.loadPolicy` on the wire, the `toml_edit` write `robotctl policy load`
+/// performs, and the per-slot report `robot.policies` answers with. Spelling the mapping out in
+/// each of them is how one of them ends up writing `policy.groundpick` to a file nobody reads
+/// back until the robot will not walk.
+///
+/// [`Slot::as_str`] is the serde key, not a display name, and
+/// [`tests::every_slot_is_a_registry_key`] is what keeps that true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Walk,
+    Stand,
+    SitStand,
+    GroundPick,
+    KickLeft,
+    KickRight,
+    Roulade,
+}
+
+impl Slot {
+    /// Every slot, in the order `[policy]` lists them and the order a report should print them.
+    pub const ALL: [Slot; 7] = [
+        Slot::Walk,
+        Slot::Stand,
+        Slot::SitStand,
+        Slot::GroundPick,
+        Slot::KickLeft,
+        Slot::KickRight,
+        Slot::Roulade,
+    ];
+
+    /// The slots that are one-shot skills: each names the `[[policy.skill]]` entry of the same
+    /// name, and its path is what that skill runs. See `PolicyParams::resolved_skills`.
+    pub const SKILLS: [Slot; 3] = [Slot::KickLeft, Slot::KickRight, Slot::Roulade];
+
+    /// The serde key, exactly as `[policy]` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Slot::Walk => "walk",
+            Slot::Stand => "stand",
+            Slot::SitStand => "sitstand",
+            Slot::GroundPick => "ground_pick",
+            Slot::KickLeft => "kick_left",
+            Slot::KickRight => "kick_right",
+            Slot::Roulade => "roulade",
+        }
+    }
+
+    /// `section.key`, which is what the registry and `toml_edit` want.
+    pub fn config_key(self) -> String {
+        format!("policy.{}", self.as_str())
+    }
+
+    /// Parse a slot name off the wire. `None` for anything else, so a caller can refuse with
+    /// the list of names it does know rather than failing to deserialize.
+    pub fn parse(name: &str) -> Option<Slot> {
+        Slot::ALL.into_iter().find(|s| s.as_str() == name)
+    }
+
+    /// Every slot name, for the "expected one of" half of a refusal.
+    pub fn names() -> String {
+        Slot::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// `[policy]` with every absent field resolved against the mode's defaults.
@@ -591,19 +1218,129 @@ pub struct ResolvedPolicy {
     pub head_lowpass: Option<f64>,
     pub legs_lowpass: Option<f64>,
     pub ground_pick_period: f64,
+    /// Fraction of the cycle at which the ground pick hands back.
+    pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
-    pub kick_duration: f64,
-    pub roulade_duration: f64,
-    pub roulade_action_scale: f64,
-    pub roulade_gain_ratio: f64,
+    /// Seconds the sitstand network rises before the gait takes over.
+    pub sitstand_rise_s: f64,
+    /// Seconds the seat takes to settle after the flag flips.
+    pub sitstand_ramp_s: f64,
+    /// The one-shot skills, config merged over the built-ins, in priority order.
+    pub skills: Vec<SkillDef>,
     pub voltage_adapt: bool,
     pub nominal_voltage: f64,
 }
 
+impl ResolvedPolicy {
+    /// The file that will actually be loaded into one slot, after mode defaults are applied.
+    /// `None` means the slot is empty — a capability this robot does not have.
+    pub fn slot(&self, slot: Slot) -> Option<&std::path::Path> {
+        match slot {
+            Slot::Walk => Some(self.walk.as_path()),
+            Slot::Stand => self.stand.as_deref(),
+            Slot::SitStand => self.sitstand.as_deref(),
+            Slot::GroundPick => self.ground_pick.as_deref(),
+            Slot::KickLeft => self.kick_left.as_deref(),
+            Slot::KickRight => self.kick_right.as_deref(),
+            Slot::Roulade => self.roulade.as_deref(),
+        }
+    }
+}
+
 impl PolicyParams {
+    /// The built-in skills with config merged over them, by name.
+    ///
+    /// Merge rather than replace, for the reason every other key in this file resolves the way it
+    /// does: the file is a list of decisions, not a copy of the defaults. Adding `polite-bow` is
+    /// one entry and does not mean re-declaring the three that were already there — and forgetting
+    /// to re-declare one cannot silently remove it, which is the failure mode of the other rule.
+    ///
+    /// A named skill keeps the built-in's position in the priority order; a new one goes last.
+    ///
+    /// **The three skill slots are applied last and win.** `kick_left`, `kick_right` and `roulade`
+    /// are `[policy]` keys like `walk`, and `robotctl policy load roulade <file>` writes that key —
+    /// so the file it names has to be the one the `roulade` skill runs, or the load reports a
+    /// file the robot never touches, which is what it did. A slot naming a skill the set does not
+    /// declare adds it with the built-in's timing; `"none"` switches it off, as it does for a
+    /// `[[policy.skill]]` entry.
+    pub fn resolved_skills(&self) -> Vec<SkillDef> {
+        self.resolved_skills_with(set_manifest().as_ref())
+    }
+
+    /// [`Self::resolved_skills`] against a manifest already read — or none, which is the
+    /// fallback three.
+    pub fn resolved_skills_with(&self, manifest: Option<&SetManifest>) -> Vec<SkillDef> {
+        let mut resolved = builtin_skills(manifest);
+        for configured in &self.skills {
+            match resolved.iter_mut().find(|s| s.name == configured.name) {
+                Some(builtin) => *builtin = configured.clone(),
+                None => resolved.push(configured.clone()),
+            }
+        }
+        for slot in Slot::SKILLS {
+            let Some(path) = self.slot(slot) else {
+                continue;
+            };
+            match resolved.iter_mut().find(|s| s.name == slot.as_str()) {
+                Some(skill) => skill.path = Some(path.clone()),
+                None => {
+                    if let Some(mut skill) = fallback_skill(slot.as_str()) {
+                        skill.path = Some(path.clone());
+                        resolved.push(skill);
+                    }
+                }
+            }
+        }
+        // A skill whose path is the `"none"` sentinel is switched off, which is how a built-in is
+        // removed without a second mechanism for it.
+        resolved.retain(|s| s.resolved_path().is_some());
+        resolved
+    }
+
+    /// What config says about one slot: `None` unset (resolve the mode's default), `Some("none")`
+    /// disabled outright, `Some(path)` an override.
+    pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
+        match slot {
+            Slot::Walk => &self.walk,
+            Slot::Stand => &self.stand,
+            Slot::SitStand => &self.sitstand,
+            Slot::GroundPick => &self.ground_pick,
+            Slot::KickLeft => &self.kick_left,
+            Slot::KickRight => &self.kick_right,
+            Slot::Roulade => &self.roulade,
+        }
+    }
+
+    /// Set or clear one slot's override. Clearing is what `robotctl policy reset` does, and it
+    /// is why this takes an `Option` rather than having a second method for it.
+    pub fn set_slot(&mut self, slot: Slot, path: Option<PathBuf>) {
+        let field = match slot {
+            Slot::Walk => &mut self.walk,
+            Slot::Stand => &mut self.stand,
+            Slot::SitStand => &mut self.sitstand,
+            Slot::GroundPick => &mut self.ground_pick,
+            Slot::KickLeft => &mut self.kick_left,
+            Slot::KickRight => &mut self.kick_right,
+            Slot::Roulade => &mut self.roulade,
+        };
+        *field = path;
+    }
+
     pub fn resolved(&self) -> ResolvedPolicy {
-        let release = |name: &str| PathBuf::from(RELEASE_DIR).join("policies").join(name);
+        self.resolved_with(set_manifest().as_ref())
+    }
+
+    /// [`Self::resolved`] against a manifest already read — or none, which is what a board whose
+    /// set predates the manifest has, and resolves to the prototype's numbers.
+    ///
+    /// **The set says how its own policies run.** The ground pick's cycle and the sit↔stand's rise
+    /// used to be literals here, per mode, which meant a retrained pick with a longer cycle was a
+    /// daemon release. They come from the set's phase-encoded and posture-flag entries now; the
+    /// literals stay as the fallback, and a `[policy]` key still overrides either, because the
+    /// file is the list of a person's decisions.
+    pub fn resolved_with(&self, manifest: Option<&SetManifest>) -> ResolvedPolicy {
+        let release = |name: &str| PathBuf::from(POLICY_DIR).join(name);
         let path = |field: &Option<PathBuf>, default: Option<&str>| -> Option<PathBuf> {
             match field {
                 Some(p) if is_none_sentinel(p) => None,
@@ -612,13 +1349,12 @@ impl PolicyParams {
             }
         };
 
-        let (walk_default, stand, sitstand, ground_pick, kick) = match self.mode {
+        let (walk_default, stand, sitstand, ground_pick) = match self.mode {
             Mode::Walk => (
                 "alpha_walking.onnx",
                 Some("alpha_stand.onnx"),
                 Some("alpha_sitstand.onnx"),
                 Some("alpha_ground_pick.onnx"),
-                true,
             ),
             // The prototype's roller preset, since rebased on the alpha defaults: roller
             // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
@@ -631,20 +1367,46 @@ impl PolicyParams {
                 None,
                 Some("alpha_sitstand.onnx"),
                 Some("roller_crouch.onnx"),
-                true,
             ),
         };
+
+        // What each skill slot reports is what the skill of that name will run — derived from the
+        // list rather than resolved beside it, so `robot.policies` cannot name a file the robot is
+        // not running.
+        let skills = self.resolved_skills_with(manifest);
+        let skill_file = |name: &str| {
+            skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
+        };
+
+        // The set's own timing for the two networks the daemon drives itself, for this mode.
+        let pick = manifest.and_then(|m| m.ground_pick(self.mode));
+        let seat = manifest.and_then(|m| m.sitstand());
 
         ResolvedPolicy {
             enabled: self.enabled,
             mode: self.mode,
-            walk: path(&self.walk, Some(walk_default)).expect("walk always has a default"),
+            // `walk` is the one slot that cannot be empty — a robot with no walking network has
+            // nothing to run — so the `"none"` sentinel does not apply to it and falls back to
+            // the mode's default instead.
+            //
+            // This used to be `.expect("walk always has a default")`, and a config saying
+            // `walk = "none"` panicked whichever thread resolved it. That thread is the control
+            // loop, so one line in a file killed the robot's control until somebody edited it
+            // back — the exact "a bad config line must not brick the board" failure the degraded
+            // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
+            // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
+            // floor under both.
+            walk: path(&self.walk, Some(walk_default))
+                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
             ground_pick: path(&self.ground_pick, ground_pick),
-            kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
-            kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
-            roulade: path(&self.roulade, Some("roulade.onnx")),
+            kick_left: skill_file("kick_left"),
+            kick_right: skill_file("kick_right"),
+            roulade: skill_file("roulade"),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -654,19 +1416,27 @@ impl PolicyParams {
             gain: self.gain,
             head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
             legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
-            ground_pick_period: self.ground_pick_period.unwrap_or(match self.mode {
-                Mode::Walk => 4.0,
-                Mode::Roller => 3.0,
-            }),
-            ground_pick_action_scale: self.ground_pick_action_scale.unwrap_or(match self.mode {
-                Mode::Walk => 1.0,
-                Mode::Roller => 0.8,
-            }),
+            ground_pick_period: self
+                .ground_pick_period
+                .or(pick.map(|t| t.period_s))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 4.0,
+                    Mode::Roller => 3.0,
+                }),
+            ground_pick_end_phase: pick
+                .map(|t| t.end_phase)
+                .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
+            ground_pick_action_scale: self
+                .ground_pick_action_scale
+                .or(pick.and_then(|t| t.action_scale))
+                .unwrap_or(match self.mode {
+                    Mode::Walk => 1.0,
+                    Mode::Roller => 0.8,
+                }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
-            kick_duration: self.kick_duration,
-            roulade_duration: self.roulade_duration,
-            roulade_action_scale: self.roulade_action_scale,
-            roulade_gain_ratio: self.roulade_gain_ratio,
+            sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
+            sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
+            skills,
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
         }
@@ -753,10 +1523,7 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
-            kick_duration: 0.5,
-            roulade_duration: 1.0,
-            roulade_action_scale: 1.0,
-            roulade_gain_ratio: 1.0,
+            skills: Vec::new(),
             voltage_adapt: false,
             nominal_voltage: 7.4,
         }
@@ -1065,6 +1832,722 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
 
 #[cfg(test)]
 mod tests {
+    /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
+    /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
+    /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the
+    /// symptom is a load that reports success and changes nothing until the next reboot proves
+    /// it never stuck.
+    ///
+    /// The registry is the right thing to check against rather than `PolicyParams`'s fields,
+    /// because it is itself pinned complete against serde's own field list.
+    #[test]
+    fn every_slot_is_a_registry_key() {
+        for slot in super::Slot::ALL {
+            let key = slot.config_key();
+            let entry = crate::registry::REGISTRY
+                .iter()
+                .find(|e| e.key == key)
+                .unwrap_or_else(|| panic!("{key} is not a key of robotd.toml"));
+            assert_eq!(
+                entry.kind,
+                crate::registry::Kind::OptionalPath,
+                "{key} must be a path slot"
+            );
+        }
+    }
+
+    /// **The set says what skills a robot has.** Adding a tenth policy used to mean two edits
+    /// in this repository and a daemon release to carry them; it is a tag on the Hub now.
+    #[test]
+    fn a_set_manifest_decides_which_policies_are_skills() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // A gait: perpetual, so not something to ask for by name.
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                // A perpetual one-shot: no length of its own, so it takes a config entry rather
+                // than appearing.
+                { "file": "flamingo.onnx", "kind": "perpetual",
+                  "unwind_s": 1.5, "command": { "idle": [0, 0, 0] } },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true },
+                { "file": "ball_kick_left.onnx", "name": "kick_left",
+                  "kind": "episodic", "duration_s": 0.5 },
+                { "file": "new_trick.onnx", "kind": "episodic", "duration_s": 2.0,
+                  "action_scale": 0.8 }
+            ]
+        }))
+        .unwrap();
+
+        let skills: Vec<(&str, f64)> = manifest
+            .skills()
+            .map(|p| (p.file.as_str(), p.duration_s.unwrap()))
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                ("roulade.onnx", 1.0),
+                ("ball_kick_left.onnx", 0.5),
+                ("new_trick.onnx", 2.0)
+            ],
+            "gaits and perpetual one-shots are not skills on their own"
+        );
+    }
+
+    /// **A set cannot shadow a skill the daemon drives itself.**
+    ///
+    /// The manifest lives on the Hub, so nothing in this repository can check it before a board
+    /// downloads it — the guard has to be on the board. `ground_pick` and `sit_toggle` have their
+    /// own arm of the cascade, and a set entry answering to either name would put a second
+    /// network behind it, fed an all-zero command it was never trained on.
+    ///
+    /// The guard is on the name, and this pins what that does and does not cover: a set that
+    /// mislabels a scripted policy without renaming it produces a junk skill under its own file
+    /// stem. That shadows nothing and is visible in `robotctl policy list`; catching it would
+    /// take a hardcoded list of our filenames, which is what this manifest exists to remove.
+    #[test]
+    fn a_set_cannot_shadow_a_skill_the_daemon_drives() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                // Named as the daemon's own: shadowing, and refused.
+                { "file": "alpha_sitstand.onnx", "name": "sit_toggle",
+                  "kind": "episodic", "duration_s": 2.0 },
+                // Mislabelled but not renamed: a junk skill, and it is allowed through.
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 4.0 },
+                // Labelled correctly: episodic on a phase command is the ground pick, and the
+                // encoding keeps it out of the skill list whatever it is called.
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller",
+                  "command": { "encoding": "phase", "period_s": 5.0, "end_phase": 0.7 } },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0 }
+            ]
+        }))
+        .unwrap();
+
+        let claimed: Vec<String> = manifest.skills().map(|p| p.skill_name()).collect();
+        assert_eq!(
+            claimed,
+            vec!["alpha_ground_pick".to_string(), "roulade".to_string()],
+            "sit_toggle is refused, the phase-encoded crouch is the ground pick; the mislabelled \
+             one is a visible mistake, not a trap"
+        );
+    }
+
+    /// A name is the role and a file is the training run, so `ball_kick_left.onnx` answers to
+    /// `kick_left` while `roulade.onnx` needs no name at all.
+    #[test]
+    fn a_set_policy_names_itself_after_its_file_unless_it_says_otherwise() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "roulade.onnx" },
+                { "file": "ball_kick_left.onnx", "name": "kick_left" }
+            ]
+        }))
+        .unwrap();
+        let names: Vec<String> = manifest.policies.iter().map(|p| p.skill_name()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+    }
+
+    /// A manifest that says nothing this build understands must not empty the robot. An older
+    /// set, or one written by a newer publisher, falls back rather than removing every skill.
+    #[test]
+    fn a_set_manifest_with_no_skills_falls_back() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [{ "file": "alpha_walking.onnx", "kind": "perpetual" }]
+        }))
+        .unwrap();
+        assert!(
+            manifest
+                .policies
+                .iter()
+                .all(|p| p.kind.as_deref() != Some("episodic")),
+            "nothing here is a skill, so builtin_skills keeps the three it knows"
+        );
+    }
+
+    /// The manifest the set actually publishes, as this build reads it. One place to see the
+    /// whole shape; the tests below take it apart.
+    fn published_set() -> super::SetManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "alpha_stand.onnx",   "kind": "perpetual" },
+                { "file": "roller.onnx",        "kind": "perpetual", "mode": "roller",
+                  "action_scale": 0.8 },
+                { "file": "alpha_sitstand.onnx", "name": "sitstand", "kind": "scripted",
+                  "command": { "encoding": "posture_flag", "slot": "twist.vx",
+                               "sit": 1.0, "stand": 0.0, "idle": [0.0, 0.0, 0.0] },
+                  "ramp_s": 2.5, "unwind_s": 1.5 },
+                { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic",
+                  "duration_s": 2.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 4.0, "end_phase": 0.7 } },
+                { "file": "roller_crouch.onnx", "name": "crouch", "kind": "episodic",
+                  "duration_s": 3.5, "mode": "roller", "action_scale": 0.8,
+                  "command": { "encoding": "phase", "slots": "twist.vx,twist.vy",
+                               "period_s": 5.0, "end_phase": 0.7 } },
+                { "file": "roulade.onnx",         "kind": "episodic", "duration_s": 1.0,
+                  "chain": true },
+                { "file": "ball_kick_left.onnx",  "name": "kick_left",  "kind": "episodic",
+                  "duration_s": 0.5 },
+                { "file": "ball_kick_right.onnx", "name": "kick_right", "kind": "episodic",
+                  "duration_s": 0.5 }
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// **The set says how fast its own ground pick runs, per mode.** The pick's cycle and the
+    /// crouch's were literals here — 4.0 and 3.0 — and the crouch is trained on a 5 s cycle, so
+    /// a board ran it at 3 s until somebody noticed. A phase-encoded episodic entry tagged with
+    /// a mode is that mode's ground pick, and its numbers are the defaults.
+    #[test]
+    fn the_set_declares_each_modes_ground_pick() {
+        let set = published_set();
+
+        let walk = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(walk.ground_pick_period, 4.0);
+        assert_eq!(walk.ground_pick_end_phase, 0.7);
+        assert_eq!(
+            walk.ground_pick_action_scale, 1.0,
+            "the pick says nothing, mode default"
+        );
+
+        let roller = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(
+            roller.ground_pick_period, 5.0,
+            "the crouch's own cycle, not the literal"
+        );
+        assert_eq!(roller.ground_pick_action_scale, 0.8);
+        assert!(
+            roller.ground_pick.unwrap().ends_with("roller_crouch.onnx"),
+            "and the slot still loads the crouch"
+        );
+    }
+
+    /// The file is a list of decisions: a `[policy]` key still beats the set.
+    #[test]
+    fn a_config_key_overrides_the_sets_ground_pick_timing() {
+        let set = published_set();
+        let tuned = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ground_pick_period: Some(6.0),
+            ground_pick_action_scale: Some(0.7),
+            ..Default::default()
+        }
+        .resolved_with(Some(&set));
+        assert_eq!(tuned.ground_pick_period, 6.0);
+        assert_eq!(tuned.ground_pick_action_scale, 0.7);
+        assert_eq!(
+            tuned.ground_pick_end_phase, 0.7,
+            "there is no key for the cutoff"
+        );
+    }
+
+    /// **The set says how the sit↔stand is timed.** The rise was a literal second and the
+    /// shutdown sit a literal four; the scripted posture-flag entry carries both.
+    #[test]
+    fn the_set_declares_the_sitstands_timing() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        assert_eq!(resolved.sitstand_rise_s, 1.5);
+        assert_eq!(resolved.sitstand_ramp_s, 2.5);
+        assert!(
+            resolved.sitstand.unwrap().ends_with("alpha_sitstand.onnx"),
+            "scripted is recorded, not turned into a skill"
+        );
+    }
+
+    /// **A phase-encoded or posture-flag policy is never a zero-command skill.** Both are driven
+    /// by the daemon through commands it generates; loading either as a generic one-shot would
+    /// run it on all-zeros. The published set's skills are exactly the three the prototype had.
+    #[test]
+    fn the_published_set_yields_the_three_skills_and_nothing_else() {
+        let set = published_set();
+        let resolved = super::PolicyParams::default().resolved_with(Some(&set));
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right"]);
+        let roulade = &resolved.skills[0];
+        assert_eq!(roulade.duration, 1.0);
+        assert!(roulade.chain);
+    }
+
+    /// **Absence is the prototype.** No manifest, or one that predates these fields, resolves to
+    /// the literals the daemon has always used — a board is never left with a pick that will not
+    /// end or a rise that never hands back.
+    #[test]
+    fn a_set_that_says_nothing_about_timing_leaves_the_prototypes_numbers() {
+        let old: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "scripted" },
+                { "file": "roller_crouch.onnx", "kind": "scripted" },
+                { "file": "alpha_sitstand.onnx", "kind": "perpetual" },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0, "chain": true }
+            ]
+        }))
+        .unwrap();
+        for manifest in [None, Some(&old)] {
+            let walk = super::PolicyParams::default().resolved_with(manifest);
+            assert_eq!(walk.ground_pick_period, 4.0);
+            assert_eq!(
+                walk.ground_pick_end_phase,
+                super::DEFAULT_GROUND_PICK_END_PHASE
+            );
+            assert_eq!(walk.ground_pick_action_scale, 1.0);
+            assert_eq!(walk.sitstand_rise_s, super::DEFAULT_SITSTAND_RISE_S);
+            assert_eq!(walk.sitstand_ramp_s, super::DEFAULT_SITSTAND_RAMP_S);
+            let roller = super::PolicyParams {
+                mode: super::Mode::Roller,
+                ..Default::default()
+            }
+            .resolved_with(manifest);
+            assert_eq!(roller.ground_pick_period, 3.0);
+            assert_eq!(roller.ground_pick_action_scale, 0.8);
+        }
+    }
+
+    /// A phase entry with a `period_s` but no `encoding` is still a phase entry — the field
+    /// means nothing else — and one with no `end_phase` hands back at the prototype's cutoff.
+    #[test]
+    fn a_period_alone_makes_a_phase_entry() {
+        let set: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "alpha_ground_pick.onnx", "kind": "episodic", "duration_s": 3.5,
+                  "command": { "period_s": 5.0 } }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            set.ground_pick(super::Mode::Walk),
+            Some(super::PhaseTiming {
+                period_s: 5.0,
+                end_phase: 0.7,
+                action_scale: None
+            })
+        );
+        assert_eq!(set.skills().count(), 0, "not a zero-command skill");
+        assert_eq!(
+            set.ground_pick(super::Mode::Roller),
+            None,
+            "untagged means walking"
+        );
+    }
+
+    /// **A robot with no `[pad]` behaves exactly as it always has.** The mapping is the
+    /// prototype's and muscle memory depends on it, so the defaults are not a fresh choice.
+    #[test]
+    fn the_default_bindings_are_the_prototypes() {
+        let pad = super::PadParams::default();
+        assert_eq!(pad.a, "ground_pick");
+        assert_eq!(pad.x, "roulade");
+        assert_eq!(pad.lb, "kick_left");
+        assert_eq!(pad.rb, "kick_right");
+        assert_eq!(pad.dpad_down, "sit_toggle");
+    }
+
+    /// Binding one button leaves the rest alone — the file is a list of decisions, and rebinding
+    /// X must not silently take the kicks off the bumpers.
+    #[test]
+    fn binding_one_button_leaves_the_others() {
+        let params: super::Params =
+            toml::from_str("[pad]\nx = \"polite-bow\"\n").expect("a pad section");
+        assert_eq!(params.pad.x, "polite-bow");
+        assert_eq!(params.pad.lb, "kick_left", "untouched");
+        assert_eq!(params.pad.a, "ground_pick", "untouched");
+    }
+
+    /// An empty binding is a button switched off on purpose, which is different from a button
+    /// bound to something that does not exist — `padd` sends nothing rather than a bad name.
+    #[test]
+    fn an_empty_binding_is_a_button_switched_off() {
+        let params: super::Params = toml::from_str("[pad]\ndpad_down = \"\"\n").unwrap();
+        assert_eq!(params.pad.skill("dpad_down"), Some(""));
+        assert_eq!(params.pad.skill("nonsense"), None, "not a button at all");
+    }
+
+    /// Every bindable button must be reachable through the accessors, or `robotctl pad bind`
+    /// would refuse a button the config file happily accepts.
+    #[test]
+    fn every_listed_button_can_be_read_and_bound() {
+        let mut pad = super::PadParams::default();
+        for button in super::PadParams::BUTTONS {
+            assert!(pad.skill(button).is_some(), "{button} is not readable");
+            assert!(pad.bind(button, "polite-bow"), "{button} is not bindable");
+            assert_eq!(pad.skill(button), Some("polite-bow"));
+        }
+        assert!(!pad.bind("triangle", "x"), "and nothing else is");
+    }
+
+    /// **Absence resolves to the three a robot has always had.** A board updating onto this
+    /// writes no config and runs no migration, and still has its kicks and its roulade.
+    #[test]
+    fn no_configured_skills_means_the_built_in_three() {
+        let resolved = super::PolicyParams::default().resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["roulade", "kick_left", "kick_right"]);
+        assert!(
+            resolved.skills.iter().all(|s| s.resolved_path().is_some()),
+            "each names a file"
+        );
+    }
+
+    /// Adding one skill does not mean re-declaring the others — the file is a list of decisions.
+    /// A rule where config replaced the lot would make forgetting an entry a silent removal.
+    #[test]
+    fn a_new_skill_is_added_without_re_declaring_the_built_ins() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from(
+                    "/var/lib/robot/policies/x/y/main/policy.onnx",
+                )),
+                duration: 4.0,
+                chain: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_left", "kick_right", "polite-bow"]);
+    }
+
+    /// Naming a built-in changes it and keeps its place in the priority order — a retuned
+    /// roulade must not become the last thing the cascade considers.
+    #[test]
+    fn naming_a_built_in_retunes_it_in_place() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: None,
+                duration: 2.5,
+                chain: false,
+                params: super::SkillOverrides {
+                    action_scale: Some(0.7),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let resolved = params.resolved();
+        assert_eq!(resolved.skills[0].name, "roulade", "still first");
+        assert_eq!(resolved.skills[0].duration, 2.5);
+        assert_eq!(resolved.skills[0].params.action_scale, Some(0.7));
+        assert_eq!(resolved.skills.len(), 3, "and nothing was added");
+    }
+
+    /// The `"none"` sentinel removes a built-in, so taking one away needs no second mechanism —
+    /// it is the same word that switches off a policy slot.
+    #[test]
+    fn a_built_in_can_be_switched_off_by_name() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "kick_left".into(),
+                path: Some(PathBuf::from("none")),
+                duration: 0.5,
+                chain: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = params
+            .resolved()
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names, ["roulade", "kick_right"]);
+    }
+
+    /// A skill with no path runs `<name>.onnx` from this robot's own set, so a built-in needs no
+    /// path written and a fetched one carries what `policy load` recorded.
+    #[test]
+    fn a_skill_without_a_path_runs_its_own_name() {
+        let resolved = super::PolicyParams::default().resolved();
+        let roulade = &resolved.skills[0];
+        assert_eq!(
+            roulade.resolved_path().unwrap(),
+            std::path::Path::new(super::POLICY_DIR).join("roulade.onnx")
+        );
+        // The kicks are the exception the built-ins spell out: their files are named for the
+        // training run, not the role.
+        let kick = resolved
+            .skills
+            .iter()
+            .find(|s| s.name == "kick_left")
+            .unwrap();
+        assert!(
+            kick.resolved_path()
+                .unwrap()
+                .ends_with("ball_kick_left.onnx"),
+            "{:?}",
+            kick.resolved_path()
+        );
+    }
+
+    /// **A skill slot is the file the skill runs.** `robotctl policy load roulade <file>` writes
+    /// `[policy] roulade`, and until this the daemon reported that file in the slot while the
+    /// `roulade` skill went on running the built-in — a load that changed the report and nothing
+    /// else.
+    #[test]
+    fn a_skill_slot_override_is_what_the_skill_runs() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            kick_left: Some(PathBuf::from("/srv/left.onnx")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+
+        let file = |name: &str| {
+            resolved
+                .skills
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.resolved_path())
+        };
+        assert_eq!(file("roulade"), Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(file("kick_left"), Some(PathBuf::from("/srv/left.onnx")));
+        assert!(
+            file("kick_right")
+                .unwrap()
+                .ends_with("ball_kick_right.onnx"),
+            "an untouched slot keeps the built-in"
+        );
+        // And the report agrees with the list, in both directions.
+        assert_eq!(resolved.roulade, file("roulade"));
+        assert_eq!(resolved.kick_left, file("kick_left"));
+        assert_eq!(resolved.kick_right, file("kick_right"));
+    }
+
+    /// The slot beats a `[[policy.skill]]` entry of the same name: `policy load` is the later,
+    /// more explicit decision, and it keeps the entry's timing.
+    #[test]
+    fn a_skill_slot_overrides_the_entry_path_and_keeps_its_timing() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            roulade: Some(PathBuf::from("/srv/roll.onnx")),
+            skills: vec![super::SkillDef {
+                name: "roulade".into(),
+                path: Some(PathBuf::from("/srv/other.onnx")),
+                duration: 2.5,
+                chain: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let roulade = params
+            .resolved()
+            .skills
+            .into_iter()
+            .find(|s| s.name == "roulade")
+            .unwrap();
+        assert_eq!(roulade.path, Some(PathBuf::from("/srv/roll.onnx")));
+        assert_eq!(roulade.duration, 2.5);
+    }
+
+    /// `"none"` in a skill slot switches the skill off, exactly as it does in the entry.
+    #[test]
+    fn a_skill_slot_set_to_none_removes_the_skill() {
+        use std::path::PathBuf;
+
+        let params = super::PolicyParams {
+            kick_right: Some(PathBuf::from("none")),
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let names: Vec<&str> = resolved.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["roulade", "kick_left"]);
+        assert_eq!(resolved.kick_right, None, "and the report says so");
+    }
+
+    /// **A policy that does not end itself needs the daemon to end it.**
+    ///
+    /// `polite-bow` is episodic: four seconds later it is standing again, so the window simply
+    /// expires and walk takes over a robot that is upright. The published flamingo is not — it
+    /// holds a foot up until told otherwise — and handing back mid-hold would give walk a robot
+    /// balanced on one leg. `unwind` is the daemon supplying the ending, which is what makes a
+    /// perpetual policy usable as a one-shot at all.
+    #[test]
+    fn a_skill_can_declare_how_it_comes_back() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "flamingo".into(),
+                path: Some(std::path::PathBuf::from("/srv/flamingo.onnx")),
+                duration: 5.0,
+                chain: false,
+                // [flag, side, 0]: lift, then stand back on two feet before handing over.
+                command: [1.0, 1.0, 0.0],
+                unwind: [0.0, 1.0, 0.0],
+                unwind_s: 3.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolved = params.resolved();
+        let flamingo = resolved.skills.last().unwrap();
+        assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind, [0.0, 1.0, 0.0]);
+        assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// And the common case declares none of it. A zero command with no unwind is what every
+    /// one-shot published so far is, and writing that out would be noise in every config file.
+    #[test]
+    fn the_built_ins_need_no_command_or_unwind() {
+        for skill in super::PolicyParams::default().resolved().skills {
+            assert_eq!(skill.command, [0.0; 3], "{} drives on zeros", skill.name);
+            assert_eq!(skill.unwind_s, 0.0, "{} ends itself", skill.name);
+        }
+    }
+
+    /// **A config that disables the walking slot must not panic.**
+    ///
+    /// It reached a board: `robotctl policy load walk none` wrote `walk = "none"`, and resolving
+    /// that killed the control thread — the daemon stayed up answering its socket while the robot
+    /// stopped ticking, and a restart panicked again at startup because the file still said it.
+    /// One line in a config file must never be able to do that.
+    #[test]
+    fn disabling_the_walking_slot_falls_back_rather_than_panicking() {
+        use super::{Mode, PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        for mode in [Mode::Walk, Mode::Roller] {
+            let mut params = PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            params.set_slot(Slot::Walk, Some(PathBuf::from("none")));
+            let resolved = params.resolved();
+            assert!(
+                resolved.walk.starts_with(super::POLICY_DIR),
+                "{mode:?} must fall back to its own walking policy, got {}",
+                resolved.walk.display()
+            );
+        }
+    }
+
+    /// Every *other* slot may legitimately be switched off, which is what running a community
+    /// policy that owns the whole command block needs. Only `walk` is special.
+    #[test]
+    fn every_other_slot_can_be_switched_off() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from("none")));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            if slot == Slot::Walk {
+                continue;
+            }
+            assert_eq!(resolved.slot(slot), None, "{slot} must be off");
+        }
+    }
+
+    /// **The default policy path must not be inside the release directory.**
+    ///
+    /// That coupling is the whole thing this move undoes: while it held, a gait retrain needed a
+    /// daemon release and a daemon fix re-shipped six megabytes of unchanged weights. It would
+    /// also come back silently — a default rewritten in terms of `RELEASE_DIR` still resolves to
+    /// a real file on a real board, and nothing else would notice.
+    #[test]
+    fn the_default_policies_live_outside_the_release() {
+        let resolved = super::PolicyParams::default().resolved();
+        for slot in super::Slot::ALL {
+            let Some(path) = resolved.slot(slot) else {
+                continue;
+            };
+            assert!(
+                path.starts_with(super::POLICY_DIR),
+                "{slot} resolves to {}",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(super::RELEASE_DIR),
+                "{slot} is back inside the release: {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Round-tripping every slot through its own name, so a rename cannot half-land: `parse`
+    /// and `as_str` disagreeing would make a slot loadable under a name nothing reports.
+    #[test]
+    fn slot_names_round_trip() {
+        for slot in super::Slot::ALL {
+            assert_eq!(super::Slot::parse(slot.as_str()), Some(slot));
+        }
+        assert_eq!(super::Slot::parse("groundpick"), None);
+        assert_eq!(super::Slot::parse(""), None);
+    }
+
+    /// The accessors have to agree with `resolved()`, which is the function everything
+    /// downstream actually consumes. A `slot()` that read the wrong field would report one
+    /// policy while the loop ran another.
+    #[test]
+    fn slot_accessors_agree_with_the_resolved_paths() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        for slot in Slot::ALL {
+            params.set_slot(slot, Some(PathBuf::from(format!("/tmp/{slot}.onnx"))));
+        }
+        let resolved = params.resolved();
+        for slot in Slot::ALL {
+            assert_eq!(
+                params.slot(slot).as_deref(),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} reads back what was set"
+            );
+            assert_eq!(
+                resolved.slot(slot),
+                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                "{slot} resolves to its override"
+            );
+        }
+    }
+
+    /// Clearing an override must fall back to the mode's default rather than emptying the slot —
+    /// that is the whole of `policy reset`, and getting it wrong would leave a robot with no gait
+    /// after an undo.
+    #[test]
+    fn clearing_a_slot_falls_back_to_the_mode_default() {
+        use super::{PolicyParams, Slot};
+        use std::path::PathBuf;
+
+        let mut params = PolicyParams::default();
+        params.set_slot(Slot::Walk, Some(PathBuf::from("/tmp/mine.onnx")));
+        assert!(params.resolved().walk.ends_with("mine.onnx"));
+
+        params.set_slot(Slot::Walk, None);
+        assert_eq!(
+            params.resolved().walk,
+            std::path::Path::new(super::POLICY_DIR).join("alpha_walking.onnx"),
+            "reset must restore the default, not empty the slot"
+        );
+    }
+
     use super::*;
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
@@ -1262,10 +2745,22 @@ mod tests {
         assert_eq!(p.ground_pick_period, 4.0);
         assert_eq!(p.ground_pick_action_scale, 1.0);
         assert_eq!(p.ground_pick_gain_ratio, 1.0);
-        assert_eq!(p.kick_duration, 0.5);
-        assert_eq!(p.roulade_duration, 1.0, "one roll, the measured time");
-        assert_eq!(p.roulade_action_scale, 1.0);
-        assert_eq!(p.roulade_gain_ratio, 1.0);
+        // The three one-shots and their numbers, which used to be four flat keys here.
+        let skill = |name: &str| {
+            p.skills
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no {name} skill"))
+        };
+        assert_eq!(skill("kick_left").duration, 0.5);
+        assert_eq!(skill("kick_right").duration, 0.5);
+        assert_eq!(
+            skill("roulade").duration,
+            1.0,
+            "one roll, the measured time"
+        );
+        assert!(skill("roulade").chain, "holding the button chains rolls");
+        assert!(!skill("kick_left").chain);
         assert!(!p.voltage_adapt, "off by default in the prototype");
         assert_eq!(p.nominal_voltage, 7.4);
 
@@ -1274,7 +2769,7 @@ mod tests {
                 .and_then(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
         };
-        assert!(p.walk.ends_with("policies/alpha_walking.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("alpha_walking.onnx"));
         assert_eq!(name(&p.stand).as_deref(), Some("alpha_stand.onnx"));
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
@@ -1307,7 +2802,7 @@ mod tests {
         let p = Params::load(&path, true).unwrap().policy.resolved();
 
         assert_eq!(p.mode, Mode::Roller);
-        assert!(p.walk.ends_with("policies/roller.onnx"));
+        assert_eq!(p.walk, PathBuf::from(POLICY_DIR).join("roller.onnx"));
         assert_eq!(
             p.stand, None,
             "the prototype never runs standing in roller mode"

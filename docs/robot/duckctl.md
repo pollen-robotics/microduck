@@ -122,8 +122,9 @@ is a robot with a console.
 
 What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
 pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
-on the picture to look at a point; enable, init, relax, stop and shutdown; the skills and the voice
-bank as menus; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
+on the picture to look at a point; enable, init, relax, stop and shutdown; the voice bank as a
+menu and **the skills as a menu the robot fills** — which skills a robot has is config, so the
+page asks `robot.policies` rather than offering a list it guessed; and the state stream at 2 Hz beside `robot.health`, which is where a hot servo, a flat
 pack or a loop running slow gets named.
 
 `stop` zeroes the intents the page is sending. **It is not an emergency stop** — nothing in this
@@ -332,6 +333,189 @@ duckctl --name <robot-name> update watch
 It prints where the update in flight has got to and then everything that follows. It never receives
 a reply, so it ends with Ctrl-C.
 
+## The Hugging Face account
+
+```
+duckctl account login
+```
+
+Prints a code and opens <https://hf.co/oauth/device>, where you type it — Hugging Face's device
+page does not accept a code in the URL, so opening saves the navigation and not the typing. **The
+robot does the waiting**, so this tool disconnects as soon as it has printed the code — approve it
+in the browser it opened, or from any other device, then:
+
+```
+duckctl account status
+```
+
+```
+duckctl account logout
+```
+
+This is the one thing that works on a robot that has never seen a network: no wifi means no
+console and no LAN, and Bluetooth is what is left. Signing in over BLE is the same flow the setup
+wizard runs.
+
+```
+duckctl account login --no-open
+```
+
+for the code and the URL without a browser — which is also what you get automatically when the
+output is not a terminal, so a script launches nothing.
+
+A robot already signed in refuses and names the account, and so does one still waiting for a code
+to be approved. `--force` replaces either — the abandoned code stops working.
+
+## Policies and skills
+
+What each slot runs, and which skills this robot has:
+
+```bash
+duckctl policy list
+```
+
+The `skills` array is the answer to "what can this robot be asked for". They are config, so it
+differs between robots and there is no list to assume — read it before offering a button.
+
+Run one:
+
+```bash
+duckctl do roulade
+```
+
+**The robot has to be driving.** Press Start on the pad first, or it answers saying so. It needs
+no pad *input* though: the deadman zeroes the twist by itself, so a robot nobody is steering
+stands still and does the thing.
+
+Change what it walks with, live:
+
+```bash
+duckctl policy load walk /opt/robot/policies/current/alpha_walking.onnx
+```
+
+Put that slot back:
+
+```bash
+duckctl policy reset walk
+```
+
+One slot at a time, because the wire call takes one — resetting all seven is
+`robotctl policy reset` on the robot. The path is on the *robot*, and must be absolute.
+
+A load from here **survives a reboot**, exactly as `robotctl policy load` on the robot does: the
+daemon writes the slot into `robotd.toml` before it swaps. `duckctl policy reset <slot>` is the
+undo.
+
+Re-read every slot from the config file, for when something else changed it:
+
+```bash
+duckctl policy reload
+```
+
+The robot goes to its home pose with torque on, loads, and drives again — a few seconds, and the
+timeout allows for it. A file that is not `obs[1,61] -> actions[1,14]` is refused before anything
+changes, and a load that fails anyway keeps the policy that was running.
+
+### From the Hub
+
+What else is published for this robot, and whether the official set has moved:
+
+```bash
+duckctl policy search microduck
+```
+
+```bash
+duckctl policy check
+```
+
+Install the newest official set — or `--version v1` to go back:
+
+```bash
+duckctl policy update
+```
+
+Download somebody else's, without running it:
+
+```bash
+duckctl policy fetch RemiFabre/microduck-flamingo-cycle
+```
+
+The reply names the path it landed at. `load` takes a path and never `org/repo`: fetching and
+loading are two calls here where `robotctl` spells both with one string.
+
+### Giving it a name
+
+`fetch` downloads a file; this makes it something `robot do` answers to:
+
+```bash
+duckctl policy skill polite-bow --path /var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx --duration 4
+```
+
+```bash
+duckctl do polite-bow
+```
+
+One call — the robot writes its config and reloads, so nothing restarts. `--duration` is required
+the first time and kept afterwards, so changing one field means sending one field:
+
+```bash
+duckctl policy skill polite-bow --command 1,0,0
+```
+
+`--command` is the twist fed to the network while it runs, zeros unless the policy reads its twist
+as something else — flamingo's is `[flag, side, 0]`. `--unwind` and `--unwind-s` are how a policy
+that holds until told otherwise is brought back.
+
+What this robot can be asked to do, and the timings behind each:
+
+```bash
+duckctl policy skills
+```
+
+`built_in` in that answer names `ground_pick` and `sit_toggle`, which `robot do` also accepts but
+which are driven by the robot itself and are not table entries.
+
+```bash
+duckctl policy unskill polite-bow
+```
+
+A skill this robot's release ships comes back when you do that, because removing the entry only
+removes the override.
+
+Nothing a stranger publishes is verified by anybody. What makes it safe to try is the manifest
+gate before the download, the shape gate at load, the joint clamps and the fall reflex — not the
+description. Have the robot on its stand the first time.
+
+## Which button runs which skill
+
+```bash
+duckctl pad bindings
+```
+
+```bash
+duckctl pad bind x polite-bow
+```
+
+```bash
+duckctl pad reset x
+```
+
+**Nothing restarts and nothing else is needed** — `padd` re-reads the file within a second. The
+name is checked against this robot's skills first, so a typo comes back as a refusal naming the
+real ones rather than becoming a button that does nothing when pressed.
+
+The listing marks two things a client cannot work out for itself: `overridden`, so somebody's
+changes are visible without knowing the defaults, and `error`, for a button bound to a skill this
+robot no longer has — the realistic way to get one of those is removing a skill, not mistyping.
+
+`""` switches a button off, which is a different wish from `pad reset` putting it back to what the
+robot ships with. Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down` — and `lb`/`rb` are
+the **bumpers**, since the analog triggers are the mouth and the quack.
+
+Pairing a pad is a different namespace and a different daemon — `pad.pair` and `pad.forget` are
+`configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
+the list of skills.
+
 ## Anything else — `call`
 
 ```bash
@@ -380,10 +564,14 @@ watching, and `update status` afterwards says how it went.
 
 ## What is refused
 
-Motor control (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`,
-`robot.relax`), high-rate telemetry (`robot.subscribe`), the two update commands a person has to
-mean (`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
-`system.setPairingPin`) are refused by `btd` itself and never reach a daemon. They come back as
+Teleop (`robot.move`, `robot.head`, `robot.enable`, `robot.stop`, `robot.init`, `robot.relax`),
+high-rate telemetry (`robot.subscribe`), the two update commands a person has to mean
+(`update.pin`, `update.resetToGolden`) and the pairing PIN (`system.pairingPin`,
+`system.setPairingPin`) are refused by `btd` itself and never reach a daemon.
+
+`robot.do` is **not** in that list, though it moves the robot: teleop is a stream of fifty small
+updates a second, which is what a 20-byte notification budget cannot carry, and a skill is one
+request. They come back as
 error code 14, "not available over Bluetooth".
 
 That is a security boundary rather than a missing feature, and each refusal has its reason next

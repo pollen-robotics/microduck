@@ -241,7 +241,11 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                     break;
                 }
 
-                let metered = frames.inspect(mean_luma);
+                // Asked for, so what gets metered is a frame captured now rather than one left
+                // over from the previous tick — [`Frames`] has why the branch works this way. The
+                // wait is bounded and lands on the same "no frame" path a camera that has not
+                // started yet does.
+                let metered = frames.inspect_next(mean_luma);
                 if metered == Some(None) && !format_logged {
                     format_logged = true;
                     // The one way a frame can arrive and be unreadable: it is not what the capture

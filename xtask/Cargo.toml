@@ -25,3 +25,7 @@ zstd = "0.13"
 # come from the dependencies above: Cargo links those into test targets too.
 [dev-dependencies]
 tempfile = "3.27.0"
+# So `the_download_list_is_exactly_what_robotd_defaults_to` can derive the list from the
+# daemon's own defaults rather than from a second copy of it. Pure serde + toml, and only a
+# dev-dependency: the packaging tool itself has no business knowing about policy slots.
+robotd-params = { path = "../robotd-params" }

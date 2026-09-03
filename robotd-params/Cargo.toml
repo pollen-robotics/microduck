@@ -16,9 +16,15 @@ kinematics = { path = "../kinematics" }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 serde = { workspace = true }
 toml = "0.9"
+# The official policy set describes itself in JSON, beside its `.onnx` files — what it contains
+# and how long each one-shot runs, so adding a policy to the set is not a daemon release. Pure
+# serde like the rest of this list; no C toolchain and no network stack.
+serde_json.workspace = true
+# The lossless writer in `edit`. Pure Rust like everything else here — no C toolchain and no
+# network stack — which is what lets the crate on the recovery path own it.
+toml_edit = "0.23"
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = "3.27.0"

@@ -835,6 +835,33 @@ enum Command {
         #[arg(value_name = "NEW_NAME")]
         name: String,
     },
+    /// Run a one-shot skill — a kick, the roulade, a bow.
+    ///
+    /// `robotctl robot do` on the robot. The robot has to be driving: press Start on the pad
+    /// first, or it answers saying so. It needs no pad *input* though — the deadman zeroes the
+    /// twist by itself, so a robot nobody is steering stands still and does the thing.
+    ///
+    /// `duckctl policy list` names the skills this robot has. They are config, so the list
+    /// differs between robots and an unknown name is refused with the real one.
+    Do {
+        #[arg(value_name = "SKILL")]
+        skill: String,
+    },
+    /// The Hugging Face account this robot belongs to.
+    ///
+    /// Signing in over Bluetooth is what a robot fresh out of a box needs: it has no network, so
+    /// it has no console and no LAN to open one from. `login` prints a short code to approve on
+    /// huggingface.co from any device — this tool does not have to stay connected while you do,
+    /// which is the point of the flow. `status` afterwards says whether it worked.
+    #[command(subcommand)]
+    Account(Account),
+
+    /// What each policy slot is running, and what to run instead.
+    #[command(subcommand)]
+    Policy(Policy),
+    /// Which pad button runs which skill.
+    #[command(subcommand)]
+    Pad(Pad),
     /// Reboot it.
     Reboot,
     /// Send any method, for whatever is not wrapped above.
@@ -843,6 +870,167 @@ enum Command {
         /// Parameters as JSON. Defaults to `{}`.
         params: Option<String>,
     },
+}
+
+/// The binding half of `robotctl pad`, named the same way.
+///
+/// Pairing a gamepad is not here: `pad.pair` and `pad.forget` are `configd`'s and reached with
+/// `call`. These two are `robotd`'s, because checking a skill name needs the list of skills, and
+/// that is the daemon with it.
+#[derive(Subcommand)]
+enum Pad {
+    /// What each of the five one-shot buttons runs.
+    ///
+    /// `overridden` marks what somebody changed; `error` marks a button bound to a skill this
+    /// robot does not have, which is a button that will do nothing when pressed.
+    Bindings,
+    /// Put a skill on a button.
+    ///
+    /// Takes effect within a second — `padd` re-reads the file, and nothing restarts. The name is
+    /// checked against this robot's skills first, so a typo is refused with the real list rather
+    /// than becoming a dead button.
+    Bind {
+        /// `a`, `x`, `lb`, `rb` or `dpad_down` — the bumpers, not the analog triggers.
+        button: String,
+        /// A skill this robot has, or `""` to leave the button doing nothing.
+        skill: String,
+    },
+    /// Put a button back to what this robot ships with.
+    Reset {
+        /// Which button.
+        button: String,
+    },
+}
+
+/// `duckctl account …` — the account half of `robotctl account`, over the radio.
+#[derive(Subcommand, Debug)]
+enum Account {
+    /// Start a login, and open the page to approve it on.
+    Login {
+        /// Print the code and the URL, and open nothing.
+        ///
+        /// Also the automatic behaviour when stderr is not a terminal, so a script does not
+        /// launch a browser on somebody's desktop.
+        #[arg(long)]
+        no_open: bool,
+        /// Sign in even though this robot already belongs to an account, or is already
+        /// waiting for a code to be approved.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Which account this robot belongs to, and whether a login is waiting for approval.
+    Status,
+    /// Forget the account.
+    Logout,
+}
+
+/// The policy commands, named as `robotctl policy` names them.
+///
+/// Same words in the same order as on the robot, for the reason [`Update`] gives. What is missing
+/// against `robotctl` is the Hub: `policy.check`, `policy.install` and `policy.search` are not
+/// served over this transport — they reach the network on the robot's behalf and write to the
+/// eMMC — so `load` here takes a path to a file already on the robot, never `org/repo`.
+#[derive(Subcommand)]
+enum Policy {
+    /// What each slot is running, from where, and which skills this robot has.
+    List,
+    /// Put a policy in a slot, live.
+    ///
+    /// The robot returns to its home pose with torque on, loads it, and drives again. A file that
+    /// is not `obs[1,61] -> actions[1,14]` is refused before anything changes, and a load that
+    /// fails anyway keeps the policy that was running.
+    Load {
+        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        slot: String,
+        /// Absolute path on the robot. Relative is refused: the daemon's working directory is
+        /// not the caller's, and a path meaning one file to each would be worse than a refusal.
+        path: String,
+    },
+    /// Put one slot back to what this robot ships with.
+    ///
+    /// One slot, because the wire call takes one. Resetting every slot at once is
+    /// `robotctl policy reset` on the robot.
+    Reset {
+        /// Which slot to clear.
+        slot: String,
+    },
+    /// What else is published for this robot.
+    ///
+    /// Reaches the Hub, changes nothing. `microduck` is the useful query until there is a tag.
+    Search {
+        /// What to look for on the Hub.
+        #[arg(default_value = "microduck")]
+        query: String,
+    },
+    /// Is there a newer official policy set? Changes nothing.
+    Check,
+    /// Install an official policy set from the Hub.
+    ///
+    /// Takes the newest unless a revision is named. The robot returns to its home pose, re-reads
+    /// every slot and drives again — and a slot pointing at a file you loaded yourself is left
+    /// alone, because it points somewhere else entirely.
+    Update {
+        /// A tag like `v2`, or a branch. Omit for the newest.
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Download somebody else's policy onto the robot, without loading it.
+    ///
+    /// **Not `robotctl policy add`**, which also writes a skill entry so `robot do` can run it —
+    /// that needs `[[policy.skill]]`, and there is no wire method for it. This is the download
+    /// half only; `policy load <slot> <path>` afterwards runs it in a slot, and the reply names
+    /// the path to give it.
+    ///
+    /// Nothing a stranger publishes is verified by anybody: what makes it safe to try is the
+    /// shape gate, the joint clamps and the fall reflex. Have the robot on its stand the first
+    /// time.
+    Fetch {
+        /// `org/repo` on the Hub.
+        repo: String,
+        /// A revision in that repo. Omit for the default branch.
+        #[arg(long)]
+        revision: Option<String>,
+        /// Which file, for a repo carrying more than one policy.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// What this robot can be asked to do, and the timings behind each one.
+    ///
+    /// `built_in` names the two `robot.do` also answers to that are not table entries —
+    /// `ground_pick` and `sit_toggle` are driven by the robot itself.
+    Skills,
+    /// Give a fetched policy a name, so `robot do` can run it.
+    ///
+    /// The other half of `policy fetch`: that downloads a file, this makes it a skill.
+    /// One call — the robot writes its config and reloads, so nothing restarts.
+    Skill {
+        /// What `robot do` will answer to. An existing name replaces that entry.
+        name: String,
+        /// Seconds it runs. Required the first time; kept if omitted afterwards.
+        #[arg(long)]
+        duration: Option<f64>,
+        /// The `.onnx` on the robot — the path `policy fetch` reported.
+        #[arg(long)]
+        path: Option<String>,
+        /// The twist fed to the network while it runs, as `vx,vy,vyaw`. Zeros unless a policy
+        /// reads its twist as something else — flamingo's is `[flag, side, 0]`.
+        #[arg(long)]
+        command: Option<String>,
+        /// The twist driven on the way back, for a policy that does not end itself.
+        #[arg(long)]
+        unwind: Option<String>,
+        /// Seconds spent coming back.
+        #[arg(long)]
+        unwind_s: Option<f64>,
+    },
+    /// Take a skill out. One this robot's release ships comes back.
+    Unskill { name: String },
+    /// Re-read every slot from the config file.
+    ///
+    /// For when something else changed what the robot should be running — a policy set installed
+    /// underneath unchanged paths, or a hand-edited `robotd.toml`. `load` would correctly
+    /// conclude there was nothing to do.
+    Reload,
 }
 
 /// The update commands, named as `robotctl update` names them.
@@ -1349,6 +1537,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(note) = restart_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
+                if let Some(note) = account_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
                 Ok(())
             };
         }
@@ -1551,7 +1742,30 @@ fn warn_about_skew(theirs: u8) {
     );
 }
 
+/// `vx,vy,vyaw` as three numbers.
+///
+/// Parsed here rather than sent as a string, so a typo is a message from this tool naming the
+/// shape rather than a `PARSE_ERROR` from the robot with nothing in it to act on.
+fn triple(spec: &str) -> Result<[f64; 3], String> {
+    let parts: Vec<&str> = spec.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "expected three numbers as vx,vy,vyaw — got {spec:?}"
+        ));
+    }
+    let mut out = [0.0; 3];
+    for (slot, part) in out.iter_mut().zip(parts) {
+        *slot = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("{part:?} is not a number, in {spec:?}"))?;
+    }
+    Ok(out)
+}
+
 fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
     let (method, params, timeout) = match command {
         // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
         // request: there is no method to send, and connecting is the thing it exists not to do.
@@ -1575,6 +1789,144 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Do { skill } => (
+            proto::method::ROBOT_DO,
+            serde_json::json!({ "skill": skill }),
+            REPLY_TIMEOUT,
+        ),
+        // The robot asks Hugging Face for a device code before it answers, so this is one
+        // outbound HTTP round trip rather than a local read — the same budget `policy load` gets
+        // for the same reason. What it does *not* wait for is the approval: that is the whole
+        // shape of the flow, and it is why this tool can disconnect immediately afterwards.
+        Command::Account(Account::Login { force, .. }) => (
+            proto::method::ACCOUNT_LOGIN,
+            serde_json::json!({ "force": force }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Account(Account::Status) => (
+            proto::method::ACCOUNT_STATUS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        Command::Account(Account::Logout) => (
+            proto::method::ACCOUNT_LOGOUT,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::List) => (
+            proto::method::ROBOT_POLICIES,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        // Both of these home the robot and rebuild the controller before answering, which is
+        // seconds rather than milliseconds — the same budget `wifi scan` needed for the same
+        // reason, that the robot is genuinely working rather than ignoring us.
+        Command::Policy(Policy::Load { slot, path }) => (
+            proto::method::ROBOT_LOAD_POLICY,
+            serde_json::json!({ "slot": slot, "path": path }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        // No `path` is the reset — the same call, saying "run whatever this robot ships with".
+        Command::Policy(Policy::Reset { slot }) => (
+            proto::method::ROBOT_LOAD_POLICY,
+            serde_json::json!({ "slot": slot }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Pad(Pad::Bindings) => (
+            proto::method::PAD_BINDINGS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        Command::Pad(Pad::Bind { button, skill }) => (
+            proto::method::PAD_BIND,
+            serde_json::json!({ "button": button, "skill": skill }),
+            REPLY_TIMEOUT,
+        ),
+        // No `skill` at all is the reset, the same shape `policy reset` uses against
+        // `robot.loadPolicy`: an empty string would mean "switched off", which is a different
+        // wish and has to stay spellable.
+        Command::Pad(Pad::Reset { button }) => (
+            proto::method::PAD_BIND,
+            serde_json::json!({ "button": button }),
+            REPLY_TIMEOUT,
+        ),
+        // All four reach the Hub, so they get the budget a slow call gets: a mirror having a
+        // bad day is not a robot that has stopped talking.
+        Command::Policy(Policy::Search { query }) => (
+            proto::method::POLICY_SEARCH,
+            serde_json::json!({ "query": query }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::Check) => (
+            proto::method::POLICY_CHECK,
+            serde_json::json!({}),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        // Downloads about 7 MB and swaps the set, then homes the robot and reloads. The update
+        // budget rather than the slow-call one, for the same reason `update apply` takes it.
+        Command::Policy(Policy::Update { version }) => {
+            let mut params = serde_json::json!({});
+            if let Some(version) = version {
+                params["version"] = serde_json::Value::String(version.clone());
+            }
+            (proto::method::POLICY_INSTALL, params, UPDATE_IDLE_TIMEOUT)
+        }
+        Command::Policy(Policy::Fetch {
+            repo,
+            revision,
+            file,
+        }) => {
+            let mut params = serde_json::json!({ "repo": repo });
+            if let Some(revision) = revision {
+                params["revision"] = serde_json::Value::String(revision.clone());
+            }
+            if let Some(file) = file {
+                params["file"] = serde_json::Value::String(file.clone());
+            }
+            (proto::method::POLICY_FETCH, params, UPDATE_IDLE_TIMEOUT)
+        }
+        Command::Policy(Policy::Skills) => (
+            proto::method::ROBOT_SKILLS,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
+        // Writes config and reloads seven networks before answering, like `policy load`.
+        Command::Policy(Policy::Skill {
+            name,
+            duration,
+            path,
+            command,
+            unwind,
+            unwind_s,
+        }) => {
+            let mut params = serde_json::json!({ "name": name });
+            if let Some(duration) = duration {
+                params["duration"] = serde_json::json!(duration);
+            }
+            if let Some(path) = path {
+                params["path"] = serde_json::Value::String(path.clone());
+            }
+            if let Some(command) = command {
+                params["command"] = serde_json::json!(triple(command)?);
+            }
+            if let Some(unwind) = unwind {
+                params["unwind"] = serde_json::json!(triple(unwind)?);
+            }
+            if let Some(unwind_s) = unwind_s {
+                params["unwind_s"] = serde_json::json!(unwind_s);
+            }
+            (proto::method::ROBOT_SET_SKILL, params, SLOW_REPLY_TIMEOUT)
+        }
+        Command::Policy(Policy::Unskill { name }) => (
+            proto::method::ROBOT_REMOVE_SKILL,
+            serde_json::json!({ "name": name }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Command::Policy(Policy::Reload) => (
+            proto::method::ROBOT_RELOAD_POLICIES,
+            serde_json::json!({}),
+            SLOW_REPLY_TIMEOUT,
+        ),
         Command::Wifi(Wifi::Status) => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
         // A scan asks NetworkManager to re-scan, which takes seconds on a quiet radio.
         Command::Wifi(Wifi::Scan) => ("net.scan", serde_json::json!({}), SLOW_REPLY_TIMEOUT),
@@ -1732,6 +2084,64 @@ fn progress_line(params: &serde_json::Value) -> String {
 /// never restarts mid-flight — `btd` may be the transport it arrived over — so both are restarted
 /// about five seconds *after* the reply goes out (`docs/design/restart-order.md` §1). Every client
 /// has to expect that, and a phone app should show it as a step rather than an error.
+/// Show the code `account.login` just answered with, and open the page to approve it on.
+///
+/// The reply is JSON like every other, and this is the one call where the *human* next step is
+/// not obvious from it: a code and a URL mean nothing until somebody is told to go and type them.
+/// Printed as a note rather than instead of the JSON, so `--verbose` and piping still behave.
+///
+/// **The code is printed before the browser opens, and that order is the whole of the caution
+/// here.** `remote-access-design.md` §2.1 inherits an invariant from the mini's phone app — never
+/// open a browser by yourself — and it is about a phone: the browser replaces the only screen and
+/// backgrounds the app, so a code shown a moment earlier is gone before it is read. A terminal
+/// does not have that problem, the code stays in the scrollback, and this tool already launches a
+/// browser for `duckctl open`. So it opens — after printing, so a failure to open leaves the code
+/// on screen rather than an error where the instructions should have been.
+///
+/// It opens `verification_uri_complete`, which for Hugging Face is the plain device page: they
+/// send no complete URI and their page ignores a `?user_code=` query, so what opening buys is the
+/// navigation and not the typing. The code above it is still the part that matters.
+fn account_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
+    use std::io::IsTerminal;
+
+    let no_open = match command {
+        Command::Account(Account::Login { no_open, .. }) => *no_open,
+        _ => return None,
+    };
+    let result = reply.get("result")?;
+    let code = result["user_code"].as_str()?;
+    let uri = result["verification_uri"].as_str()?;
+    let minutes = result["expires_in"].as_u64().unwrap_or(0) / 60;
+
+    let mut note = format!(
+        "\nOpen {uri} and enter this code:\n\n    {code}\n\n\
+         You have about {minutes} minutes. The robot is doing the waiting, so this tool can \
+         disconnect now — `duckctl account status` says whether it worked."
+    );
+
+    // Not a terminal means a script, and a script that opens a browser window on whoever runs it
+    // is a surprise rather than a convenience.
+    if no_open || !std::io::stderr().is_terminal() {
+        return Some(note);
+    }
+
+    let complete = result["verification_uri_complete"]
+        .as_str()
+        .unwrap_or(uri)
+        .to_string();
+    match webbrowser::open(&complete) {
+        Ok(()) => note.push_str(&format!("\n\nOpened {complete}")),
+        // A warning, never a failure: the login has started, the code is valid for minutes, and
+        // the terminal above says everything needed to finish it by hand. This is the opposite of
+        // `duckctl open`, where opening the browser *is* the command and failing it is the result.
+        Err(e) => note.push_str(&format!(
+            "\n\nCould not open a browser ({e}) — the URL and code above still work. \
+             `--no-open` skips this."
+        )),
+    }
+    Some(note)
+}
+
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
     let component = match command {
         Command::Update(
@@ -1973,6 +2383,80 @@ mod tests {
         let (line, _) = request_line(&cli.command).expect("a request");
         assert!(line.contains(r#""method":"system.setName""#), "{line}");
         assert!(line.contains(r#""name":"leduckpierre""#), "{line}");
+    }
+
+    /// `account login` sends `force` as the robot's route table expects it.
+    #[test]
+    fn a_forced_login_says_so_on_the_wire() {
+        let cli = Cli::try_parse_from(["duckctl", "account", "login", "--force"])
+            .expect("the login form parses");
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""method":"account.login""#), "{line}");
+        assert!(line.contains(r#""force":true"#), "{line}");
+
+        let cli = Cli::try_parse_from(["duckctl", "account", "login"]).expect("parses");
+        let (line, _) = request_line(&cli.command).expect("a request");
+        assert!(line.contains(r#""force":false"#), "{line}");
+    }
+
+    /// The code and the URL reach the terminal, and `--no-open` opens nothing.
+    ///
+    /// The assertion that matters is the *order*: the code is in the note whether or not a
+    /// browser could be launched, because a login whose instructions were replaced by an error
+    /// message is a login nobody can finish by hand. `remote-access-design.md` §2.1.
+    #[test]
+    fn a_login_note_carries_the_code_without_opening_anything() {
+        let cli =
+            Cli::try_parse_from(["duckctl", "account", "login", "--no-open"]).expect("parses");
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "user_code": "A6MY-0314",
+                "verification_uri": "https://hf.co/oauth/device",
+                // The plain URI, which is what the robot sends for Hugging Face: no complete
+                // one comes back and their page prefills nothing from a query.
+                "verification_uri_complete": "https://hf.co/oauth/device",
+                "expires_in": 300,
+                "interval": 5
+            }
+        });
+
+        let note = account_note(&cli.command, &reply).expect("a note for a login");
+        assert!(note.contains("A6MY-0314"), "the code: {note}");
+        assert!(
+            note.contains("https://hf.co/oauth/device"),
+            "where to type it: {note}"
+        );
+        assert!(
+            note.contains("about 5 minutes"),
+            "how long it is good for: {note}"
+        );
+        assert!(
+            !note.contains("Opened"),
+            "--no-open must not launch a browser: {note}"
+        );
+        assert!(
+            note.contains("duckctl account status"),
+            "the note has to say how to find out whether it worked: {note}"
+        );
+    }
+
+    /// Every other command gets no login note, including the two next to it in the namespace.
+    #[test]
+    fn only_a_login_gets_the_code_note() {
+        let reply = serde_json::json!({ "result": { "account": null } });
+        for args in [
+            vec!["duckctl", "account", "status"],
+            vec!["duckctl", "account", "logout"],
+            vec!["duckctl", "info"],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("parses");
+            assert!(
+                account_note(&cli.command, &reply).is_none(),
+                "{args:?} must get no login note"
+            );
+        }
     }
 
     /// The point of the whole thing: a robot named by nobody who is typing. The environment has to
@@ -2238,6 +2722,125 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// **The Hub commands take the budget their work needs**, because the failure otherwise
+    /// looks like a robot that stopped talking rather than a mirror having a bad day.
+    #[test]
+    fn the_hub_commands_wait_as_long_as_they_need() {
+        let budget = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").1
+        };
+
+        // Reaches the network and answers.
+        assert_eq!(
+            budget(&["policy", "search", "microduck"]),
+            SLOW_REPLY_TIMEOUT
+        );
+        assert_eq!(budget(&["policy", "check"]), SLOW_REPLY_TIMEOUT);
+        // Downloads megabytes, then homes the robot and reloads seven networks.
+        assert_eq!(budget(&["policy", "update"]), UPDATE_IDLE_TIMEOUT);
+        assert_eq!(
+            budget(&["policy", "fetch", "org/repo"]),
+            UPDATE_IDLE_TIMEOUT
+        );
+    }
+
+    /// An omitted flag is an omitted field, not a null: `version`, `revision` and `file` all
+    /// mean "the usual thing" by being absent, and a `null` would be a different request.
+    #[test]
+    fn the_hub_commands_omit_what_was_not_asked_for() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let bare = wire(&["policy", "update"]);
+        assert!(
+            bare.contains(duck_ipc_proto::method::POLICY_INSTALL),
+            "{bare}"
+        );
+        assert!(!bare.contains("version"), "{bare}");
+        assert!(wire(&["policy", "update", "--version", "v1"]).contains(r#""version":"v1""#));
+
+        let fetch = wire(&["policy", "fetch", "org/repo"]);
+        assert!(fetch.contains(r#""repo":"org/repo""#), "{fetch}");
+        assert!(
+            !fetch.contains("revision") && !fetch.contains("file"),
+            "{fetch}"
+        );
+    }
+
+    /// **`policy reset` is `loadPolicy` with no path**, and that is the whole of the difference.
+    ///
+    /// Two subcommands over one method, because the wire call says "run this in that slot" and
+    /// omitting the file means "run whatever this robot ships with". A `reset` that sent
+    /// `"path":null` would be the same request, but the omission is what the daemon's
+    /// `Option<String>` is written against, and pinning it here is cheaper than finding out on
+    /// a robot.
+    #[test]
+    fn resetting_a_slot_is_loading_it_with_no_path() {
+        let wire = |args: &[&str]| {
+            let mut argv = vec!["duckctl", "policy"];
+            argv.extend_from_slice(args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let load = wire(&[
+            "load",
+            "walk",
+            "/opt/robot/policies/current/alpha_walking.onnx",
+        ]);
+        assert!(load.contains(r#""method":"robot.loadPolicy""#), "{load}");
+        assert!(load.contains(r#""slot":"walk""#), "{load}");
+        assert!(
+            load.contains(r#""path":"/opt/robot/policies/current/alpha_walking.onnx""#),
+            "{load}"
+        );
+
+        let reset = wire(&["reset", "walk"]);
+        assert!(reset.contains(r#""method":"robot.loadPolicy""#), "{reset}");
+        assert!(reset.contains(r#""slot":"walk""#), "{reset}");
+        assert!(!reset.contains("path"), "no path at all: {reset}");
+    }
+
+    /// The method names, against the daemon's own constants rather than strings typed twice.
+    #[test]
+    fn the_policy_commands_name_the_methods_the_daemon_serves() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        assert!(wire(&["policy", "list"]).contains(duck_ipc_proto::method::ROBOT_POLICIES));
+        assert!(
+            wire(&["policy", "reload"]).contains(duck_ipc_proto::method::ROBOT_RELOAD_POLICIES)
+        );
+
+        let run = wire(&["do", "polite-bow"]);
+        assert!(run.contains(duck_ipc_proto::method::ROBOT_DO), "{run}");
+        assert!(run.contains(r#""skill":"polite-bow""#), "{run}");
+    }
+
+    /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
+    /// On the reply timeout it would look like a robot that had stopped talking, mid-swap.
+    #[test]
+    fn swapping_a_policy_waits_as_long_as_a_slow_call() {
+        let budget = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").1
+        };
+
+        assert_eq!(
+            budget(&["policy", "load", "walk", "/tmp/x.onnx"]),
+            SLOW_REPLY_TIMEOUT
+        );
+        assert_eq!(budget(&["policy", "reset", "walk"]), SLOW_REPLY_TIMEOUT);
+        assert_eq!(budget(&["policy", "reload"]), SLOW_REPLY_TIMEOUT);
+        // Reading changes nothing and answers at once.
+        assert_eq!(budget(&["policy", "list"]), REPLY_TIMEOUT);
     }
 
     /// Every shape `update apply` can ask for, on the wire.

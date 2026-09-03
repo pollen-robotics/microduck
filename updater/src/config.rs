@@ -617,6 +617,23 @@ mod tests {
             "btd must be able to relay an update request from the app: {:?}",
             config.allow_users
         );
+        // And mediad, for the mutating calls its route table permits: `account.login`, and
+        // `policy.install`/`policy.fetch`, which were routed to WebRTC before this line existed
+        // and so answered PERMISSION_DENIED. Asserted rather than assumed because the failure is
+        // silent in the worst way — a button that reads as a broken feature rather than as a
+        // missing line in a config file.
+        assert!(
+            config.allow_users.iter().any(|u| u == "mediad"),
+            "mediad must be able to sign the robot in to an account: {:?}",
+            config.allow_users
+        );
+        // Neither entry may become a *group*: the two above are services, and the layering
+        // argument above is about exactly that distinction.
+        assert!(
+            config.allow_groups.is_empty(),
+            "change authority is granted to named services, not to groups: {:?}",
+            config.allow_groups
+        );
         assert_ne!(
             config.auto_apply,
             AutoApply::All,

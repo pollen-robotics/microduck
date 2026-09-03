@@ -197,12 +197,11 @@
   <section>
     <h2>do · sound</h2>
     <div class="row">
+      <!-- Filled from `robot.policies` when the channel opens. Which skills a robot has is
+           config, so a list written here would be five guesses: wrong on a robot that has been
+           given a bow, and offering a dead entry on one that has had a kick taken away. -->
       <select id="skill">
-        <option value="sit_toggle">sit ⇄ stand</option>
-        <option value="ground_pick">ground pick</option>
-        <option value="kick_left">kick left</option>
-        <option value="kick_right">kick right</option>
-        <option value="roulade">roulade</option>
+        <option value="">asking the robot…</option>
       </select>
       <button id="do">do</button>
       <span class="grow"></span>
@@ -599,6 +598,7 @@ function startTelemetry() {
   // 2 Hz: enough to watch a robot, and decimation is server-side and per-subscriber, so this costs
   // the robot a twenty-fifth of what a digital twin at 50 Hz would.
   call("robot.subscribe", { hz: 2 }, true).catch(() => {});
+  call("robot.policies", {}, true).then(onPolicies).catch(() => {});
   poll();
   healthTimer = setInterval(poll, 2000);
   statsTimer = setInterval(readStats, 1000);
@@ -641,6 +641,32 @@ async function poll() {
       ? `${health.cpu_temp_c.toFixed(0)} °C board` : null;
     $("t-temps").textContent = [motors, cpu].filter(Boolean).join(" · ") || "not read";
   } catch { /* logged by `call` */ }
+}
+
+// **The skills a robot has are config**, so the menu is the robot's answer rather than this
+// page's assumption. A build that shipped the five names would be wrong in both directions on any
+// robot somebody has configured — missing the bow they added, offering the kick they removed.
+//
+// An empty list means the robot did not say, which is an older daemon rather than a robot with no
+// skills; the five it certainly has are better than an empty menu, and the distinction matters
+// because one of those is a robot to update and the other is a robot to leave alone.
+function onPolicies(policies) {
+  const menu = $("skill");
+  const names = (policies && policies.skills) || [];
+  const pretty = { sit_toggle: "sit ⇄ stand", ground_pick: "ground pick",
+                   kick_left: "kick left", kick_right: "kick right" };
+  const list = names.length ? names
+    : ["sit_toggle", "ground_pick", "kick_left", "kick_right", "roulade"];
+  menu.textContent = "";
+  for (const name of list) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = pretty[name] || name.replace(/[-_]/g, " ");
+    menu.append(option);
+  }
+  log("in", names.length
+    ? `${names.length} skill(s): ${names.join(", ")}`
+    : "this robot did not name its skills — an older daemon; offering the built-in five");
 }
 
 function onState(state) {

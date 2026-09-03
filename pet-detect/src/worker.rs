@@ -35,6 +35,19 @@ pub enum SoundEvent {
 /// 32 ms at 16 kHz.
 const SENTRY_FRAME: u32 = 512;
 
+/// How long a sound keeps the classifier armed after it, in [`SENTRY_FRAME`]s.
+///
+/// **A whole window, derived rather than written down.** A sound heard now is still inside
+/// the window the classifier looks at a window from now, so anything shorter would shut the
+/// gate on audio still under examination — and a stroke is not continuous anyway, it is
+/// scratches with gaps to sit through. Rounded up, because a hold that covers all but the
+/// last 23 ms of a window covers the wrong thing.
+///
+/// Written as arithmetic on [`crate::WINDOW_SAMPLES`] because the obvious literal is wrong:
+/// a window is 16 240 samples, which is 1.015 s and *not* the 31 frames that "about a
+/// second" suggests.
+const AUDIBLE_HOLD_FRAMES: u32 = (crate::WINDOW_SAMPLES as u32).div_ceil(SENTRY_FRAME);
+
 /// RMS envelope watcher over ~32 ms frames with a slowly-adapting ambient floor. Petting
 /// sounds are loud on this mic (it's practically a contact mic for head scratches), so
 /// events are suppressed while the classifier reports petting (+1 s hangover).
@@ -51,6 +64,8 @@ struct SoundSentry {
     event_peak: f32,
     /// Frames since the last periodic floor log (~every 60 s).
     floor_log_frames: u32,
+    /// Frames left in which the room counts as having made a sound. See [`Self::audible`].
+    audible_frames: u32,
 }
 
 impl SoundSentry {
@@ -66,7 +81,28 @@ impl SoundSentry {
             petting_hold_frames: 0,
             event_peak: 0.0,
             floor_log_frames: 0,
+            audible_frames: 0,
         }
+    }
+
+    /// Whether anything in the last second stood out from the room.
+    ///
+    /// **This is what decides whether the classifier runs at all.** The petting model is
+    /// 40 log-mel bands over a second of audio — a hundred 512-point FFTs and a forward
+    /// pass, four times a second, for ever. In a quiet room every one of those returns the
+    /// same answer, and this is the cheap way to know it in advance: the sentry is already
+    /// measuring the room frame by frame, so the gate reads its floor rather than keeping a
+    /// second one that could drift from it.
+    ///
+    /// Armed by the *lower* of the sentry's two thresholds, the one that says an event has
+    /// ended rather than the one that says a clap has started. This is not deciding whether
+    /// a sound is worth reporting; it is deciding whether a pet is worth looking for, and
+    /// the two want very different margins. A stroke gentle enough to stay under three
+    /// times the ambient floor for a whole second would be missed — and would have scored
+    /// far below the 0.95 enter threshold anyway, on a mic this model was trained through
+    /// where a head scratch is loud enough to need muting.
+    fn audible(&self) -> bool {
+        self.audible_frames > 0
     }
 
     fn push(&mut self, samples: &[f32], petting: bool, out: &mut Vec<SoundEvent>) {
@@ -103,6 +139,14 @@ impl SoundSentry {
         // gain puts real claps well under an absolute guess.)
         let on_thresh = (self.floor * 6.0).max(0.002);
         let off_thresh = (self.floor * 3.0).max(0.0012);
+        // Arm the classifier, or let the arming run down. Above the event thresholds so it
+        // is decided on every frame including the ones inside an event, where the floor is
+        // frozen and a petting session is exactly what is going on.
+        if rms > off_thresh {
+            self.audible_frames = AUDIBLE_HOLD_FRAMES;
+        } else {
+            self.audible_frames = self.audible_frames.saturating_sub(1);
+        }
         if !self.in_event {
             // The ambient floor adapts only from non-event frames (τ ≈ 6 s), so sustained
             // noise (gait servos, music) raises the bar instead of spamming events.
@@ -357,7 +401,14 @@ fn pump(
             i16_buf.push(i16::from_le_bytes(*chunk));
         }
         let samples = i16_to_f32(&i16_buf);
-        let (events, _p) = detector.push_samples(&samples)?;
+        // Read before the sentry sees this batch, deliberately: the answer is a one-second
+        // hangover rather than a verdict on these 128 ms, so it spans batches and reading it
+        // one batch early costs nothing. Reading it after would mean pushing to the sentry
+        // first, and the sentry's petting mute wants the state from *after* this batch's
+        // inference — see below. Only one of the two can go first, and this is the one whose
+        // ordering does not matter.
+        let audible = sentry.audible();
+        let (events, _p) = detector.push_samples(&samples, audible)?;
         for ev in events {
             if tx.send(ev).is_err() {
                 // Receiver dropped — the daemon is shutting down.
@@ -378,4 +429,91 @@ fn pump(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One sentry frame of a constant amplitude, pushed through as the mic would deliver it.
+    fn frames(sentry: &mut SoundSentry, amplitude: f32, count: u32) {
+        let block = vec![amplitude; SENTRY_FRAME as usize];
+        let mut out = Vec::new();
+        for _ in 0..count {
+            sentry.push(&block, false, &mut out);
+        }
+    }
+
+    /// **The point of the gate.** A room with nothing happening in it never arms the
+    /// classifier, so the hundred FFTs and the forward pass never run.
+    ///
+    /// A regression is silent in exactly the way the camera one is: petting still works,
+    /// and the only symptom is a robot warmer than it needs to be.
+    #[test]
+    fn a_quiet_room_never_arms_the_classifier() {
+        let mut sentry = SoundSentry::new();
+        assert!(!sentry.audible(), "nothing has happened yet");
+
+        // Well under the 0.0012 absolute minimum the off threshold floors at.
+        frames(&mut sentry, 0.0001, 200);
+        assert!(!sentry.audible(), "silence must not arm it");
+    }
+
+    /// A sound arms it, and it stays armed across the gaps in a stroke.
+    #[test]
+    fn a_sound_arms_the_classifier_and_the_arming_outlives_it() {
+        let mut sentry = SoundSentry::new();
+
+        frames(&mut sentry, 0.05, 2);
+        assert!(sentry.audible(), "a loud frame must arm it");
+
+        // The gaps between scratches must not shut the gate mid-stroke.
+        frames(&mut sentry, 0.0001, AUDIBLE_HOLD_FRAMES - 1);
+        assert!(sentry.audible(), "the hangover must span a gap in a stroke");
+    }
+
+    /// And it lets go, or the gate would be a one-way switch and the saving would last
+    /// until the first door slammed.
+    #[test]
+    fn the_arming_runs_out_after_the_hold() {
+        let mut sentry = SoundSentry::new();
+
+        frames(&mut sentry, 0.05, 1);
+        assert!(sentry.audible());
+
+        frames(&mut sentry, 0.0001, AUDIBLE_HOLD_FRAMES);
+        assert!(!sentry.audible(), "the hold must expire");
+    }
+
+    /// The hold is at least a window wide, because a sound heard now is still inside the
+    /// window the classifier looks at a second from now.
+    #[test]
+    fn the_hold_covers_a_whole_window() {
+        let held = f64::from(AUDIBLE_HOLD_FRAMES) * f64::from(SENTRY_FRAME) / 16_000.0;
+        let window = crate::WINDOW_SAMPLES as f64 / 16_000.0;
+        assert!(
+            held >= window,
+            "{held:.2}s of hold for a {window:.2}s window"
+        );
+    }
+
+    /// The gate opens on the sentry's *lower* threshold. Tying it to the upper one would
+    /// tune "is a pet worth looking for" against "is a clap worth reporting", which are not
+    /// the same question and do not want the same margin.
+    #[test]
+    fn the_gate_opens_below_the_event_threshold() {
+        let mut sentry = SoundSentry::new();
+        let floor = sentry.floor;
+        // Between the off threshold (3x) and the on threshold (6x), and above both
+        // absolute minimums at the starting floor.
+        let between = floor * 4.5;
+        assert!(between > (floor * 3.0).max(0.0012));
+        assert!(between < (floor * 6.0).max(0.002));
+
+        frames(&mut sentry, between, 1);
+        assert!(
+            sentry.audible(),
+            "a sound too small to report is not too small to classify"
+        );
+    }
 }
