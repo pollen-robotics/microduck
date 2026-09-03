@@ -476,7 +476,8 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
-| **Select**, held 2 s | sit down, then power off |
+| **Select** | torque off (`robot.relax`): the emergency release. The robot drops, so hold it |
+| **Select**, held 2 s | power off (the press has already cut torque) |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
