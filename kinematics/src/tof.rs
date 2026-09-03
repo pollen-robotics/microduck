@@ -109,8 +109,8 @@ impl Reprojector {
         let step = 2.0 * half / (COLS as f64 - 1.0);
         let mut beams = [[0.0; 3]; N_ZONES];
         for (i, beam) in beams.iter_mut().enumerate() {
-            let elevation = half - (i / COLS) as f64 * step;
-            let azimuth = half - (i % COLS) as f64 * step;
+            let elevation = ((i / COLS) as f64).mul_add(-step, half);
+            let azimuth = ((i % COLS) as f64).mul_add(-step, half);
             *beam = [
                 elevation.cos() * azimuth.cos(),
                 elevation.cos() * azimuth.sin(),
@@ -175,15 +175,15 @@ impl Reprojector {
             // Positive when the beam looks below the *world* horizon.
             let downward = -dir_level[2];
             let point = [
-                sensor.pos[0] + r * dir[0],
-                sensor.pos[1] + r * dir[1],
-                sensor.pos[2] + r * dir[2],
+                r.mul_add(dir[0], sensor.pos[0]),
+                r.mul_add(dir[1], sensor.pos[1]),
+                r.mul_add(dir[2], sensor.pos[2]),
             ];
             if above_floor > 0.0 && downward > 0.0 && r * downward >= floor_threshold {
                 zones[i] = Zone::Floor { point };
                 continue;
             }
-            let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
+            let horizontal = r * dir_level[0].hypot(dir_level[1]);
             if horizontal < Self::MIN_RANGE_M {
                 zones[i] = Zone::TooClose;
                 continue;
@@ -201,19 +201,26 @@ impl Reprojector {
 /// a gravity too small to trust — an IMU that has not converged should level
 /// nothing rather than something random.
 fn level_from_gravity(gravity: [f64; 3]) -> Quat {
-    let n = (gravity[0] * gravity[0] + gravity[1] * gravity[1] + gravity[2] * gravity[2]).sqrt();
+    let n = gravity[2]
+        .mul_add(
+            gravity[2],
+            gravity[1].mul_add(gravity[1], gravity[0] * gravity[0]),
+        )
+        .sqrt();
     if n < 0.5 {
         return Quat::IDENTITY;
     }
     let g = [gravity[0] / n, gravity[1] / n, gravity[2] / n];
     let down = [0.0, 0.0, -1.0f64];
     let axis = [
-        g[1] * down[2] - g[2] * down[1],
-        g[2] * down[0] - g[0] * down[2],
-        g[0] * down[1] - g[1] * down[0],
+        g[2].mul_add(-down[1], g[1] * down[2]),
+        g[0].mul_add(-down[2], g[2] * down[0]),
+        g[1].mul_add(-down[0], g[0] * down[1]),
     ];
-    let s = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-    let c = g[0] * down[0] + g[1] * down[1] + g[2] * down[2];
+    let s = axis[2]
+        .mul_add(axis[2], axis[1].mul_add(axis[1], axis[0] * axis[0]))
+        .sqrt();
+    let c = g[2].mul_add(down[2], g[1].mul_add(down[1], g[0] * down[0]));
     if s < 1e-9 {
         return if c > 0.0 {
             Quat::IDENTITY

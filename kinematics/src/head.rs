@@ -141,7 +141,7 @@ impl HeadFk {
             ];
             // cv2 camera axes: +x right, +y down, +z forward.
             let v = cam.quat.conjugate().rotate(v);
-            let flat = (v[0] * v[0] + v[2] * v[2]).sqrt();
+            let flat = v[0].hypot(v[2]);
             [v[0].atan2(v[2]), v[1].atan2(flat)]
         };
 
@@ -166,19 +166,22 @@ impl HeadFk {
 
             // Solve (JᵀJ + λI) Δ = -Jᵀe, the 2×2 case written out.
             let (a, b) = (
-                j[0][0] * j[0][0] + j[1][0] * j[1][0] + LAMBDA,
-                j[0][0] * j[0][1] + j[1][0] * j[1][1],
+                j[1][0].mul_add(j[1][0], j[0][0] * j[0][0]) + LAMBDA,
+                j[1][0].mul_add(j[1][1], j[0][0] * j[0][1]),
             );
-            let d = j[0][1] * j[0][1] + j[1][1] * j[1][1] + LAMBDA;
+            let d = j[1][1].mul_add(j[1][1], j[0][1] * j[0][1]) + LAMBDA;
             let g = [
-                j[0][0] * e[0] + j[1][0] * e[1],
-                j[0][1] * e[0] + j[1][1] * e[1],
+                j[1][0].mul_add(e[1], j[0][0] * e[0]),
+                j[1][1].mul_add(e[1], j[0][1] * e[0]),
             ];
-            let det = a * d - b * b;
+            let det = b.mul_add(-b, a * d);
             if det.abs() < 1e-12 {
                 break; // fully singular and damped-out: nothing left to gain
             }
-            let step = [(-d * g[0] + b * g[1]) / det, (b * g[0] - a * g[1]) / det];
+            let step = [
+                b.mul_add(g[1], -d * g[0]) / det,
+                a.mul_add(-g[1], b * g[0]) / det,
+            ];
             let scale = (MAX_STEP / step[0].hypot(step[1])).min(1.0);
             joints[1] = clamp(joints[1] + scale * step[0], range(1));
             joints[2] = clamp(joints[2] + scale * step[1], range(2));

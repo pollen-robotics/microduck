@@ -217,7 +217,7 @@ fn parse_floats_attr(
 }
 
 fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let n = v[2].mul_add(v[2], v[1].mul_add(v[1], v[0] * v[0])).sqrt();
     if n < 1e-12 {
         // A zero axis is a broken model; +z (MJCF's own default) keeps the
         // parse usable and the error visible in FK rather than as NaN.
