@@ -58,6 +58,9 @@ Things the theremin/chorale steps built that the runtime's brain never had:
 - **Group head-bob / sway** — all ducks in phase on the shared beat; visual sync tolerates
   ~50 ms where audio wanted 20. Group pose on the downbeat of a bar. Conga line.
 - **Dance** (already a runtime state) becomes *synchronized* dance when company is present.
+  One duck dancing to **heard** music is a different clock (the onboard mic, not the
+  BLE beat) and lives in [`dance-to-music.md`](dance-to-music.md) until the brain can
+  choose it as a state rather than as another `robotd` mode.
 
 **Musical, beyond the chorale:**
 

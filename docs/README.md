@@ -61,6 +61,7 @@ thinking is not lost and does not get mistaken for a decision.
 | | |
 |---|---|
 | [`autonomous_behavior.md`](ideas/autonomous_behavior.md) | The behavior stack: what the runtime's brain has to give up, and the ideas the chorale and theremin work left behind. |
+| [`dance-to-music.md`](ideas/dance-to-music.md) | Hear a beat on the onboard mic, drive the stand policy's pose command. Not a new gait and not a new mode. |
 
 ## Elsewhere
 
