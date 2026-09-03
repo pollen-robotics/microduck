@@ -103,6 +103,15 @@ impl Pool {
     }
 
     /// Send one line to `service` on `lane`'s connection, connecting first if needed.
+    ///
+    /// A daemon that restarted between two requests is ordinary here: `robotd` is the one an
+    /// update restarts, and `updaterd` restarts itself from a release's postinstall hook. The
+    /// connection from before the restart is still in the pool, its reader has already seen the
+    /// socket close, and the first write into it fails. Those bytes never left, so they are written
+    /// again on a fresh connection rather than reported. Reporting them told the console that a
+    /// daemon listening on a fresh socket was not answering, once per lane, after every restart.
+    /// Once and not in a loop: a daemon that is genuinely gone fails the reconnect, and that is
+    /// the error worth reporting.
     pub async fn send(
         &mut self,
         service: proto::Service,
@@ -110,25 +119,35 @@ impl Pool {
         line: &str,
     ) -> io::Result<()> {
         let key = (service, lane);
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+
         if !self.conns.contains_key(&key) {
             let conn = self.open(service, lane).await?;
             self.conns.insert(key, conn);
         }
-        let conn = self.conns.get_mut(&key).expect("just inserted");
+        match self.write(key, &bytes).await {
+            Err(e) if peer_is_gone(&e) => {
+                let conn = self.open(service, lane).await?;
+                self.conns.insert(key, conn);
+                self.write(key, &bytes).await
+            }
+            done => done,
+        }
+    }
 
-        let mut bytes = line.as_bytes().to_vec();
-        bytes.push(b'\n');
-
+    /// One bounded write on the connection for `key`. Any failure drops that connection, so
+    /// nothing keeps writing into a dead socket. Only this lane's: the others may be perfectly
+    /// alive.
+    async fn write(&mut self, key: (proto::Service, proto::Lane), bytes: &[u8]) -> io::Result<()> {
+        let conn = self.conns.get_mut(&key).expect("connection present");
         let write = async {
-            conn.write.write_all(&bytes).await?;
+            conn.write.write_all(bytes).await?;
             conn.write.flush().await
         };
         match tokio::time::timeout(WRITE_TIMEOUT, write).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                // A broken pipe here is ordinary — the daemon restarted. Drop this lane's
-                // connection so the next call reconnects rather than writing into a dead socket
-                // forever. Only this lane's: the others may be perfectly alive.
                 self.conns.remove(&key);
                 Err(e)
             }
@@ -181,5 +200,102 @@ impl Pool {
 
         tracing::debug!(service = ?service, lane = ?lane, path = %path.display(), "connected");
         Ok(Conn { write })
+    }
+}
+
+/// Whether a write failed because the peer went away, rather than being slow or refusing. Only
+/// these are worth one more try, because only these mean the bytes went to a daemon that is no
+/// longer there. A timeout is a daemon that is there and stuck, and that is not retried.
+fn peer_is_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A fake daemon that answers one request with `response` and hangs up.
+    fn serve_once(path: &Path, response: proto::Response) -> tokio::task::JoinHandle<String> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let request = BufReader::new(read)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let mut line = serde_json::to_vec(&response).unwrap();
+            line.push(b'\n');
+            write.write_all(&line).await.unwrap();
+            write.flush().await.unwrap();
+            request
+        })
+    }
+
+    /// The daemon restarted between two requests.
+    ///
+    /// The same pool `btd` has, with the same hole it had: the first write after a restart went
+    /// into the socket the old daemon closed, failed, and the console was told the service was
+    /// not answering while it was listening on a fresh socket the whole time.
+    #[tokio::test]
+    async fn a_restarted_daemon_gets_the_next_request_not_the_one_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.sock");
+        let sockets = Sockets {
+            robot: path.clone(),
+            updater: dir.path().join("updaterd.sock"),
+            config: dir.path().join("configd.sock"),
+            pad: dir.path().join("padd.sock"),
+            tof: dir.path().join("tofd.sock"),
+        };
+        let (replies, mut forwarded) = mpsc::channel(8);
+        let mut pool = Pool::new(sockets, replies);
+
+        let before = serve_once(
+            &path,
+            proto::Response::ok(Some(proto::Id::Number(1)), &serde_json::json!({})),
+        );
+        pool.send(
+            proto::Service::Robot,
+            proto::Lane::Prompt,
+            r#"{"jsonrpc":"2.0","id":1,"method":"robot.health"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(
+            forwarded.recv().await.is_some(),
+            "the first answer is forwarded"
+        );
+        // The daemon has answered and hung up: it is restarting.
+        before.await.unwrap();
+
+        // And it is back, listening on a fresh socket at the same path.
+        std::fs::remove_file(&path).unwrap();
+        let after = serve_once(
+            &path,
+            proto::Response::ok(Some(proto::Id::Number(2)), &serde_json::json!({})),
+        );
+        pool.send(
+            proto::Service::Robot,
+            proto::Lane::Prompt,
+            r#"{"jsonrpc":"2.0","id":2,"method":"robot.health"}"#,
+        )
+        .await
+        .expect("a daemon that is back must get the request, not a broken pipe");
+        let request = after.await.unwrap();
+        assert!(request.contains(r#""id":2"#), "{request}");
+        assert!(
+            forwarded.recv().await.is_some(),
+            "and its answer is forwarded"
+        );
     }
 }
