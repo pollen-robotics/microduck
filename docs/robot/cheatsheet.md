@@ -411,6 +411,7 @@ sudo robotctl robot init
 
 ```
 sudo robotctl robot relax --yes
+sudo robotctl robot reboot-motors           # every servo; or `reboot-motors 3 11` for just those. Torque off, then init / Start
 ```
 
 `init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
@@ -476,6 +477,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
+| **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
 | **Select**, held 2 s | sit down, then power off |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
