@@ -993,6 +993,32 @@ mod tests {
         );
     }
 
+    /// **`mediad` reads this file, so `access_token` at the top level is a contract.**
+    ///
+    /// The test lives here rather than in `mediad` because this is the writer: `mediad` cannot
+    /// depend on this crate — it is unprivileged and has no business linking the updater — so it
+    /// reads the one field it needs with a two-field struct of its own
+    /// (`mediad::relay::Relay::token`). Renaming the field here, or nesting it, would leave a
+    /// robot that is signed in and unreachable, with nothing failing anywhere. Adding fields is
+    /// fine and is what the last assertion is about.
+    #[test]
+    fn the_stored_shape_is_what_mediad_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        store.save(&token("hf_abc")).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(
+            raw["access_token"], "hf_abc",
+            "`mediad::relay` reads exactly this key at exactly this level"
+        );
+        assert!(
+            raw.get("refresh_token").is_some() && raw.get("expires_at").is_some(),
+            "and the rest of the record is this daemon's business: {raw}"
+        );
+    }
+
     /// A file somebody edited by hand reads as "signed out", not as a broken daemon.
     #[test]
     fn a_corrupt_credential_is_signed_out_rather_than_an_error() {

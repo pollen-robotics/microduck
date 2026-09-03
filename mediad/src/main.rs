@@ -37,6 +37,27 @@ struct Args {
     #[arg(long, default_value_t = 8443)]
     port: u32,
 
+    /// The rendezvous service this robot registers with, so it can be reached from off its LAN.
+    ///
+    /// Defaults to the Space the mini's fleet uses. A flag rather than a config key because there
+    /// is nothing to choose on a real robot — what it is for is pointing a board at a fake, or at
+    /// a self-hosted copy on the day somebody wants one. `docs/design/remote-access-design.md` §4.
+    #[arg(long, default_value = mediad::relay::DEFAULT_RENDEZVOUS)]
+    rendezvous_url: String,
+
+    /// The account credential `updaterd` writes, which the relay needs to prove whose robot this
+    /// is. Absent means nobody has signed this robot in, and remote access is simply off.
+    #[arg(long, default_value = mediad::relay::DEFAULT_TOKEN_PATH)]
+    token: PathBuf,
+
+    /// Do not register with the rendezvous service, whatever the token file says.
+    ///
+    /// For a board that is signed in and being worked on: a duck registering from a bench while
+    /// somebody drives the same account's robot elsewhere is a producer in a list nobody wants,
+    /// and evicting it means finding this flag afterwards.
+    #[arg(long)]
+    no_remote: bool,
+
     /// Where the console is served. `http://<robot>:8080/`, and nothing else to run.
     ///
     /// **Two ports, and only this one is ever typed.** `webrtcsink` owns the listener on `--port`
@@ -210,6 +231,33 @@ fn main() -> ExitCode {
             api_version = producer.api_version,
             "producing as"
         );
+
+        // The outward half of remote access, and it is deliberately *after* the producer is
+        // learned: the name a client sees in the service's listing comes from the same place the
+        // local `meta` gets it, and a relay that registered first would publish an unnamed robot
+        // until the next restart.
+        //
+        // Spawned whatever happens next. It is inert without a token, it holds no lock, and a
+        // pipeline that fails to build should not take remote access down with it — a robot that
+        // appears in its owner's list and cannot stream is still a robot somebody can reach to
+        // find out why.
+        if args.no_remote {
+            tracing::info!("--no-remote: this robot will not register with the rendezvous service");
+        } else {
+            match mediad::relay::Meta::of(&producer, None) {
+                None => tracing::warn!(
+                    "no serial and no machine id, so this robot has no stable identity to \
+                     register with; remote access is off"
+                ),
+                Some(meta) => {
+                    if let Some(relay) =
+                        mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
+                    {
+                        tokio::spawn(relay.run());
+                    }
+                }
+            }
+        }
 
         let source = if media.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {

@@ -19,6 +19,9 @@
 
 pub mod config;
 pub mod producer;
+/// The outward connection to the rendezvous service — what makes a duck reachable from off its
+/// own LAN. `docs/design/remote-access-design.md` §3.
+pub mod relay;
 pub mod route;
 pub mod session;
 pub mod upstream;
