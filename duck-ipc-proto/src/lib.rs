@@ -469,6 +469,10 @@ pub mod method {
     /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
     pub const ROBOT_RELAX: &str = "robot.relax";
 
+    /// Let go softly: gain to `gain_limp` at once, then down to zero over one second, then
+    /// torque off. Same end state as `relax`, without the snap. The gamepad's Select press.
+    pub const ROBOT_SOFTEN: &str = "robot.soften";
+
     // ── skills ───────────────────────────────────────────────────────────────
     //
     // One-shot scripted moves, ported from `microduck_runtime`. Each swaps a dedicated
@@ -809,6 +813,8 @@ pub enum Call {
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
     RobotRelax,
+    /// Let go softly over a second, then cut power. See [`method::ROBOT_SOFTEN`].
+    RobotSoften,
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -978,6 +984,7 @@ impl Call {
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
+            Call::RobotSoften => method::ROBOT_SOFTEN,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -1148,6 +1155,7 @@ impl Call {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotSoften
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -1288,6 +1296,7 @@ impl Call {
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotSoften
             | Call::RobotShutdown
             | Call::RobotPolicies
             | Call::RobotReloadPolicies
@@ -1345,6 +1354,7 @@ impl Call {
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
+            method::ROBOT_SOFTEN => Call::RobotSoften,
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
@@ -1492,6 +1502,7 @@ pub mod test_support {
             }),
             Call::RobotInit,
             Call::RobotRelax,
+            Call::RobotSoften,
             Call::RobotDo(DoParams {
                 skill: "ground_pick".into(),
             }),
@@ -4636,7 +4647,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            61,
+            62,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

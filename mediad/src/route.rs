@@ -82,7 +82,7 @@ fn permits(call: &proto::Call) -> bool {
         // camera: it is looking at the robot, which is precisely what a phone in the room over
         // Bluetooth was not. Permitted for that reason, and it would be worth revisiting if a
         // control-only session without video ever becomes a normal thing.
-        RobotEnable(_) | RobotInit | RobotRelax => true,
+        RobotEnable(_) | RobotInit | RobotRelax | RobotSoften => true,
 
         // `robot.stop` is permitted here and refused over BLE, and the difference is honesty
         // rather than authority. BLE's objection was that a stop button over "an unbonded,

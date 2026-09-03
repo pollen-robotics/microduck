@@ -354,7 +354,7 @@ fn permits(call: &proto::Call) -> bool {
         // offer, and `robot.init` is its counterpart: standing a robot up moves every joint at once,
         // which wants the person doing it to be looking at the robot rather than at a screen. Both
         // are `robotctl` on the robot, deliberately.
-        RobotInit | RobotRelax => false,
+        RobotInit | RobotRelax | RobotSoften => false,
 
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt

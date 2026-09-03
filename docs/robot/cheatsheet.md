@@ -411,6 +411,7 @@ sudo robotctl robot init
 
 ```
 sudo robotctl robot relax --yes
+sudo robotctl robot soften          # the gentle version: 1 s gain ramp to zero, then torque off
 ```
 
 `init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
@@ -476,7 +477,8 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
-| **Select**, held 2 s | sit down, then power off |
+| **Select** | soft release: gain down to zero over 1 s, then torque off. The robot folds to the floor |
+| **Select**, held 2 s | power off (the press above has already let go of the motors) |
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller

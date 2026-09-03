@@ -436,6 +436,13 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Let go softly: gain to the limp value at once, down to zero over a second, then torque
+    /// off. The robot still ends up on the floor, just without the snap. Then `init` or Start.
+    Soften {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Run a one-shot skill by name — `roulade`, `kick_left`, `ground_pick`, `sit_toggle`, or
     /// whatever else this robot has.
     ///
@@ -2601,6 +2608,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     let (call, json) = match &command {
         RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+        RobotCommand::Soften { json } => (proto::Call::RobotSoften, *json),
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
                 skill: skill.clone(),
@@ -2668,6 +2676,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     match command {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
+        RobotCommand::Soften { .. } => println!("letting go softly — torque off in a second"),
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }

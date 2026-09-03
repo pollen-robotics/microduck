@@ -34,6 +34,7 @@ const THEREMIN_UP: u8 = 1;
 const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
+const POWER_SOFTEN: u8 = 3;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -230,6 +231,8 @@ pub enum PowerRequest {
     Init,
     /// Torque off. The robot collapses if nothing holds it.
     Relax,
+    /// Gain to `gain_limp` now, to zero over a second, then torque off. The soft `Relax`.
+    Soften,
 }
 
 /// What the loop reads at the top of a tick.
@@ -471,6 +474,12 @@ impl Intents {
         self.power.store(POWER_RELAX, Ordering::Relaxed);
     }
 
+    /// Ask the loop to let go softly, then cut power. Clears `enabled` like `request_relax`.
+    pub fn request_soften(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+        self.power.store(POWER_SOFTEN, Ordering::Relaxed);
+    }
+
     /// Take the pending request, leaving none.
     ///
     /// Called once per tick by the loop. A later request replaces an unread earlier one, which is
@@ -540,6 +549,7 @@ impl Intents {
         match self.power.swap(POWER_NONE, Ordering::Relaxed) {
             POWER_INIT => Some(PowerRequest::Init),
             POWER_RELAX => Some(PowerRequest::Relax),
+            POWER_SOFTEN => Some(PowerRequest::Soften),
             _ => None,
         }
     }
