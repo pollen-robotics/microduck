@@ -469,6 +469,12 @@ pub mod method {
     /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
     pub const ROBOT_RELAX: &str = "robot.relax";
 
+    /// Reboot servos: the REBOOT instruction, which clears a latched hardware error (overload,
+    /// overheating, electrical shock) that otherwise holds torque off until the battery is pulled.
+    /// Torque is cut on every joint first and the robot is back at limp afterwards, so `robot.init`
+    /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
+    pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
+
     // ── skills ───────────────────────────────────────────────────────────────
     //
     // One-shot scripted moves, ported from `microduck_runtime`. Each swaps a dedicated
@@ -809,6 +815,8 @@ pub enum Call {
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
     RobotRelax,
+    /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
+    RobotRebootMotors(RebootMotorsParams),
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -978,6 +986,7 @@ impl Call {
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
+            Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -1148,6 +1157,7 @@ impl Call {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotRebootMotors(_)
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -1255,6 +1265,7 @@ impl Call {
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
+            Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
@@ -1345,6 +1356,7 @@ impl Call {
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
+            method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
@@ -1492,6 +1504,7 @@ pub mod test_support {
             }),
             Call::RobotInit,
             Call::RobotRelax,
+            Call::RobotRebootMotors(RebootMotorsParams { ids: vec![3, 11] }),
             Call::RobotDo(DoParams {
                 skill: "ground_pick".into(),
             }),
@@ -2029,6 +2042,13 @@ pub struct ThereminState {
 /// The five above are still the names a stock robot answers to. An unknown one is refused with
 /// the list it does know, which is the same shape as a bad policy slot.
 pub type Skill = String;
+
+/// Which servos [`method::ROBOT_REBOOT_MOTORS`] reboots. Empty means every servo.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RebootMotorsParams {
+    pub ids: Vec<u8>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4636,7 +4656,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            61,
+            62,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

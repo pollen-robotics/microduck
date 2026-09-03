@@ -12,8 +12,8 @@
 //! Every slot is stamped, because the loop's real question is never "what is the value" but
 //! "how old is it". That is what the deadman reads.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// "No mode switch pending" in [`Intents::mode_switch`].
 ///
@@ -198,6 +198,9 @@ pub struct Intents {
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
     /// and the loop reads value + age so a dead client's ride decays instead of looping.
     wheee: ArcSwap<Stamped<bool>>,
+    /// `robot.rebootMotors`, pending: the ids to reboot (empty = all). A mutex rather than an
+    /// atomic because it carries a list; the loop takes it with `try_lock`, so it can never wait.
+    reboot_motors: Mutex<Option<Vec<u8>>>,
 }
 
 /// A pending policy change, as [`Intents::request_policy_change`] took it.
@@ -282,6 +285,7 @@ impl Intents {
             mode_switch: AtomicU8::new(MODE_NONE),
             policy_change: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
+            reboot_motors: Mutex::new(None),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
                 at_us: 0,
@@ -465,6 +469,24 @@ impl Intents {
     /// Ask the loop to cut power to the joints.
     ///
     /// Also clears `enabled`: a robot that has been asked to go limp is not one the policy should
+    /// Ask the loop to reboot these servos (empty = all). Clears `enabled` for the same reason
+    /// [`Self::request_relax`] does: the robot comes back up when someone asks, not mid-reboot.
+    pub fn request_reboot_motors(&self, ids: Vec<u8>) {
+        self.enabled.store(false, Ordering::Relaxed);
+        if let Ok(mut slot) = self.reboot_motors.lock() {
+            *slot = Some(ids);
+        }
+    }
+
+    /// Take the pending reboot request, if any. Never blocks: a contended lock reads as "nothing
+    /// yet" and the request is picked up on the next tick.
+    pub fn take_reboot_motors(&self) -> Option<Vec<u8>> {
+        self.reboot_motors
+            .try_lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     /// keep driving, and leaving that flag set would have the next tick bring it straight back up.
     pub fn request_relax(&self) {
         self.enabled.store(false, Ordering::Relaxed);
