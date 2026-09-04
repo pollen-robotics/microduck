@@ -422,10 +422,25 @@ impl Chorale {
                     // `Follower` does anyway for its first few beats.
                     return self.tick(now);
                 }
-                // Nobody singing. If anyone is here and this duck has the lowest id, conduct.
+                // Nobody singing. The lowest id conducts — but only for as long as it takes,
+                // because the lowest id in *this duck's view* is not the lowest in the room.
+                //
+                // BLE discovery is not simultaneous or symmetric: the duck with the lowest id can
+                // still be seeing nobody while everyone else already sees it. Every other duck
+                // then defers to a duck that thinks it is alone, and four ducks sit in silence
+                // waiting for each other — which is exactly what "sometimes nothing happens"
+                // looked like on the floor. So deference is a timer, not a veto: wait one extra
+                // `SETTLE` per lower-id duck in view, and the second-lowest takes over if the
+                // lowest never starts. Ranked rather than flat, so the takeover happens in id
+                // order instead of three ducks starting three pieces at once.
                 let alone = self.peers.is_empty();
-                let lowest = self.peers.iter().all(|peer| self.id < peer.beacon.id);
-                if !alone && lowest && now.saturating_duration_since(since) >= SETTLE {
+                let lower = self
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.beacon.id < self.id)
+                    .count();
+                let patience = SETTLE + SETTLE.mul_f64(lower as f64);
+                if !alone && now.saturating_duration_since(since) >= patience {
                     let mut roster: Vec<(u8, u16)> = vec![(self.register, self.id)];
                     roster.extend(self.peers.iter().map(|p| (p.beacon.register, p.beacon.id)));
                     roster.truncate(proto::ChoraleBeacon::MAX_ROSTER);
@@ -439,7 +454,14 @@ impl Chorale {
                     });
                     self.piece_id = pick;
                     self.score = piece(pick).expect("both built-in pieces exist");
-                    tracing::warn!(voices = roster.len(), piece = pick, "chorale: conducting");
+                    tracing::warn!(
+                        voices = roster.len(),
+                        piece = pick,
+                        // Loud when it is a takeover: it means the ducks below this one were
+                        // heard and never started, which is worth seeing in a journal.
+                        deferred_to = lower,
+                        "chorale: conducting"
+                    );
                     let roster = roster;
                     self.state = State::Conducting {
                         conductor: Conductor::new(self.score.bpm, self.seconds(now)),
@@ -462,6 +484,37 @@ impl Chorale {
     }
 
     fn conduct(&mut self, now: Instant) -> Tick {
+        // **Two conductors in one room, and one of them gives way.**
+        //
+        // Nothing stopped this before, and nothing had to for two ducks: they see each other
+        // while listening and the lower id starts. Four ducks started by hand seconds apart are
+        // a different room — two can pair off and start a piece before either has seen the other
+        // two, who pair off and start a *different* piece, and both performances then ran to the
+        // end side by side. The piece each picks comes from its own clock, so they are not even
+        // the same song.
+        //
+        // Resolved the way the election is: by id, with no negotiation. A conductor that hears a
+        // lower-id duck conducting abandons its own performance and joins that one, so whoever is
+        // singing converges on the room's lowest id from any starting arrangement. Strictly
+        // lower, so the winner never yields back and there is nothing to oscillate.
+        if let Some(rival) = self
+            .peers
+            .iter()
+            .filter(|peer| peer.beacon.singing() && peer.beacon.id < self.id)
+            .min_by_key(|peer| peer.beacon.id)
+        {
+            tracing::warn!(
+                to = rival.beacon.id,
+                piece = rival.beacon.piece,
+                mine = self.piece_id,
+                "chorale: yielding to a lower conductor"
+            );
+            // Back to listening, which joins whatever is singing on this same tick — including
+            // the check that this build knows the piece, which is not this code's business.
+            self.state = State::Listening { since: now };
+            return self.tick(now);
+        }
+
         // Everyone in range who is willing, in join order: the roster grows as ducks arrive and
         // never reorders, which is what keeps anyone already singing on their own part.
         let heard: Vec<(u8, u16)> = self
@@ -520,6 +573,31 @@ impl Chorale {
     }
 
     fn follow(&mut self, now: Instant) -> Tick {
+        // **The conductor stopped. Stop with it.**
+        //
+        // A follower locks to one conductor by id and ignores every other beacon, which is what
+        // keeps a second piece in the room from pulling it off its beat. The cost was that a
+        // conductor which *stopped* — yielded to a lower id, or was switched off — left its
+        // followers free-running to the end of a piece nobody else was singing, up to half a
+        // minute of the wrong song. Gone from the air (pruned above at `PEER_STALE`) or on the
+        // air and no longer singing both mean the same thing here: go back to listening, which
+        // joins whatever is actually being sung on this tick.
+        if let State::Following {
+            conductor: Some(id),
+            ..
+        } = &self.state
+        {
+            let still_conducting = self
+                .peers
+                .iter()
+                .any(|peer| peer.beacon.id == *id && peer.beacon.singing());
+            if !still_conducting {
+                tracing::warn!(conductor = id, "chorale: the conductor stopped; listening");
+                self.state = State::Listening { since: now };
+                return self.tick(now);
+            }
+        }
+
         let State::Following {
             follower, roster, ..
         } = &mut self.state
@@ -697,6 +775,293 @@ mod tests {
             from: format!("AA:BB:CC:DD:{id:04X}"),
             age_us: 2_000,
         }
+    }
+
+    /// **The room the bug was reported from: four ducks, `robotctl chorale` by hand, seconds apart.**
+    ///
+    /// A whole flock in one test, because the failures were not in any one duck's logic — each of
+    /// the four was doing something locally reasonable. Two ducks paired off and started a piece
+    /// before either had seen the other two, who paired off and started a different one, and both
+    /// performances then ran side by side to the end. The other half of the report, "sometimes
+    /// nothing happens", is the same asymmetry with a different shape: the lowest id is the duck
+    /// whose scan has found nobody yet, so everybody defers to a duck that will never start.
+    ///
+    /// The room is simulated the way `btd` behaves — a duck's advertisement stands until it is
+    /// replaced, and `visible` decides who can hear whom, so discovery can be as one-sided as it
+    /// is on the floor.
+    #[test]
+    fn four_ducks_started_apart_converge_on_one_piece() {
+        const STEP: Duration = Duration::from_millis(50);
+        let t0 = Instant::now();
+        // Four registers apart, four seeds, so four ids and four voices.
+        let mut ducks: Vec<Chorale> = [(214.4, 7), (180.0, 11), (240.0, 23), (200.0, 31)]
+            .into_iter()
+            .map(|(hz, seed)| Chorale::new(hz, seed, None))
+            .collect();
+        // Started by hand, seconds apart, in no particular order.
+        let starts = [0u64, 400, 1_000, 1_600];
+        // Who can hear whom. For the first four seconds the room is two islands — 0 with 1, 2 with
+        // 3 — which is long enough that each island elects its own conductor before they meet.
+        // That is the whole point: two conductors, two pieces, one room.
+        let visible = |from: usize, to: usize, ms: u64| -> bool {
+            if ms < 4_000 {
+                (from / 2) == (to / 2)
+            } else {
+                true
+            }
+        };
+
+        let mut standing: Vec<Option<proto::ChoraleBeacon>> = vec![None; 4];
+        let mut conductors_seen_at_once = 0usize;
+
+        for step in 0..200u64 {
+            let ms = step * 50;
+            let now = t0 + STEP * step as u32;
+            for (i, duck) in ducks.iter_mut().enumerate() {
+                if ms == starts[i] {
+                    duck.set_active(true, now, None);
+                }
+            }
+            // Deliver what each duck is currently advertising to everyone who can hear it.
+            let air: Vec<Option<proto::ChoraleBeacon>> = standing.clone();
+            for (to, duck) in ducks.iter_mut().enumerate() {
+                for (from, beacon) in air.iter().enumerate() {
+                    if from == to || !visible(from, to, ms) {
+                        continue;
+                    }
+                    if let Some(beacon) = beacon.clone() {
+                        duck.heard(
+                            &proto::ChoraleHeard {
+                                beacon,
+                                from: format!("AA:BB:CC:DD:EE:{from:02X}"),
+                                age_us: 2_000,
+                            },
+                            now,
+                        );
+                    }
+                }
+            }
+            for (i, duck) in ducks.iter_mut().enumerate() {
+                let tick = duck.tick(now);
+                if let Some(advertise) = tick.advertise {
+                    // As `btd` holds it: a new payload replaces the old, and no payload leaves
+                    // the last one standing.
+                    if let Some(beacon) = advertise.beacon {
+                        standing[i] = Some(beacon);
+                    }
+                }
+            }
+            let conducting = standing
+                .iter()
+                .filter(|b| b.as_ref().is_some_and(|b| b.singing()))
+                .count();
+            conductors_seen_at_once = conductors_seen_at_once.max(conducting);
+        }
+
+        // The split really happened, or this test is not exercising the fix.
+        assert!(
+            conductors_seen_at_once >= 2,
+            "the two islands should each have elected a conductor"
+        );
+
+        // And it is over: one conductor, one piece, everybody on it.
+        let conducting: Vec<u16> = ducks
+            .iter()
+            .zip(&standing)
+            .filter(|(_, beacon)| beacon.as_ref().is_some_and(|b| b.singing()))
+            .map(|(duck, _)| duck.id)
+            .collect();
+        assert_eq!(
+            conducting.len(),
+            1,
+            "one room, one conductor — found {conducting:?}"
+        );
+        // Between two *conductors*, the lower id is the one that keeps the room — that is how the
+        // split resolves, and why it resolves the same way from either side. (A lower-id duck that
+        // merely arrives while somebody is already singing joins them instead; nothing needs to
+        // change hands for that.)
+        let lowest = ducks.iter().map(|d| d.id).min().expect("four ducks");
+        assert_eq!(
+            conducting[0], lowest,
+            "the lower of the two conductors should have survived"
+        );
+        let pieces: Vec<u8> = ducks.iter().map(|d| d.piece_id).collect();
+        assert!(
+            pieces.iter().all(|p| *p == pieces[0]),
+            "every duck must end up on the same piece, got {pieces:?}"
+        );
+    }
+
+    /// Deference expires, or a duck that thinks it is alone holds the whole room silent.
+    ///
+    /// The failure this is for: four ducks started by hand, and the lowest id is the one whose
+    /// scan has not found anybody yet. It is listening and willing, so everyone else sees it and
+    /// defers — to a duck that will not start, because a duck alone does not sing. Nothing
+    /// happens, for as long as anybody is patient.
+    #[test]
+    fn a_lower_duck_that_never_starts_does_not_hold_the_room() {
+        let now = Instant::now();
+        let mine = chorale().id;
+        let lower = mine.wrapping_sub(1);
+
+        let mut c = chorale();
+        c.set_active(true, now, None);
+        // One lower-id duck, on the air and idle, forever — the shape of a duck that cannot see
+        // us and so will never conduct.
+        let beat = |t: u64| now + Duration::from_millis(t);
+        c.heard(
+            &heard_from(lower, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
+            now,
+        );
+
+        let singing = |c: &mut Chorale, at: Instant| {
+            c.tick(at)
+                .advertise
+                .and_then(|a| a.beacon)
+                .is_some_and(|b| b.singing())
+        };
+
+        // One `SETTLE` is the lower duck's turn, and this duck must still be waiting.
+        c.heard(
+            &heard_from(lower, 200, proto::ChoraleBeacon::IDLE, 1, vec![]),
+            beat(1_400),
+        );
+        assert!(
+            !singing(&mut c, beat(1_600)),
+            "it is not this duck's turn yet"
+        );
+
+        // Keep the peer alive across the wait, as a real idle heartbeat does, so this is a test
+        // of patience rather than of the peer going stale.
+        for step in 1..6 {
+            c.heard(
+                &heard_from(lower, 200, proto::ChoraleBeacon::IDLE, step as u8, vec![]),
+                beat(1_500 * step),
+            );
+        }
+        // Two `SETTLE`s — one for the wait, one for the single lower id — and it takes over.
+        assert!(
+            singing(&mut c, beat(3_200)),
+            "with the lower duck heard and silent, this one must eventually start"
+        );
+    }
+
+    /// Two conductors in one room end as one, and it is the lower id that survives.
+    ///
+    /// Four ducks started seconds apart can pair off before either pair has seen the other, and
+    /// each pair then starts its own piece — picked from its own clock, so not even the same song.
+    /// This is the resolution: the higher-id conductor gives way.
+    #[test]
+    fn a_conductor_yields_to_a_lower_conductor() {
+        let now = Instant::now();
+        let mine = chorale().id;
+        let lower = mine.wrapping_sub(1);
+        let higher = mine.wrapping_add(1);
+
+        let mut c = chorale();
+        c.set_active(true, now, None);
+        // A higher-id duck is here, so this one conducts.
+        c.heard(
+            &heard_from(higher, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
+            now,
+        );
+        let tick = c.tick(now + SETTLE);
+        let mine_piece = tick
+            .advertise
+            .and_then(|a| a.beacon)
+            .expect("a beacon")
+            .piece;
+        assert!(mine_piece != proto::ChoraleBeacon::IDLE, "conducting");
+
+        // Now the other half of the room arrives, already singing something else, led by an id
+        // below this one.
+        let other = if mine_piece == PIECE_WISTFUL {
+            PIECE_DUCK_STRUT
+        } else {
+            PIECE_WISTFUL
+        };
+        let at = now + SETTLE + Duration::from_millis(100);
+        c.heard(&heard_from(lower, 200, other, 4, vec![(200, lower)]), at);
+        let tick = c.tick(at);
+
+        // It is no longer the one holding the beat, and it has taken the other piece.
+        let beacon = tick.advertise.and_then(|a| a.beacon).expect("a beacon");
+        assert!(
+            !beacon.singing(),
+            "the yielding duck must stop conducting: {beacon:?}"
+        );
+        assert_eq!(c.piece_id, other, "and sing what the survivor is singing");
+
+        // And it does not yield back: a duck conducting with only *higher* ids around it stays.
+        let mut keeps = chorale();
+        keeps.set_active(true, now, None);
+        keeps.heard(
+            &heard_from(higher, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
+            now,
+        );
+        let tick = keeps.tick(now + SETTLE);
+        assert!(tick.singing.is_some(), "conducting, and seated: {tick:?}");
+        let kept = keeps.piece_id;
+        // A rival piece, but led by a *higher* id. The beacon is only published when it changes,
+        // so what is asserted here is the state: still singing, still its own piece.
+        let at = now + SETTLE + Duration::from_millis(100);
+        keeps.heard(&heard_from(higher, 200, other, 4, vec![(200, higher)]), at);
+        let tick = keeps.tick(at);
+        assert!(
+            tick.singing.is_some(),
+            "a higher-id rival must not unseat this conductor: {tick:?}"
+        );
+        assert_eq!(keeps.piece_id, kept, "nor change what it is singing");
+    }
+
+    /// A follower whose conductor stops does not sing the rest of the piece alone.
+    ///
+    /// It locks to one conductor by id and ignores everyone else, which is what keeps a second
+    /// piece from pulling it off the beat — and what used to leave it free-running to the end of a
+    /// song nobody else was singing when that conductor yielded or was switched off.
+    #[test]
+    fn a_follower_stops_when_its_conductor_does() {
+        let now = Instant::now();
+        let lower = chorale().id.wrapping_sub(1);
+        let mut c = chorale();
+        c.set_active(true, now, None);
+
+        // Following: a lower-id duck is conducting, and it seats this one. Ticked between beats
+        // as the control loop does — the phase lock only takes observations once the state is
+        // `Following`, and it needs four of them before it will sing.
+        let roster = vec![(200, lower), (chorale().register, chorale().id)];
+        let mut at = now;
+        for beat in 0..8u8 {
+            at = now + Duration::from_millis(500 * u64::from(beat));
+            c.heard(
+                &heard_from(lower, 200, PIECE_WISTFUL, beat, roster.clone()),
+                at,
+            );
+            c.tick(at);
+        }
+        assert!(
+            c.tick(at).singing.is_some(),
+            "it should be singing its part by now"
+        );
+
+        // The conductor goes idle — it yielded to somebody, or was switched off — and says so on
+        // the air rather than vanishing.
+        let at = at + Duration::from_millis(100);
+        c.heard(
+            &heard_from(lower, 200, proto::ChoraleBeacon::IDLE, 0, vec![]),
+            at,
+        );
+        let tick = c.tick(at);
+        assert_eq!(
+            tick.singing, None,
+            "the follower must stop rather than finish the piece alone"
+        );
+        // Listening rather than waiting to be seated: `joining` is what tells those apart, and
+        // the beacon is not republished here because an idle one is what it was already sending.
+        assert!(
+            !tick.joining,
+            "back to listening, not stuck waiting for a seat: {tick:?}"
+        );
     }
 
     /// Two willing ducks agree who conducts with no election and no message: the lower id does. Both
