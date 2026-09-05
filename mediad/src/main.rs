@@ -253,6 +253,17 @@ fn main() -> ExitCode {
                 }
             };
 
+        // A recorder asks the local Unix socket for a single latest raw frame. It is intentionally
+        // separate from the datachannel: snapshots can be camera-sized, while control must remain
+        // prompt even when a recorder is writing slowly.
+        let frame_socket = std::path::PathBuf::from(duck_ipc_proto::socket::MEDIA);
+        let frame_source = frames.clone();
+        tokio::spawn(async move {
+            if let Err(error) = mediad::frame::serve(&frame_socket, frame_source).await {
+                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
+            }
+        });
+
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
         // life reporting that it cannot.

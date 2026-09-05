@@ -420,6 +420,7 @@ mod tests {
             width: 1280,
             height: 720,
             format: CAPTURE_FORMAT,
+            captured_at: std::time::SystemTime::UNIX_EPOCH,
             data,
         }
     }

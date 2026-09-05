@@ -38,3 +38,8 @@ pub mod exposure;
 /// reads the same raw branch, in the same pixel format the pipeline names.
 #[cfg(target_os = "linux")]
 pub mod detect;
+
+/// The local, on-demand raw-frame endpoint. Linux only because it shares the pipeline's raw
+/// frame store; the WebRTC control channel deliberately does not carry camera-sized replies.
+#[cfg(target_os = "linux")]
+pub mod frame;

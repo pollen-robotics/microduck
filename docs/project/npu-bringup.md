@@ -99,15 +99,18 @@ that as the price of perception, the two should be measured apart.
 
 ## What is still missing
 
-**Nothing on the robot can get a frame.** `mediad` has a raw NV12 tee branch that exists precisely
-for this — `architecture.md` §5.3 — but no IPC exposes it, which is also why capturing a dataset has
-to stop `mediad` to take the camera. Two ways forward, and they are not exclusive:
+`media.frame` now exposes the raw **UYVY** tee branch locally at `/run/mediad/media.sock`.
+`robotctl media frame --output frame.uyvy` asks for the latest frame without stopping `mediad` or
+back-pressuring its encoder. The response starts with a JSON-RPC header (geometry, format, byte
+count and capture time), followed by exactly that many binary bytes. It is deliberately not a
+WebRTC method: a frame is about 1.8 MiB at the default geometry, whereas the control channel has to
+stay prompt. A recorder can therefore join camera observations to robot state on the board without
+fighting the daemon or base64-encoding pixels.
 
-- **`media.frame`**: a call that answers with one frame. Useful for far more than perception (a
-  snapshot in the console, a still for a bug report), and it makes capture stop fighting the daemon.
-- **The detector inside `mediad`**: subscribe to the raw branch, run the model at a few Hz, and
-  publish detections on the state stream. This is where it ends up — perception next to the sensor,
-  deriving features rather than shipping pixels — and it is what a behaviour would consume.
+What remains is publishing the detector's output on the robot state stream, so a behaviour can
+consume it without opening a second observation channel. The detector already subscribes to the
+raw branch and runs at a paced rate; publishing keeps perception next to the sensor, deriving
+features rather than shipping pixels.
 
 Once detections exist as state, the behaviours in `docs/ideas/autonomous_behavior.md` that currently
 key on Bluetooth ("a duck is *nearby*") can key on sight ("a duck is *there*"): approaching,

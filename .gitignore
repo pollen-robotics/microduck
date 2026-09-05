@@ -20,3 +20,6 @@ secret*
 
 # Playground and scratch state (see updater/examples/playground.rs).
 /verify
+
+# Owner-specific notes and locally captured robot data never belong in this public repository.
+/.private/

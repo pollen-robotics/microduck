@@ -202,6 +202,10 @@ pub mod socket {
     /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
     /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
     pub const TOF: &str = "/run/tofd/tof.sock";
+
+    /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
+    /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
+    pub const MEDIA: &str = "/run/mediad/media.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -258,6 +262,10 @@ pub const JOINT_NAMES: [&str; 15] = [
 /// with `update.*`. [`Call`] is the typed form.
 pub mod method {
     pub const HELLO: &str = "hello";
+
+    /// One raw camera frame. `mediad` answers the JSON-RPC header, followed immediately by the
+    /// bytes named in that header, on its local Unix socket.
+    pub const MEDIA_FRAME: &str = "media.frame";
 
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
@@ -2573,6 +2581,11 @@ pub struct RobotState {
     pub joints: Vec<f64>,
     /// What was commanded, so a viewer can show tracking error rather than guessing at it.
     pub targets: Vec<f64>,
+    /// Raw output of the policy which drove this tick, in its 14-wide policy order. It is the
+    /// action before scaling and filtering, so an imitation-learning recorder does not have to
+    /// reverse engineer an action from joint targets. Empty when no policy drove this tick.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_action: Vec<f32>,
     /// Where contact odometry believes the robot is. `default` so a frame from
     /// a `robotd` predating the estimator still parses — zeros, like a robot
     /// that has not moved.
@@ -4428,6 +4441,7 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            policy_action: vec![],
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
@@ -4485,6 +4499,7 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            policy_action: vec![],
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
@@ -4831,6 +4846,54 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<HelloResult>(&line).unwrap(),
             released
+        );
+    }
+
+    #[test]
+    fn policy_action_is_present_only_for_a_policy_driven_tick() {
+        let state = RobotState {
+            t: 1.0,
+            movement: MoveState {
+                requested: [0.0; 3],
+                applied: [0.0; 3],
+                limited_by: vec![],
+            },
+            head: [0.0; 4],
+            policy: "walk".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: None,
+            },
+            control_loop: LoopState {
+                hz: 50.0,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+            policy_action: vec![0.0; 14],
+            odom: OdomState::default(),
+            theremin: None,
+            chorale: None,
+        };
+        let line = serde_json::to_string(&state).unwrap();
+        assert!(line.contains("\"policy_action\":[0.0,0.0,0.0"), "{line}");
+        assert_eq!(
+            serde_json::from_str::<RobotState>(&line)
+                .unwrap()
+                .policy_action
+                .len(),
+            14
+        );
+        let held = RobotState {
+            policy_action: vec![],
+            ..state
+        };
+        assert!(
+            !serde_json::to_string(&held)
+                .unwrap()
+                .contains("policy_action")
         );
     }
 }

@@ -79,6 +79,7 @@
 //! naming the arity rather than as an abort.
 
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use duck_ipc_proto as proto;
@@ -215,6 +216,9 @@ pub struct Frame {
     /// The GStreamer format name — [`CAPTURE_FORMAT`], carried rather than assumed so a consumer
     /// reading this cannot silently misinterpret the bytes if the capture format changes again.
     pub format: &'static str,
+    /// Captured when this buffer reached the raw branch. This is observation time for a recorder;
+    /// it is intentionally separate from GStreamer's scheduling timestamps.
+    pub captured_at: SystemTime,
     /// Tightly packed as the caps describe it, in `format`.
     pub data: Vec<u8>,
 }
@@ -229,6 +233,12 @@ pub struct Frame {
 pub struct Frames(Arc<Mutex<Option<Frame>>>);
 
 impl Frames {
+    /// Publish the newest frame. Replacing rather than queueing is what prevents a slow local
+    /// observer from back-pressuring capture or receiving stale observations.
+    pub(crate) fn publish(&self, frame: Frame) {
+        *self.0.lock().expect("frame lock") = Some(frame);
+    }
+
     /// Read the latest frame in place, without copying it. `None` until the first one arrives.
     ///
     /// For a reader that wants a number out of a frame rather than the frame — the auto-exposure
@@ -612,10 +622,11 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                     width,
                     height,
                     format: CAPTURE_FORMAT,
+                    captured_at: SystemTime::now(),
                     data: map.as_slice().to_vec(),
                 };
                 // Replaced, not queued: last-value-wins is the contract.
-                *frames.0.lock().expect("frame lock") = Some(frame);
+                frames.publish(frame);
 
                 Ok(gst::FlowSuccess::Ok)
             })
