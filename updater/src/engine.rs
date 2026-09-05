@@ -2072,9 +2072,7 @@ impl Engine {
                 Ok(())
             }
             ApplyAction::Reload { unit, signal } => {
-                let mut c = tokio::process::Command::new(SYSTEMCTL);
-                c.arg("kill").arg(format!("--signal={signal}")).arg(unit);
-                let result = run_systemctl(c, "apply action").await;
+                let result = reload_one(SYSTEMCTL, unit, signal).await;
                 rec.note(RunEvent::Unit {
                     unit: unit.clone(),
                     action: format!("reload ({signal})"),
@@ -2966,6 +2964,19 @@ async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
     }
 }
 
+/// Ask systemd to deliver one named signal without restarting the unit. Models use this for
+/// SIGHUP so their candidate session can be swapped only at `robotd`'s safe control boundary.
+/// Kept separate from [`Engine::run_apply_action`] because the exact argv is a safety contract and
+/// needs a stubbed test rather than a board running systemd.
+async fn reload_one(systemctl: &str, unit: &str, signal: &str) -> Result<(), Error> {
+    let mut command = tokio::process::Command::new(systemctl);
+    command
+        .arg("kill")
+        .arg(format!("--signal={signal}"))
+        .arg(unit);
+    run_systemctl(command, "apply action").await
+}
+
 /// One `systemctl restart`, with the unit named in the error.
 ///
 /// Named, because the caller restarts up to six of them and the bare message — systemd's own
@@ -3564,6 +3575,23 @@ exit 1
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    #[tokio::test]
+    async fn a_model_reload_delivers_sighup_without_restarting_robotd() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = stub_recorder(dir.path(), "systemctl");
+
+        reload_one(systemctl.to_str().unwrap(), "robotd", "SIGHUP")
+            .await
+            .expect("the stub accepts the reload");
+
+        let log = calls(dir.path());
+        assert_eq!(log, "kill --signal=SIGHUP robotd\n");
+        assert!(
+            !log.contains("restart"),
+            "a model reload must not restart motor control"
+        );
     }
 
     /// The deferred restarts, as an actual command line. Until this existed nothing in the repository
