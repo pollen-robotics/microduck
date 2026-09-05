@@ -30,7 +30,7 @@
 //!    while progress stays visible.
 //!  - Works when `robotd` is dead. It talks to `updaterd`, not to `robotd`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,6 +43,7 @@ mod duck;
 mod monitor;
 mod path_map;
 mod show;
+mod support;
 
 /// Exit codes. Stable — CI asserts on these.
 mod exit {
@@ -99,6 +100,11 @@ struct Cli {
     /// have no ToF fitted, and `monitor` says so in the block rather than failing.
     #[arg(long, global = true, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
+
+    /// Path to mediad's local raw-frame endpoint. This is deliberately separate from the WebRTC
+    /// control channel: a camera frame is too large to make a good network control reply.
+    #[arg(long, global = true, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
 
     #[command(subcommand)]
     namespace: Namespace,
@@ -200,6 +206,13 @@ enum Namespace {
         command: PadCommand,
     },
 
+    /// Camera observations for a local recorder or perception program.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Media {
+        #[command(subcommand)]
+        command: MediaCommand,
+    },
+
     /// Update and release management.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Update {
@@ -262,6 +275,13 @@ enum Namespace {
         json: bool,
     },
 
+    /// Write a redacted snapshot for support. It never changes the robot.
+    Support {
+        /// Destination file. Safe to attach after reviewing the redacted contents.
+        #[arg(long, default_value = "/var/tmp/microduck-support.txt")]
+        output: PathBuf,
+    },
+
     /// Print a shell completion script on stdout.
     ///
     /// Generated from this binary's own command tree, so the completions a robot offers
@@ -308,6 +328,17 @@ enum NetCommand {
         ssid: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MediaCommand {
+    /// Save the newest raw UYVY camera frame. It does not alter camera streaming or wait for a
+    /// future frame.
+    Frame {
+        /// Output file for the raw UYVY bytes.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -2790,6 +2821,169 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
     Ok(resolved.to_string_lossy().into_owned())
 }
 
+/// Make the artifact somebody can attach after a fault. It asks this exact binary for the
+/// JSON reports rather than rebuilding their IPC calls here, so support and the human-facing
+/// commands cannot drift into two different diagnoses.
+fn run_support(
+    socket: &Path,
+    robot_socket: &Path,
+    config_socket: &Path,
+    output: &Path,
+) -> Result<(), Failure> {
+    let exe = std::env::current_exe()
+        .map_err(|e| Failure::new(exit::FAILED, format!("locate robotctl: {e}")))?;
+    let base = |command: &str| {
+        vec![
+            "--socket".to_owned(),
+            socket.display().to_string(),
+            "--robot-socket".to_owned(),
+            robot_socket.display().to_string(),
+            "--config-socket".to_owned(),
+            config_socket.display().to_string(),
+            command.to_owned(),
+            "--json".to_owned(),
+        ]
+    };
+    let health = support::command(&exe.display().to_string(), &base("health"));
+    let version = support::command(&exe.display().to_string(), &base("version"));
+    let units = support::command(
+        "systemctl",
+        &[
+            "--no-pager".to_owned(),
+            "--full".to_owned(),
+            "--plain".to_owned(),
+            "status".to_owned(),
+            "robotd.service".to_owned(),
+            "updaterd.service".to_owned(),
+            "mediad.service".to_owned(),
+            "configd.service".to_owned(),
+        ],
+    );
+    let journal = support::command(
+        "journalctl",
+        &[
+            "--utc".to_owned(),
+            "--no-pager".to_owned(),
+            "--unit=robotd.service".to_owned(),
+            "--unit=updaterd.service".to_owned(),
+            "--unit=mediad.service".to_owned(),
+            "--unit=configd.service".to_owned(),
+            "-n".to_owned(),
+            "300".to_owned(),
+        ],
+    );
+    let update_history = support::file(Path::new("/var/lib/robot/updater/update-log.jsonl"));
+    let bundle = support::render(&[
+        ("robotctl health --json", &health),
+        ("robotctl version --json", &version),
+        ("unit status", &units),
+        ("recent daemon journal", &journal),
+        ("update history", &update_history),
+    ]);
+    std::fs::write(output, bundle)
+        .map_err(|e| Failure::new(exit::FAILED, format!("write {}: {e}", output.display())))?;
+    println!("support bundle written to {}", output.display());
+    Ok(())
+}
+
+/// Fetch one latest frame from mediad's local endpoint. Its JSON-RPC header is followed by the
+/// exact binary byte count it names, so pixels never pass through a base64 control message.
+fn run_media(socket: &Path, command: MediaCommand) -> Result<(), Failure> {
+    let MediaCommand::Frame { output } = command;
+    let stream = UnixStream::connect(socket)
+        .map_err(|e| Failure::new(exit::UNREACHABLE, unreachable_hint("mediad", socket, &e)))?;
+    let mut writer = stream.try_clone().map_err(|e| {
+        Failure::new(
+            exit::FAILED,
+            format!("could not split the media socket: {e}"),
+        )
+    })?;
+    let request = proto::Request {
+        jsonrpc: proto::JSONRPC_VERSION.to_owned(),
+        id: Some(proto::Id::Number(1)),
+        method: proto::method::MEDIA_FRAME.to_owned(),
+        params: Some(serde_json::json!({})),
+    };
+    let mut request = serde_json::to_vec(&request)
+        .map_err(|e| Failure::new(exit::FAILED, format!("could not encode media.frame: {e}")))?;
+    request.push(b'\n');
+    writer
+        .write_all(&request)
+        .and_then(|()| writer.flush())
+        .map_err(|e| Failure::new(exit::UNREACHABLE, format!("could not request a frame: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).map_err(|e| {
+        Failure::new(
+            exit::UNREACHABLE,
+            format!("could not read frame header: {e}"),
+        )
+    })? == 0
+    {
+        return Err(Failure::new(
+            exit::UNREACHABLE,
+            "mediad closed the media socket".into(),
+        ));
+    }
+    let response: proto::Response = serde_json::from_str(line.trim()).map_err(|e| {
+        Failure::new(
+            exit::FAILED,
+            format!("mediad sent an invalid frame header: {e}"),
+        )
+    })?;
+    if let Some(error) = response.error {
+        return Err(Failure::new(
+            exit::FAILED,
+            format!("media.frame: {}", error.message),
+        ));
+    }
+    let result = response
+        .result
+        .ok_or_else(|| Failure::new(exit::FAILED, "mediad returned no frame metadata".into()))?;
+    let bytes = result
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| {
+            Failure::new(
+                exit::FAILED,
+                "mediad returned an invalid frame length".into(),
+            )
+        })?;
+    let mut data = vec![0; bytes];
+    reader.read_exact(&mut data).map_err(|e| {
+        Failure::new(
+            exit::UNREACHABLE,
+            format!("frame ended before {bytes} bytes: {e}"),
+        )
+    })?;
+    std::fs::write(&output, data)
+        .map_err(|e| Failure::new(exit::FAILED, format!("write {}: {e}", output.display())))?;
+    println!(
+        "frame written to {} ({}×{}, {}, {} bytes, captured {})",
+        output.display(),
+        result
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("format")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        bytes,
+        result
+            .get("captured_at_unix_us")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    );
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
         Namespace::Health { json } => {
@@ -2798,6 +2992,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Version { json } => {
             return run_version(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }
+        Namespace::Support { output } => {
+            return run_support(&cli.socket, &cli.robot_socket, &cli.config_socket, &output);
+        }
+        Namespace::Media { command } => return run_media(&cli.media_socket, command),
         Namespace::Monitor { hz, json } => {
             return monitor::run(
                 &cli.robot_socket,

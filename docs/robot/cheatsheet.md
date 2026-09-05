@@ -31,6 +31,18 @@ Hardware and software in one report. Exits non-zero when the robot is unhealthy 
 it can gate a script — a hot motor or a pinned component is reported, not judged, and does not
 affect the exit code. `--json` for a support bundle.
 
+### A support bundle
+
+```
+robotctl support
+```
+
+Writes `/var/tmp/microduck-support.txt`: health and version reports, relevant unit status, the
+latest daemon journal, and update history. It does not change the robot. Lines that may carry a
+credential are removed before the file is written, but review the file before sharing it because
+it still identifies the robot and describes its software state. Choose another destination with
+`--output path/to/report.txt`.
+
 ### Watching the loop
 
 ```
@@ -790,4 +802,3 @@ eval "$(robotctl completions bash)"
 ```
 
 `zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
-
