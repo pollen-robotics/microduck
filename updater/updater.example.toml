@@ -166,6 +166,7 @@ install_dir   = "/opt/robot/model/walk"
 keep_previous = 3
 # Refuse a signed but incomplete artifact before it can replace `current`.
 required_files = ["walk.onnx"]
+max_artifact_bytes = 134217728 # 128 MiB; raise only for a reviewed model bundle
 
 [component.model-walk.source]
 type          = "hf_hub"

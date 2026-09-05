@@ -419,6 +419,7 @@ impl Engine {
         self.verify_manifest(&signed)?;
         let manifest = signed.parsed;
         Self::check_channel(&manifest, component)?;
+        require_artifact_budget(manifest.size, cfg.max_artifact_bytes)?;
 
         if Some(&manifest.version) == installed.as_ref() {
             return Ok(CheckResult::UpToDate {
@@ -2990,6 +2991,23 @@ fn require_files(root: &Path, required: &[PathBuf]) -> Result<(), Error> {
                 relative.display()
             )));
         }
+    }
+    Ok(())
+}
+
+fn require_artifact_budget(size: Option<u64>, maximum: Option<u64>) -> Result<(), Error> {
+    let Some(maximum) = maximum else {
+        return Ok(());
+    };
+    let Some(size) = size else {
+        return Err(Error::Incompatible(
+            "artifact size is required for this component's budget".into(),
+        ));
+    };
+    if size > maximum {
+        return Err(Error::Incompatible(format!(
+            "artifact is {size} bytes, above configured budget {maximum}"
+        )));
     }
     Ok(())
 }

@@ -164,6 +164,10 @@ pub struct ComponentConfig {
     /// components use this to reject a signed but incomplete weights bundle before the swap.
     #[serde(default)]
     pub required_files: Vec<PathBuf>,
+
+    /// Refuse an artifact above this reviewed compressed-size budget before downloading it.
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
 }
 
 fn default_keep_previous() -> usize {
@@ -443,6 +447,11 @@ impl Config {
                     ));
                 }
             }
+            if component.max_artifact_bytes == Some(0) {
+                return bad(format!(
+                    "component {name}: max_artifact_bytes must be positive"
+                ));
+            }
         }
 
         if !self.state_dir.is_absolute() {
@@ -505,6 +514,7 @@ mod tests {
             model_walk.required_files,
             [std::path::PathBuf::from("walk.onnx")]
         );
+        assert_eq!(model_walk.max_artifact_bytes, Some(128 * 1024 * 1024));
         assert!(config.component("model-jump").is_ok());
     }
 
