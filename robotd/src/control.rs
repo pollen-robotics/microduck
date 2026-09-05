@@ -119,6 +119,9 @@ impl Default for SkillTuning {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Step {
     pub targets: [f64; NUM_JOINTS],
+    /// Raw network output before action scaling or target filtering. This is distinct from
+    /// `targets`: training on filtered joint targets would label actuator dynamics as policy.
+    pub action: [f32; ACTION_LEN],
     /// Which network drove, as the wire label: `walk`, `stand`, `ground_pick`, `kick_left`,
     /// `kick_right`, `sit`, `rise`.
     pub label: &'static str,
@@ -473,6 +476,7 @@ impl Controller {
 
         Ok(Step {
             targets,
+            action,
             label,
             gain,
             busy: self.busy(),

@@ -166,11 +166,27 @@ impl Fixture {
     }
 
     fn publish_model(&self, version: &str) {
+        self.publish_model_for("model", version);
+    }
+
+    /// Publish a model artifact for the named component. A manifest's channel is a component
+    /// identity, not display text: the updater refuses a signed artifact for the wrong slot.
+    fn publish_model_for(&self, component: &str, version: &str) {
+        self.publish_model_for_with(component, version, |_| {});
+    }
+
+    fn publish_model_for_with(
+        &self,
+        component: &str,
+        version: &str,
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) {
         self.publisher
             .release(version)
-            .channel("model")
+            .channel(component)
             .dir(self.model_releases())
             .file("walk.onnx", b"weights", 0o644)
+            .manifest(edit)
             .write();
     }
 
@@ -1527,6 +1543,98 @@ health = {{ probe = "none" }}
     let outcomes = engine.recover_on_start().await.unwrap();
     assert_eq!(outcomes.len(), 1, "daemon trial was lost: {outcomes:?}");
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// A model uses the ordinary signed-component path: its own source and install directory, then
+/// `select` to repoint an already verified local version. This is the development analogue of a
+/// Hub model trial and must never need a daemon artifact or a relaxed signature check.
+#[tokio::test]
+async fn a_signed_local_model_installs_updates_and_selects_an_older_version() {
+    let fx = Fixture::new();
+    let install = fx.root.join("opt/robot/model/walk");
+    fx.publish_model_for("model-walk", "1.0.0");
+
+    let extra = format!(
+        r#"
+[component.model-walk]
+install_dir = "{}"
+source = {{ type = "local_dir", path = "{}" }}
+on_apply = {{ action = "none" }}
+health = {{ probe = "none" }}
+"#,
+        install.display(),
+        fx.model_releases().display(),
+    );
+
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), &extra);
+    let (tx, _rx) = progress_channel();
+    engine
+        .apply(
+            "model-walk",
+            Target::Exact(semver::Version::new(1, 0, 0)),
+            ApplyOptions::default(),
+            tx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        test_support::live_version(&install).as_deref(),
+        Some("1.0.0")
+    );
+
+    fx.publish_model_for("model-walk", "1.1.0");
+    let (tx, _rx) = progress_channel();
+    engine
+        .apply("model-walk", Target::Latest, ApplyOptions::default(), tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        test_support::live_version(&install).as_deref(),
+        Some("1.1.0")
+    );
+
+    engine
+        .select("model-walk", &semver::Version::new(1, 0, 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        test_support::live_version(&install).as_deref(),
+        Some("1.0.0")
+    );
+}
+
+/// A valid signature does not make a model compatible. The updater checks the candidate's model
+/// API before extracting or repointing it, so an older daemon keeps the working model it has.
+#[tokio::test]
+async fn an_incompatible_local_model_never_becomes_current() {
+    let fx = Fixture::new();
+    let install = fx.root.join("opt/robot/model/walk");
+    fx.publish_model_for_with("model-walk", "2.0.0", |manifest| {
+        manifest["model_api"] = serde_json::json!(2);
+    });
+    let extra = format!(
+        r#"
+[component.model-walk]
+install_dir = "{}"
+source = {{ type = "local_dir", path = "{}" }}
+on_apply = {{ action = "none" }}
+health = {{ probe = "none" }}
+"#,
+        install.display(),
+        fx.model_releases().display(),
+    );
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), &extra);
+    let (tx, _rx) = progress_channel();
+    let error = engine
+        .apply("model-walk", Target::Latest, ApplyOptions::default(), tx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, updater::Error::Incompatible(_)),
+        "{error:?}"
+    );
+    assert_eq!(test_support::live_version(&install), None);
 }
 
 /// **#5** `transition_to` armed the boot counter before validating the target, so a
