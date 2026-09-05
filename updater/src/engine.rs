@@ -1762,9 +1762,12 @@ impl Engine {
             //
             // Only for a socket gate. `HealthCheck::None` has nothing to ask, and `Command` answers
             // a two-way question — there is no "degraded" in an exit status.
-            if let HealthCheck::Socket { .. } = cfg.health {
-                match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                    crate::robot::Health::Healthy => {
+            if let HealthCheck::Socket { timeout, .. } = &cfg.health {
+                // For as long as the gate would have, and for the gate's reason: at boot this
+                // question lands while `robotd` may still be loading its policies, and the two
+                // units are not ordered. See `robot_verdict`.
+                match self.robot_verdict(*timeout).await {
+                    Some(crate::robot::Health::Healthy) => {
                         tracing::warn!(
                             component = %pending.component,
                             version = %pending.version,
@@ -1775,7 +1778,7 @@ impl Engine {
                         self.boot_counter.confirm(&pending.component)?;
                         continue;
                     }
-                    crate::robot::Health::Degraded(reason) => {
+                    Some(crate::robot::Health::Degraded(reason)) => {
                         tracing::warn!(
                             component = %pending.component,
                             version = %pending.version,
@@ -2144,6 +2147,33 @@ impl Engine {
         }
     }
 
+    /// The robot's verdict, asked for as long as `timeout` allows rather than once.
+    ///
+    /// Because `robotd` says so. Between its socket opening and its first tick it answers
+    /// "control loop has not completed a cycle yet", and the comment on that line reads:
+    /// `"Starting" is not "started". The gate polls, so it will see the transition.` Anything that
+    /// decides on this answer has to be that gate, or a robot that is merely late is a robot that
+    /// failed. Boot recovery asked once and reverted on what it heard.
+    ///
+    /// The first answer that settles the question, the last one heard when the time runs out, or
+    /// `None` when there was no time to ask at all.
+    async fn robot_verdict(&self, timeout: Duration) -> Option<crate::robot::Health> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last = None;
+        while tokio::time::Instant::now() < deadline {
+            let verdict = self.robot.health(ROBOT_QUERY_TIMEOUT).await;
+            if matches!(
+                verdict,
+                crate::robot::Health::Healthy | crate::robot::Health::Degraded(_)
+            ) {
+                return Some(verdict);
+            }
+            last = Some(verdict);
+            tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+        }
+        last
+    }
+
     /// Wait for the new release to report healthy.
     ///
     /// A timeout is a **failure**: unproven is not healthy, or auto-rollback would
@@ -2171,38 +2201,30 @@ impl Engine {
             HealthCheck::Socket { .. } => {
                 // The socket path lives in `Config::robot_socket` and is used to build
                 // the RobotClient in `main`; here we just ask the client.
-                let deadline = tokio::time::Instant::now() + timeout;
-                let mut last = String::from("no answer");
-                while tokio::time::Instant::now() < deadline {
-                    match self.robot.health(ROBOT_QUERY_TIMEOUT).await {
-                        crate::robot::Health::Healthy => return Ok(GatePassed::Healthy),
-                        // Passes. Logged at warn, not swallowed: committing a release onto a
-                        // robot that cannot move is the right call, but nobody should have to
-                        // guess afterwards that that is what happened.
-                        crate::robot::Health::Degraded(reason) => {
-                            tracing::warn!(
-                                reason = %reason,
-                                "committing: the robot is degraded for a reason this release \
-                                 cannot have caused and a rollback cannot fix"
-                            );
-                            return Ok(GatePassed::Degraded(reason));
-                        }
-                        crate::robot::Health::Unhealthy(reason) => last = reason,
-                        // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
-                        // about a robot that is serving its socket sends the reader to the wrong
-                        // half of the system for an hour; see `docs/project/install-path-gap.md`.
-                        crate::robot::Health::Incompatible(reason) => {
-                            last = format!(
-                                "answered in a shape this updaterd cannot read ({reason}) — \
-                                 the robot may be fine and the contract is what disagrees"
-                            );
-                        }
-                        crate::robot::Health::Unreachable => {
-                            last = "unreachable".into();
-                        }
+                let last = match self.robot_verdict(timeout).await {
+                    Some(crate::robot::Health::Healthy) => return Ok(GatePassed::Healthy),
+                    // Passes. Logged at warn, not swallowed: committing a release onto a
+                    // robot that cannot move is the right call, but nobody should have to
+                    // guess afterwards that that is what happened.
+                    Some(crate::robot::Health::Degraded(reason)) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "committing: the robot is degraded for a reason this release \
+                             cannot have caused and a rollback cannot fix"
+                        );
+                        return Ok(GatePassed::Degraded(reason));
                     }
-                    tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
-                }
+                    Some(crate::robot::Health::Unhealthy(reason)) => reason,
+                    // Fails, like `Unreachable`, and reads nothing like it. "unreachable"
+                    // about a robot that is serving its socket sends the reader to the wrong
+                    // half of the system for an hour; see `docs/project/install-path-gap.md`.
+                    Some(crate::robot::Health::Incompatible(reason)) => format!(
+                        "answered in a shape this updaterd cannot read ({reason}) — \
+                         the robot may be fine and the contract is what disagrees"
+                    ),
+                    Some(crate::robot::Health::Unreachable) => "unreachable".into(),
+                    None => "no answer".into(),
+                };
                 Err(Error::Health(format!(
                     "not healthy within {}s: {last}",
                     timeout.as_secs()
