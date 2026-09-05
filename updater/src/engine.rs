@@ -946,6 +946,8 @@ impl Engine {
             }
         })?;
 
+        require_files(extract_dir, &cfg.required_files)?;
+
         // 5b. Would this release leave an installed unit with nothing to exec? See
         //     [`crate::orphan`] — a downgrade past the release that introduced a daemon leaves
         //     that daemon's unit behind, and it then fails with `203/EXEC`, which fails the
@@ -2977,6 +2979,21 @@ async fn reload_one(systemctl: &str, unit: &str, signal: &str) -> Result<(), Err
     run_systemctl(command, "apply action").await
 }
 
+/// Reject an otherwise valid artifact which omitted a file the configured component must load.
+/// This runs against staging, before a dry run succeeds or `current` can move.
+fn require_files(root: &Path, required: &[PathBuf]) -> Result<(), Error> {
+    for relative in required {
+        let path = root.join(relative);
+        if !path.is_file() {
+            return Err(Error::Incompatible(format!(
+                "artifact is missing required file {}",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// One `systemctl restart`, with the unit named in the error.
 ///
 /// Named, because the caller restarts up to six of them and the bare message — systemd's own
@@ -3592,6 +3609,16 @@ exit 1
             !log.contains("restart"),
             "a model reload must not restart motor control"
         );
+    }
+
+    #[test]
+    fn a_model_bundle_missing_its_onnx_file_is_refused_before_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            require_files(dir.path(), &[std::path::PathBuf::from("walk.onnx")]).unwrap_err();
+        assert!(format!("{error}").contains("missing required file walk.onnx"));
+        std::fs::write(dir.path().join("walk.onnx"), b"weights").unwrap();
+        require_files(dir.path(), &[std::path::PathBuf::from("walk.onnx")]).unwrap();
     }
 
     /// The deferred restarts, as an actual command line. Until this existed nothing in the repository

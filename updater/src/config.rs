@@ -159,6 +159,11 @@ pub struct ComponentConfig {
     /// Refuse anything but this version. Set by `robotctl pin`.
     #[serde(default)]
     pub pinned: Option<semver::Version>,
+
+    /// Files which must be present in an extracted artifact before it may become current. Model
+    /// components use this to reject a signed but incomplete weights bundle before the swap.
+    #[serde(default)]
+    pub required_files: Vec<PathBuf>,
 }
 
 fn default_keep_previous() -> usize {
@@ -422,6 +427,22 @@ impl Config {
                      rollback target"
                 ));
             }
+
+            for required in &component.required_files {
+                if required.is_absolute()
+                    || required.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir | std::path::Component::RootDir
+                        )
+                    })
+                {
+                    return bad(format!(
+                        "component {name}: required_files entry {} must be a relative path inside the artifact",
+                        required.display()
+                    ));
+                }
+            }
         }
 
         if !self.state_dir.is_absolute() {
@@ -480,6 +501,10 @@ mod tests {
             model_walk.on_apply,
             ApplyAction::Reload { ref unit, ref signal } if unit == "robotd" && signal == "SIGHUP"
         ));
+        assert_eq!(
+            model_walk.required_files,
+            [std::path::PathBuf::from("walk.onnx")]
+        );
         assert!(config.component("model-jump").is_ok());
     }
 
