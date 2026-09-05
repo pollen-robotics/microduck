@@ -615,7 +615,9 @@ pub struct PolicyParams {
     pub mode: Mode,
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
-    /// release. The literal `"none"` disables a slot outright — the prototype's convention.
+    /// release. The literal `"none"` disables an optional slot outright — the prototype's
+    /// convention. Not this one: `walk` is the network the controller loads, and refusing
+    /// the config beats panicking in `resolved()`.
     pub walk: Option<PathBuf>,
     /// Standing policy. Without one the walking policy runs at every velocity.
     pub stand: Option<PathBuf>,
@@ -1668,6 +1670,11 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error(
+        "{path}: policy.walk is the one slot \"none\" cannot disable — \
+         the controller has nothing to load without it"
+    )]
+    NoneWalk { path: String },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -1754,6 +1761,15 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // `walk` is the one slot `resolved()` cannot leave empty — every mode has a default
+        // for it, and the controller has nothing to load without it — so the "none" sentinel
+        // that legitimately disables the optional slots would panic there. Refuse it here,
+        // where a bad value is still a config error with the path attached.
+        if self.policy.walk.as_deref().is_some_and(is_none_sentinel) {
+            return Err(ParamsError::NoneWalk {
+                path: path.display().to_string(),
             });
         }
         Ok(())
@@ -2866,6 +2882,22 @@ mod tests {
             Some(0.7),
             "the other filter keeps its default"
         );
+    }
+
+    /// `walk` is the exception to `"none"`: it is the one slot `resolved()` cannot leave
+    /// empty, so the sentinel would panic there. Refused at load instead, with the path in
+    /// the error — and case-insensitively, the same as the optional slots spell it.
+    #[test]
+    fn a_none_walk_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        for literal in ["none", "None"] {
+            let path = write(dir.path(), &format!("[policy]\nwalk = \"{literal}\"\n"));
+            let err = Params::load(&path, true).unwrap_err();
+            assert!(matches!(err, ParamsError::NoneWalk { .. }), "{err}");
+        }
+        // And the optional slots still take it.
+        let path = write(dir.path(), "[policy]\nstand = \"none\"\n");
+        assert!(Params::load(&path, true).is_ok());
     }
 
     /// A typo in a key is named and ignored, and the setting it was aimed at keeps its default.

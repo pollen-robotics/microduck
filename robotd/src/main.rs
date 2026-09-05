@@ -1230,6 +1230,43 @@ impl Bringup {
     }
 }
 
+/// Where an accepted mode switch leaves the bring-up state, or `None` to refuse it this tick.
+///
+/// Two cases matter:
+///
+/// - **`Limp` stays `Limp`.** Torque is off there, so there is nothing to ramp from yet — and
+///   the ramp must not start: the enable path below turns the motors on and starts the homing
+///   ramp itself, and the queued switch completes when that ramp does. Jumping to `Homing`
+///   here would skip `set_torque`, the ramp would "finish" over dead motors, and the other
+///   mode's policies would load onto a robot lying on the floor while reporting `Ready`.
+/// - **No position sample refuses.** The ramp starts from the joints' actual positions, so a
+///   tick without a read cannot arm it. Queuing the switch anyway would leave it in
+///   `mode_change` forever — its only consumer is the ramp finishing — and every later switch
+///   would be refused as already in flight.
+fn mode_switch_bringup(
+    bringup: Bringup,
+    positions: Option<[f64; NUM_JOINTS]>,
+    now: Instant,
+) -> Option<Bringup> {
+    match bringup {
+        Bringup::Limp => Some(Bringup::Limp),
+        _ => positions.map(|from| Bringup::Homing { from, since: now }),
+    }
+}
+
+/// One low-pass step toward `target`.
+///
+/// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
+/// tick and on every tick after, because nothing finite can climb back out of it. The wire
+/// can produce one — JSON parses `1e400` as infinity — and the safety layer below refuses
+/// non-finite joint targets rather than clamping them, so a single bad `robot.move` would
+/// otherwise freeze the robot on its hold pose until reboot.
+fn slew(ema: &mut f64, target: f64, alpha: f64) {
+    if target.is_finite() {
+        *ema += alpha * (target - *ema);
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -1996,7 +2033,9 @@ async fn control_loop<T: RobotIo>(
                 );
             } else if mode_change.is_some() {
                 tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
-            } else {
+            } else if let Some(next) =
+                mode_switch_bringup(bringup, sensors.as_ref().map(|s| s.positions), tick_start)
+            {
                 tracing::warn!(
                     from = policy_params.mode.as_str(),
                     to = target.as_str(),
@@ -2012,13 +2051,14 @@ async fn control_loop<T: RobotIo>(
                 }
                 mode_change = Some(target);
                 // Home the robot with the machinery `init` and a fall recovery already use: it
-                // ramps per tick, and `driving` is false until it reaches Ready.
-                if let Some(sensors) = sensors.as_ref() {
-                    bringup = Bringup::Homing {
-                        from: sensors.positions,
-                        since: tick_start,
-                    };
-                }
+                // ramps per tick, and `driving` is false until it reaches Ready. From `Limp`
+                // this is a no-op — the enable path below owns the torque and the ramp.
+                bringup = next;
+            } else {
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch refused: no position sample this tick"
+                );
             }
         }
 
@@ -2289,14 +2329,14 @@ async fn control_loop<T: RobotIo>(
             twist_ema = [0.0; 3];
         }
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
-            *ema += cmd_alpha * (target - *ema);
+            slew(ema, target, cmd_alpha);
         }
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            *ema += head_alpha * (target - *ema);
+            slew(ema, target, head_alpha);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
-                *ema += cmd_alpha * (target - *ema);
+                slew(ema, target, cmd_alpha);
             }
         } else {
             body_ema = [0.0; 3];
@@ -7557,5 +7597,66 @@ mod tests {
         // Neither other state ramps anything.
         assert!(Bringup::Limp.homing_target(since).is_none());
         assert!(Bringup::Ready.homing_target(since).is_none());
+    }
+
+    /// A mode switch requested while `Limp` must stay `Limp`: the enable path owns
+    /// `set_torque`, and jumping straight to `Homing` would run the whole ramp over dead
+    /// motors — finishing "successfully", loading the other mode's policies, and reporting
+    /// `Ready` for a robot still lying on the floor.
+    #[test]
+    fn a_mode_switch_from_limp_waits_for_the_enable_path() {
+        let now = Instant::now();
+        assert_eq!(
+            mode_switch_bringup(Bringup::Limp, Some([0.0; NUM_JOINTS]), now),
+            Some(Bringup::Limp)
+        );
+    }
+
+    /// A tick without a position sample cannot arm the ramp. Queuing the switch anyway would
+    /// leave it in `mode_change` forever — its only consumer is the ramp finishing — and every
+    /// later switch would be refused as already in flight. Refusing beats wedging.
+    #[test]
+    fn a_mode_switch_without_a_position_sample_is_refused() {
+        let now = Instant::now();
+        assert_eq!(mode_switch_bringup(Bringup::Ready, None, now), None);
+        assert_eq!(
+            mode_switch_bringup(
+                Bringup::Homing {
+                    from: [0.0; NUM_JOINTS],
+                    since: now
+                },
+                None,
+                now
+            ),
+            None
+        );
+    }
+
+    /// The ordinary case: re-home from wherever the joints are, so the other mode's policies
+    /// load at a known pose with the robot standing still.
+    #[test]
+    fn a_mode_switch_restarts_the_homing_ramp() {
+        let now = Instant::now();
+        let from = [0.1; NUM_JOINTS];
+        assert_eq!(
+            mode_switch_bringup(Bringup::Ready, Some(from), now),
+            Some(Bringup::Homing { from, since: now })
+        );
+    }
+
+    /// `1e400` on the wire parses as infinity. Folded into the EMA it is permanent — nothing
+    /// finite climbs back out — and with the safety layer refusing non-finite targets, one bad
+    /// `robot.move` would freeze the robot on its hold pose until reboot. Dropped instead.
+    #[test]
+    fn a_non_finite_command_does_not_poison_the_filter() {
+        let mut ema = 0.5;
+        slew(&mut ema, f64::INFINITY, 0.3);
+        slew(&mut ema, f64::NEG_INFINITY, 0.3);
+        slew(&mut ema, f64::NAN, 0.3);
+        assert_eq!(ema, 0.5, "non-finite targets are dropped, not folded in");
+
+        // And the filter still works afterwards: the next real command slews as always.
+        slew(&mut ema, 1.0, 0.3);
+        assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
     }
 }
