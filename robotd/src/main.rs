@@ -2269,6 +2269,7 @@ async fn control_loop<T: RobotIo>(
                 },
                 joints: sensors.positions.to_vec(),
                 targets: targets.to_vec(),
+                policy_enabled: Some(snapshot.enabled),
                 policy_action: recorded_policy_action(action),
                 odom: proto::OdomState {
                     position: odometry.position(),

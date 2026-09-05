@@ -2574,6 +2574,12 @@ pub struct RobotState {
     pub head: [f64; 4],
     /// Which policy drove this tick: `walk`, `stand`, or `held` when none did.
     pub policy: String,
+    /// Whether policy control is armed for this tick. `held` alone is not enough to decide that:
+    /// an enabled policy can be holding on a zero command. This lets an update preflight require
+    /// the disabled state before a model reload. Absent from older daemons, which callers must
+    /// treat as unknown rather than safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_enabled: Option<bool>,
     pub safety: SafetyState,
     #[serde(rename = "loop")]
     pub control_loop: LoopState,
@@ -4429,6 +4435,7 @@ mod tests {
             },
             head: [0.0; 4],
             policy: "stand".into(),
+            policy_enabled: None,
             safety: SafetyState {
                 fallen: false,
                 limp: false,
@@ -4487,6 +4494,7 @@ mod tests {
             },
             head: [0.0; 4],
             policy: "walk".into(),
+            policy_enabled: Some(false),
             safety: SafetyState {
                 fallen: false,
                 limp: false,
@@ -4508,6 +4516,7 @@ mod tests {
         let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
         assert!(line.contains(r#""method":"robot.state""#), "{line}");
         assert!(line.contains(r#""move":"#), "{line}");
+        assert!(line.contains(r#""policy_enabled":false"#), "{line}");
         assert!(line.contains(r#""loop":"#), "{line}");
         assert!(!line.contains("movement"), "{line}");
         assert!(!line.contains("control_loop"), "{line}");
@@ -4860,6 +4869,7 @@ mod tests {
             },
             head: [0.0; 4],
             policy: "walk".into(),
+            policy_enabled: None,
             safety: SafetyState {
                 fallen: false,
                 limp: false,

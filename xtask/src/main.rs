@@ -12,6 +12,7 @@
 //!
 //! ```text
 //!   cargo xtask package --version 1.2.3 --channel daemon --bin-dir <dir> --out dist/
+//!   cargo xtask package --version 1.2.3 --channel model-walk --model-dir <dir> --model-api 1 --out dist/
 //!   cargo xtask sign    --dir dist/ --key secret.key
 //!   cargo xtask promote --version 1.2.3 --staging-tag daemon-staging-v1.2.3 \
 //!                       --stable-tag daemon-v1.2.3 \
@@ -60,7 +61,8 @@ struct Cli {
 enum Command {
     /// Assemble a `.tar.zst` artifact and its unsigned manifest.
     Package {
-        /// Release version. Must match the crate version — see `--allow-version-drift`.
+        /// Release version. Must match the crate version for daemon artifacts. Model artifacts
+        /// have their own version line when `--model-dir` is used.
         #[arg(long)]
         version: semver::Version,
 
@@ -68,9 +70,23 @@ enum Command {
         #[arg(long, default_value = "daemon")]
         channel: String,
 
-        /// Directory holding the built binaries to ship.
-        #[arg(long)]
-        bin_dir: PathBuf,
+        /// Directory holding the built daemon binaries to ship.
+        #[arg(
+            long,
+            conflicts_with = "model_dir",
+            required_unless_present = "model_dir"
+        )]
+        bin_dir: Option<PathBuf>,
+
+        /// Directory holding one model bundle (for example `walk.onnx` and its metadata). Model
+        /// files are placed at the root of the installed model release, never under `bin/`.
+        #[arg(long, conflicts_with = "bin_dir", required_unless_present = "bin_dir")]
+        model_dir: Option<PathBuf>,
+
+        /// Model API required by this bundle. Required with `--model-dir`; this is the
+        /// compatibility gate checked before the updater makes a model current.
+        #[arg(long, requires = "model_dir")]
+        model_api: Option<u32>,
 
         /// Where to write the artifact and manifest.
         #[arg(long, default_value = "dist")]
@@ -217,6 +233,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             version,
             channel,
             bin_dir,
+            model_dir,
+            model_api,
             out,
             base_url,
             revision,
@@ -229,6 +247,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             version,
             channel,
             bin_dir,
+            model_dir,
+            model_api,
             out,
             base_url,
             revision,
@@ -273,7 +293,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 struct PackageArgs {
     version: semver::Version,
     channel: String,
-    bin_dir: PathBuf,
+    bin_dir: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+    model_api: Option<u32>,
     out: PathBuf,
     base_url: Option<String>,
     revision: Option<String>,
@@ -285,9 +307,32 @@ struct PackageArgs {
 }
 
 fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let is_model = args.model_dir.is_some();
+    if is_model {
+        if !args.channel.starts_with("model-") {
+            return Err(format!(
+                "model bundles must use a `model-…` channel, got {:?}",
+                args.channel
+            )
+            .into());
+        }
+        if args.model_api.is_none() {
+            return Err("--model-api is required with --model-dir".into());
+        }
+        if !args.includes.is_empty() {
+            return Err(
+                "model bundles take every file from --model-dir; --include is daemon-only".into(),
+            );
+        }
+    } else if args.model_api.is_some() {
+        return Err("--model-api requires --model-dir".into());
+    }
+
     // Catch the classic mistake: tagging a release without bumping Cargo.toml, so the
-    // robot reports a version that doesn't match what it's running.
-    if !args.allow_version_drift {
+    // robot reports a version that doesn't match what it's running. A model deliberately has a
+    // separate version line, so applying that comparison to it would turn the testing-only escape
+    // hatch into the normal publishing path.
+    if !is_model && !args.allow_version_drift {
         let crate_version = workspace_version()?;
         // A dev build is the crate version plus a prerelease tag — `0.2.0-dev.17.abc1234`
         // against a crate at `0.2.0` — so its release triple must match while its prerelease
@@ -330,8 +375,13 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
         let encoder = zstd::Encoder::new(file, args.zstd_level)?.auto_finish();
         let mut builder = tar::Builder::new(encoder);
 
+        let source_dir = args
+            .model_dir
+            .as_ref()
+            .or(args.bin_dir.as_ref())
+            .ok_or("one of --bin-dir or --model-dir is required")?;
         let mut shipped = Vec::new();
-        for entry in std::fs::read_dir(&args.bin_dir)? {
+        for entry in std::fs::read_dir(source_dir)? {
             let path = entry?.path();
             if !path.is_file() {
                 continue;
@@ -341,12 +391,20 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|n| n.to_str())
                 .ok_or("binary has an unreadable name")?
                 .to_owned();
-            // Executable: the robot runs these straight out of the release directory.
-            append_file(&mut builder, &path, &format!("bin/{name}"), 0o755)?;
+            let destination = if is_model {
+                // `robotd`'s policy paths name files from the model release directly. Keeping
+                // the model at its root makes that path unambiguous and prevents a model from
+                // carrying an executable daemon payload by accident.
+                name.clone()
+            } else {
+                format!("bin/{name}")
+            };
+            let mode = if is_model { 0o644 } else { 0o755 };
+            append_file(&mut builder, &path, &destination, mode)?;
             shipped.push(name);
         }
         if shipped.is_empty() {
-            return Err(format!("no binaries found in {}", args.bin_dir.display()).into());
+            return Err(format!("no files found in {}", source_dir.display()).into());
         }
         shipped.sort();
 
@@ -365,28 +423,32 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             append_file(&mut builder, Path::new(src), dest, mode)?;
         }
 
-        // The preinstall hook, always, generated from its template.
+        // The preinstall hook is a daemon-artifact prerequisite, not code a model release may
+        // execute. Keeping it out of model bundles is part of the channel boundary.
         //
         // Not an `--include` the release workflow has to remember: the board prerequisites it
         // asserts are a property of every release, and a check that ships only when someone
         // adds a flag is a check that will one day be missing from the release that needed it.
-        const PREINSTALL_TEMPLATE: &str = "hooks/preinstall.in";
-        if args
-            .includes
-            .iter()
-            .any(|i| i.ends_with("=hooks/preinstall"))
-        {
-            return Err("hooks/preinstall is generated; remove the --include for it".into());
+        if !is_model {
+            const PREINSTALL_TEMPLATE: &str = "hooks/preinstall.in";
+            if args
+                .includes
+                .iter()
+                .any(|i| i.ends_with("=hooks/preinstall"))
+            {
+                return Err("hooks/preinstall is generated; remove the --include for it".into());
+            }
+            let template = std::fs::read_to_string(PREINSTALL_TEMPLATE)
+                .map_err(|e| format!("reading {PREINSTALL_TEMPLATE}: {e}"))?;
+            let hook = render_preinstall_hook(&template)?;
+            append_bytes(&mut builder, "hooks/preinstall", hook.as_bytes(), 0o755)?;
         }
-        let template = std::fs::read_to_string(PREINSTALL_TEMPLATE)
-            .map_err(|e| format!("reading {PREINSTALL_TEMPLATE}: {e}"))?;
-        let hook = render_preinstall_hook(&template)?;
-        append_bytes(&mut builder, "hooks/preinstall", hook.as_bytes(), 0o755)?;
 
         // Recorded inside the release so a robot can identify what it is running even
         // with no network and no manifest.
+        let kind = if is_model { "model" } else { "daemon" };
         let version_toml = format!(
-            "version = \"{}\"\nchannel = \"{}\"\nrevision = \"{}\"\nbinaries = {:?}\n",
+            "version = \"{}\"\nchannel = \"{}\"\nkind = \"{kind}\"\nrevision = \"{}\"\nfiles = {:?}\n",
             args.version,
             args.channel,
             args.revision.as_deref().unwrap_or("unknown"),
@@ -426,6 +488,9 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(floor) = &args.min_supported {
         manifest["min_supported"] = serde_json::json!(floor);
+    }
+    if let Some(model_api) = args.model_api {
+        manifest["model_api"] = serde_json::json!(model_api);
     }
 
     let manifest_path = args.out.join("manifest.json");
@@ -848,6 +913,90 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn model_bundle_has_an_independent_version_line_and_required_compatibility_api() {
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = scratch.path().join("model");
+        let out = scratch.path().join("out");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("walk.onnx"), b"not-a-real-model").unwrap();
+        std::fs::write(model_dir.join("normalization.json"), b"{}\n").unwrap();
+
+        // This is intentionally unrelated to Cargo.toml's daemon version: a policy is an
+        // independently versioned component. Requiring --model-api makes that independence
+        // safe for the daemon that will load it.
+        package(PackageArgs {
+            version: semver::Version::new(7, 2, 1),
+            channel: "model-walk".into(),
+            bin_dir: None,
+            model_dir: Some(model_dir),
+            model_api: Some(1),
+            out: out.clone(),
+            base_url: None,
+            revision: None,
+            min_hw_rev: 0,
+            min_supported: None,
+            includes: Vec::new(),
+            allow_version_drift: false,
+            zstd_level: 1,
+        })
+        .unwrap();
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["channel"], "model-walk");
+        assert_eq!(manifest["version"], "7.2.1");
+        assert_eq!(manifest["model_api"], 1);
+
+        let artifact = std::fs::File::open(out.join("model-walk-7.2.1.tar.zst")).unwrap();
+        let decoder = zstd::Decoder::new(artifact).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert!(paths.contains(&PathBuf::from("walk.onnx")));
+        assert!(paths.contains(&PathBuf::from("normalization.json")));
+        assert!(paths.contains(&PathBuf::from(VERSION_FILE)));
+        assert!(
+            !paths.iter().any(|path| path.starts_with("bin")),
+            "a model bundle must not look like an executable daemon release"
+        );
+        assert!(
+            !paths.iter().any(|path| path.starts_with("hooks")),
+            "a model bundle must not execute daemon install hooks"
+        );
+    }
+
+    #[test]
+    fn model_bundle_refuses_missing_compatibility_api() {
+        let scratch = tempfile::tempdir().unwrap();
+        let model_dir = scratch.path().join("model");
+        std::fs::create_dir(&model_dir).unwrap();
+        std::fs::write(model_dir.join("walk.onnx"), b"weights").unwrap();
+
+        let error = package(PackageArgs {
+            version: semver::Version::new(1, 0, 0),
+            channel: "model-walk".into(),
+            bin_dir: None,
+            model_dir: Some(model_dir),
+            model_api: None,
+            out: scratch.path().join("out"),
+            base_url: None,
+            revision: None,
+            min_hw_rev: 0,
+            min_supported: None,
+            includes: Vec::new(),
+            allow_version_drift: false,
+            zstd_level: 1,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("--model-api is required"));
+    }
+
     /// Every file that packages a release, which is where the `--include` list and the staged
     /// binaries live. Repository paths, because one of them is not a workflow.
     ///

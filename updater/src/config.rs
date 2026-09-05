@@ -475,7 +475,11 @@ mod tests {
         );
 
         // One component per model, each independently versioned (§5.5).
-        assert!(config.component("model-walk").is_ok());
+        let model_walk = config.component("model-walk").unwrap();
+        assert!(matches!(
+            model_walk.on_apply,
+            ApplyAction::Reload { ref unit, ref signal } if unit == "robotd" && signal == "SIGHUP"
+        ));
         assert!(config.component("model-jump").is_ok());
     }
 

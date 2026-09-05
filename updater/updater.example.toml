@@ -171,12 +171,12 @@ repo          = "ORG/gait-walk"
 revision      = "main"
 manifest_file = "manifest.json"
 
-# Bootstrap-inert until robotd exists — see the daemon component above.
 [component.model-walk.on_apply]
-action = "none"
-# action = "reload"
-# unit   = "robotd"
-# signal = "SIGHUP"
+# Model bundles never restart motor control. `robotd` accepts the SIGHUP only after policy
+# control is disabled, and keeps the current controller if the candidate cannot load.
+action = "reload"
+unit   = "robotd"
+signal = "SIGHUP"
 
 [component.model-walk.health]
 probe = "none"

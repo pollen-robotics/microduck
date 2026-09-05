@@ -252,17 +252,20 @@ version line.
 
 **What is missing is at the two ends, not in the middle:**
 
-- **`robotd` cannot reload.** There is no SIGHUP handler and no way to swap an `ort` session
-  under a running 50 Hz loop. This is the milestone's real engineering: the swap must not drop a
-  tick, and a model whose shape is not `obs[1,61] → actions[1,14]` has to be refused *before* it
-  goes live rather than at the first inference.
-- **Nothing publishes a bundle.** `xtask package --channel model-walk` is close — it checks
-  `--version` against the crate version, which a model does not have — and the HF repo layout
-  and naming do not exist.
+- **Safe reload is implemented, but needs board evidence.** `robotd` coalesces SIGHUP requests,
+  waits until policy control is disabled, builds the candidate off the 50 Hz loop, and keeps the
+  current controller if loading fails. The remaining proof is a board run measuring the reload
+  boundary and refusing a malformed ONNX model before it is used.
+- **A bundle can now be made, but nothing publishes one.** `cargo xtask package --channel
+  model-walk --model-dir <dir> --model-api 1 --version <version>` makes an independently-versioned
+  artifact whose manifest carries its compatibility API; it does not accept daemon hooks or
+  binaries. The HF repo layout, release workflow and naming still do not exist.
 - **A third signing key.** `release-1` is CI's and `team.dev` installs nothing on a customer
   robot, so *who may publish a policy a robot will run* is a new custody question, not a reuse
   of an existing one.
-- **`model_api`** (§5.5) is designed and unimplemented on both sides.
+- **`model_api`** (§5.5) is checked by the updater against the running daemon and is required
+  when packaging a model bundle. It still needs a real published model to exercise that boundary
+  on a board.
 - **The training loop.** `microduck_rl` trains and exports to ONNX; nothing carries the result
   to a board without a daemon release. The model equivalent of `dev-push.sh` is what makes
   "train it and try it" a minute rather than a CI run.
