@@ -3639,6 +3639,24 @@ exit 1
         require_files(dir.path(), &[std::path::PathBuf::from("walk.onnx")]).unwrap();
     }
 
+    #[test]
+    fn a_model_artifact_must_declare_and_fit_its_budget() {
+        require_artifact_budget(Some(128), Some(128)).unwrap();
+        assert!(
+            require_artifact_budget(Some(129), Some(128))
+                .unwrap_err()
+                .to_string()
+                .contains("above configured budget")
+        );
+        assert!(
+            require_artifact_budget(None, Some(128))
+                .unwrap_err()
+                .to_string()
+                .contains("size is required")
+        );
+        require_artifact_budget(None, None).unwrap();
+    }
+
     /// The deferred restarts, as an actual command line. Until this existed nothing in the repository
     /// could observe that call: the program name was hardcoded, so `--on-active` could have been
     /// wrong and every test would still pass — while on a board the only symptom is `btd` quietly
