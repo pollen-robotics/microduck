@@ -4,7 +4,7 @@
 
 **Started:** 2026-09-02T22:53:00-04:00
 **Deadline:** 2026-09-05T22:53:00-04:00 (72 hours)
-**Status:** IN_PROGRESS — robot-side landed; Spark PPO **finished** 15k (`TRAIN_EXIT 0`); ONNX exported
+**Status:** CLOSED 2026-09-06 — see `SESSION_REPORT.md`. Standing + hop2 PPO finished; 20 min monitor loop stopped after the 22:53 ET deadline.
 
 ## Success criteria
 

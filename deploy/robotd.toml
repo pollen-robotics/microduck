@@ -109,13 +109,19 @@ mode = "walk"
 # Walk-mode defaults, spelled out:
 # walk        = ".../current/policies/alpha_walking.onnx"     the velstand gait
 # stand       = ".../current/policies/alpha_stand.onnx"       standing + body pose
-# To try the dance gait: point stand at dance_gait_iter14999.onnx and set
-# [audio] dance = true, dance_gait = true. Leave alpha_stand for the crouch overlay.
 # sitstand    = ".../current/policies/alpha_sitstand.onnx"    sit <-> stand, posture flag
 # ground_pick = ".../current/policies/alpha_ground_pick.onnx" A-button pick
 # kick_left   = ".../current/policies/ball_kick_left.onnx"
 # kick_right  = ".../current/policies/ball_kick_right.onnx"
 # roulade     = ".../current/policies/roulade.onnx"          X-button forward roll
+# dance       = "/path/to/dance_loco.onnx"                   optional hop-travel net
+#
+# Two-file rule: stand stays alpha_stand (crouch / idle). dance is the hop-travel
+# gait. Do not load the dance ONNX as stand or walk. Unset dance = crouch overlay
+# on stand, same as today. A configured dance path that fails to load fails the
+# whole policy bundle (unhealthy, roll it back).
+# To try the standing crouch gait without a dance slot: point stand at
+# dance_gait_iter14999.onnx and set [audio] dance = true, dance_gait = true.
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
@@ -291,8 +297,9 @@ mode = "walk"
 #
 # Dedicated dance gait (trained ONNX). Off by default. When true *and* dance
 # is on, beat fills body_x=sin, body_y=cos, body_yaw=energy and z stays 0 —
-# only with `[policy] stand` pointing at that ONNX. Do not combine with
-# alpha_stand.onnx.
+# only with `[policy] stand` pointing at that ONNX (the v1 standing crouch).
+# Do not combine with alpha_stand.onnx. `[policy] dance` ignores this flag:
+# Net::Dance always gets those slots.
 # dance_gait = false
 
 [theremin]

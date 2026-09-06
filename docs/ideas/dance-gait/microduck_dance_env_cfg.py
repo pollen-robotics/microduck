@@ -58,6 +58,12 @@ class BeatPhaseCommand(CommandTerm):
         self.phase = torch.zeros(self.num_envs, device=self.device)
         self.bpm = torch.full((self.num_envs,), 100.0, device=self.device)
         self.energy = torch.ones(self.num_envs, device=self.device)
+        self._bpm_center = self.bpm.clone()
+        self._energy_center = self.energy.clone()
+        self._groove = torch.zeros(self.num_envs, device=self.device)
+        self._lead = torch.zeros(self.num_envs, device=self.device)
+        self._hold = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._prev_phase = torch.zeros(self.num_envs, device=self.device)
 
     @property
     def command(self) -> torch.Tensor:
@@ -76,7 +82,21 @@ class BeatPhaseCommand(CommandTerm):
         self.energy[env_ids] = torch.empty(n, device=self.device).uniform_(
             self.cfg.energy_min, self.cfg.energy_max
         )
-        self.phase[env_ids] = torch.empty(n, device=self.device).uniform_(0.0, 1.0)
+        self._bpm_center[env_ids] = self.bpm[env_ids]
+        self._energy_center[env_ids] = self.energy[env_ids]
+        if self.cfg.resample_phase:
+            self.phase[env_ids] = torch.empty(n, device=self.device).uniform_(0.0, 1.0)
+        if self.cfg.organic:
+            g = float(self.cfg.groove)
+            self._groove[env_ids] = g * (
+                0.65 + 0.35 * torch.rand(n, device=self.device)
+            )
+            self._lead[env_ids] = torch.where(
+                torch.rand(n, device=self.device) < 0.5,
+                torch.zeros(n, device=self.device),
+                torch.full((n,), 0.5, device=self.device),
+            )
+            self._hold[env_ids] = 0
         silent = torch.rand(n, device=self.device) < self.cfg.zero_energy_prob
         self.energy[env_ids[silent]] = 0.0
         self._write_command()
@@ -84,25 +104,76 @@ class BeatPhaseCommand(CommandTerm):
     def _update_command(self) -> None:
         dt = float(self._env.step_dt)
         active = self.energy > 0.0
+        if self.cfg.organic:
+            self._organic_step(dt, active)
+        else:
+            self.phase = torch.where(
+                active,
+                (self.phase + self.bpm / 60.0 * dt) % 1.0,
+                self.phase,
+            )
+        self._write_command()
+
+    def _organic_step(self, dt: float, active: torch.Tensor) -> None:
+        """Wander tempo/energy, swing the displayed beat, hesitate now and then."""
+        n = self.num_envs
+        device = self.device
+        sqrt_dt = math.sqrt(dt)
+        self.bpm = (
+            self.bpm
+            + 1.4 * (self._bpm_center - self.bpm) * dt
+            + float(self.cfg.bpm_wander) * sqrt_dt * torch.randn(n, device=device)
+        )
+        self.bpm.clamp_(self.cfg.bpm_min, self.cfg.bpm_max)
+        self.energy = (
+            self.energy
+            + 0.9 * (self._energy_center - self.energy) * dt
+            + float(self.cfg.energy_wander) * sqrt_dt * torch.randn(n, device=device)
+        )
+        self.energy.clamp_(self.cfg.energy_min, self.cfg.energy_max)
+
+        self._groove = (
+            self._groove + 0.05 * sqrt_dt * torch.randn(n, device=device)
+        ).clamp(0.05, max(0.08, 1.4 * float(self.cfg.groove)))
+        wrapped = (self.phase < (self._prev_phase - 0.5)) & active
+        flip = wrapped & (torch.rand(n, device=device) < float(self.cfg.lead_flip_prob))
+        self._lead = torch.where(flip, 0.5 - self._lead, self._lead)
+        start_hold = wrapped & (
+            torch.rand(n, device=device) < float(self.cfg.hesitate_prob)
+        )
+        if bool(start_hold.any()):
+            k = int(start_hold.sum().item())
+            # ~80–220 ms at 50 Hz control.
+            self._hold[start_hold] = torch.randint(4, 12, (k,), device=device)
+        holding = self._hold > 0
+        self._hold = torch.where(holding, self._hold - 1, self._hold)
+        moving = active & ~holding
+        self._prev_phase = self.phase.clone()
         self.phase = torch.where(
-            active,
+            moving,
             (self.phase + self.bpm / 60.0 * dt) % 1.0,
             self.phase,
         )
-        self._write_command()
 
     def _write_command(self) -> None:
         two_pi = 2.0 * math.pi
         active = self.energy > 0.0
-        s = torch.sin(two_pi * self.phase)
-        c = torch.cos(two_pi * self.phase)
+        phi = self.phase
+        if self.cfg.organic:
+            # Late backbeat so foot swaps are not a metronome click.
+            phi = (phi + self._lead + self._groove * torch.sin(two_pi * phi)) % 1.0
+        s = torch.sin(two_pi * phi)
+        c = torch.cos(two_pi * phi)
         zeros = torch.zeros_like(s)
+        energy = self.energy
+        if self.cfg.organic:
+            energy = energy * (0.86 + 0.14 * (0.5 + 0.5 * torch.sin(two_pi * phi)))
         self._command[:, 0] = torch.where(active, s, zeros)
         self._command[:, 1] = torch.where(active, c, zeros)
         self._command[:, 2] = 0.0
         self._command[:, 3] = 0.0
         self._command[:, 4] = 0.0
-        self._command[:, 5] = self.energy
+        self._command[:, 5] = torch.where(active, energy, zeros)
 
 
 @dataclass(kw_only=True)
@@ -112,6 +183,13 @@ class BeatPhaseCommandCfg(CommandTermCfg):
     energy_min: float = 0.35
     energy_max: float = 1.0
     zero_energy_prob: float = ZERO_ENERGY_PROB
+    resample_phase: bool = True
+    organic: bool = False
+    groove: float = 0.0
+    bpm_wander: float = 0.0
+    energy_wander: float = 0.0
+    hesitate_prob: float = 0.0
+    lead_flip_prob: float = 0.0
 
     def build(self, env: ManagerBasedRlEnv) -> BeatPhaseCommand:
         return BeatPhaseCommand(self, env)

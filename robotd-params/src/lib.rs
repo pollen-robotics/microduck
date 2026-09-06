@@ -549,6 +549,9 @@ pub struct PolicyParams {
     pub kick_right: Option<PathBuf>,
     /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
     pub roulade: Option<PathBuf>,
+    /// Locomoting hop-dance. No release default; unset = crouch overlay on stand.
+    /// Never load this file as `stand` or `walk`.
+    pub dance: Option<PathBuf>,
     /// Scales raw policy output into a joint offset. Absent resolves per mode: 0.9 walking
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
@@ -608,6 +611,7 @@ pub struct ResolvedPolicy {
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
     pub roulade: Option<PathBuf>,
+    pub dance: Option<PathBuf>,
     pub action_scale: f64,
     pub standing_action_scale: f64,
     pub standing_gain_ratio: f64,
@@ -669,6 +673,7 @@ impl PolicyParams {
             kick_left: path(&self.kick_left, kick.then_some("ball_kick_left.onnx")),
             kick_right: path(&self.kick_right, kick.then_some("ball_kick_right.onnx")),
             roulade: path(&self.roulade, Some("roulade.onnx")),
+            dance: path(&self.dance, None),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -767,6 +772,7 @@ impl Default for PolicyParams {
             kick_left: None,
             kick_right: None,
             roulade: None,
+            dance: None,
             action_scale: None,
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.
@@ -1331,6 +1337,19 @@ mod tests {
         assert_eq!(name(&p.kick_left).as_deref(), Some("ball_kick_left.onnx"));
         assert_eq!(name(&p.kick_right).as_deref(), Some("ball_kick_right.onnx"));
         assert_eq!(name(&p.roulade).as_deref(), Some("roulade.onnx"));
+        assert_eq!(p.dance, None, "dance has no release default");
+    }
+
+    #[test]
+    fn dance_path_is_optional_and_none_disables_it() {
+        let mut p = Params::default();
+        p.policy.dance = Some("none".into());
+        assert_eq!(p.policy.resolved().dance, None);
+        p.policy.dance = Some("/tmp/dance_loco.onnx".into());
+        assert_eq!(
+            p.policy.resolved().dance.as_deref(),
+            Some(std::path::Path::new("/tmp/dance_loco.onnx"))
+        );
     }
 
     /// Command smoothing matches the prototype's `--cmd-alpha` / `--head-alpha`.

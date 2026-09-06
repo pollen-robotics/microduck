@@ -4,7 +4,7 @@
 A standing Microduck bobs on a heard beat inside the stand pose box, with no obs-width change; a dedicated dance gait is trained on Spark.
 
 ## Current Phase
-Phase 5 — post-train: hardware checklist; 72h loop still armed until deadline
+Phase 5 — closed: 72h loop stopped 2026-09-06; hardware checklist still needs a duck
 
 ## Phases
 
@@ -41,8 +41,9 @@ Phase 5 — post-train: hardware checklist; 72h loop still armed until deadline
 ### Phase 5: 72h loop
 - [x] Monitor training through 15k
 - [x] Wire dance gait command slots (`audio.dance_gait`) without touching alpha stand zeros
+- [x] Stop 72h loop after deadline; write `SESSION_REPORT.md`
 - [ ] Hardware checklist (speaker in the room; own quack; dead arecord) — needs a duck
-- **Status:** in_progress
+- **Status:** complete except hardware (needs a duck)
 
 ## Decisions Made
 | Decision | Rationale |

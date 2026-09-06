@@ -10,8 +10,10 @@
 //! inference share this file. The arecord worker and the ambient sound sentry from the
 //! prototype's `pet_worker.rs` live in [`worker`]. The beat tracker and the pose mapper
 //! that turn a heard pulse into a stand-policy crouch live in [`beat`] and [`mapper`].
+//! The locomoting hop-dance phrase mixer lives in [`director`].
 
 pub mod beat;
+pub mod director;
 pub mod mapper;
 pub mod worker;
 

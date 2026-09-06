@@ -142,6 +142,11 @@ pub const REGISTRY: &[Entry] = &[
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
     entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
     entry(
+        "policy.dance",
+        Kind::OptionalPath,
+        "Hop-dance policy; unset = crouch overlay on stand",
+    ),
+    entry(
         "policy.action_scale",
         Kind::OptionalFloat,
         "Policy output to joint offset; unset resolves per mode",

@@ -25,4 +25,8 @@ dance_gait = true   # body_x=sin, body_y=cos, body_yaw=energy; z stays 0
 
 Do not set `dance_gait` while `stand` is still `alpha_stand.onnx`.
 
+Next: locomote + hop between feet — [`locomote-and-hop.md`](locomote-and-hop.md).
+
+Spark (2026-09-04): task `Mjlab-Dance-Loco-Flat-MicroDuck`, smoke 64×5 exit 0, PPO 4096 envs / 15k scratch in tmux `dance-loco-1bf7770a`, job `/home/mstaub/jobs/feat-dancing-skill-loco-1bf7770a/`. Recipe: [`microduck_dance_loco_env_cfg.py`](microduck_dance_loco_env_cfg.py).
+
 Export only via `uv run scripts/export.py` (bakes the obs normalizer).

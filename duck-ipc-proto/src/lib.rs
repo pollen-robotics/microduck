@@ -161,6 +161,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
+/// # v19 — optional `dance` on `robot.subscribe`
+///
+/// [`SubscribeResult`] names the hop-dance policy file when `[policy] dance` is set.
+/// Additive (`skip_serializing_if` none); a v18 client sees the acknowledgement it saw
+/// before. The tick label is `"dance"` on `RobotState.policy`.
+///
 /// # v18 — optional `beat` on `robot.state`
 ///
 /// The onboard mic worker publishes a last-value-wins beat snapshot so a client can see
@@ -175,7 +181,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
 /// Both come out of the same release and an apply restarts both, so the skew lasts as long as
 /// the update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 18;
+pub const API_VERSION: u32 = 19;
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -1815,6 +1821,9 @@ pub struct SubscribeResult {
     pub kick_right: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roulade: Option<String>,
+    /// Locomoting hop-dance net, when configured. Absent is the release default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dance: Option<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].

@@ -197,6 +197,7 @@ impl Model {
             "policy.kick_left" => path(policy.kick_left),
             "policy.kick_right" => path(policy.kick_right),
             "policy.roulade" => path(policy.roulade),
+            "policy.dance" => path(policy.dance),
             "policy.action_scale" => float(policy.action_scale),
             "policy.head_lowpass" => policy.head_lowpass.and_then(float),
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),

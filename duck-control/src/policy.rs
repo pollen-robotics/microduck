@@ -187,6 +187,10 @@ pub enum Net {
     /// Episodic forward roll; trained with every command slot at zero, and it starts
     /// rolling the moment it is switched in.
     Roulade,
+    /// Locomoting hop-dance. Optional; no release default. Selected only when the
+    /// caller passes `dance_active`, even if the director twist is above the standing
+    /// threshold — it must not fall through to walk.
+    Dance,
 }
 
 /// Which policy files to load. `walk` is mandatory; every other slot is a capability the
@@ -200,6 +204,9 @@ pub struct PolicyPaths {
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
     pub roulade: Option<PathBuf>,
+    /// Locomoting hop-dance. `None` is the release default — unset means the crouch
+    /// overlay on stand, not a missing file.
+    pub dance: Option<PathBuf>,
 }
 
 /// The loaded networks.
@@ -215,6 +222,7 @@ pub struct Policy {
     kick_left: Option<Session>,
     kick_right: Option<Session>,
     roulade: Option<Session>,
+    dance: Option<Session>,
     standing_threshold: f64,
     /// Roller mode and fall-recovery mode reserve the standing network (roller has none;
     /// fall recovery keeps it for getting up), so command magnitude must never select it.
@@ -258,6 +266,7 @@ impl Policy {
                 kick_left: open_opt(&paths.kick_left, &zero)?,
                 kick_right: open_opt(&paths.kick_right, &zero)?,
                 roulade: open_opt(&paths.roulade, &zero)?,
+                dance: open_opt(&paths.dance, &zero)?,
                 standing_threshold,
                 standing_disabled: false,
             })
@@ -304,6 +313,10 @@ impl Policy {
         }
     }
 
+    pub fn has_dance(&self) -> bool {
+        self.dance.is_some()
+    }
+
     /// One inference on the named network. A missing optional network falls back to
     /// walking — the scheduler checks `has_*` before asking, so reaching the fallback is a
     /// bug, but a wrong gait beats a dead control thread.
@@ -320,6 +333,7 @@ impl Policy {
             Net::KickLeft => self.kick_left.as_mut(),
             Net::KickRight => self.kick_right.as_mut(),
             Net::Roulade => self.roulade.as_mut(),
+            Net::Dance => self.dance.as_mut(),
         };
         let session = match session {
             Some(session) => session,

@@ -107,6 +107,9 @@ pub struct OverlayGate {
     pub walk_mode: bool,
     pub enabled: bool,
     pub has_standing: bool,
+    /// Locomoting hop-dance net is loaded. Overlay can apply with this *or*
+    /// [`Self::has_standing`] — crouch needs standing; travel-hop needs dance.
+    pub has_dance: bool,
     pub fallen: bool,
     pub limp_fall: bool,
     pub skill_busy: bool,
@@ -124,7 +127,7 @@ impl OverlayGate {
         self.opt_in
             && self.walk_mode
             && self.enabled
-            && self.has_standing
+            && (self.has_standing || self.has_dance)
             && self.locked
             && self.t_fresh
             && !self.fallen
@@ -257,6 +260,16 @@ mod tests {
             g.pose_active = false;
             assert!(!g.overlay_applies());
         }
+    }
+
+    #[test]
+    fn overlay_applies_with_dance_net_even_without_standing() {
+        let mut g = live();
+        g.has_standing = false;
+        g.has_dance = true;
+        assert!(g.overlay_applies());
+        g.has_dance = false;
+        assert!(!g.overlay_applies());
     }
 
     #[test]

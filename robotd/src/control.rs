@@ -9,7 +9,7 @@
 //! ```text
 //! skill windows ← advance / expire (roulade window, kick timer, ground-pick phase, sit↔stand rise)
 //! command      ← the caller's smoothed command, re-encoded for the active skill
-//! net          ← roulade > kick > ground pick > sit/rise > stand-by-magnitude > walk
+//! net          ← roulade > kick > ground pick > sit/rise > dance > stand-by-magnitude > walk
 //! action       ← ONNX
 //! targets      ← home pose + action_scale × action
 //! filters      ← optional first-order low-pass on head and legs
@@ -200,6 +200,10 @@ impl Controller {
         self.policy.has_standing()
     }
 
+    pub fn has_dance(&self) -> bool {
+        self.policy.has_dance()
+    }
+
     pub fn is_sitting(&self) -> bool {
         self.sit == Sit::Sitting
     }
@@ -303,12 +307,17 @@ impl Controller {
     /// the standing network drives (by magnitude where it is selectable, forced where it is
     /// reserved), exactly as the prototype's B-button mode behaves.
     ///
+    /// `dance_active` is the hop-dance overlay: director twist + beat body slots on
+    /// [`Net::Dance`], before magnitude would pick walk. Skills, sit, limp-fall, and
+    /// `body_active` still win.
+    ///
     /// `scale_mult` multiplies the action scale — voltage adaptation, 1.0 when off.
     pub fn step(
         &mut self,
         sensors: &duck_control::Sensors,
         command: &Command,
         body_active: bool,
+        dance_active: bool,
         dt: f64,
         scale_mult: f64,
     ) -> Result<Step, PolicyError> {
@@ -376,12 +385,16 @@ impl Controller {
                     if body_active {
                         c.twist = [0.0; 3];
                     }
-                    let standing = self.policy.will_stand(c.twist_magnitude())
-                        || (body_active && self.policy.has_standing());
-                    if standing {
-                        (Net::Stand, c, "stand")
+                    if dance_active && !body_active && self.policy.has_dance() {
+                        (Net::Dance, c, "dance")
                     } else {
-                        (Net::Walk, c, "walk")
+                        let standing = self.policy.will_stand(c.twist_magnitude())
+                            || (body_active && self.policy.has_standing());
+                        if standing {
+                            (Net::Stand, c, "stand")
+                        } else {
+                            (Net::Walk, c, "walk")
+                        }
                     }
                 }
             }
@@ -425,6 +438,9 @@ impl Controller {
                     self.tuning.gain
                 },
             ),
+            // Trained at standing_action_scale (1.0) and walk gain. Must not fall through
+            // `_ if standing_tuned` (0.8 gain) or the walk `_` arm (scale 0.9).
+            Net::Dance => (self.tuning.standing_action_scale, self.tuning.gain),
             _ if standing_tuned => (
                 self.tuning.standing_action_scale,
                 (self.tuning.gain as f64 * self.tuning.standing_gain_ratio).round() as u16,

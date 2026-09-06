@@ -311,6 +311,7 @@ struct PolicyNames {
     kick_left: Option<String>,
     kick_right: Option<String>,
     roulade: Option<String>,
+    dance: Option<String>,
 }
 
 impl PolicyNames {
@@ -328,6 +329,7 @@ impl PolicyNames {
             kick_left: name(&policy.kick_left),
             kick_right: name(&policy.kick_right),
             roulade: name(&policy.roulade),
+            dance: name(&policy.dance),
         }
     }
 }
@@ -1092,6 +1094,7 @@ fn build_controller(
             kick_left: policy_cfg.kick_left.clone(),
             kick_right: policy_cfg.kick_right.clone(),
             roulade: policy_cfg.roulade.clone(),
+            dance: policy_cfg.dance.clone(),
         };
         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
             Ok(mut policy) => {
@@ -1109,6 +1112,7 @@ fn build_controller(
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
+                    dance = ?policy_cfg.dance.as_ref().map(|p| p.display().to_string()),
                     limp_fall,
                     "policy loaded"
                 );
@@ -1218,6 +1222,8 @@ async fn control_loop<T: RobotIo>(
     // BeatState.t is a frame counter. The mapper treats a frozen t as a dead capture.
     let mut last_beat_t = 0u64;
     let mut last_beat_at = Instant::now();
+    let mut director = pet_detect::director::DanceDirector::new(1);
+    let mut dance_twist_ema = [0.0f64; 3];
 
     // Coasting over a dropped bus read, and where the robot actually is.
     //
@@ -1789,6 +1795,7 @@ async fn control_loop<T: RobotIo>(
             walk_mode: policy_params.mode == Mode::Walk,
             enabled: snapshot.enabled,
             has_standing: controller.as_ref().is_some_and(|c| c.has_standing()),
+            has_dance: controller.as_ref().is_some_and(|c| c.has_dance()),
             fallen: safety.fallen(),
             limp_fall: in_limp_fall,
             skill_busy: skill_busy || sitting,
@@ -1800,15 +1807,28 @@ async fn control_loop<T: RobotIo>(
                 < Duration::from_millis(params.safety.deadman_ms),
             pose_active: snapshot.pose.active,
         };
+        let dance_active = dance_gate.overlay_applies()
+            && controller.as_ref().is_some_and(|c| c.has_dance());
         let mut dance_mouth = None;
         let mut gait = pet_detect::mapper::GaitCommand::default();
         if snapshot.pose.active {
+            director.tick(&beat, false);
+            dance_twist_ema = [0.0; 3];
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
                 *ema += cmd_alpha * (target - *ema);
             }
+        } else if dance_active {
+            let target = director.tick(&beat, true);
+            for (ema, t) in dance_twist_ema.iter_mut().zip(target) {
+                *ema += cmd_alpha * (t - *ema);
+            }
+            gait = pet_detect::mapper::map_beat_gait(&beat);
+            body_ema = [0.0; 3];
         } else if dance_gate.overlay_applies() {
+            director.tick(&beat, false);
+            dance_twist_ema = [0.0; 3];
             if params.audio.dance_gait {
-                // Dance net: beat in unbound slots, z/roll/pitch stay 0 (as trained).
+                // v1 ONNX-as-stand: beat in unbound slots, z/roll/pitch stay 0.
                 gait = pet_detect::mapper::map_beat_gait(&beat);
                 body_ema = [0.0; 3];
             } else {
@@ -1821,10 +1841,12 @@ async fn control_loop<T: RobotIo>(
                 dance_mouth = Some(overlay.mouth);
             }
         } else {
+            director.tick(&beat, false);
+            dance_twist_ema = [0.0; 3];
             body_ema = [0.0; 3];
         }
         let command = PolicyCommand {
-            twist: twist_ema,
+            twist: if dance_active { dance_twist_ema } else { twist_ema },
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
             // singing stops so the head settles rather than snaps.
@@ -2031,7 +2053,14 @@ async fn control_loop<T: RobotIo>(
             },
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
-                match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
+                match controller.step(
+                    sensors,
+                    &command,
+                    snapshot.pose.active,
+                    dance_active,
+                    dt,
+                    scale_mult,
+                ) {
                     Ok(step) => (
                         step.targets,
                         step.gain,
@@ -2978,6 +3007,7 @@ fn dispatch(
                     kick_left: policies.kick_left.clone(),
                     kick_right: policies.kick_right.clone(),
                     roulade: policies.roulade.clone(),
+                    dance: policies.dance.clone(),
                     unavailable: state.policy_error.load_full().map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
@@ -3787,7 +3817,24 @@ mod tests {
         // name is the part that differs between two builds someone is comparing.
         assert_eq!(result.walk.as_deref(), Some("alpha_walking.onnx"));
         assert_eq!(result.stand.as_deref(), Some("alpha_stand.onnx"));
+        assert_eq!(result.dance, None);
         assert_eq!(result.unavailable, None);
+    }
+
+    #[test]
+    fn subscribing_names_the_dance_policy_when_configured() {
+        let mut params = Params::default();
+        params.policy.dance = Some("/opt/robot/releases/7/dance_loco.onnx".into());
+        let s = Arc::new(RobotState::new(&params, false, false));
+        let result: proto::SubscribeResult = dispatch(
+            &s,
+            &Intents::new(),
+            proto::Id::Number(1),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+        )
+        .result_as()
+        .expect("shape");
+        assert_eq!(result.dance.as_deref(), Some("dance_loco.onnx"));
     }
 
     /// A policy that was wanted and would not load is a different situation from one that was

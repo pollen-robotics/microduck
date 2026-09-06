@@ -1624,6 +1624,9 @@ impl View {
         if policy.roulade.is_some() {
             skills.push("roulade");
         }
+        if policy.dance.is_some() {
+            skills.push("dance");
+        }
         if policy.walk.is_some() {
             if skills.is_empty() {
                 caption.push(Span::raw(" · no skills").dim());
