@@ -3,8 +3,8 @@ title: microduck vision demo
 emoji: 🦆
 colorFrom: yellow
 colorTo: indigo
-sdk: gradio
-app_file: app.py
+sdk: docker
+app_port: 7860
 pinned: false
 hf_oauth: true
 short_description: A duck's camera, processed on Hugging Face hardware.
@@ -18,6 +18,11 @@ optical flow, and an overlay of the camera's geometry.
 
 **Do not edit this Space directly.** The source is `spaces/vision-demo/` in
 `pollen-robotics/microduck`, and `scripts/publish-space.sh` is what puts it here.
+
+**Docker rather than `sdk: gradio`, and not by preference.** A Gradio Space installs
+`gradio[oauth,mcp]==6.26.0`, which needs `starlette>=1.0.1`, where `reachy-mini` needs
+`starlette<1.0.0` — every version of it. `ResolutionImpossible`, correctly. Gradio 5.23 resolves
+with the same consumer, so the version is the thing to control, and only a Docker Space can.
 
 ## Two things it is for
 
