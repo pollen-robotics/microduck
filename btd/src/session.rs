@@ -174,7 +174,7 @@ async fn dispatch(
             proto::code::PERMISSION_DENIED,
             format!(
                 "{} needs authentication first: send system.authenticate with the robot's PIN \
-                 (`robotctl system pin` on the robot)",
+                 (`sudo robotctl system pin` on the robot)",
                 call.method()
             ),
         );

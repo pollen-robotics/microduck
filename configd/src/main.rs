@@ -113,6 +113,20 @@ impl PeerPolicy {
     }
 }
 
+/// Whether a call takes the authority to change this robot.
+///
+/// Every mutating call does, and one read does with them: `system.pairingPin`. The PIN is not a
+/// status, it is a capability. Whoever holds it authenticates over BLE as the phone, and from there
+/// every mutating call is reachable, so a peer allowed to read it is a peer allowed to change the
+/// robot by another route. Reads are otherwise ungated on purpose, for [`PeerPolicy`]'s reasons,
+/// and the socket's group is every daemon that talks to one, the gamepad daemon included. A secret
+/// on that footing was readable by processes the design describes as having no privileged access.
+/// `btd` reads it to answer the pairing exchange and is in `--allow-user` for exactly that. A
+/// person reads it the way they set it, with `sudo robotctl system pin`.
+fn needs_authority(call: &proto::Call) -> bool {
+    call.is_mutating() || matches!(call, proto::Call::SystemPairingPin)
+}
+
 /// A user name to a uid.
 ///
 /// `SO_PEERCRED` reports a numeric uid, so a name has to become a number somewhere. Doing it
@@ -398,7 +412,7 @@ async fn dispatch(
 ) -> proto::Response {
     // Authorise before doing anything, and log the caller alongside the method: "who told this
     // robot to reboot" is the first thing support asks.
-    if call.is_mutating() {
+    if needs_authority(call) {
         if let Err(reason) = service.policy.may_mutate(peer) {
             tracing::warn!(method = call.method(), %reason, "refused");
             return proto::Response::err(
@@ -581,5 +595,22 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one read that is a capability. Pinned beside the rule that reads are ungated, so the
+    /// next read added to this daemon is asked the question rather than inheriting the answer.
+    #[test]
+    fn reading_the_pin_takes_the_authority_that_sets_it() {
+        assert!(needs_authority(&proto::Call::SystemPairingPin));
+        assert!(needs_authority(&proto::Call::SystemReboot));
+        assert!(!needs_authority(&proto::Call::SystemInfo));
+        assert!(!needs_authority(&proto::Call::NetStatus));
+        assert!(!needs_authority(&proto::Call::PadStatus));
+        assert!(!needs_authority(&proto::Call::SystemServices));
     }
 }
