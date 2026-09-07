@@ -35,12 +35,26 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
 import gradio as gr
 import numpy as np
 
 from consumer import DuckConsumer
 
 from filters import FILTERS, upright
+
+# **The container log is the only diagnostic a private Space can hand somebody**, and this printed
+# nothing of its own: the consumer logs at INFO and nothing had configured a handler, so every
+# line about the welcome, the producer, the session and the ICE state went nowhere. A Space that
+# will not connect and says nothing in its log is a Space nobody can help with.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("aiortc").setLevel(logging.WARNING)
 
 # Which robot to look for. The rendezvous lists every robot an account owns, and the consumer picks
 # by `meta.name` — the name `robotctl system set-name` sets.

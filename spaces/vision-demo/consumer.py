@@ -292,6 +292,11 @@ class DuckConsumer:
 
         if kind == "welcome":
             self._peer_id = message.get("peerId")
+            logger.info(
+                "the rendezvous welcomed this consumer as %s (%s)",
+                self._peer_id,
+                message.get("username"),
+            )
             # The peer exists only once the stream does — `POST /send` before `GET /events` is a
             # 400 — so everything else starts here rather than in `start`.
             listing = await self._send({"type": "list"})
@@ -310,18 +315,27 @@ class DuckConsumer:
                 return
             self._robot_peer_id = producer.get("id")
             meta = producer.get("meta") or {}
-            logger.info("found %s (%s)", meta.get("name"), self._robot_peer_id)
+            logger.info(
+                "found %s (%s), asking for a session",
+                meta.get("name"),
+                self._robot_peer_id,
+            )
             started = await self._send(
                 {"type": "startSession", "peerId": self._robot_peer_id}
             )
             if started and started.get("type") == "sessionStarted":
                 self._session_id = started.get("sessionId")
+                logger.info("session %s started; waiting for the robot's offer", self._session_id)
                 self._open_peer_connection()
+            else:
+                self._error = f"the service would not start a session: {started}"
+                logger.warning("%s", self._error)
 
         elif kind == "peer":
             await self._on_peer(message)
 
         elif kind == "endSession":
+            logger.info("the session ended: %s", message.get("reason"))
             self._error = message.get("reason") or "the robot ended the session"
             self._session_id = None
 
@@ -336,6 +350,18 @@ class DuckConsumer:
         self._pc = RTCPeerConnection(
             RTCConfiguration(iceServers=[RTCIceServer(urls=STUN)])
         )
+
+        @self._pc.on("connectionstatechange")
+        async def _on_state() -> None:
+            # The line that says whether this is a NAT problem or something else, so it goes in
+            # the log rather than only into `status()`: `connecting` that never becomes
+            # `connected` is no candidate pair, and `failed` is ICE having given up on all of them.
+            assert self._pc is not None
+            logger.info(
+                "peer connection %s (ice %s)",
+                self._pc.connectionState,
+                self._pc.iceConnectionState,
+            )
 
         @self._pc.on("track")
         def _on_track(track: Any) -> None:
