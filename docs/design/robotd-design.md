@@ -43,24 +43,41 @@ the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip 
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
 
-**One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
+**One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
-motor control needs the character devices, and root is not stopped by that flag. So the
-exclusion is arranged rather than enforced, and each other claimant is kept off the port
-deliberately:
+motor control needs the character devices, and root is not stopped by that flag. The daemon
+and standalone `init` therefore share an advisory lock, and other claimants are kept off the
+port separately:
 
 - **The control loop** owns it for as long as the daemon runs.
-- **`robotd init`** opens the port itself, and as root it will succeed *while the daemon is
-  running* — two writers interleaving packets on one bus, which reads as a hardware fault. So
-  it wants the daemon stopped, and that is exactly why `robot.init` and `robot.relax` exist as
-  IPC methods (§3.3): the daemon serves both from inside the loop, so nothing else has to open
-  the bus at all. `init` is the escape hatch for a robot whose daemon is not running.
+- **`robotd init`** opens the port itself, but must first take the daemon's endpoint lock.
+  It holds that lock through the entire ramp: a running daemon refuses `init`, and an `init`
+  already moving the robot refuses a daemon startup or another `init`. `robot.init` and
+  `robot.relax` remain the IPC methods (§3.3) for a running daemon; standalone `init` is the
+  escape hatch for a robot whose daemon is not running.
 - **`serial-getty@ttyS2`** — Armbian runs a login console on UART2 by default, and an `agetty`
   holding the port makes every servo invisible to everything else. `scripts/setup-board.sh`
   masks the unit; `fuser -v /dev/ttyS2` naming `agetty` is how that was found, and it is still
   the command that answers "who has the bus".
 - **The runtime**, at a coarser grain: it drives the same bus, so a board runs the runtime or
   `robotd` and never both, and the units say so with `Conflicts=` (§5.2).
+
+**Socket ownership.** Both entry points acquire `<socket>.lock` (normally
+`/run/robotd.sock.lock`) before publishing `/run/robotd/identity.json` or opening the bus.
+The daemon also binds its listener before starting the control thread, and keeps the lock
+through control-thread shutdown and socket cleanup. A refused duplicate must not overwrite
+the owner's PID and build: `robotctl health` and updater startup checks read that identity.
+For a listener left by an older daemon without a lock, the daemon's bind path removes only
+an actual socket that refuses a bounded connection probe; live listeners and ambiguous paths
+are preserved. Standalone `init` only locks and never binds or cleans up the socket.
+
+**Never unlink the lock file, even at shutdown.** The kernel releases the advisory lock when
+its file is closed or the process exits, including `SIGKILL`; the file itself stays in place.
+Deleting and recreating it could leave contenders locking two different inodes under the same
+name. File existence does not mean the lock is held. The lock is per `--socket`, so callers
+using the same physical bus must use the same socket setting; separate endpoints remain useful
+for independent fake daemons. Older binaries and other tools do not participate in this lock
+and must still be stopped before standalone `init` takes over the bus.
 
 ### 1.2 Who talks to `robotd`
 
