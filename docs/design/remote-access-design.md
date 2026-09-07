@@ -231,7 +231,7 @@ just asks for one.
 
 ### 2.5 Where the token lives, and who writes it
 
-`/etc/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
+`/etc/robot/hf-token`, `root:robot-account`, `0640`, and `robot-account` holds `mediad` and nobody else. JSON: the access token, the refresh token, an
 absolute `expires_at` (the response gives a duration, and a duration means nothing after a reboot)
 and the username, so `account.status` answers with no network at all — a robot that is offline
 still knows who it belongs to.
@@ -241,7 +241,7 @@ still knows who it belongs to.
 and a token that lands `0644` and is chmodded a moment later is world-readable for that moment —
 the kind of window that is invisible in testing and permanent in a `ps`-and-`cat` afterwards.
 `account::write_private` is the same rename dance with the temp file opened `0600` from the start,
-and a test asserts the landed file gives "others" nothing. On a board with no `robot` group — a
+and a test asserts the landed file gives "others" nothing. On a board with no `robot-account` group — a
 developer's laptop, a half-provisioned board — it stays root-only and says so once, rather than
 guessing.
 
@@ -308,7 +308,10 @@ Three things make that acceptable rather than merely permitted:
   **`logout` deletes the robot's copy and tells Hugging Face nothing.** The robot stops being a producer, which is the effect
   somebody signing out is after — but the access token it held stays valid at Hugging Face until
   it expires, up to thirty days, for anything that already read the file. The credential is
-  `0640 root:robot`, so "anything" means root or `mediad` on that board; a stolen board is the
+  `0640 root:robot-account`, and that group holds `mediad` alone, so "anything" means root or
+  `mediad` on that board. It was `root:robot` at first, and `robot` is the socket group: `btd`,
+  `padd`, `tofd` and every operator with a shell are in it, so the owner's token was readable by
+  the gamepad daemon. A group of its own is what makes this sentence true. A stolen board is the
   case that matters, and for that the answer is the account's connected-apps page on hf.co, not a
   call here. Sending a revocation from the robot is a candidate for §9 and deliberately not in
   this slice: it needs the endpoint checked against the first-party client rather than assumed,

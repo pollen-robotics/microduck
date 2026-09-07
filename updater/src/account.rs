@@ -83,11 +83,14 @@ pub const DEFAULT_PATH: &str = "/etc/robot/hf-token";
 
 /// The group that may read the token file.
 ///
-/// `mediad` runs as `User=mediad` with `SupplementaryGroups=robot`, and it is the process that
-/// needs the token — it is the one holding the relay. `updaterd` runs as root and writes it. So
-/// the file is `root:robot` and `0640`: readable by the daemons that belong to this robot, and by
-/// nothing else with a login on the board.
-const TOKEN_GROUP: &str = "robot";
+/// `mediad` is the process that needs the token, since it is the one holding the relay, and
+/// `updaterd` runs as root and writes it. So the file is `0640`, root-owned, and this is its
+/// group. Its own group, with `mediad` as the only member, and not `robot`: `robot` is the socket
+/// group, which is how any client reaches a daemon at all, so `btd`, `padd`, `tofd` and every
+/// operator with a shell are in it. A credential in that group is a credential the gamepad daemon
+/// can read. `mediad.service` grants this one, and the `sysusers.d` files create it and put
+/// `mediad` in it, on a fresh board and by update alike.
+const TOKEN_GROUP: &str = "robot-account";
 
 /// How long an HTTP round trip to Hugging Face gets.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -984,13 +987,22 @@ mod tests {
             0,
             "the token file is readable by other users: {mode:o}"
         );
-        // 0640 on a board with a `robot` group, 0600 without one — a developer's laptop has no
-        // such group, and the test has to pass in both places.
+        // 0640 on a board with the token's group, 0600 without one — a developer's laptop has
+        // no such group, and the test has to pass in both places.
         assert!(mode == 0o600 || mode == 0o640, "unexpected mode {mode:o}");
         assert!(
             !dir.path().join("hf-token.tmp").exists(),
             "the temp file must not be left behind holding a copy of the token"
         );
+    }
+
+    /// **The token's group is not the socket group.** `robot` is how a client reaches a daemon,
+    /// so everything that talks to one is in it, the gamepad daemon and every shell user
+    /// included. It was this group for a week, and the design said only root and `mediad` could
+    /// read the file. Pinned, so convenience does not put it back.
+    #[test]
+    fn the_token_group_is_not_the_socket_group() {
+        assert_ne!(TOKEN_GROUP, "robot");
     }
 
     /// **`mediad` reads this file, so `access_token` at the top level is a contract.**

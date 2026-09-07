@@ -66,7 +66,7 @@ ExecStart=/opt/robot/daemon/current/bin/mediad
 # and not on one where it is enabled.
 User=mediad
 Group=mediad
-SupplementaryGroups=video render robot
+SupplementaryGroups=video render robot robot-account
 
 # Restart=always for padd's reason: mediad exits when it cannot start a pipeline, and a missing
 # plugin or an unopenable device node is a state to retry rather than one to stay down in — a
