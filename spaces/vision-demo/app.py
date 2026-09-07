@@ -38,7 +38,7 @@ from typing import Any
 import gradio as gr
 import numpy as np
 
-from reachy_mini.media.central_consumer import ReachyCentralConsumer
+from consumer import DuckConsumer
 
 from filters import FILTERS, upright
 
@@ -61,7 +61,7 @@ class Link:
     before wondering why the page went quiet.
     """
 
-    consumer: ReachyCentralConsumer | None = None
+    consumer: DuckConsumer | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
     error: str | None = None
@@ -83,10 +83,10 @@ class Link:
             thread = threading.Thread(target=loop.run_forever, name="duck-consumer", daemon=True)
             thread.start()
 
-            consumer = ReachyCentralConsumer(
-                hf_token=token,
+            consumer = DuckConsumer(
+                token=token,
                 robot_name=ROBOT,
-                consumer_label=f"microduck-vision-demo/{os.environ.get('SPACE_ID', 'local')}",
+                label=f"microduck-vision-demo/{os.environ.get('SPACE_ID', 'local')}",
             )
             try:
                 asyncio.run_coroutine_threadsafe(consumer.start(), loop).result(timeout=30)
@@ -140,6 +140,8 @@ def describe(status: dict[str, Any]) -> str:
     session = status.get("session_id")
     state = status.get("pc_state")
     frames = status.get("frames") or 0
+    if reported := status.get("error"):
+        return f"**{reported}**"
 
     if not session:
         return (
@@ -158,9 +160,24 @@ def describe(status: dict[str, Any]) -> str:
             "(`remote-access-design.md` §6). Signalling crossing while media does not is exactly "
             "that failure, and it is not a fault in this Space."
         )
+    geometry = ""
+    if LINK.consumer is not None and (video := LINK.consumer.video_info()):
+        intrinsics = video.get("intrinsics")
+        geometry = (
+            f" Camera says {video.get('width')}×{video.get('height')}, mounted "
+            f"{video.get('rotate')}° off upright"
+            + (
+                f", fx {intrinsics['fx']:.0f} px"
+                + (" (calibrated)" if intrinsics.get("calibrated") else " (nominal)")
+                if intrinsics
+                else ", geometry unknown"
+            )
+            + "."
+        )
     return (
-        f"**connected** — session `{session[:8]}`, {frames} frames decoded. "
-        f"Robot peer `{(status.get('robot_peer_id') or '?')[:8]}`."
+        f"**connected** — session `{session[:8]}`, {frames} frames decoded."
+        + geometry
+        + f" Robot peer `{(status.get('robot_peer_id') or '?')[:8]}`."
     )
 
 

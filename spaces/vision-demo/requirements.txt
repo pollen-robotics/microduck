@@ -1,28 +1,26 @@
-# The consumer, and the WebRTC stack under it. The `central-consumer` extra is what pulls
-# `aiortc` and `av`: a robot never runs the consumer, so the base install leaves them out.
+# The consumer is ours (`consumer.py`), so this is the WebRTC stack and nothing else.
 #
-# **Unpinned deliberately, for now.** `reachy_mini`'s own app guide warns that mixing versions
-# across the SDK, the host shell and the daemon "causes silent protocol drift" — but the drift
-# that matters to *this* Space is between the consumer and a duck, and pinning a version whose
-# DTLS shim we depend on before knowing which versions work would pin the wrong thing. The first
-# time this breaks, pin it here with the version that worked.
-reachy_mini[central-consumer]
+# **`reachy_mini` is deliberately absent.** Its consumer proved the transport and was the wrong
+# dependency: `reachy_mini/__init__.py` imports the daemon's world, which drags in PyGObject — a
+# source build wanting a C compiler and cairo headers for GStreamer bindings a consumer never
+# touches — and it pins `starlette<1.0.0`, which no current Gradio can satisfy. We wrote the
+# robot half of this protocol; the client half is smaller than the workarounds. `consumer.py`
+# says so at more length, and keeps the credit for the DTLS cipher shim where it belongs.
+aiortc
+# The decoder. `aiortc` needs it and this names it, because a frame arriving as a numpy array is
+# the whole point rather than a detail of a dependency.
+av
 
-# The UI. Gradio because its OAuth support is a button rather than a flow to implement — the
-# console page learned what implementing one costs (`remote-access-design.md` §5.0).
-#
-# **The `oauth` extra is ours to ask for.** `gr.LoginButton` raises `Cannot initialize OAuth due
-# to a missing library` without it, and a Hugging Face Space installs `gradio[oauth,mcp]` of its
-# own accord — so this works there whether or not it is written down, and nowhere else. Written
-# down: an app whose login button depends on a platform's default is an app that breaks the first
-# time it runs anywhere but the platform.
-# **Pinned below 6, and the pin is load-bearing.** Gradio 6.26 needs `starlette>=1.0.1` where
-# `reachy-mini` needs `starlette<1.0.0` — every version of it, so this is not a matter of waiting
-# for an upgrade. `ResolutionImpossible` is the honest answer pip gives when both are asked for,
-# which is why this Space is Docker: it gets to choose 5.23 instead of being handed 6.26.
-gradio[oauth]>=5,<6
+# The event stream and the posts back. Streaming responses with a header, which is why this is
+# `httpx` and not `EventSource`-shaped anything.
+httpx
 
-# The processing. `-headless` because a container has no display and the GUI build drags in the
-# whole of GTK to be linked and never used.
+# The UI. Gradio 6 is fine now that nothing pins `starlette<1.0.0` — but the version stays named
+# rather than open, because a Space that installs whatever is current is a Space that breaks on a
+# morning when nobody touched it.
+gradio[oauth]>=5,<7
+
+# The processing. `-headless` because a container has no display and the GUI build links the whole
+# of GTK to never use it.
 opencv-python-headless
 numpy
