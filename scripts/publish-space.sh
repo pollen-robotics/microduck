@@ -81,4 +81,5 @@ REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
 git add -A
 git commit -q -m "$NAME from microduck $REVISION"
 git push
-echo "pushed. The Space rebuilds in a minute or two — Gradio Spaces install their requirements."
+echo "pushed. The Space rebuilds: a couple of minutes for a Docker one, since aiortc and av"
+echo "        are wheels worth waiting for. Its build log is on the Space page."
