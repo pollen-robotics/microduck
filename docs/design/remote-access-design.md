@@ -301,8 +301,11 @@ Three things make that acceptable rather than merely permitted:
 - **It is revocable** — `account.logout` from anywhere, and revoking the grant on Hugging Face,
   which no robot-side gate could offer.
 
-  Worth being exact about the first one, because it is weaker than it sounds: **`logout` deletes
-  the robot's copy and revokes nothing.** The robot stops being a producer, which is the effect
+  Exact about the first one, because it has two halves and only one of them is `updaterd`'s.
+  `logout` deletes the credential, and the relay notices within one heartbeat — ten seconds — and
+  drops its connection, which on this service evicts the producer at once. So a robot signed out
+  stops being listed and stops being reachable. What it does **not** do is revoke anything:
+  **`logout` deletes the robot's copy and tells Hugging Face nothing.** The robot stops being a producer, which is the effect
   somebody signing out is after — but the access token it held stays valid at Hugging Face until
   it expires, up to thirty days, for anything that already read the file. The credential is
   `0640 root:robot`, so "anything" means root or `mediad` on that board; a stolen board is the
@@ -391,6 +394,16 @@ is not, in three ways:
 | auth | none (§4 of `remote-webrtc.md`) | `Authorization: Bearer <hf token>` |
 | ids | its own `peerId`, its own `sessionId` | different ones, per hop |
 | our role | `listener` | `producer` |
+| where a reply arrives | on the socket, always | **`sessionStarted` and `list` in the `POST` response body**; everything else on the stream |
+
+That last row cost an afternoon and belongs in a table rather than in somebody's memory. On a
+WebSocket every answer comes back on the socket, so a client naturally treats a send as
+fire-and-forget. Here `handle_start_session` *returns* `{"type":"sessionStarted","sessionId":…}` to
+the caller of `POST /send` — the producer is notified over SSE, the consumer is answered in the
+response — and a page that discarded that body got the robot's offer for a session whose id it had
+never been told, then failed on a null peer connection. `list` is answered the same way, and is
+*also* pushed over the stream after the welcome, which is why the listing half looked healthy while
+the session half was broken.
 
 So the bridge keeps a session table both ways and rewrites `sessionId` on every `peer` message. That
 is where `reachy_mini`'s relay has needed most of its scar tissue (§3.4), and it is the honest
@@ -416,6 +429,15 @@ into a cadence slower than our own eviction. `reachy_mini`'s ladder has a middle
 publishes no `lease_seconds`**, so that rung is unreachable here; it is not worth reproducing a
 negotiation step for a field nothing sends.
 
+**`POST /send` before `GET /events` is a 400, so the order is not a preference.** The peer does
+not exist until the stream does — identity comes from the bearer token, and the token is bound to
+a peer by the `/events` connection. §3.4 wanted registration before anything reported the robot
+reachable for a different reason; the service enforces the same order for its own.
+
+**The rate limit is 1200 requests per 60 s per peer**, sliding. A 10 s heartbeat and a 30 s poll
+are nine requests a minute, so it constrains nothing here — it is a ceiling to know about before
+somebody shortens an interval to "be safe".
+
 **The SSE side has its own keepalive to size against.** After 30 s with nothing to deliver the
 server emits an `event: ping`, whose only job is to stop the HTTP/2 proxy in front of the Space
 from killing an idle connection. A read timeout on our side therefore has to be comfortably more
@@ -439,6 +461,23 @@ Four, each cheap to build in now and expensive to rediscover:
   yet know the robot exists.
 - **Backoff with jitter, capped.** 5 s growing to 60 s, plus ~10%. A fleet reconnecting in lockstep
   after a service restart is a self-inflicted outage.
+- **A credential that changed under the connection.** The token is read once per connection, so
+  neither a `logout` nor a `login --force` onto another account reaches a running relay by itself
+  — it would go on refreshing the lease with a credential its owner deleted. Re-read on the
+  heartbeat tick, which makes the lag one cadence, and dropping the stream is the deregistration:
+  a clean disconnect evicts the peer immediately, and the sweep is only for sockets that never
+  report closing. There is also an explicit `roles: []` withdraw, which is for keeping the channel
+  open to re-register later and is not what this wants.
+- **A 401 is not a case for backoff.** No number of retries fixes a token the service refuses; a
+  login does. So that path waits on the token file at the same 30 s cadence as a robot nobody has
+  signed in, rather than posting a doomed request every five seconds into somebody else's Space.
+
+Two more from their source, about what the server does rather than what to do about it. **Only
+producers carrying `meta.hardware_id` are swept**, so one without it is never evicted — a crashed
+daemon would haunt its owner's robot list until the Space restarted. That turns §3.7's "should"
+into a "must". And **a second `/events` on the same token supersedes the connection without
+evicting the peer**, so a daemon restarting while its previous socket is half-open reconnects
+cleanly — which is what makes a 60 s read timeout safe rather than merely brave.
 
 What we do **not** copy is their `RobotAppLock`: it arbitrates a local *app* against a remote session,
 and a duck has no app. `remote-webrtc.md` §9 owns the equivalent question here (a pad and a peer both
@@ -480,19 +519,28 @@ fills it in arbitrarily gets subtly wrong behaviour rather than a clear failure:
   So a duck **must** put something stable there, and the obvious candidate already exists:
   `producer.rs` reads the SoC serial for the local `meta`, which is exactly "stable per physical
   robot across reinstalls and renames". Leaving the key out means a robot that reconnects with a
-  fresh token is listed twice; putting the *name* there means renaming a robot forks its identity.
+  fresh token is listed twice — and, since the sweep keys on this field, never evicted at all;
+  putting the *name* there means renaming a robot forks its identity.
+
+  Where there is no serial to read — a developer's laptop, a board whose device tree has none — it
+  falls back to `/etc/machine-id`, stable per *install* rather than per robot. Weaker and still
+  correct for the purpose: one machine is listed once, and the producer stays sweepable. `sounds`
+  already makes exactly this substitution for exactly this reason.
 - **`name`** is what the listing shows a person, and the consumer's `name` is what the server
   reports back as `activeApp` to the owner's other devices. `transport` (`"wifi"` / `"usb"`) is a
   mini-ism a duck can leave alone; a `kind` of `microduck` is what lets one client list both
   families without opening a session.
 
-**And a hazard that belongs in the provisioning path, not here: peers are keyed by token.**
-`get_or_create_peer` is a `token -> peer_id` map, and a second SSE connection on the same token
-supersedes the first. Two robots sharing one token therefore take turns being reachable, and
-neither is broken in a way that looks like a bug. Each duck runs its own device flow, so each gets
-its own token — *unless* an image is cloned with `/etc/robot/hf-token` in it, which is exactly what
-this project's flashing path does with everything else in `/etc/robot`. Whatever produces a golden
-image has to exclude that file, and this is the note that says why.
+**And one protocol fact with a consequence: peers are keyed by token.** `get_or_create_peer` is
+a `token -> peer_id` map, and a second connection on the same token supersedes the first. Two
+things sharing a token therefore take turns being reachable, and neither looks broken. Each duck
+runs its own device flow, so no two robots share one — images are built from scratch rather than
+cloned, so there is no path by which a credential is copied onto a second board.
+
+  Where it does bite is a **consumer**: a cloud backend that authenticates with the *robot's* token
+  supersedes the robot's own peer and takes it off the listing. A Space consuming a duck needs its
+  own token on the same account, or the visitor's. §5's client uses the visitor's, which is why it
+  never meets this.
 
 ## 4. The rendezvous is the one `reachy_mini` uses — **decided**
 
@@ -525,47 +573,179 @@ The one thing that does not transfer is its **lock model** — `RobotAppLock`, l
 remote session, which the mini's relay gates incoming sessions on. A duck has no app, so §3.4
 takes the reconnect behaviour and leaves that part.
 
-## 5. The client, and where it is served — **open**
+## 5. The client is a Space with a Hugging Face sign-in — **decided**
 
-The console is `include_str!`'d into `mediad` and served by the robot (`webrtc-console.md` §1), which
-works because the client is on the LAN. **A remote client cannot fetch a page from a robot it cannot
-reach**, so remote needs the page hosted off-robot *and* a second signalling transport in it.
+The console is `include_str!`'d into `mediad` and served by the robot (`webrtc-console.md` §1),
+which works because the client is on the LAN. **A remote client cannot fetch a page from a robot it
+cannot reach**, so remote needs the page hosted off-robot *and* a second signalling transport in
+it.
 
-Three ways:
+**Decided: a Space in the `pollen-robotics` org with `hf_oauth: true`** — `microduck-console` —
+serving the same page the robot serves, with the transport chosen by how it was opened. And the
+deciding argument is not hosting, it is the **token**.
 
-- **The same file, published by CI to GitHub Pages**, with the transport chosen by the URL it is given.
-  One page, two hosts, still no build step — the constraint `webrtc-console.md` §8 defends survives.
-  The service stays a rendezvous and nothing about the client lives in it.
-- **The service serves the page.** One host and one deploy, at the cost of putting the client inside a
-  service we may not own; a page in a private repo is a page nobody here can edit.
-- **No client yet.** Prove login and the relay with the service's own dashboard, `/api/robot-status`
-  and `duckctl` — which needs no page at all, and is the whole of slices 1 and 2 in §8.
+A remote consumer authenticates to the rendezvous exactly as the robot does — a bearer token the
+service resolves through `whoami-v2`, reading `name` out of the answer. It performs no token-type
+check and no scope check, so a browser's OAuth token is accepted on the same footing as the
+robot's device-flow one. Which makes the whole question "where does a page get an HF token", and a
+Space answers it: `hf_oauth: true` in the README creates the OAuth app and registers a redirect URI
+targeting the Space, and `@huggingface/hub`'s `oauthLoginUrl` / `oauthHandleRedirectIfPresent` do
+the rest of the flow **client-side**, PKCE, with no secret in the page.
 
-**Recommendation: the third, then the first.** The proof that the token path and the lease work needs
-no UI, and deferring the hosting decision by a slice costs nothing.
+### 5.0 It is a Docker Space, and that cost an afternoon
 
-One thing to know before that page is written, and it is settled rather than a preference:
-`EventSource` **cannot set headers**, so a browser speaking the SSE wire must either put the token
-in the query string or read the stream with `fetch` and split SSE by hand. `reachy-mini-js` does
-the former. **The server is removing it** — `_resolve_hf_token` accepts `?token=` only as a
-transitional fallback, logs a deprecation warning per client IP, and says in its own docstring that
-the query form goes once the known clients ship the header. A bearer token in a query string is
-also a bearer token in the Space's access log and in every proxy in between.
+There are two documented ways for a Space to hand its page that client id, and the tidy one did
+not work. A **static** Space is supposed to inject `window.huggingface.variables.OAUTH_CLIENT_ID`
+— `huggingface.js` reads exactly that (`oauth-login-url.ts`), `reachy_mini_website` reads exactly
+that, and HF ships `huggingfacejs/client-side-oauth` as the example. On `microduck-console` it
+never appeared: not after a metadata change, not after the Space went public, not after a
+delete-and-recreate, and not after the page was given a real `<html><head>` for an injector to
+work on — a page that had been a bare doctype for its whole life until then. Hugging Face's own
+API reported our Space and a working one as indistinguishable: both `sdk: static`, both public,
+both `hf_oauth: true`, both `RUNNING`.
 
-So the page is `fetch` plus a few lines of line-splitting, not one browser API — and it should be
-written that way first rather than written twice.
+So the console is a **Docker** Space: `hf_oauth: true` puts `OAUTH_CLIENT_ID` in the container's
+environment — the documented path for anything that is not static, and the one the `grabette-*`
+Spaces use — and eight lines of `sh` substitute it into the page as it is served. A page that
+needs no server has one, for that reason and no other. `OAUTH_CLIENT_SECRET` is in the same
+environment and never goes near the page.
 
-## 6. NAT: decide the STUN server, defer TURN
+Two things that came out of chasing it are worth keeping. The page **logs its own build stamp**
+(revision plus a hash of the page), because a static host caches and a browser caches harder, and
+an hour went into a fix that was never being loaded. And every step of the sign-in **races a
+timeout**: a spent `?code=` left in the address bar leaves `oauthHandleRedirectIfPresent` pending
+forever, and everything a page would say about that is on the far side of the `await`.
 
-`webrtcsink` defaults its `stun-server` to a public Google address. LAN sessions need none, so nothing
-has exercised it — and the moment remote works, **a duck's reachability quietly depends on a third
-party we do not run**. Set the property rather than inherit it, for the same reason
-`remote-webrtc.md` §0 sets `congestion-control` to the value that is already the default: the day
-upstream changes it should not be the day every robot's connectivity changes with it.
+GitHub Pages, which an earlier draft of this section preferred, loses on the same point: the page
+would need an OAuth app registered by hand and its own redirect URI, maintained by us, to arrive
+where a line of README metadata arrives. It stays possible — the page takes a client id from
+`?client_id=` as well, which is how one is tried before it is written down — and this is the same
+reasoning §2.3 used for taking Hugging Face's own device-code client rather than registering one.
 
-TURN is what makes symmetric NAT and CGNAT work at all, and it relays the *whole* session's media at
-somebody's expense. Not in the first slice, and `remote-webrtc.md` §11 is right that the decision
-belongs with whoever runs the rendezvous rather than with the daemon.
+**We ask for no scopes beyond the defaults.** `openid profile` is always included and is all this
+needs — the token's whole job is proving an identity to the rendezvous, which is the argument §2.4
+makes about the robot's own credential, and it would be a poor look to fix it on the robot while
+handing a browser `write-repos`.
+
+**Not a route in `reachy_mini_central`.** One host and one deploy, at the cost of putting duck UI
+inside the service the mini fleet depends on. §4's "we maintain it, so a duck-shaped need is a pull
+request" cuts both ways: the reverse of that is that our page becomes their operational risk.
+
+**The page's source lives in this repository**, next to the one the robot serves, because it has to
+track two things that live here — the signalling protocol and this project's own method names — and
+a copy in a Space repo would drift from both. It **is** the one the robot serves:
+`mediad/webclient/index.html`, one file, with the transport decided by whether its
+`{{SIGNALLING_PORT}}` token was substituted. `web.rs` substitutes it and a test asserts the served
+page has none left; the Space copy keeps it, which is how the page knows no robot served it.
+
+The Space is a deploy target — `pollen-robotics/microduck-console` — and
+`scripts/publish-console.sh` is what puts a page there, along with the `Dockerfile` and
+`entrypoint.sh` that serve it. It substitutes the API version from `duck-ipc-proto`, stamps the
+build, and refuses to publish a page that has lost either the port token (which would make the
+Space's copy try to open a WebSocket) or the client-id token (which would leave it unable to sign
+anybody in). By hand while there is one Space; by CI when that stops being true.
+
+One thing settled rather than preferred, and it survives from the earlier draft: `EventSource`
+**cannot set headers**, so a browser speaking the SSE wire must either put the token in the query
+string or read the stream with `fetch` and split SSE by hand. `reachy-mini-js` does the former and
+**the server is removing it** — `_resolve_hf_token` accepts `?token=` as a transitional fallback,
+logs a deprecation per client IP, and says in its own docstring that the query form goes once the
+known clients ship the header. A bearer token in a query string is a bearer token in the Space's
+access log and in every proxy between. So the page is `fetch` plus a few lines of line-splitting,
+written that way once.
+
+What the page is, then, is the mirror of `mediad::relay`: SSE in, `POST /send` out, gst signalling
+envelopes with per-hop ids, and an opaque SDP/ICE payload — the same translation in the other
+direction, which is why §3.2's table is worth reading before writing it.
+
+### 5.1 A duck in a mini's client, which is a conversation rather than a commit
+
+Putting ducks into a rendezvous whose other clients are `reachy_mini_mobile_app` and its desktop
+counterpart means a duck can appear in somebody's mini app — and be driven as a mini, with method
+names this project does not serve. Video would arrive; nothing else would, and the failure would
+read as a broken robot.
+
+`meta.kind` is there so a client can tell the families apart (§3.7), and this page filters on it.
+The mini's clients cannot be made to, from here: that is a conversation with whoever owns them, and
+it is the direction §4 did not consider — not "what does a duck need from the service" but "what
+does a duck arriving in the service do to its existing clients".
+
+**A non-browser consumer works today, and its one snag is the channel label.**
+`ReachyCentralConsumer` — their aiortc client — connects to a duck through the rendezvous and
+decodes frames with nothing added on either side: `pip install "reachy_mini[central-consumer]"`,
+`robot_name="olducky"`, and `latest_frame()` returns `(720, 1280, 3) uint8`. Verified. What it says
+on the way past is `ignoring unexpected data channel: 'control'`, because it looks for the label
+the mini's daemon opens and ours is `control` (`remote-webrtc.md` §5). Nothing for a perception
+consumer, which wants pixels — and the first thing to fix for one that wants to *drive* a duck,
+where the label is the smaller half of the problem and the method names are the larger.
+
+**Two of their clients select on `meta.name` and neither reads `kind`.** The host shell's picker
+lists whatever is online, and `ReachyCentralConsumer` matches `robot_name` against `meta.name` with
+a **fallback**: one visible producer for the token is used whatever it is called. So a cloud backend
+written for a mini, on an account whose only online robot is a duck, picks the duck and drives it
+with method names this project does not serve. That is worth telling them before somebody meets it,
+and it is a two-line change on their side — `kind` is already on the wire.
+
+## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
+
+`stun.l.google.com:19302`, which is `webrtcsink`'s own default and now also what the console asks
+for when it is remote. That second half was missing and mattered: a page offering only its
+`192.168.…` addresses to a robot on another network negotiates a session perfectly and carries
+nothing, because there is no candidate pair that can work.
+
+**TURN is not optional and it is not symmetric.** Between a robot behind a home router and a
+consumer behind whatever a cloud provider gives a container, srflx-to-srflx needs both NATs to
+allow a hole to be punched — often they do, and often enough they do not. A relay always works, at
+the cost of somebody's bandwidth, which is why ICE tries it last.
+
+**Only the robot offers one**, and that is the part worth knowing before writing any of it: a
+connection needs *one* relay candidate, not two. If the robot offers one, a consumer that can
+reach the internet uses it — so credentials live on the robot and a consumer needs none. Which
+matters more than it sounds, because `aiortc`'s STUN client works where its TURN client does not,
+so a Python consumer *cannot* be the side that relays. `reachy_mini`'s #1182 established this
+arrangement and `mediad::turn` is the same one.
+
+The credentials are Cloudflare's, minted per account by a proxy Hugging Face hosts
+(`turn.fastrtc.org/credentials`) and authenticated with **the same token the relay signs in with**
+— so a robot that belongs to somebody can offer a relay and one that belongs to nobody cannot,
+which is the same line §2 draws everywhere else. They are short-lived: a task refreshes at half of
+a 600 s lifetime, and retries in thirty seconds after a *transient* failure only. A robot nobody
+has signed in has nothing to retry for, and a warning every thirty seconds for the life of the
+daemon is how a log stops being read.
+
+**Fetching them must never be in the way.** The only caller is GStreamer's `consumer-added`
+handler, where the SDP offer for that consumer is not generated until the handler returns, so an
+HTTP request there would delay every connection — including the LAN ones that will never use a
+relay — by however long the proxy takes to answer. `Relays::uris` therefore reads a cache, never
+blocks (a `try_read` that yields nothing rather than waiting) and never fails. An empty answer is
+the ordinary state for the first few seconds after boot and forever on a robot with no account,
+and it means host and srflx only, which is all anything on the same network needs.
+
+**And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` has no A
+record and `fastrtc.org` has no NS records at all, from three public resolvers and from the board
+— so the proxy both `fastrtc`'s own current code and `reachy_mini`'s #1182 point at cannot be
+reached by anybody. Their documentation describes it as a live Hugging Face–Cloudflare arrangement
+(10 GB a month free with an account), so this reads as a lapsed registration or an outage rather
+than a moved URL, and it means the mini fleet's relay path is down too. Worth telling whoever owns
+`fastrtc`.
+
+Three ways on, in the order they should be considered:
+
+- **Wait, having reported it.** The robot degrades exactly as designed — a warning every thirty
+  seconds and host/srflx candidates — so nothing is broken except reaching a robot from a network
+  that needs a relay.
+- **Our own proxy**, which is what that endpoint is: a small service holding a Cloudflare Calls key
+  and minting short-lived credentials for a caller presenting a valid HF token. `--turn-url` is
+  already the seam it plugs into, and the key stays in one place rather than on robots.
+- **A Cloudflare key on the robot**, using `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` directly. Fastest
+  and worst: a long-lived API token on every board, which is the shape of mistake §2.4 exists to
+  stop making.
+
+Nothing about a relay is fatal. `add-turn-server` is checked for existence before it is emitted —
+a panic in a C closure aborts the process rather than unwinding, which `pipeline.rs` learned once
+already — a refused URI is a line in the journal, and a robot that cannot offer a relay is
+reachable from most places rather than none. **And a TURN URI carries a password**, so only the
+host half is ever logged.
 
 ## 7. Authorisation, restated now that there is an account
 
@@ -601,29 +781,46 @@ Five slices, and the first two are independently useful and need no client:
    three calls, three transports, two CLIs, and a token that renews itself. Verifiable on its own,
    which is what made it the first slice: it prints the Hugging Face username.
 2. **The relay, registering only** — producer registration, the negotiated heartbeat, reconnect and
-   backoff, the split-brain poll. `mediad`. Verifiable with no client at all: the service's dashboard
-   counts a producer and `/api/robot-status` lists the duck.
-3. **Session translation** — a remote consumer gets video and the `control` channel. The first slice
-   that needs something to connect *with*.
-4. **The client, hosted.** §5.
-5. **STUN decided; TURN if a real network needs it.** §6.
+   backoff, the split-brain poll. `mediad`. **Done**: `mediad::relay`, a task with no GStreamer in
+   it, inert until `/etc/robot/hf-token` exists and picking it up without a restart when it does.
+   Verifiable with no client at all: the service's dashboard counts a producer and
+   `/api/robot-status` lists the duck.
+3. **The client, hosted.** §5. Ahead of session translation rather than after it, which is a change
+   of order and the reason for it is verification: the service ships no front-end of its own — `GET
+   /` is a status page counting peers, producers and sessions — and its consumers are the mini's
+   mobile and desktop apps, which would drive a duck with a mini's method names. So there is
+   nothing to connect with that we do not write, and translating sessions first would mean
+   building the half that can only be tested against a fake.
+4. **Session translation** — a remote consumer gets video and the `control` channel. **Done**:
+   `relay::bridge` opens `ws://127.0.0.1:<--port>` as a consumer when a session is asked for,
+   rewrites `sessionId` per hop, reads no payload, refuses a second session by name, and tells the
+   service when a session ends however it ends — including the case where there is no producer to
+   bridge to, which is a robot whose pipeline never reached PLAYING.
+5. **STUN decided; TURN offered by the robot.** §6. **Done**: `stun.l.google.com:19302` on both
+   ends, and `mediad::turn` keeps Cloudflare credentials fresh so every consumer's offer carries a
+   `relay` candidate. §6 has the argument; the two things to carry away are that only the robot
+   needs credentials, and that reading them must never block the thread building an offer.
 
 ## 9. What is open, and who can close it
 
 | | needs |
 |---|---|
 | §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
-| §5 where the client is served | follows the shape of §3, and is the decision that actually couples us to a service |
+| a calibration for the camera | `media.video` publishes the module's design figures with `calibrated: false`, which is enough to map a room and not enough for metrology. Measuring one robot and writing `[media.intrinsics]` closes it for that robot; a per-unit calibration in provisioning closes it for the family. §11 of `remote-webrtc.md` |
+| everything on the wire should be timestamped at source | `remote-webrtc.md` §11: `abs-capture-time` on the media, checked against what `webrtcsink`, a browser and `aiortc` actually surface; and a monotonic-plus-epoch field on every control-channel notification that describes a moment. Wanted for any consumer that has to relate what the robot saw to what it felt — visual-inertial SLAM is the case that makes it concrete — and it wants its own version bump rather than riding along with a transport |
 | §2.6 `logout` revokes nothing | whether Hugging Face accepts a revocation for the first-party device-code client, checked rather than assumed. Not blocking — signing out stops the robot being reachable, and a stolen board is answered on hf.co — but it is the difference between "forgotten" and "revoked" |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
 token expires (§2.7 — thirty days, with a rotating refresh token), which rendezvous to use (§4 —
-the mini's), and whether we can read it (§4 — we maintain it; the "private repo" in an earlier
-draft was a wrong-name 401).
+the mini's), whether we can read it (§4 — we maintain it; the "private repo" in an earlier draft
+was a wrong-name 401), and where the client is served (§5 — a static Space with `hf_oauth`, because
+the question was never hosting but how a page gets a token).
 
-One item this page created rather than closed: **a golden image must not carry
-`/etc/robot/hf-token`**, because peers are keyed by token and two robots sharing one take turns
-being reachable. §3.7. That belongs to whoever owns the flashing path.
+One item this page created and closed: **peers are keyed by token**, so two things sharing one
+take turns being reachable. Not a provisioning problem — images are built from scratch, not cloned,
+so no second board ever receives a copy — but it *is* a constraint on consumers: a cloud backend
+must authenticate with its own token, not the robot's, or it takes the robot off the listing by
+connecting. §3.7.
 
 ## 10. Not doing
 

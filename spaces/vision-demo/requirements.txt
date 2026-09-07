@@ -1,0 +1,18 @@
+# The consumer, and the WebRTC stack under it. The `central-consumer` extra is what pulls
+# `aiortc` and `av`: a robot never runs the consumer, so the base install leaves them out.
+#
+# **Unpinned deliberately, for now.** `reachy_mini`'s own app guide warns that mixing versions
+# across the SDK, the host shell and the daemon "causes silent protocol drift" — but the drift
+# that matters to *this* Space is between the consumer and a duck, and pinning a version whose
+# DTLS shim we depend on before knowing which versions work would pin the wrong thing. The first
+# time this breaks, pin it here with the version that worked.
+reachy_mini[central-consumer]
+
+# The UI. Gradio because its OAuth support is a button rather than a flow to implement — the
+# console page learned what implementing one costs (`remote-access-design.md` §5.0).
+gradio>=5
+
+# The processing. `-headless` because a container has no display and the GUI build drags in the
+# whole of GTK to be linked and never used.
+opencv-python-headless
+numpy

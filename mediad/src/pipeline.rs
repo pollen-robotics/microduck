@@ -357,6 +357,7 @@ pub fn start(
     source: Source,
     producer: &crate::producer::Producer,
     settings: &Settings,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
     let &Settings {
         port,
@@ -557,7 +558,7 @@ pub fn start(
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(&sink, channels_tx, runtime, consumers.clone())?;
+    wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -1020,6 +1021,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     Ok(())
 }
 
+/// Which sensor mode this process managed to put the camera in, once it has tried.
+///
+/// A `OnceLock` rather than a value threaded up through the pipeline builder, because that is what
+/// it is: one fact about this process's camera, established while the pipeline is built and read
+/// afterwards by whatever answers `media.video`. `None` — never set, or set after a failed switch
+/// — means the geometry is unknown, and `crate::camera` publishes no intrinsics for it.
+static SENSOR_MODE: std::sync::OnceLock<Option<crate::camera::SensorMode>> =
+    std::sync::OnceLock::new();
+
+/// The sensor mode in force, or `None` when there is no camera or the switch did not take.
+pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
+    *SENSOR_MODE.get().unwrap_or(&None)
+}
+
 /// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
 ///
 /// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
@@ -1046,9 +1061,12 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             %media, %entity,
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps"
+             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
+             because the field of view is then the full sensor's rather than this mode's crop"
         );
+        let _ = SENSOR_MODE.set(None);
     } else {
+        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
         tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
     }
     Ok(())
@@ -1360,6 +1378,7 @@ fn wire_consumers(
     channels: mpsc::Sender<Channel>,
     runtime: tokio::runtime::Handle,
     consumers: Consumers,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<()> {
     // Counted here rather than inferred from the log, so `robotctl health` can say whether anyone
     // is actually watching. `consumer-removed` is guarded the same way `consumer-added` is: a
@@ -1400,6 +1419,10 @@ fn wire_consumers(
             .and_then(|v| v.get::<String>().ok())
             .unwrap_or_else(|| "?".into());
 
+        // Before the datachannel, because this is what the *offer* needs and the offer is
+        // generated as soon as this handler returns. §6 of `remote-access-design.md`.
+        offer_relay_candidates(&webrtcbin, &peer, &relays);
+
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
                 // A full queue means nobody is accepting sessions, which is a bug rather than
@@ -1413,6 +1436,47 @@ fn wire_consumers(
         None
     });
     Ok(())
+}
+
+/// Add this robot's TURN servers to one consumer's `webrtcbin`, so its offer carries a `relay`.
+///
+/// **Runs on the thread that builds the offer, and must not block it.** `Relays::uris` reads a
+/// cache and never does I/O for exactly this reason: a fetch here would delay every consumer's
+/// connection, including the LAN ones that will never use a relay. An empty list is the ordinary
+/// state right after boot and on a robot nobody has signed in — host and srflx candidates are
+/// enough for anything on the same network.
+///
+/// Nothing here is fatal. A robot that cannot offer a relay is reachable from most places; one
+/// whose negotiation broke because a credential was malformed is reachable from none.
+fn offer_relay_candidates(webrtcbin: &gst::Element, peer: &str, relays: &Arc<crate::turn::Relays>) {
+    let uris = relays.uris();
+    if uris.is_empty() {
+        tracing::debug!(peer, "no relay servers held; offering host and srflx only");
+        return;
+    }
+    // Checked before it is emitted, for the reason `open_control_channel` checks its own signal:
+    // `emit_by_name` panics when a signal is absent or its signature has changed, and a panic in
+    // a C closure aborts the process instead of unwinding.
+    if glib::subclass::signal::SignalId::lookup("add-turn-server", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no add-turn-server signal; this consumer gets no relay candidate"
+        );
+        return;
+    }
+    let mut added = 0;
+    for uri in uris.iter() {
+        // The return is whether the server was accepted; a rejected URI is worth a line and not
+        // an abandoned session.
+        if webrtcbin.emit_by_name::<bool>("add-turn-server", &[&uri.as_str()]) {
+            added += 1;
+        } else {
+            // The host only. **A TURN URI carries a password**, and a log line is the one place
+            // it must never appear.
+            tracing::warn!(peer, "a relay server was refused by webrtcbin");
+        }
+    }
+    tracing::info!(peer, relays = added, "offering relay candidates");
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.

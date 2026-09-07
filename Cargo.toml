@@ -69,7 +69,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers

@@ -134,6 +134,14 @@ pub trait RobotIo {
     /// never because a process began.
     fn set_torque(&mut self, on: bool) -> Result<()>;
 
+    /// Reboot one servo: the Protocol 2 REBOOT instruction.
+    ///
+    /// The way out of a latched hardware error — overload, overheating, electrical shock, the
+    /// `shutdown` mask — which otherwise holds torque off until the battery is pulled. The servo is
+    /// off the bus for a few hundred milliseconds and comes back with torque off and its RAM
+    /// registers, the gains among them, at their EEPROM defaults; the caller owns putting them back.
+    fn reboot(&mut self, id: u8) -> Result<()>;
+
     /// Supply voltage and case temperatures, in one extra transaction.
     ///
     /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
@@ -191,6 +199,8 @@ pub struct FakeIo {
     /// How many times torque was written, so a test can tell "brought up once" from "written every
     /// tick" — the latter being a bus transaction per joint per tick.
     pub torque_writes: usize,
+    /// Every servo id rebooted, in order.
+    pub reboots: Vec<u8>,
 }
 
 impl Default for FakeIo {
@@ -217,6 +227,7 @@ impl FakeIo {
             track_targets: true,
             torque: None,
             torque_writes: 0,
+            reboots: Vec::new(),
         }
     }
 
@@ -281,6 +292,11 @@ impl RobotIo for FakeIo {
     fn set_torque(&mut self, on: bool) -> Result<()> {
         self.torque = Some(on);
         self.torque_writes += 1;
+        Ok(())
+    }
+
+    fn reboot(&mut self, id: u8) -> Result<()> {
+        self.reboots.push(id);
         Ok(())
     }
 

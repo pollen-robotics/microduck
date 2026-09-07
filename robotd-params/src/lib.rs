@@ -329,6 +329,38 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
+    /// This robot's measured camera geometry, when somebody has measured it.
+    ///
+    /// Absent on every robot until then, and absence is not a gap to fill with silence: `mediad`
+    /// publishes the module's design figures instead, marked as not calibrated, so a consumer can
+    /// tell a datasheet from a measurement. See [`CameraIntrinsics`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intrinsics: Option<CameraIntrinsics>,
+}
+
+/// A camera calibration, as OpenCV's `calibrateCamera` produces one.
+///
+/// **The resolution it was measured at is part of the record**, because intrinsics are in pixels:
+/// the same camera calibrated at 1280×720 and at 640×360 yields numbers that differ by a factor of
+/// two and describe the same optics. `mediad` scales them to whatever is being streamed, and
+/// refuses to when the aspect ratio differs — a frame of another shape is not a resize of this
+/// one, and which part was cropped is not recoverable from its size.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraIntrinsics {
+    /// The frame size these were measured at, in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Focal length in pixels, per axis. Equal for square pixels, which these are.
+    pub fx: f64,
+    pub fy: f64,
+    /// Where the optical axis crosses the image, in pixels from the top-left of the **delivered,
+    /// unrotated** frame. A few pixels off centre on a real module.
+    pub cx: f64,
+    pub cy: f64,
+    /// `k1 k2 p1 p2 k3`, OpenCV's order. Empty for a calibration that did not model distortion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distortion: Vec<f64>,
 }
 
 impl Default for MediaParams {
@@ -339,6 +371,9 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
+            // Nobody has measured this robot's camera. `mediad` says so on the wire rather than
+            // implying a measurement that did not happen.
+            intrinsics: None,
             // `webrtcsink`'s own default, named rather than inherited: what the element defaults
             // to is a fact about a plugin we ship from a pinned release, and the day it changes
             // should not be the day every robot's send rate changes with it.

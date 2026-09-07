@@ -1,5 +1,16 @@
 <!doctype html>
+<!--
+  **The `<html>`/`<head>`/`<body>` skeleton is load-bearing, however tempting it is to drop.**
+  This page was a bare doctype plus content for most of its life, which browsers parse into the
+  same tree — and Hugging Face's static hosting injects `window.huggingface.variables` (the OAuth
+  client id a remote sign-in needs) by rewriting `<head>`. With no `<head>` there is nothing to
+  rewrite, no client id, and a console that cannot sign anybody in with nothing anywhere saying
+  why. `docs/design/remote-access-design.md` §5.
+-->
+<html lang="en">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>duck console</title>
 <!--
   The robot's console. One file, no build step, no dependencies — `mediad` embeds this page and
@@ -120,6 +131,9 @@
         overflow: auto; white-space: pre-wrap; font: 12px/1.45 ui-monospace, monospace; }
 </style>
 
+</head>
+<body>
+
 <header>
   <h1 id="robot">duck console</h1>
   <span id="release" class="pill dim">release unknown</span>
@@ -128,6 +142,8 @@
   <span id="state" class="pill">idle</span>
   <span id="dcstate" class="pill dim">no control channel</span>
   <span id="signalling" class="pill dim"></span>
+  <select id="robots" hidden></select>
+  <span id="account" class="pill dim" hidden></span>
   <button id="connect">connect</button>
 </header>
 
@@ -274,6 +290,108 @@ const SERVED_BY_ROBOT = Number.isFinite(SERVED_PORT);
 const SIGNALLING_PORT = SERVED_BY_ROBOT ? SERVED_PORT : 8443;
 const SIGNALLING_URL = `ws://${location.hostname || "localhost"}:${SIGNALLING_PORT}`;
 
+// ── which transport, and it is forced rather than chosen ──────────────────────
+//
+// One page, two ways in. On a LAN it opens a WebSocket to the robot's own signalling server, which
+// is everything below `ws`. From off the LAN there is no such socket to open — the robot is behind
+// somebody's router — so it goes through the rendezvous service the robot registered with: SSE in,
+// `POST /send` out, the same envelopes. `remote-access-design.md` §5.
+//
+// **A page served over https cannot open `ws://` at all**, so this is not a heuristic: a browser
+// refuses the mixed-content connection, which means an https page that was not served by a robot
+// has exactly one transport available to it. A page opened from a checkout over `file://` keeps
+// the LAN behaviour, which is what it is for. `?mode=lan` and `?mode=remote` override, for testing
+// one from where the other would be picked.
+// Which build of this page is in front of you.
+//
+// Substituted by `scripts/publish-console.sh` at deploy time and logged as the first line, because
+// a static host caches and a browser caches harder: an hour was spent on a fix that was never
+// being loaded, and the only way to know is for the page to say so itself.
+const BUILD = "{{CONSOLE_BUILD}}";
+// The OAuth app of whatever is serving this page, put here by `entrypoint.sh`.
+const SERVER_CLIENT_ID = "{{OAUTH_CLIENT_ID}}";
+const BUILD_LABEL = BUILD.startsWith("{{") ? "unpublished (served by a robot or a checkout)" : BUILD;
+
+const PARAMS = new URLSearchParams(location.search);
+const REMOTE = PARAMS.get("mode")
+  ? PARAMS.get("mode") === "remote"
+  : !SERVED_BY_ROBOT && location.protocol === "https:";
+
+// The Space the robot's relay registers with. `?rendezvous=` points this at a local copy.
+const RENDEZVOUS = (PARAMS.get("rendezvous")
+  || "https://pollen-robotics-reachy-mini-central.hf.space").replace(/\/$/, "");
+
+// What this page will drive. The rendezvous lists every robot an account owns, and the mini's
+// producers are on it too — `meta.kind` is what tells the families apart, and driving a mini from
+// here would send it method names it does not serve. §5.1.
+const KIND = "microduck";
+
+// The sign-in library, pinned to the version a Space that works pins. `@1` resolved to something
+// whose `oauthHandleRedirectIfPresent` returned nothing on a page holding a fresh `?code=`, which
+// turns a sign-in into a redirect loop — and `reachy_mini`'s own app guide warns that mixing
+// versions across the SDK and the shell "causes silent protocol drift". Pinned, therefore, rather
+// than tracking a major.
+const HUB_ESM = "https://cdn.jsdelivr.net/npm/@huggingface/hub@2.11.2/+esm";
+
+// The OAuth app this page signs in with.
+//
+// **Explicit, rather than the client id a Space is documented to inject.** `hf_oauth: true` in a
+// static Space's front matter did not produce a `window.huggingface` on this page however it was
+// loaded, and chasing why is chasing somebody else's platform. An app registered once at
+// `huggingface.co/settings/applications/new` — client ids are public, which is why one can sit in
+// a page — takes that whole question out of the picture, and takes with it the assumption that
+// this page is served by a Space at all: the same id works from anywhere its redirect URI names.
+//
+// `?client_id=` overrides, which is how a new one is tried before it is written down here. An
+// injected one is still preferred if a Space ever provides it, because that one cannot go stale.
+/// The client id, read **when it is needed** rather than when this file is parsed.
+///
+/// **That distinction was the whole bug.** Hugging Face injects `window.huggingface.variables`
+/// into a static Space with a script tag of its own, and this page's script is inline in the body
+/// — so anything read at parse time is read before the platform's script has run. A bundled app
+/// (`reachy_mini_website`, the SDK's host shell) never notices, because a module bundle executes
+/// after the document. Read late and it is there; read early and a Space with a perfectly good
+/// OAuth app looks like a Space with none, which is exactly what this page reported for a day.
+function oauthClientId() {
+  // Substituted by the Space's `entrypoint.sh` from its `OAUTH_CLIENT_ID` environment variable.
+  // Left as a literal token on the robot's copy and in a checkout, where signing in to a
+  // rendezvous is not a thing anybody is doing.
+  const served = SERVER_CLIENT_ID.startsWith("{{") ? "" : SERVER_CLIENT_ID;
+  // Static Spaces are documented to inject this. This one never did — see the Space's README —
+  // but it is read first anyway, because an id from the platform cannot go stale the way a
+  // baked-in one can.
+  const injected = (window.huggingface && window.huggingface.variables) || {};
+  return PARAMS.get("client_id") || injected.OAUTH_CLIENT_ID || served;
+}
+
+// Where Hugging Face sends the browser back to. This page, without its query string — and it has
+// to match the app's registered redirect URI exactly, trailing slash included.
+const OAUTH_REDIRECT = location.origin + location.pathname;
+
+// Where the sign-in is remembered. `localStorage`, not `sessionStorage`: the OAuth redirect can
+// land in a new tab, and a session store is per-tab.
+const OAUTH_KEY = "duck-console-oauth-v2";
+
+// How long any step of the sign-in gets before the page says so and moves on.
+//
+// **A promise that never settles is the worst failure this page can have**, because every line it
+// would have logged is after the `await`. A spent `?code=` left in the address bar by an earlier
+// attempt produces exactly that: the library takes the code, tries to exchange it, and the page
+// goes quiet with "asking Hugging Face who you are…" as its last word. So every await here races
+// a timer, and the timer's message names the code in the URL as the thing to get rid of.
+const SIGN_IN_TIMEOUT = 10000;
+
+/// `promise`, or an error naming `what` if it takes longer than [`SIGN_IN_TIMEOUT`].
+function within(what, promise) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error(`${what} did not answer within ${SIGN_IN_TIMEOUT / 1000}s`)),
+      SIGN_IN_TIMEOUT,
+    )),
+  ]);
+}
+
 // Full deflection, matching `padd`'s defaults rather than inventing a second set of numbers:
 // 0.3 m/s and 1.5 rad/s. The robot clamps what it must; these are what a stick at the stop means.
 const MAX_LINEAR = 0.3;
@@ -303,19 +421,328 @@ function setDc(text, cls = "dim") { $("dcstate").textContent = text; $("dcstate"
 
 function banner(html) { $("banner").innerHTML = html; $("banner").hidden = false; }
 
+log("dim", "console build", BUILD_LABEL);
+
 // ── signalling ─────────────────────────────────────────────────────────────────
 
 let ws = null, pc = null, sessionId = null, control = null;
+// The rendezvous half: the account token, a handle on the open event stream, and which robot of
+// the account's this page is driving.
+let token = null, stream = null, chosen = null;
+// Whether a session is wanted. Set by a person — the connect button, or picking another robot —
+// and cleared when the robot ends one.
+//
+// **This is what stops a refusal loop.** The rendezvous pushes a `peerStatusChanged` whenever a
+// producer's state changes, which this page answers with a fresh `list` so the picker cannot go
+// stale — and a robot ending a session *is* such a change. Without a flag, that listing walks
+// straight back into `startSession`, gets refused, and the refusal produces the next listing.
+let wanted = false;
+// Whether a `startSession` is already out. The service answers a `list` twice over — once as a
+// push after the welcome, once as the reply to our own — so without this the second listing opens
+// a second session against a robot that is about to accept the first.
+let starting = false;
 
 function send(msg) {
   log("out", "→", JSON.stringify(msg));
+  if (REMOTE) {
+    // **The reply to a `POST /send` can be a message, and dropping it costs the session.**
+    // On a WebSocket every answer comes back on the socket; here `startSession` is answered in
+    // the HTTP response body — `{"type":"sessionStarted","sessionId":…}` — and so is `list`,
+    // while everything else arrives on the event stream. A page that treated this as
+    // fire-and-forget got the robot's offer for a session it had never been told the id of, and
+    // failed on a null peer connection. So the body goes through the same handler as the stream.
+    fetch(`${RENDEZVOUS}/send`, {
+      method: "POST",
+      headers: { "authorization": `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify(msg),
+    }).then(async (response) => {
+      if (!response.ok) {
+        log("bad", `!! POST /send: HTTP ${response.status}`);
+        return;
+      }
+      const answer = await response.json().catch(() => null);
+      // `{"status":"ok"}` is the answer to everything the service handles on the stream.
+      if (answer && answer.type) {
+        await onSignalling(JSON.stringify(answer));
+      }
+    }).catch((e) => log("bad", "!! POST /send:", e.message));
+    return;
+  }
   ws.send(JSON.stringify(msg));
 }
 
-$("signalling").textContent = SIGNALLING_URL;
+$("signalling").textContent = REMOTE ? RENDEZVOUS.replace(/^https:\/\//, "") : SIGNALLING_URL;
 
-$("connect").onclick = () => {
-  if (ws) { ws.close(); return; }
+// ── the rendezvous transport ──────────────────────────────────────────────────
+//
+// **`fetch`, not `EventSource`.** The stream needs an `Authorization` header and `EventSource`
+// cannot set one. The service does accept `?token=` as a transitional fallback and is removing it,
+// which is right — a bearer token in a query string is a bearer token in the Space's access log
+// and in every proxy between. So the framing is a few lines here: split on a blank line, keep the
+// `data:` payloads, ignore the comment-only pings the service sends to hold the connection open
+// through its own proxy.
+async function openRendezvous(onMessage, onClosed) {
+  const response = await fetch(`${RENDEZVOUS}/events`, {
+    headers: { "authorization": `Bearer ${token}`, "accept": "text/event-stream" },
+  });
+  if (response.status === 401) throw new Error("Hugging Face refused this sign-in");
+  if (!response.ok) throw new Error(`the rendezvous answered HTTP ${response.status}`);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let chunks = 0;
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        // **CRLF, because the framing is not ours.** SSE permits `\r\n` line endings and a
+        // proxy is free to rewrite them; splitting on `\n\n` alone then matches nothing and
+        // every message is swallowed in silence — a stream that looks connected and says
+        // nothing, which is the worst shape a bug can take here. Normalised once, on arrival.
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        if (chunks++ === 0) {
+          // The first thing off the wire, verbatim and bounded. If the frames are not what this
+          // parser expects, this line is what says so instead of a silent stream.
+          log("dim", "first bytes from the stream:", JSON.stringify(buffer.slice(0, 200)));
+        }
+        // Events are separated by a blank line; a single event may carry several `data:` lines.
+        let split;
+        while ((split = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, split);
+          buffer = buffer.slice(split + 2);
+          const data = frame
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trim())
+            .join("");
+          if (data) onMessage(data);
+        }
+      }
+    } catch (e) {
+      log("bad", "!! the event stream failed:", e.message);
+    }
+    log("dim", "the event stream ended");
+    onClosed();
+  })();
+  return reader;
+}
+
+/// Consume an OAuth redirect the moment the page loads, before anything else can.
+///
+/// **This is what a sign-in loop is made of.** Hugging Face sends the browser back here with a
+/// `?code=` in the URL, and that code has to be exchanged by whatever loads next. Doing it only
+/// when somebody clicks connect means the code is never spent: the click builds a *fresh* login
+/// URL, Hugging Face — already signed in — bounces straight back, and the page returns to idle
+/// having logged two lines that the reload then wiped. Handled here, the page comes back signed
+/// in and says so.
+async function resumeSignIn() {
+  if (!REMOTE) return;
+  log("dim", `remote mode: rendezvous ${RENDEZVOUS}`);
+
+  const returning = PARAMS.has("code") || location.hash.includes("code=");
+  const stored = localStorage.getItem(OAUTH_KEY);
+  const clientId = oauthClientId();
+  if (!clientId) {
+    log("bad", "!! no OAuth client id. On a Space this arrives as",
+               "`window.huggingface.variables.OAUTH_CLIENT_ID` from `hf_oauth: true` in the",
+               "README — if that is set and this still fires, the platform's script had not run",
+               "yet. Otherwise register an app with", OAUTH_REDIRECT, "as its redirect URI, or",
+               "pass `?client_id=` to try one.");
+    setState("no sign-in", "bad");
+    return;
+  }
+  log("dim", `oauth client ${clientId.slice(0, 8)}…, redirect ${OAUTH_REDIRECT}`);
+  if (!returning && !stored) {
+    log("dim", "not signed in. `connect` signs in with Hugging Face.");
+    return;
+  }
+
+  try {
+    if (returning) log("dim", "Hugging Face sent this page back with a sign-in code; spending it…");
+    const hub = await within("the sign-in library", import(HUB_ESM));
+    let result = returning
+      ? await within("the sign-in code exchange", hub.oauthHandleRedirectIfPresent())
+      : null;
+    if (returning && !result) {
+      log("bad", "!! Hugging Face sent this page a sign-in code and the library would not take",
+                 "it. That is a redirect loop waiting to happen, so the code is being dropped;",
+                 "click connect to start again.");
+      // Out of the URL either way: a spent or unusable code that stays in the address bar is
+      // re-read on every reload.
+      history.replaceState(null, "", location.pathname);
+      return;
+    }
+    if (result) {
+      localStorage.setItem(OAUTH_KEY, JSON.stringify(result));
+      history.replaceState(null, "", location.pathname);
+    } else {
+      result = JSON.parse(stored);
+    }
+    token = result.accessToken;
+    const who = result.userInfo && (result.userInfo.preferred_username || result.userInfo.name);
+    $("account").textContent = who || "signed in";
+    $("account").hidden = false;
+    log("dim", `signed in as ${who || "somebody"}; \`connect\` opens the session`);
+    setState("signed in");
+  } catch (e) {
+    log("bad", "!! the sign-in did not complete:", e.message || String(e));
+    if (returning) {
+      log("dim", "dropping the code from the address bar; `connect` starts a fresh sign-in");
+      history.replaceState(null, "", location.pathname);
+    }
+    localStorage.removeItem(OAUTH_KEY);
+    setState("no sign-in", "bad");
+  }
+}
+
+// **After the document, not during it.** Everything above is safe to define at parse time; only
+// this reads what the platform injected, and that script is not guaranteed to have run until the
+// page has loaded.
+if (document.readyState === "complete") {
+  resumeSignIn();
+} else {
+  window.addEventListener("load", () => resumeSignIn());
+}
+
+/// Sign in, and remember who with. `openid profile` only — this token's whole job is proving an
+/// identity to the rendezvous, and the argument for keeping it that narrow is §2.4's.
+///
+/// **Every step says what it was doing.** This is the one part of the page nothing on the robot can
+/// test, and the failures it has are all somebody else's configuration: a CDN a Space's policy
+/// will not load, OAuth metadata that has not taken effect yet, a token that has expired. A red
+/// pill and an empty log would send whoever hits one of those reading this source, so each step
+/// logs before it runs and names itself when it throws.
+async function signIn() {
+  log("dim", "loading the Hugging Face sign-in library…");
+  let hub;
+  try {
+    hub = await within("the sign-in library", import(HUB_ESM));
+  } catch (e) {
+    throw new Error(`could not load @huggingface/hub from cdn.jsdelivr.net (${e.message || e}). `
+      + `A Content-Security-Policy on this host would do that, and the fix is to vendor the `
+      + `library into this page rather than import it.`);
+  }
+
+  if (!oauthClientId()) {
+    throw new Error("this page has no OAuth client id, so it cannot sign anybody in. Register an "
+      + "app at huggingface.co/settings/applications/new with this page's URL as its redirect "
+      + `URI (${OAUTH_REDIRECT}) and the scopes \`openid profile\`, then put its client id in `
+      + "this page — or pass it as `?client_id=` to try one.");
+  }
+
+  const stored = localStorage.getItem(OAUTH_KEY);
+  log("dim", "asking Hugging Face who you are…");
+  let result;
+  try {
+    result = (await within("the sign-in code exchange", hub.oauthHandleRedirectIfPresent()))
+      || (stored ? JSON.parse(stored) : null);
+  } catch (e) {
+    localStorage.removeItem(OAUTH_KEY);
+    throw new Error(`the sign-in did not complete (${e.message || e})`);
+  }
+
+  if (!result) {
+    log("dim", "not signed in yet; going to Hugging Face");
+    let url;
+    try {
+      url = await hub.oauthLoginUrl({
+        clientId: oauthClientId(),
+        redirectUrl: OAUTH_REDIRECT,
+        scopes: "openid profile",
+      });
+    } catch (e) {
+      throw new Error(`this page cannot build a sign-in URL (${e.message || e}). The client id it `
+        + `used is ${oauthClientId().slice(0, 8)}… and the redirect it asks for is `
+        + `${OAUTH_REDIRECT}; an app whose registered redirect URI is not exactly that is the `
+        + `usual cause.`);
+    }
+    window.location.href = url;
+    return null;
+  }
+  localStorage.setItem(OAUTH_KEY, JSON.stringify(result));
+  return result;
+}
+
+$("robots").onchange = () => {
+  if (!stream) return;
+  chosen = $("robots").value;
+  wanted = true;
+  if (sessionId) {
+    send({ type: "endSession", sessionId });
+    sessionId = null;
+    if (pc) { pc.close(); pc = null; }
+    setDc("no control channel");
+    stopTelemetry();
+  }
+  send({ type: "list" });
+};
+
+/// Everything that has to be forgotten when a link goes away, whichever link it was.
+function teardown() {
+  setState("closed", "bad"); setDc("no control channel");
+  $("connect").textContent = "connect";
+  ws = null; stream = null; sessionId = null; control = null;
+  wanted = false; starting = false;
+  stopTelemetry();
+  if (pc) { pc.close(); pc = null; }
+}
+
+$("connect").onclick = async () => {
+  if (ws || stream) {
+    if (ws) ws.close();
+    // Cancelling the read closes the connection, which is what takes the *consumer* off the
+    // rendezvous. The robot's own producer registration is not ours to end.
+    if (stream) { stream.cancel().catch(() => {}); teardown(); }
+    return;
+  }
+
+  if (REMOTE) {
+    wanted = true;
+    try {
+      if (!token) {
+        setState("signing in…");
+        const oauth = await signIn();
+        if (!oauth) return; // redirected to Hugging Face; this page is about to be replaced
+        token = oauth.accessToken;
+        const who = oauth.userInfo && (oauth.userInfo.preferred_username || oauth.userInfo.name);
+        $("account").textContent = who || "signed in";
+        $("account").hidden = false;
+      }
+      setState("connecting…");
+      log("dim", "opening the rendezvous event stream…");
+      let spoke = false;
+      stream = await openRendezvous((data) => {
+        spoke = true;
+        onSignalling(data).catch((e) => log("bad", "!!", e.message));
+      }, teardown);
+      setState("signalling");
+      $("connect").textContent = "disconnect";
+      // The welcome is the first thing on a healthy stream and it arrives at once. A stream that
+      // is open and mute for this long is a parser or a proxy, not a slow server, and saying so
+      // beats a page that sits on "signalling" forever.
+      setTimeout(() => {
+        if (!spoke && stream) {
+          log("bad", "!! the stream is open and has said nothing for 10s.",
+                     "The welcome should arrive immediately — so this is the framing being read",
+                     "wrongly, or something between here and the Space buffering it.");
+        }
+      }, 10000);
+    } catch (e) {
+      // `e.message` alone can be empty — a rejected dynamic import in some browsers is one — and
+      // a red pill with an empty log is the worst thing this page can do to somebody.
+      log("bad", "!!", e.message || String(e) || e.name || "no reason given");
+      if (e.stack) log("dim", e.stack.split("\n")[0]);
+      setState(token ? "no rendezvous" : "no sign-in", "bad");
+      // A refused token is a stale sign-in far more often than a revoked one, and the fix is the
+      // same either way: forget it so the next click signs in again rather than failing again.
+      localStorage.removeItem(OAUTH_KEY);
+    }
+    return;
+  }
+
+  wanted = true;
   ws = new WebSocket(SIGNALLING_URL);
   setState("connecting…");
 
@@ -330,18 +757,22 @@ $("connect").onclick = () => {
     : `!! no answer from ${SIGNALLING_URL} — wrong host, or mediad is not running. This page was `
       + `opened from a file rather than served by a robot; \`duckctl open\` serves it from the `
       + `robot instead.`);
-  ws.onclose = () => {
-    setState("closed", "bad"); setDc("no control channel");
-    $("connect").textContent = "connect";
-    ws = null; sessionId = null; control = null;
-    stopTelemetry();
-    if (pc) { pc.close(); pc = null; }
-  };
+  ws.onclose = teardown;
 
-  ws.onmessage = async (event) => {
-    const msg = JSON.parse(event.data);
+  ws.onmessage = (event) => {
+    onSignalling(event.data).catch((e) => log("bad", "!!", e.message));
+  };
+};
+
+// ── one protocol, whichever transport carried it ───────────────────────────────
+//
+// The envelopes are the same on both sides — that is the whole reason the bridge in `mediad` is a
+// translator with an opaque payload rather than a parser (§3.2). So this switch is shared, and the
+// two cases below it that only the rendezvous ever sends are the exceptions worth naming.
+async function onSignalling(raw) {
+    const msg = JSON.parse(raw);
     // Skip the noisy ones so the log stays readable.
-    if (msg.type !== "peerStatusChanged") log("in", "←", event.data.slice(0, 400));
+    if (msg.type !== "peerStatusChanged") log("in", "←", raw.slice(0, 400));
 
     switch (msg.type) {
       case "welcome":
@@ -350,13 +781,45 @@ $("connect").onclick = () => {
         break;
 
       case "list": {
-        const producer = msg.producers && msg.producers[0];
-        if (!producer) {
-          log("bad", "!! no producers. mediad registers as one when its pipeline reaches PLAYING —",
-                     "check its journal for a pipeline that would not start.");
+        // The rendezvous lists every robot the signed-in account owns, and the mini's producers
+        // are on the same service — so this filters on `meta.kind`. On a LAN there is exactly one
+        // producer and it is this robot, whose local `meta` carries no `kind` at all, so the
+        // filter would remove the only candidate. §5.1.
+        let producers = msg.producers || [];
+        if (REMOTE) producers = producers.filter((p) => (p.meta || {}).kind === KIND);
+
+        if (!producers.length) {
+          log("bad", REMOTE
+            ? "!! no duck is registered with this account. A robot appears here about thirty "
+              + "seconds after `robotctl account login`, and only while it has a network."
+            : "!! no producers. mediad registers as one when its pipeline reaches PLAYING — "
+              + "check its journal for a pipeline that would not start.");
           setState("no producer", "bad");
           return;
         }
+
+        // More than one duck is the ordinary case for an account that owns two, so the picker
+        // appears rather than the first one silently winning.
+        if (REMOTE && producers.length > 1) {
+          const picker = $("robots");
+          picker.innerHTML = "";
+          for (const candidate of producers) {
+            const option = document.createElement("option");
+            option.value = candidate.id;
+            option.textContent = (candidate.meta || {}).name || candidate.id.slice(0, 8);
+            picker.append(option);
+          }
+          if (chosen && producers.some((p) => p.id === chosen)) picker.value = chosen;
+          picker.hidden = false;
+        }
+
+        // A session already exists, or nobody asked for one: this listing is a robot appearing
+        // or going away, not an invitation to open a session. Two consumers on one robot is
+        // `remote-webrtc.md` §9's interleaving bug, and the service refuses it anyway.
+        if (sessionId || starting || !wanted) break;
+
+        chosen = (REMOTE && producers.length > 1 && $("robots").value) || producers[0].id;
+        const producer = producers.find((p) => p.id === chosen) || producers[0];
         // The producer's `meta` names the robot before a session exists — `mediad/src/producer.rs`
         // is what puts it there. Shown straight away, so the header is filled in before the
         // datachannel opens and re-filled from `system.info` and `hello` when it does.
@@ -367,11 +830,13 @@ $("connect").onclick = () => {
         if (meta.api_version) $("api").textContent = `api v${meta.api_version}`;
         // No `offer`, so the producer offers and we answer. That is the direction webrtcsink
         // wants: it knows what it is sending.
+        starting = true;
         send({ type: "startSession", peerId: producer.id });
         break;
       }
 
       case "sessionStarted":
+        starting = false;
         sessionId = msg.sessionId;
         setState("negotiating");
         newPeerConnection();
@@ -383,6 +848,12 @@ $("connect").onclick = () => {
       // one mistake that produces silence rather than an error, so they are read off
       // net/webrtc/protocol rather than guessed.
       case "peer":
+        if (!pc) {
+          log("bad", "!! a peer message arrived before this page had a session to put it in",
+                     `(sessionId ${msg.sessionId}).`,
+                     "That is `sessionStarted` having been missed, not the robot misbehaving.");
+          break;
+        }
         if (msg.sdp) {
           await pc.setRemoteDescription(msg.sdp);
           const answer = await pc.createAnswer();
@@ -397,24 +868,56 @@ $("connect").onclick = () => {
         break;
 
       case "endSession":
-        log("dim", "session ended by the robot");
+        log("dim", "session ended by the robot", msg.reason ? `— ${msg.reason}` : "");
+        // Both, and both matter: a stale `sessionId` would be sent on the next `peer` message,
+        // and leaving `wanted` set turns the next listing into another request the robot has
+        // just declined.
+        sessionId = null;
+        wanted = false;
+        starting = false;
         if (pc) { pc.close(); pc = null; }
         setState("signalling"); setDc("no control channel");
         stopTelemetry();
+        break;
+
+      // Only the rendezvous sends these two. The robot's own signalling server has no notion of
+      // another consumer holding the robot, and no producer to refuse on behalf of.
+      case "sessionRejected":
+        log("bad", `!! the robot refused a session (${msg.reason || "no reason given"})`,
+                   msg.activeApp ? `— ${msg.activeApp} is driving it` : "");
+        setState(msg.reason === "robot_busy" ? "robot busy" : "refused", "bad");
+        break;
+
+      case "peerStatusChanged":
+        // A robot appearing or going away while this page is open. Cheap to redraw, and the
+        // alternative is a listing that goes stale the moment somebody unplugs a duck. Only
+        // remotely: on a LAN the one producer is the robot serving this page.
+        if (REMOTE) send({ type: "list" });
         break;
 
       case "error":
         log("bad", "!! server error:", msg.details);
         break;
     }
-  };
-};
+}
 
 function newPeerConnection() {
-  // No ICE servers: this is a LAN client talking to a robot on the same network, which is the
-  // case §3 exists for. Reaching a robot elsewhere goes through the bridge (§7) and would need
-  // STUN, which is that design's problem rather than this page's.
-  pc = new RTCPeerConnection();
+  // **STUN only when it is needed, which is when this page is not on the robot's network.**
+  //
+  // On a LAN both ends offer host candidates and they pair immediately; asking a public STUN
+  // server about a robot two metres away would add a round trip to somebody else's service for a
+  // candidate nothing will use. Remotely there are no host candidates in common, so the browser
+  // has to learn its own reflexive address — and until it did, this page offered only
+  // `192.168.…` to a robot on another network and the session negotiated perfectly and carried
+  // nothing.
+  //
+  // `stun.l.google.com` is what `webrtcsink` already defaults to on the robot side, so the two
+  // ends use one server rather than two. TURN is the next thing this needs — see
+  // `remote-access-design.md` §6, and `reachy_mini`'s #1182, where the *robot* fetches
+  // short-lived Cloudflare credentials with its own HF token.
+  pc = new RTCPeerConnection(REMOTE
+    ? { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] }
+    : undefined);
 
   pc.ontrack = (event) => {
     log("dim", "track:", event.track.kind);
@@ -567,7 +1070,7 @@ async function identify() {
       banner(`This page speaks API v${SERVED_API} and the robot speaks v${hello.api_version}. `
         + `Everything still works; a call this robot does not know will say so. `
         + `<code>duckctl open</code> serves the page from the robot itself, which cannot differ.`);
-    } else if (!SERVED_BY_ROBOT) {
+    } else if (!SERVED_BY_ROBOT && !REMOTE) {
       banner(`This page was opened from a checkout rather than served by the robot, so it cannot `
         + `say whether the two agree about the API. <code>duckctl open</code> serves it from the `
         + `robot.`);
@@ -996,3 +1499,6 @@ $("send").onclick = () => {
   control.send(line);
 };
 </script>
+
+</body>
+</html>

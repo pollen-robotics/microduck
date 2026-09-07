@@ -121,6 +121,27 @@ mod tests {
         );
     }
 
+    /// **The page the robot serves must be in LAN mode, and the page in the repository must not
+    /// be.**
+    ///
+    /// One file serves two hosts: substituting the port is what tells it a robot served it, and
+    /// the copy pushed to the Space keeps the token so the page reaches for the rendezvous
+    /// instead — a browser on an https page cannot open a `ws://` at all, so getting this
+    /// backwards produces a console that connects to nothing and says nothing.
+    /// `scripts/publish-console.sh` asserts the other half of it at deploy time.
+    #[test]
+    fn the_unsubstituted_page_is_the_remote_one() {
+        assert!(
+            PAGE.contains(PORT_TOKEN),
+            "the page in the repository must carry the port token: it is what the Space copy \
+             reads as `no robot served me`"
+        );
+        assert!(
+            !page(8443).contains(PORT_TOKEN),
+            "and the served page must not, or the robot would serve a page that ignores it"
+        );
+    }
+
     /// A non-default `--port` reaches the page, which is the reason the substitution exists at all:
     /// a page carrying a constant would still be dialling 8443.
     #[test]

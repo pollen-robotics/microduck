@@ -167,6 +167,18 @@ impl<T: RobotIo> Safety<T> {
         self.io.set_torque(on)
     }
 
+    /// Reboot these servos, and forget the gain cache: a rebooted servo comes back at its EEPROM
+    /// gains, and a cache that still says the running gain is written would leave it there. The
+    /// next [`Self::apply`] rewrites the gains on every servo.
+    pub fn reboot_motors(&mut self, ids: &[u8]) -> Result<(), IoError> {
+        for &id in ids {
+            tracing::warn!(id, "rebooting servo");
+            self.io.reboot(id)?;
+        }
+        self.gain = None;
+        Ok(())
+    }
+
     /// The gain last written to the servos, or `None` before the first write. This is what
     /// the robot is running at, which is not always what the caller asked for.
     pub fn gain(&self) -> Option<u16> {
@@ -288,6 +300,26 @@ impl<T: RobotIo> Safety<T> {
 
 #[cfg(test)]
 mod tests {
+    /// A reboot forgets the gain cache, so the rebooted servos get their gains back on the next
+    /// apply instead of running at whatever their EEPROM says.
+    #[test]
+    fn rebooting_motors_rewrites_the_gain_on_the_next_apply() {
+        use crate::io::FakeIo;
+        use crate::model::DEFAULT_POSITION;
+        let mut s = Safety::new(FakeIo::at(DEFAULT_POSITION), SafetyConfig::default());
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert_eq!(s.gain(), Some(200));
+        s.reboot_motors(&[3, 11]).unwrap();
+        assert_eq!(s.io().reboots, vec![3, 11]);
+        assert_eq!(
+            s.gain(),
+            None,
+            "the gain cache must be forgotten after a reboot"
+        );
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, 200).unwrap();
+        assert_eq!(s.gain(), Some(200));
+    }
+
     use super::*;
     use crate::imu::ImuData;
     use crate::io::FakeIo;

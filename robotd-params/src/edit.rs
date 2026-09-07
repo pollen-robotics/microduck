@@ -246,6 +246,15 @@ impl Model {
             Kind::Table => {
                 return Err("edit the one-shot skills with `robotctl policy`".to_owned());
             }
+            // Six numbers from a calibration, where a typo is a plausible wrong answer rather
+            // than an error. Written by whatever measured them, not typed into an editor.
+            Kind::Record(_) => {
+                return Err(
+                    "camera intrinsics come from a calibration; write them into robotd.toml \
+                     directly, or leave them absent to publish the module's design figures"
+                        .to_owned(),
+                );
+            }
             Kind::IntegerList => {
                 let mut array = toml_edit::Array::new();
                 for word in input.split(',') {

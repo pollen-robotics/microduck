@@ -53,6 +53,18 @@ pub enum Kind {
     /// this editor cannot edit is still a section it must know exists, or the next repeating
     /// table added to `Params` goes unnoticed.
     Table,
+    /// A **nested table of related values** — `[media.intrinsics]` — written by a tool rather
+    /// than typed.
+    ///
+    /// Distinct from [`Kind::Table`], which is a repeating one, and distinct from every scalar
+    /// kind for the same reason as that: it has no single cursor position. It is also not a thing
+    /// anybody should type — six numbers from a calibration, where a typo produces a plausible
+    /// wrong answer rather than an error — so the editor lists it and says what writes it.
+    ///
+    /// The string is a TOML body for the table, and it earns its place in the type rather than in
+    /// a comment: the completeness test uses it to prove the key parses, so a record whose fields
+    /// are renamed under it fails here instead of at a robot's next boot.
+    Record(&'static str),
 }
 
 /// One key of `robotd.toml`.
@@ -398,6 +410,13 @@ pub const REGISTRY: &[Entry] = &[
         "Starting video bitrate, bits/s — unset follows the quality",
     ),
     entry(
+        "media.intrinsics",
+        Kind::Record(
+            "width = 1280\nheight = 720\nfx = 1809.5\nfy = 1809.5\ncx = 640.0\ncy = 360.0",
+        ),
+        "Measured camera geometry — a calibration writes it; absent publishes the module's design figures",
+    ),
+    entry(
         "media.congestion_control",
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
@@ -534,6 +553,9 @@ mod tests {
                 Kind::Table => {
                     format!("[[{section}.{key}]]\nname = \"probe\"\nduration = 1.0\n")
                 }
+                // A record carries its own body, so this proves the *fields* still parse and not
+                // merely that something table-shaped is accepted.
+                Kind::Record(body) => format!("[{section}.{key}]\n{body}\n"),
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(

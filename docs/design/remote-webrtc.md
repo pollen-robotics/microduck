@@ -518,7 +518,58 @@ The alternative was building `mediad` on an arm64 runner like the plugins in
 two and leaves nobody able to build `mediad` on a laptop — which for the crate that will need the
 most iteration against real hardware is the wrong trade.
 
-## 11. Deferred, with reasons
+### `media.video` says what the picture is, geometrically
+
+Width, height, the mount rotation — and the camera's **intrinsics**, which is what a consumer needs
+to turn a pixel into a direction. Without them a monocular reconstruction is scale-free and its
+angles are wrong; SLAM, visual odometry and "how far away is that" all begin here.
+
+Four numbers and a flag: `fx`, `fy`, `cx`, `cy`, and `calibrated`. They describe the frame **as it
+is sent** — unrotated, because nothing on the robot rotates pixels — so a consumer that applies
+`rotate` has to rotate these with it, swapping `cx` with `cy`. The flag is not decoration: `false`
+means the IMX219 module's design figures (3.04 mm over a 1.12 µm pitch, principal point assumed
+central, no distortion model), which is good to a few percent and enough to map a room; `true`
+means somebody measured *this* robot and wrote it into `[media.intrinsics]`. A consumer that needs
+metrology can tell that it needs to ask.
+
+**And the key is absent when the geometry is unknown**, rather than present and wrong. That is a
+robot streaming a test pattern, or one where `media-ctl` would not set the sensor mode — in which
+case the sensor is in its 3280×2464 boot mode, whose field of view is the whole array rather than
+the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::camera` has the
+arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
+the view to 27° rather than saving anything.
+
+## 11. Everything on the wire should carry the time it happened — **wanted**
+
+Nothing this transport carries is timestamped at source today. A frame arrives when it arrives, a
+`robot.state` notification arrives when it arrives, and a consumer that wants to know *when* the
+robot saw or felt something has only its own clock to go on — which, over a relay on another
+continent, is off by whatever the path cost that second.
+
+That is fine for driving a robot you are watching, and it is the wrong shape for everything a
+remote consumer is interesting for. **SLAM is the case that makes it concrete**: monocular SLAM on
+a stream with no capture times can be run, and the moment somebody wants visual-inertial — the IMU
+this robot already has, at 50 Hz, on the same control channel — the two series cannot be related
+except by guessing. Timestamps applied at the far end measure the network, not the robot.
+
+Two halves, and they are not the same problem:
+
+- **Media.** RTP timestamps are relative to a random offset, so they order frames and date none of
+  them. The mechanism for this is the `abs-capture-time` RTP header extension, which carries a
+  wall-clock capture time per packet and is what a receiver needs to line video up against
+  anything else. Whether `webrtcsink` will negotiate it, and what a browser and `aiortc` expose of
+  it, is the thing to check first — a header extension nothing on the receiving side surfaces buys
+  nothing.
+- **The control channel.** This one is ours and cheap: a monotonic reading, plus the boot epoch
+  that makes it comparable across processes, on every notification that describes a moment. The
+  cost is a field per message and an argument about which clock — and the answer has to be the
+  same one the media path ends up dating frames with, or the two series still cannot be joined.
+
+Not built, and deliberately not started as part of the remote path: it changes what every
+notification looks like, so it wants its own decision and its own version bump rather than riding
+along with a transport. `remote-access-design.md` §9 carries it as open.
+
+## 12. Deferred, with reasons
 
 - **A WebSocket surface for server-side programs** (`architecture.md` §5.3). Same JSON-RPC, no
   media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and

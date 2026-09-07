@@ -40,12 +40,17 @@ use crate::upstream::Pool;
 /// and the console showed a sideways picture with nothing in the log to say why. The push is kept
 /// as a courtesy for a client that only listens; `media.video` as a *call* is what the console uses,
 /// because a question it asks when it is ready cannot arrive too early.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Video {
     pub width: u32,
     pub height: u32,
     /// Degrees clockwise the camera is mounted from upright.
     pub rotate: u32,
+    /// The camera's geometry, for a consumer that has to turn pixels into directions — SLAM,
+    /// visual odometry, "how far is that". `None` when there is no camera or its mode is not one
+    /// `crate::camera` knows the field of view of, which is a robot that should not be believed
+    /// rather than one to guess about.
+    pub intrinsics: Option<crate::camera::Intrinsics>,
 }
 
 /// The method a peer asks with. Answered here rather than routed: no service owns it.
@@ -61,15 +66,33 @@ const VIDEO_METHOD: &str = "media.video";
 ///
 /// A notification, with no id, because the page already treats an id-less line as something that
 /// streams (`robot.state` is the other one) — no new mechanism at either end.
-pub fn video_notification(video: Video) -> String {
-    let Video {
-        width,
-        height,
-        rotate,
-    } = video;
-    format!(
-        r#"{{"jsonrpc":"2.0","method":"{VIDEO_METHOD}","params":{{"width":{width},"height":{height},"rotate":{rotate}}}}}"#
-    )
+pub fn video_notification(video: &Video) -> String {
+    // Built with `serde_json` rather than `format!` since it gained a nested object: one escaping
+    // mistake in a hand-written line is a peer that cannot parse anything this daemon says.
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": VIDEO_METHOD,
+        "params": video_params(video),
+    })
+    .to_string()
+}
+
+/// The video's description, which the notification pushes and the call answers with.
+///
+/// One function for both, because a peer that asks and a peer that listens must be told the same
+/// thing — and the console does both, a push when the channel opens and a call when it is ready.
+fn video_params(video: &Video) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "width": video.width,
+        "height": video.height,
+        "rotate": video.rotate,
+    });
+    // Absent rather than null when the geometry is unknown: a consumer reading a missing key knows
+    // it must calibrate, where one reading `null` has to be told what that meant.
+    if let Some(intrinsics) = &video.intrinsics {
+        params["intrinsics"] = serde_json::to_value(intrinsics).expect("intrinsics serialise");
+    }
+    params
 }
 
 pub async fn run(
@@ -83,7 +106,7 @@ pub async fn run(
         if line.is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line, &mut pool, video).await {
+        if let Some(reply) = handle(&line, &mut pool, &video).await {
             // A closed outbound means the peer is gone; there is nothing left to do for it.
             if outbound.send(reply).await.is_err() {
                 break;
@@ -95,7 +118,7 @@ pub async fn run(
 
 /// Route one line. Returns a reply to send back only when this transport answers it itself —
 /// which is to say, only when it refuses.
-async fn handle(line: &str, pool: &mut Pool, video: Video) -> Option<String> {
+async fn handle(line: &str, pool: &mut Pool, video: &Video) -> Option<String> {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -118,15 +141,8 @@ async fn handle(line: &str, pool: &mut Pool, video: Video) -> Option<String> {
     // about `mediad`'s own pipeline, and there is no service to route it to.
     if request.method == VIDEO_METHOD {
         return Some(
-            serde_json::to_string(&proto::Response::ok(
-                id,
-                &serde_json::json!({
-                    "width": video.width,
-                    "height": video.height,
-                    "rotate": video.rotate,
-                }),
-            ))
-            .expect("Response serialises"),
+            serde_json::to_string(&proto::Response::ok(id, &video_params(video)))
+                .expect("Response serialises"),
         );
     }
 
@@ -242,6 +258,11 @@ mod tests {
                 width: 1280,
                 height: 720,
                 rotate: 90,
+                intrinsics: crate::camera::Intrinsics::nominal(
+                    Some(crate::camera::SensorMode::PINNED),
+                    1280,
+                    720,
+                ),
             },
         ));
         Harness {
@@ -406,16 +427,22 @@ mod tests {
         assert!(reply.contains("robot.teleport"), "{reply}");
     }
 
-    /// The line that tells a page how the camera is mounted.
+    /// The line that tells a page how the camera is mounted, and a consumer what its geometry is.
     ///
-    /// Hand-built JSON, so this is the only thing between a console that rotates the picture and one
-    /// that shows it sideways and says nothing.
+    /// This is the only thing between a console that rotates the picture and one that shows it
+    /// sideways and says nothing — and now also between a perception consumer that can turn a
+    /// pixel into a direction and one that has to guess a focal length.
     #[test]
-    fn the_video_notification_carries_the_mount_rotation() {
-        let line = video_notification(Video {
+    fn the_video_notification_carries_the_mount_rotation_and_the_geometry() {
+        let line = video_notification(&Video {
             width: 1280,
             height: 720,
             rotate: 90,
+            intrinsics: crate::camera::Intrinsics::nominal(
+                Some(crate::camera::SensorMode::PINNED),
+                1280,
+                720,
+            ),
         });
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(parsed["method"], "media.video");
@@ -423,6 +450,35 @@ mod tests {
         assert_eq!(parsed["params"]["width"], 1280);
         assert_eq!(parsed["params"]["height"], 720);
         assert_eq!(parsed["params"]["rotate"], 90);
+
+        let intrinsics = &parsed["params"]["intrinsics"];
+        assert!(
+            (intrinsics["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01,
+            "{intrinsics}"
+        );
+        assert_eq!(intrinsics["cx"], 640.0);
+        assert_eq!(
+            intrinsics["calibrated"], false,
+            "the module's design figures, and a consumer has to be able to tell"
+        );
+    }
+
+    /// A robot whose camera geometry is unknown omits the key rather than sending a null.
+    ///
+    /// Which is every robot streaming a test pattern, and any board where `media-ctl` would not
+    /// set the sensor mode. A consumer reading a missing key knows it has to calibrate; one
+    /// reading `null` has to be told what that meant.
+    #[test]
+    fn an_unknown_geometry_is_absent_from_the_line() {
+        let line = video_notification(&Video {
+            width: 1280,
+            height: 720,
+            rotate: 0,
+            intrinsics: None,
+        });
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert!(parsed["params"].get("intrinsics").is_none(), "{line}");
+        assert_eq!(parsed["params"]["width"], 1280);
     }
 
     /// `media.video` is answered by the session, not routed to a service.
