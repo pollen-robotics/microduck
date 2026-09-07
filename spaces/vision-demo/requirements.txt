@@ -10,7 +10,13 @@ reachy_mini[central-consumer]
 
 # The UI. Gradio because its OAuth support is a button rather than a flow to implement — the
 # console page learned what implementing one costs (`remote-access-design.md` §5.0).
-gradio>=5
+#
+# **The `oauth` extra is ours to ask for.** `gr.LoginButton` raises `Cannot initialize OAuth due
+# to a missing library` without it, and a Hugging Face Space installs `gradio[oauth,mcp]` of its
+# own accord — so this works there whether or not it is written down, and nowhere else. Written
+# down: an app whose login button depends on a platform's default is an app that breaks the first
+# time it runs anywhere but the platform.
+gradio[oauth]>=6
 
 # The processing. `-headless` because a container has no display and the GUI build drags in the
 # whole of GTK to be linked and never used.
