@@ -28,6 +28,14 @@ with the same consumer, so the version is the thing to control, and only a Docke
 It shows the path end to end: a camera on a duck, a container in a data centre, a processed
 picture. That is the demo.
 
+**What it measured, on its first run:** signalling crosses and ICE does not. The rendezvous
+welcomes this consumer, lists the duck, starts a session, and the offer and answer are exchanged —
+then `peer connection failed (ice failed)`, because no candidate pair works between a data centre
+and a robot behind a home router and neither side can offer a relay. `remote-access-design.md` §6
+has the log and what follows from it: TURN is a requirement for cloud consumers, not a fallback for
+awkward networks. **This Space will connect the day the robot can offer a relay candidate, with no
+change here.**
+
 And it is **the only thing that tests the transport from a data centre**. Every session before it
 came from a browser on the robot's own network, or a phone on 4G. A Space is neither, and the robot
 cannot offer a `relay` candidate while the TURN credentials endpoint has no DNS
