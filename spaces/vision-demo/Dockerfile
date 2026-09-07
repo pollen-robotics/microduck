@@ -23,7 +23,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py filters.py ./
+# **Every module, not a list of them.** This said `COPY app.py filters.py ./`, and the day a third
+# module appeared the image built perfectly and the app died on `import consumer` — a hand-kept
+# list of files that has to match reality is the same mistake as `cp *` in the publisher and
+# `git diff --quiet` in its check, three times in one afternoon. `publish-space.sh` sends only
+# tracked files, so a glob here cannot pick up anything that is not meant to be deployed.
+COPY *.py ./
 USER duck
 ENV HOME=/home/duck \
     GRADIO_SERVER_NAME=0.0.0.0 \
