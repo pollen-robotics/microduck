@@ -7823,6 +7823,9 @@ mod tests {
         fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
             self.inner.set_torque(on)
         }
+        fn reboot(&mut self, id: u8) -> duck_control::io::Result<()> {
+            self.inner.reboot(id)
+        }
         fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
             self.inner.slow_sensors()
         }
