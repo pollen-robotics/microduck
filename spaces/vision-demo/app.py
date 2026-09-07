@@ -195,21 +195,30 @@ def render(filter_name: str) -> tuple[np.ndarray | None, str]:
     return processed, describe(status)
 
 
-def connect(profile: gr.OAuthProfile | None, token: gr.OAuthToken | None) -> str:
-    """Open the session with whichever credential this Space has.
+def connect() -> str:
+    """Open the session with this Space's `HF_TOKEN`.
 
-    **A visitor's token by preference, and never the robot's.** The rendezvous maps a token to one
-    peer, so a consumer authenticating as the robot would take the robot off its owner's listing —
-    the same fact §3.7 records about two things sharing a credential. A visitor's OAuth token is
-    also what makes a *public* Space defensible: it reaches the visitor's own robots and nobody
-    else's. `HF_TOKEN` is the fallback for a private Space with one owner.
+    **No sign-in button, and that is a retreat rather than a design.** A visitor's own OAuth token
+    would be better — it reaches their robots and nobody else's, which is what would make this
+    Space safe to make public — and two attempts at getting one failed on platform behaviour
+    rather than on code: a static Space never injected the client id the console needed
+    (`remote-access-design.md` §5.0), and a Docker Space does not put `OAUTH_CLIENT_ID` in the
+    environment either, so Gradio decides it is not in a Space, falls back to *mocked* OAuth, and
+    refuses to start without a local login. A demo that will not start is worse than a demo with
+    one credential.
+
+    So: an `HF_TOKEN` secret, and **this Space must stay private** — a visitor would otherwise be
+    reaching the owner's robot with the owner's token. The token is still never the robot's own:
+    the rendezvous maps a token to one peer, so a consumer sharing the robot's credential takes
+    the robot off its own owner's listing. §3.7.
     """
-    if token is not None:
-        return LINK.start(token.token)
-    fallback = os.environ.get("HF_TOKEN", "").strip()
-    if fallback:
-        return LINK.start(fallback)
-    return "sign in with Hugging Face, or set an HF_TOKEN secret on this Space"
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        return (
+            "no `HF_TOKEN` secret on this Space. Settings → Variables and secrets → "
+            "`HF_TOKEN`, with a token of the account the robot belongs to (not the robot's own)."
+        )
+    return LINK.start(token)
 
 
 with gr.Blocks(title="duck vision demo") as demo:
@@ -227,7 +236,6 @@ with gr.Blocks(title="duck vision demo") as demo:
     )
 
     with gr.Row():
-        gr.LoginButton()
         connect_button = gr.Button("connect", variant="primary")
         disconnect_button = gr.Button("disconnect")
         chosen = gr.Dropdown(

@@ -6,7 +6,6 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
-hf_oauth: true
 short_description: A duck's camera, processed on Hugging Face hardware.
 ---
 
@@ -36,13 +35,18 @@ cannot offer a `relay` candidate while the TURN credentials endpoint has no DNS
 the frame count separately. "Signalling worked and media did not" is a specific, expected outcome
 here, and it is not a fault in this Space.
 
-## Identity
+## Identity, and why this Space must stay private
 
-**A visitor's token by preference, never the robot's.** The rendezvous maps a token to one peer, so
-a consumer authenticating as the robot takes the robot off its owner's listing. `hf_oauth: true`
-plus Gradio's login button gives each visitor their own token, which reaches their own robots and
-nobody else's — which is also what makes a public Space defensible. An `HF_TOKEN` secret is the
-fallback for a private Space with one owner.
+It authenticates with an **`HF_TOKEN` secret** — Settings → Variables and secrets — belonging to
+the account the robot belongs to. Not the robot's own token: the rendezvous maps a token to one
+peer, so a consumer sharing the robot's credential takes the robot off its owner's listing (§3.7).
+
+A visitor's own OAuth token would be better and would make this safe to publish. Two attempts at
+one failed on platform behaviour rather than on code: a static Space never injected the client id
+(`remote-access-design.md` §5.0), and a Docker Space does not put `OAUTH_CLIENT_ID` in the
+environment either — Gradio then decides it is not in a Space, mocks OAuth, and refuses to start
+without a local login. A demo that will not start is worse than a demo with one credential, so the
+button is gone and the Space stays private.
 
 ## What it cannot do
 
