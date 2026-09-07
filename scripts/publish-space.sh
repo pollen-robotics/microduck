@@ -72,13 +72,18 @@ for file in $FILES; do
 done
 
 cd "$CLONE"
-if git diff --quiet; then
+
+# **Staged first, then compared.** `git diff --quiet` ignores untracked files, so a publish whose
+# only change was a *new* file reported "already serves this" and pushed nothing — which is the
+# worst possible answer, because it is indistinguishable from success. `git add -A` and then a
+# cached diff sees additions, deletions and modifications alike.
+git add -A
+if git diff --cached --quiet; then
     echo "the Space already serves this"
     exit 0
 fi
 
 REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-git add -A
 git commit -q -m "$NAME from microduck $REVISION"
 git push
 echo "pushed. The Space rebuilds: a couple of minutes for a Docker one, since aiortc and av"
