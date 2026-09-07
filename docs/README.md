@@ -59,6 +59,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`media-bringup.md`](project/media-bringup.md) | What a Radxa Zero 3W does about video: the VPU, what MPP needs, and the two plugins that have to be built. |
 | [`pad-minimal-pairing.md`](project/pad-minimal-pairing.md) | The smallest board configuration a gamepad will bond under, found by taking one away at a time. |
 | [`idle-cpu.md`](project/idle-cpu.md) | What the daemons do when nobody is asking them to: four things that stopped, two that were measured and left alone, and what still wants a board. |
+| [`turn-endpoint-is-dead.md`](project/turn-endpoint-is-dead.md) | Why no robot offers a relay candidate: the default TURN proxy's DNS delegation is dangling, and a signed-in robot offers its account token to whoever takes it. |
 
 ## `ideas/` — not designed yet
 

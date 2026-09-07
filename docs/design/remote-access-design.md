@@ -721,25 +721,38 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
-**And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` has no A
-record and `fastrtc.org` has no NS records at all, from three public resolvers and from the board
-— so the proxy both `fastrtc`'s own current code and `reachy_mini`'s #1182 point at cannot be
-reached by anybody. Their documentation describes it as a live Hugging Face–Cloudflare arrangement
-(10 GB a month free with an account), so this reads as a lapsed registration or an outage rather
-than a moved URL, and it means the mini fleet's relay path is down too. Worth telling whoever owns
-`fastrtc`.
+**And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` does not
+resolve, from three public resolvers and from the board — so the proxy both `fastrtc`'s own current
+code and `reachy_mini`'s #1182 point at cannot be reached by anybody, and the mini fleet's relay
+path is down with ours.
 
-Three ways on, in the order they should be considered:
+**It is a deleted hosted zone, and that is worse than an outage.** The `.org` registry delegates
+`fastrtc.org` to four Route53 nameservers, all four of which answer `REFUSED` for it, which is
+what a Route53 server says when the zone behind it is gone; a resolver therefore returns
+`SERVFAIL`. The registration is live and locked until 2027-02-17, so the owner could restore the
+zone in minutes and has not in three months. A dangling delegation is a takeover route: whoever
+lands one of those four nameservers serves records for the name, passes DNS validation for a
+certificate on it, and receives the account token every signed-in robot sends with the credentials
+request every thirty seconds. `docs/project/turn-endpoint-is-dead.md` has the checks, the dates
+and where `reachy_mini` stands on it.
 
-- **Wait, having reported it.** The robot degrades exactly as designed — a warning every thirty
-  seconds and host/srflx candidates — so nothing is broken except reaching a robot from a network
-  that needs a relay.
+That changes the order these were first written in, because waiting now costs a token rather than
+only a relay:
+
+- **Drop the default, so a relay is opt-in.** `--turn-url` with no value means `maintain` does not
+  spawn, which removes the exfiltration route and the thirty-second warning and costs no coverage
+  — there is none to cost. `reachy_mini`'s `no-default-turn-url` is the same change on that side.
 - **Our own proxy**, which is what that endpoint is: a small service holding a Cloudflare Calls key
   and minting short-lived credentials for a caller presenting a valid HF token. `--turn-url` is
-  already the seam it plugs into, and the key stays in one place rather than on robots.
+  already the seam it plugs into, and the key stays in one place rather than on robots. This is
+  what restores relay coverage, and it is its own piece of work.
 - **A Cloudflare key on the robot**, using `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` directly. Fastest
   and worst: a long-lived API token on every board, which is the shape of mistake §2.4 exists to
   stop making.
+
+Whichever lands, a **relay-only connectivity check** goes with it. Every check there is passes
+today, because every check there is runs between peers that pair on host candidates and never
+reach for a relay — which is how a default endpoint that answers nothing merged in the first place.
 
 Nothing about a relay is fatal. `add-turn-server` is checked for existence before it is emitted —
 a panic in a C closure aborts the process rather than unwinding, which `pipeline.rs` learned once
@@ -808,6 +821,7 @@ Five slices, and the first two are independently useful and need no client:
 | §2.4 the scope breadth | one public device-code client in the `pollen-robotics` HF org with `openid profile read-repos`, created by somebody with org admin. Not blocking — a scope change is a re-login — and it should not ship without it |
 | a calibration for the camera | `media.video` publishes the module's design figures with `calibrated: false`, which is enough to map a room and not enough for metrology. Measuring one robot and writing `[media.intrinsics]` closes it for that robot; a per-unit calibration in provisioning closes it for the family. §11 of `remote-webrtc.md` |
 | everything on the wire should be timestamped at source | `remote-webrtc.md` §11: `abs-capture-time` on the media, checked against what `webrtcsink`, a browser and `aiortc` actually surface; and a monotonic-plus-epoch field on every control-channel notification that describes a moment. Wanted for any consumer that has to relate what the robot saw to what it felt — visual-inertial SLAM is the case that makes it concrete — and it wants its own version bump rather than riding along with a transport |
+| §6 the default TURN endpoint is dead, and dangling | dropping the default so a relay is opt-in, which is a small change and the urgent half — while `turn.fastrtc.org` is the default, every signed-in robot offers its account token to whoever takes that name. Relay coverage then needs a proxy of our own, which is its own piece of work. `docs/project/turn-endpoint-is-dead.md` |
 | §2.6 `logout` revokes nothing | whether Hugging Face accepts a revocation for the first-party device-code client, checked rather than assumed. Not blocking — signing out stops the robot being reachable, and a stolen board is answered on hf.co — but it is the difference between "forgotten" and "revoked" |
 
 Closed since this page was written: the OAuth client (§2.3 — Hugging Face ships one), whether the
