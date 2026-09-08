@@ -39,8 +39,19 @@ SOURCE="$REPO_ROOT/spaces/$NAME"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
+# **What git has, not what the directory has**, and that is the whole of the copy below.
+#
+# `cp *` published whatever was lying around — and something always is: running the app from its
+# own directory leaves a `__pycache__` next to it, which is a directory, which `cp` without `-r`
+# refuses, which stopped the script halfway. Listing tracked files fixes both halves: bytecode and
+# scratch files cannot reach a Space, and a Space always corresponds to a commit in this
+# repository. A file that has not been committed does not deploy, which is a feature the first
+# time somebody wonders which version is live.
+FILES=$(cd "$REPO_ROOT" && git ls-files "spaces/$NAME" | sed "s|^spaces/$NAME/||")
+[ -n "$FILES" ] || { echo "no tracked files under spaces/$NAME — commit them first" >&2; exit 1; }
+
 echo "space:  https://huggingface.co/spaces/$SPACE"
-echo "files:  $(cd "$SOURCE" && ls | tr '\n' ' ')"
+echo "files:  $(echo "$FILES" | tr '\n' ' ')"
 
 if [ -n "$DRY_RUN" ]; then
     echo "--dry-run: nothing pushed"
@@ -53,16 +64,27 @@ git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
 # Copied rather than synced: a file deleted here stays in the Space until somebody removes it
 # there. Deliberate — a `--delete` that ran against the wrong Space id would remove somebody's
 # work, and these are hand-run.
-cp "$SOURCE"/* "$CLONE/"
+#
+# One at a time and by name, so a subdirectory arrives as a subdirectory rather than as an error.
+for file in $FILES; do
+    mkdir -p "$CLONE/$(dirname "$file")"
+    cp "$SOURCE/$file" "$CLONE/$file"
+done
 
 cd "$CLONE"
-if git diff --quiet; then
+
+# **Staged first, then compared.** `git diff --quiet` ignores untracked files, so a publish whose
+# only change was a *new* file reported "already serves this" and pushed nothing — which is the
+# worst possible answer, because it is indistinguishable from success. `git add -A` and then a
+# cached diff sees additions, deletions and modifications alike.
+git add -A
+if git diff --cached --quiet; then
     echo "the Space already serves this"
     exit 0
 fi
 
 REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-git add -A
 git commit -q -m "$NAME from microduck $REVISION"
 git push
-echo "pushed. The Space rebuilds in a minute or two — Gradio Spaces install their requirements."
+echo "pushed. The Space rebuilds: a couple of minutes for a Docker one, since aiortc and av"
+echo "        are wheels worth waiting for. Its build log is on the Space page."

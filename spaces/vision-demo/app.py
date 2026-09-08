@@ -35,12 +35,26 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+
 import gradio as gr
 import numpy as np
 
-from reachy_mini.media.central_consumer import ReachyCentralConsumer
+from consumer import DuckConsumer
 
 from filters import FILTERS, upright
+
+# **The container log is the only diagnostic a private Space can hand somebody**, and this printed
+# nothing of its own: the consumer logs at INFO and nothing had configured a handler, so every
+# line about the welcome, the producer, the session and the ICE state went nowhere. A Space that
+# will not connect and says nothing in its log is a Space nobody can help with.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("aiortc").setLevel(logging.WARNING)
 
 # Which robot to look for. The rendezvous lists every robot an account owns, and the consumer picks
 # by `meta.name` — the name `robotctl system set-name` sets.
@@ -61,7 +75,7 @@ class Link:
     before wondering why the page went quiet.
     """
 
-    consumer: ReachyCentralConsumer | None = None
+    consumer: DuckConsumer | None = None
     loop: asyncio.AbstractEventLoop | None = None
     thread: threading.Thread | None = None
     error: str | None = None
@@ -83,10 +97,10 @@ class Link:
             thread = threading.Thread(target=loop.run_forever, name="duck-consumer", daemon=True)
             thread.start()
 
-            consumer = ReachyCentralConsumer(
-                hf_token=token,
+            consumer = DuckConsumer(
+                token=token,
                 robot_name=ROBOT,
-                consumer_label=f"microduck-vision-demo/{os.environ.get('SPACE_ID', 'local')}",
+                label=f"microduck-vision-demo/{os.environ.get('SPACE_ID', 'local')}",
             )
             try:
                 asyncio.run_coroutine_threadsafe(consumer.start(), loop).result(timeout=30)
@@ -140,6 +154,8 @@ def describe(status: dict[str, Any]) -> str:
     session = status.get("session_id")
     state = status.get("pc_state")
     frames = status.get("frames") or 0
+    if reported := status.get("error"):
+        return f"**{reported}**"
 
     if not session:
         return (
@@ -158,9 +174,24 @@ def describe(status: dict[str, Any]) -> str:
             "(`remote-access-design.md` §6). Signalling crossing while media does not is exactly "
             "that failure, and it is not a fault in this Space."
         )
+    geometry = ""
+    if LINK.consumer is not None and (video := LINK.consumer.video_info()):
+        intrinsics = video.get("intrinsics")
+        geometry = (
+            f" Camera says {video.get('width')}×{video.get('height')}, mounted "
+            f"{video.get('rotate')}° off upright"
+            + (
+                f", fx {intrinsics['fx']:.0f} px"
+                + (" (calibrated)" if intrinsics.get("calibrated") else " (nominal)")
+                if intrinsics
+                else ", geometry unknown"
+            )
+            + "."
+        )
     return (
-        f"**connected** — session `{session[:8]}`, {frames} frames decoded. "
-        f"Robot peer `{(status.get('robot_peer_id') or '?')[:8]}`."
+        f"**connected** — session `{session[:8]}`, {frames} frames decoded."
+        + geometry
+        + f" Robot peer `{(status.get('robot_peer_id') or '?')[:8]}`."
     )
 
 
@@ -178,21 +209,30 @@ def render(filter_name: str) -> tuple[np.ndarray | None, str]:
     return processed, describe(status)
 
 
-def connect(profile: gr.OAuthProfile | None, token: gr.OAuthToken | None) -> str:
-    """Open the session with whichever credential this Space has.
+def connect() -> str:
+    """Open the session with this Space's `HF_TOKEN`.
 
-    **A visitor's token by preference, and never the robot's.** The rendezvous maps a token to one
-    peer, so a consumer authenticating as the robot would take the robot off its owner's listing —
-    the same fact §3.7 records about two things sharing a credential. A visitor's OAuth token is
-    also what makes a *public* Space defensible: it reaches the visitor's own robots and nobody
-    else's. `HF_TOKEN` is the fallback for a private Space with one owner.
+    **No sign-in button, and that is a retreat rather than a design.** A visitor's own OAuth token
+    would be better — it reaches their robots and nobody else's, which is what would make this
+    Space safe to make public — and two attempts at getting one failed on platform behaviour
+    rather than on code: a static Space never injected the client id the console needed
+    (`remote-access-design.md` §5.0), and a Docker Space does not put `OAUTH_CLIENT_ID` in the
+    environment either, so Gradio decides it is not in a Space, falls back to *mocked* OAuth, and
+    refuses to start without a local login. A demo that will not start is worse than a demo with
+    one credential.
+
+    So: an `HF_TOKEN` secret, and **this Space must stay private** — a visitor would otherwise be
+    reaching the owner's robot with the owner's token. The token is still never the robot's own:
+    the rendezvous maps a token to one peer, so a consumer sharing the robot's credential takes
+    the robot off its own owner's listing. §3.7.
     """
-    if token is not None:
-        return LINK.start(token.token)
-    fallback = os.environ.get("HF_TOKEN", "").strip()
-    if fallback:
-        return LINK.start(fallback)
-    return "sign in with Hugging Face, or set an HF_TOKEN secret on this Space"
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if not token:
+        return (
+            "no `HF_TOKEN` secret on this Space. Settings → Variables and secrets → "
+            "`HF_TOKEN`, with a token of the account the robot belongs to (not the robot's own)."
+        )
+    return LINK.start(token)
 
 
 with gr.Blocks(title="duck vision demo") as demo:
@@ -210,7 +250,6 @@ with gr.Blocks(title="duck vision demo") as demo:
     )
 
     with gr.Row():
-        gr.LoginButton()
         connect_button = gr.Button("connect", variant="primary")
         disconnect_button = gr.Button("disconnect")
         chosen = gr.Dropdown(

@@ -721,6 +721,30 @@ blocks (a `try_read` that yields nothing rather than waiting) and never fails. A
 the ordinary state for the first few seconds after boot and forever on a robot with no account,
 and it means host and srflx only, which is all anything on the same network needs.
 
+**Measured: a data centre cannot reach a robot without a relay.** The demo Space
+(`spaces/vision-demo`) got as far as it can and the log says where that is:
+
+```
+the rendezvous welcomed this consumer as 9d3a17dd (PierreRouanet)
+found olducky (8a73eda9), asking for a session
+session 4c7e9c60 started; waiting for the robot's offer
+peer connection connecting (ice checking)
+the session ended: the robot ended the session       ← 8s later
+peer connection failed (ice failed)
+```
+
+Signalling crosses perfectly — welcome, listing, session, offer, answer — and **no candidate pair
+works**. The robot offers host and srflx; a Space offers its own; neither offers a `relay`. Eight
+seconds in, `webrtcsink` times out a consumer whose ICE never connected and ends the session, which
+the bridge forwards, which is the `the robot ended the session` line arriving before the ICE
+verdict.
+
+That settles what was previously a guess. On one LAN the console works on host candidates; from a
+4G phone it failed and carrier-grade NAT was the suspicion; **from a Hugging Face Space it fails
+too**, and a Space is not behind CGNAT. So TURN is not a fallback for awkward networks — it is the
+requirement for every consumer that is not on the robot's own wifi, which includes every cloud
+backend and therefore anything doing perception on a Space.
+
 **And the endpoint is not answering, which is where this stands.** `turn.fastrtc.org` has no A
 record and `fastrtc.org` has no NS records at all, from three public resolvers and from the board
 — so the proxy both `fastrtc`'s own current code and `reachy_mini`'s #1182 point at cannot be
@@ -732,8 +756,8 @@ than a moved URL, and it means the mini fleet's relay path is down too. Worth te
 Three ways on, in the order they should be considered:
 
 - **Wait, having reported it.** The robot degrades exactly as designed — a warning every thirty
-  seconds and host/srflx candidates — so nothing is broken except reaching a robot from a network
-  that needs a relay.
+  seconds and host/srflx candidates. What that costs is now measured rather than estimated: every
+  consumer off the robot's own network, which is all of them except a browser on the same wifi.
 - **Our own proxy**, which is what that endpoint is: a small service holding a Cloudflare Calls key
   and minting short-lived credentials for a caller presenting a valid HF token. `--turn-url` is
   already the seam it plugs into, and the key stays in one place rather than on robots.
