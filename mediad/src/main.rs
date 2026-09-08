@@ -37,6 +37,35 @@ struct Args {
     #[arg(long, default_value_t = 8443)]
     port: u32,
 
+    /// The rendezvous service this robot registers with, so it can be reached from off its LAN.
+    ///
+    /// Defaults to the Space the mini's fleet uses. A flag rather than a config key because there
+    /// is nothing to choose on a real robot — what it is for is pointing a board at a fake, or at
+    /// a self-hosted copy on the day somebody wants one. `docs/design/remote-access-design.md` §4.
+    #[arg(long, default_value = mediad::relay::DEFAULT_RENDEZVOUS)]
+    rendezvous_url: String,
+
+    /// The account credential `updaterd` writes, which the relay needs to prove whose robot this
+    /// is. Absent means nobody has signed this robot in, and remote access is simply off.
+    #[arg(long, default_value = mediad::relay::DEFAULT_TOKEN_PATH)]
+    token: PathBuf,
+
+    /// Where short-lived TURN credentials come from.
+    ///
+    /// Hugging Face hosts this proxy and mints Cloudflare credentials for the account the token
+    /// belongs to, which is why offering a relay needs no new secret on the robot. A flag for
+    /// pointing a board at a fake; there is nothing to choose on a real one.
+    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT)]
+    turn_url: String,
+
+    /// Do not register with the rendezvous service, whatever the token file says.
+    ///
+    /// For a board that is signed in and being worked on: a duck registering from a bench while
+    /// somebody drives the same account's robot elsewhere is a producer in a list nobody wants,
+    /// and evicting it means finding this flag afterwards.
+    #[arg(long)]
+    no_remote: bool,
+
     /// Where the console is served. `http://<robot>:8080/`, and nothing else to run.
     ///
     /// **Two ports, and only this one is ever typed.** `webrtcsink` owns the listener on `--port`
@@ -211,6 +240,52 @@ fn main() -> ExitCode {
             "producing as"
         );
 
+        // Relay candidates, so a consumer on a network that cannot punch a hole to this robot
+        // still reaches it. Spawned whatever the account state — it is inert without a token and
+        // starts on its own when a login lands — and *before* the pipeline, because the first
+        // consumer's offer is built as the pipeline comes up.
+        let relays = mediad::turn::Relays::empty();
+        tokio::spawn(mediad::turn::maintain(
+            std::sync::Arc::clone(&relays),
+            args.token.clone(),
+            args.turn_url.clone(),
+        ));
+
+        // The outward half of remote access, and it is deliberately *after* the producer is
+        // learned: the name a client sees in the service's listing comes from the same place the
+        // local `meta` gets it, and a relay that registered first would publish an unnamed robot
+        // until the next restart.
+        //
+        // Spawned whatever happens next. It is inert without a token, it holds no lock, and a
+        // pipeline that fails to build should not take remote access down with it — a robot that
+        // appears in its owner's list and cannot stream is still a robot somebody can reach to
+        // find out why.
+        if args.no_remote {
+            tracing::info!("--no-remote: this robot will not register with the rendezvous service");
+        } else {
+            match mediad::relay::Meta::of(&producer, None) {
+                None => tracing::warn!(
+                    "no serial and no machine id, so this robot has no stable identity to \
+                     register with; remote access is off"
+                ),
+                Some(meta) => {
+                    if let Some(relay) =
+                        mediad::relay::Relay::new(&args.rendezvous_url, &args.token, meta)
+                    {
+                        // The bridge is a *consumer* of the signalling server this same process
+                        // runs, so it has to be told the port `--port` chose rather than assuming
+                        // the default — a robot moved off 8443 would otherwise register happily
+                        // and fail every session.
+                        tokio::spawn(
+                            relay
+                                .with_local_signalling(format!("ws://127.0.0.1:{}", args.port))
+                                .run(),
+                        );
+                    }
+                }
+            }
+        }
+
         let source = if media.camera {
             mediad::pipeline::Source::Camera(mediad::pipeline::Camera {
                 device: args.camera_device.clone(),
@@ -241,17 +316,21 @@ fn main() -> ExitCode {
         // `get_frame` surface in `architecture.md` §5.3 is what the rest of it is for. The branch
         // runs from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, frames) =
-            match mediad::pipeline::start(source.clone(), &producer, &settings) {
-                Ok(started) => started,
-                Err(e) => {
-                    // The message names which step failed and what usually causes it — a missing
-                    // plugin, a missing library, or a device node nobody can open. Those look
-                    // identical from a log line that only says "failed".
-                    tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
-                    return ExitCode::FAILURE;
-                }
-            };
+        let (_pipeline, mut channels, frames) = match mediad::pipeline::start(
+            source.clone(),
+            &producer,
+            &settings,
+            std::sync::Arc::clone(&relays),
+        ) {
+            Ok(started) => started,
+            Err(e) => {
+                // The message names which step failed and what usually causes it — a missing
+                // plugin, a missing library, or a device node nobody can open. Those look
+                // identical from a log line that only says "failed".
+                tracing::error!(error = %format!("{e:#}"), "mediad cannot start");
+                return ExitCode::FAILURE;
+            }
+        };
 
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
@@ -317,10 +396,36 @@ fn main() -> ExitCode {
 
         // What every peer is told about the picture. The geometry is the *encoded* frame — the
         // pipeline does not rotate, so it is the capture geometry — and the rotation is the mount.
+        // The camera's geometry, for a consumer that has to turn pixels into directions. Read
+        // *after* the pipeline is up, because which sensor mode is in force is only known once
+        // something tried to set it — and a mode nobody knows the field of view of publishes
+        // nothing rather than a plausible wrong number. `mediad::camera` has the arithmetic.
+        let intrinsics = mediad::camera::Intrinsics::published(
+            media.intrinsics.as_ref(),
+            mediad::pipeline::sensor_mode(),
+            media.quality.width(),
+            media.quality.height(),
+        );
+        match &intrinsics {
+            Some(geometry) => tracing::info!(
+                fx = geometry.fx,
+                fy = geometry.fy,
+                cx = geometry.cx,
+                cy = geometry.cy,
+                calibrated = geometry.calibrated,
+                "camera geometry"
+            ),
+            None => tracing::info!(
+                "no camera geometry to publish: the sensor is not in a mode whose field of view \
+                 is known, so a consumer is told nothing rather than something wrong"
+            ),
+        }
+
         let video = mediad::session::Video {
             width: media.quality.width(),
             height: media.quality.height(),
             rotate: args.rotate,
+            intrinsics,
         };
 
         // One session per peer, each with its own connections to the services it talks to. Per
@@ -343,7 +448,7 @@ fn main() -> ExitCode {
             // (`media.video`), which is why that path exists and this one is best-effort.
             {
                 let to_peer = channel.outbound.clone();
-                let line = mediad::session::video_notification(video);
+                let line = mediad::session::video_notification(&video);
                 tokio::spawn(async move {
                     let _ = to_peer.send(line).await;
                 });
@@ -380,7 +485,9 @@ fn main() -> ExitCode {
                 channel.inbound,
                 channel.outbound,
                 pool,
-                video,
+                // Cloned per session: it carries the camera's intrinsics now, so it is no
+                // longer a `Copy` handful of integers.
+                video.clone(),
             ));
         }
 

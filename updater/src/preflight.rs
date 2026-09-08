@@ -260,6 +260,9 @@ mod tests {
         async fn remote_session_active(&self, _t: Duration) -> bool {
             self.session
         }
+        async fn reload_policies(&self, _timeout: Duration) -> bool {
+            true
+        }
     }
 
     fn preflight<'a>(robot: &'a dyn RobotClient, required: u64, available: u64) -> Preflight<'a> {

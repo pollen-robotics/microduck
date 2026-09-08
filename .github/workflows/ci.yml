@@ -93,16 +93,25 @@ jobs:
       # tool that may not be installed, and an unquoted or unguarded one of those is an exit
       # partway through a report that then looks complete.
       #
+      # `seed-policies.sh` runs inside an update, on every board, and decides whether to overwrite
+      # the policies a robot walks with. `hooks/postinstall` is the thing that runs it, and every
+      # other script here, and was missing from this list while being the one file that runs on
+      # every board on every update — the argument this comment opens with, applied to itself.
+      #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
             test -x "$script"
           done
+          # The hook, which is not executable in the repo — `xtask package` sets its mode on the
+          # way into the artifact, and `hooks_are_packaged_executable` is what checks that.
+          sh -n hooks/postinstall
+          shellcheck --shell=sh hooks/postinstall
 
       # `board-test.sh` separately, because it needs different flags and was excluded for it.
       #

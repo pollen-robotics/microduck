@@ -279,13 +279,41 @@ impl PettingDetector {
 
     /// Push samples; returns the state-change events this batch triggered and the latest
     /// inference probability (when one ran), for logging.
-    pub fn push_samples(&mut self, samples: &[f32]) -> Result<(Vec<PettingEvent>, Option<f32>)> {
+    ///
+    /// `audible` is the caller's answer to "has the room made a sound this could possibly
+    /// find petting in". False skips the window's features and inference — the expensive
+    /// part by far — while still advancing the ring and the schedule, so the audio a later
+    /// window sees is continuous and not spliced across the gap.
+    ///
+    /// **Pass `true` from a caller with no measure of the room**, which is what this did
+    /// before there was a gate: analysing a recording wants a probability for every window,
+    /// including the quiet ones. `worker::SoundSentry::audible` is the live measure.
+    pub fn push_samples(
+        &mut self,
+        samples: &[f32],
+        audible: bool,
+    ) -> Result<(Vec<PettingEvent>, Option<f32>)> {
         self.ring.extend_from_slice(samples);
         let mut events = Vec::new();
         let mut last_p = None;
 
         while self.ring.len() >= self.samples_until_infer {
             let start = self.samples_until_infer - WINDOW_SAMPLES;
+            // Advanced here rather than at the end of the body, so that *every* path out of
+            // this iteration has advanced it. The skip below is one such path, and a skip
+            // that forgot to would not be a missed inference — it would be this loop
+            // spinning on the same window until the thread is killed.
+            self.samples_until_infer += self.stride;
+
+            // Silence cannot be petting, and finding that out the honest way costs a
+            // hundred FFTs and a forward pass.
+            //
+            // Only while *not* petting. The End edge is found by inference exactly as the
+            // Start is, so a session whose room went quiet under a shut gate would never
+            // end — the robot would sit there believing it was still being stroked.
+            if !audible && !self.is_petting {
+                continue;
+            }
             let mel = self
                 .extractor
                 .log_mel(&self.ring[start..start + WINDOW_SAMPLES]);
@@ -302,8 +330,6 @@ impl PettingDetector {
                 self.is_petting = false;
                 events.push(PettingEvent::End);
             }
-
-            self.samples_until_infer += self.stride;
         }
 
         // Cap the ring at 2× window so memory stays bounded.

@@ -178,7 +178,7 @@ defaults are in [`media-bringup.md`](../project/media-bringup.md).
 ```text
                               ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
 capture ─ NV12 ─ capsfilter ─ tee
-                              └─ queue(leaky, 1) ─ appsink ─ latest frame
+                              └─ queue(leaky, 1) ─ appsink ─ a frame on request
 ```
 
 §5.3 wants a frame on demand for a server-side program — "it wants a frame every second or two plus
@@ -189,8 +189,21 @@ taking them off the encoded branch would mean decoding what was just encoded.
 NV12 throughout, because that is what the rkisp path emits and what `mpph264enc` accepts, so
 nothing converts anywhere. Each branch has its own `queue` — a `tee` without them runs both from
 one thread, so a slow reader would stall the video track — and the raw one is leaky and one buffer
-deep, which is the last-value-wins, non-blocking snapshot `architecture.md` §2 asks for. A stalled
-reader costs frames, never the encoder.
+deep, which is the *latest* snapshot `architecture.md` §2 asks for rather than a queue of stale
+ones. A stalled reader costs frames, never the encoder.
+
+**A frame is copied out of the appsink only when a reader has asked for one.** The readers on this
+branch want two frames a second between them — auto-exposure meters one every 500 ms, the duck
+detector looks twice a second when it is enabled at all — and a frame is 1.84 MB at 720p30.
+Capturing all thirty was 55 MB/s of memcpy and a 1.8 MB allocation thirty times a second, from
+boot, on every robot, for frames nobody read. Every buffer still reaches the appsink and is dropped
+there unread; the cost on a frame nobody wants is a relaxed load.
+
+The request is answered by the *next* capture rather than by the last one delivered. Handing back
+whatever was lying around would be cheaper again and would put the reader's own polling period into
+the measurement — an exposure loop steering on luma from half a second ago is a loop that hunts. A
+reader blocks until its frame lands, bounded by a timeout, and a camera that has stopped reaches
+the same "no frame" path it always did.
 
 The branch exists from the start rather than being added when something reads it: inserting a tee
 into a live pipeline is a materially harder problem than having one that was always there.
@@ -307,6 +320,13 @@ out:
 - **`update.*` mutations.** For now only, and for a different reason than the PIN: applying an
   update restarts `mediad` and drops the session. Wanted later; §8 is what it will take.
 
+And one category came *in* that is worth naming here rather than only in the route table:
+**`account.*`**, the calls that bind this robot to a Hugging Face account. They are the first
+mutating calls this transport carries, and the console is where somebody would sign a robot in.
+It is also the only thing here whose effect outlives the session in the way an account does —
+[`remote-access-design.md`](remote-access-design.md) §2.6 is the argument and the three
+properties that make it hold, and `mediad::route` carries the short version.
+
 ### Replies are not correlated, deliberately
 
 `btd` forwards whatever a socket emits without parsing it, and has a test pinning that: a
@@ -370,9 +390,15 @@ Two properties follow, and both are the reason for this shape:
 
 - **Local mode never depends on the bridge.** If the rendezvous service is down, a LAN client still
   connects. Invariant 1 in `architecture.md` — local recovery stays independent — extends to media.
-- **The bridge parses nothing.** It proxies the gst signalling protocol, which is the same protocol
-  a LAN client speaks. That is the concrete payoff for using `webrtcsink` rather than `webrtcbin`:
-  the protocol already exists, so the bridge is a relay rather than a translator.
+- **The bridge invents no protocol.** The envelopes are the gst signalling protocol's, which is what
+  a LAN client already speaks, so the payload — SDP and ICE — passes through opaque. That is the
+  concrete payoff for using `webrtcsink` rather than `webrtcbin`.
+
+  It does **not** follow that the bridge is a pure relay, and this bullet used to say it was.
+  `reachy_mini`'s rendezvous carries those envelopes over HTTP — SSE inbound, `POST` outbound —
+  rather than over a WebSocket, and peer and session ids are per-hop. So the bridge rewrites the
+  envelope and keeps a session table both ways: a translator with an opaque payload.
+  [`remote-access-design.md`](remote-access-design.md) §3.2 has the two sides side by side.
 
 - **The bridge authenticates, so the robot does not have to.** The relay connects *outward* holding
   an account token, and the service shows a client only the robots its account owns — so a bridged
@@ -383,9 +409,11 @@ Two properties follow, and both are the reason for this shape:
   on the difference. Nothing is foreclosed if that stops being true.
 
 `reachy_mini` runs exactly this arrangement against a Hugging Face Space, with the robot
-registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Whether we
-adopt that service, and how a robot is bound to an account, is out of scope here and stays out
-until local mode works.
+registering as a `producer` and the Space keeping a TTL lease refreshed by a heartbeat. Local mode
+works now, so the two questions this section left open — whether we adopt that service, and how a
+robot is bound to an account — are open no longer for want of asking:
+[`remote-access-design.md`](remote-access-design.md) owns both, and the account is a Hugging Face
+OAuth **device** flow rather than the redirect flow `reachy_mini` uses (§2.1 for why).
 
 ### The signalling protocol, for whoever writes the bridge
 
@@ -490,7 +518,58 @@ The alternative was building `mediad` on an arm64 runner like the plugins in
 two and leaves nobody able to build `mediad` on a laptop — which for the crate that will need the
 most iteration against real hardware is the wrong trade.
 
-## 11. Deferred, with reasons
+### `media.video` says what the picture is, geometrically
+
+Width, height, the mount rotation — and the camera's **intrinsics**, which is what a consumer needs
+to turn a pixel into a direction. Without them a monocular reconstruction is scale-free and its
+angles are wrong; SLAM, visual odometry and "how far away is that" all begin here.
+
+Four numbers and a flag: `fx`, `fy`, `cx`, `cy`, and `calibrated`. They describe the frame **as it
+is sent** — unrotated, because nothing on the robot rotates pixels — so a consumer that applies
+`rotate` has to rotate these with it, swapping `cx` with `cy`. The flag is not decoration: `false`
+means the IMX219 module's design figures (3.04 mm over a 1.12 µm pitch, principal point assumed
+central, no distortion model), which is good to a few percent and enough to map a room; `true`
+means somebody measured *this* robot and wrote it into `[media.intrinsics]`. A consumer that needs
+metrology can tell that it needs to ask.
+
+**And the key is absent when the geometry is unknown**, rather than present and wrong. That is a
+robot streaming a test pattern, or one where `media-ctl` would not set the sensor mode — in which
+case the sensor is in its 3280×2464 boot mode, whose field of view is the whole array rather than
+the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::camera` has the
+arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
+the view to 27° rather than saving anything.
+
+## 11. Everything on the wire should carry the time it happened — **wanted**
+
+Nothing this transport carries is timestamped at source today. A frame arrives when it arrives, a
+`robot.state` notification arrives when it arrives, and a consumer that wants to know *when* the
+robot saw or felt something has only its own clock to go on — which, over a relay on another
+continent, is off by whatever the path cost that second.
+
+That is fine for driving a robot you are watching, and it is the wrong shape for everything a
+remote consumer is interesting for. **SLAM is the case that makes it concrete**: monocular SLAM on
+a stream with no capture times can be run, and the moment somebody wants visual-inertial — the IMU
+this robot already has, at 50 Hz, on the same control channel — the two series cannot be related
+except by guessing. Timestamps applied at the far end measure the network, not the robot.
+
+Two halves, and they are not the same problem:
+
+- **Media.** RTP timestamps are relative to a random offset, so they order frames and date none of
+  them. The mechanism for this is the `abs-capture-time` RTP header extension, which carries a
+  wall-clock capture time per packet and is what a receiver needs to line video up against
+  anything else. Whether `webrtcsink` will negotiate it, and what a browser and `aiortc` expose of
+  it, is the thing to check first — a header extension nothing on the receiving side surfaces buys
+  nothing.
+- **The control channel.** This one is ours and cheap: a monotonic reading, plus the boot epoch
+  that makes it comparable across processes, on every notification that describes a moment. The
+  cost is a field per message and an argument about which clock — and the answer has to be the
+  same one the media path ends up dating frames with, or the two series still cannot be joined.
+
+Not built, and deliberately not started as part of the remote path: it changes what every
+notification looks like, so it wants its own decision and its own version bump rather than riding
+along with a transport. `remote-access-design.md` §9 carries it as open.
+
+## 12. Deferred, with reasons
 
 - **A WebSocket surface for server-side programs** (`architecture.md` §5.3). Same JSON-RPC, no
   media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and

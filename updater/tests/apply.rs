@@ -66,6 +66,9 @@ impl RobotClient for DeadThenHealthy {
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 /// A robot that came up fine but cannot see its servos — a bench board with the motor
@@ -86,6 +89,9 @@ impl RobotClient for DegradedRobot {
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
     }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -105,6 +111,9 @@ impl RobotClient for FakeRobot {
     }
     async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
         false
+    }
+    async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
+        true
     }
 }
 

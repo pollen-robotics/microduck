@@ -13,7 +13,7 @@
 //!                                       (leaky)     │
 //!                                          │        └─ consumer-added → "control" channel
 //!                                      appsink
-//!                                     latest frame
+//!                                   a frame on request
 //! ```
 //!
 //! **The tee is on raw NV12, before the encoder**, and that placement is the point of it.
@@ -36,7 +36,11 @@
 //! branches on one thread, so a slow consumer stalls the others — here that would mean a
 //! perception consumer pausing the video track. The raw branch drops old frames rather than
 //! applying backpressure, which is the semantics `architecture.md` §2 asks for: the *latest*
-//! snapshot, non-blocking, last-value-wins. A stalled reader costs frames, never the encoder.
+//! snapshot, never a queue of stale ones. A stalled reader costs frames, never the encoder.
+//!
+//! **And the raw branch only copies a frame somebody asked for.** Every buffer reaches the appsink
+//! and nearly all of them are dropped there unread — see [`crate::pipeline::Frames`] for what that saves and why the
+//! request has to be answered by the *next* capture rather than the last one.
 //!
 //! **`webrtcsink` runs the signalling server in this process** (`run-signalling-server`, with
 //! `signalling-server-host` and `-port`), so the separate `gst-webrtc-signalling-server` binary
@@ -219,28 +223,121 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
-/// The most recent raw frame, or none yet.
+/// A frame off the tee, handed over on request.
 ///
-/// Last-value-wins by construction: the appsink callback replaces whatever was here. A reader that
-/// is slow sees a newer frame next time rather than a queue of stale ones, which is what a
-/// perception consumer and a `get_frame` both want — and neither can slow the encoder down by
-/// being slow itself.
+/// **Asked for, not published.** Copying a frame out of the tee costs the whole frame — 1.84 MB at
+/// 720p30, the quality every robot ships at — and the branch's readers want two a second between
+/// them: the auto-exposure loop meters one every 500 ms, and the duck detector looks twice a second
+/// when it is switched on at all. Capturing all thirty meant **55 MB/s of memcpy and a 1.8 MB
+/// allocation thirty times a second, from boot, on every robot**, for twenty-eight frames nobody
+/// ever read. A reader now says when it wants one, and the appsink callback's cost on every other
+/// frame is a relaxed load and dropping the sample.
+///
+/// **A reader waits for the next frame rather than taking the last one.** The demand has to be
+/// answered by a capture that happens *after* it, or the saving would come straight back out of the
+/// picture: a reader polling every 500 ms would meter a frame captured for the previous poll, and an
+/// exposure loop steering on half-second-old luma is a loop that hunts. So the request marks the
+/// next frame, and the reader blocks until it lands — [`FRAME_TIMEOUT`] bounds that for a camera
+/// that has stopped delivering.
+///
+/// One captured frame answers every reader waiting for one: the flag is a single bit and the
+/// delivery wakes all of them, so the detector and the exposure loop asking at the same moment cost
+/// one copy between them rather than two.
 #[derive(Clone, Default)]
-pub struct Frames(Arc<Mutex<Option<Frame>>>);
+pub struct Frames(Arc<Shared>);
+
+/// The reader/callback rendezvous. [`Frames`] is the handle; this is what both ends touch.
+#[derive(Default)]
+struct Shared {
+    latest: Mutex<Latest>,
+    /// Signalled when [`Latest::generation`] moves, which is the only thing a reader waits on.
+    delivered: std::sync::Condvar,
+    /// A reader is waiting for the next frame. Read once per buffer and `Relaxed` on purpose:
+    /// nothing is published through it — the frame itself goes through `latest`, whose mutex
+    /// carries the ordering — so this only ever has to be eventually true, and it is the one thing
+    /// the callback does on a frame nobody asked for.
+    wanted: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct Latest {
+    frame: Option<Frame>,
+    /// Bumped on every delivery, so a reader can tell the frame it asked for from the one that was
+    /// already there. A counter rather than an `Option::take`, because two readers waiting on the
+    /// same capture must both see it.
+    generation: u64,
+}
+
+/// How long a reader waits for the frame it asked for before giving up on it.
+///
+/// Fifteen frame periods at 720p30 and seven at 720p15 — far longer than any capture hiccup, and
+/// short enough that a reader on a camera that has stopped goes back round its own loop and says so
+/// rather than parking for ever. Both readers already have a "no frame" path; this is what reaches
+/// it.
+pub const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Frames {
-    /// Read the latest frame in place, without copying it. `None` until the first one arrives.
+    /// Ask for the next frame and read it in place, without copying it.
     ///
     /// For a reader that wants a number out of a frame rather than the frame — the auto-exposure
-    /// loop wants a mean, and cloning 1.8 MB twice a second to average 11k bytes of it is a memcpy
+    /// loop wants a mean, and copying 1.84 MB twice a second to average 11k bytes of it is a memcpy
     /// nobody needs.
-    pub fn inspect<T>(&self, read: impl FnOnce(&Frame) -> T) -> Option<T> {
-        self.0.lock().expect("frame lock").as_ref().map(read)
+    ///
+    /// `None` when no frame arrived within [`FRAME_TIMEOUT`].
+    pub fn inspect_next<T>(&self, read: impl FnOnce(&Frame) -> T) -> Option<T> {
+        self.next_capture(|frame| frame.map(read))
     }
 
-    /// The latest frame, cloned. `None` until the first one arrives.
-    pub fn latest(&self) -> Option<Frame> {
-        self.0.lock().expect("frame lock").clone()
+    /// Ask for the next frame and take a copy of it. `None` when none arrived within
+    /// [`FRAME_TIMEOUT`].
+    pub fn next_frame(&self) -> Option<Frame> {
+        self.next_capture(|frame| frame.cloned())
+    }
+
+    /// Register the demand, wait for the capture that answers it, and read what landed.
+    ///
+    /// The generation is read *before* the flag is set: a capture that lands between the two is one
+    /// this reader asked for as far as it can tell, and waiting out a whole extra frame to be
+    /// pedantic about it would only make the answer staler.
+    fn next_capture<T>(&self, read: impl FnOnce(Option<&Frame>) -> T) -> T {
+        let latest = self.0.latest.lock().expect("frame lock");
+        let seen = latest.generation;
+        self.0
+            .wanted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let (latest, _) = self
+            .0
+            .delivered
+            .wait_timeout_while(latest, FRAME_TIMEOUT, |latest| latest.generation == seen)
+            .expect("frame lock");
+        // On a timeout this is whatever the last delivery left — `None` on a camera that has never
+        // produced one, and a stale frame on one that has stopped. Reported as the timeout it is
+        // rather than as that frame: a reader told "here is a frame" cannot tell the difference,
+        // and the exposure loop steering on a frame from a minute ago is the failure this whole
+        // rendezvous exists to prevent.
+        if latest.generation == seen {
+            return read(None);
+        }
+        read(latest.frame.as_ref())
+    }
+
+    /// Whether a reader is waiting, taking the request if one is. The callback's whole cost on a
+    /// frame nobody asked for.
+    fn take_request(&self) -> bool {
+        self.0
+            .wanted
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hand the captured frame to whoever is waiting for it.
+    fn deliver(&self, frame: Frame) {
+        let mut latest = self.0.latest.lock().expect("frame lock");
+        latest.frame = Some(frame);
+        latest.generation = latest.generation.wrapping_add(1);
+        drop(latest);
+        // Every waiter, not one: a single capture is the answer to every request outstanding when
+        // it was taken.
+        self.0.delivered.notify_all();
     }
 }
 
@@ -260,6 +357,7 @@ pub fn start(
     source: Source,
     producer: &crate::producer::Producer,
     settings: &Settings,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
     let &Settings {
         port,
@@ -460,7 +558,7 @@ pub fn start(
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
-    wire_consumers(&sink, channels_tx, runtime, consumers.clone())?;
+    wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -589,12 +687,20 @@ fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Keep [`Frames`] pointing at the most recent buffer off the raw branch.
+/// Answer a reader's request for a frame out of the raw branch, and drop every other buffer.
 fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32) {
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
+                // Pulled whatever happens, and *before* the request is looked at. A sample left
+                // unpulled sits in the appsink's queue holding one of the capture pool's buffers,
+                // and [`CAPTURE_BUFFERS`] is four with three the cliff — declining to copy a frame
+                // must not cost the pipeline a buffer to decline it with. Dropped at the end of
+                // this scope instead, which returns the buffer to the pool.
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                if !frames.take_request() {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
                 let Some(buffer) = sample.buffer() else {
                     return Ok(gst::FlowSuccess::Ok);
                 };
@@ -604,18 +710,19 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 // one on this branch.
                 let Ok(map) = buffer.map_readable() else {
                     // A buffer that will not map is not worth failing the pipeline over — the next
-                    // one is a frame away, and this branch is advisory by design.
+                    // one is a frame away, and this branch is advisory by design. The request has
+                    // been taken by now, so the reader waits out its timeout rather than being
+                    // answered with nothing; a map that fails twice running is a pipeline in
+                    // trouble, not a frame to retry for.
                     tracing::debug!("a raw frame would not map");
                     return Ok(gst::FlowSuccess::Ok);
                 };
-                let frame = Frame {
+                frames.deliver(Frame {
                     width,
                     height,
                     format: CAPTURE_FORMAT,
                     data: map.as_slice().to_vec(),
-                };
-                // Replaced, not queued: last-value-wins is the contract.
-                *frames.0.lock().expect("frame lock") = Some(frame);
+                });
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -914,6 +1021,20 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     Ok(())
 }
 
+/// Which sensor mode this process managed to put the camera in, once it has tried.
+///
+/// A `OnceLock` rather than a value threaded up through the pipeline builder, because that is what
+/// it is: one fact about this process's camera, established while the pipeline is built and read
+/// afterwards by whatever answers `media.video`. `None` — never set, or set after a failed switch
+/// — means the geometry is unknown, and `crate::camera` publishes no intrinsics for it.
+static SENSOR_MODE: std::sync::OnceLock<Option<crate::camera::SensorMode>> =
+    std::sync::OnceLock::new();
+
+/// The sensor mode in force, or `None` when there is no camera or the switch did not take.
+pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
+    *SENSOR_MODE.get().unwrap_or(&None)
+}
+
 /// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
 ///
 /// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
@@ -940,9 +1061,12 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             %media, %entity,
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps"
+             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
+             because the field of view is then the full sensor's rather than this mode's crop"
         );
+        let _ = SENSOR_MODE.set(None);
     } else {
+        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
         tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
     }
     Ok(())
@@ -1254,6 +1378,7 @@ fn wire_consumers(
     channels: mpsc::Sender<Channel>,
     runtime: tokio::runtime::Handle,
     consumers: Consumers,
+    relays: Arc<crate::turn::Relays>,
 ) -> Result<()> {
     // Counted here rather than inferred from the log, so `robotctl health` can say whether anyone
     // is actually watching. `consumer-removed` is guarded the same way `consumer-added` is: a
@@ -1294,6 +1419,10 @@ fn wire_consumers(
             .and_then(|v| v.get::<String>().ok())
             .unwrap_or_else(|| "?".into());
 
+        // Before the datachannel, because this is what the *offer* needs and the offer is
+        // generated as soon as this handler returns. §6 of `remote-access-design.md`.
+        offer_relay_candidates(&webrtcbin, &peer, &relays);
+
         match open_control_channel(&webrtcbin, &peer, &runtime) {
             Ok(channel) => {
                 // A full queue means nobody is accepting sessions, which is a bug rather than
@@ -1307,6 +1436,47 @@ fn wire_consumers(
         None
     });
     Ok(())
+}
+
+/// Add this robot's TURN servers to one consumer's `webrtcbin`, so its offer carries a `relay`.
+///
+/// **Runs on the thread that builds the offer, and must not block it.** `Relays::uris` reads a
+/// cache and never does I/O for exactly this reason: a fetch here would delay every consumer's
+/// connection, including the LAN ones that will never use a relay. An empty list is the ordinary
+/// state right after boot and on a robot nobody has signed in — host and srflx candidates are
+/// enough for anything on the same network.
+///
+/// Nothing here is fatal. A robot that cannot offer a relay is reachable from most places; one
+/// whose negotiation broke because a credential was malformed is reachable from none.
+fn offer_relay_candidates(webrtcbin: &gst::Element, peer: &str, relays: &Arc<crate::turn::Relays>) {
+    let uris = relays.uris();
+    if uris.is_empty() {
+        tracing::debug!(peer, "no relay servers held; offering host and srflx only");
+        return;
+    }
+    // Checked before it is emitted, for the reason `open_control_channel` checks its own signal:
+    // `emit_by_name` panics when a signal is absent or its signature has changed, and a panic in
+    // a C closure aborts the process instead of unwinding.
+    if glib::subclass::signal::SignalId::lookup("add-turn-server", webrtcbin.type_()).is_none() {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no add-turn-server signal; this consumer gets no relay candidate"
+        );
+        return;
+    }
+    let mut added = 0;
+    for uri in uris.iter() {
+        // The return is whether the server was accepted; a rejected URI is worth a line and not
+        // an abandoned session.
+        if webrtcbin.emit_by_name::<bool>("add-turn-server", &[&uri.as_str()]) {
+            added += 1;
+        } else {
+            // The host only. **A TURN URI carries a password**, and a log line is the one place
+            // it must never appear.
+            tracing::warn!(peer, "a relay server was refused by webrtcbin");
+        }
+    }
+    tracing::info!(peer, relays = added, "offering relay candidates");
 }
 
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
@@ -1382,6 +1552,105 @@ fn open_control_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame whose every byte is `tag`, so a test can say *which* capture came back.
+    fn frame(tag: u8) -> Frame {
+        Frame {
+            width: 4,
+            height: 2,
+            format: CAPTURE_FORMAT,
+            data: vec![tag; 16],
+        }
+    }
+
+    /// **The point of the whole rendezvous.** With nobody waiting, the callback's answer is no,
+    /// and no is what stops 1.84 MB being copied thirty times a second for readers that want two.
+    ///
+    /// A regression here is silent: the picture is identical, the detector still detects, and the
+    /// only symptom is a robot that runs hotter than it needs to.
+    #[test]
+    fn a_frame_nobody_asked_for_is_not_captured() {
+        let frames = Frames::default();
+        assert!(!frames.take_request());
+        assert!(!frames.take_request());
+    }
+
+    /// One capture answers every reader waiting for one. The request is a bit rather than a queue,
+    /// so the exposure loop and the detector asking in the same frame period cost one copy.
+    #[test]
+    fn two_readers_asking_at_once_cost_one_capture() {
+        let frames = Frames::default();
+        frames
+            .0
+            .wanted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        frames
+            .0
+            .wanted
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(frames.take_request());
+        assert!(
+            !frames.take_request(),
+            "the second frame must not be captured too"
+        );
+    }
+
+    /// **A reader gets the frame captured after it asked, not the one already lying there.**
+    ///
+    /// This is what makes demand-driven capture safe for the exposure loop. Handing back the last
+    /// delivery would be cheaper still and would mean metering a frame from the previous tick — up
+    /// to half a second of dead reckoning on a control loop whose whole job is to track the light
+    /// in the room.
+    #[test]
+    fn a_reader_gets_the_capture_that_answered_it() {
+        let frames = Frames::default();
+        // What a previous reader's request left behind.
+        frames.deliver(frame(1));
+
+        let reader = {
+            let frames = frames.clone();
+            std::thread::spawn(move || frames.next_frame())
+        };
+
+        // Stand in for the appsink: wait for the request to show up, then answer it.
+        let deadline = std::time::Instant::now() + FRAME_TIMEOUT;
+        while !frames.take_request() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never asked for a frame"
+            );
+            std::thread::yield_now();
+        }
+        frames.deliver(frame(2));
+
+        let got = reader.join().expect("reader thread").expect("a frame");
+        assert_eq!(
+            got.data,
+            vec![2; 16],
+            "got the stale frame, not the fresh one"
+        );
+    }
+
+    /// A camera that has stopped times out rather than handing back the frame it stopped on.
+    ///
+    /// The reader cannot tell a stale frame from a current one, so the staleness has to be the
+    /// answer. Both readers already have a "no frame" path — this is what reaches it.
+    #[test]
+    fn a_capture_that_never_comes_is_not_a_stale_frame() {
+        let frames = Frames::default();
+        frames.deliver(frame(1));
+
+        let waited = std::time::Instant::now();
+        assert!(
+            frames.next_frame().is_none(),
+            "a timeout must not be answered with the last frame"
+        );
+        assert!(
+            waited.elapsed() >= FRAME_TIMEOUT,
+            "it gave up before the timeout was out"
+        );
+    }
 
     /// A quarter turn swaps the frame's axes; a half turn does not.
     ///

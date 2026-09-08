@@ -20,3 +20,6 @@ secret*
 
 # Playground and scratch state (see updater/examples/playground.rs).
 /verify
+
+# Python bytecode from the demo Space, which is source rather than a build here.
+__pycache__/

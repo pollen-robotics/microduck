@@ -17,10 +17,21 @@
 //! signalling server in this process, `mpph264enc` in front of it, and a `control` datachannel per
 //! peer wired to [`session::run`].
 
+/// What the camera's geometry is — the intrinsics a consumer needs to turn pixels into
+/// directions, and which sensor mode they belong to.
+pub mod camera;
 pub mod config;
+/// The account credential `updaterd` writes, read by the two things here that need it.
+pub mod hf;
 pub mod producer;
+/// The outward connection to the rendezvous service — what makes a duck reachable from off its
+/// own LAN. `docs/design/remote-access-design.md` §3.
+pub mod relay;
 pub mod route;
 pub mod session;
+/// Relay candidates, so a robot behind a router is reachable from a network that cannot punch a
+/// hole to it. `docs/design/remote-access-design.md` §6.
+pub mod turn;
 pub mod upstream;
 pub mod web;
 

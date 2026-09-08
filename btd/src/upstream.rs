@@ -153,30 +153,47 @@ impl Pool {
     }
 
     /// Send one line to `upstream` on `lane`'s connection, connecting first if needed.
+    ///
+    /// A daemon that restarted between two requests is ordinary here: `robotd` is the one an
+    /// update restarts, and `updaterd` restarts itself from a release's postinstall hook. The
+    /// connection from before the restart is still in the pool, its reader has already seen the
+    /// socket close, and the first write into it fails. Those bytes never left, so they are written
+    /// again on a fresh connection rather than reported. Reporting them told a phone that a daemon
+    /// listening on a fresh socket was not answering, once per lane, after every update. Once and
+    /// not in a loop: a daemon that is genuinely gone fails the reconnect, and that is the error
+    /// worth reporting.
     pub async fn send(&mut self, upstream: Upstream, lane: Lane, line: &str) -> io::Result<()> {
         let key = (upstream, lane);
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+
         if !self.conns.contains_key(&key) {
             let conn = self.open(upstream, lane).await?;
             self.conns.insert(key, conn);
         }
+        match self.write(key, &bytes).await {
+            Err(e) if peer_is_gone(&e) => {
+                let conn = self.open(upstream, lane).await?;
+                self.conns.insert(key, conn);
+                self.write(key, &bytes).await
+            }
+            done => done,
+        }
+    }
 
-        // Unwrap is sound: just inserted, or the contains_key above held.
+    /// One bounded write on the connection for `key`. Any failure drops that connection, so
+    /// nothing keeps writing into a dead socket. This lane's only: the others may be perfectly
+    /// alive, and a restart that broke one breaks the next write to each of them anyway.
+    async fn write(&mut self, key: (Upstream, Lane), bytes: &[u8]) -> io::Result<()> {
+        // Unwrap is sound: the caller inserted it, or `contains_key` held.
         let conn = self.conns.get_mut(&key).expect("connection present");
-
-        let mut bytes = line.as_bytes().to_vec();
-        bytes.push(b'\n');
-
         let write = async {
-            conn.write.write_all(&bytes).await?;
+            conn.write.write_all(bytes).await?;
             conn.write.flush().await
         };
         match tokio::time::timeout(WRITE_TIMEOUT, write).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
-                // A broken pipe here is ordinary — the daemon restarted. Drop the connection
-                // so the next call reconnects rather than writing into a dead socket forever.
-                // This lane's connection only: the others may be perfectly alive, and a restart
-                // that broke one breaks the next write to each of them anyway.
                 self.conns.remove(&key);
                 Err(e)
             }
@@ -231,6 +248,19 @@ impl Pool {
         tracing::debug!(upstream = ?upstream, lane = ?lane, path = %path.display(), "connected");
         Ok(Conn { write })
     }
+}
+
+/// Whether a write failed because the peer went away, rather than being slow or refusing. Only
+/// these are worth one more try, because only these mean the bytes went to a daemon that is no
+/// longer there. A timeout is a daemon that is there and stuck, and that is not retried.
+fn peer_is_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 #[cfg(test)]
@@ -325,5 +355,65 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("configd refused"), "{err}");
+    }
+    /// The daemon restarted between two requests.
+    ///
+    /// The comment on the write path says a broken pipe is ordinary, the daemon restarted, and
+    /// the next call reconnects. It is the call *after* the next: the first write after a restart
+    /// went into the socket the old daemon closed, failed, and the phone was told the service was
+    /// not answering while it was listening on a fresh socket the whole time. The pool's own
+    /// reader had already seen the socket close and told nobody.
+    ///
+    /// On the BLE update path this is `updaterd` restarting itself from the release's postinstall
+    /// hook, and the phone's next `update.status` failing for it.
+    #[tokio::test]
+    async fn a_restarted_daemon_gets_the_next_request_not_the_one_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updaterd.sock");
+        let sockets = Sockets {
+            updater: path.clone(),
+            robot: dir.path().join("robotd.sock"),
+            config: dir.path().join("configd.sock"),
+        };
+        let (replies, mut forwarded) = mpsc::channel(8);
+        let mut pool = Pool::new(sockets, replies);
+
+        let before = serve_once(
+            &path,
+            proto::Response::ok(Some(proto::Id::Number(1)), &serde_json::json!({})),
+        );
+        pool.send(
+            Upstream::Updater,
+            Lane::Prompt,
+            r#"{"jsonrpc":"2.0","id":1,"method":"update.status"}"#,
+        )
+        .await
+        .unwrap();
+        assert!(
+            forwarded.recv().await.is_some(),
+            "the first answer is forwarded"
+        );
+        // The daemon has answered and hung up: it is restarting.
+        before.await.unwrap();
+
+        // And it is back, listening on a fresh socket at the same path.
+        std::fs::remove_file(&path).unwrap();
+        let after = serve_once(
+            &path,
+            proto::Response::ok(Some(proto::Id::Number(2)), &serde_json::json!({})),
+        );
+        pool.send(
+            Upstream::Updater,
+            Lane::Prompt,
+            r#"{"jsonrpc":"2.0","id":2,"method":"update.status"}"#,
+        )
+        .await
+        .expect("a daemon that is back must get the request, not a broken pipe");
+        let request = after.await.unwrap();
+        assert!(request.contains(r#""id":2"#), "{request}");
+        assert!(
+            forwarded.recv().await.is_some(),
+            "and its answer is forwarded"
+        );
     }
 }

@@ -192,13 +192,25 @@ impl DynamixelIo {
     /// One transaction per joint, so this is not something to call per tick — the control loop calls
     /// it once, when someone enables the policy on a limp robot. See [`RobotIo::set_torque`] for what
     /// has *not* changed: nothing touches torque because a process started.
+    ///
+    /// **Every servo is written, whatever the others said.** Fourteen acknowledged transactions
+    /// in a row, and one dropped ack used to end the loop there — which for `on = false` on the
+    /// way to a power-off meant a robot that sat down and switched off with half its legs still
+    /// locked, because the tick that saw the error was the last one that could have retried.
+    /// Writing the rest costs the same as it would have, and the error names every joint that
+    /// did not answer so the caller can decide whether to ask again.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
+        let mut failed = Vec::new();
         for &id in &JOINT_IDS {
-            self.controller
-                .write_torque_enable(id, on)
-                .map_err(|e| IoError::Bus(format!("torque {on} on {id}: {e}")))?;
+            if let Err(e) = self.controller.write_torque_enable(id, on) {
+                failed.push(format!("torque {on} on {id}: {e}"));
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(IoError::Bus(failed.join("; ")))
+        }
     }
 
     /// Ramp every joint from where it is now to `target`, linearly.
@@ -299,6 +311,15 @@ impl RobotIo for DynamixelIo {
     fn set_torque(&mut self, on: bool) -> Result<()> {
         // The inherent method, which predates the trait and is still what `robotd init` uses.
         DynamixelIo::set_torque(self, on)
+    }
+
+    fn reboot(&mut self, id: u8) -> Result<()> {
+        // The status packet is a courtesy the servo may not manage before it resets, so only a
+        // failure to send is an error here.
+        self.controller
+            .reboot(id)
+            .map(|_| ())
+            .map_err(|e| IoError::Bus(format!("reboot {id}: {e}")))
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {

@@ -96,24 +96,29 @@ enabled = true
 # mode and then never runs it, standing transitions being skipped on wheels.
 mode = "walk"
 
-# Policy files. Unset means the mode's default inside the release directory, so an ordinary
-# update carries the policies alongside the binaries that were trained against them. Point
-# one at your own .onnx to try a build without cutting a release — the loop anyone
-# iterating on gait runs. The literal "none" disables an optional slot outright.
+# Policy files. Unset means the mode's default in /opt/robot/policies/current, which is
+# deliberately *outside* the release: a gait retrain should not need a daemon release, and a
+# daemon fix should not re-ship six megabytes of unchanged weights. Until something publishes a
+# policy bundle, the release still carries the files and seeds that directory from them
+# (scripts/seed-policies.sh) — a bootstrap that stops the moment anything installs a real set.
+#
+# You do not have to edit these by hand. `robotctl policy load <slot> <file>` writes the key and
+# swaps the network live; `robotctl policy reset [slot]` removes it again. The literal "none"
+# disables an optional slot outright.
 #
 # All must be 61-input, 14-output: every alpha policy is obs[1,61] -> actions[1,14], and
 # robotd checks that at load rather than discovering it mid-stride. (microduck_runtime also
 # ships a 51-D family — legacy 3-value command — which robotd refuses at load with
 # "observation width is 51, expected 61".)
 #
-# Walk-mode defaults, spelled out:
-# walk        = ".../current/policies/alpha_walking.onnx"     the velstand gait
-# stand       = ".../current/policies/alpha_stand.onnx"       standing + body pose
-# sitstand    = ".../current/policies/alpha_sitstand.onnx"    sit <-> stand, posture flag
-# ground_pick = ".../current/policies/alpha_ground_pick.onnx" A-button pick
-# kick_left   = ".../current/policies/ball_kick_left.onnx"
-# kick_right  = ".../current/policies/ball_kick_right.onnx"
-# roulade     = ".../current/policies/roulade.onnx"          X-button forward roll
+# Walk-mode defaults, spelled out, all under /opt/robot/policies/current/:
+# walk        = "alpha_walking.onnx"     the velstand gait
+# stand       = "alpha_stand.onnx"       standing + body pose
+# sitstand    = "alpha_sitstand.onnx"    sit <-> stand, posture flag
+# ground_pick = "alpha_ground_pick.onnx" A-button pick
+# kick_left   = "ball_kick_left.onnx"
+# kick_right  = "ball_kick_right.onnx"
+# roulade     = "roulade.onnx"           X-button forward roll
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
@@ -137,9 +142,13 @@ mode = "walk"
 # head_lowpass = 0.5
 # legs_lowpass = 0.7
 
-# The ground pick: one cycle length in seconds (the move hands back at 70% of the cycle,
-# as the prototype does), its action scale, and a gain multiplier while it runs. Unset
-# period/scale resolve per mode: 4.0 / 1.0 walking, 3.0 / 0.8 for the roller crouch.
+# The ground pick: one cycle length in seconds, its action scale, and a gain multiplier while
+# it runs. Unset period/scale come from the installed set's manifest — the phase-encoded entry
+# tagged with this mode (4.0 / 1.0 for the walking pick, 5.0 / 0.8 for the roller crouch, as
+# they are trained) — and, on a board whose set predates the manifest, from the prototype's
+# 4.0 / 1.0 walking, 3.0 / 0.8 roller. The move hands back at the manifest's `end_phase`
+# (70% of the cycle); there is no key for that. The sitstand's rise and settle times come from
+# the set the same way.
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
@@ -270,6 +279,10 @@ mode = "walk"
 # coo wore thin — so this is an opt-in. The model ships in the release
 # (models/pet_detect.onnx); thresholds are the classifier's hysteresis (enter above, leave
 # below).
+#
+# The mic is read whenever [audio] is on, but the classifier only runs on audio that stands
+# out from the room: in a quiet one this costs nothing beyond the envelope the ambient-sound
+# watcher is measuring anyway.
 # pet_detect = true
 # pet_model = ".../current/models/pet_detect.onnx"
 # pet_enter_threshold = 0.95

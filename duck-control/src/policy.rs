@@ -65,6 +65,22 @@ pub enum PolicyError {
     RuntimePanic { detail: String },
 }
 
+impl PolicyError {
+    /// The file this error is about, when it is about one.
+    ///
+    /// `Load` and `Shape` name a file; a missing runtime or an `ort` panic does not, and
+    /// blaming whichever policy happened to be loading when the dylib turned out to be absent
+    /// would send an operator to replace a file that is fine.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            PolicyError::Load { path, .. } | PolicyError::Shape { path, .. } => Some(path),
+            PolicyError::Inference(_)
+            | PolicyError::RuntimeMissing { .. }
+            | PolicyError::RuntimePanic { .. } => None,
+        }
+    }
+}
+
 /// Where `ort` will look for the runtime, replicating its own logic.
 fn dylib_name() -> String {
     match std::env::var("ORT_DYLIB_PATH") {
@@ -182,11 +198,13 @@ pub enum Net {
     SitStand,
     /// Phase-scripted ground pick; the twist slots carry `[cos φ, sin φ, 0]`.
     GroundPick,
-    KickLeft,
-    KickRight,
-    /// Episodic forward roll; trained with every command slot at zero, and it starts
-    /// rolling the moment it is switched in.
-    Roulade,
+    /// A one-shot skill, by its index in [`PolicyPaths::skills`].
+    ///
+    /// Kicks and roulade used to be variants here. They were the same thing three times over —
+    /// a network trained on an all-zero command, driving for a fixed window, selected by an
+    /// explicit request — differing only in duration and tuning, which is data. An index means
+    /// a robot gains a skill by gaining a config entry rather than a release.
+    Skill(usize),
 }
 
 /// Which policy files to load. `walk` is mandatory; every other slot is a capability the
@@ -197,9 +215,10 @@ pub struct PolicyPaths {
     pub stand: Option<PathBuf>,
     pub sitstand: Option<PathBuf>,
     pub ground_pick: Option<PathBuf>,
-    pub kick_left: Option<PathBuf>,
-    pub kick_right: Option<PathBuf>,
-    pub roulade: Option<PathBuf>,
+    /// One-shot skills, in the priority order the caller wants them considered. Each is
+    /// selected only by an explicit request, so an empty list is a robot with no tricks rather
+    /// than a robot missing something.
+    pub skills: Vec<PathBuf>,
 }
 
 /// The loaded networks.
@@ -212,9 +231,7 @@ pub struct Policy {
     stand: Option<Session>,
     sitstand: Option<Session>,
     ground_pick: Option<Session>,
-    kick_left: Option<Session>,
-    kick_right: Option<Session>,
-    roulade: Option<Session>,
+    skills: Vec<Session>,
     standing_threshold: f64,
     /// Roller mode and fall-recovery mode reserve the standing network (roller has none;
     /// fall recovery keeps it for getting up), so command magnitude must never select it.
@@ -255,9 +272,11 @@ impl Policy {
                 stand: open_opt(&paths.stand, &zero)?,
                 sitstand: open_opt(&paths.sitstand, &zero)?,
                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
-                kick_left: open_opt(&paths.kick_left, &zero)?,
-                kick_right: open_opt(&paths.kick_right, &zero)?,
-                roulade: open_opt(&paths.roulade, &zero)?,
+                skills: paths
+                    .skills
+                    .iter()
+                    .map(|path| open_warm(path, &zero))
+                    .collect::<Result<Vec<_>, _>>()?,
                 standing_threshold,
                 standing_disabled: false,
             })
@@ -292,16 +311,9 @@ impl Policy {
         self.ground_pick.is_some()
     }
 
-    pub fn has_roulade(&self) -> bool {
-        self.roulade.is_some()
-    }
-
-    pub fn has_kick(&self, left: bool) -> bool {
-        if left {
-            self.kick_left.is_some()
-        } else {
-            self.kick_right.is_some()
-        }
+    /// How many one-shot skills are loaded. A caller's index is valid below this.
+    pub fn skill_count(&self) -> usize {
+        self.skills.len()
     }
 
     /// One inference on the named network. A missing optional network falls back to
@@ -317,9 +329,7 @@ impl Policy {
             Net::Stand => self.stand.as_mut(),
             Net::SitStand => self.sitstand.as_mut(),
             Net::GroundPick => self.ground_pick.as_mut(),
-            Net::KickLeft => self.kick_left.as_mut(),
-            Net::KickRight => self.kick_right.as_mut(),
-            Net::Roulade => self.roulade.as_mut(),
+            Net::Skill(index) => self.skills.get_mut(index),
         };
         let session = match session {
             Some(session) => session,
@@ -327,6 +337,31 @@ impl Policy {
         };
         run(session, Path::new("<loaded>"), observation)
     }
+}
+
+/// Can this file be loaded as a policy, without committing to running it?
+///
+/// Opens the graph and checks both shapes, then throws the session away. Two callers, and they
+/// want it for the same reason from opposite ends:
+///
+///  - `robot.loadPolicy` answers a client *synchronously*, while the real swap happens seconds
+///    later at the home pose. Validating here is what turns "accepted" followed by a robot that
+///    did not change into an immediate `observation width is 51, expected 61`.
+///  - startup checks each overridden slot before building the controller, so one bad override
+///    costs that slot rather than the whole policy.
+///
+/// **No warm-up inference**, unlike [`Policy::load`] — this is a question about a file, not a
+/// session about to be driven, and the first-inference cost is the loading path's to pay. It
+/// therefore proves less: a graph that opens and has the right shape can still fail to run.
+/// Nothing downstream treats a pass as a guarantee, which is why a failed load at the home pose
+/// still has to keep the controller it had.
+///
+/// Not from inside a tick. Opening a session is tens of milliseconds and the loop has 20 to
+/// spend — so the IPC caller runs it on its own runtime, and the loop only ever calls it in its
+/// preamble, before the first tick is due.
+pub fn validate(path: &Path) -> Result<(), PolicyError> {
+    ensure_runtime()?;
+    catching_ort_panics(|| open(path).map(drop))
 }
 
 fn open(path: &Path) -> Result<Session, PolicyError> {
@@ -486,6 +521,32 @@ mod tests {
                 "the version detail must reach the caller, got {reported:?}"
             );
         }
+    }
+
+    /// An error that names no file must not be attributed to one. A missing ONNX Runtime is an
+    /// operator problem with an operator fix, and reporting it as "this slot's file is bad" sends
+    /// them to replace a policy that is fine — which is exactly what the startup fallback would
+    /// do with it, silently dropping every override on a board that simply has no dylib.
+    #[test]
+    fn only_file_errors_name_a_file() {
+        let shape = PolicyError::Shape {
+            path: PathBuf::from("/tmp/x.onnx"),
+            what: "observation width",
+            expected: "61".into(),
+            got: "51".into(),
+        };
+        assert_eq!(shape.path(), Some(Path::new("/tmp/x.onnx")));
+
+        let missing = PolicyError::RuntimeMissing {
+            searched: "libonnxruntime.so".into(),
+            detail: "not found".into(),
+        };
+        assert_eq!(missing.path(), None, "a missing runtime blames no policy");
+
+        let panicked = PolicyError::RuntimePanic {
+            detail: "version mismatch".into(),
+        };
+        assert_eq!(panicked.path(), None, "an ort panic blames no policy");
     }
 
     /// Success must pass straight through — a wrapper that swallowed the value would turn

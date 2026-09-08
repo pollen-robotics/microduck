@@ -94,7 +94,6 @@ the tools
   test-support/   signed-release fixtures for tests; never shipped
 
 deploy/         what a robot is configured with: updater.toml, robotd.toml, trust anchor, journald
-policies/       the ONNX networks a release ships
 hooks/          preinstall · postinstall — what runs inside an update, from the artifact,
                 and the only thing that runs on every board on every update: anything
                 install.sh does to a board belongs here too (updater-design.md §9.1)

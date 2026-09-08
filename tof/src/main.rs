@@ -54,12 +54,29 @@ const GROUP: &str = "robot";
 /// jump in `seq` rather than a silent hole.
 const FRAME_BUFFER: usize = 32;
 
-/// How often to ask the sensor whether a frame is ready.
+/// How often to ask the sensor whether a frame is ready, once one is nearly due.
 ///
 /// One 1-byte register read, so the cost is a few hundred microseconds of bus.
 /// At 10 ms it adds at most that to a frame's age at 15 Hz (66 ms apart), which
 /// is well inside what any consumer of depth cares about.
 const POLL: Duration = Duration::from_millis(10);
+
+/// How long before a frame is due the loop starts asking for it.
+///
+/// **Asking every 10 ms for the whole period is asking six times to be told no
+/// once.** A frame is 66 ms away at 15 Hz and the sensor answers on its own
+/// clock, so the poll only has to be running as the frame lands — the rest was
+/// a hundred I²C transactions and a hundred thread wakeups a second, forever,
+/// on a daemon whose sensor produces fifteen frames in that time.
+///
+/// Two poll intervals of margin, and the anchor is the last frame's *arrival*,
+/// so the estimate can never accumulate more than one period of drift: this
+/// tolerates the sensor being 20 ms early on any given frame — a 30% period
+/// error, far past anything a hardware ranging timer does — and a sensor that
+/// is merely late is polled for exactly as long as it was before. Frame age is
+/// unchanged either way: it is still bounded by [`POLL`], because that is the
+/// granularity the frame is noticed at whichever way the loop got there.
+const POLL_GUARD: Duration = Duration::from_millis(20);
 
 /// Backoff between attempts to bring a sensor up, doubling to a cap.
 ///
@@ -184,6 +201,15 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// How long after one frame the sensor cannot yet have the next, at `hz`.
+///
+/// Saturating rather than clamped by hand: a rate whose period is shorter than
+/// [`POLL_GUARD`] leaves nothing to skip, and the loop then polls straight
+/// through exactly as it did before there was a guard.
+fn quiet_period(hz: u8) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(hz.max(1))).saturating_sub(POLL_GUARD)
+}
+
 /// Bring the sensor up and stream from it, forever, with a backoff between
 /// attempts. Never returns until shutdown.
 fn sensor_loop(
@@ -198,6 +224,7 @@ fn sensor_loop(
     let mut seq = 0u64;
     let mut backoff = RETRY_MIN;
     let mut said = false;
+    let quiet = quiet_period(hz);
 
     while !shutdown.load(Ordering::Acquire) {
         match open_sensor(bus, address, hz) {
@@ -208,12 +235,31 @@ fn sensor_loop(
                 tracing::warn!(sensor = generation.as_str(), hz, "ranging");
                 status.up(generation.as_str());
 
+                // When the sensor could not possibly have a frame yet, so there
+                // is nothing to ask it until then — see [`POLL_GUARD`]. `None`
+                // before the first frame and after any poll that came up empty,
+                // both of which mean "as far as this loop knows, one is due
+                // now": the wait is only ever skipped forward by a frame that
+                // actually arrived.
+                let mut quiet_until: Option<Instant> = None;
+
                 // Stream until the sensor stops answering, then fall through to
                 // the backoff and try the whole bring-up again.
                 while !shutdown.load(Ordering::Acquire) {
+                    if let Some(until) = quiet_until.take() {
+                        // Through the sliced sleep rather than `thread::sleep`,
+                        // for the reason that helper exists: at 15 Hz this is
+                        // 47 ms and either would do, but `--hz 1` makes it most
+                        // of a second, and exit must not wait it out.
+                        sleep_unless_shutdown(
+                            until.saturating_duration_since(Instant::now()),
+                            shutdown,
+                        );
+                    }
                     match sensor.data_ready() {
                         Ok(true) => match sensor.read_frame() {
                             Ok(frame) => {
+                                quiet_until = Some(Instant::now() + quiet);
                                 seq += 1;
                                 // No subscribers is the normal state — nobody is
                                 // watching most of the time — so a send that
@@ -559,5 +605,45 @@ mod tests {
         }
         assert_eq!(backoff, RETRY_MAX);
         assert!(RETRY_MIN < RETRY_MAX);
+    }
+
+    /// **The saving, as arithmetic rather than as a claim in a comment.**
+    ///
+    /// At the shipped rate a frame used to cost seven `data_ready` reads to
+    /// find, six of them answered no. Widening [`POLL_GUARD`] until the quiet
+    /// stretch disappears would leave the loop correct and the reason for it
+    /// gone, which is exactly the change nothing else here would notice.
+    #[test]
+    fn a_frame_at_the_shipped_rate_costs_three_polls_instead_of_seven() {
+        let period = Duration::from_secs_f64(1.0 / 15.0);
+        let polls = |window: Duration| (window.as_secs_f64() / POLL.as_secs_f64()).ceil() as u32;
+
+        assert_eq!(polls(period), 7, "what polling the whole period cost");
+        // The guard's window, plus the poll that finds the frame at the end of it.
+        assert_eq!(polls(period - quiet_period(15)) + 1, 3);
+    }
+
+    /// The anchor is the last frame's arrival, so the guard only ever has to
+    /// absorb one period of drift. 20 ms of it at 15 Hz is a 30% period error —
+    /// far past anything a hardware ranging timer does.
+    #[test]
+    fn the_guard_tolerates_a_sensor_running_early() {
+        let period = Duration::from_secs_f64(1.0 / 15.0);
+        let slack = POLL_GUARD.as_secs_f64() / period.as_secs_f64();
+        assert!(slack > 0.25, "only {slack:.0}% of a period of margin");
+    }
+
+    /// A rate whose period is shorter than the guard has nothing to skip, and
+    /// must poll straight through rather than underflow into a long sleep.
+    #[test]
+    fn a_rate_faster_than_the_guard_polls_straight_through() {
+        assert_eq!(quiet_period(60), Duration::ZERO);
+        assert_eq!(quiet_period(u8::MAX), Duration::ZERO);
+    }
+
+    /// `--hz 0` is a division this must not do.
+    #[test]
+    fn a_zero_rate_is_treated_as_one_hertz() {
+        assert_eq!(quiet_period(0), Duration::from_secs(1) - POLL_GUARD);
     }
 }

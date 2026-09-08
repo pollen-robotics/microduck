@@ -1608,6 +1608,9 @@ impl View {
         // The skill networks, compactly: which one-shots this robot can actually do. A
         // robot with no kick refuses the button with a reason, but the reason arrives in
         // padd's journal — this is where someone at the screen finds out first.
+        // The two fixed ones keep their short labels; the rest are whatever this robot has
+        // configured, named by the robot rather than by a list compiled in here — which is the
+        // point of a skill being config.
         let mut skills: Vec<&str> = Vec::new();
         if policy.sitstand.is_some() {
             skills.push("sit");
@@ -1615,15 +1618,7 @@ impl View {
         if policy.ground_pick.is_some() {
             skills.push("pick");
         }
-        match (policy.kick_left.is_some(), policy.kick_right.is_some()) {
-            (true, true) => skills.push("kicks"),
-            (true, false) => skills.push("kick-left"),
-            (false, true) => skills.push("kick-right"),
-            (false, false) => {}
-        }
-        if policy.roulade.is_some() {
-            skills.push("roulade");
-        }
+        skills.extend(policy.skills.iter().map(String::as_str));
         if policy.walk.is_some() {
             if skills.is_empty() {
                 caption.push(Span::raw(" · no skills").dim());

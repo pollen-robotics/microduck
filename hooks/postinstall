@@ -71,6 +71,19 @@ if [ -x bin/sounds ]; then
         || echo "postinstall: could not render the voice bank; the robot stays quiet" >&2
 fi
 
+# The official policy set. `robotd` reads its policies from /opt/robot/policies/current rather
+# than from inside this release, so a gait retrain does not need a daemon release; until something
+# publishes a policy bundle, the release is what fills that directory. The script explains the one
+# rule that matters — it never touches a set it did not put there — and is separate so it can be
+# tested and shellchecked like the other things this hook shells out to.
+#
+# Warned about, never fatal: a robot with no policy holds its pose and reports degraded.
+script=scripts/seed-policies.sh
+if [ -f "$script" ]; then
+    sh "$script" \
+        || echo "postinstall: policies were not seeded; robotctl health will say so" >&2
+fi
+
 [ -d systemd ] || exit 0
 
 # Users and groups before units: a unit naming a `User=` that does not exist fails to start, and

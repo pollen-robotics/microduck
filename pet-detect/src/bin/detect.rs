@@ -67,7 +67,10 @@ fn main() -> Result<()> {
         for chunk in buf[..n].as_chunks::<2>().0 {
             i16_buf.push(i16::from_le_bytes(*chunk));
         }
-        let (events, last_p) = detector.push_samples(&i16_to_f32(&i16_buf))?;
+        // Always audible: this reads a stream somebody is analysing, and a probability per
+        // window — including the quiet ones — is the whole output. The live gate is
+        // `pet_detect::worker`'s, off the ambient floor it is already measuring.
+        let (events, last_p) = detector.push_samples(&i16_to_f32(&i16_buf), true)?;
         if let Some(p) = last_p {
             let state = if detector.is_petting() {
                 "petting"

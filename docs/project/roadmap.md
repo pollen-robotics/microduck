@@ -27,7 +27,7 @@ Companion to [`architecture.md`](../design/architecture.md) (what we're building
 | recovery | `robot-boot-check.timer` + `robot-rescue` + the `golden` symlink ship and are enabled. **Never exercised on a board** ([`boot-recovery-net.md`](../design/boot-recovery-net.md)) |
 | tests | **942 passing** on a Mac with nothing excluded, a few more on Linux — including the health gate, the battery and thermal readout and the policy/safety path against a real `robotd` process, and `configd`'s authorisation over real sockets in `board-test.sh` |
 | in flight | `maploc` (#127), the NPU duck detector, the chorale election fix (#151); two design PRs with nothing built — the phone app (#107) and the IPC monitor (#52) |
-| missing | the app, the SDK, the model channel, the autonomous brain, and reaching a robot from outside the LAN |
+| missing | the app, the SDK, the policy channel, the autonomous brain, and reaching a robot from outside the LAN |
 
 ## The first roadmap reached its target
 
@@ -138,7 +138,19 @@ through `rkaiq`.
 **Three things keep it open.**
 
 **Outside the LAN.** The same design with a rendezvous service and TURN in front (§7),
-deliberately built second.
+deliberately built second. [`remote-access-design.md`](../design/remote-access-design.md) now owns
+it: a Hugging Face account reached by the OAuth device flow, and a bridge from the rendezvous Space
+the mini's fleet already uses to the signalling server already on the robot.
+
+The **account** is built and is the first half — `robotctl account login` prints a code, somebody
+approves it at hf.co/oauth/device, and the robot holds a credential it renews itself; the same
+three calls work over BLE, which is the only transport a robot with no wifi has, and over a
+datachannel. Nothing consumes the credential yet: the **bridge** is next, and it is where the
+rendezvous Space's protocol turns out to be HTTP rather than the WebSocket a LAN client speaks.
+
+One thing to fix before a duck ships with this: the token carries every scope Hugging Face grants,
+because the first-party device-code client takes no `scope` parameter. Narrowing it to
+`openid profile read-repos` is a public OAuth app in the org and one constant.
 
 **The SDK, and a small Python client.** §5.3 designs it as WebSocket plus snapshot: the same
 JSON-RPC, no media stack, `get_frame` returning a JPEG, a few dozen lines — and `mediad`'s
@@ -230,97 +242,68 @@ M4's two unmeasured numbers land here: eMMC write timing and battery under load.
 **Done when:** someone who is not a developer can run one command after a fault and produce
 something that names the part at fault, or says the hardware is fine.
 
-### M8 — The model channel: policies from the Hub
+### M8 — The policy channel: policies from the Hub
 
-Today every policy ships **inside the daemon artifact** — `robotd` loads
-`.../current/policies/alpha_walking.onnx` and friends — so a new gait needs a daemon release,
-and a policy trained on a laptop reaches a duck only through CI or a sideload of the whole
-daemon. The point of this milestone is that a policy trained in `microduck_rl` — the training
-repository, which is private — can be published, installed, tried and rolled back on its own
-version line.
+Every policy used to ship **inside the daemon artifact**, so a new gait needed a daemon release
+and a policy trained on a laptop reached a duck only through CI or a sideload of the whole daemon.
+The point of this milestone is that a policy trained in `microduck_rl` — the training repository,
+which is private — can be published, installed and tried on its own version line, and that
+someone can try one they did not train and get back.
 
-**The engine was designed for that arrangement and most of it is already built:**
+**Designed**, in [`policy-channel-design.md`](../design/policy-channel-design.md), which owns
+the decisions this section used to leave open. The short version: a slot is filled from one of
+three origins — official (`pollen-robotics/*`, the reset target), community (any other
+Hub repo, unsigned, reported but never auto-applied) or local (a path on the board); `policy
+load` writes the config key and `policy reset` removes it, so persistence and undo are the
+mechanism that already exists; and the official set ships as one `policies` component rather
+than one per slot.
 
-- the `hf_hub` source resolves `https://huggingface.co/{repo}/resolve/{revision}/{file}` and
-  verifies **our own** minisign signature, because HF signs nothing for us (§5.1);
-- a model is an ordinary component — its own version line, install dir, rollback target, pin,
-  boot-counter trial and known-bad history. `robotctl update apply model-walk` and
-  `robotctl update select model-walk 1.1.0` work the moment one is configured (§5.5);
-- `on_apply = { action = "reload", unit = "robotd", signal = "SIGHUP" }` is implemented in the
-  engine, so a weights swap does not have to restart motor control;
-- `xtask sign` already signs any directory of artifacts.
+**Most of the engine is already built:** the `hf_hub` source resolves and verifies, a component
+brings its own version line, rollback, pin, boot trial and known-bad history, `on_apply =
+reload` exists, and `xtask sign` signs any directory of artifacts.
 
-**What is missing is at the two ends, not in the middle:**
+**Three slices, each useful alone:**
 
-- **`robotd` cannot reload.** There is no SIGHUP handler and no way to swap an `ort` session
-  under a running 50 Hz loop. This is the milestone's real engineering: the swap must not drop a
-  tick, and a model whose shape is not `obs[1,61] → actions[1,14]` has to be refused *before* it
-  goes live rather than at the first inference.
-- **Nothing publishes a bundle.** `xtask package --channel model-walk` is close — it checks
-  `--version` against the crate version, which a model does not have — and the HF repo layout
-  and naming do not exist.
-- **A third signing key.** `release-1` is CI's and `team.dev` installs nothing on a customer
-  robot, so *who may publish a policy a robot will run* is a new custody question, not a reuse
-  of an existing one.
-- **`model_api`** (§5.5) is designed and unimplemented on both sides.
-- **The training loop.** `microduck_rl` trains and exports to ONNX; nothing carries the result
-  to a board without a daemon release. The model equivalent of `dev-push.sh` is what makes
-  "train it and try it" a minute rather than a CI run.
+1. **The local loop, no network.** `robot.loadPolicy` plus the home-pose reload, and `robotctl
+   policy list` / `load` / `reset`. Delivers "try a policy without editing the toml" end to end,
+   touches no Hub and no publishing decisions. `API_VERSION` 17 → 18.
+2. **Official policies leave the artifact.** *Done.* `robotd` reads
+   `/opt/robot/policies/current`, which `scripts/seed-policies.sh` fills by downloading the
+   pinned set from `pollen-robotics/microduck-policies` — the arrangement `setup-board.sh`
+   already uses for ONNX Runtime. `policies/` and its three `--include` lists are gone, and
+   bumping `[workspace.metadata.policies]` is now the whole of shipping a gait.
+3. **Moving past the pin.** *Done.* `policy.*` on `updaterd`, `robot.reloadPolicies`, and
+   `robotctl policy check` / `update` — a retrained gait now reaches a board with no daemon
+   release, which was the milestone's whole point. Each set records the repo it came from, so
+   nothing configures it twice.
+4. **The community library.** *Done.* `policy load <slot> <org/repo>` fetches one policy from
+   any Hub repo into `/var/lib/robot/policies/<org>/<name>/<rev>/`, `origin` reports `community`
+   for a stranger's, and `policy search` lists what is out there. The repos published so far
+   already carry a `manifest.json` with `obs_len`, `action_len` and `model_api`, so a policy that
+   cannot run here is refused before it is downloaded — which is also where `model_api` stopped
+   being designed-and-unimplemented.
 
-**Looking at what other people have made** is the other half of the ask, and it lands on the
-trust model rather than on the plumbing. Our own policies are basic and we sign them; a
-stranger's is signed by nobody this robot trusts, and every artifact the engine installs is
-verified against a trusted key. Three things to settle with the milestone rather than after it:
+`reset` means "remove the override and re-resolve" in all three, so slice 1 ships a correct
+reset against the in-release copies and slice 2 changes what it resolves *to* without touching
+the command.
 
-- **Curated or open.** A model published into an org we sign for keeps every guarantee the
-  component system already gives — rollback, pin, known-bad, the health gate — and costs
-  nothing new. An open set needs an explicitly unverified install path: off by default, never
-  auto-applied, and refused on a customer robot the way `allow_dev_keys` already refuses dev
-  builds.
-- **The shape gate stops being a nicety.** `obs[1,61] → actions[1,14]` has to be checked before
-  a model goes live whoever signed it, because an arbitrary policy drives fifteen servos.
-- **What makes it survivable is already built.** The safety layer holds the only write handle to
-  the bus — joint clamps, fall → limp, an intent deadman — so a bad policy is bounded rather
-  than dangerous. That is the argument for allowing a stranger's model at all.
+**What is genuinely missing** is at the two ends, not in the middle:
 
-**Slots stay fixed, sources do not.** `walk`, `stand`, `kick_left` and the rest are components
-with their own version lines; "look for others" is a query over the Hub for models tagged for
-this robot, plus repointing one slot's source at another repo. Letting arbitrary components
-appear at runtime would mean the config is no longer the authority on what a robot may run,
-which is the property the whole component design rests on.
+- **`robotd` cannot reload on demand.** The machinery exists — `robot.setMode` already rebuilds
+  every ONNX session at the home pose — but there is no per-slot trigger, and a failed load must
+  keep the running controller rather than leaving the robot gaitless.
+- **Nothing publishes a bundle.** `xtask package --channel` is close; it checks `--version`
+  against the crate version, which a policy set does not have, and the HF repo layout does not
+  exist.
+- **`model_api`** is designed and unimplemented on both sides. `robot.modelApi` answers, and
+  nothing consults it.
+- **The training loop.** `microduck_rl` exports ONNX; nothing carries the result to a board.
+  Slice 1 is what makes "train it and try it" a minute rather than a CI run.
 
-**One decision comes before all of it, and the lean is that policies leave the artifact.** Two
-things follow, and neither is a reason to reverse it:
-
-- A freshly flashed board with no network has no gait.
-- The sharper one: `robotd` reports **unhealthy** when a policy it wanted could not be loaded
-  (`deploy/robotd.toml`, `[policy] enabled`), so on a board with no models installed every
-  subsequent daemon update would fail its health gate and roll back — an update loop caused by
-  a missing file the update could not have supplied.
-
-Both have answers that already exist:
-
-- **A missing model is `degraded`, not unhealthy.** `HealthResult::degraded` was built for
-  exactly this shape — a condition that is a property of the *board* rather than of the release
-  being gated, where reverting the daemon cannot fix it and only churns the boot counter. Which
-  model components are installed is precisely that, so the gate commits and `robotctl health`
-  says which policy is missing.
-- **Provisioning installs the bootstrap set**, the way `setup-board.sh` already installs the
-  ONNX runtime and `setup-gstreamer.sh` the plugins. The network dependency lands where one
-  already exists, and at runtime there is exactly one source for a policy — the component's
-  install dir — with no precedence rule between a release copy and a Hub copy.
-
-The alternative — the release keeps its copies as a floor a Hub component overrides — buys a
-duck that walks with no network at all, at the cost of two sources for one file and a rule about
-which wins. It stays on the table if bootstrapping at provisioning turns out to be fragile.
-
-This milestone does *not* inherit M6's download problem: the Hub is public, whatever the source
-repo does.
-
-**Done when:** a policy trained in `microduck_rl` is published to the Hub, installed on a duck
-with `robotctl update apply model-walk`, and rolled back with `robotctl update select` — with
-the control loop never dropping a tick through either — and someone who did not train it can
-find it from the robot and try it.
+**Done when:** a policy trained in `microduck_rl` is published to the Hub, installed on a duck,
+tried, and undone with `robotctl policy reset` — with the control loop never dropping motor
+control through any of it — and someone who did not train it can find it from the robot and try
+it.
 
 ### M9 — The autonomous brain
 
@@ -345,7 +328,7 @@ the chorale is something it decides rather than something a command starts.
 
 The numbers above are identifiers. This is the order.
 
-1. **M8, the model channel.** The next feature. Nothing else is blocked by it, and it unblocks
+1. **M8, the policy channel.** The next feature. Nothing else is blocked by it, and it unblocks
    the loop that produces the robot's actual behaviour: train, publish, install, try, roll back.
 2. **M5's transport investigation.** Cheap, and its answer decides whether the Python client is
    fifty lines or a project.

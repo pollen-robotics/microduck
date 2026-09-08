@@ -36,11 +36,35 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// Free text (an ALSA device, a socket path...).
     Text,
-    /// A filesystem path, or absent meaning the release's own copy; the literal `"none"`
+    /// A filesystem path, or absent meaning this robot's own copy; the literal `"none"`
     /// disables the slot outright.
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
     IntegerList,
+    /// A **repeating table** — `[[policy.skill]]` — rather than a single value.
+    ///
+    /// Listed here and not editable in place. Not an oversight and not laziness: every other
+    /// kind is one value with one cursor position, and a repeating table is a list a person adds
+    /// to, removes from and reorders. Rendering that inside a key/value editor would be a worse
+    /// tool than the commands that already do it — `robotctl policy` — which the doc line points
+    /// at.
+    ///
+    /// It is *in* the registry so the completeness test keeps meaning what it says: a section
+    /// this editor cannot edit is still a section it must know exists, or the next repeating
+    /// table added to `Params` goes unnoticed.
+    Table,
+    /// A **nested table of related values** — `[media.intrinsics]` — written by a tool rather
+    /// than typed.
+    ///
+    /// Distinct from [`Kind::Table`], which is a repeating one, and distinct from every scalar
+    /// kind for the same reason as that: it has no single cursor position. It is also not a thing
+    /// anybody should type — six numbers from a calibration, where a typo produces a plausible
+    /// wrong answer rather than an error — so the editor lists it and says what writes it.
+    ///
+    /// The string is a TOML body for the table, and it earns its place in the type rather than in
+    /// a comment: the completeness test uses it to prove the key parses, so a record whose fields
+    /// are renamed under it fails here instead of at a robot's next boot.
+    Record(&'static str),
 }
 
 /// One key of `robotd.toml`.
@@ -119,14 +143,19 @@ pub const REGISTRY: &[Entry] = &[
          the mode a reboot comes back in",
     ),
     entry(
+        "policy.skill",
+        Kind::Table,
+        "One-shot skills, in priority order — add and remove with `robotctl policy`",
+    ),
+    entry(
         "policy.walk",
         Kind::OptionalPath,
-        "Walking policy; unset = the release's",
+        "Walking policy; unset = this robot's own",
     ),
     entry(
         "policy.stand",
         Kind::OptionalPath,
-        "Standing policy; unset = the release's",
+        "Standing policy; unset = this robot's own",
     ),
     entry(
         "policy.sitstand",
@@ -185,22 +214,6 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
-    ),
-    entry("policy.kick_duration", Kind::Float, "Kick window, seconds"),
-    entry(
-        "policy.roulade_duration",
-        Kind::Float,
-        "One forward roll, seconds",
-    ),
-    entry(
-        "policy.roulade_action_scale",
-        Kind::Float,
-        "Action scale during a roulade",
-    ),
-    entry(
-        "policy.roulade_gain_ratio",
-        Kind::Float,
-        "Gain multiplier during a roulade",
     ),
     feature(
         "policy.voltage_adapt",
@@ -397,10 +410,31 @@ pub const REGISTRY: &[Entry] = &[
         "Starting video bitrate, bits/s — unset follows the quality",
     ),
     entry(
+        "media.intrinsics",
+        Kind::Record(
+            "width = 1280\nheight = 720\nfx = 1809.5\nfy = 1809.5\ncx = 640.0\ncy = 360.0",
+        ),
+        "Measured camera geometry — a calibration writes it; absent publishes the module's design figures",
+    ),
+    entry(
         "media.congestion_control",
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
     ),
+    // ── [pad] ────────────────────────────────────────────────────────────────
+    //
+    // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
+    // file so `robotctl configure` stays the one editor a person has to know, and so a robot's
+    // whole configuration is one thing to back up and one thing to diff.
+    feature(
+        "pad.a",
+        Kind::Text,
+        "Skill on the A button — `robotctl policy list` names what this robot has",
+    ),
+    feature("pad.x", Kind::Text, "Skill on the X button"),
+    feature("pad.lb", Kind::Text, "Skill on the left bumper"),
+    feature("pad.rb", Kind::Text, "Skill on the right bumper"),
+    feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -514,6 +548,14 @@ mod tests {
                     format!("[{section}]\n{key} = \"probe\"\n")
                 }
                 Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
+                // A repeating table's probe is one empty entry — enough to prove the key parses
+                // as a table array, which is the thing being asserted.
+                Kind::Table => {
+                    format!("[[{section}.{key}]]\nname = \"probe\"\nduration = 1.0\n")
+                }
+                // A record carries its own body, so this proves the *fields* still parse and not
+                // merely that something table-shaped is accepted.
+                Kind::Record(body) => format!("[{section}.{key}]\n{body}\n"),
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(
@@ -581,6 +623,13 @@ mod tests {
                 "audio.pet_detect",
                 "media.camera",
                 "media.quality",
+                // The five one-shot buttons. Front-page keys because "what does this button do"
+                // is a question somebody asks holding the pad, not while reading tuning docs.
+                "pad.a",
+                "pad.x",
+                "pad.lb",
+                "pad.rb",
+                "pad.dpad_down",
             ]
         );
     }
