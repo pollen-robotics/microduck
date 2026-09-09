@@ -267,7 +267,11 @@ mod tests {
     #[test]
     fn the_pad_is_drawn_and_moves_with_the_attitude() {
         let flat = picture(&an_imu([0.0, 0.0, 1.0]), 40, 10);
-        let inked = flat.iter().flat_map(|r| r.chars()).filter(|c| *c != ' ').count();
+        let inked = flat
+            .iter()
+            .flat_map(|r| r.chars())
+            .filter(|c| *c != ' ')
+            .count();
         assert!(inked > 30, "a wireframe is more than a few pixels: {inked}");
         assert_ne!(flat, picture(&an_imu([0.0, 0.7, 0.7]), 40, 10));
     }

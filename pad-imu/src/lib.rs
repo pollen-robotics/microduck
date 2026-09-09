@@ -284,7 +284,10 @@ impl Imu {
             let predicted = rotate(conj(self.q), [0.0, 0.0, 1.0]);
             let error = cross(measured, predicted);
             let k = GRAVITY_GAIN * dt;
-            self.q = mul(self.q, from_rotvec([error[0] * k, error[1] * k, error[2] * k]));
+            self.q = mul(
+                self.q,
+                from_rotvec([error[0] * k, error[1] * k, error[2] * k]),
+            );
         }
         self.q = normalized4(self.q);
     }
@@ -499,7 +502,10 @@ mod tests {
         let bias = imu.bias_dps().expect("three seconds still is a bias");
         assert!((bias[2] - 12.0).abs() < 0.1, "{bias:?}");
         let [pitch, roll, yaw] = imu.euler_deg();
-        assert!(pitch.abs() < 0.5 && roll.abs() < 0.5, "level: {pitch} {roll}");
+        assert!(
+            pitch.abs() < 0.5 && roll.abs() < 0.5,
+            "level: {pitch} {roll}"
+        );
         // Yaw drifted for the half second before the bias was known and not after.
         assert!(yaw.abs() < 12.0 * 0.6, "yaw stopped drifting: {yaw}");
         let rate = imu.rate_hz().expect("a rate");
@@ -577,7 +583,11 @@ mod tests {
         // Drift: 40 °/s of yaw for a second, unlearned because the pad is "moving".
         steady(&mut imu, 1.0, [0.0, 0.0, 1.4], [0.0, 0.0, 40.0]);
         let drifted = imu.quaternion().unwrap();
-        assert!(euler_deg(drifted)[2].abs() > 30.0, "{:?}", euler_deg(drifted));
+        assert!(
+            euler_deg(drifted)[2].abs() > 30.0,
+            "{:?}",
+            euler_deg(drifted)
+        );
 
         let reference = drifted;
         let zeroed = euler_deg(relative(reference, imu.quaternion().unwrap()));

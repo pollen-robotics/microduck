@@ -293,8 +293,9 @@ impl Tap {
 fn imu_sibling(sysfs: &Path, dev: &Path, node: &Path) -> Option<PathBuf> {
     let event = node.file_name()?.to_owned();
     let class = sysfs.join("class/input");
-    let hid_parent =
-        |event: &std::ffi::OsStr| std::fs::canonicalize(class.join(event).join("device/device")).ok();
+    let hid_parent = |event: &std::ffi::OsStr| {
+        std::fs::canonicalize(class.join(event).join("device/device")).ok()
+    };
     let parent = hid_parent(&event)?;
 
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(&class)
@@ -1201,7 +1202,10 @@ mod tests {
         });
 
         let (reports, _dropped) = shared.subscribe();
-        assert!(matches!(&*reports.try_recv().unwrap(), proto::PadReport::Attached { .. }));
+        assert!(matches!(
+            &*reports.try_recv().unwrap(),
+            proto::PadReport::Attached { .. }
+        ));
         assert!(matches!(
             &*reports.try_recv().unwrap(),
             proto::PadReport::ImuAttached { .. }

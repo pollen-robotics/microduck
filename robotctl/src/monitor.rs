@@ -1166,11 +1166,9 @@ fn render_imu(imu: &pad_imu::Imu, frame: &mut ratatui::Frame, area: ratatui::lay
     // The picture gets the left half of the width, capped where a wider one stops adding detail;
     // the words take the rest. The picture is the one that earns its place, so it is sized first.
     let picture_width = (inner.width / 2).clamp(12, 48);
-    let [picture, words] = Layout::horizontal([
-        Constraint::Length(picture_width),
-        Constraint::Min(0),
-    ])
-    .areas::<2>(inner);
+    let [picture, words] =
+        Layout::horizontal([Constraint::Length(picture_width), Constraint::Min(0)])
+            .areas::<2>(inner);
     imu_view::draw(imu, picture, frame.buffer_mut());
 
     let [pitch, roll, yaw] = imu.euler_deg();
@@ -1585,7 +1583,12 @@ impl View {
         if !self.show_pad {
             return 0;
         }
-        PAD_HEIGHT + if self.pad.imu.is_some() { IMU_HEIGHT } else { 0 }
+        PAD_HEIGHT
+            + if self.pad.imu.is_some() {
+                IMU_HEIGHT
+            } else {
+                0
+            }
     }
 
     /// Carve the robot view's column off the right, when it is wanted and fits.
@@ -2480,7 +2483,11 @@ impl View {
 
         // Fixed rows, in the order the questions arrive: is it arriving, has it been arriving, and
         // what it is saying — and, when the pad has one, where the pad is in space.
-        let imu_height = if self.pad.imu.is_some() { IMU_HEIGHT } else { 0 };
+        let imu_height = if self.pad.imu.is_some() {
+            IMU_HEIGHT
+        } else {
+            0
+        };
         let [cadence, gaps, axes, held, imu] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -3834,7 +3841,10 @@ mod tests {
     fn the_pad_block_grows_an_imu_panel_only_when_the_pad_has_one() {
         let mut view = watching_a_pad();
         let without = render_to(&mut view, 100, 40);
-        assert!(!without.contains("front edge"), "no IMU, no panel:\n{without}");
+        assert!(
+            !without.contains("front edge"),
+            "no IMU, no panel:\n{without}"
+        );
         assert!(!without.contains("· IMU"), "{without}");
 
         feed(
@@ -3865,7 +3875,10 @@ mod tests {
             "the panel names the unit:\n{with}"
         );
         assert!(with.contains("pitch"), "and reads its attitude:\n{with}");
-        assert!(with.contains("settled"), "a second still learns the bias:\n{with}");
+        assert!(
+            with.contains("settled"),
+            "a second still learns the bias:\n{with}"
+        );
         assert!(
             with.contains('▀') || with.contains('▄'),
             "and draws the pad:\n{with}"
@@ -3878,7 +3891,10 @@ mod tests {
             })),
         );
         let gone = render_to(&mut view, 100, 40);
-        assert!(!gone.contains("· IMU"), "and it goes when the IMU does:\n{gone}");
+        assert!(
+            !gone.contains("· IMU"),
+            "and it goes when the IMU does:\n{gone}"
+        );
     }
 
     /// Six hundred samples a second must not become six hundred repaints a second.
@@ -3907,7 +3923,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("an update is not a failure"))
             })
             .count();
-        assert!(repaints <= 2, "a burst of samples earned {repaints} repaints");
+        assert!(
+            repaints <= 2,
+            "a burst of samples earned {repaints} repaints"
+        );
     }
 
     /// Stopping `tofd` must be an ordinary thing to do. The subscribe reports why

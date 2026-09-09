@@ -42,8 +42,8 @@ use robotd_params::Slot;
 
 mod configure;
 mod duck;
-mod monitor;
 mod imu_view;
+mod monitor;
 mod path_map;
 mod show;
 

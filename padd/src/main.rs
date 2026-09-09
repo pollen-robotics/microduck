@@ -531,9 +531,7 @@ fn main() -> std::process::ExitCode {
                     }
                 }
                 None => {
-                    if imu_head_cfg.enabled
-                        && tap.as_ref().is_some_and(|tap| tap.has_imu())
-                    {
+                    if imu_head_cfg.enabled && tap.as_ref().is_some_and(|tap| tap.has_imu()) {
                         // The IMU is there and has not spoken yet — a second after connecting,
                         // typically. Saying so beats silently doing the other thing.
                         tracing::warn!(
@@ -1213,12 +1211,21 @@ mod tests {
     fn y_cycles_follow_hold_follow_and_re_centres_each_time() {
         let level = [1.0, 0.0, 0.0, 0.0];
         // Yawed 30° by the time of the third press — drift, or a turn; the pad cannot tell.
-        let yawed = [(15.0f32.to_radians()).cos(), 0.0, 0.0, (15.0f32.to_radians()).sin()];
+        let yawed = [
+            (15.0f32.to_radians()).cos(),
+            0.0,
+            0.0,
+            (15.0f32.to_radians()).sin(),
+        ];
 
         let following = ImuHead::Off.on_y(level);
         assert_eq!(following, ImuHead::Following { reference: level });
         let holding = following.on_y(yawed);
-        assert_eq!(holding, ImuHead::Holding, "the second press holds, whatever the pad did");
+        assert_eq!(
+            holding,
+            ImuHead::Holding,
+            "the second press holds, whatever the pad did"
+        );
         let again = holding.on_y(yawed);
         assert_eq!(
             again,
@@ -1227,7 +1234,10 @@ mod tests {
         );
         // And that reference reads as centre.
         let head = head_from_pad(pad_imu::relative(yawed, yawed), 1.0, 2.5);
-        assert!(head.head_yaw.abs() < 1e-4 && head.head_pitch.abs() < 1e-4, "{head:?}");
+        assert!(
+            head.head_yaw.abs() < 1e-4 && head.head_pitch.abs() < 1e-4,
+            "{head:?}"
+        );
     }
 
     /// The pad's tilt becomes the head's pose with the signs verified on the robot: nose up is a
@@ -1239,25 +1249,39 @@ mod tests {
         // 30° nose up: a rotation about +Y.
         let nose_up = [half.cos(), 0.0, half.sin(), 0.0];
         let head = head_from_pad(nose_up, 1.0, 2.5);
-        assert!((head.head_pitch - 30.0f64.to_radians()).abs() < 0.01, "{head:?}");
-        assert!(head.head_yaw.abs() < 0.01 && head.head_roll.abs() < 0.01, "{head:?}");
+        assert!(
+            (head.head_pitch - 30.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
+        assert!(
+            head.head_yaw.abs() < 0.01 && head.head_roll.abs() < 0.01,
+            "{head:?}"
+        );
         assert_eq!(head.neck_pitch, 0.0);
 
         // 30° rolled right (left side up): about +X. The head rolls the other sign.
         let rolled = [half.cos(), half.sin(), 0.0, 0.0];
         let head = head_from_pad(rolled, 1.0, 2.5);
-        assert!((head.head_roll - (-30.0f64.to_radians())).abs() < 0.01, "{head:?}");
+        assert!(
+            (head.head_roll - (-30.0f64.to_radians())).abs() < 0.01,
+            "{head:?}"
+        );
 
         // 30° yaw left: about +Z.
         let left = [half.cos(), 0.0, 0.0, half.sin()];
         let head = head_from_pad(left, 1.0, 2.5);
-        assert!((head.head_yaw - 30.0f64.to_radians()).abs() < 0.01, "{head:?}");
+        assert!(
+            (head.head_yaw - 30.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
 
         // Gain 2 doubles it; a limit of 0.5 rad clamps it.
         let head = head_from_pad(left, 2.0, 2.5);
-        assert!((head.head_yaw - 60.0f64.to_radians()).abs() < 0.01, "{head:?}");
+        assert!(
+            (head.head_yaw - 60.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
         let head = head_from_pad(left, 2.0, 0.5);
         assert!((head.head_yaw - 0.5).abs() < 1e-6, "{head:?}");
     }
-
 }

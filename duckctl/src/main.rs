@@ -446,7 +446,9 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             }
             #[cfg(not(unix))]
             {
-                let status = ssh.status().map_err(|e| format!("could not run ssh: {e}"))?;
+                let status = ssh
+                    .status()
+                    .map_err(|e| format!("could not run ssh: {e}"))?;
                 std::process::exit(status.code().unwrap_or(1));
             }
         }
@@ -860,7 +862,11 @@ enum Command {
         #[arg(long, value_name = "USER")]
         user: Option<String>,
         /// A command to run on the robot instead of opening a shell. Put it after `--`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "COMMAND")]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
         command: Vec<String>,
     },
     /// Open the robot's console in a browser.
