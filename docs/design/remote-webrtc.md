@@ -571,10 +571,12 @@ along with a transport. `remote-access-design.md` §9 carries it as open.
 
 ## 12. Deferred, with reasons
 
-- **A WebSocket surface for server-side programs** (`architecture.md` §5.3). Same JSON-RPC, no
-  media stack, `get_frame` returning a JPEG. It is a few dozen lines once §5's routing exists, and
-  it is what makes "an LLM drives the robot" easy — but it is a second transport and the first one
-  should work.
+- ~~**A WebSocket surface for server-side programs**~~ — built. `mediad::agent` serves it at
+  `/agent` on the console's own listener, and it was the few dozen lines this predicted: §5's
+  routing already existed, and `session::run` never knew what carried its lines, so the whole of
+  the transport is pumping text frames into one channel and out of the other. What an agent may
+  call is what a console peer may call, decided in `route` for both — a method is routed once, for
+  every transport, or refused everywhere. `refusal` stopped naming WebRTC for the same reason.
 - **The `teleop` datachannel.** Not the near-term priority; §6 covers what deferring it removes,
   what it costs in the meantime, and the sequence numbers it will need.
 - **Multi-peer video.** One media session at a time, plus control-only clients. Simulcast and

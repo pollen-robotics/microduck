@@ -466,7 +466,10 @@ mod tests {
             .unwrap();
 
         let reply = h.to_peer.recv().await.unwrap();
-        assert!(reply.contains("not available over WebRTC"), "{reply}");
+        assert!(
+            reply.contains("not available over this transport"),
+            "{reply}"
+        );
         assert!(reply.contains(r#""id":7"#), "{reply}");
         assert!(
             config_seen.try_recv().is_err(),

@@ -39,7 +39,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 #
 # Default features off: this serves one file over GET, and JSON extractors, multipart, forms and
 # tracing middleware are all weight for routes that do not exist.
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
 clap = { workspace = true, features = ["derive"] }
 # The relay's half of the bridge: HTTPS to the rendezvous service — SSE inbound, `POST /send`
 # outbound. Same line `updater` uses, minus `form` (nothing here posts a form), so the TLS stack
