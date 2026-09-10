@@ -60,11 +60,44 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
     pub detect: DetectParams,
     /// Which pad button runs which skill. `padd` reads this, not `robotd`.
     pub pad: PadParams,
+    /// Posing the head from the pad's own IMU. `padd` reads this too.
+    pub imu_head: ImuHeadParams,
+}
+
+/// Controller-IMU head control: pose the head by tilting the pad.
+///
+/// Some pads carry an inertial unit — the "Pro Controller" Switch clones do; an Xbox pad does not.
+/// With this on and such a pad connected, **Y** stops meaning "the sticks pose the head" and
+/// means "the pad's tilt poses the head": the sticks keep driving, and turning the pad in your
+/// hands turns the robot's head. Press Y again and the head holds where it is, still driving.
+/// Press it a third time and the pad drives the head again **from where the pad is now** — the
+/// pad's yaw comes from a gyro and drifts, and re-centring on every re-entry is how a person
+/// beats the drift without a magnetometer.
+///
+/// Off, or on a pad with no IMU, Y is what it always was. Nothing else about the pad changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ImuHeadParams {
+    /// Whether Y engages IMU head control on a pad that has an IMU.
+    pub enabled: bool,
+    /// Head radians per pad radian. One is "the head turns as far as the pad did"; more makes a
+    /// small wrist movement a large head movement. The head's own travel limit still applies.
+    pub gain: f64,
+}
+
+impl Default for ImuHeadParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gain: 1.0,
+        }
+    }
 }
 
 /// Which pad button runs which skill.
@@ -329,11 +362,16 @@ pub struct MediaParams {
     /// Whether the send rate adapts to the link, and by what. [`CongestionControl`] has the
     /// trade — it is the largest single CPU consumer in this process.
     pub congestion_control: CongestionControl,
-    /// This robot's measured camera geometry, when somebody has measured it.
+    /// This robot's own measured camera geometry, when somebody has written a `[media.intrinsics]`
+    /// table for it — and only then.
     ///
-    /// Absent on every robot until then, and absence is not a gap to fill with silence: `mediad`
-    /// publishes the module's design figures instead, marked as not calibrated, so a consumer can
-    /// tell a datasheet from a measurement. See [`CameraIntrinsics`].
+    /// Absent is the common case and not a gap: `mediad` falls back to the hardware family's
+    /// calibration ([`CameraIntrinsics::alpha`] — the camera and lens are one part across a
+    /// revision, so it is a real solve of the same optics) and publishes it tagged `source:
+    /// "family"`, with the module's design figures (`source: "nominal"`) below that for a camera
+    /// nobody has solved at all. So this stays `Some` only for a per-robot solve, which is exactly
+    /// what lets `media.video` distinguish *this* robot's calibration from the family's. See
+    /// [`CameraIntrinsics`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intrinsics: Option<CameraIntrinsics>,
 }
@@ -363,6 +401,37 @@ pub struct CameraIntrinsics {
     pub distortion: Vec<f64>,
 }
 
+impl CameraIntrinsics {
+    /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
+    /// carries — one part across the family, so one solve is every unit's calibration.
+    ///
+    /// Solved on unit *graphite*, 2026-09-08 — ChArUco board on a screen (caliper-measured), 80
+    /// views, 0.79 px RMS, on the 1280×720 frame as `mediad` sends it (unrotated). This is the
+    /// **~62° full field of view** of the production `1920×1080@30` sensor mode: on this board's
+    /// IMX219 driver that mode is a scaled full-frame readout, not the native 1920×1080 crop the
+    /// datasheet describes — validated on hardware, the solved HFOV is 62°, not 39°. (`SensorMode`
+    /// and [`super`]'s nominal model still assume the crop; they are only the fallback this
+    /// overrides, but they are wrong for this hardware and should be corrected when touched.)
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn alpha() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 1061.8060025020175,
+            fy: 1062.193713957031,
+            cx: 596.7776848217006,
+            cy: 474.52348043048636,
+            distortion: vec![
+                -0.34695388691888,
+                0.14615866153945595,
+                -0.0007449157712424215,
+                -0.0022167170528743837,
+                -0.016437266141048814,
+            ],
+        }
+    }
+}
+
 impl Default for MediaParams {
     fn default() -> Self {
         Self {
@@ -371,8 +440,7 @@ impl Default for MediaParams {
             camera: true,
             quality: Quality::default(),
             bitrate: None,
-            // Nobody has measured this robot's camera. `mediad` says so on the wire rather than
-            // implying a measurement that did not happen.
+            // Only a per-robot solve goes here; the family calibration is `mediad`'s fallback.
             intrinsics: None,
             // `webrtcsink`'s own default, named rather than inherited: what the element defaults
             // to is a fact about a plugin we ship from a pinned release, and the day it changes
@@ -489,9 +557,10 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ThereminParams {
-    /// Master switch. On by default: the instrument still has to be picked up with
-    /// `robot.theremin`, so what this turns off is the *ability* to, on a duck where the
-    /// feature is unwanted or the sensor is known bad.
+    /// Master switch. **Off by default**: the theremin is a party trick, and a duck that
+    /// nobody asked to play one should not be reaching for the depth stream at all. Turning
+    /// it on grants the *ability* to pick the instrument up — that still takes
+    /// `robot.theremin` — on a duck where somebody wants it and the ToF is known good.
     pub enabled: bool,
     /// `tofd`'s depth stream.
     pub socket: PathBuf,
@@ -513,7 +582,7 @@ impl Default for ThereminParams {
     fn default() -> Self {
         let hand = kinematics::hand::Config::default();
         Self {
-            enabled: true,
+            enabled: false,
             socket: PathBuf::from(duck_ipc_proto::socket::TOF),
             near_m: hand.near_m,
             far_m: hand.far_m,
@@ -535,6 +604,27 @@ impl ThereminParams {
             hold: std::time::Duration::from_millis(self.hold_ms),
         }
     }
+}
+
+/// `[head_imu]` — the BMI088 on the head module, read by `tofd` and served as
+/// `head_imu.stream`.
+///
+/// **One switch, and it is off.** Reading this chip at 100 Hz costs ~3.5–4.5% of a core on an
+/// RK3566, and a bench that isolates the parts says none of it is fixable in the loop: being
+/// woken a hundred times a second is 0.7 points of it, the Madgwick fusion 0.3, and the rest is
+/// the two I²C transactions a sample takes. Fewer bytes is not on offer — a gyro and an
+/// accelerometer sample *is* twelve bytes — so what is left is not reading it, which is this
+/// key, or reading it less often, which is `tofd --imu-hz`.
+///
+/// It stays off until something subscribes to the stream, because for now nothing does: it was
+/// added for the mapping work, and a duck that is not mapping was paying for it from boot.
+/// `docs/project/tof-on-demand.md` is the measurement and the reasoning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HeadImuParams {
+    /// Read the head IMU at all. `false` — and derived rather than written out, so the default
+    /// cannot be changed by editing one word. `tofd --imu` overrides it for a session.
+    pub enabled: bool,
 }
 
 /// `[audio]` — the voice and the microphone. All optional equipment: a robot without a
@@ -2641,6 +2731,35 @@ mod tests {
     /// [`QUALITY_LABELS`] is what the registry offers and what the file may contain, and
     /// [`Quality::ALL`] is what the daemon can do — a rung in one and not the other is either a
     /// choice the editor writes and `mediad` cannot read, or a mode nobody can select.
+    /// **An absent `[media.intrinsics]` stays `None`.** Only a per-robot solve goes in the config;
+    /// the family calibration is `mediad`'s fallback, so that `Some` here means, unambiguously,
+    /// that this robot was measured — which is what lets `media.video` tag `source: "robot"` versus
+    /// `"family"`. `CameraIntrinsics::alpha` is still the family solve `mediad` reads.
+    #[test]
+    fn an_absent_intrinsics_table_is_none_not_the_family() {
+        assert_eq!(MediaParams::default().intrinsics, None);
+
+        let parsed: Params = toml::from_str("[media]\nbitrate = 2000\n").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent key");
+        let parsed: Params = toml::from_str("").expect("parses");
+        assert_eq!(parsed.media.intrinsics, None, "absent table");
+
+        // The family solve is a real calibration, just not stored here.
+        assert_eq!(CameraIntrinsics::alpha().width, 1280);
+
+        let parsed: Params = toml::from_str(
+            "[media.intrinsics]\nwidth = 640\nheight = 360\nfx = 500.0\nfy = 501.0\ncx = 320.0\ncy = 180.0\n",
+        )
+        .expect("parses");
+        let own = parsed.media.intrinsics.expect("this robot's own");
+        assert_eq!(
+            (own.width, own.fx),
+            (640, 500.0),
+            "a written table is this robot's own solve"
+        );
+        assert!(own.distortion.is_empty());
+    }
+
     #[test]
     fn every_quality_label_round_trips() {
         assert_eq!(QUALITY_LABELS.len(), Quality::ALL.len());

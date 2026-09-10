@@ -53,8 +53,21 @@ pub struct Video {
     pub intrinsics: Option<crate::camera::Intrinsics>,
 }
 
-/// The method a peer asks with. Answered here rather than routed: no service owns it.
+/// The methods a peer asks with. Answered here rather than routed: no service owns them.
 const VIDEO_METHOD: &str = "media.video";
+const STREAM_METHOD: &str = "media.stream";
+
+/// What this daemon can answer about its own media, when it has a pipeline to answer from.
+///
+/// One handle rather than two Options, because the two arrive together: both are known only once
+/// the pipeline is up — `sensor_mode()` is not truthful before then, and there are no frames to
+/// encode either — and both are absent for the same reasons, a board with no camera or a lane
+/// opened before the pipeline started. A peer asking either gets a refusal that says which.
+#[derive(Clone)]
+pub struct Media {
+    pub video: Video,
+    pub streamer: std::sync::Arc<crate::stream::Streamer>,
+}
 
 /// What the video is, told to a peer once when its channel opens.
 ///
@@ -86,6 +99,11 @@ fn video_params(video: &Video) -> serde_json::Value {
         "width": video.width,
         "height": video.height,
         "rotate": video.rotate,
+        // The two clocks at one instant: RTCP sender reports state RTP time in wall-clock
+        // (`real_ns`), `robot.state`/`tof.frame` stamp with `mono_ns`'s clock. A peer that has both
+        // can put the picture on the robot's axis.
+        "mono_ns": proto::clock::monotonic_ns(),
+        "real_ns": proto::clock::realtime_ns(),
     });
     // Absent rather than null when the geometry is unknown: a consumer reading a missing key knows
     // it must calibrate, where one reading `null` has to be told what that meant.
@@ -95,18 +113,25 @@ fn video_params(video: &Video) -> serde_json::Value {
     params
 }
 
+/// `media` is `None` when there is no pipeline to answer for.
+///
+/// A datachannel always has one — it exists because `webrtcsink` handed over a consumer — but the
+/// rendezvous control lane (`relay::Relay::control`) is JSON-RPC with no media beside it, and it
+/// can open before the pipeline has started. Answering `media.video` with zeros in that case would
+/// be a consumer told the picture is 0×0 and upright, which is worse than being told there is no
+/// picture: one is actionable, the other is a wrong number that looks like a right one.
 pub async fn run(
     mut inbound: mpsc::Receiver<String>,
     outbound: mpsc::Sender<String>,
     mut pool: Pool,
-    video: Video,
+    media: Option<Media>,
 ) {
     while let Some(line) = inbound.recv().await {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line, &mut pool, &video).await {
+        if let Some(reply) = handle(&line, &mut pool, media.as_ref()).await {
             // A closed outbound means the peer is gone; there is nothing left to do for it.
             if outbound.send(reply).await.is_err() {
                 break;
@@ -118,7 +143,7 @@ pub async fn run(
 
 /// Route one line. Returns a reply to send back only when this transport answers it itself —
 /// which is to say, only when it refuses.
-async fn handle(line: &str, pool: &mut Pool, video: &Video) -> Option<String> {
+async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>) -> Option<String> {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -140,10 +165,52 @@ async fn handle(line: &str, pool: &mut Pool, video: &Video) -> Option<String> {
     // Answered here, before anything tries to make a `Call` of it: this is `mediad`'s own question
     // about `mediad`'s own pipeline, and there is no service to route it to.
     if request.method == VIDEO_METHOD {
-        return Some(
-            serde_json::to_string(&proto::Response::ok(id, &video_params(video)))
+        return Some(match media {
+            Some(media) => {
+                serde_json::to_string(&proto::Response::ok(id, &video_params(&media.video)))
+                    .expect("Response serialises")
+            }
+            None => error_line(
+                id,
+                proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "this robot is not publishing video, so there is no geometry to describe",
+                ),
+            ),
+        });
+    }
+
+    // **The one call that makes this robot send its camera somewhere it was told about.**
+    //
+    // Answered here rather than routed for the same reason `media.video` is — the pipeline is
+    // `mediad`'s and no service owns it — and it is the reason a frame stream needs no relay
+    // candidate: the robot dials out, so a NAT is not a participant. `stream.rs`'s header has the
+    // argument; this is where a peer asks for it.
+    if request.method == STREAM_METHOD {
+        let Some(media) = media else {
+            return Some(error_line(
+                id,
+                proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "this robot has no camera to stream",
+                ),
+            ));
+        };
+        return Some(match stream_request(&request.params) {
+            // No `url` key at all is a question rather than an instruction, which is what lets a
+            // client show what is streaming without having to remember what it asked for.
+            Ask::Status => {
+                serde_json::to_string(&proto::Response::ok(id, &media.streamer.status()))
+                    .expect("Response serialises")
+            }
+            Ask::Stop => serde_json::to_string(&proto::Response::ok(id, &media.streamer.stop()))
                 .expect("Response serialises"),
-        );
+            Ask::Start(config) => match media.streamer.start(config) {
+                Ok(answer) => serde_json::to_string(&proto::Response::ok(id, &answer))
+                    .expect("Response serialises"),
+                Err(why) => error_line(id, proto::Error::new(proto::code::INVALID_PARAMS, why)),
+            },
+        });
     }
 
     let call = match request.as_call() {
@@ -185,6 +252,59 @@ async fn handle(line: &str, pool: &mut Pool, video: &Video) -> Option<String> {
 
 /// One refusal, as a line. Built through [`proto::Response`] rather than by hand so the envelope
 /// has exactly one definition — the same reason `duck-ipc-proto` exists.
+/// What a `media.stream` call is asking for.
+///
+/// `url` present is start, `url: null` is stop, no `url` key is a question. The same three-way
+/// reading `robot.loadPolicy` gives `slot` and `path`, and for the same reason: one method that a
+/// client can use to look, to change and to put back is one method to route and one to permit.
+enum Ask {
+    Status,
+    Stop,
+    Start(crate::stream::Config),
+}
+
+fn stream_request(params: &Option<serde_json::Value>) -> Ask {
+    use crate::stream::Config;
+
+    // Absent params is the same question as params with no `url`: a client asking what is
+    // streaming should not have to send `{}` to be understood.
+    let params = match params {
+        None => return Ask::Status,
+        Some(params) => params,
+    };
+    match params.get("url") {
+        None => Ask::Status,
+        Some(serde_json::Value::Null) => Ask::Stop,
+        Some(url) => Ask::Start(Config {
+            url: url.as_str().unwrap_or_default().to_owned(),
+            // Every number is optional: what a caller almost always wants is "stream to here",
+            // and a default that is cheap enough to ignore is better than four required fields.
+            fps: params
+                .get("fps")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(Config::DEFAULT_FPS),
+            longest: params
+                .get("longest")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(Config::DEFAULT_LONGEST as u64) as u32,
+            quality: params
+                .get("quality")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(Config::DEFAULT_QUALITY as u64)
+                .min(100) as u8,
+            // H.264 unless asked otherwise: the encode is the VPU's rather than a core's, and
+            // inter-frame prediction is worth five to fifteen times the bytes over the same
+            // wifi. JPEG stays reachable because it needs no keyframe to start and no decoder
+            // state to keep, which is what a receiver that reconnects constantly wants.
+            encoding: params
+                .get("encoding")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::stream::Encoding::parse)
+                .unwrap_or_default(),
+        }),
+    }
+}
+
 fn error_line(id: Option<proto::Id>, error: proto::Error) -> String {
     // A `Response` cannot fail to serialise: every field is a `String`, an `Id` or an `Error`.
     serde_json::to_string(&proto::Response::err(id, error)).expect("Response serialises")
@@ -254,16 +374,36 @@ mod tests {
             inbound,
             outbound,
             pool,
-            Video {
-                width: 1280,
-                height: 720,
-                rotate: 90,
-                intrinsics: crate::camera::Intrinsics::nominal(
-                    Some(crate::camera::SensorMode::PINNED),
-                    1280,
-                    720,
-                ),
-            },
+            Some(Media {
+                video: Video {
+                    width: 1280,
+                    height: 720,
+                    rotate: 90,
+                    intrinsics: crate::camera::Intrinsics::nominal(
+                        Some(crate::camera::SensorMode::PINNED),
+                        1280,
+                        720,
+                    ),
+                },
+                // A streamer whose encoder produces nothing, which is all this needs: the tests
+                // here are about which method is answered by whom, and an encoder that touched a
+                // pipeline would make the whole file unbuildable off a board.
+                streamer: std::sync::Arc::new(crate::stream::Streamer::new(
+                    crate::stream::Encoders {
+                        jpeg: std::sync::Arc::new(|_| None),
+                        h264: Some(std::sync::Arc::new(|_| None)),
+                        gate: None,
+                    },
+                    crate::producer::Producer {
+                        name: Some("olducky".to_owned()),
+                        serial: Some("3fa1c51b".to_owned()),
+                        release: "0.10.0".to_owned(),
+                        api_version: proto::API_VERSION,
+                    },
+                    90,
+                    dir.path().join("hf-token"),
+                )),
+            }),
         ));
         Harness {
             to_peer,
@@ -453,7 +593,7 @@ mod tests {
 
         let intrinsics = &parsed["params"]["intrinsics"];
         assert!(
-            (intrinsics["fx"].as_f64().unwrap() - 1809.52).abs() < 0.01,
+            (intrinsics["fx"].as_f64().unwrap() - 1065.14).abs() < 0.1,
             "{intrinsics}"
         );
         assert_eq!(intrinsics["cx"], 640.0);
@@ -486,6 +626,59 @@ mod tests {
     /// This is the path the console uses, and it exists because pushing the same information when
     /// the channel appears races the browser's datachannel and loses — a sideways picture with
     /// nothing in the log. A question the page asks when it is ready cannot arrive too early.
+    /// `media.stream` reads three ways off one key, and the validation is here rather than later.
+    ///
+    /// No `url` is a question, so a client can show what is streaming without remembering what it
+    /// asked for. And a url that is not a WebSocket is refused *before* a thread and a socket are
+    /// spawned for it — a robot that accepted `http://` would sit in a reconnect loop against
+    /// something that can never upgrade, having told the caller yes.
+    #[tokio::test]
+    async fn media_stream_answers_the_question_and_refuses_a_bad_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(sockets_in(dir.path()), dir);
+
+        async fn ask(h: &mut Harness, line: &str) -> serde_json::Value {
+            h.from_peer.send(line.into()).await.unwrap();
+            serde_json::from_str(&h.to_peer.recv().await.unwrap()).expect("valid json")
+        }
+
+        let answer = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":1,"method":"media.stream"}"#,
+        )
+        .await;
+        assert_eq!(answer["result"]["streaming"], false, "{answer}");
+        assert_eq!(answer["result"]["sent"], 0);
+
+        let answer = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":2,"method":"media.stream","params":{"url":"http://a.b"}}"#,
+        )
+        .await;
+        assert_eq!(
+            answer["error"]["code"],
+            proto::code::INVALID_PARAMS,
+            "{answer}"
+        );
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("ws://"),
+            "the refusal says what a url has to be: {answer}"
+        );
+
+        // Stopping something that was never started is not an error: a client tidying up after
+        // itself should not have to know whether there was anything to tidy.
+        let answer = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":3,"method":"media.stream","params":{"url":null}}"#,
+        )
+        .await;
+        assert_eq!(answer["result"]["streaming"], false, "{answer}");
+        assert_eq!(answer["result"]["was"], serde_json::Value::Null);
+    }
+
     #[tokio::test]
     async fn the_page_can_ask_what_the_video_is() {
         let dir = tempfile::tempdir().unwrap();

@@ -1182,8 +1182,7 @@ impl FakeHub {
                 // `interval` HF omits, and only to keep the suite quick: the robot sleeps one
                 // interval before its first poll, so the real five seconds would make every
                 // login test five seconds long. That HF's omission falls back to five is pinned
-                // in `account::tests::a_device_code_response_is_normalised`, where it costs
-                // nothing.
+                // in `hf_robot_account`'s own tests, where it costs nothing.
                 post(|| async {
                     axum::Json(serde_json::json!({
                         "device_code": "device-abc",
@@ -1202,7 +1201,7 @@ impl FakeHub {
                         async move {
                             assert_eq!(
                                 form.get("client_id").map(String::as_str),
-                                Some(updater::account::CLIENT_ID),
+                                Some(hf_robot_account::HUGGINGFACE_CLIENT_ID),
                                 "the device flow must identify itself as the public client"
                             );
                             let n = counter.fetch_add(1, Ordering::SeqCst);

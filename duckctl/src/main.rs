@@ -20,6 +20,11 @@
 //! module the robot uses, so if the framing were asymmetric this would not work — which makes
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
+//! The one thing that *is* asymmetric is how long a line may be, and it has to be: the robot's cap
+//! bounds what an unpaired peer in radio range can make it buffer, and this end has no such peer.
+//! Sharing the tight one made every reply over 8 KiB unreadable here while `btd` served it
+//! correctly — see `framing::MAX_REPLY_LINE`.
+//!
 //! ```text
 //! cargo run -p duckctl -- scan          # robots in range, and their addresses
 //! cargo run -p duckctl -- status
@@ -27,6 +32,7 @@
 //! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
 //! cargo run -p duckctl -- name "Ducky"
 //! cargo run -p duckctl -- call robot.health
+//! cargo run -p duckctl -- logs robotd -n 100
 //! ```
 //!
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
@@ -422,6 +428,30 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             println!("{address}");
             Ok(())
         }
+        Command::Ssh { user, command } => {
+            let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
+            let argv = ssh_argv(&user, address, command);
+            eprintln!("ssh {}", argv.join(" "));
+            let mut ssh = std::process::Command::new("ssh");
+            ssh.args(&argv);
+            // Become ssh rather than run it: the terminal is then ssh's from here on — its
+            // prompts, its exit status, its handling of a dropped link — and nothing of this
+            // process is left behind to be `Ctrl-C`d separately. The radio was released above,
+            // before this was called, so there is nothing to clean up.
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let e = ssh.exec();
+                Err(format!("could not run ssh: {e}").into())
+            }
+            #[cfg(not(unix))]
+            {
+                let status = ssh
+                    .status()
+                    .map_err(|e| format!("could not run ssh: {e}"))?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         Command::Open { print, port } => {
             let url = console_url(address, *port);
             if *print {
@@ -440,6 +470,28 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
         // `run` only calls this for the two above; every other command's answer is its JSON.
         _ => Err("this command does not resolve an address".into()),
     }
+}
+
+/// Which account `ssh` logs into: the flag, else a non-empty `DUCK_BOARD_USER`, else `radxa`.
+///
+/// Empty is unset — `DUCK_BOARD_USER= duckctl ssh` reads as "not set", the same rule `DUCK_ROBOT`
+/// follows, because a variable emptied to switch it off must not become an ssh login of `@host`.
+/// `radxa` is the image's account and `dev-push.sh`'s default for the same variable.
+fn ssh_user(flag: Option<&str>, env: Option<String>) -> String {
+    flag.map(str::to_owned)
+        .or_else(|| env.filter(|user| !user.trim().is_empty()))
+        .unwrap_or_else(|| "radxa".to_owned())
+}
+
+/// `ssh`'s arguments: `user@address`, then whatever is to run there.
+///
+/// The command's words are passed through as separate arguments and ssh joins them with spaces
+/// on the far side, which is what `ssh host sudo robotctl pad pair` does at a prompt. Quoting for
+/// the remote shell is the caller's, exactly as it would be there.
+fn ssh_argv(user: &str, address: &str, command: &[String]) -> Vec<String> {
+    let mut argv = vec![format!("{user}@{address}")];
+    argv.extend(command.iter().cloned());
+    argv
 }
 
 /// Where the console is, given where the robot is.
@@ -795,6 +847,28 @@ enum Command {
     /// stopped advertising the service to it is asked over BLE instead, which is slower and always
     /// answers.
     Ip,
+    /// ssh into the robot.
+    ///
+    /// `duckctl ssh` is `ssh <user>@$(duckctl ip)` as one step: the address comes from the
+    /// advertisement the way `ip` finds it, and then this process *becomes* `ssh`, so the terminal,
+    /// the exit status and the key prompts are ssh's own. Anything after `--` is run on the robot
+    /// instead of opening a shell: `duckctl ssh -- sudo robotctl pad pair`.
+    ///
+    /// The user is `--user`, else `DUCK_BOARD_USER` from the environment — the same variable
+    /// `scripts/dev-push.sh` reads, so a laptop set up for pushing is set up for this — else
+    /// `radxa`, the image's default account.
+    Ssh {
+        /// The account on the robot. Without it, `DUCK_BOARD_USER`; without that, `radxa`.
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// A command to run on the robot instead of opening a shell. Put it after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
     /// Open the robot's console in a browser.
     ///
     /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
@@ -810,6 +884,38 @@ enum Command {
         // has to read.
         #[arg(long, default_value_t = 8080)]
         port: u16,
+    },
+    /// The tail of one daemon's journal.
+    ///
+    /// `duckctl logs robotd` after a robot has misbehaved, which is the question `journalctl`
+    /// answers on the robot and nothing answered from here. Reachable with no network at all, so
+    /// it works on the robot whose wifi never came up — the one whose logs are hardest to get.
+    ///
+    /// `duckctl call system.services` names the units, and an unknown name is refused with the
+    /// real list. `bluetooth` and `NetworkManager` are readable too: they are what is broken when
+    /// the robot cannot be reached at all.
+    ///
+    /// Not a `journalctl` command line, and it never will be: this is served over a radio anyone
+    /// in range can talk to, so the robot picks the unit from a fixed list. For searching, take
+    /// the `ip` and use ssh.
+    Logs {
+        /// `robotd`, `btd`, `configd`, `updaterd`, `padd`, `mediad`, `tofd`, `bluetooth` or
+        /// `NetworkManager`. The `.service` suffix is optional.
+        #[arg(value_name = "SERVICE")]
+        service: String,
+        /// How many lines from the end.
+        ///
+        /// The default is what a BLE link carries in a couple of seconds. More is allowed and
+        /// costs proportionally — the robot trims the oldest lines to fit what the radio can
+        /// carry, and says so when it did.
+        #[arg(long, short = 'n', default_value_t = 40)]
+        lines: usize,
+        /// Which boot: `0` is this one, `-1` the one before it.
+        ///
+        /// `--boot -1` is "what did it say before it restarted", which is the reason the journal
+        /// is configured to survive a reboot at all (`deploy/journald.conf.d`).
+        #[arg(long, short = 'b', default_value_t = 0, allow_hyphen_values = true)]
+        boot: i32,
     },
     /// Version handshake plus update status.
     Status,
@@ -1160,11 +1266,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
     // it can only report what an advertisement carries.
     let list_only = matches!(cli.command, Command::Scan);
-    // `ip` and `open` want one field out of an advertisement, so they read it the way `scan` does —
+    // `ip`, `open` and `ssh` want one field out of an advertisement, so they read it the way `scan` does —
     // and unlike `scan` they connect after all when no advertisement carried one. Cheap read first,
     // call second: without the fallback these two commands would fail on exactly the laptops that
     // use them most, because a robot bonded to this Mac often stops advertising the service to it.
-    let resolving = matches!(cli.command, Command::Ip | Command::Open { .. });
+    let resolving = matches!(
+        cli.command,
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. }
+    );
 
     let manager = Manager::new().await?;
     let adapter = manager
@@ -1471,7 +1580,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
-    let mut reassembler = Reassembler::new();
+    // `for_replies`, not `new`: this is the client end, and the robot's answers are bounded by
+    // `MAX_REPLY_LINE` rather than by the tighter cap that limits what a radio peer may send. A
+    // `logs` tail is the reply that outgrew the other one.
+    let mut reassembler = Reassembler::for_replies();
     // The deadline is **idle**, not total: it is pushed back by every notification that arrives,
     // because a robot sending progress is a robot that is working. See `REPLY_TIMEOUT`.
     let mut deadline = tokio::time::Instant::now() + timeout;
@@ -1522,6 +1634,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
             }
 
+            // `logs` asked for text, so it prints text. A journal tail rendered as a JSON array
+            // of escaped strings is the one reply nobody can read, and reading it is the whole
+            // point of the command. A refusal still prints as JSON below, because the refusal
+            // names the units it would have accepted and that is worth seeing whole.
+            if let Command::Logs { service, boot, .. } = &cli.command
+                && value.get("error").is_none()
+            {
+                let _ = peripheral.disconnect().await;
+                return print_journal(&value["result"], service, *boot);
+            }
+
             println!("{}", serde_json::to_string_pretty(&value)?);
             let _ = peripheral.disconnect().await;
             // A JSON-RPC error is the robot answering, not this tool failing — so it is
@@ -1544,6 +1667,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
         }
     }
+}
+
+/// Print a journal tail: the lines on stdout, everything about them on stderr.
+///
+/// The split is what makes `duckctl logs robotd | grep panic` work — a truncation note or an
+/// empty-tail explanation in that pipe would be a line the robot never logged.
+fn print_journal(
+    result: &serde_json::Value,
+    service: &str,
+    boot: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let unit = result["unit"].as_str().unwrap_or(service);
+    let Some(lines) = result["lines"].as_array() else {
+        // A well-formed answer in a shape this build does not know. Printed rather than
+        // paraphrased, because the reply itself is the only evidence of what happened.
+        return Err(format!(
+            "the robot answered system.logs with no `lines`, which this version of duckctl              cannot read:\n{}",
+            serde_json::to_string_pretty(result)?
+        )
+        .into());
+    };
+
+    for line in lines {
+        match line.as_str() {
+            Some(text) => println!("{text}"),
+            None => println!("{line}"),
+        }
+    }
+
+    if lines.is_empty() {
+        // Not an error: a daemon that has not run this boot is a real answer, and it is a
+        // different one from a daemon that is running and silent. `system.services` tells them
+        // apart, so that is where this points.
+        eprintln!(
+            "no lines for {unit} in boot {boot} — it may not have run then. `duckctl call              system.services` says whether it is running now."
+        );
+    }
+    if result["truncated"] == serde_json::Value::Bool(true) {
+        eprintln!(
+            "note: older lines were dropped to fit what BLE can carry. Ask for fewer with              `-n`, or read the whole journal over ssh — `duckctl ip` has the address."
+        );
+    }
+    Ok(())
 }
 
 /// How a wait for the next notification ended.
@@ -1665,7 +1831,7 @@ async fn read_line(
     notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
     timeout: Duration,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut reassembler = Reassembler::new();
+    let mut reassembler = Reassembler::for_replies();
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -1774,7 +1940,9 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
         // same question over a connection that costs a bond and a PIN.
-        Command::Ip | Command::Open { .. } => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. } => {
+            ("net.status", serde_json::json!({}), REPLY_TIMEOUT)
+        }
         Command::Version => (
             "hello",
             serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),
@@ -1782,6 +1950,18 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         ),
         Command::Update(update) => return update_request_line(update),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
+        // A journal read is a `journalctl` spawn on the robot plus a reply several times larger
+        // than any other, chunked at 20 bytes a notification — seconds rather than milliseconds,
+        // so it gets the slow budget for the same reason `wifi scan` does.
+        Command::Logs {
+            service,
+            lines,
+            boot,
+        } => (
+            proto::method::SYSTEM_LOGS,
+            serde_json::json!({ "unit": service, "lines": lines, "boot": boot }),
+            SLOW_REPLY_TIMEOUT,
+        ),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Name { name } => (
             "system.setName",
@@ -2649,6 +2829,35 @@ mod tests {
         ));
     }
 
+    /// `ssh` takes a user and a trailing command, and the user falls back the documented way: the
+    /// flag, a non-empty `DUCK_BOARD_USER`, then the image's account. An emptied variable is unset,
+    /// not a login of `@host`.
+    #[test]
+    fn ssh_resolves_its_user_and_passes_the_command_through() {
+        let cli = Cli::try_parse_from(["duckctl", "ssh", "--user", "pierre"]).expect("parses");
+        let Command::Ssh { user, command } = &cli.command else {
+            panic!("not an ssh command");
+        };
+        assert_eq!(user.as_deref(), Some("pierre"));
+        assert!(command.is_empty());
+
+        let cli = Cli::try_parse_from(["duckctl", "ssh", "--", "sudo", "robotctl", "pad", "pair"])
+            .expect("a trailing command parses");
+        let Command::Ssh { user, command } = &cli.command else {
+            panic!("not an ssh command");
+        };
+        assert_eq!(user, &None);
+        assert_eq!(
+            ssh_argv(&ssh_user(user.as_deref(), None), "192.168.10.136", command),
+            ["radxa@192.168.10.136", "sudo", "robotctl", "pad", "pair"]
+        );
+
+        assert_eq!(ssh_user(Some("pierre"), Some("antoine".into())), "pierre");
+        assert_eq!(ssh_user(None, Some("antoine".into())), "antoine");
+        assert_eq!(ssh_user(None, Some("".into())), "radxa");
+        assert_eq!(ssh_user(None, None), "radxa");
+    }
+
     #[test]
     fn a_robot_broadcasts_where_it_is() {
         let (properties, duck) = advertised(
@@ -2722,6 +2931,48 @@ mod tests {
         assert!(answers_to("duck [1]", "duck [1]"));
         assert!(!answers_to("[duck-c51b]", "duck-c51b"));
         assert!(!answers_to("duck-c51b [", "duck-c51b"));
+    }
+
+    /// A negative boot offset is an argument, not a mistyped flag.
+    ///
+    /// `--boot -1` is the whole reason this command is worth having — "what did it say before it
+    /// restarted" — and clap rejects a value starting with `-` unless the argument says
+    /// otherwise. Pinned because the failure is at parse time, on the one invocation nobody
+    /// reaches for until something is already wrong.
+    #[test]
+    fn the_boot_before_this_one_can_be_asked_for() {
+        let wire = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["duckctl"], args].concat()).expect("parses");
+            request_line(&cli.command).expect("a request").0
+        };
+
+        let previous = wire(&["logs", "btd", "--boot", "-1"]);
+        assert!(
+            previous.contains(duck_ipc_proto::method::SYSTEM_LOGS),
+            "{previous}"
+        );
+        assert!(previous.contains(r#""boot":-1"#), "{previous}");
+
+        let default = wire(&["logs", "btd"]);
+        assert!(default.contains(r#""boot":0"#), "{default}");
+        assert!(default.contains(r#""lines":40"#), "{default}");
+        // The unit goes over verbatim, suffix and all: the robot resolves it against its own
+        // list, so this tool has no list to keep in step.
+        assert!(
+            wire(&["logs", "NetworkManager.service"])
+                .contains(r#""unit":"NetworkManager.service""#)
+        );
+    }
+
+    /// A journal read spawns `journalctl` and carries a reply several times larger than any
+    /// other, chunked at 20 bytes a notification. The reply budget has to match.
+    #[test]
+    fn reading_a_journal_gets_the_slow_budget() {
+        let cli = Cli::try_parse_from(["duckctl", "logs", "robotd", "-n", "500"]).expect("parses");
+        assert_eq!(
+            request_line(&cli.command).expect("a request").1,
+            SLOW_REPLY_TIMEOUT
+        );
     }
 
     /// **The Hub commands take the budget their work needs**, because the failure otherwise

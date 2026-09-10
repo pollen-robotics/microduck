@@ -279,6 +279,7 @@ impl Controller {
     /// exception is a seated robot, which carries across whatever changed: the seat is a static
     /// pose on a constant flag, and any sitstand network asked to hold it holds it.
     pub fn carry_over(&mut self, from: &Controller) {
+        self.policy.carry_over(&from.policy);
         self.last_action = from.last_action;
         self.previous = from.previous;
         self.ground_pick = from.ground_pick;
@@ -291,8 +292,9 @@ impl Controller {
     ///
     /// Called when the policy is re-enabled, so a robot that sat disabled for a minute does
     /// not resume with a stale action in its observation and a filter anchored to wherever
-    /// it was before.
+    /// it was before. Recurrent networks also discard their episode memory.
     pub fn reset(&mut self) {
+        self.policy.reset();
         self.last_action = [0.0; ACTION_LEN];
         self.previous = None;
     }
@@ -456,6 +458,10 @@ impl Controller {
                     let chains = active.phase == SkillPhase::Holding
                         && def.is_some_and(|d| d.chain)
                         && active.chain > 0.0;
+                    if chains {
+                        // A chained replay is a new episode even though Net is unchanged.
+                        self.policy.reset();
+                    }
                     chains.then(|| ActiveSkill {
                         phase: SkillPhase::Holding,
                         remaining: def.map_or(0.0, |d| d.duration),
@@ -648,6 +654,41 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn recurrent_memory_resets_with_controller_feedback() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../duck-control/tests/fixtures/lstm.onnx");
+        let policy = Policy::load(
+            &duck_control::policy::PolicyPaths {
+                walk: path,
+                ..Default::default()
+            },
+            0.05,
+        )
+        .unwrap();
+        let mut controller = Controller::new(policy, Tuning::default(), SkillTuning::default());
+        let sensors = duck_control::Sensors::default();
+        let command = Command::default();
+        let first = controller
+            .step(&sensors, &command, false, 0.02, 1.0)
+            .unwrap()
+            .targets;
+        let next = controller
+            .step(&sensors, &command, false, 0.02, 1.0)
+            .unwrap()
+            .targets;
+        assert_ne!(first, next);
+        controller.reset();
+        assert_eq!(
+            first,
+            controller
+                .step(&sensors, &command, false, 0.02, 1.0)
+                .unwrap()
+                .targets
+        );
+    }
 
     /// The prototype's **current alpha configuration** — its built-in defaults, which the
     /// installer deliberately passes no flags to override. The filters are ON at the values

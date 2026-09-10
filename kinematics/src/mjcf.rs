@@ -36,6 +36,8 @@ pub enum ParseError {
 }
 
 pub(crate) struct Body {
+    /// The MJCF `name`, retained for whole-skeleton FK (matching a pose to a link).
+    pub name: String,
     /// Index into `Tree::bodies`. `None` only for the root (trunk_base).
     pub parent: Option<usize>,
     /// Rest pose of this body in its parent's frame (identity for the root).
@@ -94,6 +96,7 @@ pub(crate) fn parse(xml: &str) -> Result<Tree, ParseError> {
     // The root is anchored at identity — its MJCF `pos` is where MuJoCo drops
     // the robot into the world, which trunk-frame FK must not inherit.
     tree.bodies.push(Body {
+        name: trunk.attribute("name").unwrap_or("trunk_base").to_owned(),
         parent: None,
         rest: Pose::IDENTITY,
         joint: None,
@@ -130,6 +133,7 @@ fn walk_body(node: roxmltree::Node, parent: usize, tree: &mut Tree) -> Result<()
 
     let idx = tree.bodies.len();
     tree.bodies.push(Body {
+        name: node.attribute("name").unwrap_or("").to_owned(),
         parent: Some(parent),
         rest: rest_pose(node)?,
         joint,

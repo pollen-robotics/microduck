@@ -1,0 +1,893 @@
+#!/bin/sh
+# A duck in MuJoCo, driven by the real daemon, in one command.
+#
+#   scripts/duck-sim              # a window opens, the duck stands up, and it is yours
+#   scripts/duck-sim drive        # walk it forward for a few seconds
+#   scripts/duck-sim ctl health   # anything robotctl does
+#   scripts/duck-sim down
+#
+# And the same duck, as a machine you log into:
+#
+#   scripts/duck-sim boot         # the daemons under real systemd, in a container
+#   scripts/duck-sim shell        # you are on the duck
+#   duck-a # robotctl health
+#
+# `boot` needs sudo, because `systemd-nspawn` does. What it buys over the plain form is the part
+# that is not fakeable: the real unit files, with their real User=, groups, RuntimeDirectory= and
+# hardening, under a real init — which is what makes `robotctl update apply` and the health gate
+# behave here the way they behave on a robot.
+#
+# What is running afterwards is `robotd` — the same binary a robot runs, with the same policies, the
+# same 50 Hz loop and the same IPC — with `duck_control::sim::RemoteIo` in place of the servo bus.
+# `docs/design/simulation.md` says what that is and is not a twin of.
+#
+# The three things this exists to stop anyone typing by hand, because none of them is guessable:
+#
+#   * policies live at /opt/robot/daemon/current on a robot and in this repo on a laptop, so every
+#     one has to be named in a params file;
+#   * `ort` dlopens libonnxruntime and a laptop has no system one — the RL repo's venv does;
+#   * a unix socket path is capped at ~108 bytes, so the state directory has to be short.
+set -eu
+
+STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
+RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
+PORT="${DUCK_SIM_PORT:-7801}"
+
+# `setsid` is util-linux: Linux has it, a Mac does not. What it buys is a daemon in its own session,
+# so closing this terminal does not take the duck with it — and on a machine without it `nohup`
+# alone covers the hangup, which is the part that matters. Nothing here kills by process group any
+# more (see `stop_one`), so a session was the only thing ever wanted from it.
+SETSID="$(command -v setsid 2>/dev/null || true)"
+DUCKS="${DUCK_SIM_DUCKS:-1}"
+
+# Which world. A bare name is one of the simulator's own scenes; anything with a slash is a path.
+#
+#   DUCK_SIM_SCENE=apartment scripts/duck-sim boot 2
+#
+# `apartment` is six rooms in 7x6 m with 50 cm walls and doorways deliberately off centre — that
+# asymmetry is what lets a pose be disambiguated from a 45-degree forward field of view, which is
+# exactly what the duck has. The default is a bare floor, where there is nothing to see.
+SCENE="${DUCK_SIM_SCENE:-}"
+
+# Which ducks have an eye. `a`, `a,c`, or `all`; empty for none, which is the default because a
+# rendered frame costs 12 ms against 0.3 ms to step four ducks' physics — one camera is a third of a
+# core and four is most of one. Each duck with a camera also gets a `mediad`, and its console is at
+# 8080 + its index.
+CAMERAS="${DUCK_SIM_CAMERAS:-}"
+FRAME_PORT="${DUCK_SIM_FRAME_PORT:-7901}"
+SOCK="$STATE/duck.sock"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+say()  { printf '\033[36m==\033[0m %s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Which duck `ctl` talks to. `DUCK_SIM_DUCK=duck-b scripts/duck-sim ctl monitor` for another.
+WHO="${DUCK_SIM_DUCK:-}"
+
+# **Every socket, not just robotd's.** `monitor` draws the depth frame from `tofd` and the sticks
+# from `padd`, and it looks for them under /run — which on a board is where they are and here is
+# not. A monitor with no ToF points looked like a sensor that was not wired, and was a client
+# pointed at the wrong path.
+ctl() {
+    name="${WHO:-$(duck_name 0)}"
+    "$REPO/target/debug/robotctl" \
+        --robot-socket "$STATE/$name.sock" \
+        --tof-socket "$STATE/$name-tof.sock" \
+        "$@"
+}
+
+# ── stopping ──────────────────────────────────────────────────────────────────
+# By pidfile, never by name. `pkill -f robotd` also matches the shell that is about to start one,
+# which is a good way to kill your own terminal — three times in one afternoon, in this case.
+# Stop one thing this script started, identified by name and by what it must still be running.
+#
+# **A pid is not an identity.** This function used to kill the process *group* named by a pidfile,
+# with a `sudo` fallback — and pidfiles go stale, pids are recycled, and a `boot` leaves behind the
+# pidfiles an `up` wrote. The result was `kill -TERM -<recycled pid>` as root, which took out an
+# unrelated process group: it killed a login session, and the machine had to be rebooted to get it
+# back. Nothing here may act on a pid without first confirming, through /proc, that the process is
+# still the one it was written for.
+#
+# No group kill at all any more. Every process this starts is a single process that exits on TERM,
+# and the group form bought nothing but the reach to do damage.
+# How a pid says what it is. /proc is Linux and a Mac has none, so `ps` answers there — and the
+# question is the same either way, which is the point: nothing above may signal a pid without it.
+#
+# A dead pid must not fall through to the other branch and get a second opinion. On Linux an
+# unreadable `cmdline` *is* the answer (the process is gone), so this returns empty rather than
+# asking `ps`; only a machine with no /proc at all reaches it.
+cmdline_of() {
+    if [ -d /proc ]; then
+        tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+    else
+        ps -p "$1" -o command= 2>/dev/null
+    fi
+}
+
+stop_one() {
+    file="$STATE/$1.pid"
+    expect="$2"
+    [ -f "$file" ] || return 0
+    pid="$(tr -dc '0-9' < "$file")"
+    # Removed before anything is signalled, so a stale file cannot be acted on twice.
+    rm -f "$file"
+
+    [ -n "$pid" ] || return 0
+    [ "$pid" -gt 1 ] 2>/dev/null || return 0
+    cmdline_of "$pid" | grep -q -- "$expect" || {
+        say "not stopping pid $pid: it is no longer $1"
+        return 0
+    }
+
+    kill -TERM "$pid" 2>/dev/null || sudo -n kill -TERM "$pid" 2>/dev/null || true
+    # `waited`, not `i`: there are no locals in POSIX sh, and `down` walks its ducks with `i`.
+    # This loop used to leave it wherever the wait ended, so stopping a `robotd` that took a moment
+    # to go moved the caller's counter forward and the `tofd` beside it was never signalled at all.
+    waited=0
+    while [ $waited -lt 25 ] && kill -0 "$pid" 2>/dev/null; do
+        waited=$((waited + 1))
+        sleep 0.2
+    done
+    kill -0 "$pid" 2>/dev/null || return 0
+    kill -KILL "$pid" 2>/dev/null || sudo -n kill -KILL "$pid" 2>/dev/null || true
+}
+
+down() {
+    stop_one robotd robotd
+    stop_one ether duck-ether
+    stop_one body body_server
+    i=0
+    while [ "$i" -lt 16 ]; do
+        stop_one "$(duck_name "$i")" robotd
+        stop_one "$(duck_name "$i")-tof" tofd
+        stop_one "$(duck_name "$i")-media" mediad
+        i=$((i + 1))
+    done
+    # The container-mode radio is a unit, not a pidfile — see `boot`.
+    sudo -n systemctl stop duck-ether 2>/dev/null || true
+    rm -f "$SOCK"
+    # Verified, not assumed: `down` reporting success while a MuJoCo window is still open is worse
+    # than saying nothing, and is exactly what the subshell bug above produced.
+    if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(0 if s.connect_ex(('127.0.0.1',$PORT))==0 else 1)" 2>/dev/null; then
+        say "something is still listening on $PORT — not started by this script?"
+        say "  pkill -f 'body_serve[r]'   # brackets: do not match your own command line"
+        return 1
+    fi
+    say "down"
+}
+
+# ── starting ──────────────────────────────────────────────────────────────────
+
+# Always build, never "unless the binary exists". `target/debug` is shared by every branch checked
+# out in this tree, so a robotd that is present is not a robotd that was built from here: one built
+# on another branch that afternoon installed cleanly, connected to the body, and had no idea what a
+# simulated body was — its `--sim` was the older robot-made-of-nothing — and every duck "would not
+# enable". cargo returns in a moment when nothing changed, which is the only case the guard saved.
+build_daemons() {
+    say "building the daemons from $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds)
+}
+
+# **A checkout has no policies.** They live on the Hub and reach a robot through
+# `scripts/seed-policies.sh` at install time, deliberately outside the release — so a fresh clone
+# has nothing to name here, and a duck started against seven missing files comes up *degraded* and
+# never stands. Same script, same set, a root under the state directory.
+#
+# A `policies/` beside the repo wins if it has one: that is somebody's own set, and fetching over
+# it would silently swap the gait they are working on.
+policies() {
+    if [ -f "$REPO/policies/alpha_stand.onnx" ]; then
+        POLICIES="$REPO/policies"
+        return 0
+    fi
+    POLICIES="$STATE/policies/current"
+    [ -f "$POLICIES/alpha_stand.onnx" ] || {
+        say "no policy set here — fetching the official one"
+        sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
+    }
+    [ -f "$POLICIES/alpha_stand.onnx" ] ||
+        die "no policy set in $STATE/policies. It needs the network once, or your own .onnx files in $REPO/policies."
+}
+
+up() {
+    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
+    # `.so.<version>` on Linux, `.<version>.dylib` on macOS — the wheel names it after the platform
+    # and `ort` dlopens whatever this points at, so both spellings are looked for rather than one.
+    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* \
+            "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime*.dylib \
+            2>/dev/null | head -1)"
+    [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv — the policies cannot load without it."
+
+    down
+    mkdir -p "$STATE"
+
+    build_daemons
+    policies
+
+    # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
+    # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    cat > "$STATE/robotd.toml" <<TOML
+[policy]
+enabled = true
+walk = "$POLICIES/alpha_walking.onnx"
+stand = "$POLICIES/alpha_stand.onnx"
+sitstand = "$POLICIES/alpha_sitstand.onnx"
+ground_pick = "$POLICIES/alpha_ground_pick.onnx"
+kick_left = "$POLICIES/ball_kick_left.onnx"
+kick_right = "$POLICIES/ball_kick_right.onnx"
+roulade = "$POLICIES/roulade.onnx"
+
+# Singing is opt-in, and a room full of ducks that will not sing together is a poor demonstration
+# of a room full of ducks. On a real robot this is a decision someone makes; here it is the point.
+[chorale]
+accept = true
+
+[audio]
+bank = "$STATE/sounds/DUCK"
+# plughw:aic3104 is the board's codec, and robotd passes it to aplay with -D, so on anything that is
+# not a robot every sound fails before ALSA's default is ever consulted. That failure is logged and
+# skipped by design, which is why a silent duck looks like a sound bug. No backticks in this comment:
+# the heredoc is unquoted so that $REPO expands, which means backticks run as commands — these three
+# words were being executed, and "plughw:aic3104: not found" is a confusing thing to read.
+device = "default"
+
+# Its own depth sensor. On a board this is /run/tofd/tof.sock and needs no saying; here every duck
+# has one and they must not share.
+[theremin]
+socket = "$STATE/DUCK-tof.sock"
+TOML
+
+    # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
+    # than that, `robotd` takes its chorale id from the seed recorded in the bank it plays from, and
+    # that id is how a duck recognises its own beacon reflected back. Ducks sharing a bank share an
+    # id, drop each other as their own reflection, and sit there hearing nobody. So: one bank per
+    # duck, seeded from its name.
+    [ -x "$REPO/target/debug/sounds" ] || (cd "$REPO" && cargo build --quiet -p sounds)
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" \
+            "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
+        if [ ! -d "$STATE/sounds/$name" ]; then
+            say "rendering $name a voice"
+            DUCK_IDENTITY="$name" "$REPO/target/debug/sounds" ensure-bank \
+                --dir "$STATE/sounds/$name" >/dev/null 2>&1 || say "$name has no voice"
+        fi
+        i=$((i + 1))
+    done
+
+    start_body
+
+    # Depth, before the daemon that reads it. `tofd --sim` asks the simulator for an 8x8 frame at
+    # the sensor's own 15 Hz — the same rays a real VL53L5CX would cast, from the model's `tof` site,
+    # so a head that turns takes the sensor with it.
+    say "starting tofd"
+    [ -x "$REPO/target/debug/tofd" ] || (cd "$REPO" && cargo build --quiet -p tof)
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/tofd" \
+            --sim "127.0.0.1:$(duck_port "$i")" --socket "$STATE/$name-tof.sock" \
+            > "$STATE/$name-tof.log" 2>&1 &
+        echo $! > "$STATE/$name-tof.pid"
+        i=$((i + 1))
+    done
+
+    say "starting robotd"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        # Its own identity, or every duck on this laptop has the same one — and a chorale id is
+        # how a duck recognises its own beacon reflected back, so identical ducks drop each
+        # other's beacons and never hear anybody. A container gets this from its own machine-id.
+        DUCK_IDENTITY="$name" \
+        DUCK_RUNTIME_DIR="$STATE" ORT_DYLIB_PATH="$ORT" RUST_LOG="${RUST_LOG:-info}" \
+            $SETSID nohup "$REPO/target/debug/robotd" --sim "127.0.0.1:$(duck_port "$i")" \
+            --params "$STATE/robotd-$name.toml" --socket "$STATE/$name.sock" \
+            > "$STATE/$name.log" 2>&1 &
+        echo $! > "$STATE/$name.pid"
+        i=$((i + 1))
+    done
+    # `duck.sock` is whichever duck `ctl` and `drive` talk to — the first one, unless asked.
+    ln -sf "$STATE/$(duck_name 0).sock" "$SOCK"
+    ln -sf "$STATE/$(duck_name 0).log" "$STATE/robotd.log"
+    wait_for_socket || die "robotd did not come up. $STATE/$(duck_name 0).log has why."
+
+    # A `mediad` for every duck with an eye. On the host rather than in a container even in
+    # container mode: `webrtcsink` here is a local build at /opt/gst-plugins-rs, and a Debian
+    # container has no packaged one — so the console is served from the host, pointed at the
+    # simulator's frame port. `360p30` is exactly the 640x360 the renderer produces.
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        if has_camera "$i"; then
+            name="$(duck_name "$i")"
+            [ -x "$REPO/target/debug/mediad" ] || (cd "$REPO" && cargo build --quiet -p mediad)
+            printf '[media]\nquality = "360p30"\n' > "$STATE/mediad-$name.toml"
+            DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" \
+                $SETSID nohup "$REPO/target/debug/mediad" \
+                --sim-camera "127.0.0.1:$((FRAME_PORT + i))" \
+                --config "$STATE/mediad-$name.toml" \
+                --robot-socket "$STATE/$name.sock" --tof-socket "$STATE/$name-tof.sock" \
+                --port $((8443 + i)) --web-port $((8080 + i)) \
+                > "$STATE/$name-media.log" 2>&1 &
+            echo $! > "$STATE/$name-media.pid"
+            say "$name can see — console at http://127.0.0.1:$((8080 + i))"
+        fi
+        i=$((i + 1))
+    done
+
+    # The radio, once there is more than one duck to hear. It is a client of each `robotd` exactly
+    # as `btd` is, so nothing above the socket knows the difference.
+    if [ "$DUCKS" -gt 1 ]; then
+        [ -x "$REPO/target/debug/duck-ether" ] || (cd "$REPO" && cargo build --quiet -p duck-ether)
+        args=""
+        i=0
+        while [ "$i" -lt "$DUCKS" ]; do
+            args="$args --duck $(duck_name "$i")=$STATE/$(duck_name "$i").sock@$(duck_port "$i")"
+            i=$((i + 1))
+        done
+        # shellcheck disable=SC2086
+        $SETSID nohup "$REPO/target/debug/duck-ether" $args > "$STATE/ether.log" 2>&1 &
+        echo $! > "$STATE/ether.pid"
+        say "the ether is open — $DUCKS ducks can hear each other"
+    fi
+
+    say "standing up"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        SOCK_I="$STATE/$(duck_name "$i").sock" stand_at "$STATE/$(duck_name "$i").sock" || \
+            say "$(duck_name "$i") would not enable"
+        i=$((i + 1))
+    done
+    sleep 6
+    ctl health | head -3
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
+        i=$((i + 1))
+    done
+
+    cat <<'NEXT'
+
+  Your duck is up. From here:
+
+    scripts/duck-sim drive        walk it forward, then stop
+    scripts/duck-sim ctl health   or anything else robotctl does
+    scripts/duck-sim ctl robot do roulade
+    scripts/duck-sim log          what the daemon is saying
+    scripts/duck-sim down
+
+NEXT
+}
+
+# **`robot.enable`, not `robot init`.** `init` enables torque and then position-ramps to the home
+# pose over two seconds with nothing balancing — and this duck cannot hold any pose without a policy
+# driving it, at any timestep, from any placement. So the ramp tipped it flat every time: gravity in
+# the trunk frame went from -1.000 to +0.016 inside those two seconds, and it lay there. `enable`
+# hands the robot to the policy directly, and from a seated start it stands itself up: trunk 0.063
+# to 0.116 m, upright and steady.
+#
+# There is no `robotctl` subcommand for it — the console has the button — so this is the call.
+stand() { stand_at "$SOCK"; }
+
+stand_at() {
+    python3 - "$1" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1])
+f = s.makefile("rw")
+f.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "robot.enable",
+                    "params": {"on": True}}) + "\n"); f.flush()
+answer = json.loads(f.readline())
+sys.exit(0 if answer.get("result", {}).get("accepted") else 1)
+PY
+}
+
+# Did it actually stand? Two numbers, because one of them is not enough.
+#
+# **Trunk height is the one that answers it.** An earlier version asked only for gravity in the
+# trunk frame and called -0.978 upright — but a duck sitting on its bottom with a vertical trunk has
+# gravity [0, 0, -1] as surely as a standing one does, so it reported a seated duck as standing
+# while the window showed it sitting. `STAND` is 0.12 and `SIT` is 0.07; halfway is the line.
+# Orientation still matters, for the duck that stood up and then fell over.
+upright() { upright_at "$PORT" "the duck"; }
+
+upright_at() {
+    read_z="$(python3 - "$1" <<'PY'
+import json, socket, sys
+s = socket.socket(); s.settimeout(2); s.connect(("127.0.0.1", int(sys.argv[1])))
+f = s.makefile("rw")
+f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
+f.write('{"op":"read"}\n'); f.flush()
+r = json.loads(f.readline())
+print("%.3f %.3f" % (r.get("trunk_z", -1.0), r["imu"]["gravity"][2]))
+PY
+)" || return 0
+    trunk="${read_z% *}"
+    z="${read_z#* }"
+    standing="$(python3 -c "print(1 if $trunk > 0.095 else 0)" 2>/dev/null || echo 0)"
+    if [ "$standing" = 1 ]; then
+        case "$z" in
+            -0.9*|-1*) say "$2: standing (trunk $trunk m, gravity z $z)"; return 0 ;;
+        esac
+    fi
+
+    printf '\n'
+    say "$2 did not stand up (trunk ${trunk}m, standing is about 0.12; gravity z $z)"
+    if grep -q "behind real time" "$STATE/body.log" 2>/dev/null; then
+        cat <<'WHY'
+  The simulator could not keep real time, and that is almost certainly why. The daemon's loop is
+  wall-clock: if MuJoCo runs at half speed the policy is effectively driving a robot that moves half
+  as fast as it expects, and it cannot balance one. The viewer is the usual cause.
+
+    scripts/duck-sim down && DUCK_SIM_VIEWER=0 scripts/duck-sim
+WHY
+    else
+        cat <<'WHY'
+  The simulator kept up, so this is the policy rather than the pacing. Worth a look:
+
+    scripts/duck-sim log                 what the daemon decided
+    scripts/duck-sim stand               try again
+WHY
+    fi
+    return 1
+}
+
+# Does this duck have an eye? `all`, or its letter in the list.
+has_camera() {
+    case "$CAMERAS" in
+        "")   return 1 ;;
+        all)  return 0 ;;
+        *)    case ",$CAMERAS," in *",$(printf %s "$LETTERS" | cut -c$(($1 + 1))),"*) return 0 ;; esac
+              return 1 ;;
+    esac
+}
+
+# The body, on the host in both modes: MuJoCo is not going in a container, and the container shares
+# the host's network namespace so localhost is the same localhost either way.
+start_body() {
+    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
+    mkdir -p "$STATE"
+    say "starting the body — a MuJoCo window should open"
+    # `DUCK_SIM_VIEWER=0` for a window-less run: watching costs frames, and the daemon's loop is
+    # wall-clock, so a simulator that cannot keep up is a robot that cannot balance.
+    [ "${DUCK_SIM_VIEWER:-1}" = 0 ] && HEADLESS=--headless || HEADLESS=
+    # **The viewer needs `mjpython` on macOS.** MuJoCo's passive viewer has to own the main thread
+    # and the Cocoa event loop, so `launch_passive` refuses under a plain interpreter — the body
+    # server catches that and runs headless, which is a window that never opens and no error to
+    # explain it. `mjpython` is the launcher the wheel ships for exactly this. Linux has no such
+    # rule, and asking for headless has nothing to launch either way.
+    PY_BIN="$RL/.venv/bin/python"
+    if [ -z "$HEADLESS" ] && [ "$(uname -s)" = Darwin ] && [ -x "$RL/.venv/bin/mjpython" ]; then
+        PY_BIN="$RL/.venv/bin/mjpython"
+    fi
+    # **Backgrounded directly, and in its own session.** `( cd X && nohup cmd & echo $! )` records
+    # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
+    # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
+    # group, which is what makes stopping it one signal rather than a hunt.
+    case "$SCENE" in
+        "")   scene_arg="" ;;
+        */*)  scene_arg="--scene $SCENE" ;;
+        *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+    esac
+    # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
+    # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
+    # invocation over two arguments nobody asked to use, and the duck never starts. Passed only
+    # when a camera was actually requested, so asking for one against such a build still fails,
+    # loudly and about the thing that is missing.
+    cam_args=""
+    if [ -n "$CAMERAS" ]; then
+        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT"
+    fi
+    # shellcheck disable=SC2086
+    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
+        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
+        $cam_args \
+        > "$STATE/body.log" 2>&1 &
+    echo $! > "$STATE/body.pid"
+    wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
+}
+
+wait_for_port() {
+    i=0
+    while [ $i -lt 100 ]; do
+        # Not /dev/tcp: that is a bash builtin and this is #!/bin/sh, which is dash on Debian
+        # and Ubuntu. python3 is already required by `drive`, so it is the portable knock.
+        if python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(s.connect_ex(('127.0.0.1',$PORT)))" 2>/dev/null; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.2
+    done
+    return 1
+}
+
+wait_for_socket() {
+    i=0
+    while [ $i -lt 150 ]; do
+        [ -S "$SOCK" ] && ctl health >/dev/null 2>&1 && return 0
+        i=$((i + 1)); sleep 0.2
+    done
+    return 1
+}
+
+# Walking has no robotctl subcommand — intents come from a pad or the console — so this is the
+# smallest client that sends one. Resent at 10 Hz because `robotd` expires an intent 500 ms after
+# they stop arriving, which is what makes a dropped connection stop the robot rather than run it
+# into a wall.
+drive() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    say "walking forward for 8 s"
+    python3 - "$SOCK" "${1:-0.15}" "${2:-0.0}" <<'PY'
+import json, socket, sys, time
+sock, vx, vyaw = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+s = socket.socket(socket.AF_UNIX); s.connect(sock)
+f = s.makefile("w")
+for _ in range(80):
+    f.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
+                        "params": {"vx": vx, "vy": 0.0, "vyaw": vyaw}}) + "\n")
+    f.flush()
+    time.sleep(0.1)
+PY
+    say "stopped — the intent expires on its own"
+}
+
+# How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
+# real time is not merely slow to watch — the policies are driving robots that move less than they
+# expect, and they cannot balance one. Reported rather than left to be felt.
+realtime() {
+    factor="$(python3 - "$PORT" <<'PY'
+import json, socket, sys, time
+s = socket.socket(); s.settimeout(5); s.connect(("127.0.0.1", int(sys.argv[1])))
+f = s.makefile("rw")
+f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
+def now():
+    f.write('{"op":"read"}\n'); f.flush(); return json.loads(f.readline())["sim_time"]
+a, w = now(), time.perf_counter()
+time.sleep(3.0)
+print("%.2f" % ((now() - a) / (time.perf_counter() - w)))
+PY
+)" || return 0
+    case "$factor" in
+        1.0*|0.9[5-9]) say "the world is running at ${factor}x real time" ;;
+        *) say "the world is at ${factor}x real time — below 1.0 the policies cannot balance. \
+Try DUCK_SIM_VIEWER=0, or fewer ducks." ;;
+    esac
+}
+
+# ── the container ─────────────────────────────────────────────────────────────
+
+# Every duck this script could have started, stopped and unmounted. By name from the same list that
+# starts them, so a duck left behind by an interrupted boot is still cleaned up.
+down_containers() {
+    # Called by every `down`, including the plain one. A machine with no systemd has no containers
+    # to stop, and sixteen `sudo systemctl` that cannot resolve would ask for a password first.
+    command -v systemctl >/dev/null 2>&1 || return 0
+    i=0
+    while [ "$i" -lt 16 ]; do
+        name="$(duck_name "$i")"
+        if sudo systemctl is-active --quiet "$name" 2>/dev/null; then
+            sudo systemctl stop "$name" 2>/dev/null || true
+        fi
+        merged="$STATE/ducks/$name/merged"
+        mountpoint -q "$merged" 2>/dev/null && sudo umount "$merged" 2>/dev/null || true
+        i=$((i + 1))
+    done
+}
+
+
+ROOTFS="$STATE/rootfs"
+
+# duck-a, duck-b, … — one container each, one body port each, all in one world.
+LETTERS=abcdefghijklmnop
+duck_name() { echo "duck-$(printf %s "$LETTERS" | cut -c$(($1 + 1)))"; }
+duck_port() { echo $((PORT + $1)); }
+
+# Debian 13 Trixie, the board's own userland, built unprivileged. Two things an Ubuntu host needs
+# and does not have: Debian's archive keyring, and apt not dropping to a `_apt` uid that the user
+# namespace cannot map — which leaves files nobody can delete.
+# What the container needs beyond a minimal Debian. `alsa-utils` is `aplay`, which `robotd` forks to
+# make a sound — without it the ducks sing silently, and by design that failure is logged and skipped.
+# `libasound2-plugins` is the ALSA-to-PulseAudio bridge, which is what lets several ducks be audible
+# at once rather than the first one holding the device.
+PACKAGES=systemd-sysv,dbus,libssl3,ca-certificates,alsa-utils,libasound2-plugins
+
+rootfs() {
+    containers_or_die
+    # The list is recorded, so changing it rebuilds rather than silently not taking effect — which is
+    # otherwise a round trip spent wondering why a pull changed nothing.
+    if [ -d "$ROOTFS" ] && [ "$(cat "$STATE/rootfs.packages" 2>/dev/null)" = "$PACKAGES" ]; then
+        say "rootfs already at $ROOTFS (delete it to rebuild)"
+        return 0
+    fi
+    if [ -d "$ROOTFS" ]; then
+        say "the package list changed — rebuilding the rootfs"
+        sudo rm -rf "$ROOTFS"
+    fi
+    command -v mmdebstrap >/dev/null || die "mmdebstrap is missing: sudo apt install mmdebstrap"
+    mkdir -p "$STATE/keyring"
+    if [ ! -f "$STATE/keyring/usr/share/keyrings/debian-archive-keyring.gpg" ]; then
+        say "fetching Debian's archive keyring (this host is not Debian)"
+        deb="$(curl -s http://deb.debian.org/debian/pool/main/d/debian-archive-keyring/ \
+            | grep -o 'debian-archive-keyring_[0-9.]*_all\.deb' | sort -u | tail -1)"
+        [ -n "$deb" ] || die "could not find the keyring package on deb.debian.org"
+        curl -sSL -o "$STATE/keyring.deb" "http://deb.debian.org/debian/pool/main/d/debian-archive-keyring/$deb"
+        dpkg-deb -x "$STATE/keyring.deb" "$STATE/keyring"
+    fi
+    # The keyring has to be readable by the uid apt drops to *inside* the user namespace, and a
+    # keyring under a 0700 `~/.cache` is not — apt then reports the repository as unsigned, which
+    # reads like a mirror problem and is a permissions one. So it is staged somewhere traversable
+    # for the length of the build.
+    KEYDIR="$(mktemp -d)"
+    chmod 755 "$KEYDIR"
+    cp "$STATE"/keyring/usr/share/keyrings/*.gpg "$KEYDIR/"
+    chmod 644 "$KEYDIR"/*.gpg
+    trap 'rm -rf "$KEYDIR"' EXIT
+
+    say "building a Debian 13 rootfs — about three minutes, once"
+    # **A tarball, then unpack it as root.** Building the tree directly needs every parent directory
+    # traversable by the subuids mmdebstrap maps into, and `~/.cache` is 0700 — which is the user's
+    # business, not this script's. A tar is one file in a directory we own, and unpacking it with
+    # the sudo `boot` already needs is what gets the ownership right.
+    mmdebstrap --variant=important \
+        --keyring="$KEYDIR" \
+        --aptopt='APT::Sandbox::User "root"' \
+        --include="$PACKAGES" \
+        --format=tar \
+        trixie "$STATE/rootfs.tar" http://deb.debian.org/debian
+    say "unpacking it (sudo, for the ownership)"
+    sudo mkdir -p "$ROOTFS"
+    sudo tar -xpf "$STATE/rootfs.tar" -C "$ROOTFS"
+    rm -f "$STATE/rootfs.tar"
+    printf '%s' "$PACKAGES" > "$STATE/rootfs.packages"
+    say "rootfs ready ($(sudo du -sh "$ROOTFS" | cut -f1))"
+}
+
+# Everything a release puts on a board, put here by hand — this is not `robotctl update apply`, it
+# is what a board looks like *after* one, so that the units and the daemons are the real thing.
+stage() {
+    ORT="$(ls "$RL"/.venv/lib/python*/site-packages/onnxruntime/capi/libonnxruntime.so.* 2>/dev/null | head -1)"
+    [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv"
+    say "installing the release into the container"
+    # **Every daemon's users, not just robotd's.** A unit whose `User=` does not exist fails with
+    # 217/USER and says nothing about a missing user — which is how `tofd` looked like a sensor that
+    # was never wired when it was only unable to start. The release's own postinstall installs every
+    # sysusers file it ships, so this does too, plus the `i2c` group `tofd.service` asks for and that
+    # a board gets from provisioning rather than from a release. mediad, btd and padd would each
+    # have arrived at the same wall in turn.
+    # **No apostrophes below this line.** The whole block is one single-quoted argument, so an
+    # apostrophe in a comment ends it — the rest becomes unquoted shell, and it swallowed the brace
+    # that closes this function along with the next one. `sh -n` sees nothing wrong, because the
+    # quotes balance; the symptom is `boot: not found` from a script that clearly defines boot.
+    #
+    # Which body a duck drives is therefore not written here. It goes into that duck-s own overlay
+    # in `boot`, because the environment does not survive the trip: `systemd-nspawn --setenv` sets
+    # a variable for the container PID 1, and systemd does not pass its own environment to the
+    # services it starts.
+    sudo sh -eu -c '
+        ROOTFS="$1"; REPO="$2"; ORT="$3"; PORT="$4"
+        REL="$ROOTFS/opt/robot/daemon/releases/sim"
+        mkdir -p "$REL/bin" "$REL/policies" "$ROOTFS/etc/systemd/system/robotd.service.d"
+        install -m755 "$REPO/target/debug/robotd" "$REPO/target/debug/robotctl" "$REL/bin/"
+        cp "$REPO"/policies/*.onnx "$REL/policies/"
+        ln -sfn /opt/robot/daemon/releases/sim "$ROOTFS/opt/robot/daemon/current"
+        # On PATH, because the first thing anybody types after logging into a duck is `robotctl`
+        # and `command not found` is a poor greeting. A symlink rather than a profile.d line: it
+        # works for `machinectl shell duck-a robotctl …` too, which does not read a profile.
+        ln -sfn /opt/robot/daemon/current/bin/robotctl "$ROOTFS/usr/local/bin/robotctl"
+        cp "$ORT" "$ROOTFS/usr/lib/"
+        ln -sfn "/usr/lib/$(basename "$ORT")" "$ROOTFS/usr/lib/libonnxruntime.so"
+        cp "$REPO"/robotd/systemd/robotd.service "$ROOTFS/etc/systemd/system/"
+        cp "$REPO"/tof/systemd/tofd.service "$ROOTFS/etc/systemd/system/" 2>/dev/null || true
+        install -m755 "$REPO/target/debug/tofd" "$REL/bin/" 2>/dev/null || true
+        mkdir -p "$ROOTFS/usr/lib/sysusers.d"
+        cp "$REPO"/btd/systemd/sysusers.d/btd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/mediad/systemd/sysusers.d/mediad.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/padd/systemd/sysusers.d/padd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/tof/systemd/sysusers.d/tofd.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        cp "$REPO"/updater/systemd/sysusers.d/robot.conf "$ROOTFS/usr/lib/sysusers.d/" 2>/dev/null || true
+        printf "g i2c -\n" > "$ROOTFS/usr/lib/sysusers.d/duck-sim-groups.conf"
+        # ALSA pointed at the host, so `aplay` reaches the machine speakers rather than a sound card
+        # the container does not have. Through the host audio server rather than /dev/snd, because
+        # that is what lets four ducks be audible at once.
+        printf "pcm.!default { type pulse }\nctl.!default { type pulse }\n" > "$ROOTFS/etc/asound.conf"
+        # **Run now, not left to the container.** `systemd-sysusers.service` carries
+        # `ConditionNeedsUpdate=/etc`, and staging writes /etc after /usr — so /etc looks newer, the
+        # condition is not met, and the unit is skipped. The users then do not exist, `tofd.service`
+        # dies with 217/USER, and from the monitor that looks like a sensor nobody wired. The
+        # release postinstall runs this directly for the same reason.
+        chroot "$ROOTFS" /usr/bin/systemd-sysusers >/dev/null 2>&1 || true
+        # Verified here rather than discovered three layers down.
+        for who in tofd robot mediad btd padd; do
+            grep -q "^$who:" "$ROOTFS/etc/passwd" "$ROOTFS/etc/group" 2>/dev/null \
+                || echo "  WARNING: no $who user or group — the unit that needs it will not start"
+        done
+        # The body is on the host, and this container shares the host network namespace, so
+        # localhost is the same localhost.
+        rm -f "$ROOTFS/etc/systemd/system/robotd.service.d/sim.conf"
+        # No params file at all: inside the container `RELEASE_DIR` is real, so every policy
+        # resolves the way it does on a robot. That is the whole point of booting one.
+        rm -f "$ROOTFS/etc/robot/robotd.toml"
+        printf "root:x:0:\n" >/dev/null
+        chroot "$ROOTFS" /usr/bin/passwd -d root >/dev/null 2>&1 || true
+        chroot "$ROOTFS" /usr/bin/systemctl enable robotd.service tofd.service >/dev/null 2>&1 || true
+    ' _ "$ROOTFS" "$REPO" "$ORT" "$PORT"
+}
+
+# `boot`, `shell` and `rootfs` are systemd, and a machine without it cannot run any of them. Said
+# here, before anything reaches for `sudo` — a password prompt followed by `machinectl: command not
+# found` is a worse way to learn it.
+containers_or_die() {
+    command -v systemd-nspawn >/dev/null 2>&1 && return 0
+    die "this needs systemd-nspawn, which is Linux only. \`scripts/duck-sim\` with no argument runs the same body and the same daemons as plain processes."
+}
+
+boot() {
+    containers_or_die
+    # Always, not only when the directory is missing: deciding whether the rootfs is still the right
+    # one is `rootfs`'s job, and guarding the call on the directory existing is what stopped a
+    # changed package list from ever being noticed. It returns in a moment when nothing has changed.
+    rootfs
+    build_daemons
+    stage
+    start_body
+
+    # The host's audio server, if there is one. A duck with no speaker is not an error — on a board
+    # `robotd` logs a failed `aplay` and carries on — so this is offered rather than required.
+    AUDIO_BIND=""
+    if [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+        AUDIO_BIND="--bind=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native:/run/pulse-host"
+    else
+        say "no host audio server — the ducks will sing silently"
+    fi
+
+    # **One rootfs, one overlay per duck.** The base is read-only and each duck gets its own upper,
+    # so duck four costs megabytes rather than 213 of them — and `robotctl configure` on one duck
+    # does not edit another's config.
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        upper="$STATE/ducks/$name"
+        sudo mkdir -p "$upper/upper" "$upper/work" "$upper/merged"
+        sudo mount -t overlay overlay \
+            -o "lowerdir=$ROOTFS,upperdir=$upper/upper,workdir=$upper/work" "$upper/merged"
+        # Its own name. `--hostname` below sets the kernel one, and then systemd inside reads
+        # /etc/hostname — which mmdebstrap filled in with the name of the machine that built the
+        # rootfs — and sets it back. A duck should not think it is a laptop.
+        printf '%s\n' "$name" | sudo tee "$upper/merged/etc/hostname" >/dev/null
+        # This duck's own body, in this duck's own filesystem — which is what the overlay is for.
+        #
+        # **And its socket somewhere the ether can reach.** A container's `/run` is its own, so
+        # `/run/robotd.sock` inside it is invisible from here — and the radio has to hold one
+        # connection per duck, from outside all of them. So a host directory is bound in at
+        # `/run/duck`, robotd is told to listen there, and a symlink puts it back at the path every
+        # client in the container expects. The socket is then the same object on both sides.
+        sudo mkdir -p "$upper/merged/etc/systemd/system/robotd.service.d" "$upper/run"
+        sudo tee "$upper/merged/etc/systemd/system/robotd.service.d/sim.conf" >/dev/null <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/robotd --sim 127.0.0.1:$(duck_port "$i") --socket /run/duck/robotd.sock
+ExecStartPost=/bin/ln -sf /run/duck/robotd.sock /run/robotd.sock
+Environment=PULSE_SERVER=unix:/run/pulse-host
+CONF
+        sudo mkdir -p "$upper/merged/etc/systemd/system/tofd.service.d"
+        # `RestrictAddressFamilies=AF_UNIX` in the unit, because on a robot `tofd` talks to a bus
+        # and a socket and has no business with TCP. Here its sensor is across a TCP connection, and
+        # the sandbox refuses it with EAFNOSUPPORT — "Address family not supported by protocol",
+        # which reads like a broken network rather than a policy. Reset and re-stated rather than
+        # appended: these merge as a union, and being explicit is what makes the drop-in readable.
+        sudo tee "$upper/merged/etc/systemd/system/tofd.service.d/sim.conf" >/dev/null <<CONF
+[Service]
+ExecStart=
+ExecStart=/opt/robot/daemon/current/bin/tofd --sim 127.0.0.1:$(duck_port "$i")
+RestrictAddressFamilies=
+RestrictAddressFamilies=AF_UNIX AF_INET
+CONF
+        # Singing is opt-in. Only this key: everything else resolves from the release, which is
+        # the reason to boot a container in the first place.
+        sudo mkdir -p "$upper/merged/etc/robot"
+        printf '[chorale]\naccept = true\n\n[audio]\ndevice = "default"\n' \
+            | sudo tee "$upper/merged/etc/robot/robotd.toml" >/dev/null
+        # A voice of its own — the chorale id comes from the bank seed, so ducks sharing a bank
+        # share an id and drop each other as their own reflection.
+        if [ ! -d "$upper/merged/var/lib/robot/sounds" ]; then
+            say "rendering $name a voice"
+            sudo env DUCK_IDENTITY="$name" "$REPO/target/debug/sounds" ensure-bank \
+                --dir "$upper/merged/var/lib/robot/sounds" >/dev/null 2>&1 || say "$name has no voice"
+        fi
+        say "booting $name (body on port $(duck_port "$i"))"
+        sudo systemd-run --collect --unit="$name" --quiet \
+            systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
+            --hostname="$name" --resolv-conf=copy-host \
+            --bind="$upper/run:/run/duck" $AUDIO_BIND
+        i=$((i + 1))
+    done
+
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        j=0
+        while [ $j -lt 60 ]; do
+            sudo machinectl show "$name" >/dev/null 2>&1 && break
+            j=$((j + 1)); sleep 0.5
+        done
+        i=$((i + 1))
+    done
+    sleep 5
+
+    # Hand each to its policy, from inside — the socket lives in that container's own /run, which is
+    # the point. `enable` rather than `init`: see `robotctl robot enable`.
+    say "standing them up"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        # `systemd-run --machine`, not `machinectl shell`: the latter allocates a PTY and is
+        # unhappy with its output redirected, which is how three ducks out of four were quietly
+        # never enabled. This runs the command in the container and waits for its exit status.
+        if ! sudo systemd-run --machine="$name" --pipe --wait --quiet \
+            /usr/local/bin/robotctl robot enable >/dev/null 2>&1; then
+            say "$name would not enable — shell in and try \`robotctl robot enable\`"
+        fi
+        i=$((i + 1))
+    done
+    sleep 5
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        PORT_I="$(duck_port "$i")" upright_at "$(duck_port "$i")" "$(duck_name "$i")" || true
+        i=$((i + 1))
+    done
+
+    # The radio, reaching each duck through the socket bound out of its container.
+    if [ "$DUCKS" -gt 1 ]; then
+        [ -x "$REPO/target/debug/duck-ether" ] || (cd "$REPO" && cargo build --quiet -p duck-ether)
+        args=""
+        i=0
+        while [ "$i" -lt "$DUCKS" ]; do
+            name="$(duck_name "$i")"
+            args="$args --duck $name=$STATE/ducks/$name/run/robotd.sock@$(duck_port "$i")"
+            i=$((i + 1))
+        done
+        # A unit, not a background process with a pidfile. It has to run as root — robotd creates
+        # its socket 0660 root:robot, and the host group would not help since the container has its
+        # own — and a root process stopped by pid is exactly the shape that killed a login session.
+        # `systemctl stop duck-ether` needs no pid and cannot be wrong about which process it is.
+        # shellcheck disable=SC2086
+        sudo systemd-run --collect --unit=duck-ether --quiet \
+            "$REPO/target/debug/duck-ether" $args
+        say "the ether is open — $DUCKS ducks can hear each other"
+    fi
+
+    realtime
+
+    cat <<NEXT
+
+  scripts/duck-sim shell           you are on $(duck_name 0)
+  scripts/duck-sim shell duck-b    or any other
+  duck-a # robotctl health
+
+  scripts/duck-sim down
+
+NEXT
+}
+
+shell() {
+    containers_or_die
+    sudo machinectl shell "${1:-$(duck_name 0)}"
+}
+
+case "${1:-up}" in
+    up|"")   up ;;
+    rootfs)  rootfs ;;
+    boot)    shift; DUCKS="${1:-$DUCKS}"; boot ;;
+    shell)   shift; shell "$@" ;;
+    down)    down_containers; down ;;
+    drive)   shift; drive "$@" ;;
+    ctl)     shift; ctl "$@" ;;
+    stand)   stand && sleep 6 && upright ;;
+    status)  ctl health | head -4; upright ;;
+    monitor) shift; ctl monitor "$@" ;;
+    log)     tail -f "$STATE/robotd.log" ;;
+    simlog)  tail -f "$STATE/body.log" ;;
+    realtime) realtime ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
+esac

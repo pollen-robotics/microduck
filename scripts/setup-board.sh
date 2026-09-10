@@ -48,6 +48,10 @@ CMDLINE="${CMDLINE:-/proc/cmdline}"
 
 BT_CONF=/etc/bluetooth/main.conf
 
+# BlueZ's input profile settings. One line in it decides who carries a classic (BR/EDR) gamepad's
+# reports — see `configure_classic_hid`. Every board gets that change; no flag.
+BT_INPUT_CONF=/etc/bluetooth/input.conf
+
 # Does this board need `Privacy = device`? `--weird-ble` on provision-board.sh.
 #
 # Off by default: some Zero 3W units bond a pad under BlueZ's own default and want nothing from
@@ -812,6 +816,49 @@ configure_bluetooth() {
     write_pause_marker
 }
 
+# A classic (BR/EDR) gamepad's reports go through the kernel, not through bluetoothd.
+#
+# BlueZ 5.82 defaults `UserspaceHID=true`: bluetoothd reads every HID report from the L2CAP socket
+# and re-injects it into the kernel through uhid. For an LE pad (Xbox) this setting is irrelevant —
+# HID over GATT is bluetoothd's own profile either way, and the Xbox sends nothing while idle. For a
+# classic pad it is the whole data path, and the no-name "Pro Controller" Switch clones stream IMU
+# samples in every packet at ~200 packets/s whether or not anyone touches them. Measured on graphite,
+# 2026-09-09, pad connected and untouched:
+#
+#   UserspaceHID=true   bluetoothd 15.8 % CPU, ~594 IMU reports/s on /dev/input/event5, nodes under
+#                       /sys/devices/virtual/misc/uhid/
+#   UserspaceHID=false  bluetoothd  0.0 %, same reports, nodes under .../hci0/hci0:128/ — the
+#                       kernel's hidp owns the channel and hid-nintendo binds exactly as before
+#
+# The bond, the reconnect after a reboot and `padd` driving from the pad were all unchanged by the
+# switch; the pad reconnected by itself on the first boot with the new value. No flag, because there
+# is no board on which the userspace path is the better one: it costs a core's worth of context
+# switches and buys nothing this robot uses.
+#
+# Applies at the next bluetoothd start, which on this board means a reboot — see the note on
+# `needs_reboot` above `configure_bluetooth`.
+configure_classic_hid() {
+    if [ ! -f "$BT_INPUT_CONF" ]; then
+        say "no ${BT_INPUT_CONF}; writing one with UserspaceHID=false"
+        printf '[General]\nUserspaceHID=false\n' > "$BT_INPUT_CONF"
+        needs_reboot=1
+        return 0
+    fi
+    if grep -Eq '^[[:space:]]*UserspaceHID[[:space:]]*=[[:space:]]*false' "$BT_INPUT_CONF"; then
+        say "bluetooth UserspaceHID already false (classic pads go through the kernel)"
+        return 0
+    fi
+    say "setting UserspaceHID=false in ${BT_INPUT_CONF} (classic pads through the kernel, not bluetoothd)"
+    if grep -Eq '^[[:space:]]*#?[[:space:]]*UserspaceHID[[:space:]]*=' "$BT_INPUT_CONF"; then
+        sed -i -E 's|^[[:space:]]*#?[[:space:]]*UserspaceHID[[:space:]]*=.*|UserspaceHID=false|' "$BT_INPUT_CONF"
+    elif grep -q '^\[General\]' "$BT_INPUT_CONF"; then
+        sed -i '/^\[General\]/a UserspaceHID=false' "$BT_INPUT_CONF"
+    else
+        printf '\n[General]\nUserspaceHID=false\n' >> "$BT_INPUT_CONF"
+    fi
+    needs_reboot=1
+}
+
 # The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
 #
 # Its own function because both flags write it and only one of them touches `Privacy` — which is the
@@ -1059,6 +1106,7 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_classic_hid
     configure_audio
     configure_tof
     # After configure_audio, which is what installs the vendor kernel: the camera's MIPI-CSI

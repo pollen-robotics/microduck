@@ -235,6 +235,24 @@ pub enum Error {
     Internal(String),
 }
 
+/// A refusal from the account crate, as this protocol's refusals.
+///
+/// The crate's own messages are deliberately not carried through. It cannot know that the way
+/// past `AlreadySignedIn` on a duck is spelled `--force` on a command line, and a message that
+/// says "force" where a person has to type `--force` is the kind of near-miss that costs a
+/// support round trip. The variants map; the words are this crate's.
+impl From<hf_robot_account::Error> for Error {
+    fn from(e: hf_robot_account::Error) -> Self {
+        use hf_robot_account::Error as Hf;
+        match e {
+            Hf::LoginInFlight => Error::LoginInFlight,
+            Hf::AlreadySignedIn(who) => Error::AlreadySignedIn(who),
+            Hf::Io { path, source } => Error::Io { path, source },
+            Hf::Network(why) => Error::Network(why),
+        }
+    }
+}
+
 impl Error {
     /// JSON-RPC error code for this failure.
     pub fn code(&self) -> i32 {

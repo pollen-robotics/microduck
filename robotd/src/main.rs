@@ -54,7 +54,8 @@ type PowerOff = Arc<dyn Fn() + Send + Sync>;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
 /// sensor-input / actuator-output contract a model sees changes.
-const MODEL_API: u32 = 1;
+// API 2 adds explicit recurrent state; API 1 feed-forward models remain supported.
+const MODEL_API: u32 = 2;
 
 /// Socket mode. Same reasoning as `updaterd`'s: the group decides who may ask.
 const SOCKET_MODE: u32 = 0o660;
@@ -66,6 +67,22 @@ const MAX_LINE: usize = 64 * 1024;
 /// Per-tick logging would be ~4.3M lines a day at 50 Hz. That is not merely noise: under a
 /// journal size cap it is what *evicts* the logs support needs.
 const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// How often an *isolated* dropped bus transaction is worth a line.
+///
+/// One drop is ordinary on a serial bus and a run of them is a fault, so the loop logs the first
+/// of a run and every tenth after it. That rule reads `consecutive_errors`, which resets on the
+/// next good read — so it never fired on the case a board actually produces: one drop, one good
+/// read, one drop, at about a hertz, forever `consecutive=1`. Every one of them was logged.
+///
+/// Which is the failure [`LOOP_SUMMARY_INTERVAL`] exists to prevent, arriving by another door: a
+/// journal under a size cap, filled with the most ordinary event the robot has, evicting the
+/// history somebody will need — and, since `duckctl logs` reads that journal over a radio, forty
+/// lines of it saying nothing else.
+///
+/// So an isolated drop gets one line a minute, carrying how many it stands for. A *run* is not
+/// rate-limited: that is the spasm, and it stays as loud as it was.
+const BUS_DROP_QUIET: Duration = Duration::from_secs(60);
 
 /// How fast the beak follows the vowel being sung, as a time constant.
 ///
@@ -219,10 +236,22 @@ struct Args {
     #[arg(long)]
     port: Option<String>,
 
-    /// Run against a robot made of nothing. For laptop development and tests — there is no
-    /// simulator yet, and this is what stands in for one.
+    /// Run against a robot made of nothing. For laptop development and tests, and for the cases
+    /// `--sim` does not cover: no physics, no falling over, positions that echo back perfectly.
     #[arg(long)]
     fake: bool,
+
+    /// Run against a robot in MuJoCo, at `host:port`.
+    ///
+    /// **The same daemon, a simulated body.** Everything above `duck_control::io::RobotIo` — the
+    /// loop, the policy, safety, fall detection, odometry, kinematics, every IPC call — is the code
+    /// that runs on a robot, unchanged and unable to tell. `duck_control::sim` has the protocol and
+    /// the reasons for its shape; `docs/design/simulation.md` has what it is and is not a twin of.
+    ///
+    /// Nothing is connected until the first tick, and a simulator that goes away is retried on
+    /// every tick after — restarting MuJoCo must not mean restarting the duck.
+    #[arg(long, conflicts_with = "fake")]
+    sim: Option<String>,
 
     /// Do not load a policy: run the loop and hold the startup pose.
     ///
@@ -599,6 +628,12 @@ struct RobotState {
     /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
     /// feature that silently does nothing.
     theremin_ready: AtomicBool,
+    /// Whether `[theremin] enabled` allows an instrument at all, and there is a voice to play
+    /// it in. Read once at startup, like the policies — and kept separate from
+    /// [`State::theremin_ready`] so that the refusal can name the switch. Off is the default,
+    /// so "the feature is not turned on" is the answer most of these refusals want, and
+    /// sending that person to look at `tofd` wastes their evening.
+    theremin_allowed: bool,
     /// Whether this robot's config allows it to sing with others. Read once at startup, like the
     /// policies: `[chorale] accept`, false by default.
     chorale_accepted: bool,
@@ -665,6 +700,7 @@ impl RobotState {
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
+            theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
             fallen: AtomicBool::new(false),
@@ -991,17 +1027,12 @@ async fn main() -> ExitCode {
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
 fn run_init(params: &Params, duration: Duration) -> ExitCode {
-    let mut io = match duck_control::bus::DynamixelIo::open(&params.bus.port) {
-        Ok(io) => io,
-        Err(e) => {
-            tracing::error!(error = %e, port = %params.bus.port, "cannot open the bus");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(e) = io.check_registers() {
-        tracing::error!(error = %e, "motor register check failed");
+    // The same open as the daemon's, replacement adoption included: `init` is what someone
+    // reaches for right after a motor swap, and it must not be the one path that refuses the
+    // new servo.
+    let Some(mut io) = open_bus(&params.bus.port, 0) else {
         return ExitCode::FAILURE;
-    }
+    };
     if let Err(e) = io.set_torque(true) {
         tracing::error!(error = %e, "cannot enable torque");
         return ExitCode::FAILURE;
@@ -1048,6 +1079,7 @@ fn spawn_control_thread(
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
     let fake = args.fake;
+    let sim = args.sim.clone();
     let port = params.bus.port.clone();
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
@@ -1075,6 +1107,24 @@ fn spawn_control_thread(
                 tracing::warn!("--fake: no bus, no robot");
                 runtime.block_on(control_loop(
                     FakeIo::at(DEFAULT_POSITION),
+                    state,
+                    intents,
+                    params,
+                    params_path,
+                    period,
+                    poweroff,
+                ));
+                return;
+            }
+
+            // No `open_bus_waiting` equivalent, deliberately: `RemoteIo` connects lazily and
+            // reconnects on every tick, so a duck started before its simulator simply reports
+            // unhealthy until the simulator answers — which is what a robot with no power on the
+            // bus does too, by a different route.
+            if let Some(addr) = sim {
+                tracing::warn!(%addr, "--sim: the body is in MuJoCo");
+                runtime.block_on(control_loop(
+                    duck_control::sim::RemoteIo::at(addr),
                     state,
                     intents,
                     params,
@@ -1151,6 +1201,9 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
             return None;
         }
     };
+    if !adopt_missing_servo(&mut io, loud) {
+        return None;
+    }
     match io.check_registers() {
         Ok(0) => tracing::info!("motor registers already correct"),
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
@@ -1166,6 +1219,67 @@ fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
         }
     }
     Some(io)
+}
+
+/// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
+/// answers instead, flash the new one as the missing joint.
+///
+/// A ping census of the fifteen expected IDs is all a complete bus pays for this. The
+/// factory-defaults probe — which reopens the port at 57 600 baud — only runs once a single
+/// servo is known to be missing, so an ordinary boot never scans for anything.
+///
+/// Returns whether the bus is worth checking further. `false` is "keep waiting": every servo
+/// unpowered, a servo missing with nothing fresh to replace it, or two missing at once, which
+/// cannot be told apart and is left to a human.
+#[cfg(target_os = "linux")]
+fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
+    use duck_control::bus::replacement_target;
+
+    let missing = match io.missing_servos() {
+        Ok(missing) => missing,
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, "cannot ping the servos; waiting, is servo power on?");
+            }
+            return false;
+        }
+    };
+    if missing.is_empty() {
+        return true;
+    }
+    if missing.len() == duck_control::NUM_JOINTS {
+        // Not a swap, just no power yet; `check_registers` below says so in the words people
+        // already know.
+        return true;
+    }
+    let Some(id) = replacement_target(&missing) else {
+        if loud {
+            tracing::error!(
+                ?missing,
+                "several servos are missing; a replacement can only be adopted one at a time, waiting"
+            );
+        }
+        return false;
+    };
+    match io.adopt_replacement(id) {
+        Ok(true) => true,
+        Ok(false) => {
+            if loud {
+                tracing::error!(
+                    id,
+                    "servo missing and nothing answers at factory defaults (id 1, 57600 baud); \
+                     is it plugged in? waiting"
+                );
+            }
+            false
+        }
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, id, "adopting the replacement servo failed; waiting");
+            }
+            false
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1247,6 +1361,19 @@ impl Bringup {
             *slot = from[i] + (DEFAULT_POSITION[i] - from[i]) * t;
         }
         Some(target)
+    }
+}
+
+/// One low-pass step toward `target`.
+///
+/// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
+/// tick and on every tick after, because nothing finite can climb back out of it. The wire
+/// can produce one — JSON parses `1e400` as infinity — and the safety layer below refuses
+/// non-finite joint targets rather than clamping them, so a single bad `robot.move` would
+/// otherwise freeze the robot on its hold pose until reboot.
+fn slew(ema: &mut f64, target: f64, alpha: f64) {
+    if target.is_finite() {
+        *ema += alpha * (target - *ema);
     }
 }
 
@@ -1696,6 +1823,11 @@ async fn control_loop<T: RobotIo>(
     let mut window_start = Instant::now();
     let mut window_ticks = 0u64;
     let mut last_summary = Instant::now();
+    // Dropped bus reads: when one was last reported, how many have gone unreported since, and how
+    // many happened in this summary window. See [`BUS_DROP_QUIET`].
+    let mut last_bus_drop: Option<Instant> = None;
+    let mut bus_drops_quiet = 0u32;
+    let mut bus_drops_window = 0u32;
     let mut was_driving = false;
     let mut bringup = Bringup::Limp;
     // A mode switch in flight: the mode to end up in, once the robot is home. `None` the rest of
@@ -1786,12 +1918,16 @@ async fn control_loop<T: RobotIo>(
         None
     };
 
-    // The theremin. Its depth reader starts now and parks on `tofd`'s socket whether or not
-    // anyone ever asks for an instrument: one blocked read costs nothing, and connecting
-    // lazily would make the first arming window wait for a connection as well as for
-    // frames — a second of silence that reads as a broken feature. Off entirely when the
-    // params say so, or when audio is off, since a theremin with no voice is a mouth
-    // opening for no reason.
+    // The theremin. `[theremin] enabled` is off by default, so on most ducks this is `None`
+    // and nothing here subscribes to depth at all — `tofd` keeps its own counsel, and
+    // `robotctl monitor` is unaffected either way, since it subscribes to `tofd` itself.
+    //
+    // On a duck that has turned it on, the depth reader starts *now* and parks on `tofd`'s
+    // socket whether or not anyone ever asks for an instrument: one blocked read costs
+    // nothing, and connecting lazily would make the first arming window wait for a
+    // connection as well as for frames — a second of silence that reads as a broken feature.
+    // Also off when audio is off, since a theremin with no voice is a mouth opening for no
+    // reason.
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
@@ -1835,22 +1971,47 @@ async fn control_loop<T: RobotIo>(
         voice.play("greet", false);
     }
 
+    // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
+    // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
+    // `controller.step()` (an ONNX forward pass) sits between the two and would bias every
+    // `robot.state` timestamp by one inference otherwise. It rides the coast: a coasted tick
+    // republishes the last fresh sample, so it must republish that sample's read time too.
+    let mut sensors_read_ns = 0u64;
     while !state.shutdown.load(Ordering::Relaxed) {
         ticker.tick().await;
         let tick_start = Instant::now();
 
+        let read_at = proto::clock::monotonic_ns();
         let fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
+                sensors_read_ns = read_at;
                 Some(sensors)
             }
             Err(e) => {
                 let n = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                // One dropped transaction is ordinary on a serial bus; a run of them is not.
-                // Log the first and then every tenth, so a persistent fault is visible
-                // without a wall of identical lines.
-                if n == 1 || n.is_multiple_of(10) {
-                    tracing::warn!(error = %e, consecutive = n, "bus read failed");
+                bus_drops_window += 1;
+
+                // A run of them is a fault, and stays as loud as it was: every tenth, at once.
+                // An isolated drop is ordinary, and `consecutive` resets on the next good read —
+                // so `n == 1` was true of every drop on a bus that recovers each time, and
+                // logging on it filled the journal. One line per [`BUS_DROP_QUIET`], saying how
+                // many it stands for.
+                let a_run = n.is_multiple_of(10);
+                let due = last_bus_drop.is_none_or(|at| at.elapsed() >= BUS_DROP_QUIET);
+                if a_run || due {
+                    tracing::warn!(
+                        error = %e,
+                        consecutive = n,
+                        // Zero on a run, and on the first drop after a quiet spell. Non-zero is
+                        // the rate: that many more happened and were not worth their own lines.
+                        also = bus_drops_quiet,
+                        "bus read failed"
+                    );
+                    last_bus_drop = Some(Instant::now());
+                    bus_drops_quiet = 0;
+                } else {
+                    bus_drops_quiet += 1;
                 }
                 None
             }
@@ -2415,14 +2576,14 @@ async fn control_loop<T: RobotIo>(
             twist_ema = [0.0; 3];
         }
         for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
-            *ema += cmd_alpha * (target - *ema);
+            slew(ema, target, cmd_alpha);
         }
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            *ema += head_alpha * (target - *ema);
+            slew(ema, target, head_alpha);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
-                *ema += cmd_alpha * (target - *ema);
+                slew(ema, target, cmd_alpha);
             }
         } else {
             body_ema = [0.0; 3];
@@ -2677,6 +2838,11 @@ async fn control_loop<T: RobotIo>(
         if was_driving && !driving {
             stopped_driving_at = Some(tick_start);
             if !snapshot.enabled {
+                // Even a brief explicit disable ends the recurrent episode. The resume
+                // grace period below is for dropped sensor reads, not a user's stop.
+                if let Some(controller) = controller.as_mut() {
+                    controller.reset();
+                }
                 // A deliberate stop returns to the home pose — the prototype's Start-off
                 // ("policy DISABLED - returning to default pose"). Commanded directly, no
                 // ramp: the servos do the travel at their own speed, and the robot is
@@ -2990,6 +3156,15 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 chorale: chorale_state.clone(),
+                t_ns: sensors_read_ns,
+                imu: Some(proto::ImuState {
+                    gyro: sensors.imu.gyro,
+                    quat: sensors.imu.quat,
+                }),
+                frames: Some(mapping::frames_at(mapping::head_joints_of(
+                    &sensors.positions,
+                ))),
+                skeleton: mapping::skeleton_at(&sensors.positions),
             });
         }
 
@@ -3017,6 +3192,9 @@ async fn control_loop<T: RobotIo>(
                     total = ticks,
                     hz = format!("{hz:.1}"),
                     missed = state.missed.load(Ordering::Relaxed),
+                    // Every dropped bus read in this window, reported or suppressed. The warnings
+                    // above are rate-limited, so this is where the true rate lives.
+                    bus_drops = bus_drops_window,
                     driving,
                     fallen = safety.fallen(),
                     battery_v = format!(
@@ -3034,6 +3212,7 @@ async fn control_loop<T: RobotIo>(
                     "control loop"
                 );
                 last_summary = Instant::now();
+                bus_drops_window = 0;
             }
         }
     }
@@ -4098,6 +4277,15 @@ fn dispatch(
                     accepted: false,
                     reason: Some("this robot has no voice to play a theremin in".to_owned()),
                 }
+            } else if p.active && !state.theremin_allowed {
+                proto::ThereminResult {
+                    accepted: false,
+                    reason: Some(
+                        "the theremin is off by default — turn `[theremin] enabled` on with \
+                         `robotctl configure`, which offers the robotd restart it needs"
+                            .to_owned(),
+                    ),
+                }
             } else if p.active && !state.theremin_ready.load(Ordering::Relaxed) {
                 proto::ThereminResult {
                     accepted: false,
@@ -4173,6 +4361,10 @@ fn dispatch(
         // What each slot is running, from where, and why it is not running what was asked. Served
         // from the snapshot the control loop publishes, so it answers during startup too rather
         // than racing the first load.
+        // The geometry the mapping fields of `robot.state` are stated in. Constant for the
+        // life of the process, read from the same asset the FK runs on.
+        proto::Call::RobotModel => proto::Response::ok(Some(id), &mapping::model()),
+
         proto::Call::RobotPolicies => proto::Response::ok(
             Some(id),
             &proto::PoliciesResult {
@@ -4448,6 +4640,167 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+/// What `robot.state` carries for a mapper, and what `robot.model` answers: sensor poses from
+/// the head FK, and the static geometry they are stated in. One place, the `kinematics` crate,
+/// so a laptop or a server that pairs a picture with a pose asks rather than transcribes.
+mod mapping {
+    use std::sync::LazyLock;
+
+    use duck_ipc_proto as proto;
+
+    static FK: LazyLock<kinematics::head::HeadFk> = LazyLock::new(kinematics::head::HeadFk::alpha);
+    static TOF: LazyLock<kinematics::tof::Reprojector> =
+        LazyLock::new(kinematics::tof::Reprojector::alpha);
+
+    /// The head joints, in [`kinematics::head::HeadFk`]'s order, out of a full joint vector.
+    const HEAD: [&str; 4] = ["neck_pitch", "head_pitch", "head_yaw", "head_roll"];
+
+    pub fn head_joints_of(positions: &[f64]) -> [f64; 4] {
+        let mut out = [0.0; 4];
+        for (slot, name) in out.iter_mut().zip(HEAD) {
+            if let Some(i) = proto::JOINT_NAMES.iter().position(|n| *n == name) {
+                *slot = positions.get(i).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+
+    fn pose(p: kinematics::Pose) -> proto::PoseState {
+        proto::PoseState {
+            pos: p.pos,
+            quat: p.quat.wxyz(),
+        }
+    }
+
+    /// Every body's pose in the trunk frame, in [`Model::body_names`] order, from the full measured
+    /// joint vector — the whole skeleton for a viewer. The model's joint order is the MJCF's, not
+    /// the wire's, so the angles are gathered by name from [`proto::JOINT_NAMES`]-ordered positions.
+    pub fn skeleton_at(positions: &[f64]) -> Vec<proto::PoseState> {
+        let model = kinematics::Model::alpha();
+        let angles: Vec<f64> = model
+            .joint_names()
+            .map(|n| {
+                proto::JOINT_NAMES
+                    .iter()
+                    .position(|w| *w == n)
+                    .and_then(|i| positions.get(i).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        model.body_poses(&angles).into_iter().map(pose).collect()
+    }
+
+    fn skeleton_links() -> Vec<proto::SkeletonLink> {
+        let model = kinematics::Model::alpha();
+        let parents = model.body_parents();
+        model
+            .body_names()
+            .enumerate()
+            .map(|(i, name)| proto::SkeletonLink {
+                name: name.to_owned(),
+                parent: parents[i],
+            })
+            .collect()
+    }
+
+    pub fn frames_at(head: [f64; 4]) -> proto::FramesState {
+        proto::FramesState {
+            camera: pose(FK.camera_in_trunk_cv2(head)),
+            tof: pose(FK.tof_in_trunk(head)),
+            head_imu: FK.head_imu_in_trunk(head).map(pose),
+        }
+    }
+
+    pub fn model() -> proto::ModelResult {
+        let model = kinematics::Model::alpha();
+        proto::ModelResult {
+            asset: "alpha".to_owned(),
+            trunk_height_m: model.trunk_height_m(),
+            joint_names: proto::JOINT_NAMES.iter().map(|s| (*s).to_owned()).collect(),
+            head_joints: HEAD.iter().map(|s| (*s).to_owned()).collect(),
+            tof_beams: TOF.beams().to_vec(),
+            tof_fov_deg: kinematics::tof::FOV_DEG,
+            frames_at_zero: frames_at([0.0; 4]),
+            skeleton: skeleton_links(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn head_joints_come_out_of_the_wire_order() {
+            let mut joints = [0.0; 15];
+            joints[5] = 0.1;
+            joints[6] = 0.2;
+            joints[7] = 0.3;
+            joints[8] = 0.4;
+            assert_eq!(head_joints_of(&joints), [0.1, 0.2, 0.3, 0.4]);
+        }
+
+        #[test]
+        fn the_model_says_what_the_frames_are_stated_in() {
+            let m = model();
+            assert_eq!(m.tof_beams.len(), 64);
+            assert_eq!(m.joint_names.len(), 15);
+            assert!(m.trunk_height_m > 0.05 && m.trunk_height_m < 0.3);
+            // Camera and ToF are parallel, a couple of centimetres apart.
+            let f = m.frames_at_zero;
+            let d: f64 = (0..3)
+                .map(|i| (f.camera.pos[i] - f.tof.pos[i]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(d > 0.01 && d < 0.05, "camera-tof distance {d}");
+        }
+
+        #[test]
+        fn the_skeleton_topology_and_poses_line_up() {
+            let links = model().skeleton;
+            assert!(!links.is_empty(), "a skeleton is served");
+            assert_eq!(links[0].parent, None, "the root has no parent");
+            assert!(
+                links[1..].iter().all(|l| l.parent.is_some()),
+                "every other link has a parent"
+            );
+            // A pose per link, in the same order, and every parent precedes its child.
+            let poses = skeleton_at(&[0.0; 15]);
+            assert_eq!(poses.len(), links.len(), "one pose per link");
+            assert!(
+                links
+                    .iter()
+                    .enumerate()
+                    .all(|(i, l)| l.parent.is_none_or(|p| p < i))
+            );
+        }
+
+        #[test]
+        fn the_skeleton_moves_with_a_leg_joint() {
+            let mut bent = [0.0; 15];
+            let knee = proto::JOINT_NAMES
+                .iter()
+                .position(|n| n.contains("knee"))
+                .expect("a knee joint");
+            bent[knee] = 0.8;
+            // Bending a knee moves some body, but never the root (trunk_base sits at identity).
+            let rest = skeleton_at(&[0.0; 15]);
+            let moved = skeleton_at(&bent);
+            assert_eq!(rest[0].pos, moved[0].pos, "the root does not move");
+            assert!(
+                rest.iter().zip(&moved).any(|(a, b)| a.pos != b.pos),
+                "a leg body moved"
+            );
+        }
+
+        #[test]
+        fn frames_move_with_the_head() {
+            let a = frames_at([0.0; 4]).camera.pos;
+            let b = frames_at([0.0, 0.0, 1.0, 0.0]).camera.pos;
+            assert!(a != b);
+        }
     }
 }
 
@@ -4899,6 +5252,51 @@ mod tests {
             .result_as()
             .unwrap();
         assert!(init.accepted, "nor may init refuse for gravity");
+    }
+
+    /// The theremin ships **off**, and the refusal has to name the switch.
+    ///
+    /// The switch and a silent depth stream are different problems with the same symptom, and
+    /// they used to share one message. Now that off is the default, that message would send
+    /// every first-time player to inspect a `tofd` that is running perfectly.
+    #[test]
+    fn a_switched_off_theremin_names_the_switch_and_not_tofd() {
+        let ask = |params: &Params| -> proto::ThereminResult {
+            let mut s = RobotState::new(
+                params,
+                std::path::Path::new("/test/robotd.toml"),
+                false,
+                false,
+            );
+            // A voice, which `RobotState::new` decides by looking for wavs on disk: a test
+            // machine has no bank, and without this every answer here is "no voice to play in".
+            s.has_voice = true;
+            dispatch(
+                &s,
+                &Arc::new(Intents::new()),
+                proto::Id::Number(1),
+                &proto::Call::RobotTheremin(proto::ThereminParams { active: true }),
+            )
+            .result_as()
+            .expect("a theremin answer")
+        };
+
+        let params = Params::default();
+        assert!(!params.theremin.enabled, "the theremin ships off");
+        let refused = ask(&params);
+        assert!(!refused.accepted);
+        let reason = refused.reason.expect("a refusal says why");
+        assert!(reason.contains("[theremin] enabled"), "{reason}");
+        assert!(!reason.contains("tofd"), "not tofd's fault: {reason}");
+
+        // Switched on, and the honest complaint becomes the one about depth — `theremin_ready`
+        // is published by the loop, which is not running under a dispatch test.
+        let mut on = Params::default();
+        on.theremin.enabled = true;
+        let refused = ask(&on);
+        assert!(!refused.accepted);
+        let reason = refused.reason.expect("a refusal says why");
+        assert!(reason.contains("tofd"), "{reason}");
     }
 
     fn state() -> RobotState {
@@ -8021,5 +8419,21 @@ mod tests {
 
         s.shutdown.store(true, Ordering::Relaxed);
         handle.await.unwrap();
+    }
+
+    /// `1e400` on the wire parses as infinity. Folded into the EMA it is permanent — nothing
+    /// finite climbs back out — and with the safety layer refusing non-finite targets, one bad
+    /// `robot.move` would freeze the robot on its hold pose until reboot. Dropped instead.
+    #[test]
+    fn a_non_finite_command_does_not_poison_the_filter() {
+        let mut ema = 0.5;
+        slew(&mut ema, f64::INFINITY, 0.3);
+        slew(&mut ema, f64::NEG_INFINITY, 0.3);
+        slew(&mut ema, f64::NAN, 0.3);
+        assert_eq!(ema, 0.5, "non-finite targets are dropped, not folded in");
+
+        // And the filter still works afterwards: the next real command slews as always.
+        slew(&mut ema, 1.0, 0.3);
+        assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
     }
 }

@@ -59,6 +59,13 @@ pub struct Model {
     /// Per site, the flattened root→site chain (the site's own rest pose is the
     /// final, joint-less link).
     chains: Vec<Box<[Link]>>,
+    /// The body tree, in MJCF order (a body's parent always precedes it), for
+    /// whole-skeleton FK. Parallel arrays: name, parent index (`None` = root),
+    /// rest pose in the parent frame, and the hinge joint to the parent.
+    body_names: Vec<String>,
+    body_parents: Vec<Option<usize>>,
+    body_rest: Vec<Pose>,
+    body_joint: Vec<Option<(usize, [f64; 3])>>,
     /// The trunk's standing height above the floor, metres — the scene's drop
     /// height for `trunk_base`, which is where the training world puts the
     /// floor relative to the trunk frame.
@@ -75,12 +82,18 @@ impl Model {
         let mut joint_names = Vec::new();
         let mut joint_ranges = Vec::new();
         let mut body_joint: Vec<Option<(usize, [f64; 3])>> = Vec::with_capacity(tree.bodies.len());
+        let mut body_names = Vec::with_capacity(tree.bodies.len());
+        let mut body_parents = Vec::with_capacity(tree.bodies.len());
+        let mut body_rest = Vec::with_capacity(tree.bodies.len());
         for body in &tree.bodies {
             body_joint.push(body.joint.as_ref().map(|j| {
                 joint_names.push(j.name.clone());
                 joint_ranges.push(j.range);
                 (joint_names.len() - 1, j.axis)
             }));
+            body_names.push(body.name.clone());
+            body_parents.push(body.parent);
+            body_rest.push(body.rest);
         }
 
         let mut site_names = Vec::with_capacity(tree.sites.len());
@@ -115,6 +128,10 @@ impl Model {
             joint_ranges,
             site_names,
             chains,
+            body_names,
+            body_parents,
+            body_rest,
+            body_joint,
             trunk_height: tree.trunk_pos[2],
         })
     }
@@ -188,6 +205,44 @@ impl Model {
         }
         t
     }
+
+    /// Every body's pose in the trunk frame, in [`Model::body_names`] order, at
+    /// these angles — the whole skeleton, of which the sites are a few leaves.
+    ///
+    /// One pass in tree order (a parent always precedes its children, so its
+    /// pose is already known): a body is its parent's pose, moved by its rest
+    /// offset, then turned by its own hinge. `angles` covers every joint or it
+    /// panics, the same contract as [`Model::site_pose`].
+    pub fn body_poses(&self, angles: &[f64]) -> Vec<Pose> {
+        assert_eq!(
+            angles.len(),
+            self.joint_names.len(),
+            "angle slice must cover every joint"
+        );
+        let mut poses = vec![Pose::IDENTITY; self.body_names.len()];
+        for i in 0..self.body_names.len() {
+            let mut t = match self.body_parents[i] {
+                Some(p) => poses[p] * self.body_rest[i],
+                None => self.body_rest[i], // the root's world drop is stripped: it rests at identity
+            };
+            if let Some((idx, axis)) = self.body_joint[i] {
+                t.quat = t.quat * Quat::from_axis_angle(axis, angles[idx]);
+            }
+            poses[i] = t;
+        }
+        poses
+    }
+
+    /// Body names in [`Model::body_poses`] order.
+    pub fn body_names(&self) -> impl Iterator<Item = &str> {
+        self.body_names.iter().map(String::as_str)
+    }
+
+    /// Each body's parent index in [`Model::body_poses`] order (`None` = root) —
+    /// the skeleton's edges, for drawing it or matching visual meshes to links.
+    pub fn body_parents(&self) -> &[Option<usize>] {
+        &self.body_parents
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +291,50 @@ mod tests {
         let model = Model::parse(ARM).expect("parses");
         let origin = model.site("origin").expect("origin exists");
         assert_eq!(model.site_pose(origin, &[0.0, 0.0]).pos, [0.0; 3]);
+    }
+
+    #[test]
+    fn body_poses_place_the_whole_skeleton() {
+        let model = Model::parse(ARM).expect("parses");
+        let names: Vec<&str> = model.body_names().collect();
+        assert_eq!(names, ["trunk_base", "upper", "lower"]);
+        assert_eq!(model.body_parents(), &[None, Some(0), Some(1)]);
+
+        // Straight: upper sits one out from the root, lower one further.
+        let p = model.body_poses(&[0.0, 0.0]);
+        assert!((p[1].pos[0] - 1.0).abs() < 1e-12 && p[1].pos[1].abs() < 1e-12);
+        assert!((p[2].pos[0] - 2.0).abs() < 1e-12 && p[2].pos[1].abs() < 1e-12);
+
+        // Shoulder at 90°: upper's origin does not move (a hinge turns the frame
+        // in place), but lower swings out along +y.
+        let p = model.body_poses(&[std::f64::consts::FRAC_PI_2, 0.0]);
+        assert!(
+            (p[1].pos[0] - 1.0).abs() < 1e-12,
+            "upper x: {}",
+            p[1].pos[0]
+        );
+        assert!(
+            (p[2].pos[0] - 1.0).abs() < 1e-12,
+            "lower x: {}",
+            p[2].pos[0]
+        );
+        assert!(
+            (p[2].pos[1] - 1.0).abs() < 1e-12,
+            "lower y: {}",
+            p[2].pos[1]
+        );
+
+        // The body under a site agrees with the site FK, minus the site offset.
+        let tip = model.site("tip").expect("tip");
+        let s = model.site_pose(tip, &[0.3, -0.4]);
+        let lower = model.body_poses(&[0.3, -0.4])[2];
+        // The tip site sits [1,0,0] out in `lower`; walking it back lands on lower's origin.
+        let back = lower
+            * Pose {
+                pos: [1.0, 0.0, 0.0],
+                quat: Quat::IDENTITY,
+            };
+        assert!((s.pos[0] - back.pos[0]).abs() < 1e-12 && (s.pos[1] - back.pos[1]).abs() < 1e-12);
     }
 
     #[test]

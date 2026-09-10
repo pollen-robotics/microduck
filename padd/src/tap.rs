@@ -34,6 +34,32 @@
 //! first report following the last one leaving — the same bargain `robotd` strikes by only
 //! assembling a `robot.state` frame when someone is subscribed. A pad at rest is silent, so a
 //! parked reader is not a wakeup either.
+//!
+//! ## The pad's IMU, when it has one
+//!
+//! Some pads carry an inertial unit. The "Pro Controller" Switch clones do, and the kernel's
+//! `hid-nintendo` exposes it as a **second** evdev node under the same HID device, flagged
+//! `INPUT_PROP_ACCELEROMETER` and named "... IMU". gilrs never opens it — an accelerometer's `ABS_X`
+//! is not a stick — so `padd` drives from the other node and this tap reads the IMU beside it, on a
+//! reader of its own with the same lifecycle: open while somebody subscribes, closed when nobody
+//! does. It is found by walking sysfs from the node gilrs named to its HID parent and back down to a
+//! sibling with the accelerometer property; a pad without one has no such sibling and nothing here
+//! changes for it.
+//!
+//! Unlike a stick it is never silent: the clone streams several hundred samples a second whether
+//! or not anyone touches it. That is why a sample is six integers rather than an event list, why it
+//! has its own drop counter, and why the IMU is not opened at all unless someone is watching —
+//! or unless `padd` itself is, which is the second reader below.
+//!
+//! ## The IMU as a control, not only a stream
+//!
+//! With `[imu_head] enabled`, `padd` poses the robot's head from the pad's tilt. The attitude that
+//! needs comes from the same node the tap streams, so rather than a second reader on the same
+//! device this reader runs a `pad_imu::Imu` filter over every batch it reads and the main loop asks
+//! for the attitude ([`Tap::attitude`]). [`Tap::imu_control`] is the main loop saying "keep the
+//! IMU open for me": the node then stays open with or without a subscriber, and closes again when
+//! the feature goes off. One reader, one filter, and `robotctl monitor` draws the same attitude
+//! `padd` steers by.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -93,17 +119,29 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled whenever the reader might have work: a pad appeared, or someone subscribed.
     wake: Condvar,
+    /// The IMU's attitude, kept by the IMU reader for the main loop. `None` while no IMU is
+    /// open. Its own lock, not `state`'s: the main loop reads it fifty times a second and must not
+    /// queue behind a subscriber's send.
+    attitude: Mutex<Option<pad_imu::Imu>>,
 }
 
 struct State {
     /// The node to read, as gilrs named it. `None` when no pad is connected.
     wanted: Option<PathBuf>,
+    /// The pad's IMU node, when the pad has one — see [`imu_sibling`]. Resolved once per pad node
+    /// rather than per tick, because it is a walk through sysfs.
+    wanted_imu: Option<PathBuf>,
+    /// Does `padd` itself want the IMU read, for head control? A second reason to hold the node
+    /// open, beside a subscriber.
+    control: bool,
     subscribers: Vec<Subscriber>,
     /// The `Attached` report for the device currently open.
     ///
     /// Kept so a subscriber arriving mid-stream is told what it is looking at immediately, rather
     /// than having to wait for the pad to be unplugged and put back to find out.
     attached: Option<Arc<proto::PadReport>>,
+    /// The `ImuAttached` report for the IMU currently open, for the same reason.
+    imu_attached: Option<Arc<proto::PadReport>>,
 }
 
 struct Subscriber {
@@ -111,6 +149,9 @@ struct Subscriber {
     /// Frames dropped because this subscriber's queue was full. Its writer stamps them into the
     /// next frame it does send, so a slow client cannot read as a stalled radio.
     dropped: Arc<AtomicU64>,
+    /// IMU samples dropped for the same reason, counted apart: a lost sample says nothing about
+    /// the stick reports, and stamping it onto a `PadFrame` would say it did.
+    dropped_imu: Arc<AtomicU64>,
 }
 
 impl Tap {
@@ -146,10 +187,14 @@ impl Tap {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 wanted: None,
+                wanted_imu: None,
+                control: false,
                 subscribers: Vec::new(),
                 attached: None,
+                imu_attached: None,
             }),
             wake: Condvar::new(),
+            attitude: Mutex::new(None),
         });
 
         let accepting = Arc::clone(&shared);
@@ -162,6 +207,11 @@ impl Tap {
             .name("pad-tap-read".to_owned())
             .spawn(move || read(&reading))?;
 
+        let reading_imu = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("pad-tap-imu".to_owned())
+            .spawn(move || read_imu(&reading_imu))?;
+
         Ok(Self { shared })
     }
 
@@ -173,23 +223,121 @@ impl Tap {
     /// It takes the gamepad rather than a path so the node can only come from gilrs — the one place
     /// that knows which of a pad's several input devices is the one being driven from.
     pub fn watch(&self, pad: &gilrs::Gamepad<'_>) {
-        self.want(Some(pad.devpath().to_path_buf()));
-    }
-
-    /// No pad. The reader closes the device and says so to whoever is watching.
-    pub fn idle(&self) {
-        self.want(None);
-    }
-
-    fn want(&self, node: Option<PathBuf>) {
-        let mut state = self.shared.lock();
-        if state.wanted == node {
+        let node = pad.devpath().to_path_buf();
+        // The sysfs walk for the IMU happens only when the pad's node changes, which is the
+        // comparison `want` makes anyway — so it is made here first, before the walk.
+        if self.shared.lock().wanted.as_deref() == Some(node.as_path()) {
             return;
         }
-        state.wanted = node;
+        let imu = imu_sibling(Path::new("/sys"), Path::new("/dev"), &node);
+        if let Some(imu) = imu.as_deref() {
+            tracing::info!(node = %node.display(), imu = %imu.display(), "the pad has an IMU");
+        }
+        self.want(Some(node), imu);
+    }
+
+    /// No pad. The readers close their devices and say so to whoever is watching.
+    pub fn idle(&self) {
+        self.want(None, None);
+    }
+
+    /// Keep the pad's IMU open for `padd`'s own use, or stop. Safe to call every tick.
+    pub fn imu_control(&self, on: bool) {
+        let mut state = self.shared.lock();
+        if state.control == on {
+            return;
+        }
+        state.control = on;
         drop(state);
         self.shared.wake.notify_all();
     }
+
+    /// Does the connected pad have an IMU at all? True as soon as the node is known, before it is
+    /// open — the question "can Y mean IMU head control on this pad" needs answering on the press.
+    pub fn has_imu(&self) -> bool {
+        self.shared.lock().wanted_imu.is_some()
+    }
+
+    /// The pad's attitude, body → world, `w` first. `None` while no IMU is open or before its
+    /// first believable sample.
+    pub fn attitude(&self) -> Option<[f32; 4]> {
+        self.shared
+            .attitude
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(pad_imu::Imu::quaternion)
+    }
+
+    fn want(&self, node: Option<PathBuf>, imu: Option<PathBuf>) {
+        let mut state = self.shared.lock();
+        if state.wanted == node && state.wanted_imu == imu {
+            return;
+        }
+        state.wanted = node;
+        state.wanted_imu = imu;
+        drop(state);
+        self.shared.wake.notify_all();
+    }
+}
+
+/// The IMU node that belongs to the same pad as `node`, if the pad has one.
+///
+/// A pad's several input devices share one HID parent in sysfs, and only the inertial one carries
+/// `INPUT_PROP_ACCELEROMETER` (bit 6 of `properties`). So: from `/sys/class/input/eventN/device`
+/// up one to the HID device, then over every other `eventM` whose HID device is the same one and
+/// whose properties say accelerometer. The first such node is it — a pad has one IMU.
+///
+/// `sysfs` and `dev` are parameters so a test can lay the tree out in a temporary directory;
+/// production passes `/sys` and `/dev`.
+fn imu_sibling(sysfs: &Path, dev: &Path, node: &Path) -> Option<PathBuf> {
+    let event = node.file_name()?.to_owned();
+    let class = sysfs.join("class/input");
+    let hid_parent = |event: &std::ffi::OsStr| {
+        std::fs::canonicalize(class.join(event).join("device/device")).ok()
+    };
+    let parent = hid_parent(&event)?;
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&class)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"))
+        })
+        .collect();
+    // Sorted so "the first" is the same one on every call rather than directory order.
+    candidates.sort();
+
+    for candidate in candidates {
+        let name = candidate.file_name()?.to_owned();
+        if name == event {
+            continue;
+        }
+        if hid_parent(&name).as_deref() != Some(parent.as_path()) {
+            continue;
+        }
+        let properties = std::fs::read_to_string(candidate.join("device/properties")).ok()?;
+        if has_accelerometer_property(&properties) {
+            return Some(dev.join("input").join(name));
+        }
+    }
+    None
+}
+
+/// Does a sysfs `properties` bitmask carry `INPUT_PROP_ACCELEROMETER`?
+///
+/// The file is hex words, most significant first, space separated — `40` for a device with only
+/// that bit, `0` for a pad. Bit 6, from `linux/input.h`.
+fn has_accelerometer_property(properties: &str) -> bool {
+    // The property bits fit one word on every kernel, so the last word is the one that matters
+    // and any earlier ones are zero padding.
+    let Some(low) = properties.split_whitespace().last() else {
+        return false;
+    };
+    u64::from_str_radix(low, 16).is_ok_and(|bits| bits & (1 << 6) != 0)
 }
 
 impl Shared {
@@ -231,6 +379,68 @@ impl Shared {
         None
     }
 
+    /// The IMU reader's [`Self::wait_for_work`]: a pad with an IMU, and somebody to read it for —
+    /// a subscriber, or `padd` itself.
+    fn wait_for_imu_work(&self) -> PathBuf {
+        let mut state = self.lock();
+        loop {
+            if let Some(node) = state.wanted_imu.clone()
+                && (!state.subscribers.is_empty() || state.control)
+            {
+                return node;
+            }
+            state = self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// The IMU reader's [`Self::done_with`].
+    fn done_with_imu(&self, node: &Path) -> Option<&'static str> {
+        let state = self.lock();
+        if state.subscribers.is_empty() && !state.control {
+            return Some("nobody is watching any more");
+        }
+        if state.wanted_imu.as_deref() != Some(node) {
+            return Some("the pad changed");
+        }
+        None
+    }
+
+    fn attach_imu(&self, device: proto::PadImuDevice) {
+        *self.attitude_slot() = Some(pad_imu::Imu::new(device.clone()));
+        let report = Arc::new(proto::PadReport::ImuAttached {
+            device: Box::new(device),
+        });
+        let mut state = self.lock();
+        state.imu_attached = Some(Arc::clone(&report));
+        state.send(&report);
+    }
+
+    fn detach_imu(&self, why: String) {
+        *self.attitude_slot() = None;
+        let mut state = self.lock();
+        state.imu_attached = None;
+        state.send(&Arc::new(proto::PadReport::ImuDetached { why }));
+    }
+
+    /// One batch: into the filter first, then out to whoever is watching.
+    fn samples(&self, samples: Vec<proto::PadImuSample>) {
+        let batch = proto::PadImuBatch {
+            samples,
+            socket_dropped: 0,
+        };
+        if let Some(imu) = self.attitude_slot().as_mut() {
+            imu.absorb(&batch);
+        }
+        self.lock().send(&Arc::new(proto::PadReport::Imu(batch)));
+    }
+
+    fn attitude_slot(&self) -> MutexGuard<'_, Option<pad_imu::Imu>> {
+        self.attitude.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn attach(&self, device: proto::PadInputDevice) {
         let report = Arc::new(proto::PadReport::Attached {
             device: Box::new(device),
@@ -256,26 +466,40 @@ impl Shared {
         self.lock().send(report);
     }
 
-    /// Add a subscriber, seeded with the device it is about to see frames from.
+    /// Add a subscriber, seeded with the device — and the IMU, if any — it is about to see
+    /// reports from.
     ///
-    /// Hands back the counter of what gets dropped for it, which only its own writer may clear.
-    fn subscribe(&self) -> (Receiver<Arc<proto::PadReport>>, Arc<AtomicU64>) {
+    /// Hands back the counters of what gets dropped for it, which only its own writer may clear.
+    fn subscribe(&self) -> (Receiver<Arc<proto::PadReport>>, Dropped) {
         let (reports, rx) = sync_channel(QUEUE);
         let mut state = self.lock();
         if let Some(attached) = state.attached.clone() {
             // Cannot fail: the queue is empty and this is the first thing in it.
             let _ = reports.try_send(attached);
         }
-        let dropped = Arc::new(AtomicU64::new(0));
+        if let Some(attached) = state.imu_attached.clone() {
+            let _ = reports.try_send(attached);
+        }
+        let dropped = Dropped {
+            frames: Arc::new(AtomicU64::new(0)),
+            samples: Arc::new(AtomicU64::new(0)),
+        };
         state.subscribers.push(Subscriber {
             reports,
-            dropped: Arc::clone(&dropped),
+            dropped: Arc::clone(&dropped.frames),
+            dropped_imu: Arc::clone(&dropped.samples),
         });
         drop(state);
         // A subscriber is the reader's other precondition, so it may have work now.
         self.wake.notify_all();
         (rx, dropped)
     }
+}
+
+/// One subscriber's drop counters, as its writer holds them.
+struct Dropped {
+    frames: Arc<AtomicU64>,
+    samples: Arc<AtomicU64>,
 }
 
 impl State {
@@ -285,11 +509,17 @@ impl State {
     /// a subscriber that stalled it would corrupt the measurement it asked for — every frame after
     /// the stall would carry a gap the radio had nothing to do with.
     fn send(&mut self, report: &Arc<proto::PadReport>) {
+        let is_sample = matches!(**report, proto::PadReport::Imu(_));
         self.subscribers.retain(|subscriber| {
             match subscriber.reports.try_send(Arc::clone(report)) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
-                    subscriber.dropped.fetch_add(1, Ordering::Relaxed);
+                    let counter = if is_sample {
+                        &subscriber.dropped_imu
+                    } else {
+                        &subscriber.dropped
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
                     true
                 }
                 // The writer is gone: the client disconnected.
@@ -382,13 +612,24 @@ fn subscriber(stream: UnixStream, shared: &Arc<Shared>) {
         // Whatever this subscriber missed goes on the next frame it does get, where it belongs:
         // beside the gap it explains. Left on the counter until then, so it cannot be lost to an
         // `Attached` or a `Detached` that carries nowhere to put it.
-        let stamped = match (&*report, dropped.load(Ordering::Relaxed)) {
-            (proto::PadReport::Frame(frame), missed) if missed > 0 => {
-                dropped.store(0, Ordering::Relaxed);
-                Some(proto::PadReport::Frame(proto::PadFrame {
-                    socket_dropped: missed,
-                    ..frame.clone()
-                }))
+        let stamped = match &*report {
+            proto::PadReport::Frame(frame) => {
+                let missed = dropped.frames.swap(0, Ordering::Relaxed);
+                (missed > 0).then(|| {
+                    proto::PadReport::Frame(proto::PadFrame {
+                        socket_dropped: missed,
+                        ..frame.clone()
+                    })
+                })
+            }
+            proto::PadReport::Imu(batch) => {
+                let missed = dropped.samples.swap(0, Ordering::Relaxed);
+                (missed > 0).then(|| {
+                    proto::PadReport::Imu(proto::PadImuBatch {
+                        socket_dropped: missed,
+                        ..batch.clone()
+                    })
+                })
             }
             _ => None,
         };
@@ -498,6 +739,114 @@ fn stream(shared: &Arc<Shared>, node: &Path) -> String {
             return why.to_owned();
         }
     }
+}
+
+/// Open the wanted IMU node, stream it, and go back to waiting when it ends. Forever.
+///
+/// [`read`], for the second device. Its own thread because `fetch_events` blocks, and one reader
+/// cannot block on two nodes.
+fn read_imu(shared: &Arc<Shared>) {
+    loop {
+        let node = shared.wait_for_imu_work();
+        let why = stream_imu(shared, &node);
+        tracing::info!(node = %node.display(), why, "pad tap stopped reading the IMU");
+        shared.detach_imu(why);
+        thread::sleep(REOPEN_AFTER);
+    }
+}
+
+/// Read one IMU node until it ends, describing how it ended.
+///
+/// A sample is the six `ABS_*` values as they stand at each `SYN_REPORT`. Axes a report did not
+/// mention keep their last value, which is the kernel's own contract for absolute axes — a driver
+/// that leaves an unchanged axis out of a report has not zeroed it. The samples one read produced
+/// go out together, as one report: that is what keeps this affordable at six hundred a second.
+fn stream_imu(shared: &Arc<Shared>, node: &Path) -> String {
+    let mut device = match RawDevice::open(node) {
+        Ok(device) => device,
+        Err(e) => return format!("cannot open {}: {e}", node.display()),
+    };
+    let (described, mut current) = describe_imu(&device, node);
+    shared.attach_imu(described);
+    tracing::info!(node = %node.display(), "pad tap reading the IMU");
+
+    let mut seq = 0u64;
+    let mut resyncing = false;
+    let mut samples: Vec<proto::PadImuSample> = Vec::new();
+    loop {
+        let batch = match device.fetch_events() {
+            Ok(batch) => batch,
+            Err(e) => return format!("{} ended: {e}", node.display()),
+        };
+        for event in batch {
+            let kind = EventType(event.event_type().0);
+            let code = event.code();
+            if kind == EventType::SYNCHRONIZATION {
+                match SynchronizationCode(code) {
+                    SynchronizationCode::SYN_DROPPED => resyncing = true,
+                    SynchronizationCode::SYN_REPORT => {
+                        if resyncing {
+                            // The half-sample after a drop is discarded, as for the pad; the
+                            // values themselves are still the newest the kernel has, so the next
+                            // complete report is right.
+                            resyncing = false;
+                            continue;
+                        }
+                        seq += 1;
+                        samples.push(proto::PadImuSample {
+                            seq,
+                            at_us: micros(event.timestamp()),
+                            accel: [current[0], current[1], current[2]],
+                            gyro: [current[3], current[4], current[5]],
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            if kind == EventType::ABSOLUTE
+                && let Some(slot) = imu_slot(code)
+            {
+                current[slot] = event.value();
+            }
+        }
+        if !samples.is_empty() {
+            shared.samples(std::mem::take(&mut samples));
+        }
+        if let Some(why) = shared.done_with_imu(node) {
+            return why.to_owned();
+        }
+    }
+}
+
+/// Which of the six sample slots an `ABS_*` code fills: X, Y, Z, RX, RY, RZ.
+fn imu_slot(code: u16) -> Option<usize> {
+    (code <= AbsoluteAxisCode::ABS_RZ.0).then_some(usize::from(code))
+}
+
+/// The IMU as the kernel describes it, and where its axes stand right now.
+fn describe_imu(device: &RawDevice, node: &Path) -> (proto::PadImuDevice, [i32; 6]) {
+    let mut current = [0i32; 6];
+    let mut resolution = [0i32; 6];
+    let mut max = [0i32; 6];
+    if let Ok(axes) = device.get_absinfo() {
+        for (code, info) in axes {
+            if let Some(slot) = imu_slot(code.0) {
+                current[slot] = info.value();
+                resolution[slot] = info.resolution();
+                max[slot] = info.maximum();
+            }
+        }
+    }
+    let described = proto::PadImuDevice {
+        name: device.name().unwrap_or("unnamed IMU").to_owned(),
+        node: node.display().to_string(),
+        accel_per_g: resolution[0],
+        gyro_per_dps: resolution[3],
+        accel_max: max[0],
+        gyro_max: max[3],
+    };
+    (described, current)
 }
 
 /// Everything about the device that a number in a frame has to be read against.
@@ -646,10 +995,14 @@ mod tests {
         Arc::new(Shared {
             state: Mutex::new(State {
                 wanted: None,
+                wanted_imu: None,
+                control: false,
                 subscribers: Vec::new(),
                 attached: None,
+                imu_attached: None,
             }),
             wake: Condvar::new(),
+            attitude: Mutex::new(None),
         })
     }
 
@@ -681,9 +1034,14 @@ mod tests {
         }
 
         assert_eq!(
-            dropped.load(Ordering::Relaxed),
+            dropped.frames.load(Ordering::Relaxed),
             10,
             "the overflow is counted"
+        );
+        assert_eq!(
+            dropped.samples.load(Ordering::Relaxed),
+            0,
+            "and not against the IMU, which sent nothing"
         );
         assert_eq!(
             shared.lock().subscribers.len(),
@@ -752,6 +1110,160 @@ mod tests {
         assert_eq!(event_name(0x15, 1), "21:1");
         let unnamed = event_name(EventType::ABSOLUTE.0, 0x3e);
         assert!(!unnamed.contains(' '), "no prose on the wire: {unnamed}");
+    }
+
+    fn a_sample(seq: u64) -> Arc<proto::PadReport> {
+        Arc::new(proto::PadReport::Imu(proto::PadImuBatch {
+            samples: vec![proto::PadImuSample {
+                seq,
+                at_us: 1_000_000 + seq * 1_667,
+                accel: [-391, -35, 4270],
+                gyro: [25_000, -9_000, 171_000],
+            }],
+            socket_dropped: 0,
+        }))
+    }
+
+    /// IMU samples that overflow a slow subscriber are counted against the IMU, not the pad. The
+    /// clone sends six hundred a second and the sticks a handful; a shared counter would report a
+    /// pad link losing reports it never lost.
+    #[test]
+    fn dropped_samples_are_not_dropped_frames() {
+        let shared = a_shared();
+        let (reports, dropped) = shared.subscribe();
+
+        for seq in 0..(QUEUE as u64 + 25) {
+            shared.frame_report(&a_sample(seq));
+        }
+
+        assert_eq!(dropped.samples.load(Ordering::Relaxed), 25);
+        assert_eq!(dropped.frames.load(Ordering::Relaxed), 0);
+        drop(reports);
+    }
+
+    /// `padd` wanting the attitude is reason enough to hold the IMU open, with nobody subscribed —
+    /// and the attitude it reads is the filter's, fed from the same batches the subscribers get.
+    #[test]
+    fn head_control_holds_the_imu_open_and_reads_the_filter() {
+        let shared = a_shared();
+        let node = Path::new("/dev/input/event5");
+        shared.lock().wanted_imu = Some(node.to_path_buf());
+        assert_eq!(
+            shared.done_with_imu(node),
+            Some("nobody is watching any more"),
+            "no subscriber, no control: let go"
+        );
+
+        shared.lock().control = true;
+        assert_eq!(shared.done_with_imu(node), None, "control alone holds it");
+
+        shared.attach_imu(proto::PadImuDevice {
+            name: "Nintendo Switch Pro Controller IMU".to_owned(),
+            node: node.display().to_string(),
+            accel_per_g: 4096,
+            gyro_per_dps: 14247,
+            accel_max: 32767,
+            gyro_max: 32_767_000,
+        });
+        let read = |shared: &Shared| {
+            shared
+                .attitude_slot()
+                .as_ref()
+                .and_then(pad_imu::Imu::quaternion)
+        };
+        assert!(read(&shared).is_none(), "no sample yet, no attitude");
+        // Flat on the table, one sample: seeded level.
+        shared.samples(vec![proto::PadImuSample {
+            seq: 1,
+            at_us: 1_000_000,
+            accel: [0, 0, 4096],
+            gyro: [0, 0, 0],
+        }]);
+        let q = read(&shared).expect("an attitude after a believable sample");
+        let euler = pad_imu::euler_deg(q);
+        assert!(euler.iter().all(|a| a.abs() < 0.5), "{euler:?}");
+
+        shared.detach_imu("the pad changed".to_owned());
+        assert!(read(&shared).is_none(), "gone with the node");
+    }
+
+    /// A subscriber arriving while an IMU is open is told about it, as it is told about the pad.
+    #[test]
+    fn a_subscriber_arriving_mid_stream_is_told_the_imu_too() {
+        let shared = a_shared();
+        shared.attach(a_device());
+        shared.attach_imu(proto::PadImuDevice {
+            name: "Nintendo Switch Pro Controller IMU".to_owned(),
+            node: "/dev/input/event5".to_owned(),
+            accel_per_g: 4096,
+            gyro_per_dps: 14247,
+            accel_max: 32767,
+            gyro_max: 32_767_000,
+        });
+
+        let (reports, _dropped) = shared.subscribe();
+        assert!(matches!(
+            &*reports.try_recv().unwrap(),
+            proto::PadReport::Attached { .. }
+        ));
+        assert!(matches!(
+            &*reports.try_recv().unwrap(),
+            proto::PadReport::ImuAttached { .. }
+        ));
+    }
+
+    /// The IMU is a sibling node under the pad's HID device with the accelerometer property, and
+    /// nothing else qualifies: not the pad itself, not a node of another device, not a sibling
+    /// without the property. Laid out as sysfs lays it out — `eventN/device` is the input device,
+    /// its `device` the HID one — so the walk here is the walk on a board.
+    #[test]
+    fn the_imu_is_the_accelerometer_sibling_under_the_same_hid_device() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = root.path().join("sys");
+        let dev = root.path().join("dev");
+        let hid_pad = sysfs.join("devices/hci0/0005:057E:2009.0001");
+        let hid_other = sysfs.join("devices/hci0/0005:045E:0B13.0002");
+        let class = sysfs.join("class/input");
+        std::fs::create_dir_all(&class).unwrap();
+
+        // (event, hid device, properties)
+        let nodes = [
+            ("event3", &hid_other, "0"),
+            ("event4", &hid_pad, "0"),
+            ("event5", &hid_pad, "40"),
+            ("event6", &hid_other, "40"),
+        ];
+        for (index, (event, hid, props)) in nodes.iter().enumerate() {
+            // As on a board: `<hid>/input/inputN/eventN` is the node's directory, its `device`
+            // is the input device `inputN`, and *that* device's `device` is the HID one.
+            let input = hid.join(format!("input/input{index}"));
+            let node = input.join(event);
+            std::fs::create_dir_all(&node).unwrap();
+            std::fs::write(input.join("properties"), format!("{props}\n")).unwrap();
+            std::os::unix::fs::symlink(&node, class.join(event)).unwrap();
+            std::os::unix::fs::symlink(&input, node.join("device")).unwrap();
+            std::os::unix::fs::symlink(hid, input.join("device")).unwrap();
+        }
+
+        assert_eq!(
+            imu_sibling(&sysfs, &dev, Path::new("/dev/input/event4")),
+            Some(dev.join("input/event5")),
+            "the pad's own accelerometer sibling"
+        );
+        assert_eq!(
+            imu_sibling(&sysfs, &dev, Path::new("/dev/input/event3")),
+            Some(dev.join("input/event6")),
+            "another pad, its own sibling — never the first pad's"
+        );
+        assert_eq!(
+            imu_sibling(&sysfs, &dev, Path::new("/dev/input/event9")),
+            None,
+            "a node sysfs has never heard of"
+        );
+        assert!(has_accelerometer_property("40"));
+        assert!(has_accelerometer_property("0 40"));
+        assert!(!has_accelerometer_property("0"));
+        assert!(!has_accelerometer_property(""));
     }
 
     /// The tap's wire types are the protocol's, so a frame it builds is a frame `robotctl` parses.

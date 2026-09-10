@@ -85,6 +85,7 @@ It also sits, kicks a ball, rolls forward on command, and quacks in a voice that
 | [Set up a dev board](docs/robot/install-dev.md) | From a blank board to a robot that takes branch builds. |
 | [Dev cheat sheet](docs/robot/cheatsheet-dev.md) | Branch builds, release candidates, driving from a laptop, and the restart traps after an update. |
 | [Push your branch](docs/robot/dev-push.md) | Build on your machine, install over ssh, about a minute. |
+| [The simulated duck](docs/robot/simulation.md) | No robot on the desk? `scripts/duck-sim` runs the real daemons against a body in MuJoCo — one duck in a window, or four as machines you log into. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, layout, conventions, releasing. |
 | [Docs index](docs/README.md) | Everything, including the design pages and the open problems. |
 

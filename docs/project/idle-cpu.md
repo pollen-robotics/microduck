@@ -35,8 +35,11 @@ find one frame, six of them answered no. The loop now sits out the stretch in wh
 cannot yet have one and polls through the rest. Frame age is unchanged — still bounded by the
 10 ms poll, which is the granularity a frame is noticed at either way.
 
-This runs on every duck with a ToF fitted whether or not anyone uses the theremin, because
-`robotd`'s depth reader subscribes at startup rather than when the instrument is picked up.
+This runs on every duck with a ToF fitted whether or not anyone uses the theremin: `tofd`
+ranges continuously and sends to whoever happens to be subscribed, so no subscriber is the
+normal state and none of this poll is conditional on one. `[theremin] enabled` is off by
+default and does not change the figure — what it saves is `robotd`'s parked read, which was
+never the cost here.
 
 ### `padd` re-sent the same three zeros fifty times a second
 
@@ -116,3 +119,10 @@ is:
   doing it.
 - That petting still starts as promptly as it did, on a robot in an ordinary room rather than a
   silent one.
+
+## What came after
+
+The head sensors were the loose end here, and a `ps -L` on a board settled them: `tofd`'s idle ~5%
+is 4.5% head IMU and 0.5% depth, and the IMU has no consumer in the tree at all. So the poll this
+page made cheaper was never the cost, and the thing worth turning off is the sensor nobody asked
+for. See [`tof-on-demand.md`](tof-on-demand.md).

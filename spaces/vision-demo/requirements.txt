@@ -1,18 +1,32 @@
-# The consumer, and the WebRTC stack under it. The `central-consumer` extra is what pulls
-# `aiortc` and `av`: a robot never runs the consumer, so the base install leaves them out.
-#
-# **Unpinned deliberately, for now.** `reachy_mini`'s own app guide warns that mixing versions
-# across the SDK, the host shell and the daemon "causes silent protocol drift" — but the drift
-# that matters to *this* Space is between the consumer and a duck, and pinning a version whose
-# DTLS shim we depend on before knowing which versions work would pin the wrong thing. The first
-# time this breaks, pin it here with the version that worked.
-reachy_mini[central-consumer]
-
 # The UI. Gradio because its OAuth support is a button rather than a flow to implement — the
 # console page learned what implementing one costs (`remote-access-design.md` §5.0).
-gradio>=5
+#
+# **`[oauth]`, not bare `gradio`**: `gr.LoginButton` needs `itsdangerous` and `authlib`, and
+# without them a Space with `hf_oauth: true` fails at *import* rather than at the first click,
+# with nothing on the page to say which library is missing.
+gradio[oauth]>=5
+
+# FastAPI owns the server here and Gradio is mounted into it, because the robot's frames arrive on
+# a WebSocket route of our own. `uvicorn` is what serves it, and `websockets` is the protocol
+# implementation uvicorn needs for a `ws://` route — a Space without it answers the robot's
+# handshake with a 404 that looks like a wrong url.
+fastapi
+uvicorn[standard]
+websockets
+
+# The H.264 decoder, and nothing else from the WebRTC world: `av` is FFmpeg's bindings, which is
+# what turns the robot's access units back into pictures. It is the one thing H.264 costs this
+# Space over JPEG, and it is a decoder rather than a transport — `aiortc` is not back.
+av
 
 # The processing. `-headless` because a container has no display and the GUI build drags in the
 # whole of GTK to be linked and never used.
 opencv-python-headless
 numpy
+
+# Reading the rendezvous and `whoami-v2`. Both are plain HTTP now: **there is no WebRTC stack in
+# this Space any more.** It used to pull frames with `reachy_mini[central-consumer]`, which meant
+# `aiortc` and `av` and a DTLS cipher shim, and which could never connect from a data centre for
+# want of a relay candidate. The robot dials us instead, so all of that is gone.
+requests
+huggingface_hub

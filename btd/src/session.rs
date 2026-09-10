@@ -31,7 +31,8 @@ const PIN_ATTEMPTS: u32 = 3;
 /// Serve one central until it disconnects or breaks framing.
 pub async fn run(mut link: Link, sockets: Sockets) {
     let peer = link.peer.clone();
-    tracing::info!(peer = %peer, mtu = link.mtu, "session opened");
+    tracing::info!(peer = %peer, mtu = link.mtu(), "session opened; mtu is the floor \
+     until the first write reports the negotiated one");
 
     let (replies_tx, mut replies) = mpsc::channel::<String>(QUEUE);
     let config_socket = sockets.config.clone();
@@ -305,7 +306,9 @@ async fn authenticate(
 
 /// Chunk one line out to the central.
 async fn send_line(link: &Link, line: &str) -> Result<(), ()> {
-    for chunk in framing::chunks(line, link.mtu) {
+    // Read once here, so one line is chunked one way even if a write reports a new MTU
+    // meanwhile. See `Link::mtu`.
+    for chunk in framing::chunks(line, link.mtu()) {
         if link.outbound.send(chunk).await.is_err() {
             // The backend dropped its half: the central is gone.
             return Err(());
@@ -388,6 +391,22 @@ mod tests {
                 .expect("link closed");
             if let Some(line) = r.push(&chunk).expect("framing").into_iter().next() {
                 return line;
+            }
+        }
+    }
+
+    /// Like [`read_reply`], and also says how the line was cut up on the way out.
+    async fn read_reply_in_chunks(from_robot: &mut Receiver<Vec<u8>>) -> (String, Vec<usize>) {
+        let mut r = Reassembler::new();
+        let mut sizes = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), from_robot.recv())
+                .await
+                .expect("client saw no reply")
+                .expect("link closed");
+            sizes.push(chunk.len());
+            if let Some(line) = r.push(&chunk).expect("framing").into_iter().next() {
+                return (line, sizes);
             }
         }
     }
@@ -530,6 +549,71 @@ mod tests {
         assert!(
             updater_seen.try_recv().is_err(),
             "robotd's call went to updaterd"
+        );
+    }
+
+    /// **A reply is sized for the MTU the link has learned, and a session starts knowing only
+    /// the floor.**
+    ///
+    /// This is the mechanism behind `bluez`'s shared MTU cell, tested here because that file needs
+    /// a radio and this one does not. What it pins is the ordering that makes the trick sound: a
+    /// central subscribes before it writes, so a session opens at the 20-byte floor and learns the
+    /// real payload from the first write — which is always `system.authenticate`, before any reply
+    /// worth chunking exists.
+    ///
+    /// Sizing every reply for the floor was not merely slow. Ten times the notifications is ten
+    /// times the queue depth in BlueZ, and past roughly 5 KiB the notification session was torn
+    /// down mid-reply — a `system.logs` tail was the first reply big enough to find it.
+    #[tokio::test]
+    async fn a_reply_is_chunked_for_the_mtu_the_link_has_learned() {
+        let dir = tempdir();
+        let (_, _) = FakeDaemon::spawn(dir.path(), "configd.sock", vec![pin_reply("424242")]);
+        let (_, _) = FakeDaemon::spawn(dir.path(), "updaterd.sock", vec![]);
+        let (_, _) = FakeDaemon::spawn(
+            dir.path(),
+            "robotd.sock",
+            vec![r#"{"jsonrpc":"2.0","id":2,"result":{"healthy":true}}"#.into()],
+        );
+
+        let mtu = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(20));
+        let (link, to_robot, mut from_robot) = Link::pair_sharing_mtu(mtu.clone(), "AA:BB");
+        tokio::spawn(run(
+            link,
+            sockets(dir.path(), "updaterd.sock", "robotd.sock"),
+        ));
+
+        // At the floor, so the authentication answer goes out in 20-byte pieces.
+        to_robot
+            .send(
+                b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"system.authenticate\",\"params\":{\"pin\":\"424242\"}}\n"
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+        let (reply, sizes) = read_reply_in_chunks(&mut from_robot).await;
+        assert!(reply.contains(r#""authenticated":true"#), "{reply}");
+        assert!(
+            sizes.len() > 1,
+            "a floor-sized reply arrived whole: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|&n| n <= 20),
+            "a chunk exceeded the floor: {sizes:?}"
+        );
+
+        // What the write callback does on a real link, once BlueZ has reported the MTU.
+        mtu.store(182, std::sync::atomic::Ordering::Relaxed);
+
+        to_robot
+            .send(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"robot.health\"}\n".to_vec())
+            .await
+            .unwrap();
+        let (reply, sizes) = read_reply_in_chunks(&mut from_robot).await;
+        assert!(reply.contains(r#""healthy":true"#), "{reply}");
+        assert_eq!(
+            sizes.len(),
+            1,
+            "the reply was still cut up for the floor: {sizes:?}"
         );
     }
 

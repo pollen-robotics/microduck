@@ -31,7 +31,7 @@ use ratatui::widgets::{
     Block, Cell, Paragraph, RenderDirection, Row, Sparkline, Table, TableState,
 };
 
-use crate::{Client, Failure, duck, exit, path_map};
+use crate::{Client, Failure, duck, exit, imu_view, path_map};
 
 /// Tracking error at the edge of a deviation bar, radians.
 ///
@@ -71,6 +71,21 @@ const SUBSCRIBE_ID: u64 = 1;
 /// Fixed, like the header and for the same reason — but *only while open*. Toggling it is a
 /// deliberate act, and everything below moving then is what the reader asked for.
 const PAD_HEIGHT: u16 = 8;
+
+/// Rows the pad block grows by while the pad has an IMU: two borders and ten rows of a
+/// wireframe pad tilting with the real one, beside the numbers. Ten because the picture is drawn
+/// two pixels a row and a pad needs about twenty to read as one.
+///
+/// Only while one is attached. An Xbox pad has none and its block is exactly what it was; the
+/// Pro Controller clones have one and the block opens up the moment `padd` finds it — which is the
+/// right moment for the reader to learn the pad can do that at all.
+const IMU_HEIGHT: u16 = 12;
+
+/// How often IMU samples alone may repaint the frame.
+///
+/// The clone sends six hundred a second, and a terminal redrawn at that rate is a terminal doing
+/// nothing else. Thirty a second is smooth to the eye and leaves the CPU for the filter.
+const IMU_REPAINT: Duration = Duration::from_millis(33);
 
 /// Rows the ToF block occupies while it is open: two borders and the eight rows
 /// of an 8×8 frame.
@@ -964,9 +979,26 @@ struct PadView {
     /// Times the robot's realtime clock stepped backwards between two reports. Expected exactly
     /// once on a board with no RTC, when its first NTP reply lands.
     clock_steps: u64,
+    /// The pad's inertial unit, while `padd` has one open. Its own lifecycle: a pad without one
+    /// never sets this, and a pad that drops takes it away through `ImuDetached`, not `Detached`.
+    imu: Option<pad_imu::Imu>,
+    /// When a sample last earned a repaint — see [`IMU_REPAINT`].
+    imu_painted: Option<Instant>,
 }
 
 impl PadView {
+    /// Has enough time passed since the last IMU-driven repaint for another one?
+    fn imu_repaint_due(&mut self) -> bool {
+        let now = Instant::now();
+        match self.imu_painted {
+            Some(at) if now.duration_since(at) < IMU_REPAINT => false,
+            _ => {
+                self.imu_painted = Some(now);
+                true
+            }
+        }
+    }
+
     /// Take one report.
     fn absorb(&mut self, report: proto::PadReport) {
         match report {
@@ -1002,6 +1034,15 @@ impl PadView {
                 self.trouble = Some(why);
             }
             proto::PadReport::Frame(frame) => self.frame(frame),
+            proto::PadReport::ImuAttached { device } => {
+                self.imu = Some(pad_imu::Imu::new(*device));
+            }
+            proto::PadReport::Imu(batch) => {
+                if let Some(imu) = self.imu.as_mut() {
+                    imu.absorb(&batch);
+                }
+            }
+            proto::PadReport::ImuDetached { .. } => self.imu = None,
         }
     }
 
@@ -1087,6 +1128,109 @@ impl PadView {
         };
         Some((age, verdict))
     }
+}
+
+/// The pad's inertial unit: a wireframe pad posed like the real one, and the numbers beside it.
+///
+/// Left, the picture; right, the words. The picture is what a person reads — a pad tilting on
+/// screen as it tilts in the hand is understood in the time it takes to see it — and the numbers
+/// are for when the picture is wrong: they say which axis, by how much, and whether the gyro bias
+/// the picture depends on has been learned yet.
+fn render_imu(imu: &pad_imu::Imu, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    let device = imu.device();
+    let mut title = vec![
+        Span::raw(" imu "),
+        Span::styled(
+            device.name.clone(),
+            Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    match imu.rate_hz() {
+        Some(hz) => title.push(Span::raw(format!(" · {hz:.0} Hz ")).dim()),
+        None => title.push(Span::raw(" · waiting for samples ").dim()),
+    }
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::Magenta))
+        .title(Line::from(title))
+        .title_bottom(
+            Line::from(format!(
+                " {} samples · {} · yellow bar = front edge ",
+                imu.samples(),
+                device.node
+            ))
+            .dim(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // The picture gets the left half of the width, capped where a wider one stops adding detail;
+    // the words take the rest. The picture is the one that earns its place, so it is sized first.
+    let picture_width = (inner.width / 2).clamp(12, 48);
+    let [picture, words] =
+        Layout::horizontal([Constraint::Length(picture_width), Constraint::Min(0)])
+            .areas::<2>(inner);
+    imu_view::draw(imu, picture, frame.buffer_mut());
+
+    let [pitch, roll, yaw] = imu.euler_deg();
+    let a = imu.accel_g();
+    let g = imu.gyro_dps();
+    let magnitude = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+    let signed = |v: f32| format!("{v:+7.2}");
+    let bias = match imu.bias_dps() {
+        Some(b) => Line::from(vec![
+            Span::raw(" bias  "),
+            Span::raw(format!(
+                "{} {} {} °/s ",
+                signed(b[0]),
+                signed(b[1]),
+                signed(b[2])
+            )),
+            Span::styled("settled", Style::new().fg(Color::Green)),
+            Span::raw(" — removed from the rates above").dim(),
+        ]),
+        None => Line::from(vec![
+            Span::raw(" bias  "),
+            Span::styled(
+                "learning — hold the pad still for half a second",
+                Style::new().fg(Color::Yellow),
+            ),
+        ]),
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(" tilt  "),
+            Span::styled(
+                format!("pitch {pitch:+6.1}°  roll {roll:+6.1}°"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  yaw {yaw:+6.1}°")),
+            Span::raw(" (gyro only, drifts)").dim(),
+        ]),
+        Line::from(format!(
+            " accel {} {} {} g   |a| {magnitude:.2} g",
+            signed(a[0]),
+            signed(a[1]),
+            signed(a[2])
+        )),
+        Line::from(format!(
+            " gyro  {} {} {} °/s",
+            signed(g[0]),
+            signed(g[1]),
+            signed(g[2])
+        )),
+        bias,
+        Line::from(" axes  +X front · +Y left · +Z up · at rest Z reads +1 g").dim(),
+    ];
+    if imu.socket_dropped() > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                " {} samples dropped reaching this view",
+                imu.socket_dropped()
+            ),
+            Style::new().fg(Color::Magenta),
+        )]));
+    }
+    frame.render_widget(Paragraph::new(lines), words);
 }
 
 /// What the time since the last report means.
@@ -1250,10 +1394,15 @@ impl View {
                 Ok(true)
             }
             Update::Pad(report) => {
+                let sample = matches!(*report, proto::PadReport::Imu(_));
                 self.pad.absorb(*report);
                 // A repaint even while the block is closed would be a redraw per report, at up to
-                // 125 a second, for something nobody is looking at.
-                Ok(self.show_pad)
+                // 125 a second, for something nobody is looking at — and an IMU sample, at six
+                // hundred a second, earns one only every [`IMU_REPAINT`] even when it is.
+                if !self.show_pad {
+                    return Ok(false);
+                }
+                Ok(!sample || self.pad.imu_repaint_due())
             }
             Update::Tof(frame) => {
                 self.tof = Some(*frame);
@@ -1329,7 +1478,7 @@ impl View {
             // connect to. Either way the pad block is still drawn when it is open: it reads a
             // different daemon over a different socket, and a robot is not a precondition for
             // watching the sticks.
-            let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+            let pad_height = self.pad_height();
             let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
             let [pad, tof, rest] = Layout::vertical([
                 Constraint::Length(pad_height),
@@ -1386,7 +1535,7 @@ impl View {
         // The pad block, when open, sits directly under the header rather than at the bottom: it is
         // the *source* of the command the header reports, and the frame then reads top to bottom in
         // the order the robot does — sticks, command, joints, loop rate.
-        let pad_height = if self.show_pad { PAD_HEIGHT } else { 0 };
+        let pad_height = self.pad_height();
         let tof_height = if self.show_tof { TOF_HEIGHT } else { 0 };
         let trace_height = area
             .height
@@ -1426,6 +1575,20 @@ impl View {
         if let Some(duck) = duck {
             self.render_duck(frame, duck);
         }
+    }
+
+    /// Rows the pad block takes: none while closed, [`PAD_HEIGHT`] open, and [`IMU_HEIGHT`] more
+    /// while the pad has an inertial unit to show.
+    fn pad_height(&self) -> u16 {
+        if !self.show_pad {
+            return 0;
+        }
+        PAD_HEIGHT
+            + if self.pad.imu.is_some() {
+                IMU_HEIGHT
+            } else {
+                0
+            }
     }
 
     /// Carve the robot view's column off the right, when it is wanted and fits.
@@ -2319,14 +2482,23 @@ impl View {
         };
 
         // Fixed rows, in the order the questions arrive: is it arriving, has it been arriving, and
-        // what is it saying.
-        let [cadence, gaps, axes, held] = Layout::vertical([
+        // what it is saying — and, when the pad has one, where the pad is in space.
+        let imu_height = if self.pad.imu.is_some() {
+            IMU_HEIGHT
+        } else {
+            0
+        };
+        let [cadence, gaps, axes, held, imu] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(AXIS_ROWS as u16),
             Constraint::Length(1),
+            Constraint::Length(imu_height),
         ])
-        .areas::<4>(inner);
+        .areas::<5>(inner);
+        if let Some(unit) = self.pad.imu.as_ref() {
+            render_imu(unit, frame, imu);
+        }
 
         frame.render_widget(self.pad_cadence(), cadence);
         // A label beside the trace rather than a title above it: a bordered block for one row of
@@ -2363,6 +2535,13 @@ impl View {
             title.push(Span::styled(
                 "· on USB, so there is no radio here ",
                 Style::new().fg(Color::Yellow),
+            ));
+        }
+        if self.pad.imu.is_some() {
+            // Loud on purpose: a pad with an IMU is news, and the block below has just grown.
+            title.push(Span::styled(
+                "· IMU ",
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ));
         }
         title
@@ -3644,6 +3823,112 @@ mod tests {
         view
     }
 
+    fn an_imu() -> proto::PadImuDevice {
+        proto::PadImuDevice {
+            name: "Nintendo Switch Pro Controller IMU".to_owned(),
+            node: "/dev/input/event6".to_owned(),
+            accel_per_g: 4096,
+            gyro_per_dps: 14247,
+            accel_max: 32767,
+            gyro_max: 32_767_000,
+        }
+    }
+
+    /// The pad block is what it always was for a pad without an IMU, and grows — with the
+    /// picture, the numbers and a loud tag in the title — the moment `padd` opens one. An Xbox
+    /// pad's owner must see no change; a Pro Controller's must not be able to miss it.
+    #[test]
+    fn the_pad_block_grows_an_imu_panel_only_when_the_pad_has_one() {
+        let mut view = watching_a_pad();
+        let without = render_to(&mut view, 100, 40);
+        assert!(
+            !without.contains("front edge"),
+            "no IMU, no panel:\n{without}"
+        );
+        assert!(!without.contains("· IMU"), "{without}");
+
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            })),
+        );
+        // Two hundred samples of a pad lying flat, a second's worth: level, bias learned.
+        for i in 1..=200u64 {
+            feed(
+                &mut view,
+                Update::Pad(Box::new(proto::PadReport::Imu(proto::PadImuBatch {
+                    samples: vec![proto::PadImuSample {
+                        seq: i,
+                        at_us: 1_000_000 + i * 5_000,
+                        accel: [-391, -35, 4270],
+                        gyro: [25_000, -9_000, 171_000],
+                    }],
+                    socket_dropped: 0,
+                }))),
+            );
+        }
+        let with = render_to(&mut view, 100, 40);
+        assert!(with.contains("· IMU"), "the title says so:\n{with}");
+        assert!(
+            with.contains("Nintendo Switch Pro Controller IMU"),
+            "the panel names the unit:\n{with}"
+        );
+        assert!(with.contains("pitch"), "and reads its attitude:\n{with}");
+        assert!(
+            with.contains("settled"),
+            "a second still learns the bias:\n{with}"
+        );
+        assert!(
+            with.contains('▀') || with.contains('▄'),
+            "and draws the pad:\n{with}"
+        );
+
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuDetached {
+                why: "the pad changed".to_owned(),
+            })),
+        );
+        let gone = render_to(&mut view, 100, 40);
+        assert!(
+            !gone.contains("· IMU"),
+            "and it goes when the IMU does:\n{gone}"
+        );
+    }
+
+    /// Six hundred samples a second must not become six hundred repaints a second.
+    #[test]
+    fn imu_samples_repaint_at_most_thirty_times_a_second() {
+        let mut view = watching_a_pad();
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            })),
+        );
+        let repaints = (1..=100u64)
+            .filter(|i| {
+                view.absorb(Update::Pad(Box::new(proto::PadReport::Imu(
+                    proto::PadImuBatch {
+                        samples: vec![proto::PadImuSample {
+                            seq: *i,
+                            at_us: 1_000_000 + i * 1_667,
+                            accel: [0, 0, 4096],
+                            gyro: [0, 0, 0],
+                        }],
+                        socket_dropped: 0,
+                    },
+                ))))
+                .unwrap_or_else(|_| panic!("an update is not a failure"))
+            })
+            .count();
+        assert!(
+            repaints <= 2,
+            "a burst of samples earned {repaints} repaints"
+        );
+    }
+
     /// Stopping `tofd` must be an ordinary thing to do. The subscribe reports why
     /// it failed and the caller retries — nothing here may panic or give up, or
     /// `systemctl stop tofd` would take the monitor's other two streams with it.
@@ -3741,6 +4026,7 @@ mod tests {
         proto::TofFrame {
             seq: 7,
             at_us: 1_000_000,
+            t_ns: 0,
             rows: 8,
             cols: 8,
             distance_mm,
@@ -4209,6 +4495,10 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
         }
     }
 }

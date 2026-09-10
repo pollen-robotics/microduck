@@ -1,0 +1,4 @@
+gradio>=5
+fastapi
+uvicorn[standard]
+websockets

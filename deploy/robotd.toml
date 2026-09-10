@@ -1,7 +1,10 @@
 # robotd — per-robot parameters.
 #
-# Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
-# anything here needs `systemctl restart robotd`. Live reload is deferred
+# Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
+# mostly a change needs a restart — of the daemon that reads the section, which is not
+# always robotd: [media] and [detect] are mediad's and [head_imu] is tofd's. The two
+# exceptions: padd re-reads [imu_head] a second after the file changes, and robotd
+# re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
@@ -292,8 +295,16 @@ mode = "walk"
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
 # opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this
 # switch is only whether it *can* be, so a duck with a known-bad ToF can refuse outright.
+#
+# **Off by default.** It is a party trick, and a duck nobody asked to play one has no
+# business holding a subscription to the depth stream; `robotctl theremin` on a duck that has
+# not opted in says so and names this key. Turning it on does not start anything by itself.
+#
+# Nothing else changes with it: `tofd` runs and polls the sensor either way, so
+# `robotctl monitor`'s ToF grid works the same whichever way this is set.
+#
 # Needs [audio] on: a theremin with no voice is a mouth opening for no reason.
-# enabled = true
+# enabled = false
 
 # tofd's depth stream.
 # socket = "/run/tofd/tof.sock"
@@ -349,6 +360,24 @@ mode = "walk"
 # reads anything at all, because the output tensor shares one quantisation scale with the box
 # coordinates. So this is a yes/no threshold rather than a dial.
 # threshold = 0.35
+
+[head_imu]
+# The BMI088 on the head module, read by tofd and served as `head_imu.stream` — gyro,
+# acceleration and a Madgwick orientation, for the mapping work.
+#
+# **Off by default, and this is the whole section.** Reading it at 100 Hz costs ~3.5-4.5% of a
+# core on this SoC, and a bench that takes the loop apart says none of that is fixable: the
+# wakeups are 0.7 points of it, the fusion 0.3, and the rest is the two I²C transactions a
+# sample takes — which is what a gyro and an accelerometer sample *is*. Nothing subscribes to
+# the stream yet, so every duck was paying it from boot for nobody.
+#
+# Turn it on when something reads it. `tofd --imu-hz 50` is the other lever: the cost is linear
+# in the rate. Depth is unaffected either way — tofd ranges the ToF regardless, so
+# `robotctl monitor`'s grid does not depend on this.
+#
+# A subscriber to `head_imu.stream` while this is off gets the reason, naming this key, rather
+# than the silence a board with no sensor fitted gives.
+# enabled = false
 
 [chorale]
 # Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
@@ -414,3 +443,19 @@ mode = "walk"
 #
 # gcc is webrtcsink's own default, so this line changes nothing; it is here to be found.
 # congestion_control = "gcc"
+
+# ── Controller-IMU head control ─────────────────────────────────────────────────────────────
+#
+# Read by `padd`, not by `robotd`. Some pads carry an inertial unit — the "Pro Controller" Switch
+# clones do, an Xbox pad does not. With this on and such a pad connected, Y stops meaning "the
+# sticks pose the head" and means "the pad's tilt poses the head": the sticks keep driving, and
+# turning the pad in your hands turns the robot's head. Y again holds the head where it is, still
+# driving. A third press hands the head back to the pad from where the pad is *now* — its yaw is
+# a gyro's word alone and drifts, and re-centring on every re-entry is how you beat that without
+# a magnetometer. Off, or on a pad with no IMU, Y is what it always was.
+# [imu_head]
+# enabled = false
+
+# Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into
+# a large head movement. The head's own travel limit still applies.
+# gain = 1.0
