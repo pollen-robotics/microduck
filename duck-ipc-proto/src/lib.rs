@@ -326,7 +326,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 27;
+///
+/// # v28 — measured joint velocity and load, on the state stream
+///
+/// [`RobotState::velocities`] and [`RobotState::currents_ma`]: the two blocks the control loop has
+/// read beside position on every tick and never published. Neither is recoverable from outside
+/// the daemon — differencing `joints` across a decimated subscription is not a velocity, and
+/// present current is the only measure of external force this robot has. Additive, on the rule
+/// `odom` set: absent from a daemon predating it, and absent stays distinguishable from zero.
+pub const API_VERSION: u32 = 28;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3368,6 +3376,34 @@ pub struct RobotState {
     pub joints: Vec<f64>,
     /// What was commanded, so a viewer can show tracking error rather than guessing at it.
     pub targets: Vec<f64>,
+    /// Measured joint velocities, rad/s, indexed as [`JOINT_NAMES`].
+    ///
+    /// Read in the same twelve-byte block as [`Self::joints`] — `present_pwm`,
+    /// `present_current`, `present_velocity`, `present_position` are contiguous at register 124,
+    /// so the control loop already has this every tick at no extra bus cost. It stopped at the
+    /// wire only because nothing had asked for it.
+    ///
+    /// Differencing [`Self::joints`] between frames is not the same thing: a subscriber
+    /// decimated to 10 Hz differences across five ticks, and any dropped frame silently
+    /// becomes a velocity spike.
+    ///
+    /// `default` so a frame from a `robotd` predating this field still parses, on the same rule
+    /// as [`Self::odom`]. Empty means *not reported*, which is not the same as a robot at rest —
+    /// a client must not render it as zero velocity. (v28)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub velocities: Vec<f64>,
+    /// Present current magnitude per joint, mA, indexed as [`JOINT_NAMES`].
+    ///
+    /// Sign is dropped by the control loop, which is deliberate there and worth repeating here:
+    /// direction is inferable from [`Self::velocities`], and what a consumer wants is load.
+    ///
+    /// This is the robot's only measure of external force. A joint holding a squat, a foot
+    /// taking weight, a hand pressing on the beak and a servo about to latch its overload
+    /// shutdown are all visible here and nowhere else on this wire.
+    ///
+    /// Same `default` rule as [`Self::velocities`]: empty is *not reported*, not zero load. (v28)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub currents_ma: Vec<f64>,
     /// Where contact odometry believes the robot is. `default` so a frame from
     /// a `robotd` predating the estimator still parses — zeros, like a robot
     /// that has not moved.
@@ -5687,6 +5723,8 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            velocities: vec![0.0; 15],
+            currents_ma: vec![0.0; 15],
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
@@ -5748,6 +5786,8 @@ mod tests {
             },
             joints: vec![0.0; 15],
             targets: vec![0.0; 15],
+            velocities: vec![0.0; 15],
+            currents_ma: vec![0.0; 15],
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
@@ -5763,6 +5803,98 @@ mod tests {
         let back: Request = serde_json::from_str(&line).unwrap();
         assert!(back.is_notification(), "state carries no id");
         assert_eq!(back.as_state().unwrap(), state);
+    }
+
+    /// Velocity and load must reach the wire under the names the docs promise, and must
+    /// survive a round trip. They are the only measurements of joint motion and external
+    /// force this protocol carries; a rename here is silent in Rust and leaves every
+    /// consumer reading nothing.
+    #[test]
+    fn velocity_and_load_ride_under_their_documented_names() {
+        let mut state = a_state();
+        // Distinguishable, and distinguishable *from each other* — a swap of the two blocks
+        // would otherwise round-trip happily.
+        state.velocities = (0..15).map(|i| i as f64 * 0.1).collect();
+        state.currents_ma = (0..15).map(|i| 100.0 + i as f64).collect();
+
+        let line = serde_json::to_string(&Request::notify_state(&state)).unwrap();
+        assert!(line.contains(r#""velocities":"#), "{line}");
+        assert!(line.contains(r#""currents_ma":"#), "{line}");
+
+        let back = serde_json::from_str::<Request>(&line)
+            .unwrap()
+            .as_state()
+            .unwrap()
+            .clone();
+        // Compared approximately, on this protocol's own rule that exact equality is not a
+        // comparison to offer about a measurement (see `SafetyState`, which drops `Eq` for
+        // exactly this reason). A JSON round trip is not bit-exact for every f64.
+        let close = |a: &[f64], b: &[f64], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}: length");
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!((x - y).abs() < 1e-9, "{what}[{i}]: {x} vs {y}");
+            }
+        };
+        close(&back.velocities, &state.velocities, "velocities");
+        close(&back.currents_ma, &state.currents_ma, "currents_ma");
+    }
+
+    /// A `robotd` predating these fields sends a frame without them, and a client must be able
+    /// to tell *not reported* from *reported as zero*. A robot at rest and a robot that cannot
+    /// tell you what it is doing look nothing alike, and rendering one as the other is how a
+    /// dashboard says "no load" about a servo cooking itself.
+    ///
+    /// The same rule `odom` established, applied to two more blocks.
+    #[test]
+    fn an_older_frame_reports_no_velocity_rather_than_zero() {
+        let line = serde_json::to_string(&Request::notify_state(&a_state())).unwrap();
+        assert!(
+            !line.contains("velocities") && !line.contains("currents_ma"),
+            "empty blocks must not be serialised at all: {line}"
+        );
+
+        let back = serde_json::from_str::<Request>(&line)
+            .unwrap()
+            .as_state()
+            .unwrap()
+            .clone();
+        assert!(back.velocities.is_empty(), "absent is not a vec of zeros");
+        assert!(back.currents_ma.is_empty(), "absent is not a vec of zeros");
+    }
+
+    /// A minimal frame: everything present, nothing interesting.
+    fn a_state() -> RobotState {
+        RobotState {
+            t: 1.5,
+            movement: MoveState {
+                requested: [0.0; 3],
+                applied: [0.0; 3],
+                limited_by: Vec::new(),
+            },
+            head: [0.0; 4],
+            policy: "stand".into(),
+            safety: SafetyState {
+                fallen: false,
+                limp: false,
+                gravity: [0.0, 0.0, -1.0],
+                gain: Some(200),
+            },
+            control_loop: LoopState {
+                hz: 49.8,
+                missed: 0,
+            },
+            joints: vec![0.0; 15],
+            targets: vec![0.0; 15],
+            velocities: Vec::new(),
+            currents_ma: Vec::new(),
+            odom: OdomState::default(),
+            theremin: None,
+            chorale: None,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
+        }
     }
 
     /// An unlimited command must not carry an empty array — a consumer checking
