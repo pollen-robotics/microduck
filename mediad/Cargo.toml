@@ -26,11 +26,14 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # through, so the schema, the defaults and the editor cannot drift from what is read here.
 robotd-params = { path = "../robotd-params" }
 anyhow = "1"
+# `getgrnam` and `chown`, to hand the frame socket to the `robot` group after binding — the same
+# thing `tof` and `padd` do with theirs. Mode 0660 alone would leave it `mediad:mediad`, and the
+# operator is only ever added to `robot`.
+libc = "0.2"
 # The detector itself: the letterbox+turn, the NPU binding, the ONNX fallback and the decoder.
 duck-detect = { path = "../duck-detect" }
-# JPEG for the frame stream. Same crate and same feature `duck-detect` already uses, so
-# this adds a feature to a build rather than a dependency to the tree.
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# JPEG for the frame stream and PNG for lossless console snapshots.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
 # is known-good against this toolchain and the cross build. The alternative was a hand-rolled
 # HTTP/1.1 responder: about sixty lines of hand-written request parsing bound to 0.0.0.0, written to

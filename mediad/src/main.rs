@@ -161,6 +161,9 @@ struct Args {
     pad_socket: Option<std::path::PathBuf>,
     #[arg(long)]
     updater_socket: Option<std::path::PathBuf>,
+    /// Local raw camera snapshot endpoint (not the control datachannel).
+    #[arg(long, default_value = duck_ipc_proto::socket::MEDIA)]
+    frame_socket: std::path::PathBuf,
 }
 
 // Gated with the `main` that calls it: off Linux there is no pipeline, so there is nothing to
@@ -294,8 +297,9 @@ fn main() -> ExitCode {
         // neither. So this is logged at error and the daemon carries on.
         let page = mediad::web::page(args.port);
         let (web_host, web_port) = (args.host.clone(), args.web_port);
+        let web_frame_socket = args.frame_socket.clone();
         tokio::spawn(async move {
-            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page, web_frame_socket).await {
                 tracing::error!(
                     error = %format!("{e:#}"),
                     "the console is not being served; video and control are unaffected"
@@ -423,6 +427,24 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+
+        // A recorder or perception process asks the local Unix socket for one raw frame. It is
+        // deliberately not the datachannel: a snapshot is camera-sized, and control has to stay
+        // prompt even while a slow local reader is being served. `npu-bringup.md` names this.
+        let (frame_lock, frame_listener) = match mediad::frame::bind(&args.frame_socket).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::error!(error = %error, "cannot bind media.frame; refusing a partial start");
+                return ExitCode::FAILURE;
+            }
+        };
+        let frame_source = frames.clone();
+        tokio::spawn(async move {
+            let _lock = frame_lock;
+            if let Err(error) = mediad::frame::serve(frame_listener, frame_source).await {
+                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
+            }
+        });
 
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's

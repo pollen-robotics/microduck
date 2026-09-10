@@ -28,6 +28,7 @@ pub mod producer;
 pub mod relay;
 pub mod route;
 pub mod session;
+mod snapshot;
 pub mod stream;
 /// Relay candidates, so a robot behind a router is reachable from a network that cannot punch a
 /// hole to it. `docs/design/remote-access-design.md` §6.
@@ -49,3 +50,9 @@ pub mod exposure;
 /// reads the same raw branch, in the same pixel format the pipeline names.
 #[cfg(target_os = "linux")]
 pub mod detect;
+
+/// The local, on-demand raw-frame endpoint. Linux only because it reads the pipeline's frame
+/// rendezvous, which is; the WebRTC control channel deliberately does not carry camera-sized
+/// replies. `npu-bringup.md` §"media.frame".
+#[cfg(target_os = "linux")]
+pub mod frame;

@@ -42,6 +42,7 @@ use robotd_params::Slot;
 
 mod configure;
 mod duck;
+mod frame;
 mod imu_view;
 mod monitor;
 mod path_map;
@@ -107,6 +108,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
 
+    /// Local camera snapshot socket.
+    #[arg(long, global = true, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -115,6 +120,11 @@ struct Cli {
 /// `robotctl motors` later is additive rather than a restructure.
 #[derive(Subcommand, Debug)]
 enum Namespace {
+    /// Save one fresh raw UYVY frame; geometry is printed to stderr.
+    Frame {
+        #[arg(long, default_value = "frame.uyvy")]
+        output: PathBuf,
+    },
     /// Wifi. Served by `configd`, which drives NetworkManager.
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Net {
@@ -4513,6 +4523,7 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
 
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
+        Namespace::Frame { output } => return frame::run(&cli.media_socket, &output),
         Namespace::Health { json } => {
             return run_health(&cli.socket, &cli.robot_socket, &cli.config_socket, json);
         }

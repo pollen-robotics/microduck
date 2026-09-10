@@ -89,6 +89,7 @@
 //! naming the arity rather than as an abort.
 
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use duck_ipc_proto as proto;
@@ -233,6 +234,10 @@ pub struct Frame {
     /// The GStreamer format name — [`CAPTURE_FORMAT`], carried rather than assumed so a consumer
     /// reading this cannot silently misinterpret the bytes if the capture format changes again.
     pub format: &'static str,
+    /// When this buffer was taken, for a consumer joining a frame to a separately sampled
+    /// robot state. Observation time, not a scheduling clock: it is never used to pace capture,
+    /// so an NTP step cannot reach the pipeline through it.
+    pub captured_at: SystemTime,
     /// Tightly packed as the caps describe it, in `format`.
     pub data: Vec<u8>,
 }
@@ -337,14 +342,19 @@ impl Frames {
 
     /// Whether a reader is waiting, taking the request if one is. The callback's whole cost on a
     /// frame nobody asked for.
-    fn take_request(&self) -> bool {
+    ///
+    /// `pub(crate)` so that [`crate::frame`]'s tests can stand in for the capture branch: the
+    /// endpoint's behaviour on a real delivery is only testable by driving this rendezvous.
+    pub(crate) fn take_request(&self) -> bool {
         self.0
             .wanted
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hand the captured frame to whoever is waiting for it.
-    fn deliver(&self, frame: Frame) {
+    ///
+    /// `pub(crate)` for the same reason as [`Frames::take_request`].
+    pub(crate) fn deliver(&self, frame: Frame) {
         let mut latest = self.0.latest.lock().expect("frame lock");
         latest.frame = Some(frame);
         latest.generation = latest.generation.wrapping_add(1);
@@ -1100,6 +1110,9 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                     width,
                     height,
                     format: CAPTURE_FORMAT,
+                    // Taken here rather than at delivery: this is the moment the buffer existed,
+                    // and it costs one clock read on a frame someone already asked for.
+                    captured_at: SystemTime::now(),
                     data: map.as_slice().to_vec(),
                 });
 
@@ -2093,6 +2106,7 @@ mod tests {
             width: 4,
             height: 2,
             format: CAPTURE_FORMAT,
+            captured_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(tag as u64),
             data: vec![tag; 16],
         }
     }
