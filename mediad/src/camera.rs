@@ -237,10 +237,28 @@ impl Intrinsics {
 
     /// The MuJoCo twin's head camera. The MJCF sets no `fovy` on the camera, so MuJoCo's default
     /// **45° VERTICAL** field applies over the rendered height: `fx = fy = (height/2)/tan(45°/2)`,
-    /// principal point central, no distortion (a rendered pinhole has none). Exact for the simulator,
-    /// so twin recordings self-describe and need no `--calib`. Tagged [`Source::Sim`], `calibrated`
-    /// false (it is not a measurement of a physical sensor). If a scene ever sets a custom camera
-    /// `fovy`, update `SIM_VFOV_DEG`.
+    /// no distortion (a rendered pinhole has none). Exact for the simulator, so twin recordings
+    /// self-describe and need no `--calib`. Tagged [`Source::Sim`], `calibrated` false (it is not a
+    /// measurement of a physical sensor). If a scene ever sets a custom camera `fovy`, update
+    /// `SIM_VFOV_DEG`.
+    ///
+    /// # The principal point is `(W-1)/2`, not `W/2` — a convention mismatch, not a design choice
+    ///
+    /// MuJoCo's own projection is exact with `cx = W/2`, but only in *its* pixel convention: pixel
+    /// `j` is the raster cell spanning `[j, j+1)`, and the ray through the middle of that cell
+    /// passes through image coordinate `j+0.5`, so the optical axis at the centre of a `W`-wide
+    /// image sits at raster coordinate `W/2`. Every consumer of this struct — `duckslam`'s
+    /// `project_tof`/`sample_at`, OpenCV, and RTAB-Map — uses the opposite convention: **integer**
+    /// pixel coordinates *are* pixel centres, so pixel `j`'s centre is at coordinate `j`, the image
+    /// spans `[-0.5, W-0.5]`, and the same physical axis is at `(W-1)/2`. Publishing `W/2` here hands
+    /// every downstream consumer an axis that is half a pixel off from where their own convention
+    /// says it is — not a rounding nicety: measured on a synthetic tilted-plane bench with an exact
+    /// analytic prediction and integer sampling, `cx = W/2` costs **5.03 mm mean / 20.44 mm p99**
+    /// depth error at 640×360 (10.08/40.98 at 320×180, 6.30/17.37 at 256×256), against **0.0004/0.0016
+    /// mm** (0.0011/0.0029, 0.0003/0.0008) once corrected to `(W-1)/2` — see
+    /// `docs/validation/01-intrinsics.md` in `microduck_vslam`. The half-pixel error is fixed in
+    /// pixels, so it costs proportionally more at a narrower delivered width, which is the signature
+    /// that confirms it is a convention offset and not, say, a lens or scale error.
     pub fn sim(width: u32, height: u32) -> Option<Self> {
         if width == 0 || height == 0 {
             return None;
@@ -249,8 +267,8 @@ impl Intrinsics {
         Some(Self {
             fx: focal,
             fy: focal,
-            cx: f64::from(width) / 2.0,
-            cy: f64::from(height) / 2.0,
+            cx: (f64::from(width) - 1.0) / 2.0,
+            cy: (f64::from(height) - 1.0) / 2.0,
             calibrated: false,
             source: Source::Sim,
             distortion: Vec::new(),
@@ -334,7 +352,7 @@ mod tests {
         let k = Intrinsics::sim(640, 360).expect("nonzero");
         assert!((k.fy - 434.57).abs() < 0.1, "{}", k.fy);
         assert_eq!(k.fx, k.fy, "square pixels");
-        assert_eq!((k.cx, k.cy), (320.0, 180.0), "principal point central");
+        assert_eq!((k.cx, k.cy), (319.5, 179.5), "principal point central in OpenCV coords");
         assert_eq!(k.source, Source::Sim);
         assert!(!k.calibrated && k.distortion.is_empty());
         let hfov = 2.0 * (320.0 / k.fx).atan().to_degrees();
