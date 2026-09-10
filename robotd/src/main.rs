@@ -2246,11 +2246,22 @@ async fn control_loop<T: RobotIo>(
                     "mode switch refused: the robot is shutting down"
                 );
             } else {
-                tracing::warn!(
-                    from = policy_params.mode.as_str(),
-                    to = target.as_str(),
-                    "mode switch: going home before loading the other policies"
-                );
+                // What happens next depends on where the robot is, so the line a human reads off
+                // it should too: a limp robot swaps where it stands and does not move, and saying
+                // "going home" about that describes a ramp nobody is going to see.
+                if bringup == Bringup::Limp {
+                    tracing::warn!(
+                        from = policy_params.mode.as_str(),
+                        to = target.as_str(),
+                        "mode switch: swapping the policies now; the robot is limp and stays limp"
+                    );
+                } else {
+                    tracing::warn!(
+                        from = policy_params.mode.as_str(),
+                        to = target.as_str(),
+                        "mode switch: going home before loading the other policies"
+                    );
+                }
                 // The prototype's cue, and worth keeping: one quack for walking, two for roller,
                 // so the robot says which mode it is going to without anybody reading a log.
                 if let Some(voice) = voice.as_mut() {
