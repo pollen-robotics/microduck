@@ -67,6 +67,10 @@ a policy only on a claim that is present and wrong.
 | `eval` | object | display | free-form: what was checked, in what sim, how it did |
 | `policies[]` | array | set | one entry per file, with `file` plus any per-policy field above |
 
+Recurrent LSTM exports require `model_api: 2`; existing feed-forward exports remain API 1.
+See [recurrent policies](recurrent-policies.md) for the tensor contract, memory lifecycle
+and offline rehearsal.
+
 ## A single-policy repo
 
 ```json

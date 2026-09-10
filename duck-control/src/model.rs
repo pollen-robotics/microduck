@@ -79,6 +79,12 @@ pub const IMU_DXL_ID: u8 = 200;
 
 pub const BAUD_RATE: u32 = 1_000_000;
 
+/// What a servo answers as out of the box: ID 1 at 57 600 baud. Both are deliberately unused
+/// on this bus — no joint is ID 1 and nothing runs at that speed — which is what lets a
+/// replacement be told apart from every servo already fitted ([`crate::bus`]).
+pub const FACTORY_ID: u8 = 1;
+pub const FACTORY_BAUD_RATE: u32 = 57_600;
+
 /// EEPROM registers asserted (and corrected) at startup.
 ///
 /// `return_delay_time` is the load-bearing one: the XL330 ships at 250, which is 500 µs of
@@ -156,6 +162,16 @@ mod tests {
     #[test]
     fn imu_id_does_not_collide_with_a_joint() {
         assert!(!JOINT_IDS.contains(&IMU_DXL_ID));
+    }
+
+    /// The replacement path finds a new servo by the ID it ships with. If a joint ever took
+    /// ID 1, a fresh servo would be indistinguishable from it — and flashing "the missing
+    /// joint" onto ID 1 would re-address a servo that was never missing.
+    #[test]
+    fn factory_defaults_are_unused_on_the_bus() {
+        assert!(!JOINT_IDS.contains(&FACTORY_ID));
+        assert_ne!(IMU_DXL_ID, FACTORY_ID);
+        assert_ne!(FACTORY_BAUD_RATE, BAUD_RATE);
     }
 
     /// `MOUTH_INDEX` is used to skip a slot when mapping 14 policy actions onto 15 joints.

@@ -11,6 +11,9 @@
 //! goes away. What happens between those two channels is [`crate::session`], and it never
 //! learns whether a radio is involved.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use tokio::sync::mpsc;
 
 /// How many chunks may queue in either direction.
@@ -38,18 +41,36 @@ pub struct Link {
     pub outbound: mpsc::Sender<Vec<u8>>,
     /// Usable notification payload — `ATT_MTU - 3` — as negotiated for this connection.
     ///
-    /// Read once per session rather than per message: a central may renegotiate, but not
-    /// mid-line, and re-reading it would let a line be chunked two different ways.
-    pub mtu: usize,
+    /// **A shared cell rather than a number, because the two halves of the link learn it at
+    /// different times.** BlueZ reports the negotiated MTU on every inbound write and offers the
+    /// notify side no way to ask, so a session begins knowing only the 20-byte floor and learns
+    /// the real value from the first write a client makes — which is always `system.authenticate`,
+    /// before any reply worth chunking exists. Sizing replies for the floor for the whole session
+    /// was a tenfold cost in notifications, and above about 5 KiB it stopped being merely slow:
+    /// see the pacing in `bluez`.
+    ///
+    /// Read once per *line*, never per chunk, which is the invariant that matters — a line chunked
+    /// two different ways cannot be reassembled.
+    mtu: Arc<AtomicUsize>,
     /// The central's address, for the log line. Never used for authorization — a BLE address
     /// is trivially spoofed, and pairing is what authorizes (`architecture.md` §4.2).
     pub peer: String,
 }
 
 impl Link {
-    /// A link wired to channels the caller drives. Used by tests and by `--fake`.
+    /// A link wired to channels the caller drives, with a payload size that never changes.
+    /// Used by tests and by `--fake`.
     pub fn pair(
         mtu: usize,
+        peer: impl Into<String>,
+    ) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        Self::pair_sharing_mtu(Arc::new(AtomicUsize::new(mtu)), peer)
+    }
+
+    /// A link whose payload size is written by somebody else — the radio backend, from what
+    /// BlueZ reports on each inbound write. See [`Link::mtu`].
+    pub fn pair_sharing_mtu(
+        mtu: Arc<AtomicUsize>,
         peer: impl Into<String>,
     ) -> (Self, mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         let (to_robot, inbound) = mpsc::channel(QUEUE);
@@ -64,6 +85,11 @@ impl Link {
             to_robot,
             from_robot,
         )
+    }
+
+    /// The payload to size the next outbound line for.
+    pub fn mtu(&self) -> usize {
+        self.mtu.load(Ordering::Relaxed)
     }
 }
 

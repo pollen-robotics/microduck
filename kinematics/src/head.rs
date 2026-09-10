@@ -31,6 +31,9 @@ pub struct HeadFk {
     /// true position, a couple of centimetres from the camera it would
     /// otherwise borrow.
     tof: Option<SiteId>,
+    /// The MJCF's `head_imu` site (the BMI088 on the HAT), when the asset carries one. Tilted
+    /// relative to the camera — the mount is not axis-aligned.
+    head_imu: Option<SiteId>,
     joints: [usize; 4],
 }
 
@@ -44,6 +47,7 @@ impl HeadFk {
                 .site("head_camera")
                 .expect("model has a head_camera site"),
             tof: model.site("tof"),
+            head_imu: model.site("head_imu"),
             joints: HEAD_JOINTS
                 .map(|name| model.joint_index(name).expect("model has the head joints")),
         }
@@ -82,6 +86,16 @@ impl HeadFk {
                 Pose::new(cam.pos, cam.quat * SENSOR_IN_CV2_Q)
             }
         }
+    }
+
+    /// Head-IMU (BMI088) pose in the trunk frame, when the asset has a `head_imu` site.
+    ///
+    /// The site frame is the sensor's own axes as mounted — tilted, not aligned with the camera.
+    /// Rotating a sensor-frame vector by the result's quat expresses it in the trunk, which is how
+    /// a consumer places `head_imu.stream` samples in the robot frame. `None` for an asset with no
+    /// such site (the caller then has no mount and must skip the transform).
+    pub fn head_imu_in_trunk(&self, joints: [f64; 4]) -> Option<Pose> {
+        self.head_imu.map(|site| self.site_in_trunk(site, joints))
     }
 
     /// A head-chain site posed by the four head joints, everything else at

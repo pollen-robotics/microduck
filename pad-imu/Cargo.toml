@@ -1,0 +1,14 @@
+# A gamepad's inertial unit, read into an attitude.
+#
+# One filter for two programs: `padd` poses the robot's head from it, `robotctl monitor` draws
+# the pad from it. Its own crate so neither depends on the other, and so the head and the
+# picture cannot disagree about which way the pad is tilted. Depends on the wire types only.
+[package]
+name = "pad-imu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }

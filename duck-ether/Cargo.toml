@@ -1,0 +1,15 @@
+[package]
+name = "duck-ether"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A radio for simulated ducks: what one advertises, the ones near it hear"
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+thiserror.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

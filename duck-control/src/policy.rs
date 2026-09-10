@@ -4,7 +4,8 @@
 //! `microduck_runtime` does; the skill networks — sit↔stand, ground pick, the two kicks —
 //! are selected explicitly by the scheduler in `robotd`, which owns the priority rules.
 //! Every network shares the one 61-D observation layout, so a skill is a session choice
-//! plus a command-block encoding, never a new contract.
+//! plus a command-block encoding. LSTM exports additionally pass hidden/cell state,
+//! owned by each network; sensor observations and joint actions are unchanged.
 //!
 //! **Everything is validated at load, not at inference.** A bundle with the wrong
 //! observation width, the wrong action count, or a missing ONNX Runtime must fail while the
@@ -17,7 +18,9 @@ use std::sync::OnceLock;
 
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
-use ort::value::{Value, ValueType};
+use ort::tensor::TensorElementType;
+use ort::value::{Tensor, Value, ValueType};
+use sha2::{Digest, Sha256};
 
 use crate::obs::{ACTION_LEN, OBS_LEN, Observation};
 
@@ -34,6 +37,12 @@ const INTRA_THREADS: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
+    #[error("reading {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("loading {path}: {source}")]
     Load {
         path: PathBuf,
@@ -68,12 +77,14 @@ pub enum PolicyError {
 impl PolicyError {
     /// The file this error is about, when it is about one.
     ///
-    /// `Load` and `Shape` name a file; a missing runtime or an `ort` panic does not, and
+    /// `Read`, `Load` and `Shape` name a file; a missing runtime or an `ort` panic does not, and
     /// blaming whichever policy happened to be loading when the dylib turned out to be absent
     /// would send an operator to replace a file that is fine.
     pub fn path(&self) -> Option<&Path> {
         match self {
-            PolicyError::Load { path, .. } | PolicyError::Shape { path, .. } => Some(path),
+            PolicyError::Read { path, .. }
+            | PolicyError::Load { path, .. }
+            | PolicyError::Shape { path, .. } => Some(path),
             PolicyError::Inference(_)
             | PolicyError::RuntimeMissing { .. }
             | PolicyError::RuntimePanic { .. } => None,
@@ -227,12 +238,13 @@ pub struct PolicyPaths {
 /// release, so a missing or corrupt file is a broken bundle, and the right outcome is
 /// "unhealthy, roll it back", not a robot that silently lost its kick.
 pub struct Policy {
-    walk: Session,
-    stand: Option<Session>,
-    sitstand: Option<Session>,
-    ground_pick: Option<Session>,
-    skills: Vec<Session>,
+    walk: Network,
+    stand: Option<Network>,
+    sitstand: Option<Network>,
+    ground_pick: Option<Network>,
+    skills: Vec<Network>,
     standing_threshold: f64,
+    active: Option<Net>,
     /// Roller mode and fall-recovery mode reserve the standing network (roller has none;
     /// fall recovery keeps it for getting up), so command magnitude must never select it.
     standing_disabled: bool,
@@ -255,15 +267,16 @@ impl Policy {
             // It also proves ONNX Runtime is actually present and usable, which with
             // `load-dynamic` is not known until something is run.
             let zero = Observation::zeroed();
-            fn open_warm(path: &Path, zero: &Observation) -> Result<Session, PolicyError> {
-                let mut session = open(path)?;
-                run(&mut session, path, zero)?;
-                Ok(session)
+            fn open_warm(path: &Path, zero: &Observation) -> Result<Network, PolicyError> {
+                let mut network = open(path)?;
+                network.run(zero)?;
+                network.reset();
+                Ok(network)
             }
             fn open_opt(
                 path: &Option<PathBuf>,
                 zero: &Observation,
-            ) -> Result<Option<Session>, PolicyError> {
+            ) -> Result<Option<Network>, PolicyError> {
                 path.as_deref().map(|p| open_warm(p, zero)).transpose()
             }
 
@@ -278,6 +291,7 @@ impl Policy {
                     .map(|path| open_warm(path, &zero))
                     .collect::<Result<Vec<_>, _>>()?,
                 standing_threshold,
+                active: None,
                 standing_disabled: false,
             })
         })
@@ -324,18 +338,92 @@ impl Policy {
         observation: &Observation,
         net: Net,
     ) -> Result<[f32; ACTION_LEN], PolicyError> {
-        let session = match net {
-            Net::Walk => None,
+        // Resolve fallback before comparing: asking for an absent skill must not reset
+        // the walking network on every tick.
+        let net = match net {
+            Net::Stand if self.stand.is_none() => Net::Walk,
+            Net::SitStand if self.sitstand.is_none() => Net::Walk,
+            Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
+            Net::Skill(i) if i >= self.skills.len() => Net::Walk,
+            net => net,
+        };
+        let changed = self.active != Some(net);
+        let network = match net {
+            Net::Walk => &mut self.walk,
+            Net::Stand => self.stand.as_mut().unwrap(),
+            Net::SitStand => self.sitstand.as_mut().unwrap(),
+            Net::GroundPick => self.ground_pick.as_mut().unwrap(),
+            Net::Skill(i) => &mut self.skills[i],
+        };
+        if changed {
+            network.reset();
+        }
+        let result = network.run(observation);
+        // Never carry a failed inference's state into another control tick.
+        if result.is_err() {
+            network.reset();
+            self.active = None;
+        } else {
+            self.active = Some(net);
+        }
+        result
+    }
+
+    /// Preserve the running network when only another slot changed. Compare model
+    /// bytes, not paths: a reload may replace a file in place, and a seated swap may
+    /// intentionally replace the active network. Those cases must start fresh.
+    pub fn carry_over(&mut self, from: &Self) {
+        self.reset();
+        let Some(net) = from.active else {
+            return;
+        };
+        let target = match net {
+            Net::Walk => Some(&mut self.walk),
             Net::Stand => self.stand.as_mut(),
             Net::SitStand => self.sitstand.as_mut(),
             Net::GroundPick => self.ground_pick.as_mut(),
-            Net::Skill(index) => self.skills.get_mut(index),
+            Net::Skill(i) => self.skills.get_mut(i),
         };
-        let session = match session {
-            Some(session) => session,
-            None => &mut self.walk,
+        let source = match net {
+            Net::Walk => Some(&from.walk),
+            Net::Stand => from.stand.as_ref(),
+            Net::SitStand => from.sitstand.as_ref(),
+            Net::GroundPick => from.ground_pick.as_ref(),
+            Net::Skill(i) => from.skills.get(i),
         };
-        run(session, Path::new("<loaded>"), observation)
+        if let (Some(target), Some(source)) = (target, source)
+            && target.digest == source.digest
+        {
+            if let (Some(dst), Some(src)) = (&mut target.state, &source.state) {
+                dst.h
+                    .try_extract_tensor_mut::<f32>()
+                    .unwrap()
+                    .1
+                    .copy_from_slice(src.h.try_extract_tensor::<f32>().unwrap().1);
+                dst.c
+                    .try_extract_tensor_mut::<f32>()
+                    .unwrap()
+                    .1
+                    .copy_from_slice(src.c.try_extract_tensor::<f32>().unwrap().1);
+            }
+            self.active = Some(net);
+        }
+    }
+
+    /// Start a new episode, including when resuming after disable or fall recovery.
+    /// A network also starts fresh whenever selection switches away and back to it.
+    pub fn reset(&mut self) {
+        self.active = None;
+        self.walk.reset();
+        for network in self
+            .stand
+            .iter_mut()
+            .chain(self.sitstand.iter_mut())
+            .chain(self.ground_pick.iter_mut())
+            .chain(self.skills.iter_mut())
+        {
+            network.reset();
+        }
     }
 }
 
@@ -364,7 +452,140 @@ pub fn validate(path: &Path) -> Result<(), PolicyError> {
     catching_ort_panics(|| open(path).map(drop))
 }
 
-fn open(path: &Path) -> Result<Session, PolicyError> {
+/// The mjlab/rsl_rl LSTM export passes state explicitly. Buffers belong to one
+/// session, are allocated at load, and are never shared between policy slots.
+struct Network {
+    session: Session,
+    state: Option<LstmState>,
+    action_name: String,
+    path: PathBuf,
+    digest: [u8; 32],
+}
+
+struct LstmState {
+    h: Tensor<f32>,
+    c: Tensor<f32>,
+}
+
+impl Network {
+    fn reset(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.h.try_extract_tensor_mut::<f32>().unwrap().1.fill(0.0);
+            state.c.try_extract_tensor_mut::<f32>().unwrap().1.fill(0.0);
+        }
+    }
+
+    fn run(&mut self, observation: &Observation) -> Result<[f32; ACTION_LEN], PolicyError> {
+        let fail = |e: String| PolicyError::Inference(format!("{}: {e}", self.path.display()));
+        if !observation.as_slice().iter().all(|v| v.is_finite()) {
+            return Err(fail("non-finite observation".into()));
+        }
+        let input = Value::from_array(([1usize, OBS_LEN], observation.as_slice().to_vec()))
+            .map_err(|e| fail(format!("building input: {e}")))?;
+        let outputs = match &self.state {
+            Some(state) => self.session.run(ort::inputs![
+                "obs" => &input, "h_in" => &state.h, "c_in" => &state.c
+            ]),
+            None => self.session.run(ort::inputs!["obs" => &input]),
+        }
+        .map_err(|e| fail(e.to_string()))?;
+        let (_, actions) = outputs[self.action_name.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| fail(e.to_string()))?;
+        if actions.len() != ACTION_LEN || !actions.iter().all(|v| v.is_finite()) {
+            return Err(fail("expected 14 finite actions".into()));
+        }
+        let mut result = [0.0; ACTION_LEN];
+        result.copy_from_slice(actions);
+        if let Some(state) = &mut self.state {
+            let (hs, h) = outputs["h_out"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| fail(e.to_string()))?;
+            let (cs, c) = outputs["c_out"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| fail(e.to_string()))?;
+            let (expected_h, h_in) = state
+                .h
+                .try_extract_tensor_mut::<f32>()
+                .map_err(|e| fail(e.to_string()))?;
+            let (expected_c, c_in) = state
+                .c
+                .try_extract_tensor_mut::<f32>()
+                .map_err(|e| fail(e.to_string()))?;
+            // Check both before updating either, including dynamic runtime output shapes.
+            if hs != expected_h || cs != expected_c || !h.iter().chain(c).all(|v| v.is_finite()) {
+                return Err(fail(
+                    "invalid LSTM output state shape or non-finite state".into(),
+                ));
+            }
+            h_in.copy_from_slice(h);
+            c_in.copy_from_slice(c);
+        }
+        Ok(result)
+    }
+}
+
+fn shape_error(path: &Path, what: &'static str, expected: &str, got: String) -> PolicyError {
+    PolicyError::Shape {
+        path: path.to_owned(),
+        what,
+        expected: expected.into(),
+        got,
+    }
+}
+
+/// Require an exact rank and float32 type. Batch may be symbolic, but this runtime
+/// always supplies batch one; state layers and hidden width must be known at load.
+fn tensor_shape(path: &Path, outlet: &ort::value::Outlet) -> Result<Vec<i64>, PolicyError> {
+    match outlet.dtype() {
+        ValueType::Tensor {
+            ty: TensorElementType::Float32,
+            shape,
+            ..
+        } => Ok(shape.to_vec()),
+        other => Err(shape_error(
+            path,
+            "tensor type",
+            "float32",
+            format!("{}: {other:?}", outlet.name()),
+        )),
+    }
+}
+
+fn outlet<'a>(
+    path: &Path,
+    outlets: &'a [ort::value::Outlet],
+    name: &str,
+) -> Result<&'a ort::value::Outlet, PolicyError> {
+    outlets.iter().find(|o| o.name() == name).ok_or_else(|| {
+        shape_error(
+            path,
+            "tensor names",
+            name,
+            format!("{:?}", outlets.iter().map(|o| o.name()).collect::<Vec<_>>()),
+        )
+    })
+}
+
+fn check_matrix(path: &Path, outlet: &ort::value::Outlet, width: usize) -> Result<(), PolicyError> {
+    let shape = tensor_shape(path, outlet)?;
+    if shape.len() != 2 || (shape[0] != 1 && shape[0] != -1) || shape[1] != width as i64 {
+        return Err(shape_error(
+            path,
+            "tensor shape",
+            &format!("[1 or dynamic, {width}]"),
+            format!("{}: {shape:?}", outlet.name()),
+        ));
+    }
+    Ok(())
+}
+
+fn open(path: &Path) -> Result<Network, PolicyError> {
+    let bytes = std::fs::read(path).map_err(|source| PolicyError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
     let session = Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
         .and_then(|b| b.with_intra_threads(INTRA_THREADS))
@@ -374,75 +595,95 @@ fn open(path: &Path) -> Result<Session, PolicyError> {
             source,
         })?;
 
-    check_width(path, "observation width", session.inputs(), OBS_LEN)?;
-    check_width(path, "action count", session.outputs(), ACTION_LEN)?;
-    Ok(session)
-}
-
-/// Assert the trailing dimension of a graph's single tensor outlet.
-///
-/// The leading dimension is the batch and is usually dynamic (`-1`), so only the last one
-/// is checked. That is the one that encodes the contract.
-fn check_width(
-    path: &Path,
-    what: &'static str,
-    outlets: &[ort::value::Outlet],
-    expected: usize,
-) -> Result<(), PolicyError> {
-    let shape = match outlets.first().map(|o| o.dtype()) {
-        Some(ValueType::Tensor { shape, .. }) => shape,
-        _ => {
-            return Err(PolicyError::Shape {
-                path: path.to_owned(),
-                what,
-                expected: expected.to_string(),
-                got: "not a tensor".into(),
-            });
+    let inputs = session.inputs();
+    let outputs = session.outputs();
+    check_matrix(path, outlet(path, inputs, "obs")?, OBS_LEN)?;
+    let recurrent = match (inputs.len(), outputs.len()) {
+        (1, 1) => false,
+        (3, 3) => true,
+        counts => {
+            return Err(shape_error(
+                path,
+                "input/output contract",
+                "obs -> actions, or obs/h_in/c_in -> actions/h_out/c_out",
+                format!("{counts:?} tensors"),
+            ));
         }
     };
-
-    let got = shape.iter().last().copied().unwrap_or(-1);
-    if got != expected as i64 {
-        return Err(PolicyError::Shape {
-            path: path.to_owned(),
-            what,
-            expected: expected.to_string(),
-            got: got.to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn run(
-    session: &mut Session,
-    path: &Path,
-    observation: &Observation,
-) -> Result<[f32; ACTION_LEN], PolicyError> {
-    let input = Value::from_array(([1usize, OBS_LEN], observation.as_slice().to_vec()))
-        .map_err(|e| PolicyError::Inference(format!("{}: building input: {e}", path.display())))?;
-
-    let outputs = session
-        .run(ort::inputs!["obs" => &input])
-        .map_err(|e| PolicyError::Inference(format!("{}: {e}", path.display())))?;
-
-    let value = outputs
-        .values()
-        .next()
-        .ok_or_else(|| PolicyError::Inference(format!("{}: no output", path.display())))?;
-    let (_, data) = value.try_extract_tensor::<f32>().map_err(|e| {
-        PolicyError::Inference(format!("{}: extracting output: {e}", path.display()))
-    })?;
-
-    if data.len() != ACTION_LEN {
-        return Err(PolicyError::Inference(format!(
-            "{}: {} actions, expected {ACTION_LEN}",
-            path.display(),
-            data.len()
-        )));
-    }
-    let mut actions = [0.0f32; ACTION_LEN];
-    actions.copy_from_slice(data);
-    Ok(actions)
+    // Preserve the existing feed-forward output naming contract (the sole output).
+    let action = if recurrent {
+        outlet(path, outputs, "actions")?
+    } else {
+        &outputs[0]
+    };
+    check_matrix(path, action, ACTION_LEN)?;
+    let action_name = action.name().to_owned();
+    let state = if recurrent {
+        let mut shapes = Vec::new();
+        for (outlets, name) in [
+            (inputs, "h_in"),
+            (inputs, "c_in"),
+            (outputs, "h_out"),
+            (outputs, "c_out"),
+        ] {
+            let shape = tensor_shape(path, outlet(path, outlets, name)?)?;
+            if shape.len() != 3
+                || shape[0] <= 0
+                || (shape[1] != 1 && shape[1] != -1)
+                || shape[2] <= 0
+            {
+                return Err(shape_error(
+                    path,
+                    "LSTM state shape",
+                    "[positive layers, 1 or dynamic batch, positive hidden size]",
+                    format!("{name}: {shape:?}"),
+                ));
+            }
+            shapes.push(vec![shape[0], 1, shape[2]]);
+        }
+        if shapes.iter().any(|shape| shape != &shapes[0]) {
+            return Err(shape_error(
+                path,
+                "LSTM state shapes",
+                "matching h/c input and output shapes",
+                format!("{shapes:?}"),
+            ));
+        }
+        let shape = &shapes[0];
+        let count = usize::try_from(shape[0])
+            .ok()
+            .and_then(|n| n.checked_mul(shape[2] as usize))
+            .filter(|&n| n <= 1_048_576)
+            .ok_or_else(|| {
+                shape_error(
+                    path,
+                    "LSTM state size",
+                    "at most 1048576 elements per state",
+                    format!("{shape:?}"),
+                )
+            })?;
+        let make = || {
+            Tensor::from_array((shape.clone(), vec![0.0f32; count])).map_err(|source| {
+                PolicyError::Load {
+                    path: path.to_owned(),
+                    source,
+                }
+            })
+        };
+        Some(LstmState {
+            h: make()?,
+            c: make()?,
+        })
+    } else {
+        None
+    };
+    Ok(Network {
+        session,
+        state,
+        action_name,
+        path: path.to_owned(),
+        digest,
+    })
 }
 
 #[cfg(test)]

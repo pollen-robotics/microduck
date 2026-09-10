@@ -14,6 +14,12 @@ On an **Xbox** controller this is two presses, and the second is the one that go
 
 On a **DualSense**: hold Create and PS together until the light bar flashes.
 
+On a **Pro Controller** — the no-name Switch-style pads, which bluetoothctl lists as
+`Pro Controller` — hold the small **Sync** button on the top edge, next to the USB-C port, until the
+player lights sweep back and forth. It is a classic Bluetooth (BR/EDR) pad, the Xbox one is LE, and
+the robot pairs the two in opposite orders; `pad pair` picks the right one by itself, and
+[pairing one by hand](#pairing-a-pro-controller-by-hand) says what the order is if you have to.
+
 ## Pair it
 
 ```bash
@@ -56,6 +62,21 @@ padd    active — driving whatever pad connects
 
 Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
 working robot ignoring you.
+
+A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
+beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel
+that appears only when the pad has one: a wireframe pad posed like the real one, pitch and roll
+from gravity, yaw from the gyro alone (it drifts — nothing on a pad observes heading), and the
+gyro's rest bias, which the clone needs learned before the picture stops turning on its own. Set
+the pad down for half a second and the panel says `settled`. The stream costs nothing while the
+monitor is not open: `padd` reads the IMU node only while somebody is subscribed to the tap — or
+while it is steering the head from it, below.
+
+The same attitude can drive the robot's head. `sudo robotctl configure`, section *Controller-IMU
+head control*, `enabled`: Y then hands the head to the pad's tilt while the sticks keep driving,
+Y again holds the head, and a third Y re-centres on the pad's current attitude and follows again —
+the [cheat sheet](cheatsheet.md#gamepad-configd) has the full cycle. The picture in the monitor and
+the head use one filter, so where the drawn pad points is where the head goes.
 
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
@@ -128,6 +149,44 @@ to check and how to drop it.
 
 Both are workarounds for the aic8800 radio, not properties of the design. They go when the radio
 does.
+
+### A classic pad and bluetoothd's CPU
+
+A Pro Controller streams IMU samples in every packet, about 200 packets a second, whether or not
+anyone touches it. With BlueZ's default `UserspaceHID=true` each one is relayed by bluetoothd through
+uhid, and that cost 16% of a core on graphite with the pad idle. `scripts/setup-board.sh` sets
+`UserspaceHID=false` in `/etc/bluetooth/input.conf` on every board, which hands the channel to the
+kernel's `hidp` and takes bluetoothd out of the data path — measured 0.0% afterwards, same driver,
+same input nodes, same bond. It applies at the next boot. An LE pad such as the Xbox is untouched by
+the setting: HID over GATT never went through `input.conf`. A board provisioned before this exists
+gets it by re-running the script:
+
+```bash
+sudo sh scripts/setup-board.sh && sudo reboot
+```
+
+## Pairing a Pro Controller by hand
+
+Only if `pad pair` is not available. The order matters and is the **reverse** of the Xbox one:
+
+```bash
+bluetoothctl pair 98:B6:E9:28:06:09
+```
+
+```bash
+bluetoothctl connect 98:B6:E9:28:06:09
+```
+
+```bash
+bluetoothctl trust 98:B6:E9:28:06:09
+```
+
+`connect` first — which bonds as a side effect — ends in the state that is hardest to read: the pad's
+light goes solid, `pad status` says `connected`, `bluetoothctl info` says `Paired: yes` and
+`Connected: yes`, and **no input device exists**, so `padd` sits at "waiting for padd to open a pad"
+and nothing drives. Recover with `sudo robotctl pad forget <address>`, put the pad back into pairing
+mode and pair again. Running `pad pair` never produces this state: it knows the pad is classic from
+the class BlueZ reports and pairs before it connects.
 
 ## When pairing fails every time
 

@@ -143,7 +143,9 @@ impl Tracker {
             }
         }
 
-        if in_band.len() < self.config.min_zones {
+        // The band must hold at least one zone whatever `min_zones` says: at 0 the length
+        // check passes on an empty band, and the percentile index below would panic on it.
+        if in_band.len() < self.config.min_zones.max(1) {
             // Hold the last hand briefly. This is the whole anti-chop mechanism: the note
             // rides over a dropout, and stops when one lasts.
             return match self.last {
@@ -315,6 +317,21 @@ mod tests {
         let (distance, status) = frame(0.25, 5, 1);
         assert_eq!(tracker.track(&distance, &status, Instant::now()), None);
         let (distance, status) = frame(0.25, 5, config.min_zones);
+        assert!(tracker.track(&distance, &status, Instant::now()).is_some());
+    }
+
+    /// `min_zones = 0` is a legal config, and an empty band then passes the length check —
+    /// straight into a percentile index that has nothing to index. No zones is no hand,
+    /// whatever the floor is.
+    #[test]
+    fn an_empty_band_is_not_a_hand_even_with_min_zones_zero() {
+        let mut tracker = Tracker::new(Config {
+            min_zones: 0,
+            ..Config::default()
+        });
+        assert_eq!(tracker.track(&[], &[], Instant::now()), None);
+        // But a single usable zone still is one: the floor is on emptiness, not on count.
+        let (distance, status) = frame(0.25, 5, 1);
         assert!(tracker.track(&distance, &status, Instant::now()).is_some());
     }
 

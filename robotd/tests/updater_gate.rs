@@ -277,7 +277,7 @@ async fn real_robotd_answers_every_method_the_engine_calls() {
     );
     assert_eq!(
         client.model_api(t).await,
-        Some(1),
+        Some(2),
         "modelApi must parse; None here means the field name drifted"
     );
     assert!(

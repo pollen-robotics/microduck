@@ -13,6 +13,8 @@ description = "IPC contracts between the robot's services and their clients"
 # it belongs in the crate that owns the behaviour, not here.
 [dependencies]
 serde.workspace = true
+# `clock`: CLOCK_MONOTONIC / CLOCK_REALTIME, which std does not expose as raw nanoseconds.
+libc = "0.2"
 serde_json.workspace = true
 semver.workspace = true
 

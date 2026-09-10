@@ -24,6 +24,9 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # up. Pure serde and toml, and read once at startup: this daemon still holds no privileged access
 # and still knows nothing about what a skill *is*, only that a button names one.
 robotd-params = { path = "../robotd-params" }
+# The pad's IMU as an attitude — the same filter `robotctl monitor` draws from, so the head goes
+# where the picture says the pad is.
+pad-imu = { path = "../pad-imu" }
 clap = { workspace = true, features = ["derive"] }
 gilrs = "0.11"
 # Only to serialise the tap's own lines; the wire types themselves live in duck-ipc-proto.
@@ -40,3 +43,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 evdev = "0.13"
 # `getgrnam`/`chown`, to hand the tap's socket to the `robot` group. Bindings only, no C to build.
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

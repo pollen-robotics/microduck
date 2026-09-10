@@ -273,7 +273,60 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
 /// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
 /// update does; a board left mid-update sees a missing block, not a lie.
-pub const API_VERSION: u32 = 23;
+///
+/// # v24 — a clock every stream shares, and what a map needs from the robot
+///
+/// Three additive fields and one read, for a mapper that pairs a camera frame with the joint
+/// angles and depth cells of the same instant (`docs/design/robotd-design.md` §mapping):
+///
+/// - [`RobotState::t_ns`] and [`TofFrame::t_ns`] are the same `CLOCK_MONOTONIC`, nanoseconds,
+///   so a sample from `robotd` and a frame from `tofd` can be put on one axis without guessing
+///   the offset between two daemons' start times. `t` and `at_us` stay as they were.
+/// - [`RobotState::imu`] is the trunk IMU as the loop sees it: gyro and orientation, not only
+///   the projected gravity [`SafetyState`] already carried. [`RobotState::frames`] is the
+///   camera and ToF sensor pose in the trunk frame, from the same head FK `robot.look` uses —
+///   published so no client has to carry a copy of the kinematics.
+/// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
+///
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
+/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
+/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
+/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+///
+/// # v25 — the whole skeleton's pose, for a viewer
+///
+/// [`RobotState::skeleton`] carries every body's pose in the trunk frame this tick, and
+/// [`ModelResult::skeleton`] the matching static tree (each link's name and parent). Together they
+/// let a viewer draw the robot moving for real — the full kinematics, of which
+/// [`RobotState::frames`] (camera, ToF, head IMU) is a few leaves — without carrying a copy of the
+/// kinematics, the same reason `frames` and `tof_beams` come from the robot. Both from the same FK
+/// `robot.look` uses. Additive: the `Vec`s are empty from a daemon predating it.
+///
+/// # v26 — `system.logs`
+///
+/// The tail of one daemon's journal, over the wire. Until now the answer to "what did it say
+/// before it stopped" was `journalctl` over ssh, which needs a network the robot may not have and
+/// an address a phone has no way to reach — so the one question support asks first was the one
+/// question the wire could not answer.
+///
+/// Additive as a method, and narrow on purpose: a unit from a fixed list, a line count, and which
+/// boot. Not a `journalctl` command line — see [`LogsParams`] for why that boundary is where it is.
+///
+/// An older `configd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is the designed
+/// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
+/// that the robot is too old rather than failing obscurely.
+///
+/// # v27 — the pad's IMU, on the pad tap
+///
+/// Three more [`PadReport`] variants: a pad's inertial unit as a second evdev node beside the one
+/// that drives, its samples, and its going away. The "Pro Controller" Switch clones ship a
+/// six-axis IMU and the kernel's `hid-nintendo` exposes it as a separate accelerometer device
+/// under the same HID parent; an Xbox pad has none and a subscriber never sees the variants.
+///
+/// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
+/// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
+/// other client is untouched.
+pub const API_VERSION: u32 = 27;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -553,6 +606,10 @@ pub mod method {
     /// is in them — and, when a load failed, what is in them instead of what was asked for.
     pub const ROBOT_POLICIES: &str = "robot.policies";
 
+    /// The static geometry [`RobotState::frames`] and [`TofFrame`] are stated in — see
+    /// [`ModelResult`]. A read; asked once per session.
+    pub const ROBOT_MODEL: &str = "robot.model";
+
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
     /// Answered like [`ROBOT_SET_MODE`] and for the same reason: the swap happens at the home
@@ -636,6 +693,8 @@ pub mod method {
     pub const SYSTEM_INFO: &str = "system.info";
     /// What systemd says about each daemon, and which release each is running from.
     pub const SYSTEM_SERVICES: &str = "system.services";
+    /// The tail of one unit's journal, for a client with no shell on the robot.
+    pub const SYSTEM_LOGS: &str = "system.logs";
     /// Rename the robot. This is the name a phone sees.
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
@@ -716,6 +775,13 @@ pub mod method {
 
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
+
+    /// Subscribe to the head IMU (BMI088 on the HAT, same I²C bus as the ToF). The answer
+    /// describes the sensor, then [`HEAD_IMU_FRAME`] notifications arrive until the connection closes.
+    pub const HEAD_IMU_STREAM: &str = "head_imu.stream";
+
+    /// One head-IMU sample, pushed after [`HEAD_IMU_STREAM`].
+    pub const HEAD_IMU_FRAME: &str = "head_imu.frame";
 }
 
 /// JSON-RPC error codes.
@@ -845,6 +911,8 @@ pub enum Call {
     RobotSetMode(SetModeParams),
     /// What each policy slot runs; see [`method::ROBOT_POLICIES`].
     RobotPolicies,
+    /// Static robot geometry for a mapper; see [`method::ROBOT_MODEL`].
+    RobotModel,
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -877,6 +945,8 @@ pub enum Call {
     // ── system.* ─────────────────────────────────────────────────────────────
     SystemInfo,
     SystemServices,
+    /// The tail of one unit's journal; see [`method::SYSTEM_LOGS`].
+    SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
     /// Read the pairing PIN.
@@ -908,6 +978,8 @@ pub enum Call {
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
     TofStream,
+    /// Subscribe to the head IMU (BMI088 on the HAT); see [`method::HEAD_IMU_STREAM`].
+    HeadImuStream,
 }
 
 /// The service that owns the answer to a call.
@@ -1000,6 +1072,7 @@ impl Call {
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotPolicies => method::ROBOT_POLICIES,
+            Call::RobotModel => method::ROBOT_MODEL,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1016,6 +1089,7 @@ impl Call {
             Call::NetForget(_) => method::NET_FORGET,
             Call::SystemInfo => method::SYSTEM_INFO,
             Call::SystemServices => method::SYSTEM_SERVICES,
+            Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
@@ -1031,6 +1105,7 @@ impl Call {
             Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
+            Call::HeadImuStream => method::HEAD_IMU_STREAM,
         }
     }
 
@@ -1147,6 +1222,7 @@ impl Call {
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -1178,6 +1254,7 @@ impl Call {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemServices
+            | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
@@ -1214,6 +1291,7 @@ impl Call {
             // exists today reaches neither: what a call *is* does not depend on who may ask it.
             Call::PadInput => (Pad, Stream),
             Call::TofStream => (Tof, Stream),
+            Call::HeadImuStream => (Tof, Stream),
 
             // ── answered by no service ──────────────────────────────────────
             //
@@ -1282,6 +1360,7 @@ impl Call {
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
+            Call::SystemLogs(p) => encode(p),
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
@@ -1301,6 +1380,7 @@ impl Call {
             | Call::RobotRelax
             | Call::RobotShutdown
             | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::AccountStatus
@@ -1317,6 +1397,7 @@ impl Call {
             | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
+            | Call::HeadImuStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
         }
     }
@@ -1370,6 +1451,7 @@ impl Call {
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_POLICIES => Call::RobotPolicies,
+            method::ROBOT_MODEL => Call::RobotModel,
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -1386,6 +1468,7 @@ impl Call {
             method::NET_FORGET => Call::NetForget(decode(params)?),
             method::SYSTEM_INFO => Call::SystemInfo,
             method::SYSTEM_SERVICES => Call::SystemServices,
+            method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
@@ -1409,6 +1492,7 @@ impl Call {
             method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
+            method::HEAD_IMU_STREAM => Call::HeadImuStream,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -1522,6 +1606,7 @@ pub mod test_support {
             Call::RobotShutdown,
             Call::RobotMode,
             Call::RobotPolicies,
+            Call::RobotModel,
             Call::RobotReloadPolicies,
             Call::PolicyCheck,
             Call::PolicyInstall(PolicyInstallParams {
@@ -1554,6 +1639,11 @@ pub mod test_support {
             }),
             Call::SystemInfo,
             Call::SystemServices,
+            Call::SystemLogs(LogsParams {
+                unit: "robotd".into(),
+                lines: 40,
+                boot: -1,
+            }),
             Call::SystemSetName(SetNameParams {
                 name: "duck-01".into(),
             }),
@@ -1585,6 +1675,7 @@ pub mod test_support {
             }),
             Call::PadInput,
             Call::TofStream,
+            Call::HeadImuStream,
         ]
     }
 }
@@ -1682,6 +1773,24 @@ impl Request {
     /// Read a depth-frame notification back.
     pub fn as_tof_frame(&self) -> Option<TofFrame> {
         if self.method != method::TOF_FRAME {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A head-IMU sample notification: no `id`.
+    pub fn notify_head_imu_frame(frame: &HeadImuFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::HEAD_IMU_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a head-IMU notification back.
+    pub fn as_head_imu_frame(&self) -> Option<HeadImuFrame> {
+        if self.method != method::HEAD_IMU_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -3272,6 +3381,103 @@ pub struct RobotState {
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chorale: Option<ChoraleState>,
+    /// `CLOCK_MONOTONIC` at this tick, nanoseconds — the same clock as [`TofFrame::t_ns`], so a
+    /// mapper can put a state sample and a depth frame on one axis. Zero from a daemon predating
+    /// it; `t` is still the loop's own elapsed time. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
+    /// The trunk IMU as the loop read it this tick. Absent from a daemon predating it, or while
+    /// no sensors have been read. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<ImuState>,
+    /// Where the camera and the ToF sensor are in the trunk frame at this tick's measured head
+    /// joints, from the same head FK `robot.look` uses. Published so a client that pairs a picture
+    /// with a pose never carries its own copy of the kinematics. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<FramesState>,
+    /// Every body's pose in the trunk frame this tick, in [`ModelResult::skeleton`] order, from the
+    /// same head FK `robot.look` uses — the whole skeleton, so a viewer can draw the robot moving
+    /// for real. `frames` is a few leaves of this. Empty from a daemon predating it. (v25)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<PoseState>,
+}
+
+/// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuState {
+    /// Angular velocity, rad/s.
+    pub gyro: [f64; 3],
+    /// Orientation trunk → world, scalar-first `[w, x, y, z]`. The world is the IMU's own
+    /// gravity-aligned frame with an arbitrary yaw at boot — the same frame `odom` lives in.
+    pub quat: [f64; 4],
+}
+
+/// A pose in the trunk frame: position in metres, orientation scalar-first `[w, x, y, z]`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoseState {
+    pub pos: [f64; 3],
+    pub quat: [f64; 4],
+}
+
+/// Sensor poses in the trunk frame, in [`RobotState::frames`].
+///
+/// Conventions, stated once: `camera` is the OpenCV camera frame (+x right, +y down, +z along
+/// the optical axis) — the frame intrinsics and a pixel's ray are expressed in. `tof` is the
+/// VL53L5CX/L8CX integration frame (+x along the optical axis, +y left, +z up), the frame
+/// [`ModelResult::tof_beams`] is stated in. Both come from `kinematics::head::HeadFk`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FramesState {
+    pub camera: PoseState,
+    pub tof: PoseState,
+    /// The head IMU (BMI088) in the trunk frame. The `head_imu.stream` samples are in the IMU's
+    /// own tilted axes; this pose (sensor→trunk, from the same head FK) is how a consumer rotates
+    /// them into the trunk/camera frame. Absent from a daemon predating it. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_imu: Option<PoseState>,
+}
+
+/// Answer to [`Call::RobotModel`]: the geometry that does not change while the robot runs.
+///
+/// Everything a mapper needs beyond the per-tick poses in [`RobotState::frames`], so that the
+/// kinematics stay in one place — the `kinematics` crate — and a laptop or a server asks rather
+/// than transcribes. Angles and distances in radians and metres.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelResult {
+    /// Which MJCF asset the numbers come from, e.g. `alpha`.
+    pub asset: String,
+    /// Height of the trunk origin above the floor when standing at rest.
+    pub trunk_height_m: f64,
+    /// Every joint, in [`RobotState::joints`] order.
+    pub joint_names: Vec<String>,
+    /// The four head joints in the order [`RobotState::head`] uses.
+    pub head_joints: Vec<String>,
+    /// Unit direction of each ToF zone in the sensor frame, row-major like
+    /// [`TofFrame::distance_mm`]: row 0 is the top of the grid, column 0 the sensor's left.
+    pub tof_beams: Vec<[f64; 3]>,
+    /// The sensor's field of view per axis, degrees.
+    pub tof_fov_deg: f64,
+    /// Sensor poses at every head joint zero — a fixed reference; the live ones are in
+    /// [`RobotState::frames`].
+    pub frames_at_zero: FramesState,
+    /// The body tree the per-tick [`RobotState::skeleton`] poses are stated in: each link's name
+    /// and parent, in the same order. Empty from a daemon predating it. (v25)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<SkeletonLink>,
+}
+
+/// One link in the body tree — a name and its parent — so a viewer can match a
+/// [`RobotState::skeleton`] pose to a link and draw the edge to its parent. (v25)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkeletonLink {
+    /// The MJCF body name, e.g. `trunk_base`, `upper_leg_left`.
+    pub name: String,
+    /// Index of this link's parent in [`ModelResult::skeleton`], or `None` for the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 /// What the duck chorale is doing, in [`RobotState`].
@@ -3609,6 +3815,63 @@ pub struct ServiceUnit {
     pub identity: Option<Identity>,
 }
 
+/// Which unit's journal to read, and how much of it. Parameters of [`Call::SystemLogs`].
+///
+/// **A unit name, not a filter expression.** The service picks from a fixed list and refuses
+/// anything else, because this call is reachable from a phone in radio range and `journalctl`
+/// arguments are not a language to hand such a peer. What that costs is `-g`, `--since` and
+/// several other things a person with a shell would reach for; what it buys is that the worst a
+/// client can ask for is the tail of a daemon this project ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsParams {
+    /// `robotd` or `robotd.service` — the service resolves either. See `configd::logs` for the
+    /// units it will read.
+    pub unit: String,
+    /// How many lines from the end. Clamped to [`MAX_LOG_LINES`], and the byte budget below
+    /// usually binds first.
+    pub lines: usize,
+    /// Which boot: `0` is the current one, `-1` the one before it, and so on backwards.
+    ///
+    /// Negative rather than an index because that is the question — "what did it say before it
+    /// restarted" — and because it is `journalctl -b`'s own convention, so the answer to "which
+    /// boot did I just read" is the same number in both places.
+    pub boot: i32,
+}
+
+/// Ceiling on [`LogsParams::lines`], applied by the service rather than trusted from the caller.
+pub const MAX_LOG_LINES: usize = 500;
+
+/// Ceiling on the serialised `lines` array, in bytes.
+///
+/// **This exists because of the transport, and it is the binding limit in practice.** BLE
+/// reassembles a reply into one line, and the client's buffer for that is bounded — a peer that
+/// never sends a newline must not be able to grow it without limit. 48 KiB leaves the rest of a
+/// JSON-RPC envelope room inside a 64 KiB client buffer, and at a typical ATT MTU it is already
+/// several seconds on the air, which is the other reason not to raise it.
+///
+/// The service drops the *oldest* lines to fit and says it did, because the newest are the ones
+/// somebody asked for.
+pub const MAX_LOG_BYTES: usize = 48 * 1024;
+
+/// Answer to [`Call::SystemLogs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResult {
+    /// The unit as systemd names it, so a caller that typed `robotd` sees what it actually read.
+    pub unit: String,
+    /// Oldest first, the way a journal reads. No trailing newlines.
+    ///
+    /// **A line in `-- … --` is the robot's, not the journal's.** `journalctl` uses that shape
+    /// for what it inserts rather than recorded (`-- Reboot --`, `-- No entries --`) and this
+    /// borrows it for the one thing a tail cannot otherwise show: `-- new robotd process, pid
+    /// 3227 --`, where the daemon restarted. A tail spanning an update carries two different
+    /// builds' output, and nothing in the lines themselves says where one ends.
+    pub lines: Vec<String>,
+    /// Lines were dropped from the front to fit [`MAX_LOG_BYTES`]. Not an error — it is what
+    /// asking for more than the radio can carry looks like, and a caller can say so.
+    pub truncated: bool,
+}
+
 /// Answer to [`Call::PadStatus`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadStatusResult {
@@ -3882,6 +4145,81 @@ pub enum PadReport {
         /// usually an errno the operator wants verbatim.
         why: String,
     },
+    /// The pad has an inertial unit and its node is open. Sent on subscribing if one is already
+    /// being read, and again each time one appears — the same one code path as `Attached`.
+    ///
+    /// Independent of `Attached`: the IMU is a second evdev device with a life of its own, and a
+    /// pad without one simply never sends this. Everything in a [`PadImuSample`] is read against
+    /// the device here.
+    ImuAttached { device: Box<PadImuDevice> },
+    /// Inertial samples, as many as the kernel handed over in one read — see [`PadImuBatch`].
+    Imu(PadImuBatch),
+    /// The IMU node closed.
+    ImuDetached { why: String },
+}
+
+/// A pad's inertial unit, as the kernel describes it.
+///
+/// One device rather than six axes in [`PadInputDevice::axes`], because the kernel keeps them
+/// apart: an accelerometer node carries `INPUT_PROP_ACCELEROMETER` and its `ABS_X..Z` are metres
+/// per second squared, not a stick. Reading them as a stick is what gilrs would do, which is why
+/// `padd` drives from the other node and this one is only ever tapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuDevice {
+    /// As the kernel names it: "Nintendo Switch Pro Controller IMU".
+    pub name: String,
+    /// The event node being read.
+    pub node: String,
+    /// Raw units per **g** on the accelerometer axes, from the driver's `resolution`. 4096 on
+    /// `hid-nintendo`. Zero when the driver did not say, in which case the raw numbers are all a
+    /// reader has.
+    pub accel_per_g: i32,
+    /// Raw units per **degree per second** on the gyro axes. 14247 on `hid-nintendo`.
+    pub gyro_per_dps: i32,
+    /// The accelerometer's full scale, raw units, so a reader can tell a clipped sample.
+    pub accel_max: i32,
+    /// The gyro's full scale, raw units.
+    pub gyro_max: i32,
+}
+
+/// The inertial samples one read of the IMU node produced.
+///
+/// A batch rather than one sample per report, because of what a sample costs to send: at six
+/// hundred a second, one JSON line and one socket write each was measured at 6.6% of a core on the
+/// board (2026-09-09, `padd` with a subscriber, above its 1.6% idle). The kernel already groups
+/// them — the clone packs three samples into every HID packet — so the tap sends what one `read`
+/// returned, and the viewer takes them in order: measured at exactly three per batch, two hundred
+/// batches a second, and 4.4% of a core. Nothing is summarised: every sample is here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuBatch {
+    /// In the order the kernel delivered them, oldest first. Never empty on the wire.
+    pub samples: Vec<PadImuSample>,
+    /// Batches this subscriber missed because its own socket was behind, since the last one it did
+    /// receive. Counted apart from [`PadFrame::socket_dropped`]: a dropped IMU batch says nothing
+    /// about the stick reports.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
+}
+
+/// One inertial sample: everything the IMU node delivered between two `SYN_REPORT`s.
+///
+/// Raw kernel units, deliberately — the tap hands out what the device said and the resolution to
+/// read it with, and the conversion happens once, in the viewer. Six integers rather than a
+/// `PadFrame`'s event list because this arrives at several hundred a second and every byte is
+/// paid for on the board's CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuSample {
+    /// Samples since this IMU attached, counted by `padd`. A hole is a batch this subscriber
+    /// missed — [`PadImuBatch::socket_dropped`].
+    pub seq: u64,
+    /// The kernel's timestamp, microseconds since the epoch — the same clock and the same
+    /// caveats as [`PadFrame::at_us`].
+    pub at_us: u64,
+    /// `ABS_X`, `ABS_Y`, `ABS_Z`: acceleration, including gravity. At rest on a table the axis
+    /// pointing up reads about `+accel_per_g`.
+    pub accel: [i32; 3],
+    /// `ABS_RX`, `ABS_RY`, `ABS_RZ`: angular rate about the same three axes.
+    pub gyro: [i32; 3],
 }
 
 /// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
@@ -4028,10 +4366,59 @@ pub struct TofFrame {
     /// Microseconds since `tofd` started — the sender's monotonic clock, like
     /// [`PadFrame::at_us`].
     pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the frame was read, nanoseconds — the clock
+    /// [`RobotState::t_ns`] shares. Zero from a `tofd` predating it. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
     pub rows: u8,
     pub cols: u8,
     pub distance_mm: Vec<i16>,
     pub status: Vec<u8>,
+}
+
+/// Answer to [`Call::HeadImuStream`]. Describes the head IMU rather than merely accepting, like
+/// [`TofStreamResult`]: a duck without the sensor still gets `accepted` with `sensor: None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadImuStreamResult {
+    pub accepted: bool,
+    /// The IMU that answered, e.g. `BMI088`. `None` when there is none — see `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+    /// Why there is no IMU: not fitted, bus unreadable, chip-id mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Sample rate the reader runs at, Hz.
+    pub hz: u8,
+}
+
+/// One head-IMU sample — a [`method::HEAD_IMU_FRAME`] notification.
+///
+/// The BMI088 on the HAT, read by `tofd` (it owns that I²C bus). All values are in the IMU's own
+/// axes, which are tilted relative to the head/camera — the mount is not axis-aligned. To place a
+/// sample in the trunk/camera frame, rotate it by [`FramesState::head_imu`] (the sensor→trunk
+/// pose the kinematics compute for this tick). This is the head IMU, distinct from the body IMU
+/// that [`RobotState::imu`] carries on the motor bus. Units: rad/s, m/s², unitless quaternion.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadImuFrame {
+    /// Samples since this `tofd` started — a consumer can see a gap it did not cause.
+    pub seq: u64,
+    /// Microseconds since `tofd` started (sender's monotonic clock, like [`TofFrame::at_us`]).
+    pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the sample was read, ns — the clock [`RobotState::t_ns`] shares.
+    pub t_ns: u64,
+    /// Angular velocity, rad/s, in the BMI088's own (tilted) sensor axes — NOT the head or
+    /// camera frame. Combine with [`FramesState::head_imu`] (the sensor→trunk pose from the
+    /// kinematics) to place it. See that field.
+    pub gyro: [f32; 3],
+    /// Specific force, m/s², BMI088 sensor axes.
+    pub accel: [f32; 3],
+    /// Madgwick orientation, scalar-first `[w, x, y, z]`, sensor→world (gravity down, yaw
+    /// arbitrary). The world here is the IMU's own; relate it to the trunk via the mount pose.
+    pub quat: [f32; 4],
+    /// Chip temperature, °C.
+    pub temp_c: f32,
 }
 
 /// See [`method::ROBOT_CHORALE`].
@@ -4522,6 +4909,46 @@ macro_rules! log_startup_identity {
     }};
 }
 
+/// The clocks every daemon stamps with, so no two of them disagree about which clock
+/// "monotonic" means. Nanoseconds. `monotonic` is `CLOCK_MONOTONIC` — what
+/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry; `realtime` is `CLOCK_REALTIME`, the
+/// clock RTCP sender reports are stated in, read together in `media.video` so a peer can
+/// relate the two.
+pub mod clock {
+    fn read(clock: libc::clockid_t) -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec and the clock ids are the constants libc
+        // exports for this platform.
+        let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+        debug_assert_eq!(rc, 0, "clock_gettime failed");
+        (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    /// `CLOCK_MONOTONIC`, nanoseconds.
+    pub fn monotonic_ns() -> u64 {
+        read(libc::CLOCK_MONOTONIC)
+    }
+
+    /// `CLOCK_REALTIME`, nanoseconds since the Unix epoch.
+    pub fn realtime_ns() -> u64 {
+        read(libc::CLOCK_REALTIME)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn monotonic_advances_and_realtime_is_this_century() {
+            let a = super::monotonic_ns();
+            let b = super::monotonic_ns();
+            assert!(b >= a);
+            assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::every_call;
@@ -4644,6 +5071,7 @@ mod tests {
                             | Call::RobotSubscribe(_)
                             | Call::PadInput
                             | Call::TofStream
+                            | Call::HeadImuStream
                     ),
                     "{} is on the Stream lane but is not a subscription",
                     call.method()
@@ -4656,7 +5084,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            62,
+            65,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5236,6 +5664,10 @@ mod tests {
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
@@ -5293,6 +5725,10 @@ mod tests {
     fn robot_state_uses_the_documented_field_names() {
         let state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],

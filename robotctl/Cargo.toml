@@ -27,6 +27,7 @@ libc = "0.2.189"
 # Pure geometry (the ToF reprojection the monitor overlays) — deliberately NOT the `tof`
 # crate, whose vendored C driver would drag a cross C toolchain into every robotctl build.
 kinematics = { path = "../kinematics" }
+pad-imu = { path = "../pad-imu" }
 # `robotctl configure`'s schema, defaults and validation — the same crate `robotd` parses
 # its config with, which is what makes the editor unable to disagree with the daemon. Pure
 # serde + toml, so the recovery-path rule above still holds.

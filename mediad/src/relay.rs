@@ -17,6 +17,38 @@
 //! carries envelopes between the two, rewriting the `sessionId` each hop names and reading none
 //! of the payload. One session at a time; a second is refused by name.
 //!
+//! # A control lane that needs no candidate pair, and why there is one
+//!
+//! The bridge above carries a *negotiation*: SDP and ICE, so that a consumer and the robot can
+//! find a path between them and speak WebRTC over it. When they cannot find one, everything built
+//! on it is gone — and right now they frequently cannot, because a relay candidate needs
+//! `turn.fastrtc.org`, which has no A record and whose zone has no NS records (§6). Signalling
+//! crosses, media does not, and the control channel goes with it because SCTP rides the same
+//! candidate pair.
+//!
+//! So the JSON-RPC a consumer wants to send does not have to go through WebRTC at all, and the
+//! rendezvous turns out to already carry it: `handle_peer_message` in their `app.py` relays
+//! **every key of a `peer` envelope except `type` and `sessionId`** verbatim to the session
+//! partner, without looking at `sdp` or `ice`. A `peer` message carrying an `rpc` key is therefore
+//! a control call, relayed opaquely, with no change to a service the mini fleet also depends on.
+//!
+//! ```text
+//!   consumer ──POST /send {type:peer, sessionId, rpc:{…}}──► rendezvous ──SSE──► this relay
+//!            ◄─────────── SSE {type:peer, sessionId, rpc:{…}} ◄──POST /send────────┘
+//! ```
+//!
+//! `session::run` is what answers it, unchanged: its own header says it is transport-agnostic so
+//! that "a WebSocket surface could reuse it unchanged", and this is that surface. Same routing
+//! table, same per-lane sockets, same refusal to parse a reply. No ICE, no DTLS, no TURN.
+//!
+//! **What it is not is a teleop lane.** The rendezvous allows 1200 requests per 60 s per peer, so
+//! roughly twenty a second shared with the heartbeat — four calls to install and run a policy is
+//! nothing, and a 50 Hz intent stream is over budget in a second. Worse, exceeding it earns a
+//! `429` on the *whole peer*, which would take the robot's own lease down with it: a client could
+//! knock a robot off the rendezvous by subscribing to telemetry. Hence [`Budget`], which bounds
+//! notifications and never a reply — replies are one-per-request and so already bounded by
+//! whatever the client itself can afford to send.
+//!
 //! # Why the transport is HTTP, which is not what `remote-webrtc.md` §7 assumed
 //!
 //! The envelopes are the gst signalling protocol's — the same messages a LAN client exchanges —
@@ -60,8 +92,9 @@ pub const DEFAULT_RENDEZVOUS: &str = "https://pollen-robotics-reachy-mini-centra
 
 /// Where `updaterd` keeps the account credential.
 ///
-/// **A cross-daemon file format, and `updaterd` owns it.** `updater::account::Store` writes it and
-/// a test there pins the one key this reads, because the writer is what can break the contract.
+/// **A cross-daemon file format, and `hf_robot_account` owns it.** `updaterd` performs the login
+/// and that crate writes the file; a test there pins the one key `read_access_token` takes out of
+/// it, because the writer is what can break the contract.
 /// Read on every connect attempt rather than cached: a login that happens while this task is
 /// waiting has to take effect without a restart, and re-reading a small file on a path that
 /// already sleeps for thirty seconds costs nothing.
@@ -364,6 +397,20 @@ pub struct Relay {
     client: reqwest::Client,
     timings: Timings,
     local_signalling: String,
+    /// What the pipeline knows, for the two calls [`crate::session::run`] answers itself.
+    ///
+    /// **A watch rather than a value, because the relay starts before the answer exists.** It is
+    /// spawned deliberately early — a robot that appears in its owner's list and cannot stream is
+    /// still a robot somebody can reach to find out why — while the frame geometry is only
+    /// truthful *after* the pipeline is up, since which sensor mode is in force is not known until
+    /// something has tried to set it. So `main` hands over a receiver and fills it in later, and a
+    /// lane reads whatever is current when it opens. Empty means `media.video` is refused rather
+    /// than answered with zeros.
+    video: Option<tokio::sync::watch::Receiver<Option<crate::session::Media>>>,
+    /// Where each service listens, for the control lane's pool. Overridable for the same reason
+    /// `--rendezvous-url` is: the whole of this module is meant to be exercisable on a laptop,
+    /// and a lane whose sockets were hardcoded to `/run/robot` could only be tested on a board.
+    sockets: crate::upstream::Sockets,
 }
 
 impl Relay {
@@ -391,7 +438,28 @@ impl Relay {
             client,
             timings: Timings::default(),
             local_signalling: DEFAULT_LOCAL_SIGNALLING.to_owned(),
+            video: None,
+            sockets: Default::default(),
         })
+    }
+
+    /// Where the services this lane routes to are listening.
+    pub fn with_sockets(mut self, sockets: crate::upstream::Sockets) -> Self {
+        self.sockets = sockets;
+        self
+    }
+
+    /// Where to read the video's geometry when a control lane opens.
+    ///
+    /// A builder rather than a fourth argument to [`Relay::new`] because the video is discovered
+    /// later than the relay is built, and because every test here is about the wire rather than
+    /// about the camera.
+    pub fn with_video(
+        mut self,
+        video: tokio::sync::watch::Receiver<Option<crate::session::Media>>,
+    ) -> Self {
+        self.video = Some(video);
+        self
     }
 
     /// Point the bridge at a signalling server other than `webrtcsink`'s own.
@@ -464,10 +532,12 @@ impl Relay {
         }
     }
 
-    /// The access token, or `None` when this robot belongs to nobody. [`crate::hf`] owns the
-    /// reading of it, because the TURN credentials need the same token.
+    /// The access token, or `None` when this robot belongs to nobody.
+    ///
+    /// `hf_robot_account` owns the reading of it: it is the crate that writes the file, and the
+    /// TURN credentials need the same token out of the same place.
     fn token(&self) -> Option<String> {
-        crate::hf::access_token(&self.token_path)
+        hf_robot_account::read_access_token(&self.token_path)
     }
 
     /// One connection: open the stream, register, then hold the lease until something breaks.
@@ -501,6 +571,10 @@ impl Relay {
         // intent slot is `remote-webrtc.md` §9's interleaving bug with the pad replaced by a
         // second continent. §3.4.
         let mut bridged: Option<Bridged> = None;
+
+        // The control lane, which is independent of the one above: a consumer may hold one, the
+        // other, or both. Built on the first `rpc` envelope of a session and dropped with it.
+        let mut control: Option<Control> = None;
 
         let mut heartbeats = tokio::time::interval(heartbeat);
         heartbeats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -569,7 +643,9 @@ impl Relay {
                             format!("the event stream failed: {e}"),
                         ),
                         Ok(Some(Ok(message))) => {
-                            if let Some(ended) = self.handle(token, message, &mut bridged).await {
+                            if let Some(ended) =
+                                self.handle(token, message, &mut bridged, &mut control).await
+                            {
                                 return ended;
                             }
                         }
@@ -714,6 +790,7 @@ impl Relay {
         token: &str,
         message: Inbound,
         bridged: &mut Option<Bridged>,
+        control: &mut Option<Control>,
     ) -> Option<Ended> {
         match message {
             // A second welcome on one stream would mean the service rebound this token, which is
@@ -761,6 +838,16 @@ impl Relay {
                 None
             }
             Inbound::Peer(envelope) => {
+                // **`rpc` first, because it needs no session to have been negotiated.** A
+                // consumer that never intends to speak WebRTC still had to `startSession` to get
+                // a session id — `handle_peer_message` drops an envelope naming a session the
+                // service does not know — but it has no offer to send and none to answer. So a
+                // control call is dispatched before the bridge is consulted, and a robot whose
+                // media never connected still answers.
+                if !envelope["rpc"].is_null() {
+                    return self.control(token, &envelope, control).await;
+                }
+
                 // The envelope is forwarded whole and the payload is never read. What decides
                 // where it goes is the session it names — and a `peer` for a session this robot
                 // is not in is dropped rather than guessed at.
@@ -785,18 +872,223 @@ impl Relay {
             Inbound::EndSession { session_id } => {
                 // Dropping `Bridged` aborts the task, which closes the local socket — that is
                 // what tells `webrtcsink` the consumer is gone.
+                if control
+                    .as_ref()
+                    .is_some_and(|c| session_id.as_deref().is_none_or(|id| id == c.remote_id))
+                {
+                    tracing::info!(?session_id, "the service ended the control lane");
+                    *control = None;
+                }
                 if bridged
                     .as_ref()
                     .is_some_and(|s| session_id.as_deref().is_none_or(|id| id == s.remote_id))
                 {
                     tracing::info!(?session_id, "the service ended the bridged session");
                     *bridged = None;
-                } else {
+                } else if control.is_none() {
                     tracing::debug!(?session_id, "the service ended a session we do not have");
                 }
                 None
             }
             Inbound::Other => None,
+        }
+    }
+}
+
+// ── the control lane: JSON-RPC over the rendezvous, with no candidate pair ───
+
+/// How many notifications a control lane may post per window.
+///
+/// The rendezvous allows 1200 requests per 60 s **per peer**, and exceeding it earns a `429` on
+/// everything that token does — including the heartbeat that holds this robot's lease. So a
+/// consumer subscribing to 50 Hz telemetry would not merely get a slow stream, it would take the
+/// robot off its owner's listing. Half the allowance is left for the heartbeat, the status poll
+/// and whatever a person is actually doing.
+const NOTIFICATIONS_PER_WINDOW: u32 = 400;
+const NOTIFICATION_WINDOW: Duration = Duration::from_secs(60);
+
+/// A sliding allowance for lines nobody asked for.
+///
+/// **Replies are deliberately not subject to it.** One reply answers one request, and a request
+/// cost the consumer a `POST` of its own, so replies are already bounded by whatever the consumer
+/// can afford — throttling them would only break callers. Notifications have no such bound: a
+/// subscription is one request and then an unbounded stream.
+struct Budget {
+    allowance: u32,
+    window: Duration,
+    spent: u32,
+    dropped: u64,
+    since: tokio::time::Instant,
+}
+
+impl Budget {
+    fn new(allowance: u32, window: Duration) -> Self {
+        Self {
+            allowance,
+            window,
+            spent: 0,
+            dropped: 0,
+            since: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Whether one notification may go out now.
+    fn take(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.since) >= self.window {
+            if self.dropped > 0 {
+                tracing::info!(
+                    dropped = self.dropped,
+                    "notifications dropped on the control lane: it is not a telemetry transport, \
+                     and the alternative is a rate limit that would end this robot's lease"
+                );
+                self.dropped = 0;
+            }
+            self.spent = 0;
+            self.since = now;
+        }
+        if self.spent < self.allowance {
+            self.spent += 1;
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+}
+
+/// One consumer's control lane, and the task that owns both its halves.
+struct Control {
+    /// The id the *service* knows this session by, which is what every envelope has to name.
+    remote_id: String,
+    /// Lines on their way into [`crate::session::run`].
+    to_session: tokio::sync::mpsc::Sender<String>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Control {
+    fn live(&self) -> bool {
+        !self.task.is_finished()
+    }
+}
+
+impl Drop for Control {
+    fn drop(&mut self) {
+        // The task owns the session and its pool of unix sockets; aborting it closes every one,
+        // which is what ends a subscription a consumer walked away from.
+        self.task.abort();
+    }
+}
+
+impl Relay {
+    /// One `peer` envelope carrying `rpc`.
+    ///
+    /// Opens the lane if this session has none yet, which is what makes a control-only consumer
+    /// need no cooperation from the media path: it says `startSession`, the service gives it an
+    /// id, and its first call is what builds everything on this side.
+    async fn control(
+        &self,
+        token: &str,
+        envelope: &serde_json::Value,
+        control: &mut Option<Control>,
+    ) -> Option<Ended> {
+        let Some(session_id) = envelope["sessionId"].as_str() else {
+            tracing::debug!("an rpc envelope with no sessionId; dropping it");
+            return None;
+        };
+
+        // A new session supersedes an old lane rather than being refused. Unlike a media session
+        // — where two consumers writing into one intent slot is `remote-webrtc.md` §9's
+        // interleaving bug — a lane holds no hardware: it is a socket per service, and the
+        // service's own concurrency gate already means one consumer at a time.
+        let reusable = control
+            .as_ref()
+            .is_some_and(|c| c.remote_id == session_id && c.live());
+        if !reusable {
+            *control = Some(self.open_control(token, session_id));
+        }
+
+        // The payload goes in as the line `session::run` expects, which is the object itself
+        // rather than a string containing one: this transport is JSON all the way down, so
+        // encoding a JSON-RPC object *inside* a JSON string would be an escaping bug waiting for
+        // its first apostrophe.
+        let line = envelope["rpc"].to_string();
+        let lane = control.as_ref().expect("just built");
+        if lane.to_session.send(line).await.is_err() {
+            tracing::debug!("the control lane went away before its call arrived");
+            *control = None;
+        }
+        None
+    }
+
+    /// Build a lane: a session, a pool of upstream sockets, and the task that posts its answers.
+    fn open_control(&self, token: &str, session_id: &str) -> Control {
+        let (to_session, from_consumer) = tokio::sync::mpsc::channel::<String>(64);
+        // Deeper than the inbound half on purpose: one call can answer with a stream, and the
+        // budget below would rather drop a notification than have a service block writing it.
+        let (to_consumer, mut from_session) = tokio::sync::mpsc::channel::<String>(256);
+
+        let hub = Hub {
+            client: self.client.clone(),
+            base: self.base.clone(),
+            token: token.to_owned(),
+        };
+        let pool = crate::upstream::Pool::new(self.sockets.clone(), to_consumer.clone());
+        // Read now rather than held as a receiver: a lane's answer to `media.video` should be
+        // whatever was true when the consumer connected, and a picture that changed shape
+        // mid-session is a `media.video` notification's job on the media path.
+        let video = self.video.as_ref().and_then(|watch| watch.borrow().clone());
+        let remote_id = session_id.to_owned();
+        let session_id = session_id.to_owned();
+
+        let task = tokio::spawn(async move {
+            let session = tokio::spawn(crate::session::run(
+                from_consumer,
+                to_consumer,
+                pool,
+                // `None` on a board with no camera, and on a lane opened before the pipeline has
+                // said what the video is — which is possible because the relay starts first, on
+                // purpose. `session::run` refuses `media.video` rather than answering with zeros.
+                video,
+            ));
+
+            let mut budget = Budget::new(NOTIFICATIONS_PER_WINDOW, NOTIFICATION_WINDOW);
+            while let Some(line) = from_session.recv().await {
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    // `session::run` builds every line through `duck-ipc-proto`, and a service's
+                    // own output is forwarded verbatim — so this is a daemon emitting something
+                    // that is not JSON, which is worth a line rather than a silent drop.
+                    tracing::warn!(line = %line.chars().take(120).collect::<String>(),
+                        "a control lane answer that is not JSON; dropping it");
+                    continue;
+                };
+                // An answer has an id because the call it answers had one. Everything else is a
+                // notification, and only notifications are rationed.
+                let answers = !payload["id"].is_null();
+                if !answers && !budget.take() {
+                    continue;
+                }
+                let envelope = serde_json::json!({
+                    "type": "peer",
+                    "sessionId": session_id,
+                    "rpc": payload,
+                });
+                if let Err(why) = hub.send(&envelope).await {
+                    // The stream this token is bound to has gone, or the service refused. Either
+                    // way the connection loop is about to find out on its own; this lane just
+                    // stops.
+                    tracing::info!(%why, "a control lane could not reach the service");
+                    break;
+                }
+            }
+            session.abort();
+        });
+
+        tracing::info!(%remote_id, "a control lane is open: JSON-RPC without a candidate pair");
+        Control {
+            remote_id,
+            to_session,
+            task,
         }
     }
 }
@@ -1687,6 +1979,234 @@ mod tests {
     // A stand-in for `webrtcsink`'s own signalling server, which is the one thing about this
     // module that cannot be a channel: the bridge is a WebSocket client, and the framing is part
     // of what it gets wrong if it gets anything wrong.
+
+    // ── the control lane ────────────────────────────────────────────────────
+    //
+    // The property under test is the one the lane exists for: **a call crosses with no candidate
+    // pair, no offer and no answer.** Every test here pushes an `rpc` envelope at a relay whose
+    // media path was never negotiated, which is exactly the state a consumer behind a NAT is left
+    // in while §6's TURN endpoint has no DNS.
+
+    /// A daemon that reads one line and replies with the next canned one, remembering what it saw.
+    ///
+    /// Lifted from `session.rs`'s tests rather than shared, for now: two fakes of five lines are
+    /// cheaper than a test-support surface that both have to agree on.
+    fn fake_daemon(
+        path: &Path,
+        replies: Vec<String>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen_tx.clone();
+                let mut replies = replies.clone().into_iter();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = seen.send(line);
+                        if let Some(reply) = replies.next() {
+                            let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                            let _ = write.flush().await;
+                        }
+                    }
+                });
+            }
+        });
+        seen_rx
+    }
+
+    /// Sockets pointing at a directory, so a lane can be driven on a laptop.
+    fn sockets_in(dir: &Path) -> crate::upstream::Sockets {
+        crate::upstream::Sockets {
+            updater: dir.join("updater.sock"),
+            robot: dir.join("robot.sock"),
+            config: dir.join("config.sock"),
+            pad: dir.join("pad.sock"),
+            tof: dir.join("tof.sock"),
+        }
+    }
+
+    /// **A call crosses the rendezvous and its answer comes back, with no WebRTC anywhere.**
+    ///
+    /// This is the whole of the lane: `POST /send {type:peer, rpc}` in, a JSON-RPC line out to
+    /// the service that owns the answer, and the answer back out as another `peer` envelope. No
+    /// `startSession` is bridged, no offer is exchanged, and nothing in the path can be defeated
+    /// by a NAT — which is the point, because the media path currently can be.
+    #[tokio::test]
+    async fn a_call_crosses_the_rendezvous_with_no_candidate_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let sockets = sockets_in(dir.path());
+
+        // `robot.policies` is routed to `robotd`, and this is what a duck answers with.
+        let answer = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "mode": "walk", "enabled": true, "slots": [] },
+        })
+        .to_string();
+        let mut robotd = fake_daemon(&sockets.robot, vec![answer.clone()]);
+
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_sockets(sockets);
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "peer",
+            "sessionId": "remote-session-1",
+            "rpc": { "jsonrpc": "2.0", "id": 1, "method": "robot.policies", "params": {} },
+        }));
+
+        // The daemon sees the line the consumer wrote, verbatim: this transport routes and does
+        // not rewrite.
+        let asked = tokio::time::timeout(Duration::from_secs(5), robotd.recv())
+            .await
+            .expect("robotd was asked within five seconds")
+            .expect("a line");
+        let asked: serde_json::Value = serde_json::from_str(&asked).unwrap();
+        assert_eq!(asked["method"], "robot.policies");
+        assert_eq!(asked["id"], 1);
+
+        // And the answer comes back as a `peer` envelope naming the same session.
+        until("the answer to reach the service", || {
+            service
+                .state
+                .of_type("peer")
+                .iter()
+                .any(|posted| !posted["rpc"].is_null())
+        })
+        .await;
+        let posted = service
+            .state
+            .of_type("peer")
+            .into_iter()
+            .find(|posted| !posted["rpc"].is_null())
+            .unwrap();
+        assert_eq!(
+            posted["sessionId"], "remote-session-1",
+            "the answer names the session the service routes on"
+        );
+        assert_eq!(
+            posted["rpc"],
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
+            "and the payload is the daemon's own line, unparsed and unwrapped"
+        );
+        task.abort();
+    }
+
+    /// A method this transport refuses is refused *here*, without reaching a daemon.
+    ///
+    /// `route::permits` is what says so, and it is the same table the datachannel uses — so this
+    /// asserts the lane consults it rather than that the answer is what it is. A lane that
+    /// forwarded everything would make the rendezvous a way around a per-transport rule, and the
+    /// pairing PIN is the one that would matter: a peer that can rewrite it locks a phone out of
+    /// the recovery path.
+    #[tokio::test]
+    async fn the_lane_refuses_what_the_route_table_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let sockets = sockets_in(dir.path());
+        // Deliberately no daemon at all: a refusal must not depend on one being there.
+
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_sockets(sockets);
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "peer",
+            "sessionId": "remote-session-1",
+            "rpc": { "jsonrpc": "2.0", "id": 7, "method": "system.pairingPin", "params": {} },
+        }));
+
+        until("the refusal", || {
+            service
+                .state
+                .of_type("peer")
+                .iter()
+                .any(|posted| !posted["rpc"]["error"].is_null())
+        })
+        .await;
+        let posted = service
+            .state
+            .of_type("peer")
+            .into_iter()
+            .find(|posted| !posted["rpc"]["error"].is_null())
+            .unwrap();
+        assert_eq!(
+            posted["rpc"]["id"], 7,
+            "a refusal answers the call that earned it"
+        );
+        task.abort();
+    }
+
+    /// `media.video` is refused rather than answered with zeros when there is no picture.
+    ///
+    /// The lane can open before the pipeline has said what the video is — the relay starts first,
+    /// on purpose — and it carries no media of its own in any case. A consumer told the frame is
+    /// 0×0 and upright has been handed a wrong number that looks like a right one; told there is
+    /// no video, it can act.
+    #[tokio::test]
+    async fn a_lane_with_no_picture_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        let relay = Relay::new(&service.base, signed_in(&dir), meta())
+            .unwrap()
+            .with_timings(brisk())
+            .with_sockets(sockets_in(dir.path()));
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        service.state.push(serde_json::json!({
+            "type": "peer",
+            "sessionId": "remote-session-1",
+            "rpc": { "jsonrpc": "2.0", "id": 3, "method": "media.video", "params": {} },
+        }));
+
+        until("the answer", || {
+            service
+                .state
+                .of_type("peer")
+                .iter()
+                .any(|posted| !posted["rpc"].is_null())
+        })
+        .await;
+        let posted = service
+            .state
+            .of_type("peer")
+            .into_iter()
+            .find(|posted| !posted["rpc"].is_null())
+            .unwrap();
+        assert!(
+            posted["rpc"]["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not publishing video"),
+            "said {:?}",
+            posted["rpc"]
+        );
+        task.abort();
+    }
 
     /// What the fake local server saw and said.
     #[derive(Default)]

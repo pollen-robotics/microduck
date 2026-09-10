@@ -19,7 +19,10 @@ use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
-use crate::model::{BAUD_RATE, EXPECTED_REGISTERS, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
+use crate::model::{
+    BAUD_RATE, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID, JOINT_IDS,
+    JOINT_NAMES, NUM_JOINTS,
+};
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
 /// `present_velocity`, `present_position`. Twelve bytes covers all four, and happens to be
@@ -47,6 +50,16 @@ const VOLTS_PER_COUNT: f64 = 0.1;
 /// A healthy 16-device read completes well inside this. Capping it means a missing device
 /// costs a bounded hiccup rather than stalling the loop on the serial driver's default.
 const READ_TIMEOUT: Duration = Duration::from_millis(30);
+
+/// How long a servo is off the bus after a REBOOT before it answers again — "a few hundred
+/// milliseconds" per [`RobotIo::reboot`], with margin. Pinging too early would read a servo
+/// that is merely still booting as one whose flash failed, and fail an adoption that worked.
+const REBOOT_SETTLE: Duration = Duration::from_millis(500);
+
+/// Pause after each EEPROM write. The servo acknowledges before the cell is necessarily
+/// committed, and the writes here happen once per motor swap, so waiting costs nothing and
+/// removes the one race the datasheet leaves open.
+const EEPROM_SETTLE: Duration = Duration::from_millis(20);
 
 /// Run of consecutive stale reads at which the journal says something.
 ///
@@ -88,6 +101,9 @@ impl StaleImuTracker {
 
 pub struct DynamixelIo {
     controller: Xl330Controller,
+    /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
+    /// handle outright and offers no way to change its speed in place.
+    port: String,
     /// IMU first, then the servos in [`JOINT_IDS`] order — the order blocks come back in.
     ids: Vec<u8>,
     imu: SflpDecoder,
@@ -99,17 +115,7 @@ pub struct DynamixelIo {
 
 impl DynamixelIo {
     pub fn open(port: &str) -> Result<Self> {
-        let serial = serialport::new(port, BAUD_RATE)
-            .timeout(READ_TIMEOUT)
-            .open()
-            .map_err(|e| IoError::Port {
-                path: port.to_owned(),
-                source: std::io::Error::other(e),
-            })?;
-
-        let controller = Xl330Controller::new()
-            .with_protocol_v2()
-            .with_serial_port(serial);
+        let controller = open_controller(port, BAUD_RATE)?;
 
         let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
         ids.push(IMU_DXL_ID);
@@ -117,6 +123,7 @@ impl DynamixelIo {
 
         Ok(Self {
             controller,
+            port: port.to_owned(),
             ids,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
@@ -132,40 +139,188 @@ impl DynamixelIo {
     pub fn check_registers(&mut self) -> Result<usize> {
         let mut fixed = 0;
         for &id in &JOINT_IDS {
-            for &(name, want) in EXPECTED_REGISTERS {
-                // rustypot returns a Vec even for a single-id read. An empty one means the
-                // servo did not answer, which must not be read as "register is fine".
-                let raw = match name {
-                    "return_delay_time" => self.controller.read_return_delay_time(id),
-                    "baud_rate" => self.controller.read_baud_rate(id),
-                    "pwm_slope" => self.controller.read_pwm_slope(id),
-                    "shutdown" => self.controller.read_shutdown(id),
-                    other => unreachable!("unhandled register {other}"),
-                }
-                .map_err(|e| IoError::Bus(format!("read {name} on {id}: {e}")))?;
-
-                let got = *raw.first().ok_or(IoError::ShortRead {
-                    what: "register read",
-                    expected: 1,
-                    got: 0,
-                })?;
-
-                if got == want {
-                    continue;
-                }
-                tracing::warn!(id, register = name, got, want, "correcting motor register");
-                match name {
-                    "return_delay_time" => self.controller.write_return_delay_time(id, want),
-                    "baud_rate" => self.controller.write_baud_rate(id, want),
-                    "pwm_slope" => self.controller.write_pwm_slope(id, want),
-                    "shutdown" => self.controller.write_shutdown(id, want),
-                    other => unreachable!("unhandled register {other}"),
-                }
-                .map_err(|e| IoError::Bus(format!("write {name} on {id}: {e}")))?;
-                fixed += 1;
-            }
+            fixed += self.check_registers_of(id)?;
         }
         Ok(fixed)
+    }
+
+    /// [`Self::check_registers`] for one servo.
+    fn check_registers_of(&mut self, id: u8) -> Result<usize> {
+        let mut fixed = 0;
+        for &(name, want) in EXPECTED_REGISTERS {
+            // rustypot returns a Vec even for a single-id read. An empty one means the
+            // servo did not answer, which must not be read as "register is fine".
+            let raw = match name {
+                "return_delay_time" => self.controller.read_return_delay_time(id),
+                "baud_rate" => self.controller.read_baud_rate(id),
+                "pwm_slope" => self.controller.read_pwm_slope(id),
+                "shutdown" => self.controller.read_shutdown(id),
+                other => unreachable!("unhandled register {other}"),
+            }
+            .map_err(|e| IoError::Bus(format!("read {name} on {id}: {e}")))?;
+
+            let got = *raw.first().ok_or(IoError::ShortRead {
+                what: "register read",
+                expected: 1,
+                got: 0,
+            })?;
+
+            if got == want {
+                continue;
+            }
+            tracing::warn!(id, register = name, got, want, "correcting motor register");
+            match name {
+                "return_delay_time" => self.controller.write_return_delay_time(id, want),
+                "baud_rate" => self.controller.write_baud_rate(id, want),
+                "pwm_slope" => self.controller.write_pwm_slope(id, want),
+                "shutdown" => self.controller.write_shutdown(id, want),
+                other => unreachable!("unhandled register {other}"),
+            }
+            .map_err(|e| IoError::Bus(format!("write {name} on {id}: {e}")))?;
+            std::thread::sleep(EEPROM_SETTLE);
+            fixed += 1;
+        }
+        Ok(fixed)
+    }
+
+    /// The expected servo IDs that do not answer a ping, in [`JOINT_IDS`] order.
+    ///
+    /// Fifteen pings, each bounded by [`READ_TIMEOUT`], so about half a second when the servos
+    /// are unpowered and a few milliseconds when they are not. Run once at startup: this is
+    /// what decides whether [`Self::adopt_replacement`] has anything to do, and it is the only
+    /// bus traffic the replacement path costs a robot whose servos are all present.
+    pub fn missing_servos(&mut self) -> Result<Vec<u8>> {
+        let mut missing = Vec::new();
+        for &id in &JOINT_IDS {
+            let answered = self
+                .controller
+                .ping(id)
+                .map_err(|e| IoError::Bus(format!("ping {id}: {e}")))?;
+            if !answered {
+                missing.push(id);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Flash a factory-fresh servo so it takes the place of the one that is missing.
+    ///
+    /// A new XL330 answers as ID 1 at 57 600 baud. Neither is used on this bus, so when exactly
+    /// one expected servo is silent the new one can be found, given the missing ID, switched to
+    /// the bus's speed, and then handed the same EEPROM check every other servo gets. That is
+    /// the whole of a motor swap: nobody has to run a configuration tool first.
+    ///
+    /// The servo is rebooted at the end, deliberately. A servo flashed this way comes out of it
+    /// with its hardware-error alert set (the observation behind this whole path), and that
+    /// alert holds torque off until the servo is power-cycled or rebooted. Rebooting here means
+    /// the servo that comes out of this is indistinguishable from one that was always there.
+    ///
+    /// Returns `Ok(false)` when nothing answers at the factory defaults: the servo is simply
+    /// missing, or was replaced by one that is not fresh. The bus is back at [`BAUD_RATE`]
+    /// either way, so the caller can keep waiting on it.
+    pub fn adopt_replacement(&mut self, id: u8) -> Result<bool> {
+        let name = JOINT_IDS
+            .iter()
+            .position(|&j| j == id)
+            .map(|i| JOINT_NAMES[i])
+            .ok_or_else(|| IoError::Bus(format!("{id} is not a joint id")))?;
+
+        // A servo that was already re-flashed to 1 Mbps but kept its ID is the one case where
+        // reopening the port would lose it; look at this speed first.
+        let baud = if self.ping_fresh()? {
+            BAUD_RATE
+        } else {
+            self.reopen(FACTORY_BAUD_RATE)?;
+            if !self.ping_fresh()? {
+                self.reopen(BAUD_RATE)?;
+                return Ok(false);
+            }
+            FACTORY_BAUD_RATE
+        };
+        tracing::warn!(
+            id,
+            joint = name,
+            found_at_baud = baud,
+            "factory-fresh servo on the bus; flashing it as the missing joint"
+        );
+
+        // ID first, then the baud rate: the servo answers the second write at the old speed
+        // and switches only afterwards, so both are acknowledged. The other order would need
+        // a reopen between the two writes for nothing.
+        self.controller
+            .write_id(FACTORY_ID, id)
+            .map_err(|e| IoError::Bus(format!("write id {id} on {FACTORY_ID}: {e}")))?;
+        std::thread::sleep(EEPROM_SETTLE);
+        if baud != BAUD_RATE {
+            let want = EXPECTED_REGISTERS
+                .iter()
+                .find(|(n, _)| *n == "baud_rate")
+                .map(|&(_, v)| v)
+                .expect("baud_rate is an expected register");
+            self.controller
+                .write_baud_rate(id, want)
+                .map_err(|e| IoError::Bus(format!("write baud_rate on {id}: {e}")))?;
+            std::thread::sleep(EEPROM_SETTLE);
+            self.reopen(BAUD_RATE)?;
+        }
+
+        // Now an ordinary servo at the right address: the same check the others get pins
+        // return_delay_time and the rest.
+        let fixed = self.check_registers_of(id)?;
+
+        RobotIo::reboot(self, id)?;
+        std::thread::sleep(REBOOT_SETTLE);
+        let back = self
+            .controller
+            .ping(id)
+            .map_err(|e| IoError::Bus(format!("ping {id} after reboot: {e}")))?;
+        if !back {
+            return Err(IoError::Bus(format!(
+                "servo {id} ({name}) was flashed but did not come back from its reboot"
+            )));
+        }
+        // The reboot exists to clear this; say so if it did not, because a servo that keeps
+        // its alert will hold torque off and the symptom — one limp joint — points nowhere.
+        let hardware_error = self
+            .controller
+            .read_hardware_error_status(id)
+            .map_err(|e| IoError::Bus(format!("read hardware_error_status on {id}: {e}")))?
+            .first()
+            .copied()
+            .unwrap_or(0);
+        if hardware_error != 0 {
+            tracing::error!(
+                id,
+                joint = name,
+                hardware_error,
+                "replacement servo still reports a hardware error after its reboot"
+            );
+        }
+        tracing::warn!(
+            id,
+            joint = name,
+            registers_fixed = fixed,
+            "replacement servo adopted"
+        );
+        Ok(true)
+    }
+
+    /// Does anything answer at the factory ID, at whatever speed the port is open at?
+    fn ping_fresh(&mut self) -> Result<bool> {
+        self.controller
+            .ping(FACTORY_ID)
+            .map_err(|e| IoError::Bus(format!("ping factory id {FACTORY_ID}: {e}")))
+    }
+
+    /// Close the port and open it again at `baud`.
+    ///
+    /// The old handle has to be gone first: `serialport` opens ttys exclusively, so opening a
+    /// second handle while the first lives fails with `EBUSY`. Hence the placeholder controller
+    /// — one with no port, never used — standing in while the real one is dropped.
+    fn reopen(&mut self, baud: u32) -> Result<()> {
+        self.controller = Xl330Controller::new();
+        self.controller = open_controller(&self.port, baud)?;
+        Ok(())
     }
 
     /// Present positions only — a lighter read than [`RobotIo::read`], used once at startup
@@ -238,6 +393,32 @@ impl DynamixelIo {
             std::thread::sleep(step);
         }
         Ok(())
+    }
+}
+
+/// The serial port at `baud`, wrapped in a Protocol 2 controller.
+fn open_controller(port: &str, baud: u32) -> Result<Xl330Controller> {
+    let serial = serialport::new(port, baud)
+        .timeout(READ_TIMEOUT)
+        .open()
+        .map_err(|e| IoError::Port {
+            path: port.to_owned(),
+            source: std::io::Error::other(e),
+        })?;
+    Ok(Xl330Controller::new()
+        .with_protocol_v2()
+        .with_serial_port(serial))
+}
+
+/// Which servo a factory-fresh one should become, given the IDs that did not answer.
+///
+/// Only an unambiguous answer is one: with two servos silent there is no telling which of them
+/// the new one replaces, and guessing would flash a leg joint as a neck joint. With none silent
+/// there is nothing to adopt — a stray fresh servo on a complete bus is not this code's problem.
+pub fn replacement_target(missing: &[u8]) -> Option<u8> {
+    match missing {
+        [one] => Some(*one),
+        _ => None,
     }
 }
 
@@ -415,6 +596,17 @@ impl RobotIo for DynamixelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One silent servo is the only case a swap can be inferred from. With two silent there is
+    /// no telling which the fresh servo replaces, and guessing would flash a leg joint as a neck
+    /// joint; with none silent a stray fresh servo is nobody's replacement.
+    #[test]
+    fn a_replacement_is_inferred_only_from_exactly_one_missing_servo() {
+        assert_eq!(replacement_target(&[]), None);
+        assert_eq!(replacement_target(&[23]), Some(23));
+        assert_eq!(replacement_target(&[23, 31]), None);
+        assert_eq!(replacement_target(&JOINT_IDS), None);
+    }
 
     /// The block parsed per servo must cover current, velocity and position without
     /// overrunning. If `READ_LEN` and the offsets below ever disagree, joints get each

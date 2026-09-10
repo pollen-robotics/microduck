@@ -42,6 +42,7 @@ use robotd_params::Slot;
 
 mod configure;
 mod duck;
+mod imu_view;
 mod monitor;
 mod path_map;
 mod show;
@@ -417,6 +418,28 @@ enum RobotCommand {
     /// Works whatever gravity says — a robot lying on the floor is exactly the one that
     /// needs it, and being down never refuses anything.
     Init {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hand the robot to its policy, or take it back.
+    ///
+    /// **This is the gamepad's Start button**, and the difference from `init` is the whole point:
+    /// `init` powers the joints and position-ramps to the home pose with nothing balancing, while
+    /// this gives the robot to the policy, which then holds it up. A biped cannot stand by being
+    /// commanded to a pose — in simulation, where nobody is steadying it, `init` puts the robot on
+    /// the floor and `enable` stands it up from sitting.
+    ///
+    /// The console has had this button since it existed; the CLI did not, which is a gap nobody
+    /// noticed until a robot with no hands to hold it needed one.
+    Enable {
+        /// Take it back: the policy stops driving and the robot holds its pose.
+        #[arg(long)]
+        off: bool,
+        /// Flip whichever state it is in — what Start does, and what a client cannot get right by
+        /// remembering, because the robot's state moves without asking it.
+        #[arg(long, conflicts_with = "off")]
+        toggle: bool,
         #[arg(long)]
         json: bool,
     },
@@ -801,7 +824,8 @@ enum PadCommand {
     /// the Xbox button, then press the small **Sync** button on the top edge, next to the USB-C
     /// port, until the Xbox light flashes quickly. Do NOT hold the Xbox button itself — that
     /// switches the controller off. On a DualSense: hold Create and PS together until the light bar
-    /// flashes.
+    /// flashes. On a Pro Controller (the Switch-style pads): hold the small Sync button on the top
+    /// edge until the player lights sweep.
     ///
     /// Then run this. No MAC address needed: the robot looks for a gamepad in pairing mode and
     /// takes the one it finds.
@@ -2614,6 +2638,13 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     let (call, json) = match &command {
         RobotCommand::Init { json } => (proto::Call::RobotInit, *json),
         RobotCommand::Relax { json, .. } => (proto::Call::RobotRelax, *json),
+        RobotCommand::Enable { off, toggle, json } => (
+            proto::Call::RobotEnable(proto::EnableParams {
+                on: !*off,
+                toggle: *toggle,
+            }),
+            *json,
+        ),
         RobotCommand::RebootMotors { ids, json } => (
             proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: ids.clone() }),
             *json,
@@ -2685,6 +2716,15 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     match command {
         RobotCommand::Init { .. } => println!("standing up — about two seconds to the home pose"),
         RobotCommand::Relax { .. } => println!("torque off"),
+        // The daemon's own `reason` names the state it ended in, which is the only trustworthy
+        // answer for a toggle — the client cannot know which way it went.
+        RobotCommand::Enable { .. } => println!(
+            "{}",
+            outcome
+                .reason
+                .as_deref()
+                .unwrap_or("the policy has the robot")
+        ),
         RobotCommand::RebootMotors { ids, .. } if ids.is_empty() => {
             println!("rebooting every servo, torque off — then `robot init` or Start")
         }
@@ -3435,6 +3475,24 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
     }
 }
 
+/// Ask `robotd` to re-read `[policy]`, and say whether it took it.
+///
+/// `false` is a running daemon that declined — policies are off on this robot, which is the one
+/// thing in that section a reload cannot change — and an `Err` is one that could not be reached
+/// at all. Neither is a failure worth an exit code: the config is written either way, and the
+/// next start picks it up. Shared with `configure`, which offers this instead of a restart for
+/// the same keys.
+pub(crate) fn reload_policies(robot_socket: &Path) -> Result<bool, String> {
+    (|| -> Result<bool, Failure> {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.hello()?;
+        let result: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
+        Ok(result.accepted)
+    })()
+    .map_err(|e| e.message)
+}
+
 /// Tell `robotd` to re-read its skills, and say whether it did.
 ///
 /// A skill written into config is not one the robot has until the loop resolves it again, and
@@ -3442,14 +3500,7 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
 /// the whole point of the command is that trying one is cheap. An unreachable robot is not a
 /// failure here: the config is written either way, and the next start picks it up.
 fn report_reload(robot_socket: &Path) {
-    let reloaded = (|| -> Result<bool, Failure> {
-        let mut client = Client::connect_to("robotd", robot_socket)?;
-        client.hello()?;
-        let result: proto::IntentResult =
-            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
-        Ok(result.accepted)
-    })();
-    match reloaded {
+    match reload_policies(robot_socket) {
         Ok(true) => println!("  the robot is re-reading its skills"),
         Ok(false) | Err(_) => {
             println!("  robotd did not pick it up — it will at the next start");
@@ -3975,7 +4026,8 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
         // someone who ran this needs to know *now* that they should be holding the button.
         eprintln!(
             "looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync \
-             button on the top edge (not the Xbox button, which switches it off)"
+             button on the top edge (not the Xbox button, which switches it off); on a Pro \
+             Controller, hold its Sync button until the player lights sweep"
         );
     }
 
@@ -4425,7 +4477,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file)
+                configure::run(&file, &cli.robot_socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }

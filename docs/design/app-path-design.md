@@ -386,6 +386,40 @@ the tidier model and needs `btd` to know when a call ended, which needs it to pa
 never does (§3), and that property is what keeps the routed subset a transport rather than a second
 implementation of the API.
 
+### 3.6 A reply bigger than one burst, and the MTU the notify side cannot ask  · **measured**
+
+`bluer`'s callback model — the one that works here, for the reason in `btd/src/bluez.rs`'s header —
+gives the notify side neither of the two things a sender needs. It cannot ask what the link
+negotiated, and `notify` returns as soon as a D-Bus signal is queued, so nothing tells the pump when
+the radio has caught up. Both gaps were papered over by sizing every reply for the 20-byte floor and
+firing chunks as fast as the loop would spin.
+
+Measured against the board from a Mac, asking `system.logs` for a journal tail:
+
+| reply | notifications at the floor | what happened |
+|---|---|---|
+| ~5 KiB (24 lines) | ≈265 | delivered, in 1.83 s |
+| ~7 KiB (32 lines) | ≈350 | the notification session was torn down 150 ms in |
+
+The second row is the one that cost a board session to find. `btd` logged one INFO line saying the
+central had unsubscribed — it had not; CoreBluetooth still had the link up — and the client sat
+waiting out a 60-second idle budget with half an answer in its reassembler and no error to report.
+The pump was reading `notify`'s single error as "the central left", when a full queue and a departed
+central are the same `Err` from `bluer` and only `is_stopped()` tells them apart.
+
+Three changes, none of them a real solution, because the model has no readiness signal to offer:
+
+- **The payload comes from the write side.** BlueZ reports the negotiated MTU on every inbound
+  write, one ATT MTU serves both directions, and a central always writes before there is a reply to
+  send — `system.authenticate` is the first write of every session. So a session opens at the floor
+  and is sized properly from its first answer onward, roughly a tenfold cut in notifications.
+- **The pump pauses every 16 chunks**, about a connection interval. A small reply never pauses.
+- **A refused chunk is retried** rather than read as a disconnect, and giving up now logs a warning
+  saying so.
+
+What would solve it properly is the IO model's `sendable()`, and that stays out of reach: it serves
+only the `Acquire*` fd paths, which a CoreBluetooth central does not drive.
+
 ## 5. Pairing: just-works, and a PIN the transport checks
 
 A six-digit PIN, stored by `configd`, checked by `btd` before it serves anything. **Not** by the

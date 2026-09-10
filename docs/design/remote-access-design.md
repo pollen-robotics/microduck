@@ -51,6 +51,13 @@ service too was made the other way for this reason, and §3.1 is where it costs 
 
 ## 2. The account is an OAuth device flow against Hugging Face
 
+**The flow lives in [`hf-robot-account`](https://github.com/pollen-robotics/hf-robot-account)**,
+its own repository, because nothing in it is about a duck: any robot with no browser signs in the
+same way. What stays in `updater/src/account.rs` is what is a fact about *this* robot — the token
+path, the `robot` group, the mapping onto `proto`, and which JSON-RPC code each refusal deserves.
+Everything below about the flow itself describes that crate; everything about where the credential
+lands and who may read it describes this repository.
+
 ### 2.1 Why the device grant, which is also where `reachy_mini` ended up
 
 `reachy_mini` has **both**. It started with authorization code + PKCE, pointing the redirect URI
@@ -190,8 +197,8 @@ drops its answer. That is also what makes `logout` able to promise what it says.
 `huggingface_hub` ships a **first-party public device-code client**, `DEVICE_CODE_OAUTH_CLIENT_ID`
 = `26be6b09-91c5-47da-9861-d2d2bb7a7e36`, which is what `hf auth login` uses. It is public — no
 secret, so nothing needs baking into a release beyond a public identifier — and it needs no OAuth
-app registered anywhere. `updater::account::CLIENT_ID` is that constant, and it is the whole of
-what this decision came to.
+app registered anywhere. `hf_robot_account::HUGGINGFACE_CLIENT_ID` is that constant, and it is the
+whole of what this decision came to.
 
 Two alternatives, recorded because the first one looks obvious and is blocked:
 
@@ -223,7 +230,7 @@ What the account actually needs is `openid profile`, plus `read-repos` for one r
 mechanism (`policy-channel-design.md` §7).
 
 **So the narrow version is a Pollen-owned public device-code client with
-`openid profile read-repos`** — one constant in `account.rs` and one click by somebody with HF org
+`openid profile read-repos`** — one `Config::client_id` and one click by somebody with HF org
 admin. It is not blocking: the flow works today and a scope change is a re-login. It is worth
 doing before a duck goes home with anybody, because the failure mode is asymmetric — a robot that
 has been able to write all along cannot be un-done, while a robot that needs a wider scope later
@@ -342,7 +349,7 @@ A device-code token comes back as `expires_in: 2591999` — thirty days — with
 and refreshing **rotates** it: the answer carries a *new* refresh token and the old one is spent.
 So the store is two strings plus a clock, and there are three consequences worth naming.
 
-**A robot that is simply left on must renew itself.** `updater::account::maintain` wakes every six
+**A robot that is simply left on must renew itself.** `hf_robot_account::maintain` wakes every six
 hours and refreshes anything with under a week left — three-quarters of the way through the
 token's life, leaving a week of retries for a board whose network is marginal. It is spawned
 unconditionally, unlike the update scheduler, because a robot with update checks switched off
@@ -677,7 +684,8 @@ decodes frames with nothing added on either side: `pip install "reachy_mini[cent
 on the way past is `ignoring unexpected data channel: 'control'`, because it looks for the label
 the mini's daemon opens and ours is `control` (`remote-webrtc.md` §5). Nothing for a perception
 consumer, which wants pixels — and the first thing to fix for one that wants to *drive* a duck,
-where the label is the smaller half of the problem and the method names are the larger.
+where the label is the smaller half of the problem and the method names are the larger. §5.2 is
+both halves, on this side.
 
 **Two of their clients select on `meta.name` and neither reads `kind`.** The host shell's picker
 lists whatever is online, and `ReachyCentralConsumer` matches `robot_name` against `meta.name` with
@@ -685,6 +693,149 @@ a **fallback**: one visible producer for the token is used whatever it is called
 written for a mini, on an account whose only online robot is a duck, picks the duck and drives it
 with method names this project does not serve. That is worth telling them before somebody meets it,
 and it is a two-line change on their side — `kind` is already on the wire.
+
+### 5.2 A consumer that drives a duck, and the one line of theirs it has to get past
+
+`spaces/policy-shop` is the second consumer in this repository and the first that *sends*
+anything: sign in, list the account's ducks, and put a policy from the Hub onto one in a click —
+`policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do`, which is `robotctl policy add`'s
+own order over a datachannel instead of over a unix socket.
+
+The whole cost of "drive" over "watch" is a label. `ReachyCentralConsumer` handles
+`pc.on("datachannel")` with `if channel.label != "data": ignoring unexpected data channel`, and
+`mediad` opens `control` (`remote-webrtc.md` §5) — so a consumer that wants pixels needs nothing
+and a consumer that wants to send a call gets no channel at all. `RTCPeerConnection` is a pyee
+emitter, so `pc.on` *appends* rather than replaces: a subclass overriding `_build_pc` registers a
+second listener, theirs still runs and still warns about a label it does not know, and ours takes
+the channel it dropped. Nothing in their package is rewritten, which is what makes it survive the
+version that fixes their side — the day their handler takes `control`, ours stops being the first
+to claim it and the shim becomes a deletion.
+
+Their `send_command` is reused rather than reimplemented, and that is not laziness:
+`RTCDataChannel.send` is not thread-safe, they already marshal every send onto the loop that owns
+the peer connection, and a Gradio callback runs in whichever worker thread the request landed in.
+
+**Two refusals, and which side owns them is most of what writing this settled.** `policy.fetch`
+checks the claims that are about the robot — `obs_len`, `action_len`, `model_api`, `robot.model` —
+and it checks them *before* the download, so a client should not repeat them and should show what
+the robot said. `robot.setSkill` checks nothing about the command encoding: a phase policy
+installed as a one-shot is **accepted**, and the robot then feeds a constant to a network trained
+on a phase, which is plausible movement and wrong movement. That rule lives in `robotctl`, and
+`robotctl` is not in the path of a click — so `catalogue.refusal` is the same rule written a second
+time, and any client that grows this button needs it a third.
+
+**A `401` from the rendezvous is the token and nothing else, and proving that took reading their
+`app.py` after guessing wrong.** The first version of this page listed robots with `GET
+/api/robot-status`, got a `401`, and concluded the endpoint must require an established peer —
+plausible, because `POST /send` does (§3.1's note) and because the robot only ever polls it while
+holding a stream. It does not: the route is `Depends(_resolve_hf_token)` and then
+`validate_hf_token`, which is one `whoami-v2` call with no scope check, no token-type check and no
+peer requirement, filtered to `p.username == username`. Its own docstring says it exists for
+exactly this — "a passive status indicator without consuming a session slot".
+
+Which makes it the *better* call than the console's `list`, for a reason §3.7 already stated: peers
+are keyed by token, so the `/events` stream a browser opens to list would supersede the one a
+session is riding on. A page listing that way cannot refresh its list without dropping its own
+session. `/api/robot-status` opens nothing.
+
+The `401` was **Gradio's mocked sign-in**. Outside a Space — `SPACE_ID` unset —
+`gr.LoginButton` behaves, the profile is real, and `_get_mocked_oauth_info` sets `access_token` to
+the literal string `mock-oauth-token-for-local-dev`. A service that resolves tokens through
+`whoami-v2` refuses that, correctly, and the symptom is a page saying "sign in again" beside a
+console listing the same duck. So a local run has to prefer `HF_TOKEN` or what `hf auth login`
+stored, and the mock is recognised by value rather than by an `SPACE_ID` check — a real token that
+arrives outside a Space is still a real token.
+
+**And the general lesson, which is why the page now logs everything to two places at once.** Four
+layers meet in one button — a token, a rendezvous, a candidate pair, a robot's own refusal — and
+all four fail as "nothing happened". Every HTTP status, every signalling frame, every JSON-RPC
+line and every refusal is logged, with the token's *source* named and the token never written
+down; `DUCK_LOG=DEBUG` adds the streaming notifications and the per-candidate ICE lines. The panel
+is on the page as well as the terminal because a Space has logs nobody has open and a browser has
+no stderr. Each layer is also runnable alone — `uv run rendezvous.py`, `uv run catalogue.py`,
+`uv run lan.py` — which is what turns "it does not work" into a line number without a
+conversation.
+
+`IntentResult` is the other thing a client gets wrong once: `robot.setSkill`, `robot.do`,
+`robot.init` and `robot.relax` answer `accepted: false` with a reason rather than a JSON-RPC
+error, deliberately — safety refusing to run a policy on a fallen robot is not a broken call. A
+page that only catches errors reports every one of those as a success and leaves a motionless
+robot unexplained.
+
+**And the transport is the one thing this cannot prove from a Space yet.** The control channel is
+SCTP over the same candidate pair as the media, so §6's dead TURN endpoint takes the click with
+it: from a data centre the session negotiates and may then carry nothing. That is why the status
+line names the stage it reached rather than saying "connecting…" — and why the page has a second
+way in.
+
+**`lan.py` is that second way, and it is a transport rather than a second design.** The robot is
+already serving `webrtcsink`'s signalling server at `ws://<robot>:8443` — the one the console
+talks to — and it carries the same gst envelopes the rendezvous carries over SSE and `POST /send`.
+So one hop is swapped and nothing above it changes: the same `control` channel, the same JSON-RPC,
+the same buttons, and the page holds either consumer without asking which. §3.2's table is the
+whole of the difference, and swapping in the direction of the LAN removes rather than adds — no
+account, no lease, no rendezvous, no relay, host candidates on both sides.
+
+Which turns out to be worth more than a workaround for a dead DNS record, and it is the argument
+for keeping it after §6 is fixed: **it separates the transport from everything else.** A click
+that works on the LAN and not through the rendezvous has told you which layer to look at, and
+that answer was previously a guess.
+
+Its one cost is that it is hand-written where the rendezvous half was inherited: a dozen envelope
+shapes read off `net/webrtc/protocol` and the console page, and getting one wrong produces silence
+rather than an error. So `uv run lan.py` stands up a producer on loopback that speaks the same
+protocol and drives a real session against it — welcome, list, `startSession`, an offer answered,
+DTLS, SCTP, the channel, a call matched to its reply. Two aiortc peers on `127.0.0.1` are not a
+duck; they are the same protocol, which is the part that fails quietly.
+
+### 5.3 Frames out of the robot, which is what §6 was blocking
+
+The goal §5.2's Space was a step towards is a Space **processing this camera on Hugging Face
+hardware**, and that is the one thing the control lane cannot carry: pixels are what a media path
+is for. Pulling them means WebRTC, WebRTC across two NATs means a relay candidate, and §6 says
+there is not one. `vision-demo` had "signalling worked and media did not" as its documented
+expected outcome for exactly this reason.
+
+**So the robot dials the Space and pushes.** `media.stream {url}` — answered by `mediad` itself,
+like `media.video`, because the pipeline is `mediad`'s and no service owns it — tells the robot a
+`wss://` to connect to; it opens it outward and sends frames. An outbound WebSocket is the one
+thing that always works, and the robot is already proving it every second it is reachable at all.
+No relay, no ICE, and **the rendezvous carries an instruction rather than payload**, which is the
+property that makes this scale where relaying pixels through a service the mini fleet depends on
+would not.
+
+    Space ──media.stream {url}──► rendezvous ──► robot
+    robot ═══════ H.264, outbound wss, direct ═══════► Space
+
+**H.264 rather than JPEG, and it was JPEG first.** The board has a hardware encoder, so the encode
+costs the VPU rather than a core, and prediction is worth an order of magnitude of bytes — 0.5 KB
+an access unit against JPEG's 6.5 KB a frame on synthetic content, less on real footage and the
+same direction. Two things had to be built to make it safe, and both are the kind that fail
+invisibly:
+
+- **A receiver that joins mid-stream can decode nothing until a keyframe**, and a Space restarts on
+  every push, so reconnecting is the common case rather than the exception. `h264parse
+  config-interval=-1` repeats SPS and PPS in front of every keyframe, and opening the valve sends
+  an upstream `force-key-unit` so the first thing a receiver gets is decodable.
+- **Dropping the oldest and keeping the newest is right for JPEG and wrong here.** A predicted
+  frame whose reference was dropped decodes to garbage that looks like a broken camera rather than
+  a broken transport. So a gap abandons the stream to the next keyframe, in two places: the
+  branch's queue and the sender's channel.
+
+JPEG stays reachable on `media.stream {"encoding": "jpeg"}`, because every frame being independent
+is worth having for a receiver that reconnects constantly.
+
+**The branch is valved, not conditional.** `webrtcsink` owns the video track's encoder and is
+handed raw video on purpose — pre-encoded input puts the encoder out of reach of its congestion
+control, which this pipeline tried and reverted — so there is nothing to tap and this is a *second*
+encoder off the same raw tee. On a board where the encoder is the budget that has to cost nothing
+when nobody is streaming, so the branch is built once behind a `valve drop=true` and opened by a
+property write. Adding and removing elements on a live pipeline was the alternative, and
+`pipeline.rs`'s history with a `videoflip` is why nobody should reach for that here.
+
+What this does **not** do is give a browser a picture of a robot, carry audio, or close a teleop
+loop. Those want WebRTC and §6 is still what they need; the frame stream is for the case where the
+consumer is a program.
 
 ## 6. NAT: STUN on both ends, and the robot offers the relay — **decided**
 

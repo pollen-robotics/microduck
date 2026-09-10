@@ -31,7 +31,7 @@ const N_ZONES: usize = ROWS * COLS;
 
 /// The sensor's square field of view, degrees per axis — 45°×45° per ST's
 /// datasheet for both generations, the value the prototype's beam table used.
-const FOV_DEG: f64 = 45.0;
+pub const FOV_DEG: f64 = 45.0;
 
 /// What one zone's return turned out to be, once it has a place in the world.
 #[derive(Debug, Clone, Copy, PartialEq)]
