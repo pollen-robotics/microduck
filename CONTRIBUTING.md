@@ -100,6 +100,7 @@ hooks/          preinstall · postinstall — what runs inside an update, from t
 scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from your machine) ·
                 provision.sh → setup-board.sh → setup-gstreamer.sh · setup-rkaiq.sh ·
                 migrate-network.sh · install.sh (on the board) ·
+                setup-login.sh · setup-quiet-boot.sh (install.sh and postinstall both run these) ·
                 robot-boot-check · robot-rescue (recovery, installed to /usr/local/sbin) ·
                 pad-link-test.sh · pad-stack-report.sh (gamepad radio, on the board) ·
                 board-test.sh · systemd-test.sh (CI) · cross-sysroot.sh (cross-builds) ·

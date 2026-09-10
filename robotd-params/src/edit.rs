@@ -32,7 +32,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::Params;
-use crate::registry::{Entry, Kind, REGISTRY};
+use crate::registry::{Entry, Kind, REGISTRY, RENAMED_SECTIONS};
 use toml_edit::DocumentMut;
 
 /// One key's place in the world: what the file says, what the default is.
@@ -112,9 +112,10 @@ impl Model {
         // The daemon's own parse first: a file robotd would refuse is not a file to edit
         // blind, and the error names the line.
         toml::from_str::<Params>(text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let doc: DocumentMut = text
+        let mut doc: DocumentMut = text
             .parse()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::migrate_renamed_sections(&mut doc);
         Ok(Self {
             path: path.to_path_buf(),
             doc,
@@ -122,6 +123,29 @@ impl Model {
             pending: BTreeMap::new(),
             written: Vec::new(),
         })
+    }
+
+    /// Sections that changed name, carried to the new one in the document itself.
+    ///
+    /// The loader accepts the old name through a serde alias, so a file written before the rename
+    /// keeps working untouched. This is the other half: an *editor* that then set a key under the new
+    /// name would leave the file with both sections, which the loader refuses as a duplicate — so the
+    /// old header is renamed here, once, and the next save writes the file under the new name only.
+    /// Nothing is written until something else is saved; a read-only browse changes no file.
+    ///
+    /// Called from [`Model::from_text`] and again in [`Model::save`], which re-reads the file
+    /// from disk before rendering and would otherwise write the old header straight back.
+    fn migrate_renamed_sections(doc: &mut DocumentMut) {
+        for (old, new) in RENAMED_SECTIONS {
+            if doc.contains_key(new) {
+                // Both present: the loader's duplicate-field error already named it. Not ours to
+                // guess which wins.
+                continue;
+            }
+            if let Some(item) = doc.remove(old) {
+                doc.insert(new, item);
+            }
+        }
     }
 
     /// Every key the daemon knows, in registry order, with pending edits shown as if applied.
@@ -441,8 +465,9 @@ impl Model {
     pub fn save(&mut self) -> Result<(), String> {
         let lock = lock(&self.path)?;
         if let Ok(fresh) = std::fs::read_to_string(&self.path)
-            && let Ok(doc) = fresh.parse::<DocumentMut>()
+            && let Ok(mut doc) = fresh.parse::<DocumentMut>()
         {
+            Self::migrate_renamed_sections(&mut doc);
             self.doc = doc;
         }
         let text = self.rendered();
@@ -1053,9 +1078,49 @@ mod tests {
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad",
-                "imu_head"
+                "pad_imu_head_control"
             ]
         );
+    }
+
+    /// A file written before `[imu_head]` became `[pad_imu_head_control]` loads (the alias), and
+    /// the editor carries the section to its new name so a save under the new key cannot leave two
+    /// sections the loader would refuse as duplicates. The value set under the old name is what the
+    /// new key reports.
+    #[test]
+    fn a_renamed_section_is_carried_to_its_new_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[imu_head]\nenabled = true\ngain = 0.5\n").expect("write");
+
+        let mut m = Model::load(&config).expect("loads through the alias");
+        let row = m
+            .rows()
+            .into_iter()
+            .find(|r| r.entry.key == "pad_imu_head_control.gain")
+            .expect("registry key");
+        assert_eq!(
+            row.set.as_deref(),
+            Some("0.5"),
+            "the old section's value shows under the new key"
+        );
+
+        m.edit(entry("pad_imu_head_control.enabled"), "false")
+            .expect("valid");
+        m.save().expect("saves");
+        let text = std::fs::read_to_string(&config).expect("read");
+        assert!(!text.contains("[imu_head]"), "old header gone:\n{text}");
+        assert!(
+            text.contains("[pad_imu_head_control]"),
+            "new header present:\n{text}"
+        );
+        assert!(
+            text.contains("gain = 0.5"),
+            "untouched key carried over:\n{text}"
+        );
+        let params: Params = toml::from_str(&text).expect("the daemon loads the result");
+        assert!(!params.pad_imu_head_control.enabled);
+        assert_eq!(params.pad_imu_head_control.gain, 0.5);
     }
 
     /// **Four processes write this file**, and two staging into the same `robotd.toml.new` at

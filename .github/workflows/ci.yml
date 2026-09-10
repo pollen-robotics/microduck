@@ -102,7 +102,7 @@ jobs:
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/setup-quiet-boot.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.

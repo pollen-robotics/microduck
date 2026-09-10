@@ -141,7 +141,7 @@ Three properties worth trusting:
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
 for most keys (`[media]` and `[detect]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
-`[imu_head]`, which `padd` picks up within a second. `sudo`, because the file
+`[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -482,7 +482,7 @@ mapping is the prototype's, so muscle memory carries over:
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
-| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[imu_head] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
+| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[pad_imu_head_control] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |

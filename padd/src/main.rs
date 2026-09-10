@@ -282,15 +282,20 @@ const BINDINGS_POLL: Duration = Duration::from_secs(1);
 /// are a working robot, and the reason is logged. That matters more here than elsewhere because
 /// this is re-read while running — a half-saved file caught mid-write must not take the buttons
 /// away, and the next read a second later gets the finished one.
-fn read_bindings(path: &Path) -> (robotd_params::PadParams, robotd_params::ImuHeadParams) {
+fn read_bindings(
+    path: &Path,
+) -> (
+    robotd_params::PadParams,
+    robotd_params::PadImuHeadControlParams,
+) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
             let pad = params.pad;
-            let imu_head = params.imu_head;
+            let imu_head = params.pad_imu_head_control;
             tracing::info!(
                 a = %pad.a, x = %pad.x, lb = %pad.lb, rb = %pad.rb,
                 dpad_down = %pad.dpad_down,
-                imu_head = imu_head.enabled, imu_head_gain = imu_head.gain,
+                pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
                 "button bindings"
             );
             (pad, imu_head)
@@ -303,15 +308,15 @@ fn read_bindings(path: &Path) -> (robotd_params::PadParams, robotd_params::ImuHe
             );
             (
                 robotd_params::PadParams::default(),
-                robotd_params::ImuHeadParams::default(),
+                robotd_params::PadImuHeadControlParams::default(),
             )
         }
     }
 }
 
-/// Where the pad's IMU stands in relation to the head. See `[imu_head]` in `robotd-params`.
+/// Where the pad's IMU stands in relation to the head. See `[pad_imu_head_control]` in `robotd-params`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ImuHead {
+enum PadImuHead {
     /// Y means what it always did.
     Off,
     /// The head follows the pad's attitude relative to `reference`, the attitude at the press
@@ -321,7 +326,7 @@ enum ImuHead {
     Holding,
 }
 
-impl ImuHead {
+impl PadImuHead {
     /// Y was pressed with an IMU pad and the feature on. Off or holding → follow **from here**,
     /// which is what beats the gyro's yaw drift: every re-entry makes the pad's current attitude
     /// the new centre. Following → hold.
@@ -440,9 +445,9 @@ fn main() -> std::process::ExitCode {
     let mut bindings_checked = Instant::now();
 
     let mut mode = Mode::Drive;
-    // IMU head control, when `[imu_head]` is on and the pad has one. Off whenever the pad is
+    // IMU head control, when `[pad_imu_head_control]` is on and the pad has one. Off whenever the pad is
     // gone: a reference taken against one pad means nothing to the next.
-    let mut imu_head = ImuHead::Off;
+    let mut imu_head = PadImuHead::Off;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut select = SelectButton::default();
@@ -532,7 +537,7 @@ fn main() -> std::process::ExitCode {
                 tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
                 driving = false;
             }
-            imu_head = ImuHead::Off;
+            imu_head = PadImuHead::Off;
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
@@ -562,11 +567,11 @@ fn main() -> std::process::ExitCode {
         } else {
             None
         };
-        if attitude.is_none() && imu_head != ImuHead::Off {
+        if attitude.is_none() && imu_head != PadImuHead::Off {
             // The feature went off, or the IMU went away under us. Not silent: a head that stops
             // following mid-turn wants a line in the journal saying why.
             tracing::info!("IMU head control off — no attitude to follow");
-            imu_head = ImuHead::Off;
+            imu_head = PadImuHead::Off;
         }
 
         if toggle_head {
@@ -579,13 +584,13 @@ fn main() -> std::process::ExitCode {
                     }
                     imu_head = imu_head.on_y(attitude);
                     match imu_head {
-                        ImuHead::Following { .. } => tracing::info!(
+                        PadImuHead::Following { .. } => tracing::info!(
                             "IMU head control: following the pad from here — sticks keep driving"
                         ),
-                        ImuHead::Holding => {
+                        PadImuHead::Holding => {
                             tracing::info!("IMU head control: holding the head where it is")
                         }
-                        ImuHead::Off => {}
+                        PadImuHead::Off => {}
                     }
                 }
                 None => {
@@ -915,7 +920,7 @@ fn main() -> std::process::ExitCode {
         // describe one instant. Only while driving — body-pose mode owns the whole robot for as
         // long as it lasts, and stick head mode cannot coexist with this (see the Y handling).
         if mode == Mode::Drive
-            && let (ImuHead::Following { reference }, Some(now)) = (imu_head, attitude)
+            && let (PadImuHead::Following { reference }, Some(now)) = (imu_head, attitude)
         {
             frame.push(proto::Call::RobotHead(head_from_pad(
                 pad_imu::relative(reference, now),
@@ -1274,18 +1279,18 @@ mod tests {
             (15.0f32.to_radians()).sin(),
         ];
 
-        let following = ImuHead::Off.on_y(level);
-        assert_eq!(following, ImuHead::Following { reference: level });
+        let following = PadImuHead::Off.on_y(level);
+        assert_eq!(following, PadImuHead::Following { reference: level });
         let holding = following.on_y(yawed);
         assert_eq!(
             holding,
-            ImuHead::Holding,
+            PadImuHead::Holding,
             "the second press holds, whatever the pad did"
         );
         let again = holding.on_y(yawed);
         assert_eq!(
             again,
-            ImuHead::Following { reference: yawed },
+            PadImuHead::Following { reference: yawed },
             "the third follows from the pad's attitude now, not the first one"
         );
         // And that reference reads as centre.

@@ -738,6 +738,18 @@ install_units() {
   robot. The next update installs it."
     fi
 
+    # Apt off the boot path: Armbian's `@reboot` update count and the stock apt-daily timers, which
+    # together pin a core for seconds while robotd is starting and produce nothing a robot reads.
+    # Same shape as setup-login.sh above, for the same §9.1 reason: the hook runs it too.
+    setup_quiet_boot="${INSTALL_DIR}/current/scripts/setup-quiet-boot.sh"
+    if [ -f "$setup_quiet_boot" ]; then
+        sh "$setup_quiet_boot" || warn "could not take apt off the boot path; boot is slower and
+  noisier than it needs to be, and the robot is unaffected."
+    else
+        warn "the release carries no scripts/setup-quiet-boot.sh; Armbian keeps running a simulated
+  apt upgrade at every boot. The next update installs it."
+    fi
+
     systemctl daemon-reload
     enable_unit updaterd.service
     enable_unit robotd.service

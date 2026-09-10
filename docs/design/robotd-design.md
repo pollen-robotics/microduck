@@ -783,7 +783,7 @@ A TOML file read at startup and, for the most part, **not watched**. It lives ou
 
 Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
 than steps towards watching the whole file. `padd` stats the file once a second and re-reads
-`[pad]` and `[imu_head]` when the mtime moves: a binding is changed from a phone, and restarting
+`[pad]` and `[pad_imu_head_control]` when the mtime moves: a binding is changed from a phone, and restarting
 `padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
 `robotctl policy add` lands a skill without taking motor control away from a standing robot.

@@ -3,7 +3,7 @@
 # Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
 # mostly a change needs a restart — of the daemon that reads the section, which is not
 # always robotd: [media] and [detect] are mediad's and [head_imu] is tofd's. The two
-# exceptions: padd re-reads [imu_head] a second after the file changes, and robotd
+# exceptions: padd re-reads [pad_imu_head_control] a second after the file changes, and robotd
 # re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
 #
@@ -453,7 +453,10 @@ mode = "walk"
 # driving. A third press hands the head back to the pad from where the pad is *now* — its yaw is
 # a gyro's word alone and drifts, and re-centring on every re-entry is how you beat that without
 # a magnetometer. Off, or on a pad with no IMU, Y is what it always was.
-# [imu_head]
+#
+# Not [head_imu], which is the IMU in the robot's head. This section was [imu_head] once; a file
+# still saying that loads, and `robotctl configure` renames it on its next save.
+# [pad_imu_head_control]
 # enabled = false
 
 # Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into

@@ -67,7 +67,13 @@ pub struct Params {
     /// Which pad button runs which skill. `padd` reads this, not `robotd`.
     pub pad: PadParams,
     /// Posing the head from the pad's own IMU. `padd` reads this too.
-    pub imu_head: ImuHeadParams,
+    ///
+    /// Named for what it is, in full, because `[head_imu]` is two sections up and is the IMU *in*
+    /// the robot's head: the two were `imu_head` and `head_imu` for a while, and that is a name
+    /// apart, not a difference. The alias keeps a file written under the old name loading; the
+    /// editor renames the section the next time it saves that file.
+    #[serde(alias = "imu_head")]
+    pub pad_imu_head_control: PadImuHeadControlParams,
 }
 
 /// Controller-IMU head control: pose the head by tilting the pad.
@@ -83,7 +89,7 @@ pub struct Params {
 /// Off, or on a pad with no IMU, Y is what it always was. Nothing else about the pad changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct ImuHeadParams {
+pub struct PadImuHeadControlParams {
     /// Whether Y engages IMU head control on a pad that has an IMU.
     pub enabled: bool,
     /// Head radians per pad radian. One is "the head turns as far as the pad did"; more makes a
@@ -91,7 +97,7 @@ pub struct ImuHeadParams {
     pub gain: f64,
 }
 
-impl Default for ImuHeadParams {
+impl Default for PadImuHeadControlParams {
     fn default() -> Self {
         Self {
             enabled: false,

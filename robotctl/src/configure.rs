@@ -35,7 +35,7 @@
 //! video setting is an edit that reads as having done nothing at all.
 //!
 //! Mostly, not always, and the exceptions are where offering a restart is worst. `padd` re-reads
-//! `[pad]` and `[imu_head]` a second after the file changes, so a restart there drops the pad
+//! `[pad]` and `[pad_imu_head_control]` a second after the file changes, so a restart there drops the pad
 //! session — and robotd's deadman with it — to apply what would have applied by itself. `robotd`
 //! re-reads `[policy]` on a call, so a restart there takes motor control away from a standing
 //! robot to change a number it would have taken standing up.
@@ -105,8 +105,8 @@ fn apply_for(key: &str) -> Option<Apply> {
         // velocity of whatever was walking. `robotctl pad bind` has always said the true thing —
         // "padd picks this up within a second".
         //
-        // `imu_head` is the *controller's* IMU steering the head. Not `head_imu` below.
-        "pad" | "imu_head" => Apply::Live("padd"),
+        // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
+        "pad" | "pad_imu_head_control" => Apply::Live("padd"),
         // `tofd` reads `[head_imu]` out of robotd's file — see `tof/src/config.rs` for why it
         // reads that file rather than one of its own — and reads it once, at startup.
         "head_imu" => Apply::Restart("tofd"),
@@ -839,7 +839,7 @@ mod tests {
     /// key — and left `tofd` running on the value it loaded at boot. The switch was on in the
     /// file, off in the daemon, and the only sign was a startup line nobody re-reads. Regression
     /// test rather than an assertion folded into the case above, because the two IMU sections are
-    /// a name apart: `imu_head` is the controller's, and `padd` re-reads it by itself.
+    /// a name apart (and now less so): `pad_imu_head_control` is the controller's, and `padd` re-reads it by itself.
     #[test]
     fn the_head_imu_switch_restarts_tofd_and_not_robotd() {
         let mut m = model("");
@@ -849,7 +849,8 @@ mod tests {
         assert!(plan.live.is_empty());
 
         let mut m = model("");
-        m.edit(entry("imu_head.enabled"), "true").expect("valid");
+        m.edit(entry("pad_imu_head_control.enabled"), "true")
+            .expect("valid");
         let plan = plan_for(&m);
         assert_eq!(
             plan.live,
@@ -859,7 +860,7 @@ mod tests {
         assert!(plan.restart.is_empty(), "and it needs no restart");
     }
 
-    /// `[pad]` and `[imu_head]` are live: padd re-reads them, so there is nothing to offer.
+    /// `[pad]` and `[pad_imu_head_control]` are live: padd re-reads them, so there is nothing to offer.
     ///
     /// The inverse of the `[head_imu]` bug and the same mistake — a mapping that does not
     /// describe the daemon. `padd` stats the file every second and re-reads both sections when
@@ -872,13 +873,13 @@ mod tests {
         for key in [
             "pad.a",
             "pad.dpad_down",
-            "imu_head.enabled",
-            "imu_head.gain",
+            "pad_imu_head_control.enabled",
+            "pad_imu_head_control.gain",
         ] {
             let mut m = model("");
             let value = match key {
-                "imu_head.enabled" => "true",
-                "imu_head.gain" => "0.5",
+                "pad_imu_head_control.enabled" => "true",
+                "pad_imu_head_control.gain" => "0.5",
                 _ => "walk",
             };
             m.edit(entry(key), value).expect("valid");
