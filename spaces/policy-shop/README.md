@@ -65,17 +65,17 @@ A `perpetual` policy has no length of its own, so a one-shot made out of one is 
 unwind. `robotctl policy add` refuses without `--hold` rather than picking a number; this page asks
 instead, and that is the seconds box above the rows.
 
-## Two ways in, and right now only one of them works
+## Two ways in
 
 **From anywhere** is the rendezvous: the robot registers as a producer holding its account token,
 this signs in as the visitor, and the service pairs them. It is the path that reaches a duck behind
-its owner's router, and it needs a candidate pair that works — which today it may not have.
-`turn.fastrtc.org` has no A record and its zone has no NS records at all
-(`remote-access-design.md` §6), so neither side offers a `relay` and a session between a home
-router and a data centre falls back to host and srflx. Often that punches a hole. Often it does
-not, and because the control channel is SCTP over the same candidate pair, when it does not punch
-nothing here works at all. The status line names the stage it reached instead of saying
-"connecting…", so this failure is legible rather than mysterious.
+its owner's router, and it needs a candidate pair that works. The robot offers a `relay` candidate
+(`remote-access-design.md` §6), so a session between a home router and a data centre has a
+fallback for when host and srflx do not punch a hole — which they often do not. That fallback is
+somebody's bandwidth and it is metered, and because the control channel is SCTP over the same
+candidate pair, a relay that stops being available takes every button on this page with it. The
+status line names the stage it reached instead of saying "connecting…", so that failure is
+legible rather than mysterious.
 
 **On this network** needs none of that. `mediad` is already serving `webrtcsink`'s signalling
 server on `ws://<robot>:8443` — it is what the robot's own console talks to — and it carries the

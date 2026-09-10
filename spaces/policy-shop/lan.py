@@ -1,11 +1,11 @@
-"""The same session over the robot's own signalling server, for while TURN is down.
+"""The same session over the robot's own signalling server, for a consumer already on the LAN.
 
-The rendezvous path is the one that reaches a duck from anywhere, and it needs a relay candidate
-to do it: between a home router and a data centre, srflx-to-srflx punches often enough to be worth
-trying and not often enough to rely on. `turn.fastrtc.org` has no A record and its zone has no NS
-records at all (`docs/design/remote-access-design.md` §6), so today the honest answer for a
-consumer that wants to *drive* a duck is to be on the duck's network — where ICE needs no relay
-because both sides offer host candidates.
+The rendezvous path is the one that reaches a duck from anywhere, and it leans on a relay
+candidate to do it: between a home router and a data centre, srflx-to-srflx punches often enough
+to be worth trying and not often enough to rely on, so the fallback carries the session
+(`docs/design/remote-access-design.md` §6). On the duck's own network none of that is needed —
+both sides offer host candidates and ICE pairs them immediately — and a driving session is
+exactly the kind that should not be paying a relay's latency to reach a robot two metres away.
 
 **This is a transport, not a second design.** `webrtcsink`'s signalling server is already running
 on the robot at `ws://<robot>:8443`, and it carries the same gst envelopes the rendezvous carries

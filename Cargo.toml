@@ -90,6 +90,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 tokio-util = "0.7"
 async-trait = "0.1"
+url = "2"
 
 # No custom [profile.release]. Binary size is not worth optimising for: model artifacts
 # will dwarf a few MB of binary, and the tuning cost more than it bought —

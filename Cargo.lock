@@ -2732,6 +2732,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

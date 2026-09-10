@@ -21,10 +21,10 @@
 //!
 //! The bridge above carries a *negotiation*: SDP and ICE, so that a consumer and the robot can
 //! find a path between them and speak WebRTC over it. When they cannot find one, everything built
-//! on it is gone — and right now they frequently cannot, because a relay candidate needs
-//! `turn.fastrtc.org`, which has no A record and whose zone has no NS records (§6). Signalling
-//! crosses, media does not, and the control channel goes with it because SCTP rides the same
-//! candidate pair.
+//! on it is gone. A relay candidate is what keeps that from happening (§6) — and it is a
+//! dependency rather than a guarantee: it is somebody else's service, metered per account, and
+//! the control channel is SCTP over whatever pair ICE settled on, so a relay that stops being
+//! available takes a JSON-RPC call of a few hundred bytes down with the video.
 //!
 //! So the JSON-RPC a consumer wants to send does not have to go through WebRTC at all, and the
 //! rendezvous turns out to already carry it: `handle_peer_message` in their `app.py` relays

@@ -55,7 +55,11 @@ struct Args {
     /// Hugging Face hosts this proxy and mints Cloudflare credentials for the account the token
     /// belongs to, which is why offering a relay needs no new secret on the robot. A flag for
     /// pointing a board at a fake; there is nothing to choose on a real one.
-    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT)]
+    ///
+    /// Checked here rather than trusted: this is the one URL the account token is sent to, and
+    /// `parse_endpoint` says what it will not send it over.
+    #[arg(long, default_value = mediad::turn::DEFAULT_TURN_ENDPOINT,
+          value_parser = mediad::turn::parse_endpoint)]
     turn_url: String,
 
     /// Do not register with the rendezvous service, whatever the token file says.

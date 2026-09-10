@@ -50,6 +50,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls", 
 # reconnection field. Sixty lines to hand-roll and one of them would be the bug: a `data:` split
 # across two TCP reads.
 eventsource-stream = "0.2.3"
+# Parsing, not fetching: the one endpoint this daemon sends the account token to is
+# checked before the token can reach it, and "is this loopback" and "does this carry
+# userinfo" are the two questions a hand-rolled split on `:` gets wrong. Already in the
+# lock via `reqwest`.
+url.workspace = true
 # `StreamExt`, for the byte stream `reqwest` hands over. Already in the lock via `updater`.
 futures-util = "0.3.33"
 # The local half of the bridge: a WebSocket client to `webrtcsink`'s own signalling server on

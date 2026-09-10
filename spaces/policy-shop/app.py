@@ -21,11 +21,12 @@ being a pipe to the existing API.
 
 ## Two things that will bite before the robot does
 
-**Media may not connect from a data centre, and it is not this Space's fault.** A relay candidate
-needs `turn.fastrtc.org`, which has no DNS at all right now (§6), so the session falls back to
-host and srflx — often enough to punch a hole, and often enough not. The control channel is SCTP
-over that same candidate pair, so when it does not punch, nothing here works. Running this file on
-a laptop on the robot's own network is the way through — `uv run app.py`, and the README's
+**Media from a data centre now rests on the relay, and that is worth knowing before it bites.**
+The robot offers a `relay` candidate again (§6), so the session no longer depends on host and
+srflx punching a hole. But the control channel is SCTP over whatever pair ICE settled on, so
+anything that takes the relay away — an allowance spent, a proxy not answering — takes every
+method on this page with it, for calls whose payload is a few hundred bytes. Running this file on
+a laptop on the robot's own network needs no relay at all — `uv run app.py`, and the README's
 local-run section is the two lines that get there.
 
 **One consumer at a time.** That is the rendezvous's rule, not a simplification here: while this
@@ -792,8 +793,8 @@ with gr.Blocks(title="microduck policy shop") as demo:
             "**And there is no WebRTC in this path at all.** The calls are relayed as HTTP: the "
             "rendezvous forwards an `rpc` key on a `peer` envelope verbatim, and `mediad`'s "
             "control lane answers it out of the same routing table the datachannel uses. No ICE, "
-            "no DTLS, no relay candidate — so nothing here can be defeated by a NAT, which the "
-            "WebRTC version was, every time, while `turn.fastrtc.org` has no DNS (§6).\n\n"
+            "no DTLS, no relay candidate — so nothing here can be defeated by a NAT, and no "
+            "click waits on somebody's relay staying up (§6).\n\n"
             "The cost is pixels: video is RTP on the media path, so there is none on this tab. "
             "`robot.policies` says what the robot did; the tab beside this one shows it."
         )
