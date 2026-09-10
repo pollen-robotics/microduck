@@ -946,6 +946,19 @@ async fn crash_after_swap_is_reverted_when_the_robot_is_unhealthy() {
     assert_eq!(recovered.len(), 1, "should have reverted");
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
     assert_eq!(fx.live_marker().as_deref(), Some("version=1.0.0\n"));
+
+    // The revert must be journalled against the version that *failed*, so `known_bad`
+    // remembers 1.1.0 and leaves the release now running alone. An entry that named 1.0.0
+    // here blacklisted the good release and let 1.1.0 be retried forever.
+    let bad = engine.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 1, 0)),
+        "the failed release is what a RolledBack entry must name: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 0, 0)),
+        "the release reverted TO must not be blacklisted: {bad:?}"
+    );
 }
 
 /// **A release the robot is healthy on must not be reverted for want of a confirmation.**
@@ -1571,6 +1584,64 @@ async fn failed_transition_leaves_no_armed_trial() {
     assert!(engine.recover_on_start().await.unwrap().is_empty());
 }
 
+/// **#9** A `select` whose apply action failed *after* the swap returned early: the board
+/// stayed on the unverified release, the trial was disarmed, and nothing was journalled —
+/// while `apply` rolls back on the identical failure. Reachable in production by a unit
+/// that refuses to restart (`systemd-test.sh` reproduces one), which is what
+/// `fail_apply_action` stands in for.
+#[tokio::test]
+async fn a_failed_apply_action_on_select_rolls_back_and_is_journalled() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+    let keep = "keep_previous = 5";
+
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_exact(&mut engine, "1.1.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    // Select 1.0.0 back, with the unit restart failing after the symlink has moved.
+    let mut faulty = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            fail_apply_action: true,
+            ..Faults::none()
+        },
+        keep,
+    );
+    let outcome = faulty
+        .select("daemon", &semver::Version::new(1, 0, 0))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, ApplyResult::RolledBack { .. }),
+        "a failed apply action past the swap is a rollback, as in `apply`: {outcome:?}"
+    );
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "back on the release the board started from"
+    );
+    assert!(
+        !fx.pending_file_exists(),
+        "the revert disarms the trial, or the next boot reverts the revert"
+    );
+
+    // Journalled against the version that failed — the select's *target* — so it is
+    // known-bad and the release still running is not.
+    let bad = faulty.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 0, 0)),
+        "the select's target is what failed: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 1, 0)),
+        "the release reverted to must not be blacklisted: {bad:?}"
+    );
+}
+
 /// `scripts/robot-rescue` runs when `updaterd` does not, so it cannot ask this process which
 /// release is golden and must not parse `updater.toml` to find out — a release whose `updaterd`
 /// rejects that file is the likeliest thing it exists to rescue. Every start publishes the answer
@@ -1649,7 +1720,10 @@ async fn starting_up_records_a_rescue_and_releases_its_guard() {
         .expect("an entry in the update log");
     assert_eq!(entry.component.0, "daemon", "matched by install_dir");
     assert_eq!(entry.from, Some(semver::Version::new(1, 1, 0)));
-    assert_eq!(entry.to, Some(semver::Version::new(1, 0, 0)));
+    // A RolledBack entry's `to` names the version that *failed* — the one the rescue moved
+    // off of — never the golden it landed on. Naming golden here blacklists the release the
+    // board is successfully running, via `known_bad`.
+    assert_eq!(entry.to, Some(semver::Version::new(1, 1, 0)));
     match entry.outcome {
         updater::proto::Outcome::RolledBack { reason } => assert!(
             reason.contains("robotd.service"),
@@ -1657,6 +1731,16 @@ async fn starting_up_records_a_rescue_and_releases_its_guard() {
         ),
         other => panic!("a rescue is a rollback, got {other:?}"),
     }
+
+    let bad = engine.known_bad("daemon");
+    assert!(
+        bad.contains(&semver::Version::new(1, 1, 0)),
+        "the release the rescue moved off of is the one that failed: {bad:?}"
+    );
+    assert!(
+        !bad.contains(&semver::Version::new(1, 0, 0)),
+        "golden is what the board now runs; blacklisting it would block the next rollback: {bad:?}"
+    );
 }
 
 /// A rescue outranks an armed trial, and the order inside `recover_on_start` is what enforces it.
