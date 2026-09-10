@@ -276,21 +276,72 @@ chmod 755 "$PIN"
 say "wiring the shim and the pin into rkaiq_3A.service"
 mkdir -p "$DROP_IN_DIR"
 cat > "${DROP_IN_DIR}/robot.conf" <<DROPIN
-# Installed by scripts/setup-rkaiq.sh. All three lines are load-bearing.
+# Installed by scripts/setup-rkaiq.sh. Every line is load-bearing.
 #
 # LD_PRELOAD is what keeps the engine from segfaulting on this kernel, and the pin is what keeps it
 # from programming the ISP with the sensor's boot resolution.
 #
-# **The third is an ordering invariant, and it was learned the hard way.** The engine attaches to the
-# ISP and then waits for a *stream start* event — and it misses one that already happened. Restart it
-# while \`mediad\` is streaming (which every \`robotctl update apply\` did, because the pre-install hook
-# runs this script) and it sits on "wait stream start event..." for ever: no stats loop, no auto
-# exposure, no white balance, and a green picture that a reboot fixes only because the reboot happens
-# to order the two correctly. So whenever the engine starts, the camera stream is bounced behind it.
+# **The ExecStartPost is an ordering invariant, and it was learned the hard way.** The engine
+# attaches to the ISP and then waits for a *stream start* event — and it misses one that already
+# happened. Restart it while \`mediad\` is streaming (which every \`robotctl update apply\` did, because
+# the pre-install hook runs this script) and it sits on "wait stream start event..." for ever: no
+# stats loop, no auto exposure, no white balance, and a green picture that a reboot fixes only
+# because the reboot happens to order the two correctly. So whenever the engine starts, the camera
+# stream is bounced behind it.
 #
 # \`try-restart\`, so a board with no \`mediad\` running is left alone, and \`--no-block\`, because a unit
 # waiting on another unit's job inside its own start transaction is how you deadlock systemd.
+#
+# ── Why this unit is run directly rather than through its init script ─────────
+#
+# **The vendor unit is \`Type=forking\` over \`/etc/init.d/rkaiq_3A.sh\`, and systemd cannot supervise
+# what that script starts.** The script's \`start_3A\` is \`rkaiq_3A_server 2>&1 | logger -t rkaiq &\` —
+# a *pipeline*, backgrounded, and then the script exits. systemd's forking heuristic expects one
+# forked child and finds none it can claim, so \`systemctl show rkaiq_3A -p MainPID\` answers
+# \`MainPID=0\`: both processes end up reparented to init (they do stay in the unit's cgroup, which is
+# what keeps \`systemctl stop\` honest — the cgroup kill collects them, not the unit's own
+# \`ExecStop\`). What that leaves broken is the unit reading \`active\` whether the engine is alive or
+# dead with nothing to restart it when it segfaults, a \`stop\` of \`killall rkaiq_3A_server\` that
+# reaches any engine on the box rather than this unit's, and a \`reload\` of stop-then-start inside
+# the unit that never reaches the cgroup kill and so leaks the previous run's \`logger\` every time.
+#
+# So: \`ExecStart\` is cleared and set to the engine itself, and the engine writes to the journal
+# under this unit instead of through a \`logger\` process. systemd then knows the PID, kills the
+# whole cgroup on stop, and can restart a dead engine. \`ExecStop\` is cleared too, or the vendor's
+# \`killall\` would run on every stop and reach any engine on the box, not just this unit's.
+#
+# **The engine does not daemonise, which is what makes \`Type=simple\` right.** Measured on a board:
+# the \`logger\` from the init script's pipeline was still alive alongside the server, which can only
+# be true of a server holding the write end of that pipe in the foreground. A daemonising one would
+# have exited its first process and closed the pipe. The report at the end of this script checks
+# \`MainPID\` after a restart, so if that is ever wrong on some board, it says so there.
+#
+# ── Why the restart is capped ─────────────────────────────────────────────────
+#
+# \`Restart=\` and the \`ExecStartPost\` above are a loop waiting to happen: the known failure is a
+# segfault at startup when the shim does not match the kernel, and with \`Type=simple\` the
+# ExecStartPost fires as soon as the process is spawned — before the segfault is known. Uncapped,
+# a board with a mismatched shim would bounce \`mediad\` every few seconds for ever, which is worse
+# than the engine simply staying dead. \`StartLimitBurst\` is what makes \`Restart=\` safe here: three
+# attempts, then systemd gives up and leaves the unit failed, so \`mediad\` is bounced three times
+# and not indefinitely.
+#
+# \`on-failure\` rather than \`always\` because the segfault is the failure that has been observed and
+# it exits non-zero; a clean exit from this engine has never been seen, and \`always\` would add a
+# \`mediad\` bounce to a case nobody has characterised.
+[Unit]
+StartLimitIntervalSec=180
+StartLimitBurst=3
+
 [Service]
+Type=simple
+ExecStart=
+ExecStart=/usr/bin/rkaiq_3A_server
+ExecStop=
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=10s
 Environment=LD_PRELOAD=${SHIM_SO}
 ExecStartPre=${PIN}
 ExecStartPost=-/bin/systemctl --no-block try-restart mediad.service
@@ -314,14 +365,28 @@ if [ -e /dev/video8 ] && [ -e /dev/video9 ]; then
     # The engine either survives its own startup or segfaults in it, and which one it did is the
     # single fact worth reporting. A second is enough for the latter.
     sleep 1
+    # And whether systemd is *holding* it, which is the premise of the drop-in's `Type=simple`:
+    # a `MainPID` of 0 beside a running engine is the vendor unit's supervision hole reappearing,
+    # and it would mean nothing restarts the engine and `systemctl stop` leaves it behind.
+    main_pid=$(systemctl show rkaiq_3A -p MainPID --value 2>/dev/null || echo 0)
     if pgrep rkaiq_3A_server >/dev/null 2>&1; then
-        say "rkaiq_3A_server is running, and the camera stream has been bounced behind it so the
-  engine sees it start — that is the ExecStartPost in the drop-in above, not something to do by
-  hand. \`journalctl -fu rkaiq_3A\` should say 'wait stream start event success'."
+        if [ "${main_pid:-0}" -gt 0 ] 2>/dev/null; then
+            say "rkaiq_3A_server is running as PID ${main_pid}, tracked by systemd, and the camera
+  stream has been bounced behind it so the engine sees it start — that is the ExecStartPost in the
+  drop-in above, not something to do by hand. \`journalctl -fu rkaiq_3A\` should say 'wait stream
+  start event success'."
+        else
+            warn "rkaiq_3A_server is running, but systemd is not tracking it (MainPID=${main_pid}).
+  The drop-in's Type=simple assumes the engine stays in the foreground, and on this board it
+  apparently does not. Nothing will restart it if it dies, and \`systemctl stop\` will leave it
+  running. Report this with:
+    systemctl cat rkaiq_3A; systemctl show rkaiq_3A -p MainPID -p Type"
+        fi
     else
         warn "rkaiq_3A_server is not running. The camera still works, with no 3A:
-    journalctl -t rkaiq -b --no-pager | tail -40
-  A segfault here means the shim did not match this kernel (${SHIM_SRC})."
+    journalctl -u rkaiq_3A -b --no-pager | tail -40
+  A segfault here means the shim did not match this kernel (${SHIM_SRC}). Three attempts, then
+  systemd stops trying — \`systemctl reset-failed rkaiq_3A\` after a fix, or just re-run this."
     fi
 else
     say "the ISP nodes are not present yet, so nothing to start.

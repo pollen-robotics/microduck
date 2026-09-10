@@ -387,6 +387,58 @@ order is the whole trick:
 sudo systemctl stop mediad && sudo systemctl restart rkaiq_3A && sleep 2 && sudo systemctl start mediad
 ```
 
+### Nothing was supervising the engine
+
+The vendor unit is `Type=forking` over `/etc/init.d/rkaiq_3A.sh`, whose `start_3A` is
+
+```sh
+/usr/bin/rkaiq_3A_server 2>&1 | logger -t rkaiq &
+```
+
+— a pipeline, backgrounded, and then the script exits. systemd's forking heuristic expects one
+forked child and finds nothing it can claim, so on a board with the engine running:
+
+```
+$ systemctl is-active rkaiq_3A
+active
+$ systemctl show rkaiq_3A -p MainPID
+MainPID=0
+```
+
+Both processes are reparented to init, though they do stay in the unit's cgroup, which is the one
+thing keeping `systemctl stop` honest — the final cgroup kill is what collects them, not the unit's
+own `ExecStop`. What is left broken:
+
+- **The unit reads `active` whether the engine is alive or dead**, and nothing restarts it when it
+  segfaults — which is the failure this platform actually has, the day the shim stops matching the
+  kernel.
+- **`stop_3A` is `killall rkaiq_3A_server`**, so the unit's stop reaches any engine on the box rather
+  than the one it started.
+- **`reload` is `stop_3A; start_3A` inside the unit**, so it never reaches the cgroup kill and leaks
+  the `logger` from the previous run every time.
+
+So the drop-in runs the engine directly: `ExecStart` cleared and set to `rkaiq_3A_server`, `ExecStop`
+cleared so the vendor `killall` never runs, and the engine's output to the journal under its own unit
+instead of through a `logger` process — `journalctl -u rkaiq_3A` rather than `journalctl -t rkaiq`.
+`Type=simple` is right because the engine does not daemonise, and the evidence is that `logger`: it
+was alive alongside the server, which only holds if the server keeps the write end of that pipe open
+in the foreground.
+
+**`Restart=` needs a cap here, and the cap is the interesting half.** The `ExecStartPost` above
+bounces `mediad` on every start, and with `Type=simple` it fires as soon as the process is spawned —
+before a segfault at startup is known. Uncapped, a board with a mismatched shim would bounce the
+camera stream every few seconds for ever, which is worse than an engine that simply stays dead. So
+`StartLimitBurst=3` in three minutes: `mediad` is bounced three times, then systemd gives up and
+leaves the unit `failed` — which is at least a state `systemctl status` can report, where `active`
+with `MainPID=0` was not. `on-failure` rather than `always`, because the segfault exits non-zero and
+a clean exit from this engine has never been observed.
+
+**A failed engine is still not visible in `robotctl health`.** `configd::units::MANAGED` is the seven
+units a daemon release ships and `install.sh` manages, and the 3A engine is a vendor unit this
+project provisions rather than ships, so it is deliberately not among them. Now that the unit can
+reach `failed` at all, putting it there is worth considering — a green picture is a real symptom with
+no reading on that report — but it means widening what that list claims to cover.
+
 ### rkaiq's auto-exposure fires once, and only if it caught the stream
 
 `scripts/setup-rkaiq.sh` first shipped leaving rkaiq's AE **enabled**, on this reasoning: the

@@ -98,11 +98,17 @@ jobs:
       # other script here, and was missing from this list while being the one file that runs on
       # every board on every update — the argument this comment opens with, applied to itself.
       #
+      # `setup-rkaiq.sh` runs from `hooks/preinstall` on every update too, and it writes a systemd
+      # drop-in that decides whether the 3A engine is supervised at all. Its sibling
+      # `setup-gstreamer.sh` has been linted here since the beginning; this one had not been.
+      # `setup-npu.sh` is the remaining unlinted installer and does not pass yet, so it is not
+      # here.
+      #
       # POSIX sh, not bash: the script is piped to `sh` by the documented one-liner, and
       # a bashism would work on a dev box and fail on the board.
       - name: Lint the installer
         run: |
-          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-login.sh scripts/setup-quiet-boot.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh; do
+          for script in scripts/install.sh scripts/setup-board.sh scripts/setup-gstreamer.sh scripts/setup-rkaiq.sh scripts/setup-login.sh scripts/setup-quiet-boot.sh scripts/migrate-network.sh scripts/provision.sh scripts/provision-board.sh scripts/ci-release-notes.sh scripts/robot-rescue scripts/dev-push.sh scripts/pad-link-test.sh scripts/pad-stack-report.sh scripts/seed-policies.sh; do
             sh -n "$script"
             shellcheck --shell=sh "$script"
             # The one-liner is only correct if the file is executable and self-contained.
