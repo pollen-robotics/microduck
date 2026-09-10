@@ -2214,6 +2214,15 @@ async fn control_loop<T: RobotIo>(
                     mode = target.as_str(),
                     "mode switch refused: a policy change is still loading; ask again when it lands"
                 );
+            } else if shutdown_sit.is_some() || powered_off {
+                // The robot is on its way down. Homing from inside the sit would stand it back
+                // up at gain, and the sit would then cut the torque out from under it: the shape
+                // of #159, by one more door after `robot.init` and the enable-driven bring-up,
+                // both of which 7563b4c already gates on `powered_off`.
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch refused: the robot is shutting down"
+                );
             } else {
                 tracing::warn!(
                     from = policy_params.mode.as_str(),
@@ -8254,6 +8263,60 @@ mod tests {
                 "attempt {attempt}: robot.mode says {mode:?} and the walk slot is {walk}"
             );
         }
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+    }
+
+    /// A robot on its way down is not switched. Homing from inside the sit would stand it back up
+    /// at gain, and then the sit would cut the torque out from under it — #159 by one more door,
+    /// after `robot.init` and the enable-driven bring-up, which 7563b4c already gates.
+    ///
+    /// The sit itself needs the sitstand network, so this drives the sibling path CI can reach:
+    /// no policy, so `robot.shutdown` powers off at once. The gate is the same one.
+    #[tokio::test]
+    async fn a_mode_switch_after_power_off_is_refused() {
+        let io = FakeIo::at(DEFAULT_POSITION).frozen();
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+            }
+        });
+        wait_until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        intents.request_init();
+        wait_until(
+            || s.homed.load(Ordering::Relaxed),
+            HOME_RAMP + Duration::from_secs(2),
+            "init never reached home",
+        )
+        .await;
+
+        intents.request_shutdown();
+        let at = s.ticks.load(Ordering::Relaxed);
+        wait_until(
+            || s.ticks.load(Ordering::Relaxed) >= at + 3,
+            Duration::from_secs(2),
+            "stalled",
+        )
+        .await;
+
+        intents.request_mode_switch(mode_code(Mode::Roller));
+        tokio::time::sleep(HOME_RAMP + Duration::from_millis(500)).await;
+        assert_eq!(
+            mode_of(s.mode.load(Ordering::Relaxed)),
+            Mode::Walk,
+            "a mode switch went through on a robot that was powering off"
+        );
 
         s.shutdown.store(true, Ordering::Relaxed);
         handle.await.unwrap();
