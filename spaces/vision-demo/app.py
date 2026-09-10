@@ -3,9 +3,11 @@
 The robot is behind somebody's router and this runs in a container in a data centre. The obvious
 way to join them is the one this Space used to take: a WebRTC consumer pulls the stream through
 `reachy_mini_central`. That ran into the one thing WebRTC cannot do unaided — a relay candidate —
-and `turn.fastrtc.org` has no A record and its zone no NS records at all
-(`docs/design/remote-access-design.md` §6). Signalling crossed and media never did, from every
-Space, every time.
+and the relay default every robot shipped with pointed at a name with no DNS behind it, so
+signalling crossed and media never did, from every Space, every time. That default is fixed
+(`docs/design/remote-access-design.md` §6) and this design is still the right one: a relay costs
+somebody's bandwidth, metered against the robot owner's Hugging Face allowance, for every frame
+of a stream only a program is going to look at.
 
 **So the direction is inverted and the problem disappears.** The rendezvous is used for one small
 thing — telling the robot where to send frames — and the frames come **outbound from the robot** to
@@ -352,8 +354,8 @@ with gr.Blocks(title="duck vision demo") as demo:
         # A duck's camera, processed in a data centre
 
         The robot **dials this Space** and pushes JPEG frames; OpenCV runs over them here. Nothing
-        is on the robot's network, and no relay candidate is involved — which is why this works
-        where pulling the stream over WebRTC does not, while `turn.fastrtc.org` has no DNS.
+        is on the robot's network, and no relay candidate is involved — so no shared relay carries
+        the pixels, and none of this is spent against the robot owner's TURN allowance.
 
         Frames arrive at `{RECEIVER_URL}` — change it below if the robot cannot reach that.
         """

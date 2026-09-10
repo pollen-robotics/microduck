@@ -21,10 +21,12 @@ over each decoded frame here. Nothing is on the robot's network and no relay is 
 ## The robot dials us, and that is the whole design
 
 Pulling the camera through the rendezvous means WebRTC, and WebRTC between a robot behind a home
-router and a container in a data centre needs a **relay candidate**. `turn.fastrtc.org` has no A
-record and `fastrtc.org` no NS records at all (`remote-access-design.md` §6), so there is none:
-signalling crosses and media never does. That was this Space's whole history — "signalling worked
-and media did not" was its documented expected outcome.
+router and a container in a data centre needs a **relay candidate** to fall back on. For this
+Space's whole history there was none — the relay default every robot shipped with named a host
+with no DNS behind it — and "signalling worked and media did not" was its documented expected
+outcome. That default is fixed (`remote-access-design.md` §6), and inverting the direction is
+still what this Space wants: a relay spends the robot owner's metered allowance on every frame,
+and these frames are only ever decoded by a program.
 
 So the direction is inverted:
 

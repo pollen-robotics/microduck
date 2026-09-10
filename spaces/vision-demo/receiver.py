@@ -2,11 +2,11 @@
 
 **The robot connects to us, which is the whole reason this exists.** Pulling the camera through
 the rendezvous means WebRTC, and WebRTC between a robot behind a home router and a container in a
-data centre needs a relay candidate — `turn.fastrtc.org` has no A record and its zone no NS
-records (`remote-access-design.md` §6), so it negotiates and carries nothing. An outbound
-WebSocket has no such problem: the robot already holds one to a Space every second it is
-reachable. So the direction is inverted, NAT stops being a participant, and this is the socket at
-the far end.
+data centre needs a relay candidate to fall back on (`remote-access-design.md` §6) — somebody's
+bandwidth, metered against the robot owner's Hugging Face allowance, for every frame of a stream
+that is only going to be decoded by a program. An outbound WebSocket needs nobody's: the robot
+already holds one to a Space every second it is reachable. So the direction is inverted, NAT
+stops being a participant, and this is the socket at the far end.
 
 `mediad`'s `stream.rs` is the other half. It sends one text frame describing what is coming, then
 one binary message per JPEG, upright, at the rate it was asked for.

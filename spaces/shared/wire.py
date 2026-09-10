@@ -1,10 +1,11 @@
 """JSON-RPC to a duck over the rendezvous, with no WebRTC in the path at all.
 
 The other two transports negotiate: they exchange SDP and ICE so the two ends can find a route
-between them, and then speak WebRTC over it. That works on one network and it works across NATs
-*when a relay candidate exists* — which right now it does not, because `turn.fastrtc.org` has no A
-record and its zone has no NS records (`remote-access-design.md` §6). Signalling crosses, media
-does not, and the control channel goes with it because SCTP rides the same candidate pair.
+between them, and then speak WebRTC over it. That works on one network, and across NATs it works
+*when a relay candidate exists* — which now it does (`remote-access-design.md` §6), but the
+control channel is hostage to it either way, because SCTP rides the same candidate pair as the
+media. A relay that is rate-limited, metered out, or briefly not answering takes the click with
+it, for a call whose whole payload is a few hundred bytes.
 
 This needs none of it. The rendezvous already relays what is wanted: `handle_peer_message` in its
 `app.py` forwards **every key of a `peer` envelope except `type` and `sessionId`** verbatim to the

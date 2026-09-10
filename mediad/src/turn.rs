@@ -37,8 +37,59 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// Hugging Face's TURN credentials proxy, as `reachy_mini` uses it.
-pub const DEFAULT_TURN_ENDPOINT: &str = "https://turn.fastrtc.org/credentials";
+/// Hugging Face's TURN credentials proxy, addressed as the Space it is.
+///
+/// **Not `turn.fastrtc.org`**, the vanity name `fastrtc`'s own code points at and `reachy_mini`
+/// #1182 copied. That name is a dangling delegation: the `.org` registry still names four Route53
+/// nameservers for the zone, the hosted zone behind them is gone, and all four answer `REFUSED`
+/// for the zone they are authoritative for. The service never stopped answering — only the name
+/// in front of it did — so this addresses `fastrtc/turn-service` directly.
+///
+/// Which also takes a name that can be *taken over* out of the path: a signed-in robot sends its
+/// account token down this URL every five minutes, and whoever wins a race to have AWS assign
+/// them one of those four delegated nameservers would serve records for the name, pass DNS
+/// validation for a certificate on it, and be handed the token. `reachy_mini` #1408 made the same
+/// move and measured a relay pair carrying video through it.
+pub const DEFAULT_TURN_ENDPOINT: &str = "https://fastrtc-turn-service.hf.space/credentials";
+
+/// A `--turn-url` worth handing the account token to, or the reason it is not one.
+///
+/// The token goes out as a bearer header on every refresh, so the destination is checked before
+/// it can: **`https`**, unless the host is loopback and the endpoint is therefore a test fake or
+/// a stand-in on the board itself. Userinfo is refused because one credential per request is
+/// enough, and a query or fragment because [`fetch`] appends `?ttl=` to whatever it is given —
+/// silently landing the TTL in a fragment, or as a second value of an existing parameter.
+///
+/// A `clap` `value_parser`, so a wrong value stops the daemon while somebody is still looking at
+/// the terminal. An endpoint that is wrong rather than refused becomes a warning every thirty
+/// seconds for the life of the daemon, which is how a log stops being read.
+pub fn parse_endpoint(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|why| format!("not a URL: {why}"))?;
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("carries userinfo, and one credential per request is enough".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("carries a query or a fragment, and the ttl is appended to it".to_owned());
+    }
+
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => return Err("names no host".to_owned()),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err("is plain http, which puts the account token on the wire".to_owned());
+        }
+        other => return Err(format!("{other} is not a scheme these can be fetched over")),
+    }
+
+    Ok(url.into())
+}
 
 /// How long to ask for the credentials to be valid.
 const TTL: Duration = Duration::from_secs(600);
@@ -332,6 +383,47 @@ mod tests {
     fn entries_without_credentials_are_skipped() {
         assert!(turn_uris(&servers(r#"{"iceServers":[{"urls":"turn:relay:3478"}]}"#)).is_empty());
         assert!(turn_uris(&servers(r#"{"iceServers":[]}"#)).is_empty());
+    }
+
+    /// **The default is one the guard accepts.** A default that fails its own check is a daemon
+    /// that will not start at all, on every robot at once.
+    #[test]
+    fn the_default_endpoint_is_one_the_token_may_be_sent_to() {
+        assert_eq!(
+            parse_endpoint(DEFAULT_TURN_ENDPOINT).as_deref(),
+            Ok(DEFAULT_TURN_ENDPOINT),
+            "and it survives the round trip unchanged, so `fetch` appends `?ttl=` to what was set"
+        );
+    }
+
+    /// What the guard is for: the destinations the account token must not go to.
+    #[test]
+    fn an_endpoint_that_would_leak_the_token_is_refused_at_argument_parsing() {
+        for (endpoint, because) in [
+            ("http://turn.example/credentials", "plain http"),
+            ("https://user:pass@turn.example/credentials", "userinfo"),
+            ("https://turn.example/credentials?ttl=1", "query"),
+            ("https://turn.example/credentials#f", "fragment"),
+            ("ftp://turn.example/credentials", "scheme"),
+            ("/credentials", "relative"),
+        ] {
+            assert!(
+                parse_endpoint(endpoint).is_err(),
+                "{endpoint} was accepted, and it should have been refused for its {because}"
+            );
+        }
+    }
+
+    /// And loopback http is not one of them — every test below dials one.
+    #[test]
+    fn a_loopback_fake_needs_no_certificate() {
+        for endpoint in [
+            "http://127.0.0.1:8080/credentials",
+            "http://localhost:8080/credentials",
+            "http://[::1]:8080/credentials",
+        ] {
+            assert!(parse_endpoint(endpoint).is_ok(), "{endpoint}");
+        }
     }
 
     /// An unreachable endpoint says *why* it was unreachable.

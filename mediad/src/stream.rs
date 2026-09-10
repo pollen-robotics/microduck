@@ -5,11 +5,10 @@
 //! The goal is a Space on Hugging Face hardware processing this camera. The obvious route is the
 //! one `vision-demo` takes — a WebRTC consumer pulls the stream through the rendezvous — and it
 //! runs into the one thing WebRTC cannot do without help: a robot behind a home router and a
-//! container behind a data centre's NAT need a **relay candidate** to pair, and
-//! `turn.fastrtc.org` has no A record and its zone no NS records at all
-//! (`remote-access-design.md` §6). Signalling crosses, media does not.
+//! container behind a data centre's NAT need a **relay candidate** to pair
+//! (`remote-access-design.md` §6). Signalling crosses; media needs somebody's relay.
 //!
-//! An outbound WebSocket has no such problem. **The robot already proves this every second it is
+//! An outbound WebSocket needs nobody's. **The robot already proves this every second it is
 //! reachable**: `relay.rs` holds an outbound HTTPS stream to a Space right now, and nothing about
 //! a home router objects. So the frames go the same way the registration does — outward — and NAT
 //! stops being a participant.
@@ -22,6 +21,13 @@
 //! The rendezvous carries **the instruction and not the pixels**, which is the property that makes
 //! this scale where relaying payload through a shared service would not: one small envelope per
 //! session, on a service the mini fleet also depends on, and the bytes go point to point.
+//!
+//! **This is not a workaround for a relay that does not exist**, and it used to read like one.
+//! `turn.rs` offers relay candidates and they work. The argument above is the argument either
+//! way: a relay is metered per Hugging Face account, so every one of these frames would be spent
+//! against an allowance (§6: 10 GB a month) that the robot's owner also needs for being
+//! *watched* — and the shortest path between a board and a data centre is not through a third
+//! one. A relay is the fallback for a session that cannot be made direct. This one can.
 //!
 //! # What it is not
 //!
