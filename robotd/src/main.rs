@@ -3073,6 +3073,8 @@ async fn control_loop<T: RobotIo>(
                 },
                 joints: sensors.positions.to_vec(),
                 targets: targets.to_vec(),
+                velocities: sensors.velocities.to_vec(),
+                currents_ma: sensors.currents_ma.to_vec(),
                 odom: proto::OdomState {
                     position: odometry.position(),
                     yaw: odometry.yaw(),
@@ -6474,6 +6476,74 @@ mod tests {
         );
         assert_eq!(frame.policy, "held", "no policy was loaded");
         assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    /// Measured velocity and load must reach the state stream.
+    ///
+    /// They arrive in the same twelve-byte block as position (`bus.rs`, register 124), so the
+    /// loop has had them all along and only ever published position. A client outside the
+    /// daemon cannot recover either one: differencing `joints` across frames is wrong for any
+    /// subscriber that asked for a decimated rate, and load has no substitute at all.
+    ///
+    /// The fake reports values that are distinguishable from each other and from the joint
+    /// angles, so a block landing in the wrong field fails here rather than on a robot.
+    #[tokio::test]
+    async fn the_state_stream_carries_measured_velocity_and_load() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(
+            &params,
+            &PathBuf::from("/nonexistent/robotd.toml"),
+            false,
+            false,
+        ));
+        let mut states = s.state_tx.subscribe();
+
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        let velocities = std::array::from_fn(|i| (i as f64 + 1.0) * 0.01);
+        let currents = std::array::from_fn(|i| 100.0 + i as f64);
+        io.set_velocities(velocities);
+        io.set_currents_ma(currents);
+
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(control_loop(
+            io,
+            loop_state,
+            Arc::new(Intents::new()),
+            params,
+            PathBuf::from("/nonexistent/robotd.toml"),
+            Duration::from_millis(2),
+            noop_poweroff(),
+        ));
+
+        let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+            .await
+            .expect("a frame within five seconds")
+            .expect("the stream stayed open");
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(
+            frame.velocities.len(),
+            duck_control::NUM_JOINTS,
+            "one velocity per joint, mouth included, indexed as JOINT_NAMES"
+        );
+        assert_eq!(
+            frame.currents_ma.len(),
+            duck_control::NUM_JOINTS,
+            "one current per joint"
+        );
+        assert_eq!(frame.velocities, velocities.to_vec(), "velocity block");
+        assert_eq!(frame.currents_ma, currents.to_vec(), "load block");
+        // ...and not confused with each other, or with the angles the robot is holding.
+        assert_ne!(frame.velocities, frame.currents_ma);
+        assert_ne!(frame.velocities, frame.joints);
     }
 
     /// Assembling a frame allocates, on the thread that should not be visiting the

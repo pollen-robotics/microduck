@@ -4492,6 +4492,9 @@ mod tests {
             },
             joints: vec![0.0; proto::JOINT_NAMES.len()],
             targets: vec![0.0; proto::JOINT_NAMES.len()],
+            // Not reported, as from a daemon predating them; the monitor draws neither.
+            velocities: Vec::new(),
+            currents_ma: Vec::new(),
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,

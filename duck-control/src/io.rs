@@ -256,6 +256,21 @@ impl FakeIo {
         self.sensors.imu = imu;
     }
 
+    /// Joint velocities the next [`RobotIo::read`] will report.
+    ///
+    /// Unlike positions these are never derived from what was written — a fake that echoed
+    /// its own targets back as velocity would make any test of the velocity path pass
+    /// vacuously.
+    pub fn set_velocities(&mut self, velocities: [f64; NUM_JOINTS]) {
+        self.sensors.velocities = velocities;
+    }
+
+    /// Present current per joint, mA. Same rule as [`Self::set_velocities`]: nothing derives
+    /// this, so a test has to state what the servos are supposed to be reporting.
+    pub fn set_currents_ma(&mut self, currents_ma: [f64; NUM_JOINTS]) {
+        self.sensors.currents_ma = currents_ma;
+    }
+
     pub fn positions(&self) -> [f64; NUM_JOINTS] {
         self.sensors.positions
     }
