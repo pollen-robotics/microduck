@@ -11,7 +11,7 @@ use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
 use configd::power;
 use configd::store::Store;
-use configd::{pad, units};
+use configd::{logs, pad, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -444,6 +444,27 @@ async fn dispatch(
         // question support asks first, and needing privilege to ask it would put it out of reach of
         // exactly the person diagnosing a robot.
         proto::Call::SystemServices => proto::Response::ok(Some(id), &units::all().await),
+
+        // Read-only, and not gated behind `may_mutate` for the same reason as the line above: the
+        // person who needs a daemon's last words is the person diagnosing a robot, and needing
+        // privilege to read them would put them out of that person's reach.
+        //
+        // The unit is resolved against a fixed list *before* it reaches `journalctl`, which is
+        // what makes this safe to route over BLE — see `logs` for the boundary and `btd::route`
+        // for the decision to route it.
+        proto::Call::SystemLogs(params) => match logs::resolve(&params.unit) {
+            None => proto::Response::err(Some(id), logs::refusal(&params.unit)),
+            Some(unit) => match logs::read(unit, params.lines, params.boot).await {
+                Ok(result) => proto::Response::ok(Some(id), &result),
+                // INTERNAL rather than INVALID_PARAMS: the request was well-formed and something
+                // on the board could not answer it. The one exception a caller will actually meet
+                // — a boot that is not in the journal — carries journalctl's own wording.
+                Err(e) => proto::Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::INTERNAL_ERROR, e),
+                ),
+            },
+        },
 
         proto::Call::SystemInfo => proto::Response::ok(
             Some(id),

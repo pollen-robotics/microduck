@@ -333,7 +333,7 @@ This should not have been necessary, so it is worth reading the journal for why 
 | | |
 |---|---|
 | `DUCK_ROBOT` | The robot, by name. Its address is found over Bluetooth and cached. |
-| `DUCK_BOARD_USER` | The ssh user on the board, for the name path. Default `radxa`. |
+| `DUCK_BOARD_USER` | The ssh user on the board, for the name path. Default `radxa`. `duckctl ssh` reads it too. |
 | `DUCK_PIN` | The robot's pairing PIN, if it is not the factory `000000`. Read by `duckctl`. |
 | `DUCK_BOARD_CACHE` | Where resolved addresses are cached. Default `~/.cache/duck/boards`. |
 | `DUCK_BOARD` | The board, by address, instead of an argument. `radxa@192.168.1.42`. |

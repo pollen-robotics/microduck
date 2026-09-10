@@ -22,13 +22,13 @@
 pub mod camera;
 pub mod config;
 /// The account credential `updaterd` writes, read by the two things here that need it.
-pub mod hf;
 pub mod producer;
 /// The outward connection to the rendezvous service — what makes a duck reachable from off its
 /// own LAN. `docs/design/remote-access-design.md` §3.
 pub mod relay;
 pub mod route;
 pub mod session;
+pub mod stream;
 /// Relay candidates, so a robot behind a router is reachable from a network that cannot punch a
 /// hole to it. `docs/design/remote-access-design.md` §6.
 pub mod turn;

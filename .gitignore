@@ -23,3 +23,8 @@ secret*
 
 # Python bytecode from the demo Space, which is source rather than a build here.
 __pycache__/
+
+# A venv beside a Space's source, for running one locally. `uv venv` writes its own `.gitignore`
+# holding `*` so it self-ignores; this is for the person who reaches for `python -m venv`, which
+# does not, and it is the same accident `__pycache__` above was added for.
+.venv/

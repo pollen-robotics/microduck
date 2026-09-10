@@ -228,6 +228,72 @@ pub fn letterbox_from_uyvy(
     }
 }
 
+/// The frame as an upright RGB picture, scaled to fit a box, with no padding.
+///
+/// [`letterbox_from_uyvy`] above is for the model: a square, padded, at whatever size the network
+/// wants. This is for a *person or a program looking at the picture* — a JPEG on its way to a
+/// Space that runs a model of its own — so it keeps the aspect ratio and pads nothing.
+///
+/// **The turn is applied here rather than reported.** `mediad`'s pipeline deliberately does not
+/// rotate: a `videoflip` cost the encoder its zero-copy path and the board 22 fps, so a WebRTC
+/// consumer is told the mount angle and turns the picture itself (`media.video`). That reasoning
+/// does not carry over to this path, because the conversion is a per-pixel loop either way and the
+/// turn is a change of which source pixel is fetched — free, inside a loop that is already
+/// running. And what receives these frames is a model, which wants them the way up it was trained
+/// on rather than a rotation flag to honour.
+///
+/// Returns the size written, which is not `(long, short)` in any predictable order: a quarter turn
+/// swaps the axes, so the caller is told rather than left to work it out.
+pub fn rgb_from_uyvy(
+    uyvy: &[u8],
+    width: usize,
+    height: usize,
+    longest: usize,
+    turn: Turn,
+    out: &mut Vec<u8>,
+) -> (usize, usize) {
+    let (upright_w, upright_h) = turn.upright(width, height);
+    // Downscale only. Asking for a box bigger than the sensor would interpolate detail that was
+    // never captured and cost the bandwidth of pretending.
+    let scale = (longest as f32 / upright_w.max(upright_h) as f32).min(1.0);
+    let out_w = ((upright_w as f32 * scale).round() as usize).max(1);
+    let out_h = ((upright_h as f32 * scale).round() as usize).max(1);
+    let stride = width * 2;
+
+    out.clear();
+    out.resize(out_w * out_h * 3, 0);
+    for y in 0..out_h {
+        let uy = (y * upright_h) / out_h;
+        for x in 0..out_w {
+            let ux = (x * upright_w) / out_w;
+            let (source_x, source_y) = turn.source(ux, uy, width, height);
+            let row = source_y * stride;
+            if row + stride > uyvy.len() {
+                // A frame that arrives mid-teardown is short. What is missing stays black rather
+                // than taking the daemon down over a picture — the same call `letterbox_from_uyvy`
+                // makes.
+                continue;
+            }
+            let pair = row + (source_x / 2) * 4;
+            // U Y0 V Y1: the luma is the odd byte of the half this pixel falls in.
+            let luma = uyvy[pair + 1 + 2 * (source_x & 1)] as i32 - 16;
+            let u = uyvy[pair] as i32 - 128;
+            let v = uyvy[pair + 2] as i32 - 128;
+
+            // BT.601 limited range in fixed point, as above: the ISP's convention.
+            let r = (298 * luma + 409 * v + 128) >> 8;
+            let g = (298 * luma - 100 * u - 208 * v + 128) >> 8;
+            let b = (298 * luma + 516 * u + 128) >> 8;
+
+            let target = (y * out_w + x) * 3;
+            out[target] = r.clamp(0, 255) as u8;
+            out[target + 1] = g.clamp(0, 255) as u8;
+            out[target + 2] = b.clamp(0, 255) as u8;
+        }
+    }
+    (out_w, out_h)
+}
+
 /// Candidates over `threshold`, suppressed, and mapped back to the original frame.
 ///
 /// **The head does not suppress anything.** 2100 candidates means one duck comes back as twenty
@@ -289,6 +355,42 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    /// A quarter turn swaps the axes and moves a known corner, which is the whole of what a
+    /// rotation can get wrong: an upside-down picture and an unrotated one have the same shape.
+    #[test]
+    fn the_rgb_scaler_turns_the_picture_and_keeps_its_shape() {
+        // 8x4 UYVY, all grey except the top-left pixel, which is bright.
+        let (width, height) = (8usize, 4usize);
+        let mut uyvy = [128u8, 16, 128, 16].repeat(width * height / 2);
+        uyvy[1] = 235; // Y0 of the first pair: the top-left pixel, white.
+
+        let mut out = Vec::new();
+        let (w, h) = rgb_from_uyvy(&uyvy, width, height, 8, Turn::None, &mut out);
+        assert_eq!((w, h), (8, 4), "unturned, the shape is the frame's");
+        assert!(out[0] > 200, "and the bright pixel is top-left: {}", out[0]);
+
+        let (w, h) = rgb_from_uyvy(&uyvy, width, height, 8, Turn::Right, &mut out);
+        assert_eq!((w, h), (4, 8), "a quarter turn swaps the axes");
+        // Turned clockwise, the frame's top-left corner is the picture's top-right — row zero,
+        // last column.
+        let top_right = (w - 1) * 3;
+        assert!(
+            out[top_right] > 200,
+            "the bright pixel moved to the top-right: {:?}",
+            &out[top_right..top_right + 3]
+        );
+        assert!(out[0] < 200, "and is no longer top-left: {}", out[0]);
+    }
+
+    /// Never upscales: a box larger than the sensor would interpolate detail nobody captured.
+    #[test]
+    fn the_rgb_scaler_only_ever_shrinks() {
+        let uyvy = [128u8, 16, 128, 16].repeat(8 * 4 / 2);
+        let mut out = Vec::new();
+        assert_eq!(rgb_from_uyvy(&uyvy, 8, 4, 64, Turn::None, &mut out), (8, 4));
+        assert_eq!(rgb_from_uyvy(&uyvy, 8, 4, 4, Turn::None, &mut out), (4, 2));
+    }
+
     use super::*;
 
     /// A tall frame fits inside the square with grey above and below, and nothing stretches.

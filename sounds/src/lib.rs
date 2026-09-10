@@ -130,6 +130,14 @@ pub fn render_all(p: &Personality, out_dir: &Path) -> Result<Vec<PathBuf>> {
 /// board without one. sha256 decorrelates consecutive factory serials so two robots from
 /// the same batch don't get neighbouring (and thus meaninglessly different) seeds.
 pub fn hardware_seed() -> Result<u32> {
+    // **One machine, several ducks** — the one situation where deriving identity from hardware is
+    // wrong. The simulator runs a robot per container, or several on one laptop, and they would
+    // otherwise share a serial and therefore a voice *and a chorale id*: that id is how a duck
+    // recognises its own beacon reflected back, so identical ducks drop each other's beacons as
+    // their own and can never hear anybody. Nothing on a robot sets this.
+    if let Some(named) = std::env::var_os("DUCK_IDENTITY") {
+        return Ok(seed_from_id(&named.to_string_lossy()));
+    }
     let id = std::fs::read("/proc/device-tree/serial-number")
         .map(|raw| {
             String::from_utf8_lossy(&raw)

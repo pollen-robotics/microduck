@@ -40,7 +40,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
 echo "space:  https://huggingface.co/spaces/$SPACE"
-echo "files:  $(cd "$SOURCE" && ls | tr '\n' ' ')"
+echo "files:  $(find "$SOURCE" -maxdepth 1 \( -type f -o -type l \) -exec basename {} \; | sort | tr '\n' ' ')"
 
 if [ -n "$DRY_RUN" ]; then
     echo "--dry-run: nothing pushed"
@@ -53,7 +53,19 @@ git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
 # Copied rather than synced: a file deleted here stays in the Space until somebody removes it
 # there. Deliberate — a `--delete` that ran against the wrong Space id would remove somebody's
 # work, and these are hand-run.
-cp "$SOURCE"/* "$CLONE/"
+#
+# Files only, and `find` rather than a glob for one reason: running a Space locally leaves a
+# `__pycache__` beside its source (gitignored, so it stays there), and `cp` without `-r` fails on
+# a directory instead of skipping it — which under `set -e` aborts the publish after the clone,
+# for a reason that has nothing to do with the Space.
+#
+# **Symlinks are followed and flattened, which is how two Spaces share a client.** `spaces/shared`
+# holds the modules that speak this project's protocols — the control lane, the rendezvous
+# listing — and each Space links to the ones it uses. A Space repo cannot have a parent directory,
+# so `-type l` and `cp -L` turn the link into the file at publish time. Duplicating those modules
+# per Space instead is the drift `remote-access-design.md` §5 keeps their source in this
+# repository to avoid, and two copies in one repository would drift just as happily.
+find "$SOURCE" -maxdepth 1 \( -type f -o -type l \) -exec cp -L {} "$CLONE/" \;
 
 cd "$CLONE"
 if git diff --quiet; then

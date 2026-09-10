@@ -26,7 +26,15 @@ PINNED_SENSOR_WIDTH = 1920
 
 
 def upright(frame: np.ndarray) -> np.ndarray:
-    """Turn the picture the way the robot is looking."""
+    """Turn the picture the way the robot is looking.
+
+    **Unused on the frame-stream path, and kept because it is still right for a WebRTC one.**
+    `mediad`'s `stream.rs` turns a frame upright while it converts the colours, since that is a
+    per-pixel loop either way and the turn is a change of which source pixel is fetched — free,
+    and what receives the frames is a model that wants them the way up it was trained on. A
+    consumer pulling H.264 through WebRTC gets the picture the camera took and has to do this
+    itself, which is what `media.video`'s `rotate` is for.
+    """
     if MOUNT_ROTATION_DEGREES % 360 == 0:
         return frame
     # `np.rot90` counts anticlockwise and the mount is measured clockwise.

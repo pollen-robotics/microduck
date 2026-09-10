@@ -273,6 +273,15 @@ saying so:
   swapped in arrives at 250, so the check is what removes a whole class of "why is it slow on
   this robot". `shutdown = 52` is the error mask that latches on overload, overheating and
   input-voltage faults.
+- **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
+  57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
+  the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
+  then by reopening the port at 57 600 — writes it the missing ID and then the bus's baud rate,
+  reopens at 1 Mbps, runs the same register check on it, and reboots it. The reboot is what
+  clears the hardware-error alert the flash leaves set, which would otherwise hold torque off
+  until someone pulled the battery. A complete bus pays fifteen pings for this and nothing
+  else — the 57 600 probe never runs unless a servo is missing. Two missing servos are left
+  alone: there is no telling which one a fresh servo replaces, and the journal says so.
 - The position P gain is written with I and D at **zero**, the runtime's `--ki`/`--kd`
   defaults. These are RAM registers, so a power cycle restores the servo's factory values, and
   the factory D is not zero: left in place it damps the servo's internal PID and the robot runs
@@ -768,9 +777,19 @@ single last-writer slot would lose.
 
 ### 4.2 Params
 
-A TOML file read at startup, **not watched** — live reload comes later. It lives outside
+A TOML file read at startup and, for the most part, **not watched**. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
+than steps towards watching the whole file. `padd` stats the file once a second and re-reads
+`[pad]` and `[imu_head]` when the mtime moves: a binding is changed from a phone, and restarting
+`padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+`robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
+`robotctl policy add` lands a skill without taking motor control away from a standing robot.
+Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
+and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
+a key that says nothing fails a test in `robotctl`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the
@@ -976,3 +995,24 @@ path map now does. §4.4.
    has to reach the board, so prefer pure-Rust crates on that path. *Unverified on macOS:* the
    cross-build needs an aarch64 sysroot, which a Mac cannot provide, so `cargo board --bins` fails
    locally there — build the shipped set with `-p updater -p robotd -p robotctl`, or build on Linux.
+
+## Mapping telemetry (API v24)
+
+A mapper on the far end of the video — a laptop today, a server later — needs three things from
+the robot that `robot.state` did not carry: a clock shared with `tof.frame`, the IMU beyond its
+projected gravity, and where the camera and the ToF sensor are. All three are additive.
+
+- **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
+  `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
+  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
+  wall-clock — can be put on the same axis.
+- **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
+  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
+  anything yet; when it is, it streams beside `tof.frame`, not here.
+- **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
+  `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
+  answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
+  zero). The kinematics stay in one crate; a client asks rather than transcribes.
+
+Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.

@@ -71,6 +71,12 @@ RestartSec=2s
 #   - CAP_SYS_BOOT is NOT granted, because logind performs the reboot; configd only asks. A
 #     capability here would let it call reboot(2) directly, which is precisely the unclean
 #     shutdown this service exists to avoid.
+#
+# `system.logs` spawns `journalctl` (see `configd::logs`) and needs nothing added here, which is
+# worth stating so nobody loosens this file for it: /usr stays executable under
+# ProtectSystem=strict, and the journal files are 0640 root:systemd-journal — so uid 0 reads them
+# as their owner, with the capability bounding set still empty. If a future kernel or journald
+# changes that, the fix is a SupplementaryGroups=systemd-journal, not a capability.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

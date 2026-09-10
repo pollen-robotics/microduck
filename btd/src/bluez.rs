@@ -20,8 +20,13 @@
 //! So: one session for the service's lifetime, one notify pump, and a write callback that pushes
 //! bytes into it.
 //!
-//! **Untested against hardware.** It type-checks for aarch64 and has never met a real central.
-//! Treat what follows as intent until someone connects a phone.
+//! **What the callback model costs is flow control**, and that bill came due the first time a
+//! reply was more than a few kilobytes. `notify` hands a D-Bus signal to the connection and
+//! returns; nothing here can ask BlueZ whether the radio has caught up, and nothing reports the
+//! notification MTU either. Both gaps are worked around rather than solved: the payload is taken
+//! from what BlueZ reports on inbound writes (one ATT MTU serves both directions), and the pump
+//! pauses every [`NOTIFY_BURST`] chunks. The IO model has the readiness signal this wants and
+//! still cannot be used, for the reason above — it serves only the `Acquire*` paths.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -34,11 +39,13 @@ use bluer::agent::Agent;
 // which is how it first presented.
 use bluer::gatt::local::ReqError as GattError;
 use bluer::gatt::local::{
-    Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
-    CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod, Service,
+    Application, Characteristic, CharacteristicNotifier, CharacteristicNotify,
+    CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod,
+    Service,
 };
 use futures::FutureExt;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -47,12 +54,45 @@ use crate::link::Link;
 use crate::session;
 use crate::upstream::{NameChoice, Sockets};
 
-/// Notification payload assumed for outbound chunks.
+/// Notification payload a session starts with, before any write has reported the negotiated one.
 ///
-/// The write side learns the negotiated MTU (BlueZ reports it per request); the notify side has no
-/// way to ask. So chunks are sized for 20 bytes — the payload every BLE link is required to
-/// support — which is slower than necessary on a good link and correct on every link.
+/// 20 bytes is what every BLE link is required to support, so it is the only safe *first* guess.
+/// It used to be the guess for the whole session — the notify side has no way to ask BlueZ, which
+/// remains true — and that was wrong in two ways. Tenfold more notifications than the link needed
+/// was the visible half; the other half is that a reply above roughly 5 KiB tore the session down
+/// (see [`NOTIFY_BURST`]). The write side does learn the real MTU, BlueZ reports it on every
+/// inbound write, and both directions share one ATT MTU — so the floor now lasts until the
+/// client's first write, which is always `system.authenticate`.
 const FLOOR_MTU: usize = 20;
+
+/// How many notifications to queue before pausing to let the radio drain.
+///
+/// **This is the only backpressure the callback model offers, and it has to exist.**
+/// `CharacteristicNotifier::notify` emits a D-Bus `PropertiesChanged` signal and returns as soon
+/// as the signal is queued on the connection — it does not wait for BlueZ, let alone for the
+/// controller — so an unpaced pump queues a whole reply in microseconds. Measured on the board:
+/// a ~5 KiB reply at the 20-byte floor (≈265 notifications) got through in 1.8 s, and a ~7 KiB one
+/// (≈350) killed the notification session 150 ms in, leaving the client waiting out its idle
+/// timeout against a robot that had already torn down the session. `bluer`'s IO model has a real
+/// readiness signal for this and cannot be used here — it serves only the `Acquire*` fd paths,
+/// which a CoreBluetooth central never drives (see this module's header).
+///
+/// Sixteen chunks is what a connection interval can plausibly carry, so a small reply — an
+/// authentication answer is four chunks — never pauses at all.
+const NOTIFY_BURST: usize = 16;
+
+/// How long to pause between bursts. Roughly one connection interval.
+const NOTIFY_PAUSE: Duration = Duration::from_millis(20);
+
+/// How many times to re-send a chunk the D-Bus connection would not take, and how long to wait
+/// between attempts.
+///
+/// A `notify` that fails while the session is *not* stopped is a queue that is momentarily full,
+/// which is recoverable and was being treated as the central having left — the session was torn
+/// down mid-reply and the client learned nothing at all. Only an exhausted budget, or a genuinely
+/// stopped session, ends the session now.
+const NOTIFY_RETRIES: u32 = 5;
+const NOTIFY_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 /// How often to advertise, and this is the difference between a robot that is found and one that is
 /// not.
@@ -313,6 +353,13 @@ async fn serve_on_an_adapter(
     let for_write = current.clone();
     let for_notify = current.clone();
 
+    // The negotiated payload, written by the write callback and read by the session when it sizes
+    // a reply. An atomic rather than a channel or the mutex above, because the write callback may
+    // not await and may not block: a yield point there lets two chunks swap places. See
+    // [`crate::link::Link::mtu`].
+    let mtu = Arc::new(AtomicUsize::new(FLOOR_MTU));
+    let write_mtu = mtu.clone();
+
     // The notify callback below takes ownership of `sockets` for the sessions it spawns, and the
     // reconcile loop at the end outlives it.
     let for_reconcile = sockets.clone();
@@ -364,6 +411,15 @@ async fn serve_on_an_adapter(
                             String::from_utf8_lossy(&value[..value.len().min(8)]).to_string();
                         let sender = for_write.lock().expect("write slot poisoned").clone();
 
+                        // What BlueZ says this link negotiated, minus the three bytes of ATT
+                        // header a notification cannot use. Stored on every write because it is
+                        // free to do so and a central may renegotiate; logged only when it moves,
+                        // because the value that matters is the one a reply gets chunked for and
+                        // that number had never appeared in the journal at all.
+                        let payload = usize::from(req.mtu).saturating_sub(3).max(FLOOR_MTU);
+                        let previous = write_mtu.swap(payload, Ordering::Relaxed);
+                        let learned = (previous != payload).then_some(payload);
+
                         let result = match sender {
                             None => {
                                 // Nowhere to send an answer, so accepting the request would be a
@@ -394,6 +450,12 @@ async fn serve_on_an_adapter(
                         };
 
                         async move {
+                            if let Some(payload) = learned {
+                                tracing::info!(
+                                    payload,
+                                    "negotiated notification payload; replies are sized for this"
+                                );
+                            }
                             // Eight bytes of the chunk, so a reordering is visible in the journal
                             // rather than inferred from a parse error three layers up. Truncated
                             // because a request may carry a wifi passphrase.
@@ -416,12 +478,17 @@ async fn serve_on_an_adapter(
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
                         let slot = for_notify.clone();
                         let sockets = sockets.clone();
+                        let mtu = mtu.clone();
                         async move {
                             tokio::spawn(async move {
                                 // A fresh session, so nothing from a previous central can leak
                                 // into this one.
+                                // Back to the floor for a new central: the previous one's MTU is
+                                // not this one's, and the first write will report the real value
+                                // before any reply is chunked.
+                                mtu.store(FLOOR_MTU, Ordering::Relaxed);
                                 let (link, inbound, mut outbound) =
-                                    Link::pair(FLOOR_MTU, "central");
+                                    Link::pair_sharing_mtu(mtu.clone(), "central");
                                 let mine = inbound.clone();
                                 {
                                     let mut slot = slot.lock().expect("write slot poisoned");
@@ -438,6 +505,11 @@ async fn serve_on_an_adapter(
                                 let session = tokio::spawn(session::run(link, sockets));
                                 tracing::info!("central subscribed");
 
+                                // Notifications queued since the last pause. See `NOTIFY_BURST`
+                                // for why a pump with no readiness signal has to pace itself.
+                                let mut queued = 0usize;
+                                let mut gone = false;
+
                                 loop {
                                     tokio::select! {
                                         // Biased so a central that has gone away is noticed before
@@ -448,15 +520,21 @@ async fn serve_on_an_adapter(
                                         // when a notify fails — which needs a reply to send, so a
                                         // client that disconnects while idle would hold the slot
                                         // until the next request arrives for nobody.
-                                        () = notifier.stopped() => break,
+                                        () = notifier.stopped() => {
+                                            gone = true;
+                                            break;
+                                        }
                                         chunk = outbound.recv() => match chunk {
                                             None => break,
                                             Some(chunk) => {
-                                                if let Err(e) = notifier.notify(chunk).await {
-                                                    tracing::debug!(
-                                                        error = %e, "notify failed; central gone"
-                                                    );
+                                                if !notify_chunk(&mut notifier, chunk).await {
+                                                    gone = true;
                                                     break;
+                                                }
+                                                queued += 1;
+                                                if queued >= NOTIFY_BURST {
+                                                    queued = 0;
+                                                    tokio::time::sleep(NOTIFY_PAUSE).await;
                                                 }
                                             }
                                         },
@@ -474,7 +552,20 @@ async fn serve_on_an_adapter(
                                         // its reassembly buffer and its upstream connections.
                                         slot.take();
                                         session.abort();
-                                        tracing::info!("central unsubscribed; session discarded");
+                                        // Which of the two it was, because they need different
+                                        // next moves and the old line said "unsubscribed" for
+                                        // both — including for a reply this pump could not
+                                        // deliver, which is a robot problem wearing a client's
+                                        // clothes.
+                                        if gone {
+                                            tracing::info!(
+                                                "the central is gone; session discarded"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                "the outbound queue closed; session discarded"
+                                            );
+                                        }
                                     } else {
                                         tracing::debug!(
                                             "a newer session holds the slot; leaving it alone"
@@ -529,6 +620,46 @@ async fn serve_on_an_adapter(
         ) => {}
     }
     Ok(())
+}
+
+/// Send one chunk, retrying a queue that is momentarily full. `false` means give up on the session.
+///
+/// **The distinction this function exists to draw**: `notify` returns the same error for "the
+/// central unsubscribed" and "the D-Bus connection would not take this signal", and the pump used
+/// to read both as the central having left. So a reply too big for one burst tore down the session
+/// mid-line, and the client — still connected, as far as CoreBluetooth was concerned — waited out
+/// its idle timeout with no error to report and half an answer in its reassembler. That was
+/// diagnosed from a board, not from the journal, because the only line it left was a `debug` one
+/// blaming the central.
+///
+/// `is_stopped` tells them apart: it is closed only when the notification session really has
+/// ended. Anything else is retried, and the chunk is cloned because `notify` consumes it and a
+/// dropped chunk corrupts the line rather than failing it.
+async fn notify_chunk(notifier: &mut CharacteristicNotifier, chunk: Vec<u8>) -> bool {
+    for attempt in 1..=NOTIFY_RETRIES {
+        match notifier.notify(chunk.clone()).await {
+            Ok(()) => return true,
+            Err(_) if notifier.is_stopped() => {
+                tracing::debug!("the notification session ended mid-reply");
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    error = %e,
+                    "the notification queue would not take a chunk; retrying"
+                );
+                tokio::time::sleep(NOTIFY_RETRY_BACKOFF).await;
+            }
+        }
+    }
+    // A warning rather than a silence, which is the whole point: this ends a session, and
+    // whoever is holding the client deserves to find out why from the robot's own journal.
+    tracing::warn!(
+        retries = NOTIFY_RETRIES,
+        "gave up on a notification chunk; ending the session rather than sending a corrupt line"
+    );
+    false
 }
 
 /// What the advertisement says about the robot: what it is called, and where it is on the network.

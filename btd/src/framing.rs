@@ -21,20 +21,50 @@
 /// and it is reachable by anyone in radio range. Generous next to any real request — the
 /// largest is an `update.apply` with a long ref — and far below `updaterd`'s own 1 MiB line
 /// limit, because nothing that big has any business arriving over BLE.
+///
+/// **This bounds what a peer may send, not what the robot may answer.** The two are not the
+/// same size and were one constant until a reply outgrew it: see [`MAX_REPLY_LINE`].
 pub const MAX_LINE: usize = 8 * 1024;
 
+/// Longest line a *client* will reassemble from the robot.
+///
+/// The other direction, and it needs its own number. [`MAX_LINE`] is a security bound — the
+/// peer it limits is anyone in radio range, so it is deliberately tight — whereas this limits
+/// the robot a client chose to connect to and already trusts. Reusing the tight one here made
+/// every reply over 8 KiB unreadable, which quietly took `update.show` (kilobytes for an
+/// ordinary run) and `system.logs` (a screenful of journal) out of reach of `duckctl` while
+/// `btd` served both correctly.
+///
+/// 64 KiB, and the real limit on a reply is smaller still and lives elsewhere: `proto`'s
+/// `MAX_LOG_BYTES` keeps the journal tail well inside this, because at a typical ATT MTU
+/// 64 KiB is a minute on the air and no answer should take that long.
+pub const MAX_REPLY_LINE: usize = 64 * 1024;
+
 /// Reassembles inbound chunks into whole lines.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Reassembler {
     buf: Vec<u8>,
+    /// What "too long" means for this direction. See [`MAX_LINE`] and [`MAX_REPLY_LINE`].
+    limit: usize,
+}
+
+/// The robot's side: [`MAX_LINE`], the tight bound, because the default must be the safe one.
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self {
+            buf: Vec::new(),
+            limit: MAX_LINE,
+        }
+    }
 }
 
 /// Why a peer's bytes were rejected. Both cases mean "drop the connection", but they are
 /// logged differently: one is a client that cannot frame, the other may be an attack.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FramingError {
-    /// No newline within [`MAX_LINE`].
-    LineTooLong,
+    /// No newline within this reassembler's limit, which the variant carries because the two
+    /// directions have different ones and the message must say which was hit.
+    LineTooLong { limit: usize },
     /// Not valid UTF-8, so it cannot be JSON either.
     NotUtf8,
 }
@@ -42,7 +72,7 @@ pub enum FramingError {
 impl std::fmt::Display for FramingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LineTooLong => write!(f, "no newline within {MAX_LINE} bytes"),
+            Self::LineTooLong { limit } => write!(f, "no newline within {limit} bytes"),
             Self::NotUtf8 => write!(f, "not valid UTF-8"),
         }
     }
@@ -57,17 +87,28 @@ impl Reassembler {
         Self::default()
     }
 
+    /// A reassembler for the answers coming *back*, bounded by [`MAX_REPLY_LINE`].
+    ///
+    /// Named for the direction rather than taking a number, so that a client reading replies
+    /// cannot pick the wrong bound and `btd` cannot accidentally be given the loose one.
+    pub fn for_replies() -> Self {
+        Self {
+            buf: Vec::new(),
+            limit: MAX_REPLY_LINE,
+        }
+    }
+
     /// Feed one chunk; get back every complete line it completed.
     ///
     /// Returns a `Vec` because one write can legitimately carry several short lines — a
     /// client that batches `hello` and `update.status` into one 40-byte write is being
     /// efficient, not wrong.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, FramingError> {
-        if self.buf.len() + chunk.len() > MAX_LINE {
+        if self.buf.len() + chunk.len() > self.limit {
             // Clear rather than keep the partial line: whatever follows is unparseable
             // anyway, and holding it would let a peer pin the memory.
             self.buf.clear();
-            return Err(FramingError::LineTooLong);
+            return Err(FramingError::LineTooLong { limit: self.limit });
         }
         self.buf.extend_from_slice(chunk);
 
@@ -165,9 +206,33 @@ mod tests {
     fn a_line_without_a_newline_is_refused_at_the_cap() {
         let mut r = Reassembler::new();
         let big = vec![b'x'; MAX_LINE + 1];
-        assert_eq!(r.push(&big), Err(FramingError::LineTooLong));
+        assert_eq!(
+            r.push(&big),
+            Err(FramingError::LineTooLong { limit: MAX_LINE })
+        );
         // And the buffer was released, so the peer cannot pin memory by retrying.
         assert_eq!(r.pending(), 0);
+    }
+
+    /// A reply larger than the request cap must reassemble on the client side.
+    ///
+    /// The regression this pins is one constant serving both directions: with a single 8 KiB
+    /// cap, a `system.logs` answer arrived intact from the robot and died in `duckctl` as
+    /// "no newline within 8192 bytes", which reads like a broken robot and is not one.
+    #[test]
+    fn a_reply_bigger_than_the_request_cap_is_accepted_by_a_client() {
+        let reply = format!("{{\"result\":\"{}\"}}\n", "x".repeat(32 * 1024));
+
+        let mut robot_side = Reassembler::new();
+        assert!(matches!(
+            robot_side.push(reply.as_bytes()),
+            Err(FramingError::LineTooLong { limit: MAX_LINE })
+        ));
+
+        let mut client_side = Reassembler::for_replies();
+        let lines = client_side.push(reply.as_bytes()).expect("under the cap");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), reply.len() - 1);
     }
 
     #[test]

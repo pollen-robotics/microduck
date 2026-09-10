@@ -332,7 +332,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "theremin.enabled",
         Kind::Bool,
-        "The ToF theremin may be picked up at all (robot.theremin still starts it)",
+        "The ToF theremin may be picked up at all — off by default (robot.theremin starts it)",
     ),
     entry("theremin.socket", Kind::Text, "tofd's depth stream"),
     entry(
@@ -359,6 +359,12 @@ pub const REGISTRY: &[Entry] = &[
         "theremin.hold_ms",
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
+    ),
+    // ── [head_imu] ───────────────────────────────────────────────────────────
+    feature(
+        "head_imu.enabled",
+        Kind::Bool,
+        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -414,7 +420,7 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Record(
             "width = 1280\nheight = 720\nfx = 1809.5\nfy = 1809.5\ncx = 640.0\ncy = 360.0",
         ),
-        "Measured camera geometry — a calibration writes it; absent publishes the module's design figures",
+        "This robot's own camera calibration — a per-robot solve writes it; absent, mediad publishes the family's",
     ),
     entry(
         "media.congestion_control",
@@ -435,6 +441,19 @@ pub const REGISTRY: &[Entry] = &[
     feature("pad.lb", Kind::Text, "Skill on the left bumper"),
     feature("pad.rb", Kind::Text, "Skill on the right bumper"),
     feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
+    // ── [imu_head] ───────────────────────────────────────────────────────────
+    //
+    // Controller-IMU head control. Read by `padd`, like `[pad]`.
+    feature(
+        "imu_head.enabled",
+        Kind::Bool,
+        "Y poses the head from the pad's own IMU (Pro Controller) — sticks keep driving; Y again holds, again re-centres",
+    ),
+    entry(
+        "imu_head.gain",
+        Kind::Float,
+        "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
+    ),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -618,6 +637,7 @@ mod tests {
                 "detect.enabled",
                 "chorale.accept",
                 "theremin.enabled",
+                "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
@@ -630,6 +650,7 @@ mod tests {
                 "pad.lb",
                 "pad.rb",
                 "pad.dpad_down",
+                "imu_head.enabled",
             ]
         );
     }

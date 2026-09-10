@@ -529,7 +529,7 @@ is sent** — unrotated, because nothing on the robot rotates pixels — so a co
 `rotate` has to rotate these with it, swapping `cx` with `cy`. The flag is not decoration: `false`
 means the IMX219 module's design figures (3.04 mm over a 1.12 µm pitch, principal point assumed
 central, no distortion model), which is good to a few percent and enough to map a room; `true`
-means somebody measured *this* robot and wrote it into `[media.intrinsics]`. A consumer that needs
+means a measurement: *this* robot's, written into `[media.intrinsics]`, or — the default, since the camera and lens are one part across the alpha family — the family's solve that `robotd-params` ships. A consumer that needs
 metrology can tell that it needs to ask.
 
 **And the key is absent when the geometry is unknown**, rather than present and wrong. That is a

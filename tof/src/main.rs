@@ -38,7 +38,10 @@ use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+mod config;
+mod imu;
 mod status;
+use imu::ImuStatus;
 use status::Status;
 
 /// Same mode and reasoning as every other socket here: the group decides who may
@@ -94,7 +97,7 @@ const RETRY_MAX: Duration = Duration::from_secs(60);
 /// answer on a board provisioned before that rule existed. Trying both means a
 /// board that predates the rule still finds its sensor, and the log says which
 /// path answered.
-const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
+pub(crate) const BUS_CANDIDATES: [&str; 2] = ["/dev/i2c-pihat", "/dev/i2c-3"];
 
 /// Addresses to try when none was named.
 ///
@@ -132,6 +135,38 @@ struct Args {
     /// been drawn.
     #[arg(long)]
     fake: bool,
+
+    /// Head-IMU (BMI088) sample rate, Hz. The chip's default bandwidth is 100 Hz.
+    #[arg(long, default_value_t = 100)]
+    imu_hz: u8,
+
+    /// Read the head IMU for this session, whatever `[head_imu] enabled` says.
+    ///
+    /// The switch lives in `robotd.toml` because that is what `robotctl configure` writes; this
+    /// is for trying the chip by hand on a board that has not opted in.
+    #[arg(long, conflicts_with = "no_imu")]
+    imu: bool,
+
+    /// Do not read the head IMU, whatever the file says (a board without the HAT module, or to
+    /// free the bus for a measurement).
+    #[arg(long)]
+    no_imu: bool,
+
+    /// Params file. `[head_imu]` is read from it; everything else here is a flag.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Read frames from a simulated body at `host:port` instead of a sensor.
+    ///
+    /// **The fake at the loop level, with a simulator behind it** — which is where a fake belongs
+    /// here: `sensor.rs` says in as many words that the off-board `Sensor` "is not a fake sensor and
+    /// must never become one", because the thing it stands for is a vendor C library talking to a
+    /// bus. A frame arriving from somewhere else is a different question from a sensor that lies.
+    ///
+    /// The simulator answers `{"op":"tof"}` with the same 8x8 of distances and per-zone statuses
+    /// this daemon publishes, so nothing downstream — `robotd`, the viewer — can tell.
+    #[arg(long, conflicts_with = "fake")]
+    sim: Option<String>,
 }
 
 fn parse_address(s: &str) -> Result<u8, String> {
@@ -176,10 +211,13 @@ async fn main() -> std::process::ExitCode {
         let address = args.address;
         let hz = args.hz;
         let fake = args.fake;
+        let sim = args.sim.clone();
         std::thread::Builder::new()
             .name("tof-sensor".to_owned())
             .spawn(move || {
-                if fake {
+                if let Some(addr) = sim {
+                    sim_loop(&addr, hz, &status, &frames, &shutdown);
+                } else if fake {
                     fake_loop(hz, &status, &frames, &shutdown);
                 } else {
                     sensor_loop(bus.as_deref(), address, hz, &status, &frames, &shutdown);
@@ -188,9 +226,57 @@ async fn main() -> std::process::ExitCode {
             .expect("spawn the sensor thread")
     };
 
-    let served = serve(&args.socket, &status, &frames).await;
+    // The head IMU on its own thread and channel, on the same bus. Its socket is the same one;
+    // subscribers pick the stream by method.
+    //
+    // **Off unless `[head_imu] enabled` says otherwise**, and that default is the measurement in
+    // `docs/project/tof-on-demand.md`: reading this chip at 100 Hz costs ~3.5-4.5% of a core, of
+    // which the wakeups are 0.7 points and the fusion 0.3 — the rest is two I²C transactions a
+    // sample, which is what a gyro and an accelerometer sample *is*. Nothing in the loop was
+    // worth fixing, nothing subscribes to the stream yet, and a duck that is not mapping was
+    // paying for it from boot.
+    //
+    // Skipped for --sim/--fake too: there is no real bus behind either.
+    let imu_status = Arc::new(ImuStatus::new(args.imu_hz));
+    let (imu_frames, _) = tokio::sync::broadcast::channel(imu::FRAME_BUFFER);
+    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let configured = config::load(&config_path, args.config.is_some())
+        .head_imu
+        .enabled;
+    let wanted = args.imu || (configured && !args.no_imu);
+    let imu_thread = if !wanted || args.fake || args.sim.is_some() {
+        // Said out loud, and said by the stream too: a subscriber gets this sentence instead of
+        // frames, because "no samples" and "no BMI088 fitted" are different answers and only one
+        // of them is somebody's mistake.
+        if !wanted {
+            tracing::info!(
+                config = %config_path.display(),
+                "the head IMU is off; set [head_imu] enabled = true to read it"
+            );
+            imu_status.off();
+        }
+        None
+    } else {
+        let (imu_status, imu_frames, shutdown) =
+            (imu_status.clone(), imu_frames.clone(), shutdown.clone());
+        let bus = args.bus.clone();
+        let hz = args.imu_hz;
+        Some(
+            std::thread::Builder::new()
+                .name("head-imu".to_owned())
+                .spawn(move || {
+                    imu::imu_loop(bus.as_deref(), hz, &imu_status, &imu_frames, &shutdown)
+                })
+                .expect("spawn the head-imu thread"),
+        )
+    };
+
+    let served = serve(&args.socket, &status, &frames, &imu_status, &imu_frames).await;
     shutdown.store(true, Ordering::Release);
     let _ = sensor_thread.join();
+    if let Some(t) = imu_thread {
+        let _ = t.join();
+    }
 
     match served {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -267,6 +353,7 @@ fn sensor_loop(
                                 let _ = frames.send(proto::TofFrame {
                                     seq,
                                     at_us: started.elapsed().as_micros() as u64,
+                                    t_ns: proto::clock::monotonic_ns(),
                                     rows: frame.rows,
                                     cols: frame.cols,
                                     distance_mm: frame.distance_mm,
@@ -349,6 +436,7 @@ fn fake_loop(
         let _ = frames.send(proto::TofFrame {
             seq,
             at_us: started.elapsed().as_micros() as u64,
+            t_ns: proto::clock::monotonic_ns(),
             rows: tof::ROWS as u8,
             cols: tof::COLS as u8,
             distance_mm,
@@ -356,6 +444,113 @@ fn fake_loop(
         });
         sleep_unless_shutdown(period, shutdown);
     }
+}
+
+/// Frames from a simulated body, at the sensor's own rate.
+///
+/// Newline-delimited JSON over TCP, the same link `duck_control::sim` uses for the servo bus — one
+/// handshake, then a request per frame. A simulator that goes away is one missed frame and a
+/// reconnect, not a dead daemon: MuJoCo is restarted whenever the number of ducks changes, and a
+/// duck is expected to live through that.
+fn sim_loop(
+    addr: &str,
+    hz: u8,
+    status: &Arc<Status>,
+    frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    use std::io::{BufRead, Write};
+
+    let started = Instant::now();
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz.max(1)));
+    let mut seq = 0u64;
+    let mut link: Option<SimLink> = None;
+    let mut complained = false;
+
+    while !shutdown.load(Ordering::Acquire) {
+        if link.is_none() {
+            match connect_sim(addr) {
+                Ok(fresh) => {
+                    tracing::info!(%addr, "simulated depth");
+                    status.up("sim");
+                    complained = false;
+                    link = Some(fresh);
+                }
+                Err(e) => {
+                    if !complained {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated body; retrying");
+                        status.down(&format!("no simulated body at {addr}"));
+                    }
+                    sleep_unless_shutdown(period, shutdown);
+                    continue;
+                }
+            }
+        }
+
+        let (write, read) = link.as_mut().expect("just connected");
+        let frame = write.write_all(b"{\"op\":\"tof\"}\n").and_then(|()| {
+            let mut line = String::new();
+            read.read_line(&mut line)?;
+            if line.is_empty() {
+                return Err(std::io::Error::other("the simulator closed the connection"));
+            }
+            serde_json::from_str::<SimDepth>(&line).map_err(std::io::Error::other)
+        });
+
+        match frame {
+            Ok(depth) => {
+                seq += 1;
+                let _ = frames.send(proto::TofFrame {
+                    seq,
+                    at_us: started.elapsed().as_micros() as u64,
+                    t_ns: proto::clock::monotonic_ns(),
+                    rows: depth.rows,
+                    cols: depth.cols,
+                    distance_mm: depth.distance_mm,
+                    status: depth.status,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "lost the simulated body");
+                link = None;
+                continue;
+            }
+        }
+        sleep_unless_shutdown(period, shutdown);
+    }
+}
+
+type SimLink = (std::net::TcpStream, std::io::BufReader<std::net::TcpStream>);
+
+/// One connection to a simulated body, handshake included.
+fn connect_sim(addr: &str) -> std::io::Result<SimLink> {
+    use std::io::{BufRead, Write};
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    // Nagle would add tens of milliseconds to a 15 Hz request/response, which is most of a frame.
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut write = stream.try_clone()?;
+    let mut read = std::io::BufReader::new(stream);
+    write.write_all(b"{\"op\":\"hello\",\"protocol\":1,\"joints\":15}\n")?;
+    let mut line = String::new();
+    read.read_line(&mut line)?;
+    if line.is_empty() {
+        return Err(std::io::Error::other(
+            "the simulator hung up during the handshake",
+        ));
+    }
+    Ok((write, read))
+}
+
+/// What the simulator answers `{"op":"tof"}` with.
+#[derive(serde::Deserialize)]
+struct SimDepth {
+    rows: u8,
+    cols: u8,
+    distance_mm: Vec<i16>,
+    status: Vec<u8>,
 }
 
 /// Try the named bus and address, or every candidate, and return the first
@@ -409,6 +604,8 @@ async fn serve(
     socket: &Path,
     status: &Arc<Status>,
     frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
+    imu_status: &Arc<ImuStatus>,
+    imu_frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
 ) -> Result<()> {
     if let Some(parent) = socket.parent() {
         // `RuntimeDirectory=tofd` has already made this on a board; tried anyway
@@ -448,9 +645,11 @@ async fn serve(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let status = status.clone();
+                    let imu_status = imu_status.clone();
                     let frames = frames.subscribe();
+                    let imu_frames = imu_frames.subscribe();
                     tokio::spawn(async move {
-                        if let Err(e) = subscriber(stream, &status, frames).await {
+                        if let Err(e) = subscriber(stream, &status, frames, &imu_status, imu_frames).await {
                             tracing::debug!(error = %e, "subscriber ended");
                         }
                     });
@@ -474,6 +673,8 @@ async fn subscriber(
     stream: UnixStream,
     status: &Arc<Status>,
     mut frames: tokio::sync::broadcast::Receiver<proto::TofFrame>,
+    imu_status: &Arc<ImuStatus>,
+    mut imu_frames: tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -503,31 +704,38 @@ async fn subscriber(
             Ok(proto::Call::TofStream) => {
                 let response = proto::Response::ok(id, &status.result());
                 write_line(&mut write, &response).await?;
-                break;
+                return stream_tof(&mut write, &mut frames).await;
+            }
+            Ok(proto::Call::HeadImuStream) => {
+                let response = proto::Response::ok(id, &imu_status.result());
+                write_line(&mut write, &response).await?;
+                return stream_imu(&mut write, &mut imu_frames).await;
             }
             _ => {
                 let response = proto::Response::err(
                     id,
                     proto::Error::new(
                         proto::code::METHOD_NOT_FOUND,
-                        "tofd serves tof.stream and nothing else",
+                        "tofd serves tof.stream and head_imu.stream and nothing else",
                     ),
                 );
                 write_line(&mut write, &response).await?;
             }
         }
     }
+}
 
-    // Frames, as notifications, until the socket closes or this consumer falls
-    // too far behind. A lag is not fatal: the gap shows in `seq`, and the next
-    // frame is 66 ms away.
+/// Stream ToF frames as notifications until the socket closes or the consumer lags out. A lag is
+/// not fatal — the gap shows in `seq`, and the next frame is 66 ms away.
+async fn stream_tof(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    frames: &mut tokio::sync::broadcast::Receiver<proto::TofFrame>,
+) -> Result<()> {
     loop {
         match frames.recv().await {
             Ok(frame) => {
                 let notification = proto::Request::notify_tof_frame(&frame);
-                if let Err(e) = write_line(&mut write, &notification).await {
-                    // A subscriber that went away mid-write is the ordinary end
-                    // of a `robotctl monitor` session, not an incident.
+                if let Err(e) = write_line(write, &notification).await {
                     return if e.kind() == ErrorKind::BrokenPipe {
                         Ok(())
                     } else {
@@ -536,10 +744,33 @@ async fn subscriber(
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                tracing::debug!(missed, "a subscriber fell behind");
+                tracing::debug!(missed, "a tof subscriber fell behind");
             }
-            // The sender lives as long as the process, so this cannot happen
-            // before shutdown — at which point ending the connection is right.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+/// Stream head-IMU samples as notifications; same lag/broken-pipe handling as the ToF stream.
+async fn stream_imu(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    frames: &mut tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
+) -> Result<()> {
+    loop {
+        match frames.recv().await {
+            Ok(frame) => {
+                let notification = proto::Request::notify_head_imu_frame(&frame);
+                if let Err(e) = write_line(write, &notification).await {
+                    return if e.kind() == ErrorKind::BrokenPipe {
+                        Ok(())
+                    } else {
+                        Err(e.into())
+                    };
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::debug!(missed, "an imu subscriber fell behind");
+            }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
         }
     }

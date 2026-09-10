@@ -16,6 +16,10 @@ description = "Camera, mic, WebRTC — and the remote gateway"
 # that other, and the cost is a sysroot the whole workspace now builds against.
 
 [dependencies]
+# One function: `read_access_token`. The crate that performs the login is the one that defines the
+# credential's file format, so the reader lives next to the writer and a test there pins the key
+# this depends on — rather than a two-field struct here and a test in `updater` describing it.
+hf-robot-account = "0.1"
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 # `[media]` and `[detect]` in /etc/robot/robotd.toml — what this daemon streams, and what it looks
 # for. The same crate `robotd` parses that file with and the same one `robotctl configure` edits it
@@ -24,6 +28,9 @@ robotd-params = { path = "../robotd-params" }
 anyhow = "1"
 # The detector itself: the letterbox+turn, the NPU binding, the ONNX fallback and the decoder.
 duck-detect = { path = "../duck-detect" }
+# JPEG for the frame stream. Same crate and same feature `duck-detect` already uses, so
+# this adds a feature to a build rather than a dependency to the tree.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # The console's one route. Already in `Cargo.lock` — `updater` uses it for its test mirror — so it
 # is known-good against this toolchain and the cross build. The alternative was a hand-rolled
 # HTTP/1.1 responder: about sixty lines of hand-written request parsing bound to 0.0.0.0, written to
@@ -48,7 +55,11 @@ futures-util = "0.3.33"
 # The local half of the bridge: a WebSocket client to `webrtcsink`'s own signalling server on
 # 127.0.0.1:8443, where this daemon is a *consumer* — the same role the console page plays on a
 # LAN. `ws://` only, on loopback, so no TLS: `connect` and `handshake` and nothing else.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake"] }
+# `rustls-tls-webpki-roots` because the frame stream dials a `wss://` Space, where the
+# signalling bridge only ever dialled `ws://127.0.0.1`. The roots are webpki's rather
+# than the platform's: a board's trust store is whatever the image shipped, and a
+# consumer that stops working after an OS update is a worse failure than a pinned set.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 # Jitter on the reconnect backoff, so a fleet coming back after a service restart does not arrive
 # in lockstep. Already in the lock.
 rand = "0.10.2"

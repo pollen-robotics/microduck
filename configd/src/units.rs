@@ -93,8 +93,9 @@ pub async fn describe(unit: &str) -> proto::ServiceUnit {
     }
 }
 
-/// `btd.service` names the service `btd`, which is what it publishes under.
-fn service_of(unit: &str) -> &str {
+/// `btd.service` names the service `btd`, which is what it publishes under — and, with a pid
+/// after it, what it logs under. [`crate::logs`] reads it for the second reason.
+pub fn service_of(unit: &str) -> &str {
     unit.strip_suffix(".service").unwrap_or(unit)
 }
 

@@ -137,7 +137,7 @@ pub async fn maintain(relays: Arc<Relays>, token_path: PathBuf, endpoint: String
     let mut said_there_is_no_token = false;
 
     loop {
-        let wait = match crate::hf::access_token(&token_path) {
+        let wait = match hf_robot_account::read_access_token(&token_path) {
             None => {
                 // The steady state of a robot nobody has signed in. Said once, because it is not
                 // news every five minutes for the life of the daemon.

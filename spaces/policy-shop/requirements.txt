@@ -1,0 +1,23 @@
+# The consumer, and the WebRTC stack under it. The `central-consumer` extra is what pulls
+# `aiortc` and `av`: a robot never runs the consumer, so the base install leaves them out.
+#
+# **Unpinned deliberately, for now**, for the reason `vision-demo` gives: the drift that matters
+# here is between the consumer and a duck, and pinning a version whose DTLS shim we depend on
+# before knowing which versions work would pin the wrong thing. The first time this breaks, pin
+# it here with the version that worked.
+#
+# `control.py` subclasses `ReachyCentralConsumer` and overrides one private method, so this is
+# the dependency most likely to break silently across a version — the shim's docstring says what
+# the failure looks like and what makes it stop being needed.
+reachy_mini[central-consumer]
+
+# **`[oauth]`, not bare `gradio`.** `gr.LoginButton` needs `itsdangerous` and `authlib`, which
+# only the extra pulls in, and without them a Space with `hf_oauth: true` fails at *import* —
+# `Cannot initialize OAuth due to a missing library` — rather than at the first click. Nothing
+# about the page says which one is missing, so it is worth the four characters.
+gradio[oauth]>=5
+
+# Reading the Hub: `huggingface.co/api/models?search=microduck`, and a `manifest.json` per hit.
+# The same two requests `updater/src/policy.rs` makes, so the gallery and `policy.search` cannot
+# disagree about what exists.
+requests

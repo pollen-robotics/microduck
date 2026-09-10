@@ -6,12 +6,21 @@
 //!
 //! ## The order, and why the state decides rather than the return values
 //!
-//! `connect` **before** `pair`, and `trust` after both. Leading with `Pair()` on an Xbox controller
-//! returns `AuthenticationCanceled`; that ordering comes from `microduck_runtime`'s notes and is the
-//! one that works on this board. It used to live in a provisioning script's comments and in whoever
-//! had done it before; now it is here, once, with the reason attached.
+//! **Which order depends on the transport**, and the two are opposite:
 //!
-//! But the order is **tried, not enforced**, because BlueZ's replies do not describe what happened:
+//!  - an **LE** pad (Xbox): `connect` **before** `pair`, and `trust` after both. Leading with
+//!    `Pair()` on an Xbox controller returns `AuthenticationCanceled`; that ordering comes from
+//!    `microduck_runtime`'s notes and is the one that works on this board.
+//!  - a **BR/EDR** pad (a "Pro Controller" Switch clone, and by the specification a DualShock or a
+//!    DualSense): `pair` **before** `connect`, then `trust`. See [the transport section](#which-transport-and-what-that-leaves-untested)
+//!    for what the other order does to it.
+//!
+//! `Snapshot::is_classic` decides, on whether BlueZ reports a `Class`. The rule used to live in a
+//! provisioning script's comments and in whoever had done it before; now it is here, once, with the
+//! reason attached.
+//!
+//! On the LE path the order is **tried, not enforced**, because BlueZ's replies do not describe what
+//! happened:
 //!
 //!  - `Connect()` on a device BlueZ has never bonded with can answer
 //!    `br-connection-profile-unavailable` — there is no profile to connect to *yet*. Refusing there
@@ -103,8 +112,8 @@
 //! BR/EDR and LE together, and every property `Snapshot` reads is optional partly because the two
 //! transports present different ones.
 //!
-//! But the pad all of this has been run against is **LE-only**. Its bond stores long-term keys and no
-//! `[LinkKey]`, and BlueZ reports no `Class` for it at all:
+//! The Xbox pad is **LE-only**. Its bond stores long-term keys and no `[LinkKey]`, and BlueZ reports
+//! no `Class` for it at all:
 //!
 //! ```text
 //! # /var/lib/bluetooth/<adapter>/<pad>/info
@@ -113,14 +122,45 @@
 //! [PeripheralLongTermKey]
 //! ```
 //!
-//! So the BR/EDR half of this file comes from the specification rather than from a radio. That
-//! includes the class-of-device branch in [`looks_like_a_gamepad`], which cannot have fired — an LE
-//! pad has no class to match — and the `br-connection-profile-unavailable` soft-fail above.
+//! The first **BR/EDR** pad arrived on 2026-09-09: a no-name "Pro Controller", a clone of Nintendo's
+//! Switch Pro Controller down to the modalias (`usb:v057Ep2009`), which is what makes the kernel's
+//! `hid-nintendo` bind it and expose it as "Nintendo Switch Pro Controller" on evdev. BlueZ reports
+//! it with `Class: 0x2508` — peripheral, gamepad — and derives `Icon: input-gaming` from that, so
+//! [`looks_like_a_gamepad`] recognises it on two signals, and the class-of-device branch has now
+//! fired on hardware. Only the HID and PnP UUIDs, no LE at all.
 //!
-//! Discovery stays on `auto` regardless, because the pads the heuristic names that are *not* LE — a
-//! DualShock, a DualSense — are BR/EDR HID, and filtering to LE would make hardware this claims to
-//! recognise unreachable. The thing to know is which way the risk runs: dropping BR/EDR would cost
-//! nothing yet observed, and the first classic pad to arrive exercises that path for the first time.
+//! What the LE order does to it, from `configd`'s own journal (2026-09-07, an earlier unit of the
+//! same pad): `Connect()` on the unbonded pad spends ten seconds and answers
+//! `br-connection-create-socket`; the `Pair()` fallback then answers
+//! `ConnectionAttemptFailed: Page Timeout`. The pad has left pairing mode — a rejected classic
+//! connection is enough to make it stop page-scanning — and every retry repeats the pair. Reproduced
+//! by hand, the same order (`bluetoothctl connect`, which bonds as a side effect, then `trust`) goes
+//! one step further and ends in the state that is hardest to read: `Paired: yes`, `Connected: yes`,
+//! a solid light on the pad, `pad status` saying connected — and **no input device**, so `padd` waits
+//! for a pad that BlueZ insists is there. `pair` → `connect` → `trust` works every time, so that is
+//! what `bond` does when `Class` is present. A pad already in the broken state is recovered with
+//! `pad forget` and a fresh `pad pair`.
+//!
+//! **The clone is also two devices at once.** In pairing mode it advertises an LE face,
+//! `BLE Controller_280609` at `98:B6:ED:28:06:09` — no class, no appearance, matched by the name
+//! heuristic alone — and the BR/EDR face, `Pro Controller` at `98:B6:E9:28:06:09`. The LE face is
+//! reported first — and, after the adapter power cycle `pad pair` performs on this board, several
+//! seconds first. The first `robotctl pad pair` on this branch (2026-09-09) stopped on it, took the
+//! LE order, hung [`BOND_TIMEOUT`] in `Connect()`, and by the time `Pair()` was tried the temporary
+//! object was gone: `UnknownObject: Method "Pair" ... doesn't exist`. A two-second grace after the
+//! first match did not help; the BR/EDR face was still not in the tree. So `find` now ends the
+//! search early only on a match the radio classified — the LE face's name-only match is kept as a
+//! fallback but never stops the sweep — and `one_face_per_pad` folds candidates that share their
+//! unit octets into the classic one before the ambiguity rule sees them.
+//!
+//! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
+//! are both found by the same search.
+//!
+//! Once bonded, a classic pad's reports are the kernel's business and not bluetoothd's:
+//! `scripts/setup-board.sh` sets `UserspaceHID=false` in `input.conf`, because the default relays
+//! this pad's ~200 packets/s of IMU through bluetoothd and uhid at 16% of a core. Nothing in this
+//! file depends on which path is in use; it is noted here because it is the other half of what
+//! "supporting a classic pad" turned out to mean.
 //!
 //! ## Where this has and has not run
 //!
@@ -134,8 +174,13 @@
 //! that re-initiates: the adapter scans as a central for a bonded peripheral while `btd` advertises
 //! as a peripheral itself. Both roles at once hold on this board's radio.
 //!
-//! What has **not** been exercised on hardware: a pad that bonds over BR/EDR at all, a DualSense, two
-//! pads in pairing mode at once, and pairing by explicit address.
+//! **And against the Pro Controller clone**, 2026-09-09, on the board above: `pad pair` with the pad
+//! in pairing mode found the classic face, bonded it and connected it in eight seconds — `bonded
+//! (classic)`, `connected`, `gamepad paired and trusted` — and `padd` drove from it. An Xbox pad
+//! paired a minute later through the unchanged LE path.
+//!
+//! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
+//! pairing by explicit address.
 //!
 //! And one case that cannot be fixed from here: `pad forget` removes only the robot's half of the
 //! bond. A pad that still holds its half will not pair again until it is put back into pairing mode
@@ -149,7 +194,7 @@ use duck_ipc_proto as proto;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::pad::{PadResult, Pads, looks_like_a_gamepad};
+use crate::pad::{Evidence, PadResult, Pads, gamepad_evidence, same_pad};
 
 /// Where our pairing agent lives on the bus. Any path we own will do; this one says whose it is.
 const AGENT_PATH: &str = "/com/pollenrobotics/configd/pad_agent";
@@ -176,6 +221,17 @@ const BOND_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
+
+/// How long to keep sweeping after the first classified, unbonded pad turns up, for the rest of it.
+///
+/// A pad can be two devices — the Pro Controller clones advertise an LE face and a BR/EDR face.
+/// The classified one is the one worth having, and this is a short courtesy for the case where the
+/// two arrive close together and the other happens to be classified too. It is **not** what
+/// protects against the LE face: that face has nothing but a name, and a name-only match never
+/// ends the search early at all — see `find`. Measured: after the adapter power cycle `pad pair`
+/// performs on this board, the LE face was in BlueZ's tree within two seconds and the BR/EDR face
+/// was not, so no grace short enough to be free would have caught it.
+const SIBLING_GRACE: Duration = Duration::from_secs(1);
 
 /// How often to re-read the object tree while looking for a pad.
 ///
@@ -382,13 +438,33 @@ impl Snapshot {
         })
     }
 
-    fn is_gamepad(&self) -> bool {
-        looks_like_a_gamepad(
+    /// Does this pad bond over BR/EDR rather than LE?
+    ///
+    /// `Class` is the tell: it is the classic class-of-device, which an LE-only device has no way
+    /// to present, and BlueZ reports it from the inquiry response before anything else is known
+    /// about the device. `AddressType` does not separate the two — an Xbox pad's is `public` too.
+    /// The order `bond` tries depends on this, and the module docs say why.
+    fn is_classic(&self) -> bool {
+        self.class.is_some()
+    }
+
+    fn evidence(&self) -> Option<Evidence> {
+        gamepad_evidence(
             &self.name,
             self.icon.as_deref(),
             self.class,
             self.appearance,
         )
+    }
+
+    fn is_gamepad(&self) -> bool {
+        self.evidence().is_some()
+    }
+
+    /// Unbonded, and a pad on the radio's word rather than its name's — the only kind of match the
+    /// search ends early on.
+    fn is_fresh_and_classified(&self) -> bool {
+        !self.paired && self.evidence() == Some(Evidence::Classified)
     }
 
     fn as_pad(&self) -> proto::Pad {
@@ -497,9 +573,13 @@ impl BlueZ {
     /// first, which is the wrong shape: a robot may have several pads bonded, and `padd` drives
     /// whichever connects.
     ///
-    /// So with no address given, the sweep only ends early on a candidate that is **not yet paired**;
-    /// otherwise it runs to the deadline and reports what it has, which may be the pad already
-    /// bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
+    /// So with no address given, the sweep only ends early on a candidate that is **not yet paired
+    /// and classified by the radio** — icon, class or appearance, not its name alone. A name-only
+    /// match is kept and used if nothing better arrives by the deadline, but it does not stop the
+    /// search: the Pro Controller clone's LE face is exactly such a match, it is reported seconds
+    /// before the BR/EDR face that actually pairs, and stopping on it cost every attempt a
+    /// thirty-second hang and a dead object. Otherwise the sweep runs to the deadline and reports
+    /// what it has, which may be the pad already bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
     /// window before saying "already paired" — `--timeout` shortens it.
     ///
     /// An explicit address ends the sweep as soon as it appears, paired or not: the caller has named
@@ -512,6 +592,9 @@ impl BlueZ {
     /// no way to learn the address that `--mac` needs. So the refusal carries the list.
     async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Found> {
         let deadline = tokio::time::Instant::now() + timeout;
+        // When the first classified, unbonded candidate was seen, so the sweep can run
+        // [`SIBLING_GRACE`] past it before deciding.
+        let mut first_fresh: Option<tokio::time::Instant> = None;
         loop {
             let seen = self.devices().await?;
             let matches: Vec<Snapshot> = seen
@@ -525,11 +608,19 @@ impl BlueZ {
                 .cloned()
                 .collect();
 
+            let now = tokio::time::Instant::now();
             let worth_stopping_for = match mac {
                 Some(_) => !matches.is_empty(),
-                None => matches.iter().any(|device| !device.paired),
+                None => {
+                    if matches.iter().any(Snapshot::is_fresh_and_classified) {
+                        let since = *first_fresh.get_or_insert(now);
+                        now - since >= SIBLING_GRACE
+                    } else {
+                        false
+                    }
+                }
             };
-            if worth_stopping_for || tokio::time::Instant::now() >= deadline {
+            if worth_stopping_for || now >= deadline {
                 return Ok(Found { matches, seen });
             }
             tokio::time::sleep(DISCOVERY_POLL.min(deadline - tokio::time::Instant::now())).await;
@@ -576,9 +667,52 @@ impl BlueZ {
             .await
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
 
-        if !device.paired {
-            // `Connect()` first, which is the order that works on this board — leading with `Pair()`
-            // on an Xbox controller returns `AuthenticationCanceled`.
+        if !device.paired && device.is_classic() {
+            // A BR/EDR pad: `Pair()` first, then `Connect()`. The other order — the one below, which
+            // an LE pad needs — does not work on classic HID and leaves things worse than it found
+            // them. Seen against a "Pro Controller" (a Switch Pro clone, class 0x2508):
+            // `Connect()` on the unbonded pad spends ten seconds and answers
+            // `br-connection-create-socket`, and the `Pair()` after it answers
+            // `ConnectionAttemptFailed: Page Timeout` — the pad has stopped page-scanning by then,
+            // and the person has to put it back into pairing mode. Done by hand in the same order,
+            // `bluetoothctl connect` then `trust`, the pad ends up *Paired and Connected* with no
+            // input device behind it: the light on the pad goes solid, `pad status` says connected,
+            // and `padd` has nothing to open. `pair` → `connect` → `trust` is the sequence that
+            // works, so it is the one this takes.
+            //
+            // `Pair()` on BR/EDR is synchronous and answers when the bond is done — but it is still
+            // raced against `Paired`, as below, because that property is the ground truth and the
+            // reply is only one way to learn it.
+            let paired = tokio::select! {
+                outcome = tokio::time::timeout(BOND_TIMEOUT, proxy.pair()) => match outcome {
+                    Ok(Ok(())) => { tracing::info!("bonded (classic)"); true }
+                    Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
+                    Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                    Err(_) => false,
+                },
+                bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
+            };
+            if !paired {
+                return Err((
+                    proto::PadPairFailure::Timeout,
+                    "the pad did not finish pairing".to_owned(),
+                ));
+            }
+
+            // Now connect, which is what brings up the HID channel and hands the pad to the kernel
+            // driver — `hid-nintendo`, for the clone above — so an input device appears. Soft: a
+            // bonded and trusted pad reconnects by itself, so a refusal here is not worth failing a
+            // pairing that succeeded. Logged at warn rather than info, though, because a classic
+            // pad that bonded and will not connect is the "connected light, no input" state from
+            // the other order, and worth a line in the journal.
+            match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!("connected"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "bonded but not connected yet"),
+                Err(_) => tracing::warn!("bonded; connect did not answer in time"),
+            }
+        } else if !device.paired {
+            // An LE pad. `Connect()` first, which is the order that works on this board — leading
+            // with `Pair()` on an Xbox controller returns `AuthenticationCanceled`.
             //
             // But **soft-failed**, deliberately. A device BlueZ has never bonded with has no known
             // profile to connect to, so `Connect()` can answer
@@ -659,6 +793,38 @@ impl BlueZ {
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
         Ok(())
     }
+}
+
+/// Collapse a pad that presents as two devices into the one worth bonding.
+///
+/// Candidates that share their unit octets — [`same_pad`] — are one pad seen over two transports,
+/// and the classic face is the one to keep: it is the one that carries HID to the kernel and the one
+/// `bond` knows the order for. Among faces of the same kind the lowest address wins, for the same
+/// determinism the caller applies to bonded pads. Candidates that share nothing pass through, so a
+/// genuine second pad in pairing mode is still refused as ambiguous.
+fn one_face_per_pad(fresh: Vec<&Snapshot>) -> Vec<&Snapshot> {
+    let mut kept: Vec<&Snapshot> = Vec::new();
+    for candidate in fresh {
+        match kept.iter_mut().find(|k| same_pad(&k.mac, &candidate.mac)) {
+            Some(face) => {
+                let better = match (candidate.is_classic(), face.is_classic()) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => candidate.mac < face.mac,
+                };
+                if better {
+                    tracing::info!(
+                        kept = %candidate.mac,
+                        dropped = %face.mac,
+                        "one pad, two faces: keeping the classic one"
+                    );
+                    *face = candidate;
+                }
+            }
+            None => kept.push(candidate),
+        }
+    }
+    kept
 }
 
 /// Did BlueZ refuse this because the bond already exists?
@@ -770,6 +936,7 @@ impl Pads for BlueZ {
                 // Without this, adding a second pad in a room where the first is in range would be
                 // refused as ambiguous forever.
                 let fresh: Vec<&Snapshot> = several.iter().filter(|d| !d.paired).collect();
+                let fresh = one_face_per_pad(fresh);
                 match fresh.as_slice() {
                     [only] => (*only).clone(),
                     // Nothing new: report the bonded one, and let `bond` re-assert `Trusted`. This is
@@ -906,5 +1073,50 @@ impl Pads for BlueZ {
             .map_err(|e| format!("bluetoothd would not remove {mac}: {e}"))?;
         tracing::info!(mac, "pad forgotten");
         Ok(proto::PadForgetResult { removed: true })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn face(mac: &str, name: &str, class: Option<u32>) -> Snapshot {
+        Snapshot {
+            path: OwnedObjectPath::try_from(format!(
+                "/org/bluez/hci0/dev_{}",
+                mac.replace(':', "_")
+            ))
+            .unwrap(),
+            mac: mac.to_owned(),
+            name: name.to_owned(),
+            icon: None,
+            class,
+            appearance: None,
+            paired: false,
+            trusted: false,
+            connected: false,
+        }
+    }
+
+    /// The Pro Controller clone as the radio reports it: an LE face first, the classic one after.
+    /// One pad comes out, and it is the classic one whichever order they arrived in.
+    #[test]
+    fn a_pad_with_two_faces_is_one_candidate_and_the_classic_face_wins() {
+        let le = face("98:B6:ED:28:06:09", "BLE Controller_280609", None);
+        let classic = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
+
+        for order in [vec![&le, &classic], vec![&classic, &le]] {
+            let kept = one_face_per_pad(order);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].mac, classic.mac);
+        }
+    }
+
+    /// Two different pads stay two candidates — the ambiguity refusal downstream depends on it.
+    #[test]
+    fn two_pads_stay_two_candidates() {
+        let a = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
+        let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
+        assert_eq!(one_face_per_pad(vec![&a, &b]).len(), 2);
     }
 }

@@ -193,6 +193,14 @@ pub enum Source {
     Test,
     /// The head camera, through the rkisp capture path.
     Camera(Camera),
+    /// A simulated head camera, at `host:port`: what a duck in MuJoCo sees.
+    ///
+    /// Frames arrive length-prefixed and raw rather than as JSON, unlike the rest of the simulator
+    /// links — 640x360 UYVY is 460,800 bytes, and at 15 fps that is 6.9 MB/s. There is no handshake,
+    /// because there is nothing to negotiate that both ends do not already have to agree on to be
+    /// useful: the geometry is fixed on both sides — `[media] quality` here, the body's camera
+    /// there — or nothing works.
+    Sim(String),
 }
 
 /// The head camera, and the two things it will not work without.
@@ -358,7 +366,12 @@ pub fn start(
     producer: &crate::producer::Producer,
     settings: &Settings,
     relays: Arc<crate::turn::Relays>,
-) -> Result<(gst::Pipeline, mpsc::Receiver<Channel>, Frames)> {
+) -> Result<(
+    gst::Pipeline,
+    mpsc::Receiver<Channel>,
+    Frames,
+    Option<StreamBranch>,
+)> {
     let &Settings {
         port,
         bitrate,
@@ -405,6 +418,7 @@ pub fn start(
             src
         }
         Source::Camera(camera) => camera_source(camera, fps)?,
+        Source::Sim(addr) => sim_source(addr, width, height, fps)?,
     };
 
     // Pinned rather than negotiated, because both branches of the tee depend on the answer, and a
@@ -596,6 +610,27 @@ pub fn start(
         .build();
     wire_frames(&appsink, frames.clone(), out_width, out_height);
 
+    // ── the H.264 branch, for a Space this robot streams to ─────────────────
+    //
+    // A third branch off the same raw tee, and **valved shut**: with `drop=true` nothing reaches
+    // the encoder, so a second encode costs nothing until `media.stream` asks for it. Built once
+    // rather than added on demand, because adding elements to a live pipeline means pad-blocking
+    // surgery and this file's history with a `videoflip` is a warning about touching this path.
+    //
+    // `webrtcsink` owns the encoder on the other branch and is handed raw video on purpose (see
+    // the header): with pre-encoded input its congestion control cannot reach the encoder. So
+    // there is nothing to tap and this is a second encoder — cheap on a VPU at a few frames a
+    // second, and the reason the rate and the size are pinned here rather than left to the caller.
+    let stream_branch = build_stream_branch(&pipeline, out_width, out_height, fps)
+        .inspect_err(|error| {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "no H.264 branch, so this robot cannot stream frames to a Space; the rest of the \
+                 pipeline is unaffected"
+            );
+        })
+        .ok();
+
     if let Some(flip) = flip.as_ref() {
         pipeline
             .add(flip)
@@ -643,6 +678,10 @@ pub fn start(
     // two links are separate from the `link_many` chains above.
     link_tee_branch(&tee, &video_queue).context("could not attach the video branch to the tee")?;
     link_tee_branch(&tee, &raw_queue).context("could not attach the raw branch to the tee")?;
+    if let Some(branch) = stream_branch.as_ref() {
+        link_tee_branch(&tee, branch.head())
+            .context("could not attach the H.264 branch to the tee")?;
+    }
 
     // **Watch the bus, or every media failure is silent.**
     //
@@ -670,7 +709,322 @@ pub fn start(
         fps,
         "signalling server listening"
     );
-    Ok((pipeline, channels_rx, frames))
+    Ok((pipeline, channels_rx, frames, stream_branch))
+}
+
+/// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! enc ! parse ! appsink`.
+///
+/// Fails rather than degrades when there is no encoder to use, and the caller carries on without a
+/// branch: a robot that cannot stream to a Space is still a robot that walks, and `media.stream`
+/// then refuses with a reason instead of accepting and sending nothing.
+fn build_stream_branch(
+    pipeline: &gst::Pipeline,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Result<StreamBranch> {
+    // Rate and size for the streamed copy, independent of what the video track carries. Five a
+    // second at 640 is what a model wants and a fraction of the encode the WebRTC branch does.
+    const STREAM_FPS: u32 = 5;
+    const STREAM_LONGEST: u32 = 640;
+
+    let make = |name: &str| -> Result<gst::Element> {
+        gst::ElementFactory::make(name)
+            .build()
+            .map_err(|_| anyhow!("no {name} element"))
+    };
+
+    // Leaky like the raw branch: a stalled encoder must never become the video track's problem.
+    let queue = gst::ElementFactory::make("queue")
+        .property("max-size-buffers", 2u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .map_err(|_| anyhow!("no queue element"))?;
+
+    let valve = gst::ElementFactory::make("valve")
+        // **Shut until asked.** This is what makes a second encoder free while nobody streams.
+        .property("drop", true)
+        .build()
+        .map_err(|_| anyhow!("no valve element"))?;
+
+    // `drop-only` so it never duplicates a frame to hit a rate — a repeated frame costs the
+    // encoder a whole access unit to say nothing happened.
+    let rate = gst::ElementFactory::make("videorate")
+        .property("drop-only", true)
+        .property("max-rate", STREAM_FPS as i32)
+        .build()
+        .map_err(|_| anyhow!("no videorate element"))?;
+
+    let scale = make("videoscale")?;
+
+    // The turn already happened before the tee, so this branch's input is upright and the aspect
+    // ratio here is the upright one.
+    let scale = (scale, {
+        let longest = width.max(height) as f32;
+        let factor = (STREAM_LONGEST as f32 / longest).min(1.0);
+        // Even dimensions: H.264 chroma is subsampled, and an odd width is a negotiation failure
+        // on some encoders and a green column on others.
+        let even = |value: f32| ((value.round() as u32).max(2) / 2) * 2;
+        gst::Caps::builder("video/x-raw")
+            .field("width", even(width as f32 * factor) as i32)
+            .field("height", even(height as f32 * factor) as i32)
+            .build()
+    });
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property("caps", &scale.1)
+        .build()
+        .map_err(|_| anyhow!("no capsfilter element"))?;
+    let scale = scale.0;
+
+    // `mpph264enc` is the board's hardware encoder — the same one `webrtcsink` uses through the
+    // patched plugin the header describes. `x264enc` is the fallback for a laptop and for a board
+    // whose MPP is missing, which is a slow encode rather than a broken one.
+    let encoder = make("mpph264enc")
+        .or_else(|_| {
+            tracing::info!("no mpph264enc; falling back to x264enc for the frame stream");
+            make("x264enc")
+        })
+        .context("neither mpph264enc nor x264enc is available")?;
+
+    // `config-interval=-1` repeats SPS and PPS in front of every keyframe, which is what lets a
+    // receiver that connects mid-stream decode from the next one without having been sent
+    // anything it missed. Without it a reconnecting Space needs the parameter sets it never saw.
+    let parse = gst::ElementFactory::make("h264parse")
+        .property("config-interval", -1i32)
+        .build()
+        .map_err(|_| anyhow!("no h264parse element"))?;
+
+    let encoded = Encoded::default();
+    let appsink = gst_app::AppSink::builder()
+        .caps(
+            &gst::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        )
+        // One WebSocket message is one access unit, which is what `alignment=au` above buys.
+        .sync(false)
+        .max_buffers(ENCODED_DEPTH as u32)
+        .drop(false)
+        .build();
+
+    {
+        let encoded = encoded.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    // A keyframe is a buffer *without* the delta-unit flag. Reading it the other
+                    // way round would mark every P-frame a keyframe and defeat the whole queue.
+                    let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                    encoded.push(map.as_slice().to_vec(), keyframe);
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+
+    pipeline
+        .add_many([
+            &queue,
+            &valve,
+            &rate,
+            &scale,
+            &caps,
+            &encoder,
+            &parse,
+            appsink.upcast_ref(),
+        ])
+        .context("could not add the H.264 branch to the pipeline")?;
+    gst::Element::link_many([
+        &queue,
+        &valve,
+        &rate,
+        &scale,
+        &caps,
+        &encoder,
+        &parse,
+        appsink.upcast_ref(),
+    ])
+    .context("could not link the H.264 branch")?;
+
+    tracing::info!(
+        encoder = %encoder.factory().map(|f| f.name().to_string()).unwrap_or_default(),
+        fps = STREAM_FPS,
+        "an H.264 branch is available for streaming, shut until something asks"
+    );
+    let _ = fps;
+    Ok(StreamBranch {
+        head: queue,
+        valve,
+        encoder,
+        encoded,
+    })
+}
+
+/// The H.264 branch's output: access units in order, with gaps closed to the next keyframe.
+///
+/// **Not [`Frames`], and the difference is the whole point.** `Frames` is last-value-wins: a slow
+/// reader gets the newest picture and the older ones are discarded, which is exactly right for an
+/// independent frame and exactly wrong for a predicted one. A P-frame whose reference was dropped
+/// decodes to garbage that looks like a broken camera rather than a broken transport, so a reader
+/// that falls behind here is given the next *keyframe* and nothing between.
+///
+/// A short queue rather than one slot for the same reason: a group of pictures has to arrive whole.
+#[derive(Clone, Default)]
+pub struct Encoded(Arc<EncodedShared>);
+
+#[derive(Default)]
+struct EncodedShared {
+    units: Mutex<EncodedQueue>,
+    arrived: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct EncodedQueue {
+    /// `(bytes, keyframe)`, oldest first.
+    ready: std::collections::VecDeque<(Vec<u8>, bool)>,
+    /// Set when the queue overflowed: everything until the next keyframe is unusable to a reader
+    /// that missed what came before it.
+    awaiting_key: bool,
+    /// How many units were discarded, for the stream's own counters.
+    dropped: u64,
+}
+
+/// How many access units to hold. Two seconds at 15 fps, which is longer than any keyframe
+/// interval worth setting — so a reader that stalls briefly recovers without waiting for one.
+const ENCODED_DEPTH: usize = 32;
+
+impl Encoded {
+    /// Take the next unit, waiting up to `FRAME_TIMEOUT` for one.
+    ///
+    /// `None` means the encoder produced nothing in that time, which on a valved branch is the
+    /// ordinary state: nobody is streaming, so nothing is being encoded.
+    pub fn next_unit(&self) -> Option<(Vec<u8>, bool)> {
+        let mut units = self.0.units.lock().expect("not poisoned");
+        loop {
+            while let Some((bytes, keyframe)) = units.ready.pop_front() {
+                if units.awaiting_key && !keyframe {
+                    units.dropped += 1;
+                    continue;
+                }
+                units.awaiting_key = false;
+                return Some((bytes, keyframe));
+            }
+            let (again, timed_out) = self
+                .0
+                .arrived
+                .wait_timeout(units, FRAME_TIMEOUT)
+                .expect("not poisoned");
+            units = again;
+            if timed_out.timed_out() && units.ready.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    /// Units discarded because a reader was behind. Cumulative.
+    pub fn dropped(&self) -> u64 {
+        self.0.units.lock().expect("not poisoned").dropped
+    }
+
+    fn push(&self, bytes: Vec<u8>, keyframe: bool) {
+        let mut units = self.0.units.lock().expect("not poisoned");
+        if units.ready.len() >= ENCODED_DEPTH {
+            // Behind by two seconds of video. Throwing away one unit would leave a hole that
+            // corrupts everything referring across it, so the queue is emptied and the stream
+            // resumes at the next keyframe.
+            units.dropped += units.ready.len() as u64;
+            units.ready.clear();
+            units.awaiting_key = true;
+        }
+        units.ready.push_back((bytes, keyframe));
+        drop(units);
+        self.0.arrived.notify_one();
+    }
+}
+
+/// Turn the H.264 branch on or off, and ask its encoder for a keyframe.
+///
+/// **A valve rather than adding and removing elements.** The branch is built once and gated: with
+/// `drop=true` no buffer reaches the encoder, so the second encode costs nothing while nobody is
+/// streaming — and turning it on is a property write rather than pad-blocking surgery on a live
+/// pipeline. `remote-webrtc.md`'s note that the encoder is this board's budget is why it is gated
+/// at all, and `pipeline.rs`'s own history with a `videoflip` is why it is not rebuilt.
+#[derive(Clone)]
+pub struct StreamBranch {
+    /// The branch's first element — its `queue`, which is what the tee's request pad links to.
+    ///
+    /// **Separate from the valve, and it cost a panic on the board to learn why.** Both were one
+    /// field called `valve`, holding the queue because that is what has to be linked; `open()`
+    /// then set `drop` on it and glib panicked with `property 'drop' of type 'GstQueue' not
+    /// found`. It killed the task handling the call rather than the daemon, so the symptom was a
+    /// `media.stream` that never answered — silence, from a robot that was otherwise fine.
+    head: gst::Element,
+    valve: gst::Element,
+    encoder: gst::Element,
+    pub encoded: Encoded,
+}
+
+impl StreamBranch {
+    /// What the tee links to: the head of the branch, not the valve behind it.
+    pub fn head(&self) -> &gst::Element {
+        &self.head
+    }
+
+    /// Open the valve, and ask for a keyframe so a receiver has something to start on.
+    ///
+    /// Without the request a receiver waits for the encoder's own keyframe interval before its
+    /// first decodable picture — seconds of nothing, indistinguishable from a stream that is not
+    /// working. `h264parse config-interval=-1` puts SPS and PPS in front of it, so that keyframe
+    /// is enough on its own.
+    pub fn open(&self) {
+        self.gate(false);
+        self.request_keyframe();
+    }
+
+    pub fn close(&self) {
+        self.gate(true);
+    }
+
+    /// Set the valve's `drop`, and **do not panic if it is the wrong element**.
+    ///
+    /// `set_property` panics on a name the element does not have, and this one ran on a tokio
+    /// worker inside the task answering `media.stream` — so the first version of this file killed
+    /// that task and the call simply never came back. A robot that is otherwise healthy, silent
+    /// on one method, is a much worse failure than a refusal. The element is right now; the guard
+    /// is for the next time somebody moves a field.
+    fn gate(&self, drop: bool) {
+        if self
+            .valve
+            .has_property_with_type("drop", bool::static_type())
+        {
+            self.valve.set_property("drop", drop);
+        } else {
+            tracing::error!(
+                element = %self.valve.factory().map(|f| f.name().to_string()).unwrap_or_default(),
+                "the frame stream's valve has no `drop` property, so it cannot be gated"
+            );
+        }
+    }
+
+    /// Ask the encoder for a keyframe now.
+    pub fn request_keyframe(&self) {
+        if let Some(pad) = self.encoder.static_pad("sink") {
+            // Upstream, on the encoder's sink pad: the event travels to the encoder, which is the
+            // element that can honour it. `all_headers` is what repeats SPS/PPS with it.
+            let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            if !pad.send_event(event) {
+                tracing::debug!("the encoder would not take a keyframe request");
+            }
+        }
+    }
 }
 
 /// Request a source pad from the tee and link it to a branch's sink pad.
@@ -895,6 +1249,102 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
     Ok(src)
 }
 
+/// A simulated camera as an `appsrc`, fed by a thread reading frames off a socket.
+///
+/// **`is-live` and `do-timestamp`, both of them.** A camera is live by construction; an `appsrc` is
+/// not, and without saying so the pipeline races ahead of the clock and `webrtcsink` sees a source
+/// that can be pulled faster than real time. And without timestamps every downstream element has to
+/// invent them, which shows up as a stream that plays at the wrong speed rather than as an error.
+///
+/// The reader owns the reconnect: MuJoCo restarts whenever the number of ducks changes, and a
+/// camera that goes away must not take the pipeline with it — the encoder simply has no new frames
+/// until it comes back, which is what a real camera being unplugged looks like too.
+fn sim_source(addr: &str, width: u32, height: u32, fps: u32) -> Result<gst::Element> {
+    use gst_app::prelude::*;
+
+    let caps = gst::Caps::builder("video/x-raw")
+        .field("format", CAPTURE_FORMAT)
+        .field("width", width as i32)
+        .field("height", height as i32)
+        .field("framerate", gst::Fraction::new(fps as i32, 1))
+        .build();
+
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let expected = (width as usize) * (height as usize) * 2;
+    let announce = addr.to_owned();
+    let addr = addr.to_owned();
+    let pushable = src.clone();
+    std::thread::Builder::new()
+        .name("sim-camera".into())
+        .spawn(move || {
+            let mut complained = false;
+            loop {
+                match read_frames(&addr, expected, &pushable) {
+                    // A clean close means it had connected and streamed; clear the flag so the
+                    // *next* failure is logged, as `tofd`'s `sim_loop` and `RemoteIo` both do.
+                    Ok(()) => {
+                        complained = false;
+                        tracing::warn!(%addr, "the simulated camera closed");
+                    }
+                    Err(e) if !complained => {
+                        complained = true;
+                        tracing::warn!(%addr, error = %e, "no simulated camera; retrying");
+                    }
+                    Err(_) => {}
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(
+            |e| tracing::error!(error = %e, "no reader thread for the simulated camera"),
+        );
+
+    tracing::info!(addr = %announce, width, height, fps, "simulated head camera");
+    Ok(src.upcast())
+}
+
+/// Length-prefixed frames from the simulator into an `appsrc`, until it stops or the frames stop.
+fn read_frames(addr: &str, expected: usize, src: &gst_app::AppSrc) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let stream = std::net::TcpStream::connect(addr)?;
+    stream.set_nodelay(true)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut header = [0u8; 4];
+    let mut frame = vec![0u8; expected];
+    tracing::info!(%addr, "the simulated camera is feeding the pipeline");
+
+    loop {
+        reader.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header) as usize;
+        // A frame of the wrong size means the two ends disagree about the geometry, and pushing it
+        // would be a picture nobody can read. Said once, loudly, rather than a stream of noise.
+        if len != expected {
+            return Err(std::io::Error::other(format!(
+                "the simulator sent a {len}-byte frame and this pipeline expects {expected} — the simulator's camera must match `[media] quality`"
+            )));
+        }
+        reader.read_exact(&mut frame)?;
+        let mut buffer = gst::Buffer::with_size(len).map_err(std::io::Error::other)?;
+        buffer
+            .get_mut()
+            .expect("a fresh buffer is writable")
+            .map_writable()
+            .map_err(std::io::Error::other)?
+            .copy_from_slice(&frame);
+        if src.push_buffer(buffer).is_err() {
+            return Ok(()); // the pipeline is gone
+        }
+    }
+}
+
 /// What the tee carries, and what both branches therefore see.
 ///
 /// Single-plane on purpose: `v4l2src` cannot drive rkisp's two-plane `NM12` at full rate, and
@@ -1062,7 +1512,8 @@ fn pin_sensor_mode(fps: u32) -> Result<()> {
             why = %String::from_utf8_lossy(&output.stderr).trim(),
             "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
              mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
-             because the field of view is then the full sensor's rather than this mode's crop"
+             because the exact framing is then the boot mode's (same ~62 deg field, different \
+             4:3->16:9 crop) rather than the pinned mode the calibration is for"
         );
         let _ = SENSOR_MODE.set(None);
     } else {
