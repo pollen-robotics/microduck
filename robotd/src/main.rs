@@ -3334,18 +3334,28 @@ async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, Uni
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     let lock = claim_lock(socket_path)?;
+    // Before bind, not after it. A regular file or a symlink at the path is a typo, and it is
+    // refused here on every platform rather than left to the kernel: Linux fails to bind over
+    // either, which is what made this look enforced, but macOS follows a dangling symlink and
+    // creates the socket at its target, so a daemon there came up serving through a path nobody
+    // asked for. That is the one platform `cargo test --workspace` is promised on.
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(existing) if !existing.file_type().is_socket() => {
+            return Err(std::io::Error::new(
+                ErrorKind::AddrInUse,
+                "the socket path exists and is not a socket; refusing to bind over it",
+            ));
+        }
+        Ok(_) => (),
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
             // An older daemon may own the socket without holding our new lock. Only a
-            // real socket that refuses connections is stale; a timeout, permission error,
-            // regular file or symlink is not permission to remove somebody else's path.
-            if !std::fs::symlink_metadata(socket_path)?
-                .file_type()
-                .is_socket()
-            {
-                return Err(e);
-            }
+            // real socket that refuses connections is stale; a timeout or a permission error
+            // is not permission to remove somebody else's path.
             match tokio::time::timeout(Duration::from_secs(1), UnixStream::connect(socket_path))
                 .await
             {
