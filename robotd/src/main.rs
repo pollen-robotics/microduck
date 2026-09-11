@@ -2204,6 +2204,16 @@ async fn control_loop<T: RobotIo>(
                 );
             } else if mode_change.is_some() {
                 tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
+            } else if pending_swap.is_some() {
+                // The other half of the guard on the policy change below. A change is derived
+                // from the params that are running, so a switch accepted now would rebuild
+                // everything at the home pose and then have the load land on top of it, putting
+                // the old mode's params, networks and slot report back with `robot.mode` still
+                // saying the new one.
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch refused: a policy change is still loading; ask again when it lands"
+                );
             } else {
                 tracing::warn!(
                     from = policy_params.mode.as_str(),
@@ -2242,6 +2252,15 @@ async fn control_loop<T: RobotIo>(
         if let Some(change) = intents.take_policy_change() {
             if mode_change.is_some() || pending_swap.is_some() {
                 tracing::warn!("a policy change is already in flight; ignoring this one");
+            } else if shutdown_sit.is_some() {
+                // A change to the network driving takes the mode switch's path home, and from
+                // inside the sit that stands the robot up at gain until the sit cuts the torque
+                // out from under it: the shape of #159, by one more door. Nothing about a
+                // shutdown wants a new network.
+                tracing::warn!(
+                    change = describe_change(&change),
+                    "policy change refused: the robot is shutting down"
+                );
             } else if let Some(candidate) =
                 candidate_params(&change, &policy_params, &params_path, &mut slot_errors)
             {
@@ -8127,6 +8146,117 @@ mod tests {
         // Neither other state ramps anything.
         assert!(Bringup::Limp.homing_target(since).is_none());
         assert!(Bringup::Ready.homing_target(since).is_none());
+    }
+
+    async fn wait_until(what: impl Fn() -> bool, deadline: Duration, or: &str) {
+        let started = Instant::now();
+        while !what() {
+            assert!(started.elapsed() < deadline, "{or}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// **A mode switch and a policy change cannot both be in flight.** The guard existed one way:
+    /// a change is refused while a switch is in flight, because the switch is about to rebuild
+    /// everything the change was derived from. The other way was open. A switch accepted while
+    /// a load was still on its thread went home, swapped in the other mode's bundle, and then the
+    /// load landed and put the old mode's params, networks and slot report back, with
+    /// `robot.mode` still reporting the new one. On a robot a load is most of a second, which is
+    /// a long time to be holding D-pad up in.
+    ///
+    /// With no runtime here the load lands within a tick, so the window is the gap between the
+    /// thread starting and the loop polling it. Several tries, so that main trips it and the fix
+    /// never does. The check after each is the invariant itself: `robot.mode` and the walk slot
+    /// name the same mode.
+    #[tokio::test]
+    async fn a_mode_switch_is_not_undone_by_a_policy_load_that_lands_after_it() {
+        let mut params = Params::default();
+        // The load has to land for the bug to show, and there is no runtime here to load with.
+        params.policy.enabled = false;
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn(control_loop(
+            FakeIo::at(DEFAULT_POSITION).frozen(),
+            Arc::clone(&s),
+            Arc::clone(&intents),
+            params,
+            PathBuf::from("/test/robotd.toml"),
+            Duration::from_millis(2),
+            noop_poweroff(),
+        ));
+
+        wait_until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        intents.request_init();
+        wait_until(
+            || s.homed.load(Ordering::Relaxed),
+            HOME_RAMP + Duration::from_secs(2),
+            "init never reached home",
+        )
+        .await;
+
+        let walk_slot = |s: &RobotState| {
+            s.policy_slots
+                .load()
+                .iter()
+                .find(|slot| slot.slot == "walk")
+                .and_then(|slot| slot.path.clone())
+                .unwrap_or_default()
+        };
+        for attempt in 0..5 {
+            let mode = mode_of(s.mode.load(Ordering::Relaxed));
+            let target = if mode == Mode::Roller {
+                Mode::Walk
+            } else {
+                Mode::Roller
+            };
+
+            intents.request_policy_change(intents::PolicyChange::Slot {
+                slot: params::Slot::KickLeft,
+                path: None,
+            });
+            // Taken on the next tick, which starts its load. The switch lands on the tick after.
+            let at = s.ticks.load(Ordering::Relaxed);
+            wait_until(
+                || s.ticks.load(Ordering::Relaxed) > at,
+                Duration::from_secs(2),
+                "stalled",
+            )
+            .await;
+            intents.request_mode_switch(mode_code(target));
+
+            // A switch that was accepted starts a ramp; give it and the load time to finish.
+            let at = s.ticks.load(Ordering::Relaxed);
+            wait_until(
+                || s.ticks.load(Ordering::Relaxed) >= at + 10,
+                Duration::from_secs(2),
+                "stalled",
+            )
+            .await;
+            if !s.homed.load(Ordering::Relaxed) {
+                tokio::time::sleep(HOME_RAMP + Duration::from_millis(300)).await;
+            }
+
+            let mode = mode_of(s.mode.load(Ordering::Relaxed));
+            let walk = walk_slot(&s);
+            assert_eq!(
+                mode == Mode::Roller,
+                walk.ends_with("roller.onnx"),
+                "attempt {attempt}: robot.mode says {mode:?} and the walk slot is {walk}"
+            );
+        }
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
     }
 
     /// `1e400` on the wire parses as infinity. Folded into the EMA it is permanent — nothing
