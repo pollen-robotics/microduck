@@ -480,10 +480,16 @@ start_body() {
     if [ -n "$CAMERAS" ]; then
         cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT"
     fi
+    # **Anything else the body server understands, verbatim.** Experiments grow flags faster
+    # than this script can grow options for them — the head gimbal (`--stabilize-head`,
+    # `--stabilize-kp-mult`) is the first — and threading each one through as its own
+    # DUCK_SIM_* variable would mean editing three repositories to try one idea. Unset by
+    # default, so a duck nobody asked to change behaves exactly as it always has.
+    #   DUCK_SIM_BODY_ARGS='--stabilize-head 1.0 --stabilize-kp-mult 20' scripts/duck-sim up
     # shellcheck disable=SC2086
     $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
         --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        $cam_args \
+        $cam_args ${DUCK_SIM_BODY_ARGS:-} \
         > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     wait_for_port || die "the simulator did not come up. $STATE/body.log has why."
