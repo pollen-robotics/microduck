@@ -102,6 +102,49 @@ impl Applied {
     }
 }
 
+/// How often a limit that keeps firing is said again.
+///
+/// The first tick a limit trips always reports — a clamp that happens once is news, and
+/// before this none of it was visible at all. After that, one line per fifty: at 50 Hz that
+/// is one a second, which shows a fault is still going on without writing a line per tick
+/// into the journal. The same shape as the bus-read warning in `robotd`, which reports the
+/// first failure and then every tenth.
+const LIMIT_LOG_EVERY: u64 = 50;
+
+/// How many ticks running each limit has tripped, which is what the journal is keyed off.
+///
+/// Three counters rather than one because the three limits are independent events: a
+/// deadman that fires for a second says nothing about whether a joint is being clamped, and
+/// one shared counter would let whichever fires most starve the other two of a line.
+///
+/// Each is cleared by a tick that reaches that limit's check and does *not* trip it, so the
+/// number reads "how long has this been going on" — which is the number worth saying, and
+/// the one a reader has to be able to distinguish from "how many times has it ever
+/// happened".
+///
+/// A tick refused as non-finite returns before the clamp is ever reached, so it leaves
+/// `range` standing rather than clearing it. That is deliberate, and the alternative is
+/// worse: a target alternating between `NaN` and out-of-range would end the range run on
+/// every second tick, and both limits would then report on every tick they tripped — the
+/// line per tick this counting exists to prevent. So the number is trips in a run, not
+/// strictly consecutive ticks.
+#[derive(Debug, Default, PartialEq)]
+struct LimitRuns {
+    deadman: u64,
+    range: u64,
+    not_finite: u64,
+}
+
+impl LimitRuns {
+    /// Whether a run of `n` has reached a point worth writing down.
+    ///
+    /// Kept here rather than at each call site so the three limits cannot drift into
+    /// three different ideas of "often enough".
+    fn worth_logging(n: u64) -> bool {
+        n == 1 || n.is_multiple_of(LIMIT_LOG_EVERY)
+    }
+}
+
 pub struct Safety<T: RobotIo> {
     io: T,
     config: SafetyConfig,
@@ -111,6 +154,12 @@ pub struct Safety<T: RobotIo> {
     /// Tracks the last gain written so an unchanged one is not rewritten every tick — that
     /// would be fifteen bus writes per tick for no reason.
     gain: Option<u16>,
+    /// Trip counts, for rate-limiting what the layer says about itself.
+    runs: LimitRuns,
+    /// Whether an intent has ever arrived inside the deadman, which is what makes a stale
+    /// one news. Until one has, the robot has no driver to have lost. See
+    /// [`Self::deadman_is_news`].
+    deadman_armed: bool,
 }
 
 impl<T: RobotIo> Safety<T> {
@@ -121,6 +170,8 @@ impl<T: RobotIo> Safety<T> {
             falling_for: Duration::ZERO,
             fallen: false,
             gain: None,
+            runs: LimitRuns::default(),
+            deadman_armed: false,
         }
     }
 
@@ -211,6 +262,7 @@ impl<T: RobotIo> Safety<T> {
             return;
         }
 
+        let was_fallen = self.fallen;
         let down = sensors.imu.gravity[2] > self.config.fall_gravity_z;
         if down {
             self.falling_for = self.falling_for.saturating_add(dt);
@@ -221,19 +273,74 @@ impl<T: RobotIo> Safety<T> {
             self.falling_for = Duration::ZERO;
             self.fallen = false;
         }
+
+        // Not rate-limited, unlike the limits below — though a flip is less rare than the
+        // debounce suggests. Latching takes `fall_debounce` of down, but one upright sample
+        // clears it, so a robot held near the threshold on a noisy IMU can cycle in roughly
+        // that period and report a few times a second. Still not rate-limited, because what
+        // is being said here is the flip itself: a limit reports "this is still wrong",
+        // where this reports "this just changed", and dropping all but one in fifty of those
+        // would drop the one that says when.
+        //
+        // It is also the only *event* there is. `fallen` otherwise shows up in two places
+        // and neither is a record of the fall: a subscribed client's frame — which on a
+        // robot is usually nobody, since `robotd` only assembles one when it has a
+        // receiver — and the loop summary, which samples the boolean every five minutes.
+        // A fall that comes and goes inside one of those windows leaves nothing at all,
+        // and one that persists has no time on it. This fires on the flip, so it has both.
+        if self.fallen != was_fallen {
+            tracing::warn!(
+                fallen = self.fallen,
+                gravity_z = sensors.imu.gravity[2],
+                "the fall verdict changed"
+            );
+        }
     }
 
     /// Apply the deadman to a command.
     ///
     /// Zeroes the *twist* only. Head targets are left alone deliberately: a stale head pose
     /// is harmless, while a stale velocity walks the robot into a wall.
-    pub fn gate(&self, command: Command, intent_age: Duration) -> (Command, Option<Limit>) {
+    ///
+    /// Takes `&mut self` because how long the intents have been stale is this layer's to
+    /// remember: a robot standing still because comms dropped is a state, not a moment, and
+    /// the journal has to be able to say how long it has lasted without saying so 50 times
+    /// a second. See [`LimitRuns`].
+    pub fn gate(&mut self, command: Command, intent_age: Duration) -> (Command, Option<Limit>) {
         if intent_age <= self.config.deadman {
+            self.runs.deadman = 0;
+            self.deadman_armed = true;
             return (command, None);
         }
+
+        self.runs.deadman += 1;
+        if self.deadman_is_news() {
+            tracing::warn!(
+                intent_age_ms = intent_age.as_millis(),
+                deadman_ms = self.config.deadman.as_millis(),
+                tripped = self.runs.deadman,
+                "intents went stale — the velocity command is zeroed"
+            );
+        }
+
         let mut stopped = command;
         stopped.twist = [0.0; 3];
         (stopped, Some(Limit::Deadman))
+    }
+
+    /// Whether a stale intent this tick is worth saying anything about.
+    ///
+    /// Never, on a robot that has not had a driver since it started, however long it has been
+    /// idle. This runs every tick whether or not anything is driving the robot, and an intent
+    /// that has never been written reads as maximally stale from the moment it boots — so
+    /// without this, a robot nobody has sent a twist to trips the deadman about half a second
+    /// after start and reports it once a second forever, with the count climbing without
+    /// bound. That is a bench robot, and any robot driven through skills or `robotctl` rather
+    /// than a pad: the common case, and eighty thousand lines a day describing it.
+    ///
+    /// A robot with no driver is not being ignored, and that is not news. Losing one is.
+    fn deadman_is_news(&self) -> bool {
+        self.deadman_armed && LimitRuns::worth_logging(self.runs.deadman)
     }
 
     /// The only path to the motors.
@@ -261,20 +368,50 @@ impl<T: RobotIo> Safety<T> {
         // value, which is a plausible-looking joint angle — far worse than declining to
         // move, because the robot would lurch to a limit rather than hold still.
         if targets.iter().any(|v| !v.is_finite()) {
+            // Returned before the clamp below is reached, so `range` is left standing — see
+            // [`LimitRuns`] for why that is the right way round.
+            self.runs.not_finite += 1;
+            if LimitRuns::worth_logging(self.runs.not_finite) {
+                tracing::warn!(
+                    tripped = self.runs.not_finite,
+                    "targets refused: not finite — holding the pose the robot is already in"
+                );
+            }
             applied.limits.push(Limit::NotFinite);
             self.io.write(&JointTargets::new(hold))?;
             return Ok(applied);
         }
+        self.runs.not_finite = 0;
 
+        // Counted, not merely detected: one joint at its limit and nine are different
+        // faults wearing the same `Limit::Range` on the wire, and the lowest index out is
+        // what someone goes to look up. `first_clamped` doubles as "any were clamped",
+        // which is what keeps the run counter honest on a tick that clamps nothing.
         let mut safe = targets;
-        for value in safe.iter_mut() {
+        let mut clamped_joints = 0u32;
+        let mut first_clamped = None;
+        for (joint, value) in safe.iter_mut().enumerate() {
             let clamped = value.clamp(ACTUATOR_MIN, ACTUATOR_MAX);
             if clamped != *value {
-                if !applied.limited_by(Limit::Range) {
-                    applied.limits.push(Limit::Range);
-                }
+                clamped_joints += 1;
+                first_clamped.get_or_insert(joint);
                 *value = clamped;
             }
+        }
+
+        if let Some(first) = first_clamped {
+            self.runs.range += 1;
+            applied.limits.push(Limit::Range);
+            if LimitRuns::worth_logging(self.runs.range) {
+                tracing::warn!(
+                    joints = clamped_joints,
+                    first_joint = first,
+                    tripped = self.runs.range,
+                    "joint targets clamped to the actuator's travel"
+                );
+            }
+        } else {
+            self.runs.range = 0;
         }
 
         self.io.write(&JointTargets::new(safe))?;
@@ -562,7 +699,7 @@ mod tests {
     /// stand still — not collapse, and not forget where its head was pointing.
     #[test]
     fn the_deadman_zeroes_the_twist_only() {
-        let s = safety();
+        let mut s = safety();
         let command = Command {
             twist: [0.5, 0.0, 0.3],
             head: [0.1, 0.2, 0.3, 0.4],
@@ -608,5 +745,169 @@ mod tests {
         assert_eq!(s.io().writes, 3);
         assert_eq!(s.io().last_gain, Some(SafetyConfig::default().gain_running));
         assert_eq!(s.gain, Some(SafetyConfig::default().gain_running));
+    }
+
+    fn gain() -> u16 {
+        SafetyConfig::default().gain_running
+    }
+
+    /// Every joint asked to go past the actuator's travel.
+    fn over_travel() -> [f64; NUM_JOINTS] {
+        [ACTUATOR_MAX + 1.0; NUM_JOINTS]
+    }
+
+    /// A limit that trips once is reported; one that trips forever is reported every
+    /// [`LIMIT_LOG_EVERY`] ticks and not on any tick in between.
+    ///
+    /// This is the failure the run counters exist to prevent: at 50 Hz a policy emitting
+    /// NaN writes a line a tick, and fifty identical lines a second is what teaches
+    /// everyone to stop reading the journal — the same reason the stale-IMU warning in
+    /// `bus.rs` says nothing until a run is long enough to mean something.
+    #[test]
+    fn a_limit_that_keeps_firing_is_reported_periodically_not_per_tick() {
+        assert!(LimitRuns::worth_logging(1), "the first trip is always news");
+        assert!(!LimitRuns::worth_logging(2), "not the second");
+        assert!(!LimitRuns::worth_logging(LIMIT_LOG_EVERY - 1));
+        assert!(LimitRuns::worth_logging(LIMIT_LOG_EVERY));
+        assert!(!LimitRuns::worth_logging(LIMIT_LOG_EVERY + 1));
+        assert!(LimitRuns::worth_logging(LIMIT_LOG_EVERY * 3));
+    }
+
+    /// A run must measure *how long this has been going on*, not how many times it has
+    /// ever happened.
+    ///
+    /// Otherwise the count climbs for the life of the process and `50` stops meaning
+    /// anything: a clamp on Tuesday and a clamp on Friday would read the same as a
+    /// second-long one now. The debounce on the fall verdict is reset the same way, and
+    /// for the same reason.
+    #[test]
+    fn a_limit_run_resets_when_the_limit_stops_firing() {
+        let mut s = safety();
+
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        assert_eq!(s.runs.range, 2, "two clamped ticks in a row");
+
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, gain()).unwrap();
+        assert_eq!(s.runs.range, 0, "a clean tick ends the run");
+
+        // A deadman run clears the same way, when a fresh intent arrives again.
+        s.gate(Command::default(), Duration::from_secs(5));
+        s.gate(Command::default(), Duration::from_secs(5));
+        assert_eq!(s.runs.deadman, 2);
+        s.gate(Command::default(), Duration::from_millis(10));
+        assert_eq!(s.runs.deadman, 0, "fresh intents end the run");
+    }
+
+    /// The three counts must be independent. One shared counter would let whichever limit
+    /// fires most starve the other two of a line entirely — a robot whose joints are being
+    /// clamped every tick would say nothing about it, because the deadman kept resetting
+    /// the number that both were writing into.
+    #[test]
+    fn the_three_limits_are_counted_separately() {
+        let mut s = safety();
+
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        s.apply([f64::NAN; NUM_JOINTS], DEFAULT_POSITION, gain())
+            .unwrap();
+        s.gate(Command::default(), Duration::from_secs(5));
+        s.gate(Command::default(), Duration::from_secs(5));
+        s.gate(Command::default(), Duration::from_secs(5));
+
+        assert_eq!(s.runs.range, 2, "clamped twice, then refused as NaN");
+        assert_eq!(s.runs.not_finite, 1, "the NaN tick is its own run");
+        assert_eq!(s.runs.deadman, 3);
+    }
+
+    /// An ordinary tick trips nothing and reports nothing — the common case, and the one
+    /// that has to stay silent for any of this to be worth reading.
+    #[test]
+    fn a_plain_tick_trips_no_limit() {
+        let mut s = safety();
+        s.observe(&upright(), Duration::from_millis(20));
+
+        let applied = s.apply(DEFAULT_POSITION, DEFAULT_POSITION, gain()).unwrap();
+        let (command, limit) = s.gate(Command::default(), Duration::from_millis(10));
+
+        assert!(applied.limits.is_empty(), "{:?}", applied.limits);
+        assert!(limit.is_none());
+        assert_eq!(s.runs, LimitRuns::default());
+        assert_eq!(command, Command::default());
+        assert!(!s.fallen());
+    }
+
+    /// Refusing non-finite targets must still leave the robot where it was, and clamping
+    /// must still land every joint inside the actuator's travel.
+    ///
+    /// The run counters and the journal lines were added to a path that already worked;
+    /// this is what says they did not change what it decides. Both are the difference
+    /// between a robot that holds still and one that lurches to a limit.
+    #[test]
+    fn limits_are_reported_without_changing_what_is_applied() {
+        let mut s = safety();
+
+        // Refused: the write is the hold pose, not the NaN.
+        s.apply([f64::NAN; NUM_JOINTS], DEFAULT_POSITION, gain())
+            .unwrap();
+        assert_eq!(
+            s.io().last_written.unwrap().positions,
+            DEFAULT_POSITION,
+            "a refused target must not reach the servos"
+        );
+
+        // Clamped: every joint lands on the boundary, none beyond it.
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        let written = s.io().last_written.unwrap().positions;
+        assert!(
+            written.iter().all(|v| *v <= ACTUATOR_MAX),
+            "nothing past the actuator's travel: {written:?}"
+        );
+        assert_eq!(written, [ACTUATOR_MAX; NUM_JOINTS]);
+    }
+
+    /// A robot nobody has driven since it started says nothing about the deadman, however
+    /// long it has been idle.
+    ///
+    /// This is the failure the arming exists to prevent. `gate` runs every tick whatever the
+    /// robot is doing, and an intent that was never written reads as maximally stale from
+    /// boot, so an idle robot trips the deadman about half a second in and never stops: one
+    /// line a second, eighty thousand a day, the count climbing without bound. That is a
+    /// bench robot, and any robot driven through skills or `robotctl` instead of a pad.
+    ///
+    /// Losing a driver is news. Never having had one is not.
+    #[test]
+    fn a_robot_that_has_never_been_driven_reports_no_deadman() {
+        let mut s = safety();
+
+        for _ in 0..200 {
+            assert!(!s.deadman_is_news(), "never driven: nothing to say");
+            s.gate(Command::default(), Duration::from_secs(5));
+        }
+        assert_eq!(s.runs.deadman, 200, "counted, but not worth saying");
+
+        // One fresh intent arms it, and from then on going quiet is news again.
+        s.gate(Command::default(), Duration::from_millis(10));
+        assert!(s.deadman_is_news(), "a driver that goes quiet is different");
+    }
+
+    /// A tick refused as non-finite returns before the clamp is reached, so it leaves the
+    /// range run standing rather than ending it.
+    ///
+    /// Deliberate, and the alternative is noisier: a target alternating between `NaN` and
+    /// out-of-range would end the range run on every other tick, and then both limits report
+    /// on the first tick of every run — a line per tick, which is what the counting is
+    /// there to prevent. See [`LimitRuns`].
+    #[test]
+    fn a_refused_tick_does_not_end_a_range_run() {
+        let mut s = safety();
+
+        s.apply(over_travel(), DEFAULT_POSITION, gain()).unwrap();
+        assert_eq!(s.runs.range, 1);
+
+        s.apply([f64::NAN; NUM_JOINTS], DEFAULT_POSITION, gain())
+            .unwrap();
+        assert_eq!(s.runs.range, 1, "the refused tick leaves the run standing");
+        assert_eq!(s.runs.not_finite, 1, "and is its own run");
     }
 }
