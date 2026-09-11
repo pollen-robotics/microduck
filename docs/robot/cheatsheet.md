@@ -874,7 +874,7 @@ robotctl system info
 ```
 
 ```
-robotctl system pin
+sudo robotctl system pin
 ```
 
 ```
