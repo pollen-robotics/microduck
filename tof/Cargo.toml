@@ -23,6 +23,9 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { workspace = true, features = ["derive"] }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# `[head_imu]` lives in `robotd.toml`, and this crate is the schema for that file — the same
+# dependency, for the same reason, that `mediad` takes on for `[media]`. See `src/config.rs`.
+robotd-params = { path = "../robotd-params" }
 libc = "0.2"
 serde = { workspace = true }
 serde_json.workspace = true
@@ -37,10 +40,15 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 # The BMI088 driver and its Madgwick fusion, ours because the crates.io ones stop at the raw
 # registers. Pinned to a tag: it is a second repository and a moving `main` is not a dependency.
-bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", tag = "v0.1.1" }
+# v0.1.2 is the one that has `Bmi088Ahrs::update_all`, which is what takes a head-IMU sample
+# from three I²C transactions to two.
+bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", tag = "v0.1.2" }
 # `I2cdev`, the `embedded-hal` bus the driver is generic over. Linux-only by construction —
 # `i2cdev`'s `linux` module is the whole crate.
 linux-embedded-hal = "0.4"
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

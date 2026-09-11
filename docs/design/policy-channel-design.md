@@ -273,7 +273,10 @@ updater design).
 
 Fetching rather than copying is the point: it is the arrangement `setup-board.sh` already uses
 for ONNX Runtime and `setup-gstreamer.sh` for the plugins, which are the other two things a board
-needs and a release has no business carrying. The pin lives in `[workspace.metadata.policies]`
+needs and a release has no business carrying. The duck detector followed the same road out of the
+release — `scripts/seed-detector.sh`, `/opt/robot/detector/current`, `robotctl duck-detector
+check/update`, a pin in `[workspace.metadata.detector]` — with a fixed file list in place of the
+manifest, since its two files have fixed names (`docs/project/npu-bringup.md`). The pin lives in `[workspace.metadata.policies]`
 and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
 because a script that runs from inside a release cannot read the manifest.
 

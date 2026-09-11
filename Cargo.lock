@@ -481,8 +481,8 @@ dependencies = [
 
 [[package]]
 name = "bmi088"
-version = "0.1.0"
-source = "git+https://github.com/pollen-robotics/bmi088-rs?tag=v0.1.1#efddf2029f276495a99dd51435c61b643fa009b5"
+version = "0.1.2"
+source = "git+https://github.com/pollen-robotics/bmi088-rs?tag=v0.1.2#bd113f317b14923f50f9a12a06678fe162b7fe06"
 dependencies = [
  "ahrs",
  "embedded-hal",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "btd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bluer",
  "clap",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "configd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "duck-control"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "duck-ipc-proto",
  "libloading 0.8.9",
@@ -1123,13 +1123,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
  "tracing",
 ]
 
 [[package]]
 name = "duck-detect"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1142,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ether"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -1155,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "libc",
  "semver",
@@ -1166,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "duckctl"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "btd",
  "btleplug",
@@ -2512,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "kinematics"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "roxmltree",
  "serde",
@@ -2704,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "mediad"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3172,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "odometry"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -3236,14 +3237,14 @@ checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
 name = "pad-imu"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "duck-ipc-proto",
 ]
 
 [[package]]
 name = "padd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -3351,7 +3352,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pet-detect"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3806,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3826,7 +3827,7 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "clap",
@@ -3857,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "robotd-params"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -4391,7 +4392,7 @@ dependencies = [
 
 [[package]]
 name = "sounds"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4594,7 +4595,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "minisign",
@@ -4703,7 +4704,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tof"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "bmi088",
@@ -4712,8 +4713,10 @@ dependencies = [
  "duck-ipc-proto",
  "libc",
  "linux-embedded-hal",
+ "robotd-params",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5119,7 +5122,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -5762,7 +5765,7 @@ checksum = "636f85e5ca6488e96401b61eb7de54f4e44755c988af0f52cf90230c312a1a89"
 
 [[package]]
 name = "xtask"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "clap",
  "minisign",

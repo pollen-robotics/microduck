@@ -53,7 +53,7 @@
 //!
 //! ## The IMU as a control, not only a stream
 //!
-//! With `[imu_head] enabled`, `padd` poses the robot's head from the pad's tilt. The attitude that
+//! With `[pad_imu_head_control] enabled`, `padd` poses the robot's head from the pad's tilt. The attitude that
 //! needs comes from the same node the tap streams, so rather than a second reader on the same
 //! device this reader runs a `pad_imu::Imu` filter over every batch it reads and the main loop asks
 //! for the attitude ([`Tap::attitude`]). [`Tap::imu_control`] is the main loop saying "keep the

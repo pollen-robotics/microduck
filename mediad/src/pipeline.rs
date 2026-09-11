@@ -69,6 +69,12 @@
 //! without the capture path existing. The camera arrives as a different source element behind the
 //! same encoder, and `media-bringup.md` records why capture cannot simply be `v4l2src`.
 //!
+//! **It runs at `robotd_params::TEST_PATTERN_GEOMETRY` rather than `[media] quality`**, and that is
+//! a CPU decision. A camera's frames come off the ISP in hardware; a test pattern's are drawn by
+//! this process, so at the configured rung an idle board with no camera burned 29.4% of a core
+//! against a real camera's 6.1% — synthesising 1.84 MB of UYVY thirty times a second for a tee
+//! whose readers had all said no. The session it exists to provide needs none of those pixels.
+//!
 //! ## What is not verified
 //!
 //! **Nothing in a signal handler here may panic.** These closures are invoked from C, so a panic
@@ -712,7 +718,8 @@ pub fn start(
     Ok((pipeline, channels_rx, frames, stream_branch))
 }
 
-/// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! enc ! parse ! appsink`.
+/// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! videoconvert ! enc !
+/// parse ! appsink`.
 ///
 /// Fails rather than degrades when there is no encoder to use, and the caller carries on without a
 /// branch: a robot that cannot stream to a Space is still a robot that walks, and `media.stream`
@@ -778,6 +785,13 @@ fn build_stream_branch(
         .map_err(|_| anyhow!("no capsfilter element"))?;
     let scale = scale.0;
 
+    // The tee carries `UYVY` (see the capture caps above) and neither encoder takes it: `x264enc`
+    // wants planar YUV, `mpph264enc` NV12. Without this the branch **fails to link at build time**,
+    // `start` returns the error, and mediad does not start at all on a machine without `mpph264enc`
+    // — which is every laptop, and the sim twin with it. A passthrough when formats already agree,
+    // so it costs the board nothing.
+    let convert = make("videoconvert")?;
+
     // `mpph264enc` is the board's hardware encoder — the same one `webrtcsink` uses through the
     // patched plugin the header describes. `x264enc` is the fallback for a laptop and for a board
     // whose MPP is missing, which is a slow encode rather than a broken one.
@@ -806,6 +820,15 @@ fn build_stream_branch(
         )
         // One WebSocket message is one access unit, which is what `alignment=au` above buys.
         .sync(false)
+        // **`async=false`, or this sink holds the whole pipeline in PAUSED.** A sink prerolls on
+        // its first buffer, and the bin does not finish going to PLAYING until every async sink
+        // has. This branch's first buffer only arrives once somebody opens the valve — so with the
+        // default the pipeline never completed its state change, and the *raw* appsink one branch
+        // over, which had prerolled, waited for PLAYING for ever: no callbacks, no frames, and the
+        // duck detector and the auto-exposure loop starved on a camera that was capturing at 30
+        // fps. The video track kept working because `webrtcsink` is live and does not preroll,
+        // which is what made this invisible from the console.
+        .async_(false)
         .max_buffers(ENCODED_DEPTH as u32)
         .drop(false)
         .build();
@@ -835,6 +858,7 @@ fn build_stream_branch(
             &rate,
             &scale,
             &caps,
+            &convert,
             &encoder,
             &parse,
             appsink.upcast_ref(),
@@ -846,6 +870,7 @@ fn build_stream_branch(
         &rate,
         &scale,
         &caps,
+        &convert,
         &encoder,
         &parse,
         appsink.upcast_ref(),
@@ -2003,6 +2028,64 @@ fn open_control_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A reader gets a frame out of the real pipeline.** The rendezvous tests below stand in
+    /// for the appsink; this one runs the appsink, on the test pattern, with every branch the
+    /// robot has — because the bug this guards was between branches. The valved H.264 sink
+    /// prerolled nothing, so the bin never finished going to PLAYING, and the raw appsink sat in
+    /// preroll holding its first buffer for ever: `starved=20` on every detector report and no
+    /// `metering` line from auto-exposure, on a robot whose console video was fine.
+    ///
+    /// Skipped, and loudly, where the plugins are not installed: CI has GStreamer's base and bad
+    /// sets but neither `webrtcsink` nor an H.264 encoder, and a test that fails for want of a
+    /// plugin says nothing about the pipeline. A machine set up to run `mediad` has them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_gets_a_frame_from_the_running_pipeline() {
+        gst::init().expect("gstreamer");
+        let missing: Vec<&str> = ["videotestsrc", "webrtcsink", "valve", "h264parse"]
+            .into_iter()
+            .filter(|name| gst::ElementFactory::find(name).is_none())
+            .collect();
+        let no_encoder = ["mpph264enc", "x264enc"]
+            .iter()
+            .all(|name| gst::ElementFactory::find(name).is_none());
+        if !missing.is_empty() || no_encoder {
+            eprintln!("skipping: no {missing:?} / no H.264 encoder on this machine");
+            return;
+        }
+
+        let producer = crate::producer::Producer::local(duck_ipc_proto::build_info!());
+        let settings = Settings {
+            host: "127.0.0.1".into(),
+            // Not 8443, so a `mediad` already running on this machine is left alone.
+            port: 18_443,
+            bitrate: 500_000,
+            congestion_control: robotd_params::CongestionControl::default(),
+            width: 320,
+            height: 240,
+            fps: 15,
+            rotation: Rotation::None,
+        };
+        let (pipeline, _channels, frames, _stream) = start(
+            Source::Test,
+            &producer,
+            &settings,
+            crate::turn::Relays::empty(),
+        )
+        .expect("the pipeline starts on the test pattern");
+
+        // Several asks, because the first can legitimately land before the source has produced
+        // anything; what must not happen is every one of them timing out.
+        let frame = tokio::task::spawn_blocking(move || (0..10).find_map(|_| frames.next_frame()))
+            .await
+            .expect("the reader thread");
+        let _ = pipeline.set_state(gst::State::Null);
+
+        let frame = frame.expect("a frame within five seconds; the raw branch is starved");
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.format, CAPTURE_FORMAT);
+        assert_eq!(frame.data.len(), 320 * 240 * 2, "packed UYVY");
+    }
 
     /// A frame whose every byte is `tag`, so a test can say *which* capture came back.
     fn frame(tag: u8) -> Frame {

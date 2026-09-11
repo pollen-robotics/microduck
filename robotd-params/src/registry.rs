@@ -301,24 +301,24 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
-    // ── [detect] ─────────────────────────────────────────────────────────────
+    // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
-        "detect.enabled",
+        "duck_detector.enabled",
         Kind::Bool,
         "Look for other ducks in the camera (mediad runs it; needs a restart)",
     ),
     entry(
-        "detect.model",
+        "duck_detector.model",
         Kind::OptionalPath,
         "Model to run; unset = the release's, .rknn on the NPU before .onnx on the CPU",
     ),
     entry(
-        "detect.hz",
+        "duck_detector.hz",
         Kind::Float,
         "Looks per second. 2 is a thermal limit, not a preference — flat out cooks the board",
     ),
     entry(
-        "detect.threshold",
+        "duck_detector.threshold",
         Kind::Float,
         "Confidence a detection needs, on this model's own scale (int8 scores are not 0..1)",
     ),
@@ -360,6 +360,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
     ),
+    // ── [head_imu] ───────────────────────────────────────────────────────────
+    feature(
+        "head_imu.enabled",
+        Kind::Bool,
+        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
+    ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
         "audio.enabled",
@@ -395,9 +401,9 @@ pub const REGISTRY: &[Entry] = &[
     ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
-        "media.camera",
-        Kind::Bool,
-        "Stream the head camera — off is a test pattern, for a board with no camera",
+        "media.source",
+        Kind::Choice(crate::MEDIA_SOURCE_LABELS),
+        "Where video comes from: the head camera, or a cheap test pattern for a board without one",
     ),
     feature(
         "media.quality",
@@ -435,19 +441,35 @@ pub const REGISTRY: &[Entry] = &[
     feature("pad.lb", Kind::Text, "Skill on the left bumper"),
     feature("pad.rb", Kind::Text, "Skill on the right bumper"),
     feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
-    // ── [imu_head] ───────────────────────────────────────────────────────────
+    // ── [pad_imu_head_control] ───────────────────────────────────────────────
     //
-    // Controller-IMU head control. Read by `padd`, like `[pad]`.
+    // Controller-IMU head control. Read by `padd`, like `[pad]`. Not `[head_imu]`, which is
+    // the IMU in the robot's head.
     feature(
-        "imu_head.enabled",
+        "pad_imu_head_control.enabled",
         Kind::Bool,
         "Y poses the head from the pad's own IMU (Pro Controller) — sticks keep driving; Y again holds, again re-centres",
     ),
     entry(
-        "imu_head.gain",
+        "pad_imu_head_control.gain",
         Kind::Float,
         "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
     ),
+];
+
+/// Sections that changed name: `(old, new)`.
+///
+/// The loader takes the old name through a `#[serde(alias)]` on the field, so a file written
+/// before the rename keeps loading; the editor (`edit.rs`) carries the section to its new name so
+/// its next save cannot leave both in one file, which the loader refuses as a duplicate. Listed
+/// here, beside the registry, because the coverage test below has to know an alias is not a
+/// section of its own — serde names aliases in its "unknown field" message like any other field.
+pub const RENAMED_SECTIONS: &[(&str, &str)] = &[
+    // The pad's IMU steering the head, a letter-swap away from `head_imu` — the IMU *in* the
+    // head. Renamed 2026-09 for that reason alone.
+    ("imu_head", "pad_imu_head_control"),
+    // "detect" read as "detect what?" in the editor. Renamed 2026-09 for the thing it detects.
+    ("detect", "duck_detector"),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -512,6 +534,8 @@ mod tests {
             .skip(1)
             .step_by(2)
             .filter(|name| *name != "__no_such_section__")
+            // An old name is an alias for a section already in this list, not a section.
+            .filter(|name| !RENAMED_SECTIONS.iter().any(|(old, _)| old == name))
             .map(str::to_owned)
             .collect();
         // A sanity anchor so a serde message change cannot pass vacuously: the sections this
@@ -628,13 +652,14 @@ mod tests {
                 "policy.voltage_adapt",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
-                "detect.enabled",
+                "duck_detector.enabled",
                 "chorale.accept",
                 "theremin.enabled",
+                "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
-                "media.camera",
+                "media.source",
                 "media.quality",
                 // The five one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
@@ -643,7 +668,7 @@ mod tests {
                 "pad.lb",
                 "pad.rb",
                 "pad.dpad_down",
-                "imu_head.enabled",
+                "pad_imu_head_control.enabled",
             ]
         );
     }

@@ -38,6 +38,7 @@ use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+mod config;
 mod imu;
 mod status;
 use imu::ImuStatus;
@@ -139,9 +140,21 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     imu_hz: u8,
 
-    /// Do not read the head IMU (e.g. a board without the HAT module, or to free the bus).
+    /// Read the head IMU for this session, whatever `[head_imu] enabled` says.
+    ///
+    /// The switch lives in `robotd.toml` because that is what `robotctl configure` writes; this
+    /// is for trying the chip by hand on a board that has not opted in.
+    #[arg(long, conflicts_with = "no_imu")]
+    imu: bool,
+
+    /// Do not read the head IMU, whatever the file says (a board without the HAT module, or to
+    /// free the bus for a measurement).
     #[arg(long)]
     no_imu: bool,
+
+    /// Params file. `[head_imu]` is read from it; everything else here is a flag.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Read frames from a simulated body at `host:port` instead of a sensor.
     ///
@@ -213,11 +226,35 @@ async fn main() -> std::process::ExitCode {
             .expect("spawn the sensor thread")
     };
 
-    // The head IMU on its own thread and channel, on the same bus. Skipped for --sim/--fake
-    // (no real bus) and --no-imu. Its socket is the same one; subscribers pick the stream by method.
+    // The head IMU on its own thread and channel, on the same bus. Its socket is the same one;
+    // subscribers pick the stream by method.
+    //
+    // **Off unless `[head_imu] enabled` says otherwise**, and that default is the measurement in
+    // `docs/project/tof-on-demand.md`: reading this chip at 100 Hz costs ~3.5-4.5% of a core, of
+    // which the wakeups are 0.7 points and the fusion 0.3 — the rest is two I²C transactions a
+    // sample, which is what a gyro and an accelerometer sample *is*. Nothing in the loop was
+    // worth fixing, nothing subscribes to the stream yet, and a duck that is not mapping was
+    // paying for it from boot.
+    //
+    // Skipped for --sim/--fake too: there is no real bus behind either.
     let imu_status = Arc::new(ImuStatus::new(args.imu_hz));
     let (imu_frames, _) = tokio::sync::broadcast::channel(imu::FRAME_BUFFER);
-    let imu_thread = if args.no_imu || args.fake || args.sim.is_some() {
+    let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    let configured = config::load(&config_path, args.config.is_some())
+        .head_imu
+        .enabled;
+    let wanted = args.imu || (configured && !args.no_imu);
+    let imu_thread = if !wanted || args.fake || args.sim.is_some() {
+        // Said out loud, and said by the stream too: a subscriber gets this sentence instead of
+        // frames, because "no samples" and "no BMI088 fitted" are different answers and only one
+        // of them is somebody's mistake.
+        if !wanted {
+            tracing::info!(
+                config = %config_path.display(),
+                "the head IMU is off; set [head_imu] enabled = true to read it"
+            );
+            imu_status.off();
+        }
         None
     } else {
         let (imu_status, imu_frames, shutdown) =

@@ -8,6 +8,32 @@ here as a quantised `.rknn`. First model, for reference: `yolo11n` at 320×320, 
 from three sessions, mAP50 0.976 on a held-out session — and 3.9 MB after INT8 quantisation, which
 kept 2 of 2 detections at 95% box overlap against the float model on the desk.
 
+## Where the model comes from
+
+**The Hub, the way the policies do.** `duck_detector` publishes every run to
+[`pollen-robotics/microduck-duck-detector`](https://huggingface.co/pollen-robotics/microduck-duck-detector)
+— `duck_detect.rknn` for the NPU and `duck_detect.onnx` for the CPU fallback, at the repo root under
+fixed names, one tag per run. Nothing in this repository carries the weights: `mediad` reads them
+from `/opt/robot/detector/current`, and what fills that is
+
+| | |
+|---|---|
+| `scripts/seed-detector.sh` | run by the release's postinstall hook; installs the pin in `[workspace.metadata.detector]` on a board that has nothing, and never touches a set it did not install |
+| `robotctl duck-detector check` | what is installed against what the repo offers |
+| `sudo robotctl duck-detector update [--version <tag>]` | installs a revision and restarts `mediad` onto it |
+
+It is `seed-policies.sh` and `robotctl policy check/update` with a different root and a fixed file
+list, served by the same `updaterd` calls (`detector.check`, `detector.install`), and
+`docs/design/policy-channel-design.md` §9 has the reasoning that carries over: the pin is a floor,
+nothing partial goes live, a retrain is a tag rather than a daemon release.
+
+Two things worth knowing. The model repo **shares its name with the dataset repo**; the robot only
+ever addresses the model (`…/resolve/<rev>/…`, `api/models/…`), and the dataset lives under
+`datasets/`, so nothing on the robot can land on a frame by accident. And `update`'s "newest" is
+decided by **version tags** (`v2` sorts above `v1`; a name like `experimental` never counts), so a
+run meant for robots wants a `vN` tag — the first run was tagged `duck-v1`, which is what the pin
+names and is fine to install by name, but is not a version `check` can rank.
+
 ## What is here
 
 | | |

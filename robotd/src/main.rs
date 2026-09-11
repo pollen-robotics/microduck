@@ -54,7 +54,8 @@ type PowerOff = Arc<dyn Fn() + Send + Sync>;
 
 /// Model API version this build implements (`updater-design.md` §5.5). Bump when the
 /// sensor-input / actuator-output contract a model sees changes.
-const MODEL_API: u32 = 1;
+// API 2 adds explicit recurrent state; API 1 feed-forward models remain supported.
+const MODEL_API: u32 = 2;
 
 /// Socket mode. Same reasoning as `updaterd`'s: the group decides who may ask.
 const SOCKET_MODE: u32 = 0o660;
@@ -2793,6 +2794,11 @@ async fn control_loop<T: RobotIo>(
         if was_driving && !driving {
             stopped_driving_at = Some(tick_start);
             if !snapshot.enabled {
+                // Even a brief explicit disable ends the recurrent episode. The resume
+                // grace period below is for dropped sensor reads, not a user's stop.
+                if let Some(controller) = controller.as_mut() {
+                    controller.reset();
+                }
                 // A deliberate stop returns to the home pose — the prototype's Start-off
                 // ("policy DISABLED - returning to default pose"). Commanded directly, no
                 // ramp: the servos do the travel at their own speed, and the robot is

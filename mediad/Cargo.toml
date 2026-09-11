@@ -21,7 +21,7 @@ description = "Camera, mic, WebRTC — and the remote gateway"
 # this depends on — rather than a two-field struct here and a test in `updater` describing it.
 hf-robot-account = "0.1"
 duck-ipc-proto = { path = "../duck-ipc-proto" }
-# `[media]` and `[detect]` in /etc/robot/robotd.toml — what this daemon streams, and what it looks
+# `[media]` and `[duck_detector]` in /etc/robot/robotd.toml — what this daemon streams, and what it looks
 # for. The same crate `robotd` parses that file with and the same one `robotctl configure` edits it
 # through, so the schema, the defaults and the editor cannot drift from what is read here.
 robotd-params = { path = "../robotd-params" }

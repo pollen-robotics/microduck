@@ -62,6 +62,16 @@ if [ -f "$script" ]; then
         || echo "postinstall: the login-shell files did not install; they are cosmetic" >&2
 fi
 
+# Apt off the boot path: Armbian's `@reboot` simulated upgrade and the stock apt-daily timers. Here
+# rather than in setup-board.sh alone because every board in the field was provisioned with them
+# running, and this hook is what reaches those boards. Never fatal — a slower boot is not worth a
+# rollback.
+script=scripts/setup-quiet-boot.sh
+if [ -f "$script" ]; then
+    sh "$script" \
+        || echo "postinstall: could not take apt off the boot path; boot stays slower than it needs to be" >&2
+fi
+
 # The robot's voice bank, rendered from the SoC serial by the release's own generator.
 # Idempotent — a marker records the seed and bank version, and a current bank is a no-op —
 # so this runs on every install and only actually renders on the first one (or when the
@@ -82,6 +92,16 @@ script=scripts/seed-policies.sh
 if [ -f "$script" ]; then
     sh "$script" \
         || echo "postinstall: policies were not seeded; robotctl health will say so" >&2
+fi
+
+# The duck detector, the same way and for the same reason: `mediad` reads it from
+# /opt/robot/detector/current, a retrain is a tag on the Hub rather than a daemon release, and the
+# seeder never touches a set it did not install. Warned about, never fatal — the detector is
+# off by default, and a robot asked to look for ducks with no model says so in mediad's journal.
+script=scripts/seed-detector.sh
+if [ -f "$script" ]; then
+    sh "$script" \
+        || echo "postinstall: the duck detector was not seeded; mediad will say so if asked for it" >&2
 fi
 
 [ -d systemd ] || exit 0

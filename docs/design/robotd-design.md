@@ -777,9 +777,19 @@ single last-writer slot would lose.
 
 ### 4.2 Params
 
-A TOML file read at startup, **not watched** — live reload comes later. It lives outside
+A TOML file read at startup and, for the most part, **not watched**. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
+than steps towards watching the whole file. `padd` stats the file once a second and re-reads
+`[pad]` and `[pad_imu_head_control]` when the mtime moves: a binding is changed from a phone, and restarting
+`padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+`robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
+`robotctl policy add` lands a skill without taking motor control away from a standing robot.
+Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
+and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
+a key that says nothing fails a test in `robotctl`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the

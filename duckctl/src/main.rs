@@ -430,27 +430,11 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
         }
         Command::Ssh { user, command } => {
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
-            let argv = ssh_argv(&user, address, command);
-            eprintln!("ssh {}", argv.join(" "));
-            let mut ssh = std::process::Command::new("ssh");
-            ssh.args(&argv);
-            // Become ssh rather than run it: the terminal is then ssh's from here on — its
-            // prompts, its exit status, its handling of a dropped link — and nothing of this
-            // process is left behind to be `Ctrl-C`d separately. The radio was released above,
-            // before this was called, so there is nothing to clean up.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let e = ssh.exec();
-                Err(format!("could not run ssh: {e}").into())
-            }
-            #[cfg(not(unix))]
-            {
-                let status = ssh
-                    .status()
-                    .map_err(|e| format!("could not run ssh: {e}"))?;
-                std::process::exit(status.code().unwrap_or(1));
-            }
+            become_program("ssh", &ssh_argv(&user, address, command))
+        }
+        Command::Scp { user, paths } => {
+            let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
+            become_program("scp", &scp_argv(&user, address, paths))
         }
         Command::Open { print, port } => {
             let url = console_url(address, *port);
@@ -467,12 +451,13 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
                 .into()
             })
         }
-        // `run` only calls this for the two above; every other command's answer is its JSON.
+        // `run` only calls this for the four above; every other command's answer is its JSON.
         _ => Err("this command does not resolve an address".into()),
     }
 }
 
-/// Which account `ssh` logs into: the flag, else a non-empty `DUCK_BOARD_USER`, else `radxa`.
+/// Which account `ssh` and `scp` log into: the flag, else a non-empty `DUCK_BOARD_USER`, else
+/// `radxa`.
 ///
 /// Empty is unset — `DUCK_BOARD_USER= duckctl ssh` reads as "not set", the same rule `DUCK_ROBOT`
 /// follows, because a variable emptied to switch it off must not become an ssh login of `@host`.
@@ -492,6 +477,76 @@ fn ssh_argv(user: &str, address: &str, command: &[String]) -> Vec<String> {
     let mut argv = vec![format!("{user}@{address}")];
     argv.extend(command.iter().cloned());
     argv
+}
+
+/// What `scp` is refused for, checked **before** the radio is turned on.
+///
+/// Two of them, and neither could be left to `scp`: its usage error cannot mention the rule that
+/// is actually being broken. A copy with no `:` anywhere in it is the one worth catching — it is a
+/// local-to-local copy, `scp` performs it happily, and nothing in the output says the robot was
+/// never involved. Here rather than in `scp_argv` because the alternative is charging eight
+/// seconds of scanning for a robot the command was never going to touch.
+fn scp_refusal(paths: &[String]) -> Result<(), String> {
+    if !paths.iter().any(|path| path.starts_with(':')) {
+        return Err(format!(
+            "no path on the robot in `{}`\nA leading `:` is the robot: `duckctl scp report.md \
+             :/tmp/` sends a file up, `duckctl scp :/var/log/robotd.log .` brings one down. \
+             Without one this is a local-to-local copy that has nothing to do with a robot.",
+            paths.join(" "),
+        ));
+    }
+    if paths.len() < 2 {
+        return Err(format!(
+            "`{}` is a source with no destination. `scp` takes both: `duckctl scp \
+             :/var/log/robotd.log .`",
+            paths[0],
+        ));
+    }
+    Ok(())
+}
+
+/// `scp`'s arguments: every `:path` pointed at the robot, everything else as typed.
+///
+/// The rewrite is textual and deliberately narrow — a leading `:` becomes `user@address:` and
+/// nothing else is touched — so `-r`, `-P`, a local path, and a path with a colon in the middle of
+/// it all reach `scp` exactly as they were typed. `scp` itself decides what they mean.
+fn scp_argv(user: &str, address: &str, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| match path.strip_prefix(':') {
+            Some(remote) => format!("{user}@{address}:{remote}"),
+            None => path.clone(),
+        })
+        .collect()
+}
+
+/// Hand the terminal to `ssh` or `scp` and never come back.
+///
+/// Become the program rather than run it: the terminal is then its from here on — its prompts,
+/// its progress meter, its exit status, its handling of a dropped link — and nothing of this
+/// process is left behind to be `Ctrl-C`d separately. The radio was released before this was
+/// called, so there is nothing to clean up.
+///
+/// The command line is echoed first, on stderr, because a tool that resolved the address for you
+/// still owes you the address it resolved — and it is the line to paste when the next copy needs
+/// a flag this does not pass.
+fn become_program(program: &str, argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("{program} {}", argv.join(" "));
+    let mut child = std::process::Command::new(program);
+    child.args(argv);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = child.exec();
+        Err(format!("could not run {program}: {e}").into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = child
+            .status()
+            .map_err(|e| format!("could not run {program}: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Where the console is, given where the robot is.
@@ -868,6 +923,33 @@ enum Command {
             value_name = "COMMAND"
         )]
         command: Vec<String>,
+    },
+    /// Copy files to or from the robot with `scp`.
+    ///
+    /// A path that starts with `:` is on the robot: `duckctl scp report.md :/tmp/` sends one up,
+    /// `duckctl scp :/var/log/robotd.log .` brings one down. That is `scp`'s own `host:path` with
+    /// the host left out, because the host is the thing this tool exists to find. Everything else
+    /// — local paths, `-r`, any other `scp` flag — is passed through as typed, and then this
+    /// process *becomes* `scp`, so the progress meter, the key prompts and the exit status are
+    /// `scp`'s own.
+    ///
+    /// `duckctl`'s own flags come before the paths — `duckctl --name ducky scp -r logs/ :/tmp/` —
+    /// and `--` ends them for anything after that this tool would otherwise read as its own. A
+    /// local file that really is named `:foo` is `./:foo`.
+    ///
+    /// The user resolves the way `ssh`'s does: `--user`, else `DUCK_BOARD_USER`, else `radxa`.
+    Scp {
+        /// The account on the robot. Without it, `DUCK_BOARD_USER`; without that, `radxa`.
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// What to copy, `scp`-style, with a leading `:` for a path on the robot.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "PATH"
+        )]
+        paths: Vec<String>,
     },
     /// Open the robot's console in a browser.
     ///
@@ -1261,18 +1343,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target = Target::new(cli.name.clone(), std::env::var("DUCK_ROBOT").ok());
     let pin = resolve_pin(cli.pin.clone(), std::env::var("DUCK_PIN").ok());
 
+    // Before the scan rather than after it: a copy that names no path on the robot is wrong on its
+    // own terms, and finding the robot first would charge eight seconds for the privilege.
+    if let Command::Scp { paths, .. } = &cli.command {
+        scp_refusal(paths)?;
+    }
+
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
     // same thing and differ only in what they do with it. It connects to nothing at all: that is
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
     // it can only report what an advertisement carries.
     let list_only = matches!(cli.command, Command::Scan);
-    // `ip`, `open` and `ssh` want one field out of an advertisement, so they read it the way `scan` does —
-    // and unlike `scan` they connect after all when no advertisement carried one. Cheap read first,
-    // call second: without the fallback these two commands would fail on exactly the laptops that
-    // use them most, because a robot bonded to this Mac often stops advertising the service to it.
+    // `ip`, `open`, `ssh` and `scp` want one field out of an advertisement, so they read it the way
+    // `scan` does — and unlike `scan` they connect after all when no advertisement carried one.
+    // Cheap read first, call second: without the fallback these commands would fail on exactly the
+    // laptops that use them most, because a robot bonded to this Mac often stops advertising the
+    // service to it.
     let resolving = matches!(
         cli.command,
-        Command::Ip | Command::Open { .. } | Command::Ssh { .. }
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. } | Command::Scp { .. }
     );
 
     let manager = Manager::new().await?;
@@ -1940,7 +2029,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
         // same question over a connection that costs a bond and a PIN.
-        Command::Ip | Command::Open { .. } | Command::Ssh { .. } => {
+        Command::Ip | Command::Open { .. } | Command::Ssh { .. } | Command::Scp { .. } => {
             ("net.status", serde_json::json!({}), REPLY_TIMEOUT)
         }
         Command::Version => (
@@ -2856,6 +2945,75 @@ mod tests {
         assert_eq!(ssh_user(None, Some("antoine".into())), "antoine");
         assert_eq!(ssh_user(None, Some("".into())), "radxa");
         assert_eq!(ssh_user(None, None), "radxa");
+    }
+
+    /// A leading `:` is the robot, in either operand, and everything else reaches `scp` as typed.
+    #[test]
+    fn scp_points_colon_paths_at_the_robot_and_leaves_the_rest_alone() {
+        let up = scp_argv("radxa", "192.168.10.136", &paths(&["report.md", ":/tmp/"]));
+        assert_eq!(up, ["report.md", "radxa@192.168.10.136:/tmp/"]);
+
+        let down = scp_argv(
+            "pierre",
+            "192.168.10.136",
+            &paths(&[":/var/log/robotd.log", "."]),
+        );
+        assert_eq!(down, ["pierre@192.168.10.136:/var/log/robotd.log", "."]);
+
+        // Flags, several sources, and a bare `:` for the home directory — all of it passes
+        // through, because the rewrite only ever looks at the first character.
+        let many = scp_argv("radxa", "192.168.10.136", &paths(&["-r", "a", "b:c", ":"]));
+        assert_eq!(many, ["-r", "a", "b:c", "radxa@192.168.10.136:"]);
+    }
+
+    /// The two refusals `scp`'s own usage error could not have explained: a copy that names no
+    /// path on the robot, and a source with nothing to copy it to.
+    #[test]
+    fn scp_refuses_a_copy_the_robot_has_nothing_to_do_with() {
+        let local = scp_refusal(&paths(&["a", "b"])).expect_err("neither side is the robot");
+        assert!(local.contains("leading `:`"), "names the rule: {local}");
+        assert!(local.contains("duckctl scp"), "shows the shape: {local}");
+
+        let lonely = scp_refusal(&paths(&[":/tmp/x"])).expect_err("a source with no destination");
+        assert!(
+            lonely.contains("destination"),
+            "says what is missing: {lonely}"
+        );
+
+        scp_refusal(&paths(&["report.md", ":/tmp/"])).expect("a copy that touches the robot");
+        scp_refusal(&paths(&["-r", ":/tmp/logs", "."])).expect("a flag is not an operand");
+    }
+
+    /// `scp` takes the same `--user` as `ssh`, its paths are trailing, and it needs at least one.
+    #[test]
+    fn scp_parses_its_user_and_requires_a_path() {
+        let cli = Cli::try_parse_from(["duckctl", "scp", "--user", "pierre", "x", ":/tmp/"])
+            .expect("parses");
+        let Command::Scp { user, paths } = &cli.command else {
+            panic!("not an scp command");
+        };
+        assert_eq!(user.as_deref(), Some("pierre"));
+        assert_eq!(paths, &["x".to_owned(), ":/tmp/".to_owned()]);
+
+        // `--` ends `duckctl`'s flags, so an `scp` flag of the same shape is not mistaken for one.
+        let cli = Cli::try_parse_from(["duckctl", "scp", "--", "-r", "logs/", ":/tmp/"])
+            .expect("a flag for scp parses after `--`");
+        let Command::Scp { paths, .. } = &cli.command else {
+            panic!("not an scp command");
+        };
+        assert_eq!(
+            paths,
+            &["-r".to_owned(), "logs/".to_owned(), ":/tmp/".to_owned()]
+        );
+
+        assert!(
+            Cli::try_parse_from(["duckctl", "scp"]).is_err(),
+            "scp with nothing to copy"
+        );
+    }
+
+    fn paths(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| (*path).to_owned()).collect()
     }
 
     #[test]

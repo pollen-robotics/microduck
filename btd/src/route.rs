@@ -352,6 +352,10 @@ fn permits(call: &proto::Call) -> bool {
         // The transport is the gate here, not the credential.
         PolicyFetch(_) | PolicyInstall(_) => true,
 
+        // The detector's set, by the same argument: a read that reaches the network, and an
+        // install whoever tapped it is standing next to.
+        DetectorCheck | DetectorInstall(_) => true,
+
         // ── the account, which BLE is the right transport for ────────────────
         //
         // Signing the robot in to a Hugging Face account is what makes it reachable from outside
@@ -502,6 +506,8 @@ mod tests {
                 // the download, the shape gate at load, the clamps, the fall reflex.
                 proto::method::POLICY_INSTALL,
                 proto::method::POLICY_FETCH,
+                // Replacing the detector, by the same argument as the policy set.
+                proto::method::DETECTOR_INSTALL,
                 // Binding the robot to a Hugging Face account, and unbinding it. Provisioning,
                 // like the two below it and for the same reason: a robot out of a box has no
                 // network, so it has no console and no LAN to open one from, and this is the
@@ -688,6 +694,8 @@ mod tests {
                 query: "microduck".to_owned(),
             }),
             proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+            proto::Call::DetectorCheck,
+            proto::Call::DetectorInstall(proto::PolicyInstallParams::default()),
         ] {
             assert_eq!(
                 upstream_for(&call),

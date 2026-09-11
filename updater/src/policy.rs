@@ -24,6 +24,29 @@ use crate::source::http;
 /// Where the sets live. Matches `robotd_params::POLICY_DIR`'s parent and the seeder's default.
 pub const POLICY_ROOT: &str = "/opt/robot/policies";
 
+/// Where the duck detector lives. Matches `robotd_params::DETECTOR_DIR`'s parent and
+/// `scripts/seed-detector.sh`'s default — the same layout as the policies, one directory over,
+/// so [`check`], [`install_set`] and the seeder's rules apply unchanged.
+pub const DETECTOR_ROOT: &str = "/opt/robot/detector";
+
+/// What a detector set holds, NPU first. The detector's repo carries no manifest — its file
+/// names are fixed — so this list is the download list, and `scripts/seed-detector.sh` and
+/// `robotd_params::DETECTOR_FILES` carry the same one; an xtask test holds the three together.
+///
+/// The model repo shares its name with the dataset repo. Everything here addresses the model
+/// (`resolve/` without a `datasets/` prefix, `api/models/`), so the shared name cannot cross.
+pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
+
+/// Where a set's file list comes from.
+#[derive(Debug, Clone, Copy)]
+pub enum Contents {
+    /// The revision's `manifest.json`, falling back to what the installed set holds — the
+    /// official policy set, whose list can grow with a tag.
+    Manifest,
+    /// A fixed list — the detector, whose two files have fixed names and no manifest.
+    Fixed(&'static [&'static str]),
+}
+
 /// The provenance record the seeder writes beside a set.
 const SOURCE_FILE: &str = ".source";
 
@@ -221,14 +244,23 @@ fn files_in_manifest(bytes: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Download one revision of the official policy set into `root`, and point `current` at it.
+pub async fn install(
+    root: &Path,
+    version: Option<&str>,
+) -> Result<(String, Option<String>), Error> {
+    install_set(root, version, Contents::Manifest).await
+}
+
 /// Download one revision of a repo into `root`, and point `current` at it.
 ///
 /// Nothing partial goes live: the files land in a staging directory and the symlink moves only
 /// once every one of them has arrived. Same rule the seeder follows, and for the same reason —
-/// a half-written set is one a restarting `robotd` could read.
-pub async fn install(
+/// a half-written set is one a restarting `robotd` (or `mediad`) could read.
+pub async fn install_set(
     root: &Path,
     version: Option<&str>,
+    contents: Contents,
 ) -> Result<(String, Option<String>), Error> {
     let source = installed(root).ok_or_else(|| {
         Error::Network("no policy set is installed, so there is no repo to install from".into())
@@ -257,10 +289,15 @@ pub async fn install(
         return Ok((version, None));
     }
 
-    let (files, manifest) = set_files(&client, &source.repo, &version).await;
-    let files = match files.is_empty() {
-        false => files,
-        true => installed_files(root),
+    let (files, manifest) = match contents {
+        Contents::Manifest => {
+            let (files, manifest) = set_files(&client, &source.repo, &version).await;
+            match files.is_empty() {
+                false => (files, manifest),
+                true => (installed_files(root), None),
+            }
+        }
+        Contents::Fixed(names) => (names.iter().map(|n| (*n).to_owned()).collect(), None),
     };
     if files.is_empty() {
         return Err(Error::Network(format!(

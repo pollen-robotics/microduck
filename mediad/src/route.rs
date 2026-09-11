@@ -162,6 +162,10 @@ fn permits(call: &proto::Call) -> bool {
         // neighbour can already replace with `robot.loadPolicy`.
         PolicyFetch(_) | PolicyInstall(_) => true,
 
+        // The detector's set, the same way. Installing one restarts *this* daemon, which ends the
+        // session that asked — the answer is sent before the restart, and the peer reconnects.
+        DetectorCheck | DetectorInstall(_) => true,
+
         // ── the account, permitted, and this one is worth reading ────────────
         //
         // The console is the obvious place to sign a robot in from: it is a page with the robot
@@ -389,6 +393,9 @@ mod tests {
                 // a decision.
                 proto::method::POLICY_INSTALL,
                 proto::method::POLICY_FETCH,
+                // Replacing the detector, which restarts this daemon. Permitted for the policy
+                // set's reason; the session ends and the peer reconnects.
+                proto::method::DETECTOR_INSTALL,
                 // Binding this robot to a Hugging Face account, and unbinding it. The argument
                 // is in the table above — briefly: the console is where somebody would sign a
                 // robot in, a robot that already belongs to somebody refuses without `force`,
@@ -508,6 +515,8 @@ mod tests {
                 query: "microduck".to_owned(),
             }),
             proto::Call::PolicyInstall(proto::PolicyInstallParams::default()),
+            proto::Call::DetectorCheck,
+            proto::Call::DetectorInstall(proto::PolicyInstallParams::default()),
         ] {
             assert!(
                 matches!(route_for(&call), Route::To(..)),

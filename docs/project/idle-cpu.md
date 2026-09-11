@@ -4,14 +4,15 @@ A duck sitting on a desk with no pad connected, no viewer, and nothing driving i
 five daemons. This is what they were each doing in that state, what was changed, and — for the
 two candidates that were not — the numbers that say why.
 
-Everything here is arithmetic on the code or a measurement on this machine. **Nothing in it has
-been measured on a board**, and the last section says what that would take.
+Everything here was arithmetic on the code or a measurement on this machine. **Only the test
+pattern has been measured on a board**; the last section says what the rest would take.
 
 ## What was costing something
 
 | | idle before | idle after |
 |---|---|---|
 | `mediad` raw branch | 1.84 MB copied 30×/s | copied when a reader asks — ~2×/s |
+| `mediad` test pattern | 720p30 drawn by the CPU — 29.4% of a core | 256x144@5 — 0.7% of the pixel rate |
 | `tofd` frame poll | ~100 I²C reads/s | ~45 |
 | `padd`, pad connected, sticks centred | 50–100 msg/s | 10 |
 | `pet-detect`, when enabled | ~400 FFTs/s + 4 forward passes/s | none until the room makes a sound |
@@ -19,7 +20,8 @@ been measured on a board**, and the last section says what that would take.
 ### `mediad` copied every frame
 
 The appsink callback copied every buffer off the tee into a slot readers took the latest of.
-At 720p30 — the shipped quality, and `media.camera` defaults on — a UYVY frame is 1 280 × 720 × 2
+At 720p30 — the shipped quality, and `media.source` defaults to the camera — a UYVY frame is
+1 280 × 720 × 2
 = 1.84 MB. The readers are auto-exposure at 2 Hz and the duck detector at 2 Hz when enabled, so
 twenty-eight of every thirty copies were made for nobody: 55 MB/s of memcpy and a 1.8 MB
 allocation thirty times a second, from boot.
@@ -27,6 +29,30 @@ allocation thirty times a second, from boot.
 A reader now asks and the callback answers the *next* frame. Answering with the last one instead
 would be cheaper again and would put the reader's own polling period into the measurement — an
 exposure loop steering on half-second-old luma hunts rather than settles.
+
+### The test pattern was drawn at the camera's resolution
+
+A board with `[media] source = "test"` streams `videotestsrc` instead, so that a robot with no
+camera still has a session — signalling, negotiation, the datachannel, the control API, all of
+which ride the video track. It ran at `[media] quality`, the same rung a camera streams at.
+
+The difference is where the pixels come from. A camera's frames arrive off the ISP in hardware and
+cost `v4l2src` almost nothing to hand on; a test pattern's are drawn by this process, one packed
+UYVY frame at a time. Two boards, same model, both idle with nothing connected:
+
+| source | idle `mediad` |
+|---|---|
+| `Camera`, rkisp | 6.1% |
+| `Test`, 720p30 | **29.4%** |
+
+Five times the cost of the thing it stands in for, to synthesise 1.84 MB thirty times a second for
+a tee whose readers had all said no — `camera.json` on that board read `"frames":23142` against
+`"consumers":0`.
+
+The pattern now runs at `TEST_PATTERN_GEOMETRY` — 256x144 at 5 fps, 16:9 and 8-aligned like every
+`Quality` rung, 73 KB a frame. That is 0.7% of the pixel rate, and it is not a compromise: nothing
+in what the pattern is *for* wants resolution. `media.video` reports the small geometry, because
+that is what the robot is producing.
 
 ### `tofd` polled a 15 Hz sensor 100 times a second
 
@@ -110,7 +136,12 @@ measurement on a developer's machine. The four changes want confirming where the
 is:
 
 - `mediad`, `tofd` and `padd` CPU before and after, from `dev-push.sh` and `top -H`. The camera
-  one should be the visible change.
+  one should be the visible change. What exists so far is `mediad` idle on 0.12.0 — 6.1% with a
+  camera, 29.4% with the 720p test pattern — which is an after-figure for the raw branch with no
+  before-figure beside it, and nothing at all for `tofd` or `padd`.
+- The test pattern at 256x144@5 on the board that measured 29.4% at 720p30. The arithmetic says
+  0.7% of the pixel rate; what it actually leaves is `videotestsrc`'s per-frame overhead, which
+  no longer scales with the picture.
 - SoC temperature at idle over ten minutes, which is the number the whole exercise is for. The
   `videoflip` episode took this board to 97 °C and throttled it to 408 MHz, so idle headroom is
   what decides whether a duck walks well while it is also looking at something.
@@ -119,3 +150,10 @@ is:
   doing it.
 - That petting still starts as promptly as it did, on a robot in an ordinary room rather than a
   silent one.
+
+## What came after
+
+The head sensors were the loose end here, and a `ps -L` on a board settled them: `tofd`'s idle ~5%
+is 4.5% head IMU and 0.5% depth, and the IMU has no consumer in the tree at all. So the poll this
+page made cheaper was never the cost, and the thing worth turning off is the sensor nobody asked
+for. See [`tof-on-demand.md`](tof-on-demand.md).

@@ -89,6 +89,31 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
 — else `radxa`. Words after `--` run on the robot instead of opening a shell.
 
+Files go the same way:
+
+```bash
+duckctl scp report.md :/tmp/
+```
+
+```bash
+duckctl scp :/var/log/robotd.log .
+```
+
+A path starting with `:` is on the robot — `scp`'s own `host:path` with the host left out, since the
+host is the part this finds for you. Everything else reaches `scp` as typed, `-r` and the rest of
+its flags included, and the progress meter and the exit status are `scp`'s own. The account resolves
+the way `ssh`'s does.
+
+This tool's own flags come first, before the paths:
+
+```bash
+duckctl --name ducky scp -r logs/ :/tmp/
+```
+
+A copy with no `:` anywhere in it is refused before the scan, because it is a local-to-local copy
+that no robot is party to and nothing in `scp`'s output would say so. A local file that really is
+named `:foo` is `./:foo`.
+
 A robot bonded to this machine often stops advertising the service to it, and then `ip` connects and
 asks `net.status` instead. That is slower and needs the PIN, and it always answers. `--verbose` says
 which of the two happened.

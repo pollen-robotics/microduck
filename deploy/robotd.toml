@@ -1,7 +1,10 @@
 # robotd — per-robot parameters.
 #
-# Installed to /etc/robot/robotd.toml. Read once at startup, not watched: changing
-# anything here needs `systemctl restart robotd`. Live reload is deferred
+# Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
+# mostly a change needs a restart — of the daemon that reads the section, which is not
+# always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
+# exceptions: padd re-reads [pad_imu_head_control] a second after the file changes, and robotd
+# re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
 # (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
@@ -332,20 +335,26 @@ mode = "walk"
 # withdrew keeps sounding.
 # hold_ms = 250
 
-[detect]
+[duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because
 # this is the file `robotctl configure` edits and a robot has one place for its settings.
 #
-# **Off by default.** The model ships in the release (models/duck_detect.rknn for the NPU,
-# models/duck_detect.onnx for the CPU), and a robot nobody has asked to look for ducks should not
-# pay ~60 ms of work every half second for it.
+# **Off by default.** A robot nobody has asked to look for ducks should not pay ~60 ms of work
+# every half second for it.
 # enabled = true
 
 # Which model, and therefore which processor: a `.rknn` runs on the NPU, an `.onnx` on the CPU.
-# Unset tries the release's own, NPU first — and falls through to the CPU on a board whose NPU is
+# Unset means the installed set — /opt/robot/detector/current/duck_detect.rknn for the NPU,
+# duck_detect.onnx for the CPU — NPU first, falling through to the CPU on a board whose NPU is
 # switched off in its device tree, which is how Armbian ships the Radxa Zero 3. `sudo sh
 # /opt/robot/daemon/current/scripts/setup-npu.sh` turns it on, and needs a reboot.
+#
+# That set comes from the Hub (pollen-robotics/microduck-duck-detector, trained in
+# pollen-robotics/duck_detector), the way the official policy set does: the release's postinstall
+# hook seeds it once, `robotctl duck-detector check` asks whether a newer one exists, and
+# `sudo robotctl duck-detector update` installs it and restarts mediad onto it. A retrain is a tag
+# there, not a daemon release. This key is for a model of your own.
 # model = "/home/microduck/my_detector.rknn"
 
 # Looks per second. **2 is a thermal limit, not a preference**: flat out this reaches 95 °C on a
@@ -357,6 +366,24 @@ mode = "walk"
 # reads anything at all, because the output tensor shares one quantisation scale with the box
 # coordinates. So this is a yes/no threshold rather than a dial.
 # threshold = 0.35
+
+[head_imu]
+# The BMI088 on the head module, read by tofd and served as `head_imu.stream` — gyro,
+# acceleration and a Madgwick orientation, for the mapping work.
+#
+# **Off by default, and this is the whole section.** Reading it at 100 Hz costs ~3.5-4.5% of a
+# core on this SoC, and a bench that takes the loop apart says none of that is fixable: the
+# wakeups are 0.7 points of it, the fusion 0.3, and the rest is the two I²C transactions a
+# sample takes — which is what a gyro and an accelerometer sample *is*. Nothing subscribes to
+# the stream yet, so every duck was paying it from boot for nobody.
+#
+# Turn it on when something reads it. `tofd --imu-hz 50` is the other lever: the cost is linear
+# in the rate. Depth is unaffected either way — tofd ranges the ToF regardless, so
+# `robotctl monitor`'s grid does not depend on this.
+#
+# A subscriber to `head_imu.stream` while this is off gets the reason, naming this key, rather
+# than the silence a board with no sensor fitted gives.
+# enabled = false
 
 [chorale]
 # Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
@@ -380,10 +407,16 @@ mode = "walk"
 # only supported way to change one was a systemd drop-in, and nobody reaches for a drop-in to
 # answer "why is the video soft?".
 
-# Stream the head camera. Off streams a test pattern instead, which is what a board with no
-# camera wants — the pipeline still starts, so the WebRTC *control* channel still exists. It is
-# bundled with the video track, so a pipeline that will not start costs both.
-# camera = true
+# Where the video comes from: "camera" or "test".
+#
+# "test" streams a test pattern, which is what a board with no camera wants — the pipeline still
+# starts, so the WebRTC *control* channel still exists. It is bundled with the video track, so a
+# pipeline that will not start costs both. A name rather than a boolean because "camera = false"
+# does not mean "no video", it means "synthetic video", and nothing in the old key said so.
+#
+# The pattern ignores `quality` and runs at 256x144@5: it exists to make the session reachable,
+# and drawing a 720p30 one in software cost five times what the camera it stands in for does.
+# source = "camera"
 
 # Frame size and rate, as one name: 1080p30, 720p30, 720p15 or 360p30.
 #
@@ -432,7 +465,10 @@ mode = "walk"
 # driving. A third press hands the head back to the pad from where the pad is *now* — its yaw is
 # a gyro's word alone and drifts, and re-centring on every re-entry is how you beat that without
 # a magnetometer. Off, or on a pad with no IMU, Y is what it always was.
-# [imu_head]
+#
+# Not [head_imu], which is the IMU in the robot's head. This section was [imu_head] once; a file
+# still saying that loads, and `robotctl configure` renames it on its next save.
+# [pad_imu_head_control]
 # enabled = false
 
 # Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into

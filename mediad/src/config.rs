@@ -1,7 +1,7 @@
 //! What this daemon streams and what it looks for, out of the config file `robotd` already reads.
 //!
 //! `[media]` in `/etc/robot/robotd.toml` — camera or test pattern, frame size, rate, bitrate — and
-//! `[detect]` beside it, which is this daemon's too because the frames are on this daemon's tee.
+//! `[duck_detector]` beside it, which is this daemon's too because the frames are on this daemon's tee.
 //! The schema, the defaults and the validation are `robotd_params`'s, which is the point: the crate
 //! read here is the one `robotctl configure` writes through, so the editor cannot offer a value
 //! this daemon would not understand.
@@ -45,7 +45,7 @@ pub fn load(path: &Path, explicit: bool) -> Params {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use robotd_params::MediaParams;
+    use robotd_params::{MediaParams, MediaSource};
 
     fn write(dir: &Path, text: &str) -> PathBuf {
         let path = dir.join("robotd.toml");
@@ -62,7 +62,11 @@ mod tests {
         assert_eq!(media.quality.size(), (640, 360));
         assert_eq!(media.quality.fps(), 30);
         assert_eq!(media.bitrate_resolved(), media.quality.default_bitrate());
-        assert!(media.camera, "untouched keys keep their defaults");
+        assert_eq!(
+            media.source,
+            MediaSource::Camera,
+            "untouched keys keep their defaults"
+        );
     }
 
     /// A robot with no file at the default path streams its camera, and says nothing about it.
@@ -71,7 +75,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let media = load(&dir.path().join("absent.toml"), false).media;
         assert_eq!(media.quality, MediaParams::default().quality);
-        assert!(media.camera);
+        assert_eq!(media.source, MediaSource::Camera);
     }
 
     /// The claim the doc comment makes, pinned: a params file `robotd` will not start on still
@@ -82,7 +86,7 @@ mod tests {
         let path = write(dir.path(), "[media\nquality = ");
         let media = load(&path, true).media;
         assert_eq!(media.quality, MediaParams::default().quality);
-        assert!(media.camera);
+        assert_eq!(media.source, MediaSource::Camera);
     }
 
     /// A `[media]` section from a build that had a key this one does not is ignored key by key,

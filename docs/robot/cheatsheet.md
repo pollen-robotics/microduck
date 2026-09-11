@@ -122,7 +122,8 @@ about a robot behaving oddly, and until now answering it meant a full-screen edi
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
-value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
+screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
 
@@ -138,8 +139,10 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-The daemons read the file once at startup, so saving offers a restart — of the ones that read
-what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
+Saving offers what the change actually needs, from the daemon that actually reads it: a restart
+for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
+`[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -151,9 +154,12 @@ sudo robotctl configure
 ```
 
 Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
-offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+offers. `media.source` set to `test` streams a test pattern instead, which is what a board with
+no camera
 wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
-costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+costs both. The pattern ignores `media.quality` and runs at 256x144@5 — it is there to make the
+session exist, and drawing a 720p one costs five times the CPU a real camera does.
+`media.bitrate` follows the quality unless you set it; the unit is bits per second.
 
 `media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
 `disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
@@ -215,6 +221,23 @@ nothing and says so plainly when the Hub cannot be reached. `update` takes the n
 name one — `--version v1` is how to go back. The robot returns to its home pose, re-reads every
 slot and drives again, and **a slot you loaded yourself is left alone**, because it points
 somewhere else entirely.
+
+#### A newer duck detector
+
+The model `mediad` finds other ducks with lives on the Hub the same way
+(`pollen-robotics/microduck-duck-detector`) and versions on its own line:
+
+```
+robotctl duck-detector check
+```
+
+```
+sudo robotctl duck-detector update
+```
+
+Same shape as the policy pair — `--version <tag>` names one, and `check` changes nothing. `update`
+restarts `mediad`, which drops the console's video for a moment; whether the detector then runs at
+all is `[duck_detector] enabled` in `robotctl configure`.
 
 #### Trying your own file
 
@@ -480,7 +503,7 @@ mapping is the prototype's, so muscle memory carries over:
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
 | **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
-| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[imu_head] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
+| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[pad_imu_head_control] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |
@@ -757,6 +780,19 @@ The sensor shares the codec's I²C bus, so `setup-board.sh`'s audio section alre
 provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
 name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
 interchangeable on the board, and the daemon picks the driver from an ID read.
+
+#### The head IMU (`head_imu.stream`)
+
+`tofd` also serves the head module's BMI088 — gyro, acceleration and a Madgwick
+orientation — and it is **off by default**: `[head_imu] enabled` in `robotd.toml`,
+set with `robotctl configure`, which offers the `tofd` restart. Reading it costs
+~4% of a core at 100 Hz and nothing subscribes yet, so a duck that is not mapping
+was paying that from boot. A subscriber while it is off gets a reason naming the
+key, not the silence an unfitted sensor gives. `tofd --imu` reads it for one
+session without touching the file, and `--imu-hz` trades rate for cost linearly.
+
+None of this touches depth: the ToF ranges either way, so the grid above works on
+a duck whose IMU has never been switched on.
 
 ### Wifi (`configd`)
 

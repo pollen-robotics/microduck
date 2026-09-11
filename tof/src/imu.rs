@@ -90,6 +90,18 @@ impl ImuStatus {
         inner.unavailable = None;
     }
 
+    /// Switched off in the config, rather than absent or broken.
+    ///
+    /// A separate sentence from [`Self::lost`] on purpose: every other reason this stream has
+    /// nothing is a board to go and look at, and this one is a line in `robotd.toml`. A
+    /// subscriber that cannot tell them apart sends somebody to check a cable.
+    pub fn off(&self) {
+        self.lost(
+            "the head IMU is off — `[head_imu] enabled = true` in robotd.toml, then restart tofd"
+                .to_owned(),
+        );
+    }
+
     fn lost(&self, why: String) {
         let mut inner = self.inner.lock().unwrap();
         inner.sensor = None;
@@ -145,19 +157,19 @@ pub fn imu_loop(
             let tick = Instant::now();
             let dt = (tick - last).as_secs_f32().clamp(1e-4, 0.2);
             last = tick;
-            match ahrs.update(dt) {
-                Ok((gyro, quat)) => {
-                    // A failed accelerometer read must not become `(0, 0, 0)`: zero acceleration
-                    // is indistinguishable from free-fall to a consumer, and nothing recovers from
-                    // it. Reopen the chip instead, exactly as a gyro failure does below.
-                    let accel = match ahrs.imu().read_accelerometer_ms2() {
-                        Ok(accel) => accel,
-                        Err(e) => {
-                            status.lost(format!("accelerometer read failed: {e:?}"));
-                            tracing::warn!("head IMU accelerometer read failed; reopening");
-                            break;
-                        }
-                    };
+            // `update_all` rather than `update`: both read the accelerometer and the gyroscope,
+            // and only this one hands the accelerometer sample back. Asking for it afterwards —
+            // which is what this loop used to do — read the same six registers a second time.
+            //
+            // **Not for the CPU.** A transaction is worth about 9 µs of the ~440 µs a sample
+            // costs on this board (`bench_imu` at 100 Hz: 4.53% for three reads against 4.46%
+            // for two), so this buys nothing measurable and the idle cost of this thread is
+            // somewhere else entirely. What it buys is that the published `accel` is the sample
+            // the quaternion was computed from, rather than one read ~200 µs later, and that a
+            // read can fail in one place instead of two — either chip failing reopens rather
+            // than publishing a zero acceleration, which a consumer cannot tell from free-fall.
+            match ahrs.update_all(dt) {
+                Ok((accel, gyro, quat)) => {
                     if seq.is_multiple_of(TEMP_EVERY)
                         && let Ok(t) = ahrs.imu().read_temperature()
                     {
@@ -169,7 +181,7 @@ pub fn imu_loop(
                         at_us: started.elapsed().as_micros() as u64,
                         t_ns: proto::clock::monotonic_ns(),
                         gyro,
-                        accel: [accel.0, accel.1, accel.2],
+                        accel,
                         quat,
                         temp_c,
                     });
@@ -244,5 +256,38 @@ fn sleep_unless_shutdown(dur: Duration, shutdown: &Arc<AtomicBool>) {
         let step = left.min(slice);
         std::thread::sleep(step);
         left = left.saturating_sub(step);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three answers a subscriber can get, and the one this switch adds.
+    ///
+    /// "Off" has to be distinguishable from "not fitted" in the sentence itself, because they
+    /// are the same silence: one is a line in a file and the other is a board to go and look
+    /// at. So the reason names the key.
+    #[test]
+    fn switched_off_reads_differently_from_absent() {
+        let status = ImuStatus::new(100);
+
+        let fresh = status.result();
+        assert!(fresh.sensor.is_none());
+        assert_eq!(fresh.hz, 100);
+
+        status.off();
+        let off = status.result();
+        let why = off.unavailable.expect("a reason");
+        assert!(why.contains("[head_imu] enabled"), "{why}");
+        assert!(off.sensor.is_none());
+        // Still `accepted`: the subscription is fine, there is simply nothing coming. A refusal
+        // would send a client into a reconnect loop over a setting.
+        assert!(off.accepted);
+
+        status.lost("nothing answered on any bus".to_owned());
+        let absent = status.result();
+        let why = absent.unavailable.expect("a reason");
+        assert!(!why.contains("[head_imu]"), "{why}");
     }
 }

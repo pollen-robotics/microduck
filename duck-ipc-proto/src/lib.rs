@@ -316,6 +316,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
 /// that the robot is too old rather than failing obscurely.
 ///
+/// # v28 — `detector.*`
+///
+/// The duck detector leaves the release the way the policies did at v19: `mediad` reads it from
+/// `/opt/robot/detector/current`, the release's postinstall hook seeds that from a pinned Hub
+/// revision, and `detector.check` / `detector.install` are how a board asks what exists and
+/// moves to it — `policy.check` / `policy.install` with a different root, answered by the same
+/// daemon for the same reason (it has the network stack). An install restarts `mediad`, which is
+/// where the model is loaded, and says whether that took.
+///
+/// Additive as methods; the parameters and answers are the policy set's own types.
+///
 /// # v27 — the pad's IMU, on the pad tap
 ///
 /// Three more [`PadReport`] variants: a pad's inertial unit as a second evdev node beside the one
@@ -326,7 +337,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 27;
+pub const API_VERSION: u32 = 28;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -642,6 +653,16 @@ pub mod method {
     /// Search the Hub for policies.
     pub const POLICY_SEARCH: &str = "policy.search";
 
+    // ── detector.* ───────────────────────────────────────────────────────────
+    //
+    // The duck detector's set, served by `updaterd` for `policy.*`'s reason. The answers are
+    // `policy.*`'s types: a set is a set, whatever is in it.
+
+    /// Is there a newer duck detector than the one installed?
+    pub const DETECTOR_CHECK: &str = "detector.check";
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    pub const DETECTOR_INSTALL: &str = "detector.install";
+
     // ── account.* ────────────────────────────────────────────────────────────
     //
     // Which Hugging Face account this robot belongs to. Served by `updaterd` for `policy.*`'s
@@ -928,6 +949,12 @@ pub enum Call {
     /// Search the Hub; see [`method::POLICY_SEARCH`].
     PolicySearch(PolicySearchParams),
 
+    // ── detector.* ───────────────────────────────────────────────────────────
+    /// What detector is installed and what the Hub offers; see [`method::DETECTOR_CHECK`].
+    DetectorCheck,
+    /// Install a detector and restart `mediad` onto it; see [`method::DETECTOR_INSTALL`].
+    DetectorInstall(PolicyInstallParams),
+
     // ── account.* ────────────────────────────────────────────────────────────
     /// Start a device-code login; see [`method::ACCOUNT_LOGIN`].
     AccountLogin(AccountLoginParams),
@@ -1079,6 +1106,8 @@ impl Call {
             Call::PolicyInstall(_) => method::POLICY_INSTALL,
             Call::PolicyFetch(_) => method::POLICY_FETCH,
             Call::PolicySearch(_) => method::POLICY_SEARCH,
+            Call::DetectorCheck => method::DETECTOR_CHECK,
+            Call::DetectorInstall(_) => method::DETECTOR_INSTALL,
             Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
             Call::AccountStatus => method::ACCOUNT_STATUS,
             Call::AccountLogout => method::ACCOUNT_LOGOUT,
@@ -1143,6 +1172,9 @@ impl Call {
                 // replacing the official set. `policy.search` and `policy.fetch`'s read-only
                 // cousins stay ungated — asking what exists changes nothing.
                 | Call::PolicyFetch(_)
+                // Replacing the detector writes to the eMMC and restarts `mediad`, which drops
+                // every video session. `detector.check` is a read and stays ungated.
+                | Call::DetectorInstall(_)
                 // Signing the robot in binds it to a Hugging Face account, and signing it out
                 // takes it away again. That is the most consequential pair here by one measure
                 // nothing else in this list shares: it decides who can reach the robot *from
@@ -1200,6 +1232,9 @@ impl Call {
             // `robotd` to reload, which is the same order of magnitude as a small update — long,
             // but bounded and not a stream.
             Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
+            // The same two, for the detector: one round trip, or a fourteen-megabyte download
+            // and a `mediad` restart.
+            Call::DetectorCheck | Call::DetectorInstall(_) => (Updater, Prompt),
             // `fetch` downloads one file and `search` is a single query; both are bounded and
             // neither streams.
             Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
@@ -1349,6 +1384,7 @@ impl Call {
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::PolicyInstall(p) => encode(p),
+            Call::DetectorInstall(p) => encode(p),
             Call::PolicyFetch(p) => encode(p),
             Call::PolicySearch(p) => encode(p),
             Call::AccountLogin(p) => encode(p),
@@ -1383,6 +1419,7 @@ impl Call {
             | Call::RobotModel
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
+            | Call::DetectorCheck
             | Call::AccountStatus
             | Call::AccountLogout
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
@@ -1458,6 +1495,8 @@ impl Call {
             method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
             method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
             method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
+            method::DETECTOR_CHECK => Call::DetectorCheck,
+            method::DETECTOR_INSTALL => Call::DetectorInstall(decode(params)?),
             method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
             method::ACCOUNT_STATUS => Call::AccountStatus,
             method::ACCOUNT_LOGOUT => Call::AccountLogout,
@@ -1619,6 +1658,10 @@ pub mod test_support {
             }),
             Call::PolicySearch(PolicySearchParams {
                 query: "microduck".into(),
+            }),
+            Call::DetectorCheck,
+            Call::DetectorInstall(PolicyInstallParams {
+                version: Some("v2".into()),
             }),
             Call::AccountLogin(AccountLoginParams { force: false }),
             Call::AccountStatus,
@@ -2306,7 +2349,7 @@ pub struct PolicySlot {
     pub error: Option<String>,
 }
 
-/// Which set to install, for [`Call::PolicyInstall`].
+/// Which set to install, for [`Call::PolicyInstall`] and [`Call::DetectorInstall`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyInstallParams {
@@ -5084,7 +5127,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            65,
+            67,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5298,6 +5341,9 @@ mod tests {
                 // list: asking what exists is inspection, and support has to be able to ask it
                 // on a robot it may not change.
                 method::POLICY_FETCH,
+                // Replacing the detector writes fourteen megabytes to the eMMC and restarts
+                // `mediad`. `detector.check` stays off this list, like `policy.check`.
+                method::DETECTOR_INSTALL,
                 // Binding the robot to an account, and unbinding it. On this list for a reason
                 // none of the others share: it decides who can reach the robot from outside the
                 // building, and it survives every reboot. `account.status` must stay off it —

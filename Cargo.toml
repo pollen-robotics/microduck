@@ -56,6 +56,15 @@ runtime = "v2.3.2"
 repo    = "pollen-robotics/microduck-policies"
 version = "v1"
 
+# The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
+# and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
+# `robotctl duck-detector update`. The model repo shares its name with the *dataset* repo; the robot only
+# ever addresses the model (`huggingface.co/<repo>/resolve/…`, `api/models/<repo>`), and the
+# dataset lives under `datasets/`, so the shared name cannot be confused on the wire.
+[workspace.metadata.detector]
+repo    = "pollen-robotics/microduck-duck-detector"
+version = "duck-v1"
+
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
 # Rockchip MPP) and `webrtcsink`/`webrtcsrc`, neither of which exists in any Debian suite.
@@ -69,7 +78,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers

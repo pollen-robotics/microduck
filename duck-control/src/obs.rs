@@ -144,6 +144,13 @@ pub struct Observation {
     data: [f32; OBS_LEN],
 }
 
+/// Replay an already assembled observation (for offline policy rehearsal).
+impl From<[f32; OBS_LEN]> for Observation {
+    fn from(data: [f32; OBS_LEN]) -> Self {
+        Self { data }
+    }
+}
+
 impl Observation {
     pub fn as_slice(&self) -> &[f32] {
         &self.data

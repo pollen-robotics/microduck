@@ -27,6 +27,8 @@ tracing.workspace = true
 # internally, so a successful probe means its own load will succeed too — see
 # `policy::ensure_runtime` for why that matters.
 libloading = "0.8"
+# Identify unchanged networks when a different slot is hot-swapped.
+sha2 = "0.11.0"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic"] }
 
 # 1.6.0 is a floor, not a preference: it de-stuffs protocol 2.0 status packets whose payload
@@ -40,3 +42,6 @@ rustypot = "1.6.0"
 # not have, so leaving it on breaks the aarch64 build outright. rustypot disables it for the
 # same reason; this crate has to as well, or cargo's feature unification turns it back on.
 serialport = { version = "4.8", default-features = false }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -266,6 +266,19 @@ enum Namespace {
         file: PathBuf,
     },
 
+    /// The duck detector — which model `mediad` looks for other ducks with.
+    ///
+    /// The model is trained in `pollen-robotics/duck_detector` and published on the Hub as
+    /// `pollen-robotics/microduck-duck-detector`; a robot installs it from there the way it
+    /// installs the official policy set, into `/opt/robot/detector/current`, so a retrain is a
+    /// tag rather than a daemon release. `[duck_detector]` in the config says whether the detector runs
+    /// at all (`robotctl configure`); this is about which model it runs.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    DuckDetector {
+        #[command(subcommand)]
+        command: DuckDetectorCommand,
+    },
+
     /// Watch what the robot is doing, live.
     ///
     /// This is the one window into the control loop. It shows what a client asked for
@@ -891,6 +904,33 @@ enum AccountCommand {
     },
     /// Forget the account. The robot stops being reachable from outside the LAN.
     Logout {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `robotctl duck-detector …`
+#[derive(Subcommand, Debug)]
+enum DuckDetectorCommand {
+    /// Is there a newer duck detector than the one installed?
+    ///
+    /// Asks the Hub what revisions the detector's own repo offers, against the one on the
+    /// board. Changes nothing, and an unreachable Hub is reported rather than treated as a
+    /// failure.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a duck detector from the Hub and run it.
+    ///
+    /// The newest revision unless `--version` names one, which is also how to go back. `mediad`
+    /// is restarted onto it — the model is loaded once, at its start — which drops the console's
+    /// video for a moment; `[duck_detector] enabled` decides whether the detector then runs at all.
+    Update {
+        /// A revision in the detector repo — a tag like `v2`. Omit for the newest.
+        #[arg(long)]
+        version: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -3037,9 +3077,11 @@ fn run_policy(
     // `check` and `update` are `updaterd`'s: they need a network stack, which this binary
     // deliberately does not link and `robotd` deliberately does not have.
     match &command {
-        PolicyCommand::Check { json } => return run_policy_check(updater_socket, *json),
+        PolicyCommand::Check { json } => {
+            return run_set_check(updater_socket, Set::Policies, *json);
+        }
         PolicyCommand::Update { version, json } => {
-            return run_policy_update(updater_socket, version.as_deref(), *json);
+            return run_set_update(updater_socket, Set::Policies, version.as_deref(), *json);
         }
         PolicyCommand::Search { query, json } => {
             return run_policy_search(updater_socket, query, *json);
@@ -3475,6 +3517,24 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
     }
 }
 
+/// Ask `robotd` to re-read `[policy]`, and say whether it took it.
+///
+/// `false` is a running daemon that declined — policies are off on this robot, which is the one
+/// thing in that section a reload cannot change — and an `Err` is one that could not be reached
+/// at all. Neither is a failure worth an exit code: the config is written either way, and the
+/// next start picks it up. Shared with `configure`, which offers this instead of a restart for
+/// the same keys.
+pub(crate) fn reload_policies(robot_socket: &Path) -> Result<bool, String> {
+    (|| -> Result<bool, Failure> {
+        let mut client = Client::connect_to("robotd", robot_socket)?;
+        client.hello()?;
+        let result: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
+        Ok(result.accepted)
+    })()
+    .map_err(|e| e.message)
+}
+
 /// Tell `robotd` to re-read its skills, and say whether it did.
 ///
 /// A skill written into config is not one the robot has until the loop resolves it again, and
@@ -3482,14 +3542,7 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
 /// the whole point of the command is that trying one is cheap. An unreachable robot is not a
 /// failure here: the config is written either way, and the next start picks it up.
 fn report_reload(robot_socket: &Path) {
-    let reloaded = (|| -> Result<bool, Failure> {
-        let mut client = Client::connect_to("robotd", robot_socket)?;
-        client.hello()?;
-        let result: proto::IntentResult =
-            decode(&result_of(client.call(&proto::Call::RobotReloadPolicies)?)?)?;
-        Ok(result.accepted)
-    })();
-    match reloaded {
+    match reload_policies(robot_socket) {
         Ok(true) => println!("  the robot is re-reading its skills"),
         Ok(false) | Err(_) => {
             println!("  robotd did not pick it up — it will at the next start");
@@ -3566,10 +3619,62 @@ fn run_policy_search(updater_socket: &Path, query: &str, json: bool) -> Result<(
 }
 
 /// `robotctl policy check` — what is installed against what the repo offers.
-fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
+/// The two Hub-installed sets `updaterd` manages the same way: the official policy set and the
+/// duck detector. Same layout on disk, same provenance record, same two questions — what differs
+/// is which daemon runs the result and what to tell a person when it did not pick it up.
+#[derive(Clone, Copy)]
+enum Set {
+    Policies,
+    Detector,
+}
+
+impl Set {
+    fn check_call(self) -> proto::Call {
+        match self {
+            Set::Policies => proto::Call::PolicyCheck,
+            Set::Detector => proto::Call::DetectorCheck,
+        }
+    }
+
+    fn install_call(self, version: Option<&str>) -> proto::Call {
+        let params = proto::PolicyInstallParams {
+            version: version.map(str::to_owned),
+        };
+        match self {
+            Set::Policies => proto::Call::PolicyInstall(params),
+            Set::Detector => proto::Call::DetectorInstall(params),
+        }
+    }
+
+    /// The `robotctl` namespace, for the hint that names the install command.
+    fn namespace(self) -> &'static str {
+        match self {
+            Set::Policies => "policy",
+            Set::Detector => "duck-detector",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Set::Policies => "the official set",
+            Set::Detector => "the duck detector",
+        }
+    }
+
+    /// What tells a person whether the thing that runs it is running it.
+    fn where_it_shows(self) -> &'static str {
+        match self {
+            Set::Policies => "`robotctl health` says if a slot could not be loaded.",
+            Set::Detector => "`journalctl -u mediad` says if it could not be loaded.",
+        }
+    }
+}
+
+/// `robotctl policy check` and `robotctl duck-detector check` — what is installed, against the Hub.
+fn run_set_check(updater_socket: &Path, set: Set, json: bool) -> Result<(), Failure> {
     let mut client = Client::connect_to("updaterd", updater_socket)?;
     client.hello()?;
-    let result = result_of(client.call(&proto::Call::PolicyCheck)?)?;
+    let result = result_of(client.call(&set.check_call())?)?;
     if json {
         println!("{}", compact(&result));
         return Ok(());
@@ -3581,8 +3686,11 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
         // ask about, and the fix is the same — the daemon's post-install hook installs the set,
         // so the interesting question is why it did not.
         println!("installed  nothing this daemon can identify");
-        println!("           the release's postinstall hook installs the official set;");
-        println!("           `robotctl health` says if a slot could not be loaded.");
+        println!(
+            "           the release's postinstall hook installs {};",
+            set.what()
+        );
+        println!("           {}", set.where_it_shows());
         return Ok(());
     };
     println!("installed  {installed}  (from {repo})");
@@ -3597,7 +3705,7 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
         }
         (Some(available), _) => {
             println!("newest     {available}");
-            println!("\n`sudo robotctl policy update` installs it.");
+            println!("\n`sudo robotctl {} update` installs it.", set.namespace());
         }
         (None, _) => println!("newest     the repo has no tagged revisions"),
     }
@@ -3607,19 +3715,16 @@ fn run_policy_check(updater_socket: &Path, json: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `robotctl policy update` — fetch a set and run it.
-fn run_policy_update(
+/// `robotctl policy update` and `robotctl duck-detector update` — fetch a set and run it.
+fn run_set_update(
     updater_socket: &Path,
+    set: Set,
     version: Option<&str>,
     json: bool,
 ) -> Result<(), Failure> {
     let mut client = Client::connect_to("updaterd", updater_socket)?;
     client.hello()?;
-    let result = result_of(client.call(&proto::Call::PolicyInstall(
-        proto::PolicyInstallParams {
-            version: version.map(str::to_owned),
-        },
-    ))?)?;
+    let result = result_of(client.call(&set.install_call(version))?)?;
     if json {
         println!("{}", compact(&result));
         return Ok(());
@@ -3632,13 +3737,19 @@ fn run_policy_update(
             println!("installed {} (was {previous})", installed.installed);
             // Worth its own line rather than silence: the files are right and the robot is not
             // running them, which looks from the outside exactly like an update that did nothing.
-            if installed.reloaded {
-                println!("the robot is running it now");
-            } else {
-                println!(
+            match (set, installed.reloaded) {
+                (Set::Policies, true) => println!("the robot is running it now"),
+                (Set::Policies, false) => println!(
                     "the robot did not pick it up — it is still running the old set. \n\
                      `sudo systemctl restart robotd`, or check `robotctl health`."
-                );
+                ),
+                (Set::Detector, true) => println!(
+                    "mediad restarted onto it — if [duck_detector] enabled is on, it is looking with it now"
+                ),
+                (Set::Detector, false) => println!(
+                    "mediad did not restart — it is still running the old model. \n\
+                     `sudo systemctl restart mediad`, or check `journalctl -u mediad`."
+                ),
             }
         }
     }
@@ -4450,6 +4561,16 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Policy { command, file } => {
             return run_policy(&cli.robot_socket, &cli.socket, &file, command);
         }
+        Namespace::DuckDetector { command } => {
+            return match command {
+                DuckDetectorCommand::Check { json } => {
+                    run_set_check(&cli.socket, Set::Detector, json)
+                }
+                DuckDetectorCommand::Update { version, json } => {
+                    run_set_update(&cli.socket, Set::Detector, version.as_deref(), json)
+                }
+            };
+        }
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
@@ -4466,7 +4587,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file)
+                configure::run(&file, &cli.robot_socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }

@@ -630,6 +630,32 @@ impl Server {
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
                 }
             }
+            // The detector's set: the same two questions against the other root, and the same
+            // locking — a read that takes no lock, an install that must not run beside a release
+            // install because both would be restarting daemons at once.
+            Call::DetectorCheck => {
+                Response::ok(Some(id), &crate::policy::check(
+                    std::path::Path::new(crate::policy::DETECTOR_ROOT),
+                ).await)
+            }
+            Call::DetectorInstall(params) => {
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                match engine.install_detector(params.version.as_deref()).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
             // ── account.* ───────────────────────────────────────────────────────
             //
             // None of the three touches the engine, so none takes its lock: a login is an HTTP

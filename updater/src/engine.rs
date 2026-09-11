@@ -1299,6 +1299,42 @@ impl Engine {
         })
     }
 
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    ///
+    /// `mediad` loads the model once, at startup, so a swapped set is invisible to it until it
+    /// restarts — and unlike `robotd`'s policies there is no live reload to ask for, because the
+    /// detector is a thread holding an NPU context and the honest way to replace it is to start
+    /// again. The restart drops every video session, which is why `detector.install` is gated
+    /// like `policy.install`. `reloaded` is whether the restart took; a `mediad` this board does
+    /// not have (a bench) counts as taken, since there is nothing running the old one.
+    pub async fn install_detector(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::DETECTOR_ROOT);
+        let (installed, previous) = crate::policy::install_set(
+            root,
+            version,
+            crate::policy::Contents::Fixed(&crate::policy::DETECTOR_FILES),
+        )
+        .await?;
+        let reloaded = match &previous {
+            None => true,
+            Some(_) => match restart_one(SYSTEMCTL, MEDIAD_UNIT).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mediad did not restart onto the new detector");
+                    false
+                }
+            },
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
     /// Fetch one policy from any Hub repo into this robot's library.
     ///
     /// The model API comes from the running `robotd` rather than from a constant here, because it
@@ -2426,6 +2462,9 @@ const SYSTEMCTL: &str = "systemctl";
 
 /// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
 const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// The daemon that loads the duck detector, restarted by [`Engine::install_detector`].
+const MEDIAD_UNIT: &str = "mediad";
 
 /// This process's own unit, which the reconciliation must recognise and never restart.
 ///

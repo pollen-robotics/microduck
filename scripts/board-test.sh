@@ -771,6 +771,16 @@ sed "s|\"ORG/duck-daemon\"|\"pollen-robotics/microduck\"|" \
     /bin/deploy/updater.toml > /etc/robot/updater.toml
 cp /bin/deploy/robotd.toml /etc/robot/robotd.toml
 
+# What Armbian ships in /etc/cron.d: a simulated `apt-get upgrade` at every boot, whose only
+# reader is the login banner and which holds one core for seconds while robotd is starting.
+# setup-quiet-boot.sh is meant to empty it, and the assertion below is on what the file contains, not
+# on its absence — the package that owns it would recreate a deleted one.
+mkdir -p /etc/cron.d
+cat > /etc/cron.d/armbian-updates <<"CRON"
+@reboot root /usr/lib/armbian/armbian-apt-updates
+@daily root /usr/lib/armbian/armbian-apt-updates
+CRON
+
 # ── install.sh, the provisioning path ──
 #
 # The bootstrap download self-skips because a release is already live, which is the branch a
@@ -847,6 +857,22 @@ echo "    [ok] the login banner is installed and reports a rolled-back update"
 # updated had it.
 test -f /etc/profile.d/robot-name-prompt.sh \
     || { echo "    [FAIL] the prompt snippet was not installed"; exit 1; }
+
+# Apt off the boot path. The cron file must still exist, hold no live job, and both stock apt
+# timers must be masked — masked, not disabled, because an upgrade of apt itself re-enables a disabled
+# timer and leaves a mask alone.
+test -f /etc/cron.d/armbian-updates \
+    || { echo "    [FAIL] setup-quiet-boot deleted the Armbian cron file instead of emptying it"; exit 1; }
+if grep -Eq "^[[:space:]]*[^#[:space:]]" /etc/cron.d/armbian-updates; then
+    echo "    [FAIL] /etc/cron.d/armbian-updates still runs armbian-apt-updates at boot"
+    cat /etc/cron.d/armbian-updates
+    exit 1
+fi
+for unit in apt-daily.timer apt-daily-upgrade.timer; do
+    grep -q "^mask ${unit}$" /stub/systemctl.log \
+        || { echo "    [FAIL] install.sh did not mask ${unit}"; exit 1; }
+done
+echo "    [ok] install.sh takes the Armbian update count and the apt-daily timers off the boot path"
 test -f /etc/bash_completion.d/robotctl \
     || { echo "    [FAIL] the robotctl completions were not installed"; exit 1; }
 
@@ -1010,6 +1036,12 @@ rm -f /etc/systemd/journald.conf.d/10-robot.conf /usr/local/bin/robotctl
 # And the login-shell files, for the opposite reason: the hook is supposed to put these back, and
 # leaving the ones install.sh wrote in place would make that assertion vacuous.
 rm -f /etc/profile.d/robot-name-prompt.sh /etc/bash_completion.d/robotctl /etc/update-motd.d/40-robot
+# And the Armbian boot-time apt job put back, for the same reason: a board in the field has it, and
+# the hook is the only thing that reaches that board.
+cat > /etc/cron.d/armbian-updates <<"CRON"
+@reboot root /usr/lib/armbian/armbian-apt-updates
+@daily root /usr/lib/armbian/armbian-apt-updates
+CRON
 ( cd "$REL" && PATH="/stub:$PATH" sh "$REL"/hooks/postinstall > /tmp/hook.log 2>&1 ) || {
     echo "    [FAIL] hooks/postinstall exited non-zero, which fails an update"
     cat /tmp/hook.log
@@ -1067,6 +1099,17 @@ for f in /etc/profile.d/robot-name-prompt.sh /etc/bash_completion.d/robotctl /et
         || { echo "    [FAIL] postinstall alone did not install ${f}"; exit 1; }
 done
 echo "    [ok] postinstall alone installs the login-shell files"
+
+# Apt off the boot path, from the hook alone: the whole fleet was provisioned with the Armbian
+# `@reboot` simulated upgrade running, and an update is the only path that fixes those boards.
+if grep -Eq "^[[:space:]]*[^#[:space:]]" /etc/cron.d/armbian-updates; then
+    echo "    [FAIL] postinstall alone left armbian-apt-updates running at boot"; exit 1
+fi
+for unit in apt-daily.timer apt-daily-upgrade.timer; do
+    grep -q "^mask ${unit}$" /stub/systemctl.log \
+        || { echo "    [FAIL] postinstall alone did not mask ${unit}"; exit 1; }
+done
+echo "    [ok] postinstall alone takes apt off the boot path"
 
 # What the hook does NOT place, which is now a short list and worth naming exactly: the journald
 # drop-in and the robotctl symlink. Both were deleted above and the hook restored neither, so a
