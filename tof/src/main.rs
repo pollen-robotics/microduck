@@ -259,6 +259,18 @@ fn quiet_period(hz: u8) -> Duration {
     Duration::from_secs_f64(1.0 / f64::from(hz.max(1))).saturating_sub(POLL_GUARD)
 }
 
+/// How long the poll may be told "no frame" before the sensor is called stuck.
+///
+/// This is the one failure `data_ready` cannot see: a sensor whose ranging engine has
+/// wedged still ACKs the bus, so the register read succeeds and the answer is `false`
+/// forever — without a clock on that answer the daemon streams silence for the rest of
+/// the boot and never re-opens the sensor. Scaled to the frame period so `--hz 1` gets
+/// the same margin in frames as the shipped 15 Hz gets in time.
+fn frame_watchdog(hz: u8) -> Duration {
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz.max(1)));
+    Duration::from_secs(2).max(period * 4)
+}
+
 /// Bring the sensor up and stream from it, forever, with a backoff between
 /// attempts. Never returns until shutdown.
 fn sensor_loop(
@@ -292,6 +304,12 @@ fn sensor_loop(
                 // actually arrived.
                 let mut quiet_until: Option<Instant> = None;
 
+                // The clock for the one failure the poll cannot see — see
+                // [`frame_watchdog`]. Armed at open, so a sensor that never
+                // produces a first frame is reopened on the same bound.
+                let mut last_frame = Instant::now();
+                let watchdog = frame_watchdog(hz);
+
                 // Stream until the sensor stops answering, then fall through to
                 // the backoff and try the whole bring-up again.
                 while !shutdown.load(Ordering::Acquire) {
@@ -308,6 +326,7 @@ fn sensor_loop(
                     match sensor.data_ready() {
                         Ok(true) => match sensor.read_frame() {
                             Ok(frame) => {
+                                last_frame = Instant::now();
                                 quiet_until = Some(Instant::now() + quiet);
                                 seq += 1;
                                 // No subscribers is the normal state — nobody is
@@ -328,7 +347,16 @@ fn sensor_loop(
                                 break;
                             }
                         },
-                        Ok(false) => std::thread::sleep(POLL),
+                        Ok(false) => {
+                            if last_frame.elapsed() >= watchdog {
+                                tracing::warn!(
+                                    ?watchdog,
+                                    "no frames on a sensor that still answers; reopening it"
+                                );
+                                break;
+                            }
+                            std::thread::sleep(POLL);
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "lost the sensor");
                             break;
@@ -799,6 +827,17 @@ mod tests {
         }
         assert_eq!(backoff, RETRY_MAX);
         assert!(RETRY_MIN < RETRY_MAX);
+    }
+
+    /// The watchdog's two ends: at the shipped rate it tolerates a couple of seconds
+    /// of "no frame" — long enough that a mere late frame never trips it — and at the
+    /// slowest rate it scales with the period, so `--hz 1` is not called stuck one
+    /// second into a one-second frame.
+    #[test]
+    fn the_frame_watchdog_scales_with_the_period() {
+        assert_eq!(frame_watchdog(15), Duration::from_secs(2));
+        assert_eq!(frame_watchdog(1), Duration::from_secs(4));
+        assert_eq!(frame_watchdog(0), frame_watchdog(1), "hz 0 means 1");
     }
 
     /// **The saving, as arithmetic rather than as a claim in a comment.**
