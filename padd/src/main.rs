@@ -242,6 +242,13 @@ impl SelectButton {
         // A release after the shutdown, or a tick with nothing to say.
         SelectAction::Nothing
     }
+
+    /// Forget a hold in flight. Called when the pad goes away: the hold's start was measured
+    /// against *that* pad's button, and carrying it onto the next pad would turn a Select
+    /// still held across a long dropout into a shutdown on the first tick back.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// D-pad up held this long switches drive mode, walk ⇄ roller.
@@ -532,6 +539,12 @@ fn main() -> std::process::ExitCode {
                 tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
                 driving = false;
             }
+            // A hold in flight was measured against the pad that just left: drop it, or a
+            // Select (or D-pad up) still down when the pad returns lands its full hold time
+            // at once — a shutdown or a mode switch nobody asked for.
+            select.reset();
+            dpad_up_held_since = None;
+            mode_switch_sent = false;
             imu_head = ImuHead::Off;
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
@@ -1369,5 +1382,31 @@ mod tests {
         // And the next short press is a stop again.
         assert_eq!(select.tick(true, false, at(6_000)), SelectAction::Nothing);
         assert_eq!(select.tick(false, true, at(6_100)), SelectAction::Relax);
+    }
+
+    /// Select held when the pad drops, back three seconds later with Select still down: that
+    /// is a reconnection, not a two-second hold — the hold was measured against the pad that
+    /// left. Pinned both ways, because the `tick` arithmetic alone would call it a shutdown.
+    #[test]
+    fn a_hold_does_not_survive_the_pad_going_away() {
+        let t0 = Instant::now();
+        let mut select = SelectButton::default();
+        assert_eq!(select.tick(true, false, t0), SelectAction::Nothing);
+
+        select.reset();
+        assert_eq!(
+            select.tick(true, false, t0 + SHUTDOWN_HOLD + Duration::from_secs(1)),
+            SelectAction::Nothing,
+            "a hold older than the pad's absence is not a shutdown"
+        );
+
+        // Without the reset that same tick is the shutdown — the arithmetic is why the
+        // reset exists.
+        let mut stale = SelectButton::default();
+        assert_eq!(stale.tick(true, false, t0), SelectAction::Nothing);
+        assert_eq!(
+            stale.tick(true, false, t0 + SHUTDOWN_HOLD + Duration::from_secs(1)),
+            SelectAction::Shutdown
+        );
     }
 }
