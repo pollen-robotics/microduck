@@ -185,6 +185,12 @@ pub fn imu_loop(
                 sleep_unless_shutdown(period - elapsed, shutdown);
             }
         }
+
+        // A read failure fell straight back into `open_imu`: a chip that answers its ID but
+        // cannot stream was reopened in a tight loop, warning each time, on the bus the audio
+        // codec shares. Same backoff as the open-failure path above.
+        sleep_unless_shutdown(backoff, shutdown);
+        backoff = (backoff * 2).min(RETRY_MAX);
     }
 }
 
