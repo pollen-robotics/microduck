@@ -21,6 +21,33 @@ It is deliberately small. Every method is one call, and the ones that exist are 
 `mediad::route` permits — so what a script may do is what a browser on the LAN may do, decided in
 one place on the robot rather than twice.
 
+## A behaviour is a loop
+
+What the robot can see arrives on three streams at three different rates — state at the control
+rate, depth at 15 Hz, frames at whatever you asked for. `watch` merges them and hands you the
+latest of each, once per tick:
+
+```python
+with Duck("robot.local") as duck:
+    for view in duck.watch(fps=4, camera=False):
+        if view.nearest and view.nearest < 0.4:
+            duck.move(vyaw=0.8)
+        else:
+            duck.move(vx=0.12)
+```
+
+`view.nearest` is the closest thing the depth sensor can see, in metres, or `None` when it sees
+nothing usable. The interpretation is `tof::Frame::zone`'s, including the part that bites: the
+sensor returns negative distances on a failed convergence and still flags them valid, so taken at
+face value they are the nearest thing in the room.
+
+`examples/wander_without_bumping_into_things.py` is a duck that walks around a room, in about
+twenty lines of behaviour.
+
+Nothing here looks at a picture. `view.frame` is the JPEG as it arrived and what is in it is your
+model to run — an SDK that shipped one would be a much bigger dependency and a worse guess than
+whatever you already have.
+
 ## Frames
 
 The robot does not serve frames, it **sends** them to a socket you open:

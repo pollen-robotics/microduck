@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Iterator
 
 from websockets.sync.client import connect
 
 from .rpc import Rpc, RpcError
+from .view import View
 
-__all__ = ["Duck", "RpcError"]
+__all__ = ["Duck", "RpcError", "View"]
 
 #: Where `mediad` serves the console, and the agent socket beside it.
 DEFAULT_PORT = 8080
@@ -153,6 +155,37 @@ class Duck:
         """What is streaming, if anything."""
         return self._rpc.call("media.stream")
 
+    # ── the loop ─────────────────────────────────────────────────────────────
+
+    def watch(
+        self,
+        fps: float = 2.0,
+        camera: bool = True,
+        depth: bool = True,
+        frame_port: int = 8099,
+    ) -> "Iterator[View]":
+        """Yield one [`View`] per tick, with whatever each stream sent most recently.
+
+        This is the loop a robot program is:
+
+            for view in duck.watch():
+                if view.nearest and view.nearest < 0.3:
+                    duck.stop()
+
+        It subscribes to `robot.state`, starts the depth stream, and tells the robot to send
+        frames to a socket it opens here — then merges the three and hands over the latest of
+        each. Everything is turned off again when the loop ends, including when it ends because
+        the caller raised.
+
+        `camera=False` skips the frames, which is what a behaviour that only needs state and
+        depth wants: the robot stops encoding JPEGs for nobody, and no inbound port is opened.
+
+        **The rate is the behaviour's, not the sensors'.** `robot.state` arrives at the control
+        rate and depth at 15 Hz; ticking at those would make the loop the fastest thing rather
+        than the one deciding. `fps` is how often the caller wants to think.
+        """
+        return _watch(self, fps=fps, camera=camera, depth=depth, frame_port=frame_port)
+
 
 def receive(port: int, on_frame: Callable[[bytes], None], host: str = "0.0.0.0") -> None:
     """Listen for the frames a duck was told to send, and hand each JPEG to `on_frame`.
@@ -173,3 +206,113 @@ def receive(port: int, on_frame: Callable[[bytes], None], host: str = "0.0.0.0")
 
     with serve(handler, host, port) as server:
         server.serve_forever()
+
+
+def _watch(
+    duck: Duck, fps: float, camera: bool, depth: bool, frame_port: int
+) -> Iterator[View]:
+    """[`Duck.watch`]'s body, as a generator so its `finally` runs when the caller stops."""
+    latest: dict[str, Any] = {"frame": None}
+    started = time.monotonic()
+
+    # A notification lands on the reader thread. Nothing here locks: each of these is one
+    # assignment of one reference, and a tick reading a field mid-swap gets the old value or the
+    # new one, never half of either.
+    def on_frame(jpeg: bytes) -> None:
+        latest["frame"] = jpeg
+
+    server = None
+    if camera:
+        server = _FrameServer(frame_port, on_frame)
+        server.start()
+        duck.frames(url=f"ws://{_address_the_robot_can_reach(duck.url)}:{frame_port}", fps=fps)
+
+    duck.subscribe()
+    if depth:
+        # `tofd` streams to whoever asked; the notifications land in `Rpc.notifications` beside
+        # `robot.state`, so there is nothing further to wire up.
+        try:
+            duck.call("tof.stream")
+        except RpcError:
+            # A duck with no ToF fitted refuses this, and that is not a reason to stop: a
+            # behaviour that wanted depth gets `None` and can say so itself.
+            pass
+
+    tick = 0
+    period = 1.0 / fps if fps > 0 else 0.0
+    try:
+        while True:
+            tick += 1
+            yield View(
+                frame=latest["frame"],
+                state=duck._rpc.notifications.get("robot.state"),
+                depth=duck._rpc.notifications.get("tof.frame"),
+                elapsed=time.monotonic() - started,
+                tick=tick,
+            )
+            if period:
+                time.sleep(period)
+    finally:
+        # Whatever ended the loop — a `break`, an exception, the caller simply stopping — the
+        # robot should not be left encoding frames for a socket that has gone.
+        if camera:
+            try:
+                duck.frames_stop()
+            except RpcError:
+                pass
+        if server is not None:
+            server.stop()
+
+
+class _FrameServer:
+    """The socket the robot dials, run on a thread so the loop above stays in charge."""
+
+    def __init__(self, port: int, on_frame: Callable[[bytes], None]):
+        self._port = port
+        self._on_frame = on_frame
+        self._server: Any = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        from websockets.sync.server import serve
+
+        ready = threading.Event()
+
+        def run() -> None:
+            def handler(connection: Any) -> None:
+                for message in connection:
+                    if isinstance(message, bytes):
+                        self._on_frame(message)
+
+            with serve(handler, "0.0.0.0", self._port) as server:
+                self._server = server
+                ready.set()
+                server.serve_forever()
+
+        self._thread = threading.Thread(target=run, name="duck-frames", daemon=True)
+        self._thread.start()
+        # Bound before telling the robot where to dial, or the first connection is refused and
+        # `stream.rs` backs off before anybody is listening.
+        ready.wait(timeout=5)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+
+
+def _address_the_robot_can_reach(url: str) -> str:
+    """Our address on the route to the robot.
+
+    Not `localhost`: the robot dials this, so it has to be the address *it* would use, which on
+    any machine with more than one interface is not something a caller should have to work out.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    host = urlparse(url).hostname or "127.0.0.1"
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((host, 80))
+        return str(probe.getsockname()[0])
+    finally:
+        probe.close()
