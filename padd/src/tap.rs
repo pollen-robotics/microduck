@@ -319,7 +319,11 @@ fn imu_sibling(sysfs: &Path, dev: &Path, node: &Path) -> Option<PathBuf> {
         if hid_parent(&name).as_deref() != Some(parent.as_path()) {
             continue;
         }
-        let properties = std::fs::read_to_string(candidate.join("device/properties")).ok()?;
+        // A candidate whose properties cannot be read — unplugged between the `read_dir`
+        // and here, so the file is gone — must not end the search: the IMU may sort after it.
+        let Ok(properties) = std::fs::read_to_string(candidate.join("device/properties")) else {
+            continue;
+        };
         if has_accelerometer_property(&properties) {
             return Some(dev.join("input").join(name));
         }
@@ -1264,6 +1268,39 @@ mod tests {
         assert!(has_accelerometer_property("0 40"));
         assert!(!has_accelerometer_property("0"));
         assert!(!has_accelerometer_property(""));
+    }
+
+    /// A sibling whose properties cannot be read — the device was unplugged between the
+    /// `read_dir` and the read, so the file is gone — must not end the search: the IMU may
+    /// sort after it.
+    #[test]
+    fn an_unreadable_sibling_does_not_end_the_imu_search() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = root.path().join("sys");
+        let dev = root.path().join("dev");
+        let hid_pad = sysfs.join("devices/hci0/0005:057E:2009.0001");
+        let class = sysfs.join("class/input");
+        std::fs::create_dir_all(&class).unwrap();
+
+        // event4 is the pad; event5 is a sibling that vanished mid-walk (its `properties`
+        // is a directory, which no read ever survives); event6 is the real IMU, after it.
+        for (index, event) in ["event4", "event5", "event6"].iter().enumerate() {
+            let input = hid_pad.join(format!("input/input{index}"));
+            let node = input.join(event);
+            std::fs::create_dir_all(&node).unwrap();
+            std::os::unix::fs::symlink(&node, class.join(event)).unwrap();
+            std::os::unix::fs::symlink(&input, node.join("device")).unwrap();
+            std::os::unix::fs::symlink(&hid_pad, input.join("device")).unwrap();
+        }
+        std::fs::write(hid_pad.join("input/input0/properties"), "0\n").unwrap();
+        std::fs::create_dir_all(hid_pad.join("input/input1/properties")).unwrap();
+        std::fs::write(hid_pad.join("input/input2/properties"), "40\n").unwrap();
+
+        assert_eq!(
+            imu_sibling(&sysfs, &dev, Path::new("/dev/input/event4")),
+            Some(dev.join("input/event6")),
+            "the vanished sibling is skipped, and the IMU behind it is found"
+        );
     }
 
     /// The tap's wire types are the protocol's, so a frame it builds is a frame `robotctl` parses.
