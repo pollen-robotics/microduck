@@ -479,6 +479,11 @@ fn main() -> std::process::ExitCode {
 
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.
+        //
+        // The driving pad is the first one, and only its events may act: with two pads
+        // connected, a Start or Select from the *other* one would otherwise steer a robot
+        // whose sticks belong to somebody else.
+        let pad_id = gilrs.gamepads().next().map(|(id, _)| id);
         let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
@@ -489,6 +494,9 @@ fn main() -> std::process::ExitCode {
         let mut select_released = false;
         let mut reboot_motors = false;
         while let Some(event) = gilrs.next_event() {
+            if Some(event.id) != pad_id {
+                continue;
+            }
             // Select is the one button read on its release: a short press stops, a long hold shuts
             // down, and which it was is only known when the thumb comes off.
             if let gilrs::EventType::ButtonReleased(Button::Select, _) = event.event {
@@ -520,7 +528,10 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        let Some((_, pad)) = gilrs.gamepads().next() else {
+        // Re-read the pad by id after the drain: a `Disconnected` dequeued above may have
+        // taken it, and asking for the first pad again would silently hand the robot the
+        // *other* pad's sticks. One tick of "pad gone" beats that.
+        let Some(pad) = pad_id.and_then(|id| gilrs.connected_gamepad(id)) else {
             // No pad. Send nothing: `robotd`'s deadman stops the robot on its own, which is
             // exactly the wanted behaviour, and inventing a zero command here would mask a
             // disconnected pad as a deliberate stop.
