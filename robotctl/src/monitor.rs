@@ -981,6 +981,8 @@ struct PadView {
     clock_steps: u64,
     /// The pad's inertial unit, while `padd` has one open. Its own lifecycle: a pad without one
     /// never sets this, and a pad that drops takes it away through `ImuDetached`, not `Detached`.
+    /// The two paths no report ever arrives on are covered instead below: a new `Attached` clears
+    /// it until the new pad's own `ImuAttached`, and a lost tap clears it with the pad.
     imu: Option<pad_imu::Imu>,
     /// When a sample last earned a repaint — see [`IMU_REPAINT`].
     imu_painted: Option<Instant>,
@@ -1005,6 +1007,8 @@ impl PadView {
             proto::PadReport::Attached { device } => {
                 // A new device is a new measurement: the counters and the trace describe *a link*,
                 // and carrying the old ones over would blame this pad for the last one's stalls.
+                // The IMU as well: if the new pad has one its `ImuAttached` follows, and a pad
+                // without one must not inherit the last pad's panel.
                 let device = *device;
                 self.axes = device.axes.iter().map(|a| (a.code, a.value)).collect();
                 self.held = device
@@ -1014,6 +1018,7 @@ impl PadView {
                     .map(|b| b.code)
                     .collect();
                 self.device = Some(device);
+                self.imu = None;
                 self.trouble = None;
                 self.arrived = None;
                 self.reports = 0;
@@ -1425,6 +1430,10 @@ impl View {
             }
             Update::PadLost(why) => {
                 self.pad.device = None;
+                // The IMU goes with it: the `ImuDetached` for this pad died with the tap, and
+                // the next subscription seeds only what the new `padd` has — a pad without an
+                // IMU would leave the last one's panel frozen on screen forever.
+                self.pad.imu = None;
                 self.pad.trouble = Some(why);
                 Ok(self.show_pad)
             }
@@ -3832,6 +3841,39 @@ mod tests {
             accel_max: 32767,
             gyro_max: 32_767_000,
         }
+    }
+
+    /// A pad without an IMU must not inherit the last pad's panel, on either of the two paths
+    /// no `ImuDetached` covers: a new device is a new measurement, and a lost tap's
+    /// `ImuDetached` died with the connection.
+    #[test]
+    fn a_pad_without_an_imu_never_shows_the_last_pads_panel() {
+        let imu_attached = || {
+            Update::Pad(Box::new(proto::PadReport::ImuAttached {
+                device: Box::new(an_imu()),
+            }))
+        };
+
+        // A pad swap with the tap alive: the new pad has no IMU, so no ImuAttached follows.
+        let mut view = watching_a_pad();
+        feed(&mut view, imu_attached());
+        assert!(view.pad.imu.is_some());
+        feed(
+            &mut view,
+            Update::Pad(Box::new(proto::PadReport::Attached {
+                device: Box::new(a_device()),
+            })),
+        );
+        assert!(view.pad.imu.is_none(), "a new device is a new measurement");
+
+        // The tap itself lost: no ImuDetached is coming — it died with the connection.
+        let mut view = watching_a_pad();
+        feed(&mut view, imu_attached());
+        feed(&mut view, Update::PadLost("the tap stopped".to_owned()));
+        assert!(
+            view.pad.imu.is_none(),
+            "the panel goes with the tap that fed it"
+        );
     }
 
     /// The pad block is what it always was for a pad without an IMU, and grows — with the
