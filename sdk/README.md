@@ -1,0 +1,46 @@
+# Driving a duck from a script
+
+```python
+from duck import Duck
+
+with Duck("robot.local") as duck:
+    print(duck.health()["healthy"])
+    duck.move(vx=0.1)
+```
+
+`pip install -e .`, and the robot needs `mediad` running — the socket is `/agent` on the port the
+console is served from, 8080 by default.
+
+## What it is
+
+One WebSocket, the same JSON-RPC every other transport speaks, and no media stack.
+`architecture.md` §5.3 is the argument for why a program should not have to negotiate ICE and
+decode H.264 to send an intent.
+
+It is deliberately small. Every method is one call, and the ones that exist are the ones
+`mediad::route` permits — so what a script may do is what a browser on the LAN may do, decided in
+one place on the robot rather than twice.
+
+## Frames
+
+The robot does not serve frames, it **sends** them to a socket you open:
+
+```python
+from duck import Duck, receive
+import threading
+
+threading.Thread(target=receive, args=(8099, print_frame), daemon=True).start()
+with Duck("robot.local") as duck:
+    duck.frames(url="ws://192.168.1.20:8099", fps=1)
+```
+
+That direction is the point. A robot behind a home router and a script anywhere else cannot pair
+without a relay candidate, and the robot dialling out means NAT is not a participant.
+`mediad/src/stream.rs` has the whole argument.
+
+`examples/fetch_a_frame_and_send_an_intent.py` is both halves in about thirty lines.
+
+## What it does not do
+
+Live video. A viewer wants WebRTC and the console already is one. This is for when the consumer
+is a program.
