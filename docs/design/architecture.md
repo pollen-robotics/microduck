@@ -422,6 +422,11 @@ Same API behind all of them. "Run an LLM on a server that controls the robot"
 becomes: open a WebSocket, poll a frame, send intents — a few dozen lines, no
 media stack. That is what makes it genuinely easy.
 
+`mediad::agent` is that socket, at `/agent` on the port the console is already
+served from. Same API is not a promise here, it is the implementation: a line
+arriving there runs through `session::run` against `route`, which is the same
+dispatcher and the same table the datachannel uses.
+
 Note also that LLM latency (hundreds of ms to seconds) means the agent is a
 **high-level** controller: "go to the kitchen", "look at the person". Reactive
 control stays local in `robotd`. This is the correct split regardless of

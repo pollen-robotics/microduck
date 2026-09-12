@@ -292,10 +292,19 @@ fn main() -> ExitCode {
         // a port already in use, which `Restart=always` cannot fix by trying again; a robot that
         // streams and answers control calls with no console is much better than one that does
         // neither. So this is logged at error and the daemon carries on.
+        // Made here rather than beside the relay, because the console's listener now carries the
+        // agent socket too and both want the same late-arriving media.
+        let (video_tx, video_rx) =
+            tokio::sync::watch::channel::<Option<mediad::session::Media>>(None);
+
         let page = mediad::web::page(args.port);
         let (web_host, web_port) = (args.host.clone(), args.web_port);
+        let agent = mediad::agent::State {
+            sockets: args.sockets(),
+            video: video_rx.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = mediad::web::serve(&web_host, web_port, page).await {
+            if let Err(e) = mediad::web::serve(&web_host, web_port, page, agent).await {
                 tracing::error!(
                     error = %format!("{e:#}"),
                     "the console is not being served; video and control are unaffected"
@@ -333,9 +342,6 @@ fn main() -> ExitCode {
         // once something has tried to set it, and there are no frames to encode before then — and
         // the relay below is spawned before that on purpose, so the answer has to be able to
         // arrive late rather than be a value passed in now.
-        let (video_tx, video_rx) =
-            tokio::sync::watch::channel::<Option<mediad::session::Media>>(None);
-
         // The outward half of remote access, and it is deliberately *after* the producer is
         // learned: the name a client sees in the service's listing comes from the same place the
         // local `meta` gets it, and a relay that registered first would publish an unnamed robot
