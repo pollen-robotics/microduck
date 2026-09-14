@@ -363,7 +363,7 @@ impl PolicyNames {
 
 /// Why a slot is not running what was asked of it, for as long as that stays true.
 ///
-/// A `Vec` rather than seven fields or a map: it is empty on nearly every robot, at most seven
+/// A `Vec` rather than nine fields or a map: it is empty on nearly every robot, at most nine
 /// long, and the linear scan is over a list shorter than the branch predictor's memory.
 #[derive(Debug, Default, Clone)]
 struct SlotErrors(Vec<(Slot, String)>);
@@ -3995,15 +3995,25 @@ fn load_policy_request(
                         "a slot to disable, or omit both to reset",
                     );
                 }
-                // The one slot that cannot be empty: a robot with no walking network has nothing
-                // to run, and every other slot resolving to it is what makes the rest optional.
-                // Refused here rather than left to the config layer, which now falls back
-                // instead of honouring it — a request that would be quietly ignored is worse
-                // than one that is answered.
+                // The two slots that cannot be empty, one per drive mode: whichever of them the
+                // robot is on, emptying it leaves nothing to run. Refused here rather than left
+                // to the config layer, which now falls back instead of honouring it — a request
+                // that would be quietly ignored is worse than one that is answered. Ignored is
+                // what this was for the roller until it was listed here: the key was written,
+                // the call answered "accepted", and the robot went on driving `roller.onnx`
+                // until the next boot dropped the line with a degraded-health row.
                 Some(Slot::Walk) => {
                     return proto::IntentResult::refused(
                         "the walking policy cannot be switched off — it is what every other \
                          slot falls back to. `policy reset walk` returns it to this robot's own",
+                    );
+                }
+                // Not the same sentence: on wheels nothing falls back to this slot, it is
+                // simply the network that drives the robot.
+                Some(Slot::Roller) => {
+                    return proto::IntentResult::refused(
+                        "the roller policy cannot be switched off — it is what drives the \
+                         robot on wheels. `policy reset roller` returns it to this robot's own",
                     );
                 }
                 Some(_) => {}
@@ -7126,6 +7136,47 @@ mod tests {
         assert!(
             reason.contains("policy reset walk"),
             "with the way out: {reason}"
+        );
+        assert!(intents.take_policy_change().is_none(), "and nothing queued");
+    }
+
+    /// **And neither can the roller's over this method**, which is where the branch left it.
+    ///
+    /// `drop_unloadable_overrides` learned that the roller is locomotion too; this method was
+    /// left behind, so `policy load roller none` was accepted, written to the file and reported
+    /// as success while the robot kept driving `roller.onnx` — the answer and the behaviour
+    /// disagreeing for as long as it took somebody to reboot and read the health line.
+    #[test]
+    fn the_roller_slot_cannot_be_switched_off_over_the_rpc() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("roller".into()),
+                path: Some("none".into()),
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(!result.accepted);
+        let reason = result.reason.unwrap();
+        assert!(
+            reason.contains("policy reset roller"),
+            "with the way out: {reason}"
+        );
+        assert!(
+            !reason.contains("falls back"),
+            "and not the walking slot's sentence, which is not true on wheels: {reason}"
         );
         assert!(intents.take_policy_change().is_none(), "and nothing queued");
     }
