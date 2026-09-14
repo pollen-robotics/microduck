@@ -625,7 +625,7 @@ minutes with nothing arriving at all — which is why they are the way to run an
 - `--name <robot-name>` — which robot. Without it, `DUCK_ROBOT`; without that, the first one found
   wins. Worth giving always: it skips a slow fallback tier that tries every already-connected
   peripheral on the Mac, earbuds included.
-- `--pin <six-digits>` — defaults to `DUCK_PIN`, then to `000000`. `robotctl system pin` on the
+- `--pin <six-digits>` — defaults to `DUCK_PIN`, then to `000000`. `sudo robotctl system pin` on the
   robot shows the real one.
 - `--verbose` — print every line sent and received, and have `scan` list every device rather than
   only the robots. The first thing to add when something hangs.
