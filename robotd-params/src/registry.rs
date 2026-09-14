@@ -153,6 +153,11 @@ pub const REGISTRY: &[Entry] = &[
         "Walking policy; unset = this robot's own",
     ),
     entry(
+        "policy.roller",
+        Kind::OptionalPath,
+        "Roller-mode locomotion; unset = this robot's own. Walk mode does not read it",
+    ),
+    entry(
         "policy.stand",
         Kind::OptionalPath,
         "Standing policy; unset = this robot's own",
@@ -166,6 +171,11 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick",
         Kind::OptionalPath,
         "Ground-pick policy (roller: the crouch)",
+    ),
+    entry(
+        "policy.crouch",
+        Kind::OptionalPath,
+        "Roller-mode ground pick (the crouch); unset = this robot's own",
     ),
     entry("policy.kick_left", Kind::OptionalPath, "Left-kick policy"),
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
@@ -214,6 +224,21 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
+    ),
+    entry(
+        "policy.crouch_period",
+        Kind::OptionalFloat,
+        "One crouch cycle, seconds; unset resolves from the set then 3.0",
+    ),
+    entry(
+        "policy.crouch_action_scale",
+        Kind::OptionalFloat,
+        "Action scale during the crouch; unset resolves from the set then 0.8",
+    ),
+    entry(
+        "policy.crouch_gain_ratio",
+        Kind::Float,
+        "Gain multiplier during the crouch",
     ),
     feature(
         "policy.voltage_adapt",

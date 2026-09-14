@@ -854,6 +854,18 @@ pub struct PolicyParams {
     pub kick_right: Option<PathBuf>,
     /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
     pub roulade: Option<PathBuf>,
+    /// The roller's locomotion network — roller mode's `walk`.
+    ///
+    /// A separate key rather than a per-mode meaning for `walk`, because the mode used to pick
+    /// only the *default*: an explicit `walk = …` loaded on wheels too, so a robot given a
+    /// retrained gait and switched to the roller drove a walking network with nothing to warn
+    /// about it. The slot name is the mode. Unset resolves to `roller.onnx` in the set.
+    pub roller: Option<PathBuf>,
+    /// The roller's ground pick — the crouch. Roller mode's `ground_pick`.
+    ///
+    /// Not the same gesture as the legs' pick, which is why it is not the same key: on wheels
+    /// the A button crouches. Unset resolves to `roller_crouch.onnx` in the set.
+    pub crouch: Option<PathBuf>,
     /// Scales raw policy output into a joint offset. Absent resolves per mode: 0.9 walking
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
@@ -878,6 +890,19 @@ pub struct PolicyParams {
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// One crouch cycle, seconds. Roller mode's `ground_pick_period`. Absent resolves through
+    /// the roller's own layers — the set's roller-tagged entry, then 3.0 — and **never** reads
+    /// `ground_pick_period`, which belongs to the legs.
+    pub crouch_period: Option<f64>,
+    /// Action scale while the crouch runs. Roller mode's `ground_pick_action_scale`. Absent:
+    /// the set's roller entry, else 0.8.
+    pub crouch_action_scale: Option<f64>,
+    /// Gain multiplier during the crouch. Roller mode's `ground_pick_gain_ratio`.
+    ///
+    /// A bare `f64` rather than an `Option` because its twin is one, and the twin has no
+    /// per-mode resolution to preserve — 1.0 in both modes. Matching the sibling's shape is
+    /// worth more than a distinction nothing reads.
+    pub crouch_gain_ratio: f64,
     /// The one-shot skills this robot has, in priority order.
     ///
     /// Empty means the built-in three — kicks and roulade, with the numbers they have always
@@ -1474,6 +1499,25 @@ impl ResolvedPolicy {
     }
 }
 
+/// The half of `[policy]` that belongs to one drive mode: which keys it reads, and what they
+/// fall back to when unset.
+///
+/// It exists so the mode is consulted **once**, before anything is resolved, rather than at each
+/// `unwrap_or` — which is what let an explicit `walk = …` load on wheels. Walking reads
+/// `walk`/`ground_pick*`; the roller reads `roller`/`crouch*`; neither ever reads the other's.
+/// See `docs/design/per-mode-policy-slots-design.md` §3.
+struct ModeSlots<'a> {
+    locomotion: &'a Option<PathBuf>,
+    locomotion_default: &'static str,
+    pick: &'a Option<PathBuf>,
+    pick_default: Option<&'static str>,
+    period: Option<f64>,
+    period_default: f64,
+    action_scale: Option<f64>,
+    action_scale_default: f64,
+    gain_ratio: f64,
+}
+
 impl PolicyParams {
     /// The built-in skills with config merged over them, by name.
     ///
@@ -1557,6 +1601,38 @@ impl PolicyParams {
         self.resolved_with(set_manifest().as_ref())
     }
 
+    /// The keys and defaults belonging to the mode this robot is in.
+    ///
+    /// No `mode` parameter: `resolved_slot_with` asks about another mode by cloning and setting
+    /// `mode`, so a parameter here would be flexibility nothing uses.
+    fn mode_slots(&self) -> ModeSlots<'_> {
+        match self.mode {
+            Mode::Walk => ModeSlots {
+                locomotion: &self.walk,
+                // The velstand gait (set v5) walks on a twist and stands still at zero command.
+                locomotion_default: "velstand.onnx",
+                pick: &self.ground_pick,
+                pick_default: Some("alpha_ground_pick.onnx"),
+                period: self.ground_pick_period,
+                period_default: 4.0,
+                action_scale: self.ground_pick_action_scale,
+                action_scale_default: 1.0,
+                gain_ratio: self.ground_pick_gain_ratio,
+            },
+            Mode::Roller => ModeSlots {
+                locomotion: &self.roller,
+                locomotion_default: "roller.onnx",
+                pick: &self.crouch,
+                pick_default: Some("roller_crouch.onnx"),
+                period: self.crouch_period,
+                period_default: 3.0,
+                action_scale: self.crouch_action_scale,
+                action_scale_default: 0.8,
+                gain_ratio: self.crouch_gain_ratio,
+            },
+        }
+    }
+
     /// [`Self::resolved`] against a manifest already read — or none, which is what a board whose
     /// set predates the manifest has, and resolves to the prototype's numbers.
     ///
@@ -1575,30 +1651,14 @@ impl PolicyParams {
             }
         };
 
-        let (walk_default, stand, sitstand, ground_pick) = match self.mode {
-            // The velstand gait (set v5) walks on a twist and stands still at zero command,
-            // so no standing network is loaded by default: with `stand` unset the walking
-            // policy runs at every velocity. `alpha_walking.onnx` + `alpha_stand.onnx` stay
-            // in the set for a board that loads them back by hand.
-            Mode::Walk => (
-                "velstand.onnx",
-                None,
-                Some("alpha_sitstand.onnx"),
-                Some("alpha_ground_pick.onnx"),
-            ),
-            // The prototype's roller preset, since rebased on the alpha defaults: roller
-            // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
-            // kicks, the trained low-pass — as the walking mode has it. `stand` stays
-            // unloaded, deliberately: the prototype loads the standing network in roller
-            // mode and then skips every standing transition while `roller_mode` is set, so
-            // it never runs — not loading it is the same robot without the dead session.
-            Mode::Roller => (
-                "roller.onnx",
-                None,
-                Some("alpha_sitstand.onnx"),
-                Some("roller_crouch.onnx"),
-            ),
+        // `stand` and `sitstand` are the same in both modes today — velstand stands on its own
+        // at zero command, and the roller skips standing transitions — but they stay a match
+        // rather than two constants, because that is the shape a divergence goes back into.
+        let (stand, sitstand) = match self.mode {
+            Mode::Walk => (None, Some("alpha_sitstand.onnx")),
+            Mode::Roller => (None, Some("alpha_sitstand.onnx")),
         };
+        let slots = self.mode_slots();
 
         // What each skill slot reports is what the skill of that name will run — derived from the
         // list rather than resolved beside it, so `robot.policies` cannot name a file the robot is
@@ -1629,11 +1689,11 @@ impl PolicyParams {
             // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
             // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
             // floor under both.
-            walk: path(&self.walk, Some(walk_default))
-                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
+            walk: path(slots.locomotion, Some(slots.locomotion_default))
+                .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(slots.locomotion_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
-            ground_pick: path(&self.ground_pick, ground_pick),
+            ground_pick: path(slots.pick, slots.pick_default),
             kick_left: skill_file("kick_left"),
             kick_right: skill_file("kick_right"),
             roulade: skill_file("roulade"),
@@ -1646,24 +1706,18 @@ impl PolicyParams {
             gain: self.gain,
             head_lowpass: Some(self.head_lowpass.unwrap_or(0.5)).filter(|a| *a < 1.0),
             legs_lowpass: Some(self.legs_lowpass.unwrap_or(0.7)).filter(|a| *a < 1.0),
-            ground_pick_period: self
-                .ground_pick_period
+            ground_pick_period: slots
+                .period
                 .or(pick.map(|t| t.period_s))
-                .unwrap_or(match self.mode {
-                    Mode::Walk => 4.0,
-                    Mode::Roller => 3.0,
-                }),
+                .unwrap_or(slots.period_default),
             ground_pick_end_phase: pick
                 .map(|t| t.end_phase)
                 .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
-            ground_pick_action_scale: self
-                .ground_pick_action_scale
+            ground_pick_action_scale: slots
+                .action_scale
                 .or(pick.and_then(|t| t.action_scale))
-                .unwrap_or(match self.mode {
-                    Mode::Walk => 1.0,
-                    Mode::Roller => 0.8,
-                }),
-            ground_pick_gain_ratio: self.ground_pick_gain_ratio,
+                .unwrap_or(slots.action_scale_default),
+            ground_pick_gain_ratio: slots.gain_ratio,
             sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
             sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
@@ -1743,6 +1797,8 @@ impl Default for PolicyParams {
             kick_left: None,
             kick_right: None,
             roulade: None,
+            roller: None,
+            crouch: None,
             action_scale: None,
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.
@@ -1753,6 +1809,9 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
+            crouch_period: None,
+            crouch_action_scale: None,
+            crouch_gain_ratio: 1.0,
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
@@ -2258,14 +2317,15 @@ mod tests {
         );
     }
 
-    /// The file is a list of decisions: a `[policy]` key still beats the set.
+    /// The file is a list of decisions: a `[policy]` key still beats the set. Roller mode's keys
+    /// are `crouch_*`; `ground_pick_*` are the legs' and are not read here.
     #[test]
     fn a_config_key_overrides_the_sets_ground_pick_timing() {
         let set = published_set();
         let tuned = super::PolicyParams {
             mode: super::Mode::Roller,
-            ground_pick_period: Some(6.0),
-            ground_pick_action_scale: Some(0.7),
+            crouch_period: Some(6.0),
+            crouch_action_scale: Some(0.7),
             ..Default::default()
         }
         .resolved_with(Some(&set));
@@ -2275,6 +2335,110 @@ mod tests {
             tuned.ground_pick_end_phase, 0.7,
             "there is no key for the cutoff"
         );
+    }
+
+    /// **A mode reads its own keys and only its own.** `[policy]` had one `walk` key for both
+    /// modes, so a robot given a retrained gait and then switched to the roller drove a walking
+    /// network on wheels — the mode picked the default and an explicit value beat the default.
+    /// Four slots named for their mode is the fix, and this is the half of it that matters: the
+    /// keys of the mode you are not in are not read at all.
+    #[test]
+    fn each_mode_reads_only_its_own_slots() {
+        let both = super::PolicyParams {
+            walk: Some(std::path::PathBuf::from("/legs/gait.onnx")),
+            ground_pick: Some(std::path::PathBuf::from("/legs/pick.onnx")),
+            roller: Some(std::path::PathBuf::from("/wheels/roller.onnx")),
+            crouch: Some(std::path::PathBuf::from("/wheels/crouch.onnx")),
+            ..Default::default()
+        };
+
+        let walking = both.clone().resolved_with(None);
+        assert_eq!(walking.walk, std::path::PathBuf::from("/legs/gait.onnx"));
+        assert_eq!(
+            walking.ground_pick,
+            Some(std::path::PathBuf::from("/legs/pick.onnx"))
+        );
+
+        let rolling = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ..both
+        }
+        .resolved_with(None);
+        assert_eq!(
+            rolling.walk,
+            std::path::PathBuf::from("/wheels/roller.onnx"),
+            "the roller drives its own network, not the one in the walk key"
+        );
+        assert_eq!(
+            rolling.ground_pick,
+            Some(std::path::PathBuf::from("/wheels/crouch.onnx")),
+            "and the crouch, not the legs' ground pick"
+        );
+    }
+
+    /// The bug in one assertion: a robot configured for legs, switched to wheels, must come back
+    /// up on the roller's own default rather than the gait somebody loaded for walking.
+    #[test]
+    fn a_walk_override_does_not_follow_the_robot_onto_wheels() {
+        let rolling = super::PolicyParams {
+            mode: super::Mode::Roller,
+            walk: Some(std::path::PathBuf::from("/legs/gait_v4.onnx")),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(
+            rolling.walk,
+            std::path::PathBuf::from(super::POLICY_DIR).join("roller.onnx"),
+            "roller.onnx, not gait_v4.onnx"
+        );
+    }
+
+    /// **No cross-mode fallback on the tuning either.** `crouch_period` unset resolves through the
+    /// roller's own layers — the set's roller entry, then the roller literal — and never picks up a
+    /// `ground_pick_period` written for the legs. A fallback between the two would be the same bleed
+    /// one level down and harder to see.
+    #[test]
+    fn the_crouch_tuning_never_reads_the_ground_picks() {
+        let rolling = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ground_pick_period: Some(9.0),
+            ground_pick_action_scale: Some(0.1),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(rolling.ground_pick_period, 3.0, "the roller literal");
+        assert_eq!(rolling.ground_pick_action_scale, 0.8, "the roller literal");
+
+        let tuned = super::PolicyParams {
+            mode: super::Mode::Roller,
+            crouch_period: Some(2.5),
+            crouch_action_scale: Some(0.6),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(tuned.ground_pick_period, 2.5);
+        assert_eq!(tuned.ground_pick_action_scale, 0.6);
+    }
+
+    /// Walk mode is the mirror: the wheels' keys are inert.
+    #[test]
+    fn the_roller_keys_are_inert_while_walking() {
+        let walking = super::PolicyParams {
+            roller: Some(std::path::PathBuf::from("/wheels/roller.onnx")),
+            crouch: Some(std::path::PathBuf::from("/wheels/crouch.onnx")),
+            crouch_period: Some(2.5),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(
+            walking.walk,
+            std::path::PathBuf::from(super::POLICY_DIR).join("velstand.onnx")
+        );
+        assert_eq!(
+            walking.ground_pick,
+            Some(std::path::PathBuf::from(super::POLICY_DIR).join("alpha_ground_pick.onnx"))
+        );
+        assert_eq!(walking.ground_pick_period, 4.0, "the walk literal");
     }
 
     /// **The set says how the sit↔stand is timed.** The rise was a literal second and the

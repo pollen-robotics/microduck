@@ -89,14 +89,11 @@ hz = 50
 # from the command line.
 enabled = true
 
-# Drive mode: "walk" (legs, the default) or "roller". The mode changes which policies load
-# AND the tuning defaults below — every value left unset resolves per mode, so switching a
-# robot to the roller is this one line plus `systemctl restart robotd`. The roller preset
-# is the prototype launcher's, rebased on the alpha defaults as its installer now is:
-# roller.onnx as the locomotion policy, the crouch on the ground-pick trigger (3.0 s, 0.8),
-# action_scale 0.8 — and everything else as walking has it: sit/stand, kicks, roulade, the
-# trained low-pass. Only the standing network stays out: the prototype loads it in roller
-# mode and then never runs it, standing transitions being skipped on wheels.
+# Drive mode: "walk" (legs, the default) or "roller". The mode picks which *slots* are read,
+# not just their defaults: walking reads walk/ground_pick and the ground_pick_* tuning, the
+# roller reads roller/crouch and the crouch_* tuning, and neither reads the other's. So a robot
+# can be given a gait for its legs and a different network for its wheels, and switching modes
+# is one line plus a restart (or a held DPad-Up, which switches live without writing config).
 mode = "walk"
 
 # Policy files. Unset means the mode's default in /opt/robot/policies/current, which is
@@ -123,6 +120,11 @@ mode = "walk"
 # kick_left   = "ball_kick_left.onnx"
 # kick_right  = "ball_kick_right.onnx"
 # roulade     = "roulade.onnx"           X-button forward roll
+
+# Roller-mode slots. Same rules as the walk-mode pair above — unset means the set's own file,
+# "none" switches an optional slot off, `robotctl policy load roller <file>` writes the key.
+# roller = "/opt/robot/policies/current/roller.onnx"        locomotion on wheels
+# crouch = "/opt/robot/policies/current/roller_crouch.onnx" the A-button crouch
 
 # Requires ONNX Runtime on the board. It is dlopened, not linked, so a missing library is
 # a startup failure rather than a build one — robotd reports it through robot.health and
@@ -156,6 +158,12 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+
+# The crouch's timing, as ground_pick_* is the legs' pick's. Unset resolves from the installed
+# set's roller-tagged entry, then from 3.0 / 0.8 / 1.0.
+# crouch_period = 3.0
+# crouch_action_scale = 0.8
+# crouch_gain_ratio = 1.0
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5
