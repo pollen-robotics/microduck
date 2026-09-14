@@ -2334,6 +2334,14 @@ pub struct PoliciesResult {
 pub struct PolicySlot {
     /// `"walk"`, `"stand"`, …
     pub slot: String,
+    /// Which drive mode reads this slot — `"walk"`, `"roller"`, or absent for the five both
+    /// modes share.
+    ///
+    /// Carried so a client can render the mode-specific rows as such without hardcoding which
+    /// names those are, which would render wrong the next time a slot is added. A string rather
+    /// than an enum, for the same reason `origin` is one: a client that predates a mode reports
+    /// it verbatim instead of failing to parse a robot's answer.
+    pub mode: Option<String>,
     /// The file running in it. Absent means the slot is empty, which is a capability this
     /// robot does not have rather than a fault — roller mode has no standing network.
     pub path: Option<String>,

@@ -3778,10 +3778,17 @@ fn render_policies(
         let _ = writeln!(out, "the last policy change did not take: {error}");
     }
 
+    let slot_name = |s: &proto::PolicySlot| match s.mode.as_deref() {
+        // Named rather than inferred: the four mode-specific slots are the point of the
+        // column, and a hardcoded list of which names those are would go stale the next time
+        // a slot is added.
+        Some(mode) => format!("{} ({mode})", s.slot),
+        None => s.slot.clone(),
+    };
     let width = policies
         .slots
         .iter()
-        .map(|s| s.slot.len())
+        .map(|s| slot_name(s).len())
         .max()
         .unwrap_or(4)
         .max(4);
@@ -3805,7 +3812,11 @@ fn render_policies(
         // A bullet on every row config has an opinion about, so "what have I changed" is
         // answerable at a glance rather than by remembering.
         let mark = if slot.overridden { "*" } else { " " };
-        let _ = writeln!(out, " {mark} {:width$}  {origin:9}  {what}", slot.slot);
+        let _ = writeln!(
+            out,
+            " {mark} {:width$}  {origin:9}  {what}",
+            slot_name(slot)
+        );
     }
 
     let changed = policies.slots.iter().filter(|s| s.overridden).count();
@@ -4831,6 +4842,7 @@ mod tests {
     fn slot_state(slot: Slot, path: Option<&str>, overridden: bool) -> proto::PolicySlot {
         proto::PolicySlot {
             slot: slot.as_str().to_owned(),
+            mode: slot.mode().map(|m| m.as_str().to_owned()),
             path: path.map(str::to_owned),
             origin: path.map(|_| "local".to_owned()),
             overridden,

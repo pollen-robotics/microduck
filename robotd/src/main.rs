@@ -426,17 +426,21 @@ const OFFICIAL_ORG: &str = "pollen-robotics";
 /// the same fact, updated from three.
 fn slot_report(
     policy_params: &params::PolicyParams,
-    cfg: &params::ResolvedPolicy,
     errors: &SlotErrors,
 ) -> Vec<proto::PolicySlot> {
+    // Once, not once per slot: `set_manifest` parses the file on every call.
+    let manifest = params::set_manifest();
     Slot::ALL
         .into_iter()
         .map(|slot| {
-            let path = cfg.slot(slot);
+            // In the slot's own mode, so a configured slot of the mode the robot is not in
+            // names its file instead of reporting as empty.
+            let path = policy_params.resolved_slot_with(slot, manifest.as_ref());
             proto::PolicySlot {
                 slot: slot.as_str().to_owned(),
-                path: path.map(|p| p.display().to_string()),
-                origin: path.map(|p| origin_of(p).to_owned()),
+                mode: slot.mode().map(|m| m.as_str().to_owned()),
+                path: path.as_ref().map(|p| p.display().to_string()),
+                origin: path.as_ref().map(|p| origin_of(p).to_owned()),
                 overridden: policy_params.slot(slot).is_some(),
                 error: errors.get(slot).map(str::to_owned),
             }
@@ -703,7 +707,6 @@ impl RobotState {
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
-                &params.policy.resolved(),
                 &SlotErrors::default(),
             )),
             policy_enabled: params.policy.enabled,
@@ -1732,11 +1735,9 @@ async fn control_loop<T: RobotIo>(
     // have dropped an override since. A client that asks before the first tick gets what this
     // loop is actually going to load, not what the file asked for.
     state.policies.store(Arc::new(PolicyNames::of(&policy_cfg)));
-    state.policy_slots.store(Arc::new(slot_report(
-        &policy_params,
-        &policy_cfg,
-        &slot_errors,
-    )));
+    state
+        .policy_slots
+        .store(Arc::new(slot_report(&policy_params, &slot_errors)));
     let mut safety = Safety::new(
         io,
         SafetyConfig {
@@ -2624,7 +2625,7 @@ async fn control_loop<T: RobotIo>(
                 state.mode.store(mode_code(target), Ordering::Relaxed);
                 state
                     .policy_slots
-                    .store(Arc::new(slot_report(&policy_params, &cfg, &slot_errors)));
+                    .store(Arc::new(slot_report(&policy_params, &slot_errors)));
                 policy_cfg = cfg;
                 tracing::warn!(
                     mode = target.as_str(),
@@ -2681,11 +2682,9 @@ async fn control_loop<T: RobotIo>(
                     state.policy_error.store(None);
                     state.policy_change_error.store(None);
                     state.policies.store(Arc::new(PolicyNames::of(&cfg)));
-                    state.policy_slots.store(Arc::new(slot_report(
-                        &policy_params,
-                        &cfg,
-                        &slot_errors,
-                    )));
+                    state
+                        .policy_slots
+                        .store(Arc::new(slot_report(&policy_params, &slot_errors)));
                     policy_cfg = cfg;
                     tracing::warn!(
                         change = describe_change(&change),
@@ -2709,11 +2708,9 @@ async fn control_loop<T: RobotIo>(
                     match change {
                         intents::PolicyChange::Slot { slot, .. } => {
                             slot_errors.set(slot, e);
-                            state.policy_slots.store(Arc::new(slot_report(
-                                &policy_params,
-                                &policy_cfg,
-                                &slot_errors,
-                            )));
+                            state
+                                .policy_slots
+                                .store(Arc::new(slot_report(&policy_params, &slot_errors)));
                         }
                         // A reload or a whole-robot reset names no slot to hang this on, and
                         // without somewhere to put it the failure was a log line on the robot
@@ -7694,13 +7691,9 @@ mod tests {
         assert!(result.enabled);
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
-            // `stand` is the empty row by default — velstand stands on its own — and an
-            // empty slot has no file to have come from anywhere. `roller` and `crouch` are
-            // empty for a different reason: they are the other mode's, and this robot is on
-            // its legs. What the report says about a slot nobody is driving is a question of
-            // its own, and the answer here is the narrow one.
-            let empty = matches!(slot.slot.as_str(), "stand" | "roller" | "crouch");
-            let expected = (!empty).then_some("official");
+            // `stand` is the only empty row on a default robot: velstand stands on its own, so
+            // `stand` is unset in both modes and has no file to have come from anywhere.
+            let expected = (slot.slot != "stand").then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
                 expected,
@@ -7709,6 +7702,37 @@ mod tests {
             assert!(!slot.overridden, "{slot:?}");
             assert!(slot.error.is_none(), "{slot:?}");
         }
+    }
+
+    /// **A configured slot never reports as empty.** Left resolving against the current mode, a
+    /// robot on its legs with `roller` set reported that row with no path, no origin and
+    /// `overridden: true` — which reads as "switched off" for a slot that is configured and will
+    /// load at the next mode switch. This report is how a person checks what their robot runs.
+    #[test]
+    fn the_report_names_a_file_for_every_configured_slot() {
+        let policy = params::PolicyParams {
+            mode: params::Mode::Walk,
+            roller: Some(std::path::PathBuf::from("/wheels/v3.onnx")),
+            ..Default::default()
+        };
+        let rows = slot_report(&policy, &SlotErrors::default());
+
+        assert_eq!(rows.len(), 9);
+        let roller = rows.iter().find(|r| r.slot == "roller").expect("a row");
+        assert_eq!(
+            roller.path.as_deref(),
+            Some("/wheels/v3.onnx"),
+            "configured, and it says so"
+        );
+        assert!(roller.overridden);
+        assert_eq!(roller.mode.as_deref(), Some("roller"));
+
+        let walk = rows.iter().find(|r| r.slot == "walk").expect("a row");
+        assert_eq!(walk.mode.as_deref(), Some("walk"));
+        assert!(walk.path.is_some(), "the default, unoverridden");
+
+        let sitstand = rows.iter().find(|r| r.slot == "sitstand").expect("a row");
+        assert_eq!(sitstand.mode, None, "shared by both modes");
     }
 
     /// The three origins, told apart by the path — because the path is made of the answer.
