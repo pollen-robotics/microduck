@@ -646,10 +646,10 @@ async fn serve(
                 Ok((stream, _)) => {
                     let status = status.clone();
                     let imu_status = imu_status.clone();
-                    let frames = frames.subscribe();
-                    let imu_frames = imu_frames.subscribe();
+                    let frames = frames.clone();
+                    let imu_frames = imu_frames.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = subscriber(stream, &status, frames, &imu_status, imu_frames).await {
+                        if let Err(e) = subscriber(stream, &status, &frames, &imu_status, &imu_frames).await {
                             tracing::debug!(error = %e, "subscriber ended");
                         }
                     });
@@ -669,12 +669,16 @@ async fn serve(
 }
 
 /// One subscriber: its request, then frames until it goes away.
+/// Takes the two `Sender`s and subscribes only in the arm that matched, so a receiver exists
+/// where the method is known and nowhere else. Subscribing on `accept` made `receiver_count()`
+/// count connections rather than interest: a client asking for `head_imu.stream` held a depth
+/// receiver, and one that connected and said nothing held both.
 async fn subscriber(
     stream: UnixStream,
     status: &Arc<Status>,
-    mut frames: tokio::sync::broadcast::Receiver<proto::TofFrame>,
+    frames: &tokio::sync::broadcast::Sender<proto::TofFrame>,
     imu_status: &Arc<ImuStatus>,
-    mut imu_frames: tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
+    imu_frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -704,11 +708,13 @@ async fn subscriber(
             Ok(proto::Call::TofStream) => {
                 let response = proto::Response::ok(id, &status.result());
                 write_line(&mut write, &response).await?;
+                let mut frames = frames.subscribe();
                 return stream_tof(&mut write, &mut frames).await;
             }
             Ok(proto::Call::HeadImuStream) => {
                 let response = proto::Response::ok(id, &imu_status.result());
                 write_line(&mut write, &response).await?;
+                let mut imu_frames = imu_frames.subscribe();
                 return stream_imu(&mut write, &mut imu_frames).await;
             }
             _ => {
@@ -817,6 +823,77 @@ async fn write_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A connection that has asked for nothing wants nothing**, and one that asked for depth
+    /// does not want the IMU. `accept` used to subscribe to both channels before reading a byte
+    /// of the request, so `receiver_count()` counted open connections rather than interest —
+    /// which is the number anything gating a sensor on demand would have to trust.
+    ///
+    /// Drives the real `subscriber` over a socket pair and counts receivers on the senders it
+    /// holds, since that count is the thing that was wrong.
+    #[tokio::test]
+    async fn a_connection_subscribes_only_to_what_it_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tofd.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let (frames, _) = tokio::sync::broadcast::channel::<proto::TofFrame>(4);
+        let (imu_frames, _) = tokio::sync::broadcast::channel::<proto::HeadImuFrame>(4);
+        let status = Arc::new(Status::new(15));
+        let imu_status = Arc::new(ImuStatus::new(100));
+
+        let served = {
+            let (frames, imu_frames) = (frames.clone(), imu_frames.clone());
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = subscriber(stream, &status, &frames, &imu_status, &imu_frames).await;
+            })
+        };
+
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = client.into_split();
+        let mut reader = BufReader::new(read);
+
+        // Connected, and nothing asked for yet: neither channel has a receiver.
+        assert_eq!(
+            frames.receiver_count(),
+            0,
+            "a silent connection wants no depth"
+        );
+        assert_eq!(imu_frames.receiver_count(), 0, "nor the imu");
+
+        // Ask for depth only.
+        let request = format!(
+            "{}\n",
+            serde_json::to_string(&proto::Request::call(
+                proto::Id::Number(1),
+                &proto::Call::TofStream
+            ))
+            .unwrap()
+        );
+        write.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        reader.read_line(&mut answer).await.unwrap();
+        assert!(answer.contains("result"), "{answer}");
+
+        // The answer is written before the subscribe, so give the task its next poll.
+        for _ in 0..100 {
+            if frames.receiver_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(frames.receiver_count(), 1, "depth was asked for");
+        assert_eq!(
+            imu_frames.receiver_count(),
+            0,
+            "a client that asked for depth must not hold an imu receiver"
+        );
+
+        // `stream_tof` is parked on the channel, not on the socket, so it would sit there until a
+        // frame arrived. Nothing here sends one, and the counts have already been taken.
+        served.abort();
+    }
 
     #[test]
     fn addresses_parse_in_both_bases() {
