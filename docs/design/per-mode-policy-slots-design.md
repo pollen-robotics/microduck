@@ -126,13 +126,24 @@ let each work it out, one helper on `PolicyParams`:
 ```rust
 /// What `slot` would load, resolved in the mode that slot belongs to rather than the mode the
 /// robot is in. `None` for a slot switched off with the `"none"` sentinel.
+pub fn resolved_slot_with(&self, slot: Slot, manifest: Option<&SetManifest>) -> Option<PathBuf>
+
+/// The same, against the set installed on this board.
 pub fn resolved_slot(&self, slot: Slot) -> Option<PathBuf>
 ```
 
 For the five shared slots this is what `resolved()` already says. For `walk`/`ground_pick` it
 resolves against walk-mode defaults and for `roller`/`crouch` against roller-mode defaults,
-whatever `mode` currently is. It is the only new public surface in this change, and it exists
-because two callers asking the same awkward question separately is how they come to disagree.
+whatever `mode` currently is.
+
+One question, two functions, and the pair is still the only new public surface here. The `_with`
+form is the one callers use: `set_manifest()` re-parses a JSON file off disk on every call, and
+every caller of this asks about all nine slots in a loop — the bare form in that loop is nine
+parses of the same file, at boot and again on every report republish. The bare form stays because
+it is the pairing `resolved()`/`resolved_with()` already established, and a caller holding no
+manifest should not have to learn about the file to ask about one slot. There are two of these
+and not three because two callers working the same awkward question out separately is how they
+come to disagree.
 
 ## 4. The tuning of the crouch
 
@@ -163,18 +174,32 @@ That one decision is what keeps the rest of this list short:
 
 - **`robot.loadPolicy`** — `LoadPolicyParams` carries a slot *name*, so two more names need no
   protocol change; `PolicyNames`, which names what is driving, is built from `ResolvedPolicy` and
-  sees nothing new. (`robot.policies` is the exception, and it is §5.1.)
+  sees nothing new. (`robot.policies` is the exception, and it is §5.1.) Its one behaviour change
+  is the `"none"` refusal: the method refuses `walk = "none"` because a robot with no locomotion
+  network has nothing to run, and under §3 that is true of `roller` on wheels for exactly the
+  same reason — so it refuses both, with its own sentence for each, rather than accepting a
+  `policy load roller none` it would then ignore until the next boot dropped it.
 - **`xtask`'s `policies_robotd_expects`** — the list of files that must exist on a board. It
-  already loops over both modes and unions the resolved slots, and because `ResolvedPolicy` keeps
-  its field names it keeps returning `roller.onnx` and `roller_crouch.onnx` from the roller pass.
-  Left alone deliberately; it looks like it wants updating and does not.
+  already loops over both modes and unions what `ResolvedPolicy::slot()` answers for each, and
+  the reason it keeps returning `roller.onnx` and `roller_crouch.onnx` from the roller pass is
+  the new mode gate: in that pass `slot(Roller)` and `slot(Crouch)` are the ones that answer, and
+  they answer with the roller's defaults. (`ResolvedPolicy` keeping its field names is why it
+  still compiles untouched; it is not why the answer is right.) Left alone deliberately; it looks
+  like it wants updating and does not.
 - **`change_disturbs`** (`robotd/src/main.rs`) compares two `ResolvedPolicy` values, so
   `Driving::Walk => before.walk != after.walk` already covers "the `roller` key changed while the
   roller was driving".
 - **`updater::policy`** writes through `Slot::config_key()`, so a fetched policy lands in
   `policy.roller` with no new branch.
-- **`robotctl configure`** derives its rows from the registry and learns the five keys at compile
-  time, which is what `the_registry_covers_every_key_exactly` enforces.
+- **`robotctl configure`** — its *rows* need no change: they derive from the registry and learn
+  the five keys at compile time, which is what `the_registry_covers_every_key_exactly` enforces.
+  Its *hints* did. `Model::resolved_hint` (`robotd-params/src/edit.rs`) mapped registry keys onto
+  a single `resolved()`, which answers for the mode the robot is in — so on a wheeled robot the
+  `policy.walk` row hinted `roller.onnx`, pre-filled the edit box with it, and took whatever the
+  operator then typed into a key roller mode does not read. That is §1 again, through the one
+  tool this list claimed was untouched. The eight mode-specific policy keys resolve through
+  [§3.1](#31-resolving-a-slot-that-is-not-this-modes) instead, each in its own mode, and they are
+  the only hints in that function that no longer move when `mode` does.
 
 ### 5.1 The one report that does change
 
@@ -222,15 +247,41 @@ overridden neither — the normal case — pays nothing, because the loop alread
 
 ## 7. Migration
 
-Additive. The five keys are new, and `Params` has `#[serde(default)]`, so every existing
-`robotd.toml` parses unchanged and every robot with unset slots — the normal case — resolves
-exactly as it does today.
+Additive at the schema. The five keys are new, and `Params` has `#[serde(default)]`, so every
+existing `robotd.toml` parses unchanged and every robot with unset slots — the normal case —
+resolves exactly as it does today.
 
-One behaviour genuinely changes, and it is the bug: a robot in roller mode with `walk` set stops
-driving the walking network and comes back to `roller.onnx`. That robot was running a walking
-network on wheels; it is not a configuration anyone chose, it is the failure in §1. No compat
-shim — silently honouring `walk` in roller mode would preserve the thing being fixed. `roller` is
-where that robot's intent goes if it really wanted a custom roller network.
+Not additive at the resolution. **A robot already on `mode = "roller"` stops reading five keys it
+used to read**, because §3 dispatches on the mode before it defaults and there is no cross-mode
+fallback:
+
+| key it stops reading on wheels | what the robot comes back with | re-apply it as |
+|---|---|---|
+| `walk` | `roller.onnx`, or `roller` if that is set | `roller` |
+| `ground_pick` | `roller_crouch.onnx`, or `crouch` if that is set | `crouch` |
+| `ground_pick_period` | the set's roller entry, then 3.0 | `crouch_period` |
+| `ground_pick_action_scale` | the set's roller entry, then 0.8 | `crouch_action_scale` |
+| `ground_pick_gain_ratio` | **1.0** | `crouch_gain_ratio` |
+
+The first row is the bug and is why this page exists: that robot was driving a walking network on
+wheels, which is not a configuration anyone chose, it is the failure in §1. No compat shim —
+silently honouring `walk` in roller mode would preserve the thing being fixed. `roller` is where
+that robot's intent goes if it really wanted a custom roller network.
+
+**The last row is the sharp one: it is the only one that changes how the hardware behaves rather
+than which file loads.** `ground_pick_gain_ratio` is a bare `f64` that both modes read today, so a
+roller deliberately tuned to `ground_pick_gain_ratio = 0.6` for a softer crouch comes back after
+this change at `crouch_gain_ratio`'s literal 1.0 — servos noticeably stiffer through every crouch,
+on real hardware, with nothing pointing at the release that did it. The other four rows surface
+somewhere: a changed path shows in `policy list` and a changed period is visible in the motion. A
+gain ratio has no report row, no health line and nothing in the log, because from the daemon's
+side nothing failed — a key the current mode does not read is not an error, and warning about one
+would mean warning on every wheeled robot that has `walk` set on purpose.
+
+So, plainly: **a roller owner who tuned any `ground_pick_*` key must re-apply it under the
+`crouch_*` name.** That table is the whole migration. `robotctl configure` lists both families of
+keys with what each resolves to, and `robotctl policy list` shows all nine slots, so what a robot
+has set under either name is one command away.
 
 ## 8. Tests
 
