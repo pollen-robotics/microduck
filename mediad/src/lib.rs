@@ -17,6 +17,9 @@
 //! signalling server in this process, `mpph264enc` in front of it, and a `control` datachannel per
 //! peer wired to [`session::run`].
 
+/// The WebSocket a program drives the robot over, as opposed to the datachannel a person does.
+/// `architecture.md` §5.3 has the argument; the surface is the same one either way.
+pub mod agent;
 /// What the camera's geometry is — the intrinsics a consumer needs to turn pixels into
 /// directions, and which sensor mode they belong to.
 pub mod camera;
