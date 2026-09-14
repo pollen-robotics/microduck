@@ -1383,9 +1383,11 @@ fn fallback_skill(name: &str) -> Option<SkillDef> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Slot {
     Walk,
+    Roller,
     Stand,
     SitStand,
     GroundPick,
+    Crouch,
     KickLeft,
     KickRight,
     Roulade,
@@ -1393,11 +1395,13 @@ pub enum Slot {
 
 impl Slot {
     /// Every slot, in the order `[policy]` lists them and the order a report should print them.
-    pub const ALL: [Slot; 7] = [
+    pub const ALL: [Slot; 9] = [
         Slot::Walk,
+        Slot::Roller,
         Slot::Stand,
         Slot::SitStand,
         Slot::GroundPick,
+        Slot::Crouch,
         Slot::KickLeft,
         Slot::KickRight,
         Slot::Roulade,
@@ -1411,9 +1415,11 @@ impl Slot {
     pub fn as_str(self) -> &'static str {
         match self {
             Slot::Walk => "walk",
+            Slot::Roller => "roller",
             Slot::Stand => "stand",
             Slot::SitStand => "sitstand",
             Slot::GroundPick => "ground_pick",
+            Slot::Crouch => "crouch",
             Slot::KickLeft => "kick_left",
             Slot::KickRight => "kick_right",
             Slot::Roulade => "roulade",
@@ -1486,12 +1492,24 @@ pub struct ResolvedPolicy {
 impl ResolvedPolicy {
     /// The file that will actually be loaded into one slot, after mode defaults are applied.
     /// `None` means the slot is empty — a capability this robot does not have.
+    ///
+    /// **The four mode-specific slots answer only for the mode this resolved.** On legs,
+    /// `Roller` and `Crouch` are empty because nothing is driving them; on wheels, `Walk` and
+    /// `GroundPick` are. That is the honest answer to "what is in this slot right now" — for
+    /// "what *would* this slot load", which is a different question, see
+    /// [`PolicyParams::resolved_slot_with`].
     pub fn slot(&self, slot: Slot) -> Option<&std::path::Path> {
         match slot {
-            Slot::Walk => Some(self.walk.as_path()),
+            Slot::Walk => (self.mode == Mode::Walk).then_some(self.walk.as_path()),
+            Slot::Roller => (self.mode == Mode::Roller).then_some(self.walk.as_path()),
             Slot::Stand => self.stand.as_deref(),
             Slot::SitStand => self.sitstand.as_deref(),
-            Slot::GroundPick => self.ground_pick.as_deref(),
+            Slot::GroundPick => (self.mode == Mode::Walk)
+                .then(|| self.ground_pick.as_deref())
+                .flatten(),
+            Slot::Crouch => (self.mode == Mode::Roller)
+                .then(|| self.ground_pick.as_deref())
+                .flatten(),
             Slot::KickLeft => self.kick_left.as_deref(),
             Slot::KickRight => self.kick_right.as_deref(),
             Slot::Roulade => self.roulade.as_deref(),
@@ -1573,9 +1591,11 @@ impl PolicyParams {
     pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
         match slot {
             Slot::Walk => &self.walk,
+            Slot::Roller => &self.roller,
             Slot::Stand => &self.stand,
             Slot::SitStand => &self.sitstand,
             Slot::GroundPick => &self.ground_pick,
+            Slot::Crouch => &self.crouch,
             Slot::KickLeft => &self.kick_left,
             Slot::KickRight => &self.kick_right,
             Slot::Roulade => &self.roulade,
@@ -1587,9 +1607,11 @@ impl PolicyParams {
     pub fn set_slot(&mut self, slot: Slot, path: Option<PathBuf>) {
         let field = match slot {
             Slot::Walk => &mut self.walk,
+            Slot::Roller => &mut self.roller,
             Slot::Stand => &mut self.stand,
             Slot::SitStand => &mut self.sitstand,
             Slot::GroundPick => &mut self.ground_pick,
+            Slot::Crouch => &mut self.crouch,
             Slot::KickLeft => &mut self.kick_left,
             Slot::KickRight => &mut self.kick_right,
             Slot::Roulade => &mut self.roulade,
@@ -2914,12 +2936,95 @@ mod tests {
                 Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
                 "{slot} reads back what was set"
             );
+            // `params` is in the default (walk) mode, so the roller's two slots are the other
+            // mode's — `resolved()` honestly reports them empty regardless of their override,
+            // which is `the_other_modes_slots_resolve_empty`'s point, not this test's.
+            let name = format!("/tmp/{slot}.onnx");
+            let expected = if matches!(slot, Slot::Roller | Slot::Crouch) {
+                None
+            } else {
+                Some(std::path::Path::new(&name))
+            };
             assert_eq!(
                 resolved.slot(slot),
-                Some(std::path::Path::new(&format!("/tmp/{slot}.onnx"))),
+                expected,
                 "{slot} resolves to its override"
             );
         }
+    }
+
+    /// **A slot the robot is not in is not running.** `ResolvedPolicy` carries one mode's answer,
+    /// so the other mode's slots report empty — and `PolicyParams::slot` still reports the key,
+    /// because the config says what it says regardless of which mode is live.
+    #[test]
+    fn the_other_modes_slots_resolve_empty() {
+        let walking = super::PolicyParams {
+            roller: Some(std::path::PathBuf::from("/wheels/roller.onnx")),
+            crouch: Some(std::path::PathBuf::from("/wheels/crouch.onnx")),
+            ..Default::default()
+        };
+        let cfg = walking.resolved_with(None);
+
+        assert!(cfg.slot(super::Slot::Walk).is_some());
+        assert!(cfg.slot(super::Slot::GroundPick).is_some());
+        assert_eq!(cfg.slot(super::Slot::Roller), None, "not running on legs");
+        assert_eq!(cfg.slot(super::Slot::Crouch), None, "not running on legs");
+
+        assert!(
+            walking.slot(super::Slot::Roller).is_some(),
+            "the key is set, whatever mode the robot is in"
+        );
+    }
+
+    /// The mirror, and the one that matters: on wheels, `walk` and `ground_pick` are the empty ones.
+    #[test]
+    fn on_wheels_the_legs_slots_resolve_empty() {
+        let cfg = super::PolicyParams {
+            mode: super::Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(None);
+
+        assert_eq!(cfg.slot(super::Slot::Walk), None);
+        assert_eq!(cfg.slot(super::Slot::GroundPick), None);
+        assert!(
+            cfg.slot(super::Slot::Roller)
+                .is_some_and(|p| p.ends_with("roller.onnx"))
+        );
+        assert!(
+            cfg.slot(super::Slot::Crouch)
+                .is_some_and(|p| p.ends_with("roller_crouch.onnx"))
+        );
+    }
+
+    /// `set_slot` reaches the new fields, which is what `robot.loadPolicy` writes through.
+    #[test]
+    fn set_slot_writes_the_roller_keys() {
+        let mut p = super::PolicyParams::default();
+        p.set_slot(
+            super::Slot::Roller,
+            Some(std::path::PathBuf::from("/wheels/v3.onnx")),
+        );
+        p.set_slot(
+            super::Slot::Crouch,
+            Some(std::path::PathBuf::from("/wheels/crouch_v2.onnx")),
+        );
+        assert_eq!(
+            p.roller.as_deref(),
+            Some(std::path::Path::new("/wheels/v3.onnx"))
+        );
+        assert_eq!(
+            p.crouch.as_deref(),
+            Some(std::path::Path::new("/wheels/crouch_v2.onnx"))
+        );
+    }
+
+    /// The names a person types, and the ones a client sends.
+    #[test]
+    fn the_new_slots_parse_by_name() {
+        assert_eq!(super::Slot::parse("roller"), Some(super::Slot::Roller));
+        assert_eq!(super::Slot::parse("crouch"), Some(super::Slot::Crouch));
+        assert_eq!(super::Slot::ALL.len(), 9);
     }
 
     /// Clearing an override must fall back to the mode's default rather than emptying the slot —

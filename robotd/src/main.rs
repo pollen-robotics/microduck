@@ -7623,8 +7623,12 @@ mod tests {
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
             // `stand` is the empty row by default — velstand stands on its own — and an
-            // empty slot has no file to have come from anywhere.
-            let expected = (slot.slot != "stand").then_some("official");
+            // empty slot has no file to have come from anywhere. `roller` and `crouch` are
+            // empty for a different reason: they are the other mode's, and this robot is on
+            // its legs. What the report says about a slot nobody is driving is a question of
+            // its own, and the answer here is the narrow one.
+            let empty = matches!(slot.slot.as_str(), "stand" | "roller" | "crouch");
+            let expected = (!empty).then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
                 expected,

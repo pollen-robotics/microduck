@@ -43,8 +43,8 @@ already cover.
 
 ## 2. Three origins, one slot
 
-A slot — `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right`, `roulade` — is
-filled from exactly one of three origins:
+A slot — `walk`, `roller`, `stand`, `sitstand`, `ground_pick`, `crouch`, `kick_left`,
+`kick_right`, `roulade` — is filled from exactly one of three origins:
 
 | | comes from | provenance | signed | auto-updates | reset target |
 |---|---|---|---|---|---|
@@ -55,6 +55,11 @@ filled from exactly one of three origins:
 Origin is decided by the HF org: **`pollen-robotics/*` is official, everything else is
 community**. One constant, one place. It is not a config key — a robot that can be told which
 org to trust is a robot whose "official" badge means nothing.
+
+`walk`/`ground_pick` are walk mode's and `roller`/`crouch` are roller mode's; the other five are
+shared. Which mode reads which is
+[`per-mode-policy-slots-design.md`](per-mode-policy-slots-design.md), not this page — here they
+are nine slots filled the same way.
 
 Origin drives behaviour and not only a label:
 

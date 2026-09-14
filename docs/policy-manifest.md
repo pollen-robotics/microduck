@@ -56,7 +56,7 @@ a policy only on a claim that is present and wrong.
 | `unwind_s` | float | skills, sitstand | seconds driving `command.idle` before handing back; for the sit↔stand, the rise |
 | `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits twice this |
 | `mode` | str | set | `walk` (default) or `roller`; which mode's ground pick a phase entry is |
-| `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `stand`, …), so `policy load <slot> <repo>` is the install line |
+| `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `roller`, `stand`, …), so `policy load <slot> <repo>` is the install line |
 | `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
 | `command.encoding` | str | skills | see above |
 | `command.idle` | [3] | skills | the twist that means "stop doing the thing" |
