@@ -191,10 +191,16 @@ impl Model {
 
     /// What an unset key resolves to, through the daemon's own resolution — per-mode policy
     /// defaults, release-relative paths, the mic's mode-dependent switch. Parsed from the
-    /// pending state, so flipping `mode` updates every hint that depends on it.
+    /// pending state, so flipping `mode` updates every hint that genuinely depends on it — the
+    /// pet detector's switch, and the rest. The eight mode-specific policy keys are the
+    /// exception: each answers for the mode it belongs to and stays put when `mode` moves, for
+    /// the reason written above them.
     fn resolved_hint(&self, key: &str) -> Option<String> {
         let params: Params = toml::from_str(&self.rendered()).ok()?;
-        let policy = params.policy.resolved();
+        // Read the set's manifest once and hand it around: every `resolved*` call without a
+        // `_with` re-parses that JSON off disk, and a hint below resolves the policy twice.
+        let manifest = crate::set_manifest();
+        let policy = params.policy.resolved_with(manifest.as_ref());
         let path = |p: Option<std::path::PathBuf>| {
             Some(match p {
                 Some(p) => p.display().to_string(),
@@ -202,19 +208,44 @@ impl Model {
             })
         };
         let float = |f: f64| Some(f.to_string());
+        // **A mode-specific key hints what *that key* would load, never what is driving now.**
+        // `resolved()` answers for the mode the robot is in, so on a wheeled robot its `walk`
+        // field holds `roller.onnx` and its `ground_pick*` fields hold the crouch's numbers.
+        // Hinting `policy.walk` from that would show an operator `roller.onnx` under the walk
+        // key, pre-fill the edit box with it, and take the retrained roller network they then
+        // typed into `policy.walk` — a key roller mode does not read. The robot would keep
+        // driving `roller.onnx`, the file would name something else, and nothing would say so.
+        // So each of the eight resolves in its own mode, whatever `mode` currently says.
+        let slot =
+            |slot: crate::Slot| path(params.policy.resolved_slot_with(slot, manifest.as_ref()));
+        let in_mode = |mode: crate::Mode| {
+            let mut policy = params.policy.clone();
+            policy.mode = mode;
+            policy.resolved_with(manifest.as_ref())
+        };
         match key {
-            "policy.walk" => Some(policy.walk.display().to_string()),
+            "policy.walk" => slot(crate::Slot::Walk),
+            "policy.roller" => slot(crate::Slot::Roller),
             "policy.stand" => path(policy.stand),
             "policy.sitstand" => path(policy.sitstand),
-            "policy.ground_pick" => path(policy.ground_pick),
+            "policy.ground_pick" => slot(crate::Slot::GroundPick),
+            "policy.crouch" => slot(crate::Slot::Crouch),
             "policy.kick_left" => path(policy.kick_left),
             "policy.kick_right" => path(policy.kick_right),
             "policy.roulade" => path(policy.roulade),
             "policy.action_scale" => float(policy.action_scale),
             "policy.head_lowpass" => policy.head_lowpass.and_then(float),
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
-            "policy.ground_pick_period" => float(policy.ground_pick_period),
-            "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            // `ResolvedPolicy` keeps one pair of pick fields for both modes (§5 of the design),
+            // so the crouch's numbers are read off a roller-mode resolution of the same fields.
+            "policy.ground_pick_period" => float(in_mode(crate::Mode::Walk).ground_pick_period),
+            "policy.crouch_period" => float(in_mode(crate::Mode::Roller).ground_pick_period),
+            "policy.ground_pick_action_scale" => {
+                float(in_mode(crate::Mode::Walk).ground_pick_action_scale)
+            }
+            "policy.crouch_action_scale" => {
+                float(in_mode(crate::Mode::Roller).ground_pick_action_scale)
+            }
             "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
             "audio.pet_detect" => Some(
                 params
@@ -962,14 +993,15 @@ mod tests {
             Some("false"),
             "petting is an opt-in now, in every mode"
         );
-        // Flip the mode and the hints follow — they are resolved through the pending state.
+        // Flip the mode and the mode-dependent hints follow — they are resolved through the
+        // pending state. (The policy slots are the exception; that is the test below.)
         m.edit(entry("policy.mode"), "roller").expect("edits");
         assert_eq!(
             hint(&m, "audio.pet_detect").as_deref(),
             Some("false"),
             "the roller does not"
         );
-        let crouch = hint(&m, "policy.ground_pick").expect("resolves");
+        let crouch = hint(&m, "policy.crouch").expect("resolves");
         assert!(
             crouch.contains("crouch") || crouch.contains("roller"),
             "{crouch}"
@@ -977,6 +1009,47 @@ mod tests {
         // A set key hints nothing — the value speaks for itself.
         m.edit(entry("policy.legs_lowpass"), "0.6").expect("edits");
         assert_eq!(hint(&m, "policy.legs_lowpass"), None);
+    }
+
+    /// **A slot key hints its own mode's answer, not the driving mode's.** A wheeled robot
+    /// whose `policy.walk` row showed `roller.onnx` is the editor reproducing the bug this
+    /// branch exists to remove: the operator edits the box it pre-filled, `robotctl` writes
+    /// `policy.walk`, roller mode never reads that key, and the robot keeps driving
+    /// `roller.onnx` with nothing to warn about it.
+    #[test]
+    fn a_policy_slot_hints_the_mode_it_belongs_to() {
+        let hint = |m: &Model, key: &str| {
+            m.rows()
+                .iter()
+                .find(|r| r.entry.key == key)
+                .expect("known")
+                .resolved
+                .clone()
+                .unwrap_or_else(|| panic!("{key} resolves"))
+        };
+
+        let rolling = model("[policy]\nmode = \"roller\"\n");
+        let walking = model("[policy]\nmode = \"walk\"\n");
+
+        for m in [&rolling, &walking] {
+            let walk = hint(m, "policy.walk");
+            assert!(walk.contains("velstand"), "{walk}");
+            assert!(!walk.contains("roller"), "{walk}");
+            let roller = hint(m, "policy.roller");
+            assert!(roller.ends_with("roller.onnx"), "{roller}");
+
+            let pick = hint(m, "policy.ground_pick");
+            assert!(pick.contains("alpha_ground_pick"), "{pick}");
+            let crouch = hint(m, "policy.crouch");
+            assert!(crouch.contains("roller_crouch"), "{crouch}");
+
+            // The crouch's cycle and scale are the roller's numbers in either mode, and the
+            // pick's are the walker's — no cross-mode bleed in the hints either.
+            assert_eq!(hint(m, "policy.ground_pick_period"), "4");
+            assert_eq!(hint(m, "policy.crouch_period"), "3");
+            assert_eq!(hint(m, "policy.ground_pick_action_scale"), "1");
+            assert_eq!(hint(m, "policy.crouch_action_scale"), "0.8");
+        }
     }
 
     /// **Binding a button writes one key and leaves the file alone otherwise.** It goes through
