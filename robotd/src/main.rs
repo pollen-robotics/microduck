@@ -480,31 +480,41 @@ fn drop_unloadable_overrides_with(
     }
     // A `walk = "none"` already in the file, from a `policy load walk none` this daemon used to
     // accept. `resolved` now falls back rather than panicking, so the robot walks — but it walks
-    // with something the config does not name, which is exactly what this reports.
-    if policy_params
-        .slot(Slot::Walk)
-        .as_deref()
-        .is_some_and(params::is_none_sentinel)
-    {
-        tracing::error!("[policy] walk = \"none\" cannot be honoured; using this robot's own");
-        errors.set(
-            Slot::Walk,
-            "the walking policy cannot be switched off; using this robot's own".to_owned(),
-        );
-        policy_params.set_slot(Slot::Walk, None);
+    // with something the config does not name, which is exactly what this reports. The roller's
+    // locomotion slot is the same rule: a robot on wheels with no network has nothing to run.
+    for slot in [Slot::Walk, Slot::Roller] {
+        if policy_params
+            .slot(slot)
+            .as_deref()
+            .is_some_and(params::is_none_sentinel)
+        {
+            tracing::error!(
+                slot = slot.as_str(),
+                "[policy] {} = \"none\" cannot be honoured; using this robot's own",
+                slot.as_str()
+            );
+            errors.set(
+                slot,
+                "the locomotion policy cannot be switched off; using this robot's own".to_owned(),
+            );
+            policy_params.set_slot(slot, None);
+        }
     }
 
+    let manifest = params::set_manifest();
     for slot in Slot::ALL {
         if policy_params.slot(slot).is_none() {
             continue;
         }
-        let cfg = policy_params.resolved();
+        // Resolved in the slot's own mode, not the robot's: a path that will not load is worth
+        // finding at boot even when it belongs to the mode nobody is in. The alternative is
+        // finding it at the held DPad-Up that loads it.
         // A slot set to the literal "none" resolves to nothing, and disabling a capability on
         // purpose is not a fault to fall back from.
-        let Some(path) = cfg.slot(slot) else {
+        let Some(path) = policy_params.resolved_slot_with(slot, manifest.as_ref()) else {
             continue;
         };
-        let Err(e) = validate(path) else {
+        let Err(e) = validate(&path) else {
             continue;
         };
         if e.path().is_none() {
@@ -7146,6 +7156,68 @@ mod tests {
                 .contains("cannot be switched off"),
             "and health says so"
         );
+    }
+
+    /// **A path that will not load is found at boot, not at the DPad-Up that loads it.** The
+    /// roller's slots are not driving while the robot is on its legs, and skipping them would move
+    /// the discovery of a typo to the one moment it takes something down. Two extra ONNX loads at
+    /// startup, and only on a robot that has overridden both modes.
+    #[test]
+    fn a_broken_roller_path_is_dropped_while_walking() {
+        let mut policy = params::PolicyParams {
+            mode: params::Mode::Walk,
+            roller: Some(PathBuf::from("/wheels/gone.onnx")),
+            ..Default::default()
+        };
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |path| {
+            Err(shape_error(&path.display().to_string()))
+        });
+
+        assert!(
+            policy.slot(Slot::Roller).is_none(),
+            "the override is dropped, so the roller comes back on its own default"
+        );
+        assert!(
+            errors.get(Slot::Roller).is_some(),
+            "and health says why, rather than the robot going down on the next mode switch"
+        );
+    }
+
+    /// The mirror: the legs' slots are checked while the robot is on wheels.
+    #[test]
+    fn a_broken_walk_path_is_dropped_while_rolling() {
+        let mut policy = params::PolicyParams {
+            mode: params::Mode::Roller,
+            walk: Some(PathBuf::from("/legs/gone.onnx")),
+            ..Default::default()
+        };
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |path| {
+            Err(shape_error(&path.display().to_string()))
+        });
+
+        assert!(policy.slot(Slot::Walk).is_none());
+        assert!(errors.get(Slot::Walk).is_some());
+    }
+
+    /// `roller = "none"` is the same refusal `walk = "none"` gets, for the same reason: a robot
+    /// with no locomotion network on wheels has nothing to run.
+    #[test]
+    fn the_roller_slot_cannot_be_switched_off() {
+        let mut policy = params::PolicyParams {
+            mode: params::Mode::Roller,
+            roller: Some(PathBuf::from("none")),
+            ..Default::default()
+        };
+        let mut errors = SlotErrors::default();
+
+        drop_unloadable_overrides_with(&mut policy, &mut errors, |_| Ok(()));
+
+        assert!(policy.slot(Slot::Roller).is_none(), "the line is dropped");
+        assert!(errors.get(Slot::Roller).is_some());
     }
 
     /// But "switch off" needs a slot to switch off. Without one it is indistinguishable from

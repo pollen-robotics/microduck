@@ -1517,10 +1517,10 @@ impl ResolvedPolicy {
             Slot::Stand => self.stand.as_deref(),
             Slot::SitStand => self.sitstand.as_deref(),
             Slot::GroundPick => (self.mode == Mode::Walk)
-                .then(|| self.ground_pick.as_deref())
+                .then_some(self.ground_pick.as_deref())
                 .flatten(),
             Slot::Crouch => (self.mode == Mode::Roller)
-                .then(|| self.ground_pick.as_deref())
+                .then_some(self.ground_pick.as_deref())
                 .flatten(),
             Slot::KickLeft => self.kick_left.as_deref(),
             Slot::KickRight => self.kick_right.as_deref(),
@@ -1771,6 +1771,11 @@ impl PolicyParams {
     ///
     /// Takes the manifest rather than reading it, because [`set_manifest`] parses the file on
     /// every call and both callers ask about all nine slots in a loop.
+    ///
+    /// This resolves the whole policy afresh on every call, so a nine-slot loop pays nine full
+    /// resolutions. Both current callers are on cold paths — boot, and event-driven report
+    /// republishes — where that cost is invisible; a caller on a hot path should resolve once
+    /// per mode instead of calling this per slot.
     pub fn resolved_slot_with(
         &self,
         slot: Slot,
