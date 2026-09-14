@@ -1445,6 +1445,18 @@ impl Slot {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// Which drive mode reads this slot, or `None` for the five both modes share.
+    ///
+    /// The four mode-specific slots are the reason this change exists: the slot name is the
+    /// mode, so nothing has to carry a mode alongside a slot to know which is which.
+    pub fn mode(self) -> Option<Mode> {
+        match self {
+            Slot::Walk | Slot::GroundPick => Some(Mode::Walk),
+            Slot::Roller | Slot::Crouch => Some(Mode::Roller),
+            Slot::Stand | Slot::SitStand | Slot::KickLeft | Slot::KickRight | Slot::Roulade => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Slot {
@@ -1746,6 +1758,43 @@ impl PolicyParams {
             voltage_adapt: self.voltage_adapt,
             nominal_voltage: self.nominal_voltage,
         }
+    }
+
+    /// What `slot` would load, resolved in the mode that slot belongs to rather than the mode
+    /// the robot is in. `None` for a slot switched off with the `"none"` sentinel.
+    ///
+    /// [`ResolvedPolicy::slot`] answers "what is running in this slot", and for a slot of the
+    /// mode the robot is not in the honest answer is nothing. This is the other question, and
+    /// two callers need it: the boot-time check that clears a path that will not load, and the
+    /// slot report. A broken `roller = …` found at boot is a degraded health line; found at the
+    /// held DPad-Up that loads it, it is a robot going down, usually on a table.
+    ///
+    /// Takes the manifest rather than reading it, because [`set_manifest`] parses the file on
+    /// every call and both callers ask about all nine slots in a loop.
+    pub fn resolved_slot_with(
+        &self,
+        slot: Slot,
+        manifest: Option<&SetManifest>,
+    ) -> Option<PathBuf> {
+        let mode = slot.mode().unwrap_or(self.mode);
+        if mode == self.mode {
+            return self
+                .resolved_with(manifest)
+                .slot(slot)
+                .map(std::path::Path::to_path_buf);
+        }
+        let mut as_if = self.clone();
+        as_if.mode = mode;
+        as_if
+            .resolved_with(manifest)
+            .slot(slot)
+            .map(std::path::Path::to_path_buf)
+    }
+
+    /// [`Self::resolved_slot_with`] against the installed set. Prefer the `_with` form in a
+    /// loop — this one re-reads the manifest each call.
+    pub fn resolved_slot(&self, slot: Slot) -> Option<PathBuf> {
+        self.resolved_slot_with(slot, set_manifest().as_ref())
     }
 }
 
@@ -2143,6 +2192,93 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
 
 #[cfg(test)]
 mod tests {
+    /// **A slot resolves in the mode it belongs to, not the one the robot is in.** Two callers need
+    /// this — the boot-time validation and the slot report — and both are about a slot that is not
+    /// currently driving. `ResolvedPolicy::slot` answers "what is running"; this answers "what
+    /// would load", which is the question you need to catch a broken path before it is loaded.
+    #[test]
+    fn a_slot_resolves_in_its_own_mode() {
+        let walking = super::PolicyParams::default();
+        assert_eq!(walking.mode, super::Mode::Walk);
+
+        assert!(
+            walking
+                .resolved_slot_with(super::Slot::Roller, None)
+                .is_some_and(|p| p.ends_with("roller.onnx")),
+            "the roller's default, on a robot standing on its legs"
+        );
+        assert!(
+            walking
+                .resolved_slot_with(super::Slot::Crouch, None)
+                .is_some_and(|p| p.ends_with("roller_crouch.onnx"))
+        );
+        assert!(
+            walking
+                .resolved_slot_with(super::Slot::Walk, None)
+                .is_some_and(|p| p.ends_with("velstand.onnx"))
+        );
+    }
+
+    /// An override is honoured whichever mode is live — that is the point, since the caller is
+    /// checking a file it is not about to load.
+    #[test]
+    fn resolved_slot_honours_an_override_from_the_other_mode() {
+        let walking = super::PolicyParams {
+            roller: Some(std::path::PathBuf::from("/wheels/v3.onnx")),
+            ..Default::default()
+        };
+        assert_eq!(
+            walking.resolved_slot_with(super::Slot::Roller, None),
+            Some(std::path::PathBuf::from("/wheels/v3.onnx"))
+        );
+    }
+
+    /// The five shared slots answer the same in both modes, and agree with `resolved()`.
+    #[test]
+    fn a_shared_slot_resolves_the_same_in_both_modes() {
+        for mode in [super::Mode::Walk, super::Mode::Roller] {
+            let p = super::PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            let cfg = p.resolved_with(None);
+            for slot in [
+                super::Slot::Stand,
+                super::Slot::SitStand,
+                super::Slot::KickLeft,
+                super::Slot::KickRight,
+                super::Slot::Roulade,
+            ] {
+                assert_eq!(
+                    p.resolved_slot_with(slot, None).as_deref(),
+                    cfg.slot(slot),
+                    "{slot} disagrees with resolved() in {mode:?}"
+                );
+            }
+        }
+    }
+
+    /// The `"none"` sentinel still switches an optional slot off, whichever mode asked.
+    #[test]
+    fn resolved_slot_respects_the_none_sentinel() {
+        let p = super::PolicyParams {
+            crouch: Some(std::path::PathBuf::from("none")),
+            ..Default::default()
+        };
+        assert_eq!(p.resolved_slot_with(super::Slot::Crouch, None), None);
+    }
+
+    /// Which mode owns which slot.
+    #[test]
+    fn slots_know_their_mode() {
+        assert_eq!(super::Slot::Walk.mode(), Some(super::Mode::Walk));
+        assert_eq!(super::Slot::GroundPick.mode(), Some(super::Mode::Walk));
+        assert_eq!(super::Slot::Roller.mode(), Some(super::Mode::Roller));
+        assert_eq!(super::Slot::Crouch.mode(), Some(super::Mode::Roller));
+        assert_eq!(super::Slot::Stand.mode(), None, "shared");
+        assert_eq!(super::Slot::Roulade.mode(), None, "shared");
+    }
+
     /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
     /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
     /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the
