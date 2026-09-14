@@ -483,7 +483,7 @@ Put that slot back:
 duckctl policy reset walk
 ```
 
-One slot at a time, because the wire call takes one — resetting all seven is
+One slot at a time, because the wire call takes one — resetting all nine is
 `robotctl policy reset` on the robot. The path is on the *robot*, and must be absolute.
 
 A load from here **survives a reboot**, exactly as `robotctl policy load` on the robot does: the

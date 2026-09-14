@@ -186,7 +186,7 @@ What this robot is running right now:
 robotctl policy list
 ```
 
-Two tables: the seven slots, then the skills — what runs by default, and what runs when asked.
+Two tables: the nine slots, then the skills — what runs by default, and what runs when asked.
 
 ```text
    SKILL        RUNS FOR  POLICY
@@ -250,7 +250,7 @@ sudo robotctl policy load walk /home/radxa/my_walking.onnx
 If the robot is walking, it goes to its home pose, loads it, and drives again. If it is doing
 something else — sitting, standing still — nothing moves: the network being replaced is not the
 one running, and the swap happens underneath. `sudo robotctl policy reset walk` puts that slot
-back; with no slot, it puts all seven back.
+back; with no slot, it puts all nine back.
 
 #### Trying somebody else's
 
@@ -378,10 +378,15 @@ oddly and you are not sure what was left set.
 
 #### The slots, and four things worth knowing
 
-The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
-survives updates — a release replaces the binaries and the policies it ships, not the line that
-points elsewhere.
+The slots are `walk`, `roller`, `stand`, `sitstand`, `ground_pick`, `crouch`, `kick_left`,
+`kick_right` and `roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it
+survives a reboot and survives updates — a release replaces the binaries and the policies it
+ships, not the line that points elsewhere.
+
+Four of them name a drive mode rather than a gesture: on legs the robot reads `walk` and
+`ground_pick`, on wheels it reads `roller` and `crouch` (the roller's ground pick is a crouch),
+and it reads neither pair in the other mode. Loading a retrained roller network into `walk`
+writes a key the wheels never look at, so it is `roller` you want.
 
 - **Resetting something already reset does nothing, and says so.** No homing, no reload, and no
   `sudo` needed when there is also nothing to write.

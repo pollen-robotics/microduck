@@ -244,9 +244,14 @@ enum Namespace {
 
     /// Which `.onnx` runs in which slot — try a policy, and put it back.
     ///
-    /// Slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-    /// `roulade`. Each one is a config key; `load` writes it and `reset` removes it, so a change
-    /// survives a reboot and undoing it is one command rather than an edit.
+    /// Slots are `walk`, `roller`, `stand`, `sitstand`, `ground_pick`, `crouch`, `kick_left`,
+    /// `kick_right` and `roulade`. Each one is a config key; `load` writes it and `reset`
+    /// removes it, so a change survives a reboot and undoing it is one command rather than an
+    /// edit.
+    ///
+    /// Four of them belong to a drive mode: `walk` and `ground_pick` are read on legs, `roller`
+    /// and `crouch` on wheels. A load into the other mode's slot is honoured, it just changes
+    /// nothing until the robot switches — which is the point of there being two of each.
     ///
     /// The swap is live, without a restart and without going limp. Only a change to the network
     /// that is driving right now sends the robot to its home pose first; a `walk` reset while it
@@ -953,7 +958,8 @@ enum PolicyCommand {
     /// directory you are in, and the file has to still be there at the next boot — a slot whose
     /// file has gone falls back to this robot's own policy and says so in `robotctl health`.
     Load {
-        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        /// `walk`, `roller`, `stand`, `sitstand`, `ground_pick`, `crouch`, `kick_left`,
+        /// `kick_right` or `roulade` — `roller` and `crouch` are the wheeled mode's.
         slot: String,
         /// A file on this robot, a Hub repo to fetch it from, or `none` to switch the slot off.
         ///

@@ -2279,9 +2279,13 @@ pub struct ModeResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadPolicyParams {
-    /// `"walk"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"kick_left"`, `"kick_right"` or
-    /// `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
-    /// does not have should be refused with the list of ones it does, not fail to parse.
+    /// `"walk"`, `"roller"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"crouch"`,
+    /// `"kick_left"`, `"kick_right"` or `"roulade"`. `roller` and `crouch` are the wheeled
+    /// mode's own locomotion and pick; `walk` and `ground_pick` are read only on legs, so
+    /// loading into the slot of the mode the robot is not in changes nothing until it switches.
+    ///
+    /// A string for the reason [`SetModeParams`] carries one: a slot this build does not have
+    /// should be refused with the list of ones it does, not fail to parse.
     pub slot: Option<String>,
     /// The `.onnx` to run. Absolute — the daemon resolves nothing relative, because its working
     /// directory is not the caller's and a path that meant one file to each would be worse than

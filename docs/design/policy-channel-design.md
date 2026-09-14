@@ -87,7 +87,7 @@ disturbing a comment. So:
 
 - `policy load <slot> <x>` writes `policy.<slot>`, then reloads live;
 - `policy reset <slot>` removes the key, then reloads live;
-- `policy reset` removes all seven — "put it back the way it came".
+- `policy reset` removes all nine — "put it back the way it came".
 
 **`robotd` writes the key, not the caller.** `robot.loadPolicy` records the slot in
 `robotd.toml` before it queues the swap, so the durability above is a property of the *method*
@@ -222,7 +222,7 @@ robotctl policy list                      slot · current · origin · version
 robotctl policy check [slot]              is anything newer at the source
 robotctl policy load <slot> <repo|name|path>
 robotctl policy update <slot>             fetch the newest and load it
-robotctl policy reset [slot]              back to official; no slot = all seven
+robotctl policy reset [slot]              back to official; no slot = all nine
 robotctl policy search <query>            Hub models matching a query
 ```
 
