@@ -72,7 +72,7 @@ pub fn page(signalling_port: u32) -> String {
 /// Returns only on failure — a bind that was refused, or a listener that died. The caller decides
 /// what that costs; in `mediad` it costs the page and not the video, because a robot that streams
 /// and answers control calls with no console is a great deal better than one that does neither.
-pub async fn serve(host: &str, port: u16, page: String) -> Result<()> {
+pub async fn serve(host: &str, port: u16, page: String, agent: crate::agent::State) -> Result<()> {
     let address: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("{host}:{port} is not an address to listen on"))?;
@@ -80,15 +80,24 @@ pub async fn serve(host: &str, port: u16, page: String) -> Result<()> {
         .await
         .with_context(|| format!("could not listen on {address}"))?;
 
-    tracing::info!(%address, "serving the console");
-    axum::serve(listener, router(page))
+    tracing::info!(%address, "serving the console and the agent socket");
+    axum::serve(listener, router(page, agent))
         .await
         .context("the console's listener stopped")
 }
 
-/// One route, returning `page`.
-fn router(page: String) -> Router {
-    Router::new().route("/", get(move || std::future::ready(Html(page))))
+/// The page, and the WebSocket a program drives the robot over.
+///
+/// One listener for both because they are one interface seen from two sides, and because a second
+/// port is a second thing to configure, open and explain. `/` is for a person, `/agent` is for a
+/// program, and `crate::agent` says why the second one exists.
+fn router(page: String, agent: crate::agent::State) -> Router {
+    Router::new()
+        .route("/", get(move || std::future::ready(Html(page))))
+        .route(
+            "/agent",
+            get(move |ws| crate::agent::upgrade(ws, agent.clone())),
+        )
 }
 
 #[cfg(test)]
@@ -161,7 +170,12 @@ mod tests {
             .expect("a loopback port");
         let address = listener.local_addr().expect("the port it took");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(page(8443))).await;
+            let (_video_tx, video) = tokio::sync::watch::channel(None);
+            let agent = crate::agent::State {
+                sockets: crate::upstream::Sockets::default(),
+                video,
+            };
+            let _ = axum::serve(listener, router(page(8443), agent)).await;
         });
 
         let mut stream = tokio::net::TcpStream::connect(address)

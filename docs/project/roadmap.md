@@ -153,15 +153,18 @@ because the first-party device-code client takes no `scope` parameter. Narrowing
 `openid profile read-repos` is a public OAuth app in the org and one constant.
 
 **The SDK, and a small Python client.** §5.3 designs it as WebSocket plus snapshot: the same
-JSON-RPC, no media stack, `get_frame` returning a JPEG, a few dozen lines — and `mediad`'s
-session layer was built so that surface reuses it unchanged (`mediad/src/session.rs`). A Python
-client over **WebRTC** instead gets live video and the `control` datachannel from one
-connection, at the cost of `aiortc`, an ICE negotiation and a signalling round trip for a caller
-who only wants to send an intent and read a frame. **The investigation is whether one client
-covers both** — WebSocket for control and snapshots, WebRTC only when the caller asks for a
-stream — or whether the WebSocket surface alone is what a script wants and live video stays in
-the console. Answer that before writing either, because it decides whether the SDK is fifty
-lines or a project.
+JSON-RPC, no media stack, a few dozen lines — and `mediad`'s session layer was built so that
+surface reuses it unchanged (`mediad/src/session.rs`). Both halves are built: `mediad::agent`
+serves the socket at `/agent`, and `sdk/` is the client.
+
+**The investigation it was waiting on is answered, and the answer was fifty lines rather than a
+project.** One client does cover both, because the transport was never the hard part:
+`spaces/shared/control.py` had already carried the same JSON-RPC over three of them — a
+datachannel through the rendezvous, a datachannel on the LAN, and HTTP with no WebRTC at all — so
+the SDK binds a WebSocket to that same object rather than being a fourth implementation of the
+wire. Live video stays in the console: a viewer wants WebRTC, and a script that wants frames gets
+them the way `stream.rs` already sends them, outbound to a socket it opens, which needs no relay
+candidate and no ICE.
 
 **Privacy, and it is now two items rather than one.** *Consent* — explicit per-session approval
 before a stream starts — is a `mediad` session-layer change and is not blocked on anything. The
@@ -171,7 +174,8 @@ be asked of the hardware rather than parked on a software milestone. `architectu
 right that both are cheap now and expensive later, so consent should not wait for the LED.
 
 **Done when:** telepresence works from outside the LAN, and a server-side script can fetch a
-frame and send an intent in a few dozen lines.
+frame and send an intent in a few dozen lines. The second half is done —
+`sdk/examples/fetch_a_frame_and_send_an_intent.py` is that sentence as a program.
 
 ### M6 — Ship readiness
 
