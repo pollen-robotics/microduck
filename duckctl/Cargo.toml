@@ -26,7 +26,12 @@ description = "The robot from a laptop — over BLE today, over whatever reaches
 # the *client* side of the module the robot chunks with, so an asymmetry between them would show
 # up as this tool not working — which makes it a test of the protocol rather than a second
 # implementation free to agree with itself.
-btd = { path = "../btd" }
+#
+# `duck-ble` rather than `btd`, since a second consumer arrived and the split
+# became worth making: this tool wanted three platform-independent modules and
+# was pulling a Linux daemon — and on Linux, `bluer` and a vendored libdbus with
+# it — to reach them.
+duck-ble = { path = "../duck-ble" }
 
 # `API_VERSION`, and the `semver` re-export it is compared with. The version handshake is a
 # contract between this client and every daemon, so it is read from the crate that defines it

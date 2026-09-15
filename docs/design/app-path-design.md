@@ -606,7 +606,7 @@ links libdbus built from vendored source by `zig cc`.
 
 `duckctl` (`cargo run -p duckctl`) is the phone's stand-in and the only way to exercise
 the radio. An **example, not a binary**, so `btleplug` never reaches the robot; `btleplug` rather
-than `bluer` because it must run on a developer's Mac. It reuses `btd::framing`, so the chunking is
+than `bluer` because it must run on a developer's Mac. It reuses `duck_ble::framing`, so the chunking is
 genuinely the client half of the robot's own code rather than a reimplementation free to agree with
 itself.
 

@@ -19,9 +19,9 @@
 
 use std::time::{Duration, Instant};
 
-use btd::gatt::SERVICE_UUID;
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
+use duck_ble::gatt::SERVICE_UUID;
 use futures::StreamExt;
 
 /// How long to watch.

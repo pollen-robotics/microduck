@@ -1,0 +1,22 @@
+[package]
+name = "duck-ble"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The BLE wire contract — GATT UUIDs, NDJSON chunking, and the advertisement's payload"
+
+# **Deliberately tiny, and that is the feature.** Every client of the robot's
+# BLE surface needs these three modules and none of them needs a Bluetooth
+# stack: the phone app builds this for `aarch64-apple-ios`, `duckctl` builds it
+# for three desktop platforms, and `btd` builds it for the board. Adding a
+# dependency here is adding it to all three, so the bar is high.
+#
+# They lived in `btd` until a second consumer appeared. That cost the app
+# `clap`, `tracing-subscriber` and a tokio feature set it never used, because
+# `btd` is a daemon and needs them — and it cost `duckctl` a `bluer` and a
+# vendored libdbus on Linux, for a tool that talks to a robot rather than being
+# one.
+[dependencies]
+# The GATT UUIDs are values of this type, so a client cannot receive them
+# without it. Nothing else here needs a crate at all.
+uuid = "1"

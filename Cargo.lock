@@ -502,6 +502,7 @@ dependencies = [
  "bluer",
  "clap",
  "dbus",
+ "duck-ble",
  "duck-ipc-proto",
  "futures",
  "serde_json",
@@ -509,7 +510,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1108,6 +1108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "duck-ble"
+version = "0.13.0"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "duck-control"
 version = "0.13.0"
 dependencies = [
@@ -1165,9 +1172,9 @@ dependencies = [
 name = "duckctl"
 version = "0.13.0"
 dependencies = [
- "btd",
  "btleplug",
  "clap",
+ "duck-ble",
  "duck-ipc-proto",
  "futures",
  "serde_json",

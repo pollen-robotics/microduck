@@ -103,7 +103,7 @@ impl Link {
 /// await, because a yield point between receiving a chunk and enqueueing it lets two chunks swap
 /// places, and a reordered chunk corrupts a request rather than failing it.
 const _: () = assert!(
-    QUEUE * 20 >= crate::framing::MAX_LINE,
+    QUEUE * 20 >= duck_ble::framing::MAX_LINE,
     "QUEUE * 20 must be at least framing::MAX_LINE, or a full-length request can fill the \
      inbound queue and be refused"
 );

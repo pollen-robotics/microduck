@@ -16,7 +16,7 @@
 //! macOS, BlueZ on Linux, WinRT on Windows. `bluer` would restrict the client to Linux, which
 //! defeats the point.
 //!
-//! It reuses `btd::framing` deliberately. The chunking here is the *client* half of the same
+//! It reuses `duck_ble::framing` deliberately. The chunking here is the *client* half of the same
 //! module the robot uses, so if the framing were asymmetric this would not work — which makes
 //! it a real test of the protocol rather than a reimplementation that could agree with itself.
 //!
@@ -41,15 +41,15 @@
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use btd::adv;
-use btd::framing::{self, Reassembler};
-use btd::gatt::{RPC_UUID, SERVICE_UUID};
 use btleplug::api::{
     Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, PeripheralProperties,
     ScanFilter, WriteType,
 };
 use btleplug::platform::{Manager, Peripheral};
 use clap::{Parser, Subcommand};
+use duck_ble::adv;
+use duck_ble::framing::{self, Reassembler};
+use duck_ble::gatt::{RPC_UUID, SERVICE_UUID};
 use futures::StreamExt;
 
 /// How long to look for a robot before giving up.
@@ -135,7 +135,7 @@ struct Seen {
     /// Whether this advertisement carried the duck service UUID, which is the strongest evidence a
     /// listing has: anything better needs a connection, and `scan` deliberately makes none.
     duck: bool,
-    /// What the robot broadcast about its place on the network — see [`Address`], and `btd::adv`
+    /// What the robot broadcast about its place on the network — see [`Address`], and `duck_ble::adv`
     /// for why four bytes of IPv4 and not the SSID too.
     address: Address,
 }
@@ -753,7 +753,7 @@ async fn listing(seen: &[Seen], verbose: bool, target: &Target) -> String {
 /// the radio — while a list the robot is missing from points at the robot.
 ///
 /// And the robot can be *in* that list, unrecognisable. `btd` advertises flags (3 bytes), a 128-bit
-/// service UUID (18) and the address field (8, see `btd::adv`), which is 29 of the 31 bytes a legacy
+/// service UUID (18) and the address field (8, see `duck_ble::adv`), which is 29 of the 31 bytes a legacy
 /// advertisement holds — so the name never travels in it. It goes in the scan response, a second
 /// exchange that can be missed on its own. A device reported with no name and no services is
 /// therefore a plausible robot, which is why the unnamed ones are listed rather than filtered out.

@@ -12,7 +12,7 @@
 //! ## Out: a second advertising instance
 //!
 //! The board reports five advertising instances with one in use, so the beacon gets its own and
-//! **the existing advertisement is not touched.** That is not tidiness. `crate::adv` documents a
+//! **the existing advertisement is not touched.** That is not tidiness. `duck_ble::adv` documents a
 //! 31-byte budget, and the controller here reports a 251-byte one — so BlueZ would happily accept
 //! a bigger payload on the existing instance and, because it picks legacy against extended PDUs by
 //! size, would switch it to extended and make the robot invisible to a legacy-only scanner. Phone
@@ -67,10 +67,10 @@ use std::collections::HashMap;
 
 use duck_ipc_proto::ChoraleBeacon;
 
-/// The company id chorale beacons ride under — the same one [`crate::adv`] uses, for the same
+/// The company id chorale beacons ride under — the same one [`duck_ble::adv`] uses, for the same
 /// reason: `0xFFFF` is the id the SIG reserves for testing and is the correct choice for a project
 /// that has not been assigned one.
-pub const COMPANY_ID: u16 = crate::adv::COMPANY_ID;
+pub const COMPANY_ID: u16 = duck_ble::adv::COMPANY_ID;
 
 /// The advertising interval for the beacon.
 ///
@@ -91,7 +91,7 @@ pub fn scan_pattern() -> Vec<u8> {
 
 /// A beacon as the advertisement's manufacturer-data payload.
 ///
-/// The payload rather than the map, mirroring [`crate::adv::address_data`] — and because the two
+/// The payload rather than the map, mirroring [`duck_ble::adv::address_data`] — and because the two
 /// halves want different containers: `bluer` advertises from a `BTreeMap` and reports a scanned
 /// device's data as a `HashMap`.
 pub fn beacon_data(beacon: &ChoraleBeacon) -> Vec<u8> {
@@ -412,7 +412,7 @@ mod tests {
     }
 
     /// The round trip the broadcasting half and the scanning half both depend on — the same
-    /// property `crate::adv` pins for the address field, and for the same reason.
+    /// property `duck_ble::adv` pins for the address field, and for the same reason.
     #[test]
     fn a_beacon_survives_the_advertisement() {
         assert_eq!(beacon_in(&advertised(&beacon())), Some(beacon()));
@@ -425,15 +425,15 @@ mod tests {
     fn the_address_instance_is_not_heard_as_a_beat() {
         let address = HashMap::from([(
             COMPANY_ID,
-            crate::adv::address_data(Some(std::net::Ipv4Addr::new(192, 168, 1, 42))),
+            duck_ble::adv::address_data(Some(std::net::Ipv4Addr::new(192, 168, 1, 42))),
         )]);
         assert_eq!(beacon_in(&address), None);
         // And the reverse: a beacon is not read as an address, so a scanning `duck-btctl` does not
         // report a robot at some nonsense IP.
         let as_advertised = advertised(&beacon());
-        assert_eq!(crate::adv::address_in(&as_advertised), None);
+        assert_eq!(duck_ble::adv::address_in(&as_advertised), None);
         assert!(
-            !crate::adv::has_address_field(&as_advertised),
+            !duck_ble::adv::has_address_field(&as_advertised),
             "a beacon is not four bytes, so it is not an address field"
         );
     }
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(pattern, vec![0xFF, 0xFF, ChoraleBeacon::TAG]);
         // An address advertisement must *not* match, or the filter buys nothing.
         let mut address_field = COMPANY_ID.to_le_bytes().to_vec();
-        address_field.extend(crate::adv::address_data(None));
+        address_field.extend(duck_ble::adv::address_data(None));
         assert!(!address_field.starts_with(&pattern));
     }
 

@@ -13,11 +13,11 @@
 use duck_ipc_proto as proto;
 use tokio::sync::mpsc;
 
-use crate::framing::{self, Reassembler};
 use crate::link::{Link, QUEUE};
 use crate::pairing;
 use crate::route::{self, Route};
 use crate::upstream::{Pool, Sockets};
+use duck_ble::framing::{self, Reassembler};
 
 /// How many wrong PINs a session may offer before it is closed.
 ///

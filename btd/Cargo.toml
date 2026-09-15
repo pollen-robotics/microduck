@@ -14,13 +14,15 @@ description = "BLE transport adapter — a GATT front door onto the robot's JSON
 # stays unprivileged while `configd` is the one running as root.
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# The wire contract, shared with every client rather than exported to them.
+# It used to live here, which made a phone app depend on a daemon to agree
+# about chunking — see that crate's manifest.
+duck-ble = { path = "../duck-ble" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-# The GATT UUIDs are a wire contract every client needs, not a Linux detail — see src/gatt.rs.
-uuid = "1"
 
 # BlueZ, reached over bluetoothd's D-Bus API. Only on Linux, and this only ever *runs* on the
 # Radxa — but the crate must still *build* on a macOS laptop, because `cargo test` there is the
