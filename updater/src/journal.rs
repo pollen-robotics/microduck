@@ -260,6 +260,62 @@ impl Pins {
     }
 }
 
+/// When each component's update source last answered with a manifest that verified.
+///
+/// A robot that cannot reach its source (a blocked host, a DNS that stopped resolving, a clock TLS
+/// will not accept) looks like a robot with nothing to install: the scheduled check fails, and
+/// every other answer about the robot stays the same. How long ago the source last answered is the
+/// one thing that differs, so it is written down here and `update.status` reports it
+/// (`docs/design/updater-design.md` §8.4.2, option 3). A source replaying an old signed manifest
+/// still answers, and this does not catch that one; expiry would.
+///
+/// Only the source's latest counts. An exact version is one a source that stopped moving still
+/// serves.
+pub struct Checked {
+    path: PathBuf,
+}
+
+impl Checked {
+    pub fn open(state_dir: &Path) -> Self {
+        Self {
+            path: state_dir.join("checked.json"),
+        }
+    }
+
+    /// When `component`'s source last answered, in unix seconds. `None` when it never has on this
+    /// board, or the record cannot be read: this is a report riding on `update.status`, and a
+    /// report that failed the call it rides on would be worse than a missing one.
+    pub fn get(&self, component: &str) -> Option<i64> {
+        self.read_all().remove(component)
+    }
+
+    /// Record that `component`'s source answered now.
+    pub fn record(&self, component: &str) -> Result<(), Error> {
+        self.record_at(component, now_unix())
+    }
+
+    /// A clock before the preflight floor is not written down. A board with no RTC boots in 1970,
+    /// a `local_dir` source needs no TLS to answer, and a time from then would report the source as
+    /// fifty years quiet the moment the clock caught up.
+    fn record_at(&self, component: &str, at: i64) -> Result<(), Error> {
+        if at < crate::preflight::CLOCK_FLOOR_UNIX {
+            return Ok(());
+        }
+        let mut all = self.read_all();
+        all.insert(component.to_owned(), at);
+        let bytes = serde_json::to_vec(&all)
+            .map_err(|e| Error::Internal(format!("serialising check times: {e}")))?;
+        write_atomic(&self.path, &bytes)
+    }
+
+    fn read_all(&self) -> BTreeMap<String, i64> {
+        std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+}
+
 /// What `scripts/robot-rescue` leaves in the state dir when it swaps `current` to golden.
 ///
 /// The file it writes, verbatim:
@@ -757,5 +813,43 @@ mod tests {
         let counter = BootCounter::open(dir.path());
         counter.confirm("daemon").unwrap();
         counter.confirm("daemon").unwrap();
+    }
+
+    /// A board that has never reached its source has nothing to report, and one component's
+    /// check says nothing about another's.
+    #[test]
+    fn a_check_is_recorded_per_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = Checked::open(dir.path());
+        assert_eq!(checked.get("daemon"), None);
+
+        checked.record_at("daemon", 1_800_000_000).unwrap();
+        assert_eq!(checked.get("daemon"), Some(1_800_000_000));
+        assert_eq!(checked.get("model"), None);
+
+        checked.record_at("model", 1_800_000_500).unwrap();
+        assert_eq!(
+            checked.get("daemon"),
+            Some(1_800_000_000),
+            "another component's check leaves this one alone"
+        );
+    }
+
+    /// A clock that has not synced is not a time anything happened.
+    #[test]
+    fn a_check_under_an_unsynced_clock_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let checked = Checked::open(dir.path());
+        checked.record_at("daemon", 1_800_000_000).unwrap();
+        checked.record_at("daemon", 86_400).unwrap();
+        assert_eq!(checked.get("daemon"), Some(1_800_000_000));
+    }
+
+    /// A damaged record is a missing report, not a failed `update.status`.
+    #[test]
+    fn a_damaged_record_reads_as_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("checked.json"), b"{not json").unwrap();
+        assert_eq!(Checked::open(dir.path()).get("daemon"), None);
     }
 }

@@ -470,6 +470,79 @@ async fn check_reports_availability_without_changing_anything() {
     assert_eq!(fx.live_version(), None, "check must not install anything");
 }
 
+/// When `daemon`'s source last answered, as `update.status` reports it.
+async fn last_checked(engine: &Engine) -> Option<i64> {
+    engine
+        .status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|status| status.component.to_string() == "daemon")?
+        .last_checked
+}
+
+/// **A check that reached the source says when, and one that did not says nothing.**
+///
+/// A robot that cannot reach its source reads exactly like one with nothing to install, so when
+/// the source last answered is what `update.status` has to carry. It must move only on an answer:
+/// a failed fetch recorded as a check would hide the one case this exists to show.
+#[tokio::test]
+async fn status_says_when_the_source_last_answered() {
+    let fx = Fixture::new();
+    let engine = fx.engine_healthy();
+
+    // Nothing published, so the fetch fails, and that is not an answer.
+    engine.check("daemon").await.unwrap_err();
+    assert_eq!(last_checked(&engine).await, None);
+
+    fx.publish("1.0.0", None);
+    let before = updater::journal::now_unix();
+    engine.check("daemon").await.unwrap();
+    let at = last_checked(&engine)
+        .await
+        .expect("a check that reached the source is recorded");
+    assert!(at >= before, "{at} is before the check started at {before}");
+}
+
+/// **A manifest that does not verify is not an answer either.** The fetch worked and the signature
+/// did not, and a source serving something unsigned has told this robot nothing.
+#[tokio::test]
+async fn a_manifest_that_does_not_verify_is_not_an_answer() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let manifest = fx.releases.join("1.0.0.manifest.json");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&manifest, bytes).unwrap();
+    let engine = fx.engine_healthy();
+
+    engine.check("daemon").await.unwrap_err();
+    assert_eq!(last_checked(&engine).await, None);
+}
+
+/// **A sideloaded release says nothing about the source.** `--from` reads a directory on the board,
+/// and counting it would report a source that has not answered in a month as fresh the day somebody
+/// pushed a dev build. An apply of the source's own latest does count.
+#[tokio::test]
+async fn applying_from_a_directory_is_not_an_answer_from_the_source() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    let mut engine = fx.engine_healthy();
+
+    apply_from(&mut engine, &fx.sideload(), Target::Latest)
+        .await
+        .unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert_eq!(last_checked(&engine).await, None);
+
+    fx.publish("2.0.0", None);
+    apply_latest(&mut engine).await.unwrap();
+    assert!(
+        last_checked(&engine).await.is_some(),
+        "an apply of the source's latest is an answer"
+    );
+}
+
 #[tokio::test]
 async fn dry_run_verifies_everything_but_does_not_swap() {
     let fx = Fixture::new();

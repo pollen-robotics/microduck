@@ -1465,6 +1465,13 @@ struct ComponentReport {
     /// The last update attempt, as one line. `None` on a robot that has never updated.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_attempt: Option<String>,
+    /// How long since the update source last answered, in words: "3 hours ago". `None` when it
+    /// never has, or `updaterd` predates saying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_checked: Option<String>,
+    /// The same, in whole days, for the warning. The words are what a report carries.
+    #[serde(skip)]
+    quiet_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1753,6 +1760,9 @@ fn render_health(report: &HealthReport) -> String {
         if let Some(attempt) = &component.last_attempt {
             let _ = writeln!(out, "  {:<9} last update {attempt}", "");
         }
+        if let Some(checked) = &component.last_checked {
+            let _ = writeln!(out, "  {:<9} source last answered {checked}", "");
+        }
     }
 
     // After the installed lines rather than between them and the daemons above, because it has a
@@ -1896,6 +1906,9 @@ fn collect_version_report(
 
     report.warnings = version_warnings(&report, updaterd_running.as_ref());
     report
+        .warnings
+        .extend(quiet_source_warnings(&report.components));
+    report
 }
 
 /// Installed release per component, with the revision of the active one.
@@ -1911,6 +1924,7 @@ fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
     let Ok(statuses) = response.result_as::<Vec<proto::ComponentStatus>>() else {
         return Vec::new();
     };
+    let now = unix_now();
 
     statuses
         .into_iter()
@@ -1933,6 +1947,8 @@ fn installed_components(client: &mut Client) -> Vec<ComponentReport> {
                 revision,
                 pinned: status.pinned.map(|v| v.to_string()),
                 last_attempt: status.last_attempt.as_ref().map(describe_attempt),
+                last_checked: status.last_checked.map(|at| describe_check(at, now)),
+                quiet_days: status.last_checked.map(|at| (now - at).max(0) / 86_400),
             }
         })
         .collect()
@@ -1955,6 +1971,61 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
     }
+}
+
+/// Seconds since the epoch, by this machine's clock.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// When the update source last answered, in the unit a person would pick.
+///
+/// A clock behind the recorded time is a board that rebooted and has not synced yet. "In 3 hours"
+/// would be a claim about the future, so it says that instead of guessing.
+fn describe_check(at: i64, now: i64) -> String {
+    let age = now - at;
+    if age < 0 {
+        return "at a time this clock has not reached (not synced yet?)".to_owned();
+    }
+    if age < 60 {
+        return "just now".to_owned();
+    }
+    let (count, unit) = if age < 3_600 {
+        (age / 60, "minute")
+    } else if age < 86_400 {
+        (age / 3_600, "hour")
+    } else {
+        (age / 86_400, "day")
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
+}
+
+/// Past this, a quiet update source is said without being asked. A week is twenty-eight missed
+/// checks at the shipped six-hour interval, which is not a flaky link.
+const QUIET_SOURCE_DAYS: i64 = 7;
+
+/// A source that has not answered in a week, beside the pin and the last update. "Updates stopped
+/// arriving" is otherwise a symptom with nothing pointing at it, because a robot that cannot reach
+/// its source still reads as up to date.
+fn quiet_source_warnings(components: &[ComponentReport]) -> Vec<String> {
+    components
+        .iter()
+        .filter_map(|component| {
+            let days = component
+                .quiet_days
+                .filter(|days| *days >= QUIET_SOURCE_DAYS)?;
+            Some(format!(
+                "the {} update source has not answered in {days} days.\n  \
+                 A robot that cannot reach it still reads as up to date, because the only thing\n  \
+                 that fails is the check. `journalctl -u updaterd` has each attempt and why.",
+                component.name
+            ))
+        })
+        .collect()
 }
 
 /// Disagreements worth telling a human about.
@@ -4725,6 +4796,9 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                         if let Some(last) = &status.last_attempt {
                             println!("  last attempt: {}", compact(last));
                         }
+                        if let Some(at) = status.last_checked {
+                            println!("  source last answered {}", describe_check(at, unix_now()));
+                        }
                     }
                 }
             }
@@ -6078,6 +6152,38 @@ mod tests {
         assert_eq!(describe_attempt(&first), "0.2.0: applied");
     }
 
+    /// When the source last answered, in the unit a person would pick, and honest about a clock
+    /// that has not caught up with it.
+    #[test]
+    fn a_check_is_described_by_how_long_ago_it_was() {
+        let now = 1_800_000_000;
+        assert_eq!(describe_check(now - 5, now), "just now");
+        assert_eq!(describe_check(now - 60, now), "1 minute ago");
+        assert_eq!(describe_check(now - 3 * 3_600, now), "3 hours ago");
+        assert_eq!(describe_check(now - 47 * 86_400, now), "47 days ago");
+        assert!(describe_check(now + 600, now).contains("not synced"));
+    }
+
+    /// A week of silence is a warning without being asked for, and the line is in `health` either
+    /// way. A source that answered this morning, or an `updaterd` too old to say, warns nothing.
+    #[test]
+    fn a_quiet_update_source_is_said_without_being_asked() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        report.software.components[0].last_checked = Some("9 days ago".into());
+        report.software.components[0].quiet_days = Some(9);
+
+        let out = render_health(&report);
+        assert!(out.contains("source last answered 9 days ago"), "{out}");
+        let warnings = quiet_source_warnings(&report.software.components);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("9 days"), "{warnings:?}");
+
+        report.software.components[0].quiet_days = Some(0);
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+        report.software.components[0].quiet_days = None;
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+    }
+
     // ── version reporting ────────────────────────────────────────────────────
 
     fn report(services: Vec<ServiceReport>, daemon_installed: Option<&str>) -> VersionReport {
@@ -6092,6 +6198,8 @@ mod tests {
                 revision: None,
                 pinned: None,
                 last_attempt: None,
+                last_checked: None,
+                quiet_days: None,
             }],
             warnings: Vec::new(),
         }

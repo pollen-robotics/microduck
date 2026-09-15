@@ -189,7 +189,8 @@ difficulty — the items with the least code have the longest lead.
   a release whose daemons cannot start, which is the only path that matters. Cheapest item here:
   one board, one deliberately broken release.
 - **Consent**, from M5.
-- **Manifest staleness reporting** (§8.4.2).
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **done**: `robotctl health` says when the
+  update source last answered, and warns after a week of silence.
 - **Authority arbitration**, finished — including the edge #52 surfaced: `Call::is_mutating()`
   does not cover `robot.enable`, so the call that starts a policy running on a walking robot is
   classified alongside `hello`.
