@@ -72,7 +72,7 @@ class WsConsumer:
     """
 
     def __init__(self, token: str, peer_id: str, rpc: Any, base: str = DEFAULT_CENTRAL_URL,
-                 label: str = "microduck-policy-shop"):
+                 label: str = "microduck-policy-playground"):
         self._token = token
         self._peer_id = peer_id
         self._rpc = rpc
@@ -378,7 +378,9 @@ if __name__ == "__main__":
 
     # Shorter than the page's, because a person is watching this one.
     rpc = Rpc(timeout=15)
-    consumer = WsConsumer(credential, duck.peer_id, rpc, label="microduck-policy-shop/wire-check")
+    consumer = WsConsumer(
+        credential, duck.peer_id, rpc, label="microduck-policy-playground/wire-check"
+    )
     try:
         consumer.start()
     except WireError as e:

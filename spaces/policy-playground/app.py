@@ -98,7 +98,7 @@ logging.getLogger().addHandler(RING)
 for chatty in ("aioice", "aiortc", "aiohttp", "httpx", "urllib3"):
     logging.getLogger(chatty).setLevel(logging.DEBUG if LEVEL == "DEBUG" else logging.WARNING)
 
-logger = logging.getLogger("shop")
+logger = logging.getLogger("playground")
 
 # How long to hold a policy that declares no length of its own. Perpetual means "until told
 # otherwise", so something has to choose, and `robotctl policy add` refuses rather than guessing —
@@ -208,7 +208,7 @@ class Link:
                 # match would be the place a mini could be handed to a duck's client.
                 peer_id,
                 rpc,
-                label=f"microduck-policy-shop/{os.environ.get('SPACE_ID', 'local')}",
+                label=f"microduck-policy-playground/{os.environ.get('SPACE_ID', 'local')}",
             ),
         )
 
@@ -542,12 +542,11 @@ def already_note(result: Any) -> str:
 
 
 def install_and_run(index: int, hold: float) -> str:
-    """`policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do` — and stop at the first no.
+    """A row's button: the policy the gallery read, put on the duck.
 
-    Every refusal is worth showing verbatim. `policy.fetch` is the one that checks the claims that
-    matter — `obs_len`, `action_len`, `model_api`, `robot.model` — and it makes them *before* the
-    download, so "this policy is 51-D and this robot is 61-D" arrives in a second rather than
-    after 800 KB and a load failure.
+    The refusal is made here rather than left to the four calls because the gallery has already
+    read this one's manifest — a policy the page knows is a ground pick should not cost a
+    download to find that out.
     """
     if index >= len(CATALOGUE):
         return "that row is stale — reload the catalogue."
@@ -557,25 +556,59 @@ def install_and_run(index: int, hold: float) -> str:
     blocked = catalogue.refusal(policy)
     if blocked:
         return f"**not installed.** {blocked}"
+    return put_on_the_duck(policy.repo, None, policy.file, hold)
 
-    params: dict[str, Any] = {"repo": policy.repo}
-    if policy.file:
-        params["file"] = policy.file
+
+def install_typed(spec: str, hold: float) -> str:
+    """The box's button: whatever somebody named, put on the duck.
+
+    **Nothing is read here first, and that is the difference from a row.** The gallery is
+    `?search=microduck` and this box exists for what that does not reach — a branch, a repo named
+    something else, a policy published ten minutes ago — so there is no manifest in hand and
+    fetching one to pre-judge it would be this page second-guessing `policy.fetch`, which reads
+    the same file on the robot and refuses on it before downloading anything.
+    """
+    try:
+        repo, revision, file = catalogue.parse_spec(spec)
+    except ValueError as why:
+        return f"**that is not a policy to fetch.** {why}"
+    logger.info(
+        "typed: %r → repo=%s revision=%s file=%s (hold %s)", spec, repo, revision, file, hold
+    )
+    return put_on_the_duck(repo, revision, file, hold)
+
+
+def put_on_the_duck(repo: str, revision: str | None, file: str | None, hold: float) -> str:
+    """`policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do` — and stop at the first no.
+
+    Every refusal is worth showing verbatim. `policy.fetch` is the one that checks the claims that
+    matter — `obs_len`, `action_len`, `model_api`, `robot.model` — and it makes them *before* the
+    download, so "this policy is 51-D and this robot is 61-D" arrives in a second rather than
+    after 800 KB and a load failure.
+    """
+    params: dict[str, Any] = {"repo": repo}
+    if revision:
+        params["revision"] = revision
+    if file:
+        params["file"] = file
 
     try:
         fetched = LINK.call("policy.fetch", params, timeout=FETCH_TIMEOUT) or {}
     except RpcError as e:
         return f"**`policy.fetch` refused it.** {e.message}"
 
-    # The robot's own reading of the manifest wins over this Space's: it downloaded the file and
-    # parsed the manifest beside it, so its answer is about the bytes that are going to run.
+    # Everything below is the robot's own reading of the manifest rather than this Space's: it
+    # downloaded the file and parsed the manifest beside it, so its answer is about the bytes that
+    # are going to run. For a typed policy it is the *only* reading there has been.
+    spec = catalogue.spec_of(fetched)
+    name = fetched.get("name") or spec
     if not fetched.get("duration_s") and not hold:
         return (
-            f"**{policy.name} holds until it is told otherwise**, so it has no length of its own. "
+            f"**{name} holds until it is told otherwise**, so it has no length of its own. "
             "Say how many seconds to hold it, beside the button."
         )
     late_refusal = catalogue.refusal(
-        Policy(repo=policy.repo, name=policy.name, encoding=fetched.get("encoding"))
+        Policy(repo=repo, name=name, encoding=fetched.get("encoding"))
     )
     if late_refusal:
         return f"**downloaded, and not installed.** {late_refusal}"
@@ -603,23 +636,25 @@ def install_and_run(index: int, hold: float) -> str:
     if after.get("change_error"):
         return f"**added, and the robot could not re-read it:** {after['change_error']}"
 
-    name = skill["name"]
+    skill_name = skill["name"]
     try:
-        ran = LINK.call("robot.do", {"skill": name})
+        ran = LINK.call("robot.do", {"skill": skill_name})
     except RpcError as e:
         return (
-            f"**`{name}` is installed** ({skill['duration']:g}s) **and it would not run:** "
+            f"**`{skill_name}` is installed** ({skill['duration']:g}s) **and it would not run:** "
             f"{e.message}"
         )
     said_no = not_accepted(ran)
     if said_no:
         return (
-            f"**`{name}` is installed** ({skill['duration']:g}s) **and the robot would not run "
-            f"it:** {said_no}"
+            f"**`{skill_name}` is installed** ({skill['duration']:g}s) **and the robot would not "
+            f"run it:** {said_no}"
         )
+    # The spec rather than the row's key: it is what was actually fetched, revision and all, and
+    # it is a line somebody can paste back into the box or into `robotctl policy add`.
     return (
-        f"**`{name}` installed and running** — {skill['duration']:g}s from "
-        f"`{policy.key}`{already_note(ran)}{unconfirmed}"
+        f"**`{skill_name}` installed and running** — {skill['duration']:g}s from "
+        f"`{spec}`{already_note(ran)}{unconfirmed}"
     )
 
 
@@ -770,7 +805,7 @@ def open_session(peer_id: str | None, oauth: gr.OAuthToken | None) -> str:
     return LINK.through_rendezvous(token, peer_id, NAMES.get(peer_id, peer_id))
 
 
-with gr.Blocks(title="microduck policy shop") as demo:
+with gr.Blocks(title="microduck policy playground") as demo:
     gr.Markdown(
         """
         # Put a policy on your duck
@@ -867,6 +902,32 @@ with gr.Blocks(title="microduck policy shop") as demo:
             scale=2,
         )
         reload_catalogue = gr.Button("reload the catalogue")
+
+    # **The box, above the list rather than under it.** The gallery is `?search=microduck`, which
+    # is a convention rather than a rule, and the policy somebody actually wants to try is often
+    # the one that convention has not reached yet — a branch, a fork, a repo named something else,
+    # a file published ten minutes ago. Forty rows below this would be forty rows to scroll past
+    # to find it.
+    gr.Markdown(
+        "**Somewhere else on the Hub?** Name it and it is the same four calls. "
+        "`robotctl policy add`'s own spelling — `org/name`, optionally `@branch-tag-or-commit`, "
+        "optionally `:file.onnx` for a repo carrying several — or paste the address of the "
+        "repo's page, a `blob/` or a `resolve/` URL included.\n\n"
+        "**Its manifest is read on the robot and nowhere else.** Unlike a row, nothing here "
+        "knows what this policy claims to be, so the answer comes back from `policy.fetch` — "
+        "which reads the manifest beside the file and refuses on shape before downloading "
+        "anything. A public repo: the robot fetches these signed in as nobody, exactly as this "
+        "page reads the Hub."
+    )
+    with gr.Row():
+        typed = gr.Textbox(
+            value="",
+            placeholder="RemiFabre/microduck-flamingo-cycle",
+            label="a policy repo, or the URL of its page on the Hub",
+            scale=3,
+        )
+        put_typed = gr.Button("put it on the duck and run it", scale=0)
+
     catalogue_note = gr.Markdown("Loading…")
 
     rows: list[Any] = []
@@ -901,6 +962,12 @@ with gr.Blocks(title="microduck policy shop") as demo:
     stop.click(lambda: plain("robot.stop"), outputs=status)
     relax.click(lambda: plain("robot.relax"), outputs=status)
     run.click(run_installed, inputs=installed, outputs=status)
+    # The button and the return key both, because a box you typed a repo into is a box you press
+    # return in.
+    for press in (put_typed.click, typed.submit):
+        press(install_typed, inputs=[typed, hold], outputs=status).then(
+            lambda: robot_state()[0], outputs=robot_panel
+        )
     reload_catalogue.click(
         lambda: load_catalogue(force=True), outputs=[catalogue_note, *rows]
     )
@@ -927,4 +994,14 @@ with gr.Blocks(title="microduck policy shop") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=int(os.environ.get("PORT", 7860)))
+    # **`ssr_mode=False`, and the Space would not stay up without it.** Gradio's server-side
+    # rendering puts a Node proxy on 7860 in front of Python on 7861, and on this Space it
+    # started, served nothing, and stopped ten seconds later — `Stopping Node.js server...` and no
+    # traceback, which is a failure with nowhere to look. SSR buys SEO for a page that sits behind
+    # a sign-in, so the second process is all cost; `vision-demo`'s Dockerfile rules it out with
+    # `GRADIO_SSR_MODE=false` for the different reason that its image has no Node at all.
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
+        ssr_mode=False,
+    )

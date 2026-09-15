@@ -696,7 +696,7 @@ and it is a two-line change on their side — `kind` is already on the wire.
 
 ### 5.2 A consumer that drives a duck, and the one line of theirs it has to get past
 
-`spaces/policy-shop` is the second consumer in this repository and the first that *sends*
+`spaces/policy-playground` is the second consumer in this repository and the first that *sends*
 anything: sign in, list the account's ducks, and put a policy from the Hub onto one in a click —
 `policy.fetch`, `robot.setSkill`, `robot.policies`, `robot.do`, which is `robotctl policy add`'s
 own order over a datachannel instead of over a unix socket.

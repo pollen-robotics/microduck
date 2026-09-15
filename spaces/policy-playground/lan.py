@@ -39,16 +39,55 @@ from aiortc import RTCDataChannel, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 
-# **Their DTLS shim, called out loud.** aiortc's default cipher list shares no cipher with the
-# GStreamer `webrtcsink` a duck runs, so DTLS never completes and the peer connection never
-# reaches `connected` — a failure that looks exactly like a NAT problem and is not one. Their
-# module applies it at import; calling it here means this file does not depend on somebody else's
-# import having happened first, and it is idempotent by design.
-from reachy_mini.media.central_consumer import _patch_aiortc_dtls_ciphers
-
 from control import CONTROL_LABEL, Rpc
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_aiortc_dtls_ciphers() -> None:
+    """Let aiortc agree a cipher with the GStreamer `webrtcsink` a duck runs.
+
+    **Without this, DTLS never completes and the peer connection never reaches `connected`** — a
+    failure that looks exactly like a NAT problem and is not one, which is the worst kind of bug
+    this page can have, since a NAT problem is what the *from anywhere* tab exists to work around.
+    aiortc's default cipher list and `webrtcsink`'s share nothing; adding
+    `ECDHE-RSA-AES128-GCM-SHA256` is the whole fix. Upstream is aiortc PR #1392, and the day a
+    released aiortc negotiates one of these by default this function is a deletion.
+
+    **This is `reachy_mini.media.central_consumer._patch_aiortc_dtls_ciphers`, copied.** It was
+    imported until the Space would not build: on Linux `reachy_mini` pulls `PyGObject`, which
+    compiles against headers a Gradio builder has none of, and installing them would have put a
+    motor controller and ONNX Runtime inside a web page to get thirty lines of cipher list. A copy
+    of a shim that is itself a monkeypatch of somebody's private method, with the upstream PR
+    named, is the smaller debt — and `requirements.txt` says so at the point of the decision.
+
+    The flag it sets is *their* attribute name, deliberately: whichever of the two runs first, the
+    other sees it and does nothing, so a process that has both installed patches once.
+    """
+    from aiortc.rtcdtlstransport import RTCCertificate
+
+    if getattr(RTCCertificate, "_reachy_cipher_patched", False):
+        return
+    original = RTCCertificate._create_ssl_context
+    ciphers = (
+        b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:"
+        b"ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:"
+        b"ECDHE-RSA-AES128-GCM-SHA256"
+    )
+
+    def patched(self: Any, srtp_profiles: Any) -> Any:
+        context = original(self, srtp_profiles)
+        try:
+            context.set_cipher_list(ciphers)
+        except Exception as e:  # noqa: BLE001 - a cipher list that will not set is a DTLS that
+            # fails later with a better message than this one would be
+            logger.warning("dtls: set_cipher_list refused the list: %r", e)
+        return context
+
+    RTCCertificate._create_ssl_context = patched
+    RTCCertificate._reachy_cipher_patched = True
+    logger.info("dtls: cipher list extended (+ECDHE-RSA-AES128-GCM-SHA256)")
+
 
 _patch_aiortc_dtls_ciphers()
 

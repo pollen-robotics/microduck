@@ -18,7 +18,8 @@ the top level; the official set carries ten files and the same fields once per e
 `policies`. `policy.fetch` takes a `file`, so an entry out of the set is one click like any other.
 
 Runnable on its own — `uv run catalogue.py` prints what a duck would be offered — which is how
-this is checked without a robot, a token or a Space.
+this is checked without a robot, a token or a Space. Given arguments it answers for the box
+instead: `uv run catalogue.py <repo-or-URL>` says what that parses to and what the Hub has there.
 """
 
 from __future__ import annotations
@@ -93,6 +94,145 @@ class Policy:
         if self.encoding and self.encoding != "constant":
             bits.append(f"command: {self.encoding}")
         return " · ".join(bits)
+
+
+# ── naming one the list does not have ────────────────────────────────────────
+#
+# The gallery is `?search=microduck`, which is a convention and not a rule: a policy on a branch,
+# in a repo named something else, or published an hour ago into a search index that has not caught
+# up is invisible here and perfectly fetchable. So there is a box to type into, and this is what it
+# accepts.
+
+# Hosts a Hub URL can arrive under. What is in somebody's clipboard is the address bar of the page
+# they were just reading, and asking them to retype it as `org/name` is asking them to do a
+# machine's job.
+HUB_HOSTS = ("huggingface.co", "www.huggingface.co", "hf.co")
+# The path shapes a repo's own pages use: `/org/name/blob/main/policy.onnx` is what the file
+# viewer's address bar says, `resolve` is the download link behind it, `tree` is a directory.
+REVISIONED = ("blob", "resolve", "tree", "raw")
+
+
+def parse_spec(text: str) -> tuple[str, str | None, str | None]:
+    """A repo, a revision and a file out of whatever somebody typed or pasted.
+
+    **`robotctl policy add`'s spelling, exactly**: `org/name`, optionally `@revision`, optionally
+    `:file.onnx`. Somebody who has one of those in their notes or in a README should not have to
+    translate it to use this page, and a second syntax for the same three fields is a second
+    syntax to get wrong.
+
+    **And a Hub URL besides**, because that is what a person actually has to hand. Every shape the
+    Hub's own pages produce resolves to the same three fields — the repo page, a `tree`, and the
+    `blob`/`resolve` of a file, which carries the revision and the file both.
+
+    Raises `ValueError` carrying the sentence to show. The repo rule is `updater/src/policy.rs`'s
+    own, repeated here rather than relied on: the daemon's refusal is correct and arrives after a
+    round trip to a robot, and a typo deserves an answer while the cursor is still in the box.
+    """
+    typed = (text or "").strip()
+    if not typed:
+        raise ValueError("nothing typed.")
+
+    # A scheme or a hostname means a URL, whatever host it names — routing `example.com/org/name`
+    # through the `org/name` parser instead would answer a pasted address with a complaint about
+    # the word `https`, which is the least useful true thing that could be said about it.
+    if "://" in typed or typed.split("/")[0].lower() in HUB_HOSTS:
+        repo, revision, file = _from_url(typed)
+    else:
+        repo, revision, file = _from_spec(typed)
+
+    org, _, name = repo.partition("/")
+    if not org or not name or "/" in name:
+        raise ValueError(
+            f"`{repo}` is not an `org/name` repo — that is the whole of what the Hub calls one."
+        )
+    for part in (org, name):
+        # `updater/src/policy.rs`'s rule, character for character: neither half may hold a dot or
+        # a backslash, because both halves become a path under the policy library. It costs the
+        # Hub's dotted model names — `org/Phi-3.5-mini` is unfetchable by a duck — and a page that
+        # accepted one would be a page that sends a call guaranteed to come back refused.
+        if any(character in part for character in "./\\"):
+            raise ValueError(
+                f"`{repo}` is not an `org/name` repo — a dot or a slash in either half is what "
+                "the robot refuses, since both halves become a directory on it."
+            )
+    # The daemon's rule again: a revision becomes the last directory under `<org>/<name>/`.
+    if revision is not None and (revision.startswith(".") or any(c in revision for c in "/\\")):
+        raise ValueError(
+            f"`{revision}` is not a branch, a tag or a commit — it becomes a directory on the "
+            "robot, so it carries no slash."
+        )
+    if file is not None:
+        if "/" in file:
+            raise ValueError(
+                f"`{file}` is not at the top of the repo, and the robot installs only files that "
+                "are — `docs/policy-manifest.md` is why."
+            )
+        if not file.endswith(".onnx"):
+            raise ValueError(
+                f"`{file}` is not a policy. The file is the `.onnx` — leave it off entirely and "
+                "the robot takes the only one in the repo, which is what these repos have."
+            )
+    return repo, revision, file
+
+
+def _from_spec(typed: str) -> tuple[str, str | None, str | None]:
+    """`org/name[@revision][:file]`, split the way `robotctl` splits it."""
+    repo, _, file = typed.partition(":")
+    repo, _, revision = repo.partition("@")
+    return repo.strip("/"), revision or None, file or None
+
+
+def _from_url(typed: str) -> tuple[str, str | None, str | None]:
+    """The three fields out of a Hub address, whichever of its pages it came from."""
+    address = typed.split("//")[-1].split("?")[0].split("#")[0]
+    host, _, path = address.partition("/")
+    if host.lower() not in HUB_HOSTS:
+        raise ValueError(f"`{host}` is not the Hub. A policy lives at `huggingface.co/org/name`.")
+
+    parts = [part for part in path.split("/") if part]
+    # `/api/models/org/name` is the JSON behind the page, and somebody debugging has it open.
+    if parts[:2] == ["api", "models"]:
+        parts = parts[2:]
+    if parts[:1] == ["models"]:
+        parts = parts[1:]
+    # A Space and a dataset are not policies, and their URLs are the same shape as a model's — so
+    # this is the one mistake worth naming rather than letting the Hub answer it with a 404.
+    if parts and parts[0] in ("spaces", "datasets"):
+        what = parts[0].rstrip("s")
+        raise ValueError(
+            f"that is a {what}, not a model repo. A policy is the `.onnx` and the "
+            "`manifest.json` beside it, published as a model — `huggingface.co/org/name`."
+        )
+    if len(parts) < 2:
+        raise ValueError(f"`{typed}` names no repo. A policy lives at `huggingface.co/org/name`.")
+
+    repo = f"{parts[0]}/{parts[1]}"
+    rest = parts[2:]
+    if rest and rest[0] in REVISIONED:
+        revision = rest[1] if len(rest) > 1 else None
+        return repo, revision, "/".join(rest[2:]) or None
+    if rest:
+        raise ValueError(
+            f"`{'/'.join(rest)}` is not part of a repo's address — the repo itself is "
+            f"`huggingface.co/{repo}`, and a file in it is under `blob/` or `resolve/`."
+        )
+    return repo, None, None
+
+
+def spec_of(fetched: dict[str, Any]) -> str:
+    """What the robot fetched, written the way this page would take it back.
+
+    The answer to "what did that button actually install" has to be something a person can act on
+    — paste into the box to run it again, or into `robotctl policy add` on the robot. `main` is
+    left off because it is what a bare repo means anyway.
+    """
+    spec = fetched.get("repo") or "?"
+    revision = fetched.get("revision")
+    if revision and revision != "main":
+        spec += f"@{revision}"
+    if fetched.get("file"):
+        spec += f":{fetched['file']}"
+    return spec
 
 
 def refusal(policy: Policy) -> str | None:
@@ -214,13 +354,13 @@ def _integer(value: Any) -> int | None:
     return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 
 
-def _manifest(repo: str) -> dict[str, Any] | None:
+def _manifest(repo: str, revision: str = "main") -> dict[str, Any] | None:
     """A repo's `manifest.json`, or `None` if it has none.
 
     No token: these are public repos, and a Space that reads them signed in as whoever is looking
     would show a different catalogue to each visitor for no reason.
     """
-    url = f"https://huggingface.co/{repo}/resolve/main/manifest.json"
+    url = f"https://huggingface.co/{repo}/resolve/{revision}/manifest.json"
     try:
         answer = requests.get(url, timeout=TIMEOUT)
     except requests.RequestException:
@@ -339,7 +479,52 @@ def skill_for(fetched: dict[str, Any], hold: float | None) -> dict[str, Any]:
     return params
 
 
+def _check(typed: str) -> None:
+    """What the box would make of one line, and what the Hub says about the result."""
+    try:
+        repo, revision, file = parse_spec(typed)
+    except ValueError as why:
+        print(f"{typed}\n  refused: {why}")
+        return
+    print(
+        f"{typed}\n  repo={repo}  revision={revision or 'main'}  "
+        f"file={file or '(the only .onnx in it)'}"
+    )
+    manifest = _manifest(repo, revision or "main")
+    if manifest is None:
+        print("  no manifest.json there — the robot will fetch it anyway and the shape gate at")
+        print("  load is what decides, but nothing can be said about it first.")
+        return
+
+    # A set is a repo with several `.onnx` in it, and `policy.fetch` refuses one without a `file`
+    # rather than guessing which network to run. Saying so here beats learning it from the robot.
+    entries = manifest.get("policies")
+    if isinstance(entries, list) and entries:
+        entry = next((e for e in entries if e.get("file") == file), None) if file else None
+        if entry is None:
+            names = ", ".join(str(e.get("file")) for e in entries if e.get("file"))
+            print(f"  a set of {len(entries)} — name one with `:file.onnx`: {names}")
+            return
+        manifest = _merge(manifest, entry)
+    one = _policy_from(manifest, repo, file)
+    print(f"  {one.name} — {one.headline()}")
+    if one.description:
+        print(f"  {one.description}")
+    if refusal(one):
+        print(f"  REFUSED: {refusal(one)}")
+
+
 if __name__ == "__main__":
+    import sys
+
+    # `uv run catalogue.py <what you would type into the box>` answers, without a robot, a token
+    # or a Space, the two questions a typed policy raises: does this parse into a repo, and does
+    # the Hub have anything there. Asked nothing, it prints the whole catalogue as before.
+    if len(sys.argv) > 1:
+        for argument in sys.argv[1:]:
+            _check(argument)
+        raise SystemExit(0)
+
     found, why = read_hub()
     if why:
         print(why)

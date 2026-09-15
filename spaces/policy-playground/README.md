@@ -1,5 +1,5 @@
 ---
-title: microduck policy shop
+title: microduck policy playground
 emoji: 🦆
 colorFrom: yellow
 colorTo: pink
@@ -10,13 +10,13 @@ hf_oauth: true
 short_description: Pick a policy off the Hub, put it on your duck, run it.
 ---
 
-# microduck policy shop
+# microduck policy playground
 
 Everything published to the Hub as `microduck-…`, read the way the robot reads it, with a button
-that downloads one onto your duck and runs it.
+that downloads one onto your duck and runs it — and a box to name one the search did not reach.
 
-**Do not edit this Space directly.** The source is `spaces/policy-shop/` in
-`pollen-robotics/microduck`, and `scripts/publish-space.sh policy-shop` is what puts it here.
+**Do not edit this Space directly.** The source is `spaces/policy-playground/` in
+`pollen-robotics/microduck`, and `scripts/publish-space.sh policy-playground` is what puts it here.
 
 ## The one click
 
@@ -36,6 +36,32 @@ pipe to the API the robot already serves.
 **The robot's reading of a manifest wins over this page's.** The catalogue is read here so a row
 can say what a policy claims to be before anybody clicks it, but the skill that gets written comes
 from `policy.fetch`'s answer, which is about the bytes that were actually downloaded.
+
+## Naming one yourself
+
+The gallery is `?search=microduck`, which is a convention rather than a rule. A policy on a branch,
+in a repo named something else, or published into a search index that has not caught up is
+invisible in the list and perfectly fetchable — so there is a box above the rows, and what it takes
+is `robotctl policy add`'s own spelling: `org/name`, optionally `@branch-tag-or-commit`, optionally
+`:file.onnx` for a repo carrying several. A pasted Hub address is the same three fields and is
+accepted as it comes, `blob/` and `resolve/` URLs included, because what is in somebody's clipboard
+is the page they were just reading.
+
+`catalogue.parse_spec` is the whole of that, and it repeats `updater/src/policy.rs`'s rule about
+what an `org/name` is for one reason: the daemon's refusal is correct and arrives after a round
+trip to a robot, and a typo deserves an answer while the cursor is still in the box. A Space URL
+gets named as one rather than 404ing, since it is the same shape as a model's and it is the
+mistake to expect.
+
+**Nothing is read here first, and that is the difference from a row.** A row has had its manifest
+read, so the page can refuse a ground pick before anything is downloaded; a typed repo has not, and
+fetching one to pre-judge it would be this page second-guessing `policy.fetch` — which reads the
+same file on the robot, refuses on shape before downloading, and is the reading that the skill gets
+written from either way. The encoding refusal still lands, one step later, off the fetch answer.
+
+The line a run finishes on is the spec rather than the row's key — `org/name@v2:walk.onnx`, what
+was actually fetched, revision and all. It pastes back into the box, and into `robotctl policy add`
+on the robot.
 
 ## The picture
 
@@ -162,6 +188,12 @@ uv run catalogue.py
 ```
 
 prints the whole Hub catalogue with what each policy claims and which are refused. Needs no token.
+Given arguments, it answers for the box instead — what each one parses to, and what the Hub has
+there:
+
+```bash
+uv run catalogue.py https://huggingface.co/RemiFabre/microduck-flamingo-cycle
+```
 
 ```bash
 uv run lan.py

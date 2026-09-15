@@ -83,7 +83,7 @@ class Ring(logging.Handler):
     **A Space's logs are on a page only its owner can open**, and reading them needs write access
     to the Space — so "click the button and tell me what it said" was a round trip through
     somebody's screenshot. The panel shows what the container's stderr shows, to whoever is
-    already looking at the thing that failed. `policy-shop` has the same handler for the same
+    already looking at the thing that failed. `policy-playground` has the same handler for the same
     reason.
     """
 

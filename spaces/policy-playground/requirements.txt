@@ -1,0 +1,39 @@
+# **`reachy_mini` is deliberately not here, and it used to be.** The page asked for
+# `reachy_mini[central-consumer]`, whose whole contribution was `aiortc`, `av` and one DTLS cipher
+# patch — and on Linux the package pulls `PyGObject`, which builds from source against
+# `gobject-introspection` headers a Gradio Space's builder does not carry. The Space failed to
+# build with a page of `reachy-mini X does not provide the extra 'central-consumer'`, which is pip
+# backtracking through every older version after the newest one would not install, and names the
+# wrong thing entirely.
+#
+# Installing the build deps would have worked and would still have been wrong: it would put a
+# robot runtime — a motor controller, `rustypot`, `libusb`, ONNX Runtime, zeroconf — inside a web
+# page that drives a robot over HTTP. So the two libraries that page actually uses are named here,
+# and `lan.py` carries the cipher patch itself.
+
+# WebRTC, for the *on this network* tab. `av` comes with `aiortc` and is named anyway, because
+# `lan.py`'s own check builds frames with it.
+aiortc>=1.9
+av>=12
+
+# The signalling client for that tab. It was arriving transitively before, which is not the same
+# as being a dependency.
+aiohttp
+
+# **`[oauth]`, not bare `gradio`.** `gr.LoginButton` needs `itsdangerous` and `authlib`, which
+# only the extra pulls in, and without them a Space with `hf_oauth: true` fails at *import* —
+# `Cannot initialize OAuth due to a missing library` — rather than at the first click. Nothing
+# about the page says which one is missing, so it is worth the four characters.
+gradio[oauth]>=5
+
+# Frames arrive as arrays and the page rotates them.
+numpy
+
+# Reading the Hub: `huggingface.co/api/models?search=microduck`, and a `manifest.json` per hit.
+# The same two requests `updater/src/policy.rs` makes, so the gallery and `policy.search` cannot
+# disagree about what exists. `requests` is also the whole of the rendezvous transport.
+requests
+
+# `get_token`, for a local run: the sign-in button is mocked off a Space, so the token comes from
+# `HF_TOKEN` or from whatever `hf auth login` stored.
+huggingface_hub
