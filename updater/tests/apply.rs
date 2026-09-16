@@ -94,6 +94,46 @@ impl RobotClient for DegradedRobot {
     }
 }
 
+/// A robot that is still coming up the first time it is asked, and fine after that.
+///
+/// What `robotd` answers between its socket opening and its first tick: `healthy: false`,
+/// `degraded: false`, reason "control loop has not completed a cycle yet". Its own comment on that
+/// line says the gate polls, so it will see the transition. This is the transition.
+struct StartingThenHealthy {
+    asked: std::sync::atomic::AtomicU32,
+}
+
+impl StartingThenHealthy {
+    fn new() -> Self {
+        Self {
+            asked: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RobotClient for StartingThenHealthy {
+    async fn safe_to_restart(&self, _t: std::time::Duration) -> SafeToRestart {
+        SafeToRestart::Yes
+    }
+    async fn health(&self, _t: std::time::Duration) -> Health {
+        let asked = self
+            .asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if asked == 0 {
+            Health::Unhealthy("control loop has not completed a cycle yet".into())
+        } else {
+            Health::Healthy
+        }
+    }
+    async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
+        Some(1)
+    }
+    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
+        false
+    }
+}
+
 #[async_trait::async_trait]
 impl RobotClient for FakeRobot {
     async fn safe_to_restart(&self, _t: std::time::Duration) -> SafeToRestart {
@@ -983,6 +1023,50 @@ async fn an_unconfirmed_trial_on_a_healthy_robot_is_committed() {
         );
     }
     assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+}
+
+/// **A robot that is still starting is not a robot that failed.**
+///
+/// `robotd` answers "control loop has not completed a cycle yet" from the moment its socket opens
+/// until its first tick, and it says on that line that the gate polls and will see the transition.
+/// The apply gate does. Boot recovery asked once, with a two second timeout, and reverted on the
+/// answer. The two daemons start under different `After=` targets and nothing orders them, so on
+/// the boot that exhausts the budget the question could land in the seconds between `robotd`
+/// opening its socket and loading its policies, and a release the robot was about to be fine on
+/// went back to the previous one with "never reported healthy" in the log.
+#[tokio::test]
+async fn an_unconfirmed_trial_waits_for_a_robot_that_is_still_starting() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        "",
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    // First start counts. The second exhausts the budget and asks the robot, which is mid-start.
+    let mut engine = fx.engine(Box::new(StartingThenHealthy::new()), Faults::none(), "");
+    assert!(engine.recover_on_start().await.unwrap().is_empty());
+    let outcomes = engine.recover_on_start().await.unwrap();
+
+    assert!(
+        outcomes.is_empty(),
+        "a robot that had not ticked yet was treated as a failed release: {outcomes:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+    assert!(
+        !fx.pending_file_exists(),
+        "and once it answered healthy the trial is over"
+    );
 }
 
 /// And the case that prompted all of this: a bench board with no servo power.
