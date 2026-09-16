@@ -337,7 +337,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
 /// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
 /// other client is untouched.
-pub const API_VERSION: u32 = 28;
+///
+/// # v29: `ComponentStatus::last_checked`
+///
+/// `update.status` says when each component's update source last answered with a manifest that
+/// verified, so a robot that has stopped reaching its source stops looking up to date. An optional
+/// field an older client ignores and an older `updaterd` omits, and it bumps anyway, per the rule
+/// above.
+pub const API_VERSION: u32 = 29;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2970,6 +2977,14 @@ pub struct ComponentStatus {
     pub healthy: Option<bool>,
     pub pinned: Option<semver::Version>,
     pub last_attempt: Option<LogEntry>,
+    /// When this component's update source last answered with a manifest that verified, unix
+    /// seconds. `None` on a board where it never has, and from an `updaterd` older than v29.
+    ///
+    /// A robot that cannot reach its source reads exactly like one with nothing to install: the
+    /// scheduled check fails and every other field here stays the same. How long ago the source
+    /// last answered is what shows it. A source replaying an old signed manifest still answers,
+    /// so this does not catch that one; `updater-design.md` §8.4.2 has what would.
+    pub last_checked: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -889,6 +889,13 @@ cost — a re-signing schedule that, if missed, warns the entire fleet — is no
 paying before the publishing pipeline is routine. (2) is cheap but solves a problem
 §8.4.1 already covers at the version level.
 
+**(3) is built.** `update.status` carries `last_checked` per component, and `robotctl health`
+says when the update source last answered and warns once it has been quiet for a week. Only the
+source's latest counts, signed and for the right channel, so a failed fetch, a manifest that does
+not verify and a `--from` directory all leave it where it was. As the option says, it makes a robot
+that cannot reach its source visible, and not one being fed an old signed manifest; that is still
+(1).
+
 **Explicitly accepted for v1:** a robot whose network is hostile can be prevented
 from updating. It cannot be made to *downgrade*, install an artifact we did not
 sign, or install one that fails its health gate. Those are the properties we
@@ -1452,10 +1459,9 @@ Still open:
   That listener's blast radius is bounded by signature verification (an unsigned
   upload cannot install; worst case is filling the disk), but it wants a token
   and a deliberate bind regardless (`architecture.md` §2.2). Backup plan, not v1.
-- **Manifest staleness reporting** (§8.4.2) — surface "last successful check N
-  days ago" in `status` and the app, converting a freeze attack from silent to
-  visible. Cheap; recommended. Signed manifest expiry is the real defence but
-  carries a re-signing schedule, deferred until publishing is routine.
+- ~~**Manifest staleness reporting**~~ (§8.4.2), **built**: `update.status` carries
+  `last_checked`, and `robotctl health` warns when a source has been quiet for a week. Signed
+  manifest expiry is still the real defence, deferred until publishing is routine.
 - **Config ownership** — does config ride with the model bundle, the daemon, or
   become its own tiny channel? (Hooks handle migrations either way, §9.)
 - **Minimal success/failure phone-home** — one ping per update would let us catch

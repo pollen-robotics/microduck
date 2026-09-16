@@ -409,8 +409,8 @@ impl Engine {
 
     // ── queries ──────────────────────────────────────────────────────────────
 
-    /// Is an update available? Changes nothing.
-    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+    /// [`Self::check`]'s answer, before it is recorded.
+    async fn check_source(&self, component: &str) -> Result<CheckResult, Error> {
         let cfg = self.config.component(component)?;
         let store = self.store(component)?;
         let installed = store.current()?;
@@ -464,6 +464,28 @@ impl Engine {
         }
     }
 
+    /// Is an update available? Changes nothing that is installed.
+    ///
+    /// Records that the source answered, when it did, because `update.status` reports how long ago
+    /// that was ([`crate::journal::Checked`]). Every `Ok` below comes after the manifest verified
+    /// and named this component's channel; an `Err` may be the fetch, the signature or the
+    /// channel, and none of those is an answer.
+    pub async fn check(&self, component: &str) -> Result<CheckResult, Error> {
+        let result = self.check_source(component).await;
+        if result.is_ok() {
+            self.source_answered(component);
+        }
+        result
+    }
+
+    /// Note that `component`'s source answered with its latest. A failure to write that down is
+    /// logged and nothing more: it is a report about updates, not part of one.
+    fn source_answered(&self, component: &str) {
+        if let Err(e) = crate::journal::Checked::open(&self.config.state_dir).record(component) {
+            tracing::warn!(component, error = %e, "could not record that the update source answered");
+        }
+    }
+
     pub async fn status(&self) -> Result<Vec<ComponentStatus>, Error> {
         let mut out = Vec::new();
         for (name, cfg) in &self.config.components {
@@ -488,6 +510,7 @@ impl Engine {
                 healthy,
                 pinned: self.effective_pin(name),
                 last_attempt: self.journal.last_for(name)?,
+                last_checked: crate::journal::Checked::open(&self.config.state_dir).get(name),
             });
         }
         Ok(out)
@@ -691,6 +714,13 @@ impl Engine {
         });
 
         Self::check_channel(&manifest, component)?;
+
+        // The source answered with its latest, signed and for this component: what a `check`
+        // records. Not a `--from` directory, which says nothing about the source, and not an exact
+        // version, which a source that has stopped moving still serves.
+        if options.from_dir.is_none() && matches!(target, crate::proto::Target::Latest) {
+            self.source_answered(component);
+        }
 
         if let Some(pinned) = self.effective_pin(component)
             && pinned != manifest.version
