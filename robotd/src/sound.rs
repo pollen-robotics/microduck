@@ -52,6 +52,15 @@ const SYNTH_BLOCK: usize = sounds::SR as usize / 100;
 /// this number — see the module docs for why it is not the ride's 250 ms.
 const SYNTH_LEAD_S: f64 = 0.03;
 
+/// How long the beak stays open around a one-shot. A chirp is ~200 ms; the servo is
+/// slower, so a hold that ended with the wav would barely move. Long enough to read as a
+/// quack from across the room, short enough not to leave the beak hanging.
+const QUACK_MOUTH_HOLD: Duration = Duration::from_millis(450);
+
+/// How open the beak goes for a one-shot. Fully open: `robotctl quack` is how you tell
+/// ducks apart in a group, and a half-open beak is easy to miss.
+const QUACK_MOUTH_OPEN: f64 = 1.0;
+
 /// How loud one voice of an ensemble sings.
 ///
 /// Under full scale, and not for headroom: **four ducks in a room sum acoustically.** The offline
@@ -194,6 +203,9 @@ pub struct Sound {
     /// theremin and the rendered wavs are the same duck. `None` until first asked for;
     /// `Some(None)` once it has been asked for and there is no seed to be had.
     personality: Option<Option<Personality>>,
+    /// Beak stays open until this instant while a one-shot plays. The wav is shorter
+    /// than the servo's travel, so the hold is a duration, not `aplay`'s lifetime.
+    oneshot_mouth_until: Option<Instant>,
 }
 
 impl Sound {
@@ -208,6 +220,27 @@ impl Sound {
             live: None,
             singing: None,
             personality: None,
+            oneshot_mouth_until: None,
+        }
+    }
+
+    /// How open the beak should be for a one-shot that is in flight.
+    ///
+    /// The pad already opens the mouth via the analog triggers; `robotctl quack` has no
+    /// trigger, so this is the visible half of that call. Zero unless a chirp/greet/peck
+    /// (anything that went through [`Self::play`]) is still being shown, and never while a
+    /// ride/theremin/chorale owns the PCM — those own the mouth themselves.
+    pub fn quack_mouth(&mut self) -> f64 {
+        if self.ride != Ride::Off {
+            self.oneshot_mouth_until = None;
+            return 0.0;
+        }
+        match self.oneshot_mouth_until {
+            Some(until) if Instant::now() < until => QUACK_MOUTH_OPEN,
+            _ => {
+                self.oneshot_mouth_until = None;
+                0.0
+            }
         }
     }
 
@@ -243,6 +276,7 @@ impl Sound {
         }
         self.singing = None;
         self.ride = Ride::Off;
+        self.oneshot_mouth_until = None;
         if let Some(mut child) = self.child.take()
             && let Ok(None) = child.try_wait()
         {
@@ -302,6 +336,12 @@ impl Sound {
             }
             return;
         };
+        // The visual half of the call, even if `aplay` then fails: a quiet speaker is
+        // still a duck you can pick out by the beak. Not on the blocking goodbye peck —
+        // torque is about to go and there is no tick left to close it.
+        if !blocking {
+            self.oneshot_mouth_until = Some(Instant::now() + QUACK_MOUTH_HOLD);
+        }
         let child = Command::new("aplay")
             .args(["-q", "-D", &self.device])
             .arg(&wav)
@@ -897,6 +937,41 @@ mod tests {
         sound.wheee(WheeeHold::Released);
         assert!(sound.child.is_none());
         assert_eq!(sound.ride, Ride::Off);
+        assert_eq!(
+            sound.quack_mouth(),
+            0.0,
+            "a missing bank must not flap the beak"
+        );
+    }
+
+    /// A one-shot opens the beak even if `aplay` cannot run: `robotctl quack` is how you
+    /// tell ducks apart, and a quiet speaker is still a duck you can pick out visually.
+    #[test]
+    fn a_one_shot_opens_the_beak() {
+        let dir = std::env::temp_dir().join(format!("sound-quack-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("chirp")).unwrap();
+        std::fs::write(dir.join("chirp/a.wav"), b"RIFF").unwrap();
+        let mut sound = Sound::new(dir.clone(), "null".into());
+        sound.play("chirp", false);
+        assert_eq!(sound.quack_mouth(), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A wheee ride owns the mouth via the analog trigger; a one-shot skipped because the
+    /// ride has the PCM must not steal it.
+    #[test]
+    fn a_ride_does_not_open_the_beak_for_a_skipped_one_shot() {
+        let dir = std::env::temp_dir().join(format!("sound-ride-mouth-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("wheee")).unwrap();
+        std::fs::create_dir_all(dir.join("chirp")).unwrap();
+        std::fs::write(dir.join("chirp/a.wav"), b"RIFF").unwrap();
+        let mut sound = Sound::new(dir.clone(), "null".into());
+        sound.wheee(WheeeHold::Held);
+        assert_eq!(sound.ride, Ride::Riding);
+        sound.play("chirp", false);
+        assert_eq!(sound.quack_mouth(), 0.0);
+        sound.wheee(WheeeHold::Released);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A bank whose `wheee/` holds no triads (a half-rendered `ensure-bank`, or a bank from
