@@ -38,11 +38,14 @@ pub const DEFAULT_PATH: &str = "/etc/robot/hf-token";
 
 /// The group that may read the token file.
 ///
-/// `mediad` runs as `User=mediad` with `SupplementaryGroups=robot`, and it is the process that
-/// needs the token — it is the one holding the relay. `updaterd` runs as root and writes it. So
-/// the file is `root:robot` and `0640`: readable by the daemons that belong to this robot, and by
-/// nothing else with a login on the board.
-pub const TOKEN_GROUP: &str = "robot";
+/// `mediad` is the process that needs the token, since it is the one holding the relay, and
+/// `updaterd` runs as root and writes it. So the file is `0640`, root-owned, and this is its
+/// group. Its own group, with `mediad` as the only member, and not `robot`: `robot` is the socket
+/// group, which is how any client reaches a daemon at all, so `btd`, `padd`, `tofd` and every
+/// operator with a shell are in it. A credential in that group is a credential the gamepad daemon
+/// can read. `mediad.service` grants this one, and the `sysusers.d` files create it and put
+/// `mediad` in it, on a fresh board and by update alike.
+pub const TOKEN_GROUP: &str = "robot-account";
 
 /// The account this robot belongs to, at [`DEFAULT_PATH`].
 pub fn account() -> Account {
@@ -163,5 +166,13 @@ mod tests {
 
         let down: crate::Error = Hf::Network("POST /oauth/device: timed out".into()).into();
         assert_eq!(down.code(), proto::code::NETWORK);
+    }
+    /// **The token's group is not the socket group.** `robot` is how a client reaches a daemon,
+    /// so everything that talks to one is in it, the gamepad daemon and every shell user
+    /// included. It was this group at first, and the design said only root and `mediad` could
+    /// read the file. Pinned, so convenience does not put it back.
+    #[test]
+    fn the_token_group_is_not_the_socket_group() {
+        assert_ne!(TOKEN_GROUP, "robot");
     }
 }
