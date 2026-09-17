@@ -40,7 +40,14 @@ impl Quat {
     /// attribute, and a model that ignores a broken quat is diagnosable where a
     /// model full of NaN is not.
     pub fn normalized(self) -> Self {
-        let n = (self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z).sqrt();
+        let n = self
+            .z
+            .mul_add(
+                self.z,
+                self.y
+                    .mul_add(self.y, self.x.mul_add(self.x, self.w * self.w)),
+            )
+            .sqrt();
         if n < 1e-12 {
             return Self::IDENTITY;
         }
@@ -57,13 +64,16 @@ impl Quat {
     /// full quaternion sandwich.
     pub fn rotate(self, v: [f64; 3]) -> [f64; 3] {
         let [vx, vy, vz] = v;
-        let tx = 2.0 * (self.y * vz - self.z * vy);
-        let ty = 2.0 * (self.z * vx - self.x * vz);
-        let tz = 2.0 * (self.x * vy - self.y * vx);
+        let tx = 2.0 * self.z.mul_add(-vy, self.y * vz);
+        let ty = 2.0 * self.x.mul_add(-vz, self.z * vx);
+        let tz = 2.0 * self.y.mul_add(-vx, self.x * vy);
         [
-            vx + self.w * tx + self.y * tz - self.z * ty,
-            vy + self.w * ty + self.z * tx - self.x * tz,
-            vz + self.w * tz + self.x * ty - self.y * tx,
+            self.z
+                .mul_add(-ty, self.y.mul_add(tz, self.w.mul_add(tx, vx))),
+            self.x
+                .mul_add(-tz, self.z.mul_add(tx, self.w.mul_add(ty, vy))),
+            self.y
+                .mul_add(-tx, self.x.mul_add(ty, self.w.mul_add(tz, vz))),
         ]
     }
 
@@ -80,8 +90,8 @@ impl Quat {
     /// Yaw about world +z, for an estimator that reports heading as one angle.
     pub fn yaw(self) -> f64 {
         // atan2 of the rotation matrix's (1,0) over (0,0) elements, expanded.
-        let siny = 2.0 * (self.w * self.z + self.x * self.y);
-        let cosy = 1.0 - 2.0 * (self.y * self.y + self.z * self.z);
+        let siny = 2.0 * self.x.mul_add(self.y, self.w * self.z);
+        let cosy = 2.0f64.mul_add(-self.z.mul_add(self.z, self.y * self.y), 1.0);
         siny.atan2(cosy)
     }
 }
@@ -92,10 +102,10 @@ impl Mul for Quat {
     fn mul(self, b: Quat) -> Quat {
         let a = self;
         Quat::new(
-            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
-            a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
-            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.z.mul_add(-b.z, a.y.mul_add(-b.y, a.x.mul_add(-b.x, a.w * b.w))),
+            a.z.mul_add(-b.y, a.y.mul_add(b.z, a.x.mul_add(b.w, a.w * b.x))),
+            a.z.mul_add(b.x, a.y.mul_add(b.w, a.x.mul_add(-b.z, a.w * b.y))),
+            a.z.mul_add(b.w, a.y.mul_add(-b.x, a.x.mul_add(b.y, a.w * b.z))),
         )
     }
 }
