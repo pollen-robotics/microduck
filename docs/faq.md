@@ -79,5 +79,6 @@ reach.
 
 ## Can I test without a robot?
 
-`spaces/vision-demo/fake_duck.py` stands in for one, and `scripts/duck-sim` runs the real daemons
-against a MuJoCo body ([`robot/simulation.md`](robot/simulation.md)).
+`scripts/duck-sim` runs the real daemons against a MuJoCo body
+([`robot/simulation.md`](robot/simulation.md)). It registers with the rendezvous the way a board
+does, flagged simulated, so a Space reaches it exactly as it reaches a robot.

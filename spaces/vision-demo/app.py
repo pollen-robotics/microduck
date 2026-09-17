@@ -126,7 +126,8 @@ PORT = int(os.environ.get("PORT", 7860))
 #
 # On a Space, `SPACE_HOST` is the Space's own hostname and `wss://` is the only thing that will
 # work through the platform's proxy. Locally the default is loopback, because the common local case
-# is `fake_duck.py` on this same machine — and loopback is then exactly right. A *real* robot is on
+# is a duck from `scripts/duck-sim` on this same machine — and loopback is then exactly right. A
+# *real* robot is on
 # another machine, so it needs this host's address on the robot's network instead, which is what
 # the box on the page is for.
 def default_receiver() -> str:
@@ -258,8 +259,8 @@ def start(url: str, fps: float, longest: int) -> str:
     if not url.startswith(("ws://", "wss://")):
         return f"**`{url}` is not a ws:// or wss:// url**, so the robot will refuse it."
     if "127.0.0.1" in url or "localhost" in url:
-        # Right for `fake_duck.py` on this machine, and wrong for anything else — a real robot's
-        # loopback is its own, so it would dial itself and find nothing.
+        # Right for a `scripts/duck-sim` duck on this machine, and wrong for anything else — a
+        # real robot's loopback is its own, so it would dial itself and find nothing.
         logger.info("the receiver is loopback, which only a duck on this machine can reach")
 
     try:
@@ -279,7 +280,7 @@ def start(url: str, fps: float, longest: int) -> str:
     if ("127.0.0.1" in url or "localhost" in url) and not ON_A_SPACE:
         note += (
             " That address is loopback, so it only works for a duck running on this machine — "
-            "`fake_duck.py`. A robot elsewhere needs this host's address on *its* network."
+            "`scripts/duck-sim`. A robot elsewhere needs this host's address on *its* network."
         )
     return note
 
@@ -398,8 +399,8 @@ with gr.Blocks(title="duck vision demo") as demo:
             info=(
                 "This Space's own address, as the robot sees it."
                 if ON_A_SPACE
-                else "Loopback works for `fake_duck.py` on this machine; a real robot needs this "
-                "host's address on its own network."
+                else "Loopback works for a `scripts/duck-sim` duck on this machine; a real robot "
+                "needs this host's address on its own network."
             ),
             scale=3,
         )
