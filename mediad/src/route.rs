@@ -309,10 +309,14 @@ pub fn route_for(call: &proto::Call) -> Route {
 }
 
 /// The refusal a peer gets, naming the method so a client can report which call was declined.
+///
+/// "this transport" rather than "WebRTC": the table is shared with the agent socket
+/// (`crate::agent`), and a websocket client told its call was refused over WebRTC would go looking
+/// for a second table that does not exist.
 pub fn refusal(call: &proto::Call) -> proto::Error {
     proto::Error::new(
         proto::code::METHOD_NOT_FOUND,
-        format!("{} is not available over WebRTC", call.method()),
+        format!("{} is not available over this transport", call.method()),
     )
 }
 
