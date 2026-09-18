@@ -271,8 +271,12 @@ saying so:
   load-bearing — at the XL330 default of 250 that is 500 µs of turnaround per device, so
   sixteen devices cost ~8 ms per tick, 40% of the budget. A servo that was factory-reset or
   swapped in arrives at 250, so the check is what removes a whole class of "why is it slow on
-  this robot". `shutdown = 52` is the error mask that latches on overload, overheating and
-  input-voltage faults.
+  this robot". `shutdown = 52` is `0b110100` — overload, electrical shock, overheating — with
+  the input-voltage bit **clear**, where the factory's 53 sets it. That bit is what clears
+  torque once the supply passes the servo's `Max Voltage Limit`, which nothing here writes and
+  which therefore stays at its default 7.0 V. A charged 2S pack sits above that, so the clear
+  bit is what lets this bus run the pack's range across a servo rated to 6.0 V. Read as
+  "latches on input-voltage faults" it says the opposite of what it does.
 - **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
   57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
   the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
@@ -607,6 +611,15 @@ from constants of its own, which is how the same pack shows two different number
 screens. A client drawing a battery pill should not have to know which pack this robot ships
 with. There is no fuel gauge: the measurement is the servos' own supply voltage (§2.1), so it
 sags under load and recovers at rest.
+
+**The span is a statement about the rail, and it holds because the rail *is* the pack** — the
+servos are fed the 2S battery, not a regulated 5 V, which is why the span runs from 6.6 to
+8.2 V across a servo whose own rating is 3.7–6.0 V. That does not make the two disagree: the
+servo's `Max Voltage Limit` is not written by anything here (§2.1), and the `shutdown` mask
+clears the input-voltage bit that would otherwise latch torque off above it, so a charged pack
+runs. A servo on a bench supply is answering the same question about a different rail — 5 V
+lands under 6.6 V and maps to 0%, which is the mapping working as defined rather than a fault
+to chase. Regulation would be a different robot, and these constants move with it.
 
 Same payload for `robotctl monitor` and, later, the app. This is what replaces the runtime's
 180-byte frame on 9870, the JPEG stream on 9871, the UDP command socket on 9872, the maploc

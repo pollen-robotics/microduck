@@ -90,8 +90,14 @@ pub const FACTORY_BAUD_RATE: u32 = 57_600;
 /// `return_delay_time` is the load-bearing one: the XL330 ships at 250, which is 500 µs of
 /// turnaround *per device*. Across 16 devices that is 8 ms per tick — 40% of a 20 ms budget
 /// — spent waiting for servos to get around to answering. The rest are here because the
-/// runtime found them worth pinning; `shutdown = 52` is the error mask that latches on
-/// overload, overheating and input-voltage faults.
+/// runtime found them worth pinning.
+///
+/// `shutdown = 52` is `0b110100` — overload, electrical shock, overheating — with the
+/// input-voltage bit **clear**, where the factory's 53 sets it. That bit is what clears torque
+/// once the supply passes the servo's `Max Voltage Limit`, which nothing here writes and which
+/// therefore stays at its default 7.0 V. A charged 2S pack sits above that, so the clear bit is
+/// the reason fifteen servos do not latch themselves off a fully charged battery. Read as
+/// "latches on input-voltage faults" it says the opposite of what it does.
 pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("return_delay_time", 0),
     ("baud_rate", 3), // 3 = 1 Mbps, must agree with BAUD_RATE
@@ -110,6 +116,12 @@ pub fn joint_index(name: &str) -> Option<usize> {
 // report as their own supply (`crate::bus::DynamixelIo::bus_voltage`), which is the pack
 // seen through the bus — so it sags under load and recovers when the robot stands still.
 // That is why the span below is *usable-under-load*, not the cell chemistry's range.
+//
+// The span is a statement about the *rail*, and it holds because that rail is the pack: the
+// servos are fed the 2S battery, not a regulated 5 V. A servo on a bench supply reads its own
+// supply voltage like any other, so 5 V lands under `BATTERY_EMPTY_V` and maps to 0% — the
+// mapping working as defined rather than a fault to chase. Anything that regulates the servo
+// rail has to move these two constants with it.
 
 /// Off a full charge, under load. NP-F550, 2S Li-ion.
 pub const BATTERY_FULL_V: f64 = 8.2;
@@ -172,6 +184,29 @@ mod tests {
         assert!(!JOINT_IDS.contains(&FACTORY_ID));
         assert_ne!(IMU_DXL_ID, FACTORY_ID);
         assert_ne!(FACTORY_BAUD_RATE, BAUD_RATE);
+    }
+
+    /// `shutdown` is the one register whose *bits* are the decision rather than the number:
+    /// the input-voltage bit is cleared on purpose, and that is what lets the pack's range run
+    /// across a servo rated to 6.0 V. The factory default is 53 — one bit away — so a later
+    /// edit that "restores the default" should meet a test rather than a comment.
+    #[test]
+    fn the_shutdown_mask_clears_the_input_voltage_bit() {
+        let want = EXPECTED_REGISTERS
+            .iter()
+            .find(|(n, _)| *n == "shutdown")
+            .map(|&(_, v)| v)
+            .expect("shutdown is an expected register");
+        const OVERLOAD: u8 = 1 << 5;
+        const ELECTRICAL_SHOCK: u8 = 1 << 4;
+        const OVERHEATING: u8 = 1 << 2;
+        const INPUT_VOLTAGE: u8 = 1 << 0;
+        assert_eq!(
+            want,
+            OVERLOAD | ELECTRICAL_SHOCK | OVERHEATING,
+            "the three faults worth latching on, with input-voltage clear"
+        );
+        assert_eq!(want & INPUT_VOLTAGE, 0);
     }
 
     /// `MOUTH_INDEX` is used to skip a slot when mapping 14 policy actions onto 15 joints.
