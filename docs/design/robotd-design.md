@@ -1066,7 +1066,9 @@ projected gravity, and where the camera and the ToF sensor are. All three are ad
   `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
   stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
   `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
-  wall-clock — can be put on the same axis.
+  wall-clock — can be put on the same axis. `proto::clock::ClockPair` is the consumer's side of
+  that pair: the two readings, and the addition that turns a `t_ns` into a wall-clock moment,
+  with the error term stated rather than inherited.
 - **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
   it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
   anything yet; when it is, it streams beside `tof.frame`, not here.

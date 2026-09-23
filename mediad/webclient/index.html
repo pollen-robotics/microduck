@@ -328,9 +328,15 @@
         <tr><th>health</th><td id="t-health">–</td></tr>
         <tr><th>battery</th><td id="t-battery">–</td></tr>
         <tr><th>temperatures</th><td id="t-temps">–</td></tr>
+        <tr><th>clock</th><td id="t-clock">–</td></tr>
       </table>
-      <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz; the last three rows are
-        <code>robot.health</code>, polled, because none of it is on that stream.</p>
+      <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz. <code>mode</code> is
+        <code>robot.mode</code>, and <code>health</code>, <code>battery</code> and
+        <code>temperatures</code> are one polled <code>robot.health</code> — none of the four is on
+        that stream. The clock row puts <code>robot.state</code>'s <code>t_ns</code> on the wall
+        clock, via the <code>mono_ns</code>/<code>real_ns</code> pair <code>media.video</code>
+        publishes — the sample's moment and how long ago it was true, bounded by the two machines'
+        clock agreement rather than claimed.</p>
     </section>
   </div>
 </main>
@@ -1435,6 +1441,41 @@ function onState(state) {
   const limited = (move.limited_by || []).join(", ");
   $("t-applied").textContent = limited ? `${twist(move.applied)} — ${limited}` : twist(move.applied);
   $("t-applied").className = limited ? "warn" : "";
+
+  // The clock row consumes what `media.video` publishes. `t_ns` is CLOCK_MONOTONIC — the same
+  // axis `mono_ns` was read on — so `(t_ns - mono_ns)` added to `real_ns` is when this sample
+  // was true, in wall-clock, and `Date.now()` minus that is how long ago the robot saw it.
+  // Seconds-of-day rather than a formatted date: this page keeps to the methods it already uses,
+  // and the age is the number anything actually reads.
+  //
+  // The board has no battery-backed RTC and boots at 1970, so a pair taken before NTP first set
+  // the clock yields a 1970 time that looks like an ordinary number. The page does not carry its
+  // own floor for that — `updater`'s preflight already judges whether the robot's clock has been
+  // set, and a threshold repeated here would be a second copy to keep in step. What this does is
+  // refuse to print an age that is obviously a missing sync rather than a slow network.
+  const clockCell = $("t-clock");
+  const IMPLAUSIBLE_AGE_MS = 86400000; // a day: nothing on this path is near it
+  if (videoClock && typeof state.t_ns === "number" && state.t_ns > 0) {
+    const wallMs = Math.round((videoClock.real_ns + (state.t_ns - videoClock.mono_ns)) / 1e6);
+    const age = Date.now() - wallMs;
+    if (Math.abs(age) > IMPLAUSIBLE_AGE_MS) {
+      // Said out loud rather than shown: "1970", or a fifty-year age, would read as a fault in
+      // this page rather than as a fact about the robot.
+      clockCell.textContent = "clock not synced";
+      clockCell.className = "warn";
+    } else {
+      const secondsOfDay = (wallMs % 86400000) / 1000;
+      // A negative age means this robot's wall clock reads ahead of this machine's, which is the
+      // two clocks disagreeing rather than a sample from the future. Say which side it falls on;
+      // "-500 ms ago" reads as a bug in this page.
+      const ageText = age >= 0 ? `${Math.round(age)} ms ago` : `${Math.round(-age)} ms ahead`;
+      clockCell.textContent = `t+${secondsOfDay.toFixed(3)}s · ${ageText}`;
+      clockCell.className = "";
+    }
+  } else {
+    clockCell.textContent = "–";
+    clockCell.className = "";
+  }
 }
 
 // ── link quality ───────────────────────────────────────────────────────────────
@@ -1604,8 +1645,18 @@ video.addEventListener("pointercancel", stopLooking);
 // over the video would be in; only the <video> inside it turns. So nothing else on this page has to
 // know about the mount.
 let mountRotation = 0;
+// The clocks `media.video` last published, kept for the clock row. `robot.state`'s `t_ns` is on
+// the same CLOCK_MONOTONIC axis as `mono_ns`, so the pair turns a state sample into a wall-clock
+// moment — which is what relating a picture to a sample needs, and nothing a browser page can do
+// on its own (a page cannot read RTP timestamps at all).
+let videoClock = null;
 
-function onVideoInfo({ width, height, rotate }) {
+function onVideoInfo({ width, height, rotate, mono_ns, real_ns }) {
+  // The pair `media.video` reads back to back. Absent from an older daemon, so the clock row
+  // stays at its dash until the pair appears; nothing else here depends on it.
+  if (typeof mono_ns === "number" && typeof real_ns === "number") {
+    videoClock = { mono_ns, real_ns };
+  }
   mountRotation = ((rotate % 360) + 360) % 360;
   log("dim", `video ${width}x${height}, camera mounted ${mountRotation}° off upright`);
 
