@@ -517,6 +517,19 @@ create_group() {
         die "the robot group could not be created; updaterd.service will not start without it"
     fi
 
+    # The account credential's group, with mediad as its only member. Its own group because
+    # `robot` is everybody who talks to a daemon, and the token must not be readable by the
+    # gamepad daemon. sysusers does this above where it exists; this is the same fallback as
+    # the accounts.
+    if ! getent group robot-account >/dev/null; then
+        groupadd --system robot-account \
+            || warn "could not create the robot-account group; the token stays root-only"
+    fi
+    if getent passwd mediad >/dev/null && getent group robot-account >/dev/null; then
+        usermod -aG robot-account mediad \
+            || warn "could not add mediad to robot-account; the relay will not find the token"
+    fi
+
     add_operator_to_group
 }
 
