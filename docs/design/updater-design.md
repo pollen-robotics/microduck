@@ -1123,6 +1123,31 @@ refused: `state_dir` inside an `install_dir` (a swap would destroy the update lo
 two components sharing an `install_dir`, relative paths, and `keep_previous = 0`
 with no golden (no rollback target).
 
+Two optional per-component guards reject a signed but unsuitable artifact:
+
+```toml
+[component.daemon]
+# Alongside source, install_dir and on_apply:
+required_files = ["bin/robotd", "bin/mediad"]
+max_artifact_bytes = 134217728 # compressed bytes, inclusive
+```
+
+`max_artifact_bytes` requires a declared `size` in the signed manifest. Both `check`
+and `apply` refuse a missing or over-budget size before fetching the artifact;
+`apply` also checks the downloaded file's actual size before extraction. This is
+an installation budget, not a per-transfer streaming limit: an underreported
+artifact is refused after download. The HTTP source's transfer limit and the
+global `max_uncompressed_bytes` / `max_archive_entries` extraction limits still apply.
+
+`required_files` is checked after verified extraction, before either hook or the
+live swap, including for a dry run. Entries must be nonempty relative file paths
+without `..`; directories and links resolving outside the extracted tree do not
+satisfy them. `check` does not download or inspect the archive, so it cannot verify
+this file list. A refusal leaves the installed release in place and removes staging.
+
+Both settings default to disabled. Enable them only after installing an updater
+that understands these config keys; an older updater rejects unknown fields.
+
 
 Note the model uses `reload` (SIGHUP → re-mmap weights) rather than `restart`,
 so motor control is never dropped for a model swap. Per-component `on_apply` is

@@ -171,6 +171,14 @@ pub struct ComponentConfig {
     /// Refuse anything but this version. Set by `robotctl pin`.
     #[serde(default)]
     pub pinned: Option<semver::Version>,
+
+    /// Files required in the extracted artifact before hooks run or the release becomes live.
+    #[serde(default)]
+    pub required_files: Vec<PathBuf>,
+
+    /// Maximum compressed artifact size. When set, the signed manifest must declare a size.
+    #[serde(default)]
+    pub max_artifact_bytes: Option<u64>,
 }
 
 fn default_keep_previous() -> usize {
@@ -399,6 +407,24 @@ impl Config {
         }
 
         for (name, component) in &self.components {
+            for required in &component.required_files {
+                if required.as_os_str().is_empty()
+                    || !required
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return bad(format!(
+                        "component {name}: required_files entry {} must be a nonempty relative file path without ..",
+                        required.display()
+                    ));
+                }
+            }
+            if component.max_artifact_bytes == Some(0) {
+                return bad(format!(
+                    "component {name}: max_artifact_bytes must be positive"
+                ));
+            }
+
             // A relative install_dir would resolve against the daemon's cwd,
             // which systemd does not guarantee.
             if !component.install_dir.is_absolute() {
@@ -952,6 +978,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no rollback target"), "got: {err}");
+    }
+
+    #[test]
+    fn component_guards_reject_invalid_paths_and_zero_budget() {
+        for setting in [
+            "required_files = ['']",
+            "required_files = ['.']",
+            "required_files = ['/bin/worker']",
+            "required_files = ['../worker']",
+            "required_files = ['bin/../../worker']",
+            "max_artifact_bytes = 0",
+        ] {
+            let err = config_with(&format!(
+                r#"
+                [component.daemon]
+                install_dir = "/opt/robot/daemon"
+                source = {{ type = "local_dir", path = "/var/tmp/rel" }}
+                on_apply = {{ action = "none" }}
+                {setting}
+                "#
+            ))
+            .unwrap_err();
+            assert!(matches!(err, crate::Error::Config(_)), "{setting}: {err}");
+        }
     }
 
     #[test]

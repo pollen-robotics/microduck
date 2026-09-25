@@ -513,6 +513,200 @@ async fn check_reports_availability_without_changing_anything() {
     assert_eq!(fx.live_version(), None, "check must not install anything");
 }
 
+/// A signed release can still be unsuitable for a particular component. Checking and applying
+/// independently must both refuse it, before trying to fetch the artifact.
+#[tokio::test]
+async fn component_guard_refuses_over_budget_manifest_in_check_and_apply() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| m["size"] = 101.into());
+    std::fs::remove_file(fx.releases.join("daemon-1.0.0.tar.zst")).unwrap();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 100",
+    );
+    let result = engine.check("daemon").await.unwrap();
+    assert!(
+        matches!(result, CheckResult::Incompatible { ref reason, .. } if reason.contains("max_artifact_bytes")),
+        "{result:?}"
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(
+        matches!(error, updater::Error::Incompatible(ref reason) if reason.contains("max_artifact_bytes")),
+        "{error}"
+    );
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_requires_declared_size_when_budgeted() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| {
+        m.as_object_mut().unwrap().remove("size");
+    });
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 10000",
+    );
+    let result = engine.check("daemon").await.unwrap();
+    assert!(
+        matches!(result, CheckResult::Incompatible { .. }),
+        "{result:?}"
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("size is required"), "{error}");
+    assert_eq!(fx.live_version(), None);
+}
+
+/// A declared size is an early refusal, not proof of the bytes actually downloaded.
+#[tokio::test]
+async fn component_guard_checks_actual_compressed_size() {
+    let fx = Fixture::new();
+    fx.publish_with("1.0.0", None, |m| m["size"] = 1.into());
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    assert!(matches!(
+        engine.check("daemon").await.unwrap(),
+        CheckResult::Available { .. }
+    ));
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("max_artifact_bytes"), "{error}");
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+/// An incomplete bundle must not execute even its preinstall hook, or replace a working release.
+#[tokio::test]
+async fn component_guard_requires_files_before_hooks_and_swap() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    apply_exact(&mut fx.engine_healthy(), "1.0.0")
+        .await
+        .unwrap();
+    let marker = fx.root.join("hook-ran");
+    let hook = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    fx.publisher
+        .release("2.0.0")
+        .file("hooks/preinstall", hook.as_bytes(), 0o755)
+        .write();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin/worker']",
+    );
+    let error = apply_exact(&mut engine, "2.0.0").await.unwrap_err();
+    assert!(
+        error.to_string().contains("required file bin/worker"),
+        "{error}"
+    );
+    assert!(!marker.exists());
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert!(!fx.release_exists("2.0.0"));
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_accepts_required_file_and_exact_budget() {
+    let fx = Fixture::new();
+    fx.publisher
+        .release("1.0.0")
+        .file("bin/worker", b"demo", 0o644)
+        .write();
+    let bytes = std::fs::metadata(fx.releases.join("daemon-1.0.0.tar.zst"))
+        .unwrap()
+        .len();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        &format!("required_files = ['bin/worker']\nmax_artifact_bytes = {bytes}"),
+    );
+    assert!(matches!(
+        engine.check("daemon").await.unwrap(),
+        CheckResult::Available { .. }
+    ));
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+#[tokio::test]
+async fn component_guard_does_not_treat_directory_as_required_file() {
+    let fx = Fixture::new();
+    fx.publisher
+        .release("1.0.0")
+        .file("bin/worker", b"demo", 0o644)
+        .write();
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin']",
+    );
+    let error = apply_exact(&mut engine, "1.0.0").await.unwrap_err();
+    assert!(error.to_string().contains("required file bin"), "{error}");
+    assert_eq!(fx.live_version(), None);
+}
+
+#[tokio::test]
+async fn component_guard_dry_run_checks_required_files() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "required_files = ['bin/worker']",
+    );
+    let (tx, _rx) = progress_channel();
+    let error = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                dry_run: true,
+                ..ApplyOptions::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("required file bin/worker"),
+        "{error}"
+    );
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
+#[tokio::test]
+async fn component_guard_sideload_cannot_bypass_budget() {
+    let fx = Fixture::new();
+    fx.publish_sideload("1.0.0");
+    let mut engine = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults::none(),
+        "max_artifact_bytes = 1",
+    );
+    let (tx, _rx) = progress_channel();
+    let error = engine
+        .apply(
+            "daemon",
+            Target::Latest,
+            ApplyOptions {
+                from_dir: Some(fx.sideload()),
+                ..ApplyOptions::default()
+            },
+            tx,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("max_artifact_bytes"), "{error}");
+    assert_eq!(fx.live_version(), None);
+    assert_eq!(fx.staging_leftovers(), 0);
+}
+
 /// When `daemon`'s source last answered, as `update.status` reports it.
 async fn last_checked(engine: &Engine) -> Option<i64> {
     engine

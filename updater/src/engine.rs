@@ -420,6 +420,13 @@ impl Engine {
         let manifest = signed.parsed;
         Self::check_channel(&manifest, component)?;
 
+        if let Err(reason) = require_artifact_budget(manifest.size, cfg.max_artifact_bytes) {
+            return Ok(CheckResult::Incompatible {
+                candidate: manifest.version,
+                reason,
+            });
+        }
+
         if Some(&manifest.version) == installed.as_ref() {
             return Ok(CheckResult::UpToDate {
                 installed: manifest.version,
@@ -770,6 +777,10 @@ impl Engine {
             )));
         }
 
+        // `apply` can be called without `check`, including for exact versions and sideloads.
+        require_artifact_budget(manifest.size, cfg.max_artifact_bytes)
+            .map_err(Error::Incompatible)?;
+
         if Some(&manifest.version) == installed.as_ref() {
             // Correct, and for years the whole answer. It is the wrong *question* in one case: the
             // release is installed and a daemon is serving from a different one. That is what an
@@ -950,6 +961,17 @@ impl Engine {
         drop(tx_keepalive);
         let _ = pump.await;
 
+        if cfg.max_artifact_bytes.is_some() {
+            let bytes = std::fs::metadata(&fetched.artifact)
+                .map_err(|source| Error::Io {
+                    path: fetched.artifact.clone(),
+                    source,
+                })?
+                .len();
+            require_artifact_budget(Some(bytes), cfg.max_artifact_bytes)
+                .map_err(Error::Incompatible)?;
+        }
+
         if self.faults.corrupt_artifact {
             // Append a byte so the hash no longer matches — the same observable
             // condition as a truncated download or a tampered mirror.
@@ -1006,6 +1028,8 @@ impl Engine {
         let dest = extract_dir.to_path_buf();
         let limits = self.config.archive_limits();
         blocking(move || verify::extract_artifact(&artifact, &dest, limits)).await?;
+
+        require_files(extract_dir, &cfg.required_files)?;
 
         // Keep the verified manifest with the release, for `select` and provenance.
         std::fs::write(extract_dir.join(EMBEDDED_MANIFEST), manifest_bytes).map_err(|e| {
@@ -3042,6 +3066,72 @@ fn configured_units(cfg: &ComponentConfig) -> Vec<String> {
     match &cfg.on_apply {
         ApplyAction::Restart { units } => units.clone(),
         _ => Vec::new(),
+    }
+}
+
+fn require_artifact_budget(size: Option<u64>, maximum: Option<u64>) -> Result<(), String> {
+    let Some(maximum) = maximum else {
+        return Ok(());
+    };
+    let Some(size) = size else {
+        return Err("artifact size is required when max_artifact_bytes is configured".into());
+    };
+    if size > maximum {
+        return Err(format!(
+            "artifact is {size} bytes, above max_artifact_bytes {maximum}"
+        ));
+    }
+    Ok(())
+}
+
+/// A signed bundle may be incomplete. Check staging before hooks can run or `current` moves.
+fn require_files(root: &Path, required: &[PathBuf]) -> Result<(), Error> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let root = root.canonicalize().map_err(|source| Error::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for relative in required {
+        let path = root.join(relative);
+        // Resolving first also prevents a link to a host file from satisfying the requirement.
+        if !path
+            .canonicalize()
+            .is_ok_and(|resolved| resolved.starts_with(&root) && resolved.is_file())
+        {
+            return Err(Error::Incompatible(format!(
+                "artifact is missing required file {} inside its extracted tree",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod artifact_guard_tests {
+    use super::*;
+
+    #[test]
+    fn required_file_links_must_resolve_inside_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(dir.path().join("host-file"), b"outside").unwrap();
+        std::fs::write(root.join("payload"), b"inside").unwrap();
+        let link = root.join("required");
+        std::os::unix::fs::symlink("../host-file", &link).unwrap();
+        assert!(require_files(&root, &[PathBuf::from("required")]).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("payload", &link).unwrap();
+        require_files(&root, &[PathBuf::from("required")]).unwrap();
+    }
+
+    #[test]
+    fn absent_budget_preserves_manifests_without_size() {
+        require_artifact_budget(None, None).unwrap();
+        require_artifact_budget(Some(u64::MAX), None).unwrap();
     }
 }
 
