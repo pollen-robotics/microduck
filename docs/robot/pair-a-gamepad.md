@@ -37,6 +37,18 @@ No MAC address needed: the robot looks for a gamepad in pairing mode and takes t
 pad is *trusted* as well as paired, which is what makes it reconnect by itself after a reboot with
 nobody logged in.
 
+The robot says how it went:
+
+| sound | means |
+|---|---|
+| chirp | it is looking — also the answer to pressing again while it looks |
+| greet | paired, and `padd` has the pad |
+| honk | it gave up — the terminal says why |
+
+It looks for 60 seconds and tries the bond up to three times inside that, so the pad and the robot
+can be started in either order. Running `pad pair` again while it looks follows the same attempt
+rather than starting another. Both numbers are in `sudo robotctl configure`, under `pad_pairing`.
+
 If two are in pairing mode it refuses rather than guessing and prints their addresses. Naming one is
 also how to pair hardware the robot does not recognise as a gamepad:
 
@@ -97,6 +109,34 @@ no longer has — which fails in exactly the way a broken board does. If pairing
 the pad to a laptop once and remove it there; that consumes and releases its bond slot, and putting
 it in pairing mode alone does not reliably do so.
 
+## Start over
+
+When pairing keeps failing, clear everything the robot knows about pads and pair from there:
+
+```bash
+sudo robotctl pad pair --reset
+```
+
+The robot pecks once it has forgotten them, then looks for a pad as above. Put the pad in pairing
+mode after the peck: the pad still holds its half of every old bond. An Xbox pad that still will not
+bond wants pairing to a laptop once and removing it there — see [Forget one](#forget-one).
+
+## Start it from anything else
+
+A button, a phone, an NFC tag: whatever it is, it runs one of these on the robot and needs nothing
+else. The robot quacks the outcome, and pressing twice is safe.
+
+```bash
+sudo robotctl pad pair --no-wait
+```
+
+```bash
+sudo robotctl pad pair --reset --no-wait
+```
+
+Over the socket, they are `pad.pair` and `pad.reset` on `configd`. Both answer at once; `pad.status`
+has the session's progress and outcome.
+
 ## When a pad will not bond at all
 
 On the aic8800 radio a pad cannot form a **new** bond while `btd` is advertising. Re-provision such a
@@ -107,8 +147,9 @@ board with `--pause-btd-on-pair`:
 ```
 
 That leaves a marker at `/var/lib/robot/weird-ble` and changes nothing else. On a board with that
-marker, `sudo robotctl pad pair` handles the rest by itself — it stops `btd`, power-cycles the
-adapter, pairs, and starts `btd` again. It says so as it goes. An existing bond is unaffected by any
+marker, every pairing handles the rest by itself — it stops `btd`, power-cycles the adapter, pairs,
+and starts `btd` again — however it was started. A phone pairing this way loses its connection for
+the length of the pairing and reconnects afterwards. An existing bond is unaffected by any
 of this, so a paired pad connects and drives with everything running.
 
 Some units additionally cannot bond under BlueZ's default `Privacy = off` at all, even with `btd`

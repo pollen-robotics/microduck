@@ -59,8 +59,8 @@ That sends your dev key, starts provisioning, waits out the reboot, streams the 
 ### Why `--pause-btd-on-pair` is in that command
 
 On the aic8800 radio a pad cannot form a **new** bond while `btd` is advertising. That flag leaves a
-marker so `robotctl pad pair` stops `btd` and power-cycles the adapter for the pairing window, then
-starts it again. An existing bond is unaffected — a bonded pad connects and drives with the whole
+marker so a pairing session stops `btd` and power-cycles the adapter for the pairing window, then
+starts it again — whatever started the session. An existing bond is unaffected — a bonded pad connects and drives with the whole
 stack up — so the cost is one daemon being down for the length of a pairing.
 
 It is the default here because a board that needed it and was provisioned without it presents as a

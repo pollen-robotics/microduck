@@ -233,7 +233,10 @@ contact with the thing it was refusing:
 - **The gamepad, from the phone.** `pad.pair`, `pad.forget`, `pad.bind` and the skill-table edits
   are routed and unreached. `route.rs` says BLE is what `pad.bind` exists for — whoever is holding
   the robot is holding the pad — and fault 3 above is why pairing from the phone is harder than the
-  routing suggests.
+  routing suggests. Since v38 `pad.pair` answers at once and the robot runs the session, retries
+  and quacks by itself; the app follows `pad.status` by session number. On a `weird-ble` board the
+  session stops `btd`, so the phone loses its link a second after asking and reads the outcome when
+  it reconnects.
 - **Whether one app eventually serves both robots.** Not now — it would mean a second dialect in a
   shipping codebase, and the flows share only a transport. If it becomes a goal, the precondition is
   the *protocol* converging, not the UI.

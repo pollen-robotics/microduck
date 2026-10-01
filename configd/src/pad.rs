@@ -32,19 +32,12 @@ use duck_ipc_proto as proto;
 /// What went wrong, in terms a caller can act on.
 pub type PadResult<T> = Result<T, String>;
 
-/// How long to look for a pad when the caller does not say.
-///
-/// Fifteen seconds because someone is standing there holding a sync button, and that is about how
-/// long a person will wait before concluding it did not work. Long enough for BlueZ to report a
-/// device that only advertises every few seconds; short enough that a phone gets an answer rather
-/// than a spinner.
-pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Longest window a caller may ask for.
+/// Longest window a caller may ask for — the same ceiling `[pad_pairing] window_seconds` has.
 ///
 /// A cap rather than a courtesy: discovery is on for the whole window, and a client that asked for
 /// an hour would leave the adapter scanning long after whoever typed it walked away.
-pub const MAX_PAIR_TIMEOUT: Duration = Duration::from_secs(120);
+pub const MAX_PAIR_TIMEOUT: Duration =
+    Duration::from_secs(robotd_params::PAIRING_WINDOW_MAX as u64);
 
 #[async_trait]
 pub trait Pads: Send + Sync {
@@ -61,15 +54,32 @@ pub trait Pads: Send + Sync {
 
     /// Drop the bond, so this pad stops reconnecting.
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult>;
+
+    /// Remove every gamepad the adapter knows — bonded, and merely cached from a scan — and say
+    /// how many. Anything that is not a gamepad is left alone: a reset is about pads, and a phone
+    /// or a speaker bonded to this robot is not what somebody pressing "reset the pad" means.
+    async fn reset(&self) -> PadResult<u32>;
+
+    /// Power the adapter down and up. What a pad cannot bond past on a `weird-ble` board, and
+    /// the radio's half of a reset.
+    async fn cycle_adapter(&self) -> PadResult<()>;
+
+    /// Is there an input device for this pad — something `padd` can open?
+    ///
+    /// The last word on whether a pairing worked. `Paired` and `Connected` can both be true with
+    /// nothing behind them: a classic pad connected in the wrong order has a solid light, a bond,
+    /// a connection and no input device, and `padd` waits for it forever.
+    async fn has_input(&self, mac: &str) -> bool;
 }
 
-/// Clamp a caller's timeout into something the adapter should be asked to do.
-pub fn pair_timeout(requested: Option<u32>) -> Duration {
+/// Clamp a caller's timeout into something the adapter should be asked to do. `None` means the
+/// session's own window.
+pub fn pair_timeout(requested: Option<u32>, window: Duration) -> Duration {
     match requested {
         // Zero is "look once", not "look forever": a scripted retry loop should be able to ask
         // whether a pad is there right now without holding discovery open.
         Some(seconds) => Duration::from_secs(u64::from(seconds)).min(MAX_PAIR_TIMEOUT),
-        None => DEFAULT_PAIR_TIMEOUT,
+        None => window.min(MAX_PAIR_TIMEOUT),
     }
 }
 
@@ -210,6 +220,17 @@ struct FakeState {
     /// that mattered: a bonded pad shows up in *every* sweep, so the selection rule has to prefer an
     /// unbonded one or a robot can never be given a second pad.
     visible: Vec<proto::Pad>,
+    /// Failures the next bonds end in, in order — what a flaky radio does, on demand. Each one
+    /// names the pad it was bonding, the way BlueZ's does.
+    failures: std::collections::VecDeque<proto::PadPairFailure>,
+    /// Pads that bond and never produce an input device: the classic pad connected in the wrong
+    /// order.
+    inputless: Vec<String>,
+    /// How long a bond takes. Zero by default; a test that needs a session to be *running* while
+    /// something else happens sets it.
+    bond_takes: Duration,
+    /// How many times the adapter was power-cycled, for the tests that care that it was.
+    cycles: u32,
 }
 
 impl FakePads {
@@ -224,8 +245,43 @@ impl FakePads {
 
     pub fn with(visible: Vec<proto::Pad>) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(FakeState { visible }),
+            inner: tokio::sync::Mutex::new(FakeState {
+                visible,
+                failures: Default::default(),
+                inputless: Vec::new(),
+                bond_takes: Duration::ZERO,
+                cycles: 0,
+            }),
         }
+    }
+
+    /// The next bond ends in `reason` instead of a pad.
+    pub async fn fail_next(&self, reason: proto::PadPairFailure) {
+        self.inner.lock().await.failures.push_back(reason);
+    }
+
+    /// This pad bonds and never gets an input device.
+    pub async fn without_input(&self, mac: &str) {
+        self.inner.lock().await.inputless.push(mac.to_owned());
+    }
+
+    /// Every bond takes this long.
+    pub async fn bonds_take(&self, how_long: Duration) {
+        self.inner.lock().await.bond_takes = how_long;
+    }
+
+    /// A pad comes into range — somebody pressed its Sync button.
+    pub async fn appears(&self, pad: proto::Pad) {
+        let mut state = self.inner.lock().await;
+        state
+            .visible
+            .retain(|p| !p.mac.eq_ignore_ascii_case(&pad.mac));
+        state.visible.push(pad);
+    }
+
+    /// How many times the adapter has been power-cycled.
+    pub async fn cycles(&self) -> u32 {
+        self.inner.lock().await.cycles
     }
 }
 
@@ -270,6 +326,10 @@ impl Pads for FakePads {
     }
 
     async fn pair(&self, mac: Option<&str>, _timeout: Duration) -> PadResult<proto::PadPairResult> {
+        let bond_takes = self.inner.lock().await.bond_takes;
+        if !bond_takes.is_zero() {
+            tokio::time::sleep(bond_takes).await;
+        }
         let mut state = self.inner.lock().await;
 
         let candidates: Vec<proto::Pad> = state
@@ -289,6 +349,7 @@ impl Pads for FakePads {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
                     detail: None,
+                    mac: None,
                 });
             }
             // Nothing new in pairing mode, so the answer is the pad already bonded: an idempotent
@@ -302,9 +363,22 @@ impl Pads for FakePads {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::Ambiguous,
                     detail: Some(format!("{} pads are in pairing mode", several.len())),
+                    mac: None,
                 });
             }
         };
+
+        // A scripted failure lands on a pad that was found, the way a real one does: found, then
+        // not bonded. It leaves the device behind unbonded, which is what a retry has to clear.
+        if !pad.paired
+            && let Some(reason) = state.failures.pop_front()
+        {
+            return Ok(proto::PadPairResult::Failed {
+                reason,
+                detail: Some("scripted".to_owned()),
+                mac: Some(pad.mac),
+            });
+        }
 
         let paired = proto::Pad {
             paired: true,
@@ -326,6 +400,35 @@ impl Pads for FakePads {
         Ok(proto::PadForgetResult {
             removed: state.visible.len() != before,
         })
+    }
+
+    async fn reset(&self) -> PadResult<u32> {
+        // The robot forgets them; the pads are still in the room. Every pad in range comes back as
+        // one in pairing mode, which is the fake's only way of saying "pairable again" — a real pad
+        // needs its Sync button pressed for that, and the fake has no button.
+        let mut state = self.inner.lock().await;
+        let mut removed = 0;
+        for pad in &mut state.visible {
+            if pad.paired {
+                removed += 1;
+            }
+            *pad = unpaired(&pad.mac, &pad.name);
+        }
+        Ok(removed)
+    }
+
+    async fn cycle_adapter(&self) -> PadResult<()> {
+        self.inner.lock().await.cycles += 1;
+        Ok(())
+    }
+
+    async fn has_input(&self, mac: &str) -> bool {
+        let state = self.inner.lock().await;
+        state
+            .visible
+            .iter()
+            .any(|p| p.paired && p.connected && p.mac.eq_ignore_ascii_case(mac))
+            && !state.inputless.iter().any(|m| m.eq_ignore_ascii_case(mac))
     }
 }
 
@@ -415,7 +518,7 @@ mod tests {
         let pads = FakePads::new();
         assert!(pads.status().await.unwrap().is_empty());
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let result = pads.pair(None, Duration::from_secs(60)).await.unwrap();
         let proto::PadPairResult::Paired { pad } = result else {
             panic!("{result:?}");
         };
@@ -436,7 +539,7 @@ mod tests {
     async fn an_absent_pad_is_not_found_rather_than_an_error() {
         let pads = FakePads::with(Vec::new());
         assert!(matches!(
-            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
+            pads.pair(None, Duration::from_secs(60)).await.unwrap(),
             proto::PadPairResult::Failed {
                 reason: proto::PadPairFailure::NotFound,
                 ..
@@ -457,7 +560,7 @@ mod tests {
             unpaired("A4:AE:11:00:22:33", "DualSense Wireless Controller"),
         ]);
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let result = pads.pair(None, Duration::from_secs(60)).await.unwrap();
         let proto::PadPairResult::Paired { pad } = result else {
             panic!("{result:?}");
         };
@@ -476,7 +579,7 @@ mod tests {
         untrusted.trusted = false;
         let pads = FakePads::with(vec![untrusted]);
 
-        let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let result = pads.pair(None, Duration::from_secs(60)).await.unwrap();
         let proto::PadPairResult::Paired { pad } = result else {
             panic!("{result:?}");
         };
@@ -494,7 +597,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
+            pads.pair(None, Duration::from_secs(60)).await.unwrap(),
             proto::PadPairResult::Failed {
                 reason: proto::PadPairFailure::Ambiguous,
                 ..
@@ -503,7 +606,7 @@ mod tests {
 
         // And naming one resolves it, which is what the refusal tells the caller to do.
         let result = pads
-            .pair(Some("a4:ae:11:00:22:33"), DEFAULT_PAIR_TIMEOUT)
+            .pair(Some("a4:ae:11:00:22:33"), Duration::from_secs(60))
             .await
             .unwrap();
         let proto::PadPairResult::Paired { pad } = result else {
@@ -526,9 +629,10 @@ mod tests {
     /// once" rather than "look forever" — a scripted retry needs to be able to ask.
     #[test]
     fn a_requested_timeout_is_clamped() {
-        assert_eq!(pair_timeout(None), DEFAULT_PAIR_TIMEOUT);
-        assert_eq!(pair_timeout(Some(30)), Duration::from_secs(30));
-        assert_eq!(pair_timeout(Some(0)), Duration::ZERO);
-        assert_eq!(pair_timeout(Some(9_999)), MAX_PAIR_TIMEOUT);
+        let window = Duration::from_secs(60);
+        assert_eq!(pair_timeout(None, window), window);
+        assert_eq!(pair_timeout(Some(30), window), Duration::from_secs(30));
+        assert_eq!(pair_timeout(Some(0), window), Duration::ZERO);
+        assert_eq!(pair_timeout(Some(9_999), window), MAX_PAIR_TIMEOUT);
     }
 }

@@ -193,13 +193,18 @@ fn permits(call: &proto::Call) -> bool {
         // Pairing a controller from the phone, which is where it belongs: whoever is holding the
         // robot is holding the pad, and the alternative is an ssh session. The same physical-presence
         // argument §4.2 makes for `net.connect` covers it — a pad has to be in the room, in pairing
-        // mode, in a fifteen-second window — and it is `configd` that does the work either way.
+        // mode, inside the session's window — and it is `configd` that does the work either way.
         //
         // `pad.pair` is the more consequential of the two, because a bonded pad can enable the
         // policy afterwards. That is deliberate: it is the same authority as standing next to the
         // robot with a controller, and the PIN gate is what stands in front of it.
+        //
+        // `pad.reset` removes every pad from the robot's side and then pairs. It is `pad.forget`
+        // for all of them at once, which the phone could already do one at a time, and it is the
+        // way back from a robot whose bonds are in a state nobody can read.
         PadStatus => true,
         PadPair(_) => true,
+        PadReset => true,
         PadForget(_) => true,
 
         // ── refused ─────────────────────────────────────────────────────────
@@ -599,6 +604,7 @@ mod tests {
                 // robot, so BLE's physical-presence claim (§4.2) is not being stretched — and the
                 // alternative is an ssh session, which is not a thing an owner has.
                 proto::method::PAD_PAIR,
+                proto::method::PAD_RESET,
                 proto::method::PAD_FORGET,
             ]
         );
@@ -611,6 +617,7 @@ mod tests {
         for call in [
             proto::Call::PadStatus,
             proto::Call::PadPair(proto::PadPairParams::default()),
+            proto::Call::PadReset,
             proto::Call::PadForget(proto::PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
@@ -936,7 +943,6 @@ mod tests {
                 ssid: "Home".into(),
                 psk: None,
             }),
-            proto::Call::PadPair(proto::PadPairParams::default()),
         ] {
             let (_, lane) = destination_for(&call).expect("routed");
             assert_ne!(lane, Lane::Prompt, "{}", call.method());

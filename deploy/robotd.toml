@@ -496,3 +496,20 @@ mode = "walk"
 # Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into
 # a large head movement. The head's own travel limit still applies.
 # gain = 1.0
+
+# A gamepad pairing session — whatever started it: `robotctl pad pair`, the phone, a button.
+# Read by configd at the start of each session, so a change applies to the next one without a
+# restart.
+# [pad_pairing]
+# Seconds to wait for a pad in pairing mode. Long enough that it does not matter whether the pad
+# or the robot was told first. 5 to 300.
+# window_seconds = 60
+
+# Bonds to try before giving up, all inside the window. Each retry starts from a clean slate on
+# the robot's side: the half-made device is removed, and on a `weird-ble` board the adapter is
+# power-cycled. 1 to 10.
+# attempts = 3
+
+# Quack when a session starts (chirp), pairs (greet) or gives up (alarm). The only feedback a
+# trigger with no screen gets.
+# sounds = true

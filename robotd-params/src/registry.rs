@@ -468,6 +468,24 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
     ),
+    // ── [pad_pairing] ────────────────────────────────────────────────────────
+    //
+    // A pairing session, whatever started it. Read by `configd` at the start of each session.
+    entry(
+        "pad_pairing.window_seconds",
+        Kind::Integer,
+        "Seconds a pairing session waits for a pad in pairing mode (5–300)",
+    ),
+    entry(
+        "pad_pairing.attempts",
+        Kind::Integer,
+        "Bonds a session tries before giving up, each from a clean slate (1–10)",
+    ),
+    entry(
+        "pad_pairing.sounds",
+        Kind::Bool,
+        "Quack when pairing starts, succeeds or fails",
+    ),
 ];
 
 /// Sections that changed name: `(old, new)`.

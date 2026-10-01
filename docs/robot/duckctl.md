@@ -612,8 +612,8 @@ robot no longer has — the realistic way to get one of those is removing a skil
 robot ships with. Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down` — and `lb`/`rb` are
 the **bumpers**, since the analog triggers are the mouth and the quack.
 
-Pairing a pad is a different namespace and a different daemon — `pad.pair` and `pad.forget` are
-`configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
+Pairing a pad is a different namespace and a different daemon — `pad.pair`, `pad.reset` and
+`pad.forget` are `configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
 the list of skills.
 
 ## Anything else — `call`
@@ -629,7 +629,8 @@ written without the `duckctl --name <robot-name>` in front of them:
 |---|---|
 | `call system.services` | Which daemons are up, and the release each runs. |
 | `call pad.status` | Is a gamepad bonded, and is it connected? |
-| `call pad.pair '{"timeout_seconds":30}'` | Bond a pad held in pairing mode. |
+| `call pad.pair '{"timeout_seconds":30}'` | Start the robot's pairing session, or join the one running. Answers at once; follow it with `pad.status`. |
+| `call pad.reset` | Forget every pad on the robot's side, then start a session. |
 | `call pad.forget '{"mac":"<address>"}'` | Drop a bond. |
 
 `call` waits 60 seconds for an answer. The update commands above wait on *silence* instead — three

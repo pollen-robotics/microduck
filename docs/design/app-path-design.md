@@ -372,9 +372,9 @@ choosing.
 
 | lane | holds its connection for | calls |
 |---|---|---|
-| `Prompt` | as long as a lookup | `hello`, `update.status`, `update.log`, `update.listInstalled`, `robot.health`, `net.status`, `net.forget`, `system.*`, `pad.status`, `pad.forget` |
+| `Prompt` | as long as a lookup | `hello`, `update.status`, `update.log`, `update.listInstalled`, `robot.health`, `net.status`, `net.forget`, `system.*`, `pad.*` |
 | `Slow` | seconds — the network, or a radio sweep | `update.check`, `net.scan` |
-| `Operation` | as long as it takes, and changes the robot | `update.apply`, `update.rollback`, `update.select`, `net.connect`, `pad.pair` |
+| `Operation` | as long as it takes, and changes the robot | `update.apply`, `update.rollback`, `update.select`, `net.connect` |
 | `Stream` | forever, and answers nothing | `update.subscribe` |
 
 Sharing a lane is queueing, and each grouping is one where that is the right answer: `updaterd`
@@ -933,9 +933,9 @@ line (`serving BLE ... address=`):
 
 Between them: no reflash. Nothing done to the board but BLE connections through `duckctl` and gamepad
 pairing. The top four bytes held; only the low two moved, which fits a driver that generates an
-address once behind a vendor prefix and caches it rather than reading one out of the module. `configd`
-never power-cycles the adapter — it only powers one on that is off — so pad pairing has no obvious
-mechanism, which makes it the thing to test rather than the thing to blame.
+address once behind a vendor prefix and caches it rather than reading one out of the module. When this
+was recorded `configd` never power-cycled the adapter; a pairing session now does, on a `weird-ble`
+board and on every `pad.reset` (`configd/src/pairing.rs`), so a cycle is a mechanism to test first.
 
 Why it matters beyond a puzzling log line:
 

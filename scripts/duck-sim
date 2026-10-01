@@ -320,10 +320,12 @@ TOML
         mkdir -p "$STATE/$name"
         # `--fake-net` and `--fake-pads` for the reason those flags exist: there is no
         # NetworkManager and no BlueZ here, and a configd spending its life saying so would bury
-        # the calls that do work.
+        # the calls that do work. `--params` and `--robotd-socket` are this duck's own, so a
+        # pairing session reads its `[pad_pairing]` and quacks through its robotd.
         DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/configd" \
             --socket "$STATE/$name-config.sock" --state-dir "$STATE/$name" \
             --simulated "sim-$name" --fake-net --fake-pads \
+            --params "$STATE/robotd-$name.toml" --robotd-socket "$STATE/$name.sock" \
             > "$STATE/$name-config.log" 2>&1 &
         echo $! > "$STATE/$name-config.pid"
         i=$((i + 1))

@@ -890,14 +890,31 @@ enum PadCommand {
     /// Once paired the pad is also *trusted*, which is what makes it reconnect by itself after a
     /// reboot with nobody logged in. Nothing else is needed — `padd.service` is already running and
     /// starts driving when the pad connects.
+    ///
+    /// **This starts the robot's pairing session**, the same one a phone or a button starts. It
+    /// retries inside its window, and the robot quacks: a chirp when it starts, a greet when the pad
+    /// drives, a honk when it gives up. Run it again while one is going and it follows that one
+    /// rather than starting another. The window and the retries are `[pad_pairing]` in
+    /// `sudo robotctl configure`.
     Pair {
         /// Which pad, when more than one is in pairing mode — or when it is hardware the robot does
         /// not recognise as a gamepad. `pad pair` prints the addresses it saw when it refuses.
         mac: Option<String>,
 
-        /// How long to look, in seconds.
+        /// How long to look, in seconds. Default: `[pad_pairing] window_seconds`.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u32>,
+
+        /// Forget every pad on the robot's side first, then pair. The way back to a known-clean
+        /// robot when pairing keeps failing. The pad keeps its own half of any old bond, so put it
+        /// in pairing mode afterwards.
+        #[arg(long, conflicts_with = "mac")]
+        reset: bool,
+
+        /// Start the session and return at once, without following it. What a button or any other
+        /// trigger with no one reading a terminal wants: the robot quacks the outcome.
+        #[arg(long)]
+        no_wait: bool,
 
         #[arg(long)]
         json: bool,
@@ -3255,160 +3272,6 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The unit paused while a pad bonds. See [`BtdPaused`].
-const BTD_UNIT: &str = "btd.service";
-
-/// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
-///
-/// Under /var/lib rather than in a release directory: it is a fact about the board, and it has to
-/// survive an update and a rollback.
-const WEIRD_BLE_MARKER: &str = "/var/lib/robot/weird-ble";
-
-/// Was this board provisioned with `--weird-ble`?
-///
-/// A marker rather than re-deriving the answer from `Privacy = device` in `main.conf`: an explicit
-/// record of the decision someone made cannot be confused with a setting that arrived some other
-/// way, and there is no parsing to get subtly wrong.
-///
-/// Absent answers `false`, which is the right default — most boards need nothing.
-fn needs_the_ble_workaround() -> bool {
-    std::path::Path::new(WEIRD_BLE_MARKER).exists()
-}
-
-/// Run `systemctl` and say whether it succeeded, with its output discarded.
-///
-/// Discarded because every call here has something better to say than systemd does: a stop that
-/// fails is reported as what it means for the pairing, not as an exit status.
-fn systemctl(args: &[&str]) -> bool {
-    std::process::Command::new("systemctl")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// `btd` stopped for the length of a pad pairing, and started again afterwards.
-///
-/// **A temporary workaround for a board that is going away, and deliberately in the CLI rather than
-/// in a daemon.** Measured on a Radxa Zero 3W on 2026-08-19: with `btd` running, a pad cannot form a
-/// *new* bond — the bisect in `docs/project/pad-minimal-pairing.md` narrows it to `btd` and nothing
-/// else, one variable, reproducible both ways. An existing bond is unaffected: a bonded pad connects
-/// and drives with the whole stack up, which is what makes stopping `btd` for one pairing a complete
-/// answer rather than a degradation.
-///
-/// Why not in `btd` or `configd`. The fault is the aic8800 radio behaving badly with an adapter that
-/// both advertises as a peripheral and acts as central at once; the chip and the board are not what
-/// ships. Teaching `btd` to drop its advertisement would be real work against hardware with no
-/// future, and having `configd` drive `btd.service` would put a dependency between them that
-/// `docs/design/architecture.md` §1.1 keeps out on purpose — `btd` is in the recovery path.
-///
-/// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
-/// the radio changes**; nothing else has to be unpicked.
-///
-/// Applied only on a board provisioned with `--weird-ble`, which is what sets `Privacy = device` and
-/// leaves the marker this looks for.
-///
-/// Stopping `btd` is only half of it: what it already pushed to the controller outlives the process,
-/// so the adapter is power-cycled too. See [`reset_the_adapter`].
-///
-/// A guard rather than a stop and a start around the call, so `btd` comes back on every path out —
-/// including the error ones, which is where a pairing is most likely to end.
-struct BtdPaused {
-    /// Was it running when we arrived? Only then is starting it again correct: a board with `btd`
-    /// deliberately disabled must not have it switched on by pairing a gamepad.
-    restart: bool,
-}
-
-impl BtdPaused {
-    fn for_pairing() -> Self {
-        // Only where the workaround is needed. A board at BlueZ's default bonds a pad with `btd`
-        // running, and stopping it there would take the phone path down for no reason.
-        if !needs_the_ble_workaround() {
-            return Self { restart: false };
-        }
-
-        // Only restarted if it was running: a board with `btd` deliberately disabled must not have
-        // it switched on by pairing a gamepad.
-        let restart = if systemctl(&["is-active", "--quiet", BTD_UNIT]) {
-            if systemctl(&["stop", BTD_UNIT]) {
-                eprintln!("paused btd while the pad bonds; it comes back on its own");
-                true
-            } else {
-                // Not fatal: the pairing may still work, and refusing to try would be worse than
-                // trying and saying why it might fail. This is also what an unprivileged run looks
-                // like, where the call below is about to be refused anyway.
-                eprintln!(
-                    "warning: could not stop btd, so this pairing may fail on this board. Try:\n \
-                     sudo systemctl stop btd"
-                );
-                false
-            }
-        } else {
-            false
-        };
-
-        reset_the_adapter();
-        Self { restart }
-    }
-}
-
-/// Power the adapter down and up, which is what actually makes a pad bond here.
-///
-/// Stopping `btd` is not enough on its own. Its advertisement and the IO capability its default
-/// pairing agent gave the controller outlive the process — a daemon does not undo what it pushed to
-/// a subsystem when it dies — and a pad still refuses to bond. Every manual pairing that worked had
-/// a **reboot** after stopping `btd`; measured 2026-08-19, a power cycle substitutes for it, which is
-/// what keeps `pad pair` one command instead of two with a reboot between.
-///
-/// Done unconditionally on a marker board, even when `btd` was already stopped: it may have run
-/// earlier this boot and left the same residue, and a board someone stopped `btd` on by hand should
-/// not pair differently from one where this did it.
-///
-/// `bluetoothctl power off/on` and **not** `systemctl restart bluetooth`, which on this board leaves
-/// the kernel holding hci0 while bluetoothd reports "No default controller available" until a reboot.
-/// This is an adapter power toggle through mgmt; the daemon stays up.
-fn reset_the_adapter() {
-    let cycled = bluetoothctl(&["power", "off"]) && bluetoothctl(&["power", "on"]);
-    if !cycled {
-        eprintln!(
-            "warning: could not power-cycle the Bluetooth adapter, so this pairing may fail. \
-             A reboot has the same effect."
-        );
-        return;
-    }
-    // The controller comes back through `off-enabling` before it is usable, and the discovery below
-    // starts immediately. Short enough not to be felt against a discovery window measured in tens
-    // of seconds.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-}
-
-/// Run `bluetoothctl` and say whether it succeeded, with its output discarded.
-fn bluetoothctl(args: &[&str]) -> bool {
-    std::process::Command::new("bluetoothctl")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-impl Drop for BtdPaused {
-    fn drop(&mut self) {
-        if self.restart && !systemctl(&["start", BTD_UNIT]) {
-            eprintln!(
-                "warning: could not start btd again, so the phone path is down until:\n    \
-                 sudo systemctl start btd"
-            );
-        }
-    }
-}
-
-/// The gamepad, through `configd`.
-///
-/// `pair` is the only command here that takes a while — discovery is held open while someone holds
-/// the pad's sync button — and it stays a single blocking call rather than a progress stream: there
-/// is exactly one thing to report, and it arrives at the end.
 /// How long to wait for the loop to actually make the swap.
 ///
 /// The daemon accepts a load and answers immediately; the swap happens at the home pose, after
@@ -4591,13 +4454,7 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
 
     let (call, json) = match &command {
         PadCommand::Status { json } => (proto::Call::PadStatus, *json),
-        PadCommand::Pair { mac, timeout, json } => (
-            proto::Call::PadPair(proto::PadPairParams {
-                mac: mac.clone(),
-                timeout_seconds: *timeout,
-            }),
-            *json,
-        ),
+        PadCommand::Pair { .. } => return run_pad_pair(&mut client, command),
         // Both handled above, before the connection to `configd` this arm opens — they are
         // config edits and a `robotd` question, and configd has nothing to do with either.
         PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
@@ -4609,21 +4466,6 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
         ),
     };
 
-    if let PadCommand::Pair { json: false, .. } = &command {
-        // Printed before the call, not after: the call blocks for the whole discovery window, and
-        // someone who ran this needs to know *now* that they should be holding the button.
-        eprintln!(
-            "looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync \
-             button on the top edge (not the Xbox button, which switches it off); on a Pro \
-             Controller, hold its Sync button until the player lights sweep"
-        );
-    }
-
-    // Held until this function returns, so `btd` is restored on every path out including the
-    // failures. See `BtdPaused` — temporary, and only for `pair`: `status` and `forget` neither
-    // need the radio quiet nor should disturb it.
-    let _btd = matches!(command, PadCommand::Pair { .. }).then(BtdPaused::for_pairing);
-
     let result = result_of(client.call(&call)?)?;
     if json {
         println!("{}", compact(&result));
@@ -4632,7 +4474,7 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
 
     match command {
         PadCommand::Status { .. } => println!("{}", render_pad_status(&result)?),
-        PadCommand::Pair { .. } => return report_pair(&result),
+        PadCommand::Pair { .. } => unreachable!("pair returned before this point"),
         PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
             unreachable!("bindings, bind and reset returned before this point")
         }
@@ -4654,6 +4496,127 @@ fn run_pad(socket: &Path, command: PadCommand) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// How often `pad pair` asks how its session is going.
+const PAIRING_POLL: Duration = Duration::from_millis(500);
+
+/// `pad pair`: start the robot's session — or join it — and follow it to its outcome.
+///
+/// Followed by number through `pad.status`, the way any caller follows one: the answer to the start
+/// says which session this is, and the outcome carrying that number is this command's. That is what
+/// keeps a second `pad pair` in another terminal, a phone and a button from confusing each other.
+fn run_pad_pair(client: &mut Client, command: PadCommand) -> Result<(), Failure> {
+    let PadCommand::Pair {
+        mac,
+        timeout,
+        reset,
+        no_wait,
+        json,
+    } = command
+    else {
+        unreachable!("only called for pair")
+    };
+
+    let call = if reset {
+        proto::Call::PadReset
+    } else {
+        proto::Call::PadPair(proto::PadPairParams {
+            mac,
+            timeout_seconds: timeout,
+        })
+    };
+    let started: proto::PadPairing = decode(&result_of(client.call(&call)?)?)?;
+    if no_wait {
+        if json {
+            println!(
+                "{}",
+                compact(&serde_json::to_value(&started).unwrap_or_default())
+            );
+        } else {
+            println!("{}", describe_session(&started));
+        }
+        return Ok(());
+    }
+
+    if !json {
+        if started.joined {
+            eprintln!(
+                "already {} — following session {}",
+                phase_words(started.phase),
+                started.session
+            );
+        }
+        // Said up front: someone who ran this needs to know *now* that they should be holding the
+        // button, and the robot's chirp may be the only other sign that anything started.
+        eprintln!(
+            "looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync \
+             button on the top edge (not the Xbox button, which switches it off); on a Pro \
+             Controller, hold its Sync button until the player lights sweep"
+        );
+    }
+
+    let mine = started.session;
+    let mut said = (started.phase, started.attempt);
+    let result = loop {
+        std::thread::sleep(PAIRING_POLL);
+        let status: proto::PadStatusResult =
+            decode(&result_of(client.call(&proto::Call::PadStatus)?)?)?;
+        let pairing = status.pairing;
+        if let Some(last) = pairing.last.clone().filter(|last| last.session == mine) {
+            break last.result;
+        }
+        // Numbered from 1 each time `configd` starts, so a lower number than ours is a `configd`
+        // that restarted under this session — which took the session with it.
+        if pairing.session < mine {
+            return Err(Failure::new(
+                exit::REFUSED,
+                "configd restarted while pairing, which ended the session; run this again".into(),
+            ));
+        }
+        // A new phase, or a retry. The first attempt is what the line above already said.
+        let news = pairing.phase != said.0 || (pairing.attempt > 1 && pairing.attempt != said.1);
+        if !json && pairing.session == mine && news {
+            said = (pairing.phase, pairing.attempt);
+            eprintln!("{}", describe_session(&pairing));
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            compact(&serde_json::to_value(&result).unwrap_or_default())
+        );
+        return Ok(());
+    }
+    report_pair(result)
+}
+
+fn phase_words(phase: proto::PadPairingPhase) -> &'static str {
+    match phase {
+        proto::PadPairingPhase::Idle => "idle",
+        proto::PadPairingPhase::Resetting => "resetting",
+        proto::PadPairingPhase::Pairing => "pairing",
+    }
+}
+
+/// One line about a session in flight.
+fn describe_session(pairing: &proto::PadPairing) -> String {
+    match pairing.phase {
+        proto::PadPairingPhase::Idle => format!("session {} finished", pairing.session),
+        proto::PadPairingPhase::Resetting => format!(
+            "session {}: forgetting every pad on the robot's side",
+            pairing.session
+        ),
+        proto::PadPairingPhase::Pairing if pairing.attempt > 1 => format!(
+            "session {}: trying again from a clean slate — attempt {} of {}, {}s left",
+            pairing.session, pairing.attempt, pairing.attempts, pairing.remaining_seconds
+        ),
+        proto::PadPairingPhase::Pairing => format!(
+            "session {}: pairing — {}s left",
+            pairing.session, pairing.remaining_seconds
+        ),
+    }
 }
 
 fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
@@ -4698,13 +4661,16 @@ fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
         proto::UnitState::Unknown => "unknown — could not ask systemd".to_owned(),
     };
     let _ = write!(out, "padd    {driver}");
+    if status.pairing.phase != proto::PadPairingPhase::Idle {
+        let _ = write!(out, "\npairing {}", describe_session(&status.pairing));
+    }
     Ok(out)
 }
 
 /// Pairing is a successful call that may report a failed outcome, like a wifi join: the exit status
 /// has to distinguish "the robot refused" from "the robot could not be asked".
-fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
-    match decode::<proto::PadPairResult>(result)? {
+fn report_pair(result: proto::PadPairResult) -> Result<(), Failure> {
+    match result {
         proto::PadPairResult::Paired { pad } => {
             println!("paired  {} {}", pad.name, pad.mac);
             if pad.connected {
@@ -4716,7 +4682,7 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
             }
             Ok(())
         }
-        proto::PadPairResult::Failed { reason, detail } => {
+        proto::PadPairResult::Failed { reason, detail, .. } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
                     "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
@@ -4728,7 +4694,16 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                     "more than one pad is in pairing mode; name the one you want by its address"
                 }
                 proto::PadPairFailure::Timeout => {
-                    "the pad was found but never finished pairing; try again"
+                    "the pad was found but never finished pairing, on every attempt. Put it back \
+                     in pairing mode and try again; if it keeps failing, `pad pair --reset`"
+                }
+                proto::PadPairFailure::NoInput => {
+                    "the pad bonded but no input device appeared for it, so nothing could drive \
+                     from it — every attempt. Switch the pad off and on, put it in pairing mode, \
+                     and try `pad pair --reset`"
+                }
+                proto::PadPairFailure::Cancelled => {
+                    "a reset replaced this pairing session — the reset carries on by itself"
                 }
                 proto::PadPairFailure::NoAdapter => {
                     "this robot has no Bluetooth adapter yet. Just after a boot that is normal — \

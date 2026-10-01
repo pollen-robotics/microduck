@@ -89,6 +89,48 @@ pub struct Params {
     /// editor renames the section the next time it saves that file.
     #[serde(alias = "imu_head")]
     pub pad_imu_head_control: PadImuHeadControlParams,
+    /// How a pairing session behaves: how long it waits for a pad, how often it retries, whether
+    /// it quacks. `configd` reads this, at the start of every session, not `robotd`.
+    pub pad_pairing: PadPairingParams,
+}
+
+/// A gamepad pairing session — `pad.pair`, whatever triggered it.
+///
+/// Read by `configd` when a session starts, so a change applies to the next press without a
+/// restart. `configd::pairing` owns what these mean; this is the schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadPairingParams {
+    /// How long a session waits for a pad in pairing mode, in seconds.
+    ///
+    /// Long enough that the order does not matter: whoever pressed the robot's trigger still has
+    /// to find the pad's Sync button, and a pad that was already flashing when the session started
+    /// is found in the first sweep anyway.
+    pub window_seconds: u32,
+    /// How many bonds a session tries before giving up. Each retry after the first starts from a
+    /// clean slate on the robot's side — the half-made device removed, the radio reset where the
+    /// board needs it — and all of them share `window_seconds`.
+    pub attempts: u32,
+    /// Quack when a session starts, succeeds and fails. The only feedback a trigger with no screen
+    /// gets, so it is on unless somebody wants a silent robot.
+    pub sounds: bool,
+}
+
+/// Bounds on [`PadPairingParams::window_seconds`]. Below the lower one no pad has time to
+/// answer; above the upper one the adapter scans long after whoever pressed the button has left.
+pub const PAIRING_WINDOW_MIN: u32 = 5;
+pub const PAIRING_WINDOW_MAX: u32 = 300;
+/// Bounds on [`PadPairingParams::attempts`].
+pub const PAIRING_ATTEMPTS_MAX: u32 = 10;
+
+impl Default for PadPairingParams {
+    fn default() -> Self {
+        Self {
+            window_seconds: 60,
+            attempts: 3,
+            sounds: true,
+        }
+    }
 }
 
 /// Controller-IMU head control: pose the head by tilting the pad.
@@ -1931,6 +1973,15 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error("{path}: pad_pairing.window_seconds must be between {min} and {max}, got {got}")]
+    PairingWindow {
+        path: String,
+        got: u32,
+        min: u32,
+        max: u32,
+    },
+    #[error("{path}: pad_pairing.attempts must be between 1 and {max}, got {got}")]
+    PairingAttempts { path: String, got: u32, max: u32 },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2017,6 +2068,23 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // Here rather than in `configd` for the same reason: the editor refuses to write it.
+        let pairing = &self.pad_pairing;
+        if !(PAIRING_WINDOW_MIN..=PAIRING_WINDOW_MAX).contains(&pairing.window_seconds) {
+            return Err(ParamsError::PairingWindow {
+                path: path.display().to_string(),
+                got: pairing.window_seconds,
+                min: PAIRING_WINDOW_MIN,
+                max: PAIRING_WINDOW_MAX,
+            });
+        }
+        if !(1..=PAIRING_ATTEMPTS_MAX).contains(&pairing.attempts) {
+            return Err(ParamsError::PairingAttempts {
+                path: path.display().to_string(),
+                got: pairing.attempts,
+                max: PAIRING_ATTEMPTS_MAX,
             });
         }
         Ok(())
@@ -3042,6 +3110,29 @@ mod tests {
             Params::load(&path, true).unwrap().media.bitrate_resolved(),
             2_000_000
         );
+    }
+
+    /// A pairing window of zero is a session that can never find a pad, and one of an hour is an
+    /// adapter left scanning for an hour. Refused when written rather than when a button is pressed.
+    #[test]
+    fn a_pairing_session_outside_its_bounds_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "[pad_pairing]\nwindow_seconds = 0\n",
+            "[pad_pairing]\nwindow_seconds = 3600\n",
+            "[pad_pairing]\nattempts = 0\n",
+            "[pad_pairing]\nattempts = 50\n",
+        ] {
+            let path = write(dir.path(), bad);
+            assert!(Params::load(&path, true).is_err(), "{bad}");
+        }
+        let path = write(
+            dir.path(),
+            "[pad_pairing]\nwindow_seconds = 120\nattempts = 5\n",
+        );
+        let pairing = Params::load(&path, true).unwrap().pad_pairing;
+        assert_eq!((pairing.window_seconds, pairing.attempts), (120, 5));
+        assert!(pairing.sounds);
     }
 
     /// Today's shipped behaviour, pinned: a robot with no `[media]` section streams its camera

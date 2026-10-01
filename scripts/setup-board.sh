@@ -58,19 +58,19 @@ BT_INPUT_CONF=/etc/bluetooth/input.conf
 # this script. See `configure_bluetooth`.
 WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
 
-# Does `robotctl pad pair` have to pause `btd` on this board? `--pause-btd-on-pair`.
+# Does a pairing session have to pause `btd` on this board? `--pause-btd-on-pair`.
 #
 # Separate from `WEIRD_BLE` because they fix different faults, and a board can need this one
 # without wanting `Privacy = device` — measured, see `configure_bluetooth`. `--weird-ble` implies
 # it, so every board provisioned before this flag existed keeps behaving the same way.
 PAUSE_BTD="${DUCK_PAUSE_BTD:-}"
 
-# Where the answer is left for `robotctl`, which has to pause `btd` while a pad bonds on such a
-# board. Under /var/lib rather than in a release directory: it is a fact about this board and must
+# Where the answer is left for `configd`, whose pairing session pauses `btd` while a pad bonds on
+# such a board (`configd/src/pairing.rs`). Under /var/lib rather than in a release directory: it is a fact about this board and must
 # survive an update and a rollback.
 #
 # The name is now narrower than what it means — it marks "pause btd for a pairing", which is no
-# longer tied to `Privacy = device`. Kept as-is deliberately: `robotctl` reads this exact path, and
+# longer tied to `Privacy = device`. Kept as-is deliberately: `configd` reads this exact path, and
 # renaming it would make every board already carrying one stop pausing `btd` with nothing to say
 # why. Rename both together, or neither.
 WEIRD_BLE_MARKER=/var/lib/robot/weird-ble
@@ -436,9 +436,9 @@ free_motor_port() {
 # not track it either — a pad bonds fine on the build that was once blamed.
 #
 # Why it is a flag rather than the default. `device` is not free: under it a pad cannot form a *new*
-# bond while `btd` advertises, so `robotctl pad pair` has to stop `btd` for the pairing window on any
+# bond while `btd` advertises, so a pairing session has to stop `btd` for the pairing window on any
 # board that has it. Setting `device` everywhere would impose that on boards that never needed it.
-# `robotctl` needs to know too, since it is what pauses `btd`. It reads a marker this writes rather
+# `configd` needs to know too, since it is what pauses `btd`. It reads a marker this writes rather
 # than re-deriving the answer from `main.conf`: an explicit record of the decision someone made
 # cannot be confused with a `Privacy` value that arrived some other way.
 #
@@ -474,7 +474,7 @@ free_motor_port() {
 # the new flag; a board that cannot bond under `off` at all still wants `--weird-ble`.
 #
 # Both are workarounds for the aic8800 radio, which is not what ships. When the radio changes, both
-# flags and `BtdPaused` in robotctl/src/main.rs all go.
+# flags and `Board::stop_btd` in configd/src/pairing.rs all go.
 #
 # The change sets `needs_reboot` rather than restarting bluetooth. Restarting the daemon here leaves
 # the kernel holding hci0 while bluetoothd reports "No default controller available", which needs a
@@ -779,7 +779,7 @@ configure_bluetooth() {
         say "  a pad that pairs and then flaps wants neither; one that will not pair wants one"
         # The marker is deliberately *not* removed here. Without a flag this function changes
         # nothing, so a board that has `Privacy = device` still has it — and clearing the marker
-        # would leave `robotctl` no longer pausing `btd` on a board that still needs it, which is
+        # would leave `configd` no longer pausing `btd` on a board that still needs it, which is
         # the silent version of the bug these flags exist for. Undoing it is a hand edit.
         return 0
     fi
@@ -859,7 +859,7 @@ configure_classic_hid() {
     needs_reboot=1
 }
 
-# The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
+# The marker `configd` reads to decide whether to pause `btd` for a pairing.
 #
 # Its own function because both flags write it and only one of them touches `Privacy` — which is the
 # distinction this whole section exists to make.
@@ -872,8 +872,8 @@ write_pause_marker() {
     cat > "$WEIRD_BLE_MARKER" <<'MARKER'
 # This board needs btd paused while a gamepad bonds.
 #
-# On the aic8800 radio a pad cannot form a NEW bond while btd advertises, so `robotctl pad pair`
-# stops btd for the pairing window, power-cycles the adapter, and starts btd again afterwards. An
+# On the aic8800 radio a pad cannot form a NEW bond while btd advertises, so configd's pairing
+# session stops btd for the pairing window, power-cycles the adapter, and starts btd again after. An
 # existing bond is unaffected: a bonded pad connects and drives with the whole stack up.
 #
 # This says nothing about Privacy. A board provisioned with --pause-btd-on-pair keeps BlueZ's
@@ -881,11 +881,11 @@ write_pause_marker() {
 # under off at all. Setting device on a board that did not need it makes a bond flap with
 # `PIN or Key Missing` instead, so the two are deliberately separate.
 #
-# A workaround for a radio that is not what ships. Delete this file and drop BtdPaused from
-# robotctl when the radio changes.
+# A workaround for a radio that is not what ships. Delete this file and drop Board::stop_btd from
+# configd when the radio changes.
 MARKER
     chmod 644 "$WEIRD_BLE_MARKER"
-    say "wrote ${WEIRD_BLE_MARKER} so robotctl pauses btd while a pad bonds"
+    say "wrote ${WEIRD_BLE_MARKER} so configd pauses btd while a pad bonds"
 }
 
 # What the board looks like now. Printed whether or not anything was changed, because "is

@@ -39,7 +39,7 @@
 #   --no-ble          do not use Bluetooth to re-find the board. See below for what that costs.
 #   --pause-btd-on-pair
 #                     for a Radxa Zero 3W that pairs a gamepad only while `btd` is out of the way.
-#                     Leaves /var/lib/robot/weird-ble, which makes `robotctl pad pair` stop `btd`
+#                     Leaves /var/lib/robot/weird-ble, which makes a pairing session stop `btd`
 #                     and power-cycle the adapter for the pairing window — and **does not touch
 #                     `Privacy`**. This is what a board wants when a pad pairs and then flaps with
 #                     `PIN or Key Missing`: that is `Privacy = device` on a board that needed only

@@ -492,6 +492,14 @@ sudo robotctl pad pair 78:86:2E:BB:13:28
 ```
 
 ```
+sudo robotctl pad pair --reset
+```
+
+```
+sudo robotctl pad pair --no-wait
+```
+
+```
 sudo robotctl pad forget 78:86:2E:BB:13:28
 ```
 

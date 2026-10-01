@@ -29,6 +29,11 @@ libc = "0.2"
 # rename every robot. Already in the graph via the updater's release verification.
 sha2 = "0.11.0"
 
+# `[pad_pairing]` lives in robotd.toml beside every other per-robot setting, so `robotctl
+# configure` edits it and validates it against the same schema this reads it with — the way
+# `mediad` reads `[media]` and `tofd` reads `[head_imu]`. Pure Rust, no network stack.
+robotd-params = { path = "../robotd-params" }
+
 # NetworkManager and logind, both Linux-only. As with btd, the crate must still build and test on
 # a macOS laptop — `cargo test` there is the onboarding path — so the backend sits behind a trait
 # with an in-memory fake and the D-Bus client is not in the graph off-Linux.
@@ -46,3 +51,6 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Paused time, so a pairing session's sixty-second window runs in milliseconds. Dev only: Cargo
+# does not build dev-dependencies into the shipped binary.
+tokio = { workspace = true, features = ["test-util"] }

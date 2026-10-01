@@ -423,7 +423,23 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 37;
+///
+/// # v38 — pairing a pad is a session, not a call
+///
+/// [`Call::PadPair`] now **starts** a pairing session and answers at once with a [`PadPairing`];
+/// it used to hold the connection for the whole search and answer with a [`PadPairResult`]. A
+/// session retries within its window, starts each retry from a clean slate, quacks, and is shared:
+/// a second `pad.pair` while one runs joins it (`joined: true`) rather than starting another, so
+/// any number of triggers — a button, a phone, a script — can be pressed at once safely.
+/// [`Call::PadReset`] is new: forget every pad on the robot's side, then start a session.
+/// [`PadStatusResult::pairing`] is where a caller follows it, and where the finished session's
+/// [`PadPairResult`] now arrives. [`PadPairFailure`] gains `no_input` and `cancelled`, and its
+/// `failed` carries the address it was bonding when it got that far.
+///
+/// **Not compatible with a client that waits on `pad.pair`'s answer**: it gets a `PadPairing`
+/// where it expected a `PadPairResult`. `robotctl` and this daemon ship together; the phone app
+/// has to follow `pad.status` instead.
+pub const API_VERSION: u32 = 38;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -836,8 +852,10 @@ pub mod method {
 
     /// Which pads this robot knows, and whether `padd` is driving from one.
     pub const PAD_STATUS: &str = "pad.status";
-    /// Pair the gamepad that is in pairing mode now.
+    /// Start a pairing session, or join the one running. Answers at once; see [`super::PadPairing`].
     pub const PAD_PAIR: &str = "pad.pair";
+    /// Forget every pad on the robot's side, then start a pairing session.
+    pub const PAD_RESET: &str = "pad.reset";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
     pub const PAD_BINDINGS: &str = "pad.bindings";
@@ -1091,6 +1109,7 @@ pub enum Call {
     // ── pad.* ────────────────────────────────────────────────────────────────
     PadStatus,
     PadPair(PadPairParams),
+    PadReset,
     PadForget(PadForgetParams),
     PadBindings,
     PadBind(PadBindParams),
@@ -1222,6 +1241,7 @@ impl Call {
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
+            Call::PadReset => method::PAD_RESET,
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadBindings => method::PAD_BINDINGS,
             Call::PadBind(_) => method::PAD_BIND,
@@ -1259,6 +1279,7 @@ impl Call {
                 // consequential thing in this namespace — a paired pad can enable the policy.
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
+                | Call::PadReset
                 | Call::PadForget(_)
                 // Replacing the policy set changes what drives fifteen servos, which is at least
                 // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
@@ -1391,7 +1412,12 @@ impl Call {
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
-            | Call::PadForget(_) => (Config, Prompt),
+            | Call::PadForget(_)
+            // Both answer at once: a pairing session runs in `configd` after the reply, and is
+            // followed through `pad.status`. So neither holds a connection, and neither needs the
+            // `Operation` class `pad.pair` had while it waited for the pad.
+            | Call::PadPair(_)
+            | Call::PadReset => (Config, Prompt),
 
             // **The one place `pad.*` splits across two daemons.** Pairing is about the radio,
             // which `configd` owns. A binding is about what a button does to the robot, and
@@ -1411,10 +1437,9 @@ impl Call {
             // Re-sweeps the radio rather than returning the last scan.
             Call::NetScan => (Config, Slow),
             // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
-            // and `pad.pair` waits on a gamepad for its whole timeout. Both hold the connection
-            // for that long, which is what `Operation` is for — and why `net.status` must not be
-            // queued behind them.
-            Call::NetConnect(_) | Call::PadPair(_) => (Config, Operation),
+            // and holds the connection for that long, which is what `Operation` is for — and why
+            // `net.status` must not be queued behind it.
+            Call::NetConnect(_) => (Config, Operation),
 
             // ── padd and tofd ───────────────────────────────────────────────
             //
@@ -1526,6 +1551,7 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
+            | Call::PadReset
             | Call::PadBindings
             | Call::RobotSkills
             | Call::PadInput
@@ -1619,6 +1645,7 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
+            method::PAD_RESET => Call::PadReset,
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_BINDINGS => Call::PadBindings,
             method::PAD_BIND => Call::PadBind(decode(params)?),
@@ -1799,6 +1826,7 @@ pub mod test_support {
                 mac: Some("78:86:2E:BB:13:28".into()),
                 timeout_seconds: Some(20),
             }),
+            Call::PadReset,
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
@@ -3003,7 +3031,11 @@ pub struct SetPairingPinParams {
 
 // ── pad.* parameters ─────────────────────────────────────────────────────────
 
-/// Pair the gamepad that is in pairing mode now.
+/// Start a pairing session for the gamepad in pairing mode now — or join the one running.
+///
+/// Both fields apply only to a session this call **starts**. A call that joins a running session
+/// takes it as it is: the person who pressed first set the window, and a second press moving it
+/// would be a pad that could never be sure how long it had.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PadPairParams {
@@ -3014,11 +3046,11 @@ pub struct PadPairParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
 
-    /// How long to look, in seconds. `None` means the service's own default.
+    /// How long the session looks, in seconds. `None` means `[pad_pairing] window_seconds`.
     ///
-    /// A parameter because the caller knows something the robot does not: whoever typed this is
-    /// standing there holding the pad's pairing button, and a phone app offering "keep looking"
-    /// needs a longer window than a script does.
+    /// A parameter because the caller knows something the robot does not: a script re-asserting
+    /// trust on a pad already bonded wants a few seconds, and a phone app offering "keep looking"
+    /// wants longer than the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
 }
@@ -4286,6 +4318,63 @@ pub struct PadStatusResult {
     /// Every pad the robot is bonded to, connected first.
     pub pads: Vec<Pad>,
     pub driver: UnitState,
+    /// The pairing session, running or last finished. Default from a `configd` older than v38,
+    /// which had no sessions: idle, nothing ever run.
+    #[serde(default)]
+    pub pairing: PadPairing,
+}
+
+/// Where the robot is with pairing a pad: the answer to [`Call::PadPair`] and [`Call::PadReset`],
+/// and part of [`PadStatusResult`].
+///
+/// **One session at a time, held by `configd`, and every trigger shares it.** A button, the phone
+/// and `robotctl` are all callers of the same two methods, so the state lives where the work does
+/// and a trigger holds none of its own. Pressing again while a session runs joins it.
+///
+/// A caller follows its session by number: `session` from the answer that started or joined it,
+/// then `pad.status` until [`PadPairing::last`] carries that number. Numbering, rather than
+/// waiting for `idle`, is what keeps a slow poller from reading the next session's outcome as its
+/// own, or missing its own because another started in between.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadPairing {
+    /// The session running, or the last one to run. Counts from 1 each time `configd` starts; 0
+    /// means none has run since.
+    pub session: u64,
+    pub phase: PadPairingPhase,
+    /// Which bond this is, from 1, and how many the session allows. Both 0 while idle.
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub attempts: u32,
+    /// Seconds left in the window. 0 while idle.
+    #[serde(default)]
+    pub remaining_seconds: u32,
+    /// Set on the answer to `pad.pair` or `pad.reset` when the call joined a session already
+    /// running rather than starting one. Never set in `pad.status`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joined: bool,
+    /// How the most recent finished session ended. `None` until one has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<PadPairingOutcome>,
+}
+
+/// What a session is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadPairingPhase {
+    #[default]
+    Idle,
+    /// Removing every pad from the robot's side, before pairing. See [`Call::PadReset`].
+    Resetting,
+    /// Looking for a pad in pairing mode, and bonding it.
+    Pairing,
+}
+
+/// A finished session: which one, and how it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadPairingOutcome {
+    pub session: u64,
+    pub result: PadPairResult,
 }
 
 /// Why pairing a pad failed.
@@ -4305,6 +4394,12 @@ pub enum PadPairFailure {
     /// BlueZ refused the bond. The classic cause on this board is the `Privacy` setting in
     /// `/etc/bluetooth/main.conf` — see `configd::bluez` for which value and why.
     Rejected,
+    /// It bonded and no input device appeared for it, so nothing can drive from it. The state a
+    /// classic pad connected in the wrong order ends in; the session removes the bond and retries,
+    /// so this is what is left when every retry ended the same way.
+    NoInput,
+    /// A `pad.reset` arrived while the session ran, and replaced it.
+    Cancelled,
     Other,
 }
 
@@ -4319,6 +4414,9 @@ pub enum PadPairResult {
         reason: PadPairFailure,
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
+        /// The pad it was bonding, when it got that far. What a retry removes before trying again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mac: Option<String>,
     },
 }
 
@@ -5560,7 +5658,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            67,
+            68,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5792,6 +5890,7 @@ mod tests {
                 // list: reading which pads are paired is exactly the kind of inspection support
                 // needs on a robot it is not allowed to reconfigure.
                 method::PAD_PAIR,
+                method::PAD_RESET,
                 method::PAD_FORGET,
             ]
         );

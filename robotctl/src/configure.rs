@@ -107,6 +107,10 @@ fn apply_for(key: &str) -> Option<Apply> {
         //
         // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
         "pad" | "pad_imu_head_control" => Apply::Live("padd"),
+        // `configd` reads `[pad_pairing]` afresh at the start of every pairing session, so the
+        // next press is the one that sees it. A session already running keeps what it started
+        // with, which is the only reading of "the window" that does not move under a person.
+        "pad_pairing" => Apply::Live("configd"),
         // `tofd` reads `[head_imu]` out of robotd's file — see `tof/src/config.rs` for why it
         // reads that file rather than one of its own — and reads it once, at startup.
         "head_imu" => Apply::Restart("tofd"),

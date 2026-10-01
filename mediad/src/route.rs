@@ -258,10 +258,11 @@ fn permits(call: &proto::Call) -> bool {
         // that network" — while a robot reachable over WebRTC demonstrably has one.
         NetConnect(_) | NetForget(_) => false,
 
-        // Bonding a gamepad needs a pad in the room, in pairing mode, in a fifteen-second window.
+        // Bonding a gamepad needs a pad in the room, in pairing mode, inside the session's window.
         // A remote peer cannot satisfy any of that, so permitting it would only offer a button
-        // that times out.
-        PadPair(_) => false,
+        // that times out. A reset is the same session with every local pad forgotten first — the
+        // pad of whoever is standing next to the robot, from someone who is not.
+        PadPair(_) | PadReset => false,
 
         // ── refused: never over a network transport ──────────────────────────
         //

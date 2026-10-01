@@ -79,9 +79,9 @@
 //! populations, so `device` is set on every board.
 //!
 //! Under `device`, a pad cannot form a **new** bond while `btd` advertises. An existing bond is
-//! unaffected, which is why `robotctl pad pair` stops `btd` for the pairing window rather than
-//! anything here changing — see `BtdPaused` in `robotctl/src/main.rs`, and
-//! `docs/project/pad-minimal-pairing.md` for the bisect.
+//! unaffected, which is why a pairing session stops `btd` for the pairing window rather than
+//! anything here changing — see `crate::pairing`, and `docs/project/pad-minimal-pairing.md` for the
+//! bisect.
 //!
 //! The failure that looks like this file is at fault, and is not:
 //!
@@ -564,6 +564,25 @@ impl BlueZ {
             .collect())
     }
 
+    /// Take down a pairing agent left behind by an attempt that never reached its own cleanup.
+    async fn withdraw_agent(&self) {
+        let Ok(path) = ObjectPath::try_from(AGENT_PATH) else {
+            return;
+        };
+        let removed = self
+            .bus
+            .object_server()
+            .remove::<PairingAgent, _>(&path)
+            .await
+            .unwrap_or(false);
+        if removed {
+            tracing::info!("withdrew a pairing agent an earlier attempt left behind");
+            if let Ok(manager) = AgentManagerProxy::new(&self.bus).await {
+                let _ = manager.unregister_agent(&path).await;
+            }
+        }
+    }
+
     /// Look for a gamepad until `deadline`, then give up.
     ///
     /// **An unbonded pad wins, and the search waits for one.** A robot that already has a pad bonded
@@ -860,6 +879,7 @@ impl Pads for BlueZ {
                     "no Bluetooth adapter. On this board hci0 appears about 73s after power-on."
                         .to_owned(),
                 ),
+                mac: None,
             });
         };
 
@@ -871,6 +891,13 @@ impl Pads for BlueZ {
         //
         // Idempotence is kept where it belongs instead: if the pad that turns up is already bonded,
         // `bond` skips connecting and pairing and only re-asserts `Trusted`.
+
+        // Start from nothing of ours. A session that was replaced by a reset drops this future
+        // wherever it was, which can leave discovery running and the agent registered — and a
+        // second `RegisterAgent` at the same path is refused, which silently leaves the pad to an
+        // agent that never answers. Both are no-ops when there is nothing to clear.
+        let _ = adapter.stop_discovery().await;
+        self.withdraw_agent().await;
 
         // Discovery has to be running for a first-time bond to resolve an address. A failure here
         // is worth reporting rather than working around: without it the search below can only ever
@@ -927,6 +954,7 @@ impl Pads for BlueZ {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
                     detail: Some(detail),
+                    mac: None,
                 });
             }
             [only] => only.clone(),
@@ -958,6 +986,7 @@ impl Pads for BlueZ {
                                 "more than one pad is in pairing mode: {}",
                                 names.join(", ")
                             )),
+                            mac: None,
                         });
                     }
                 }
@@ -1031,6 +1060,7 @@ impl Pads for BlueZ {
             return Ok(proto::PadPairResult::Failed {
                 reason,
                 detail: Some(detail),
+                mac: Some(device.mac.clone()),
             });
         }
 
@@ -1074,6 +1104,79 @@ impl Pads for BlueZ {
         tracing::info!(mac, "pad forgotten");
         Ok(proto::PadForgetResult { removed: true })
     }
+
+    async fn reset(&self) -> PadResult<u32> {
+        let Some(adapter) = self.adapter().await? else {
+            return Ok(0);
+        };
+        // Every gamepad, bonded or only cached. The cached ones matter as much: a pad the radio
+        // saw half-way through a failed attempt is a stale object with stale properties, and the
+        // point of a reset is that the next search sees only what is in the room.
+        let mut removed = 0;
+        for device in self
+            .devices()
+            .await?
+            .into_iter()
+            .filter(Snapshot::is_gamepad)
+        {
+            match adapter.remove_device(&device.path.as_ref()).await {
+                Ok(()) => {
+                    tracing::info!(mac = %device.mac, paired = device.paired, "removed");
+                    if device.paired {
+                        removed += 1;
+                    }
+                }
+                Err(e) => tracing::warn!(mac = %device.mac, error = %e, "could not remove"),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Through bluetoothd's `Powered`, which is mgmt underneath: the daemon stays up.
+    ///
+    /// **Never `systemctl restart bluetooth`** in its place: on this board that leaves the kernel
+    /// holding hci0 while bluetoothd reports "No default controller available" until a reboot.
+    async fn cycle_adapter(&self) -> PadResult<()> {
+        let Some(adapter) = self.adapter().await? else {
+            return Err("no Bluetooth adapter".to_owned());
+        };
+        adapter
+            .set_powered(false)
+            .await
+            .map_err(|e| format!("cannot power the adapter off: {e}"))?;
+        adapter
+            .set_powered(true)
+            .await
+            .map_err(|e| format!("cannot power the adapter on: {e}"))?;
+        // It comes back through `off-enabling` before it is usable, and discovery starts right
+        // after this. Measured 2026-08-19: half a second is enough, and short against a window.
+        tokio::time::sleep(ADAPTER_SETTLE).await;
+        tracing::info!("adapter power-cycled");
+        Ok(())
+    }
+
+    async fn has_input(&self, mac: &str) -> bool {
+        input_device_for(mac)
+    }
+}
+
+/// How long a power-cycled adapter gets before it is asked to discover.
+const ADAPTER_SETTLE: Duration = Duration::from_millis(500);
+
+/// Is there an input device whose `uniq` is this address?
+///
+/// The kernel's own record, from sysfs: both paths a pad takes set `uniq` to the pad's address —
+/// `hidp` for a classic pad, bluetoothd's uhid device for an LE one (`78:86:2e:bb:13:28` on the Xbox
+/// pad, which is what `padd`'s tap reports). Readable under `configd`'s sandbox, which makes `/sys`
+/// read-only but not unreadable.
+fn input_device_for(mac: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/input") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_to_string(entry.path().join("uniq"))
+            .is_ok_and(|uniq| uniq.trim().eq_ignore_ascii_case(mac))
+    })
 }
 
 #[cfg(test)]

@@ -110,7 +110,7 @@ FORCE_REINSTALL="$ENV_FORCE"
 #
 # Off by default because most Radxa Zero 3W units do not need it and the workarounds have a cost:
 # `Privacy = device` stops a pad forming a new bond while `btd` advertises, which is why
-# `robotctl pad pair` has to pause `btd` on a board that has it. See `configure_bluetooth` in
+# a pairing session has to pause `btd` on a board that has it. See `configure_bluetooth` in
 # `setup-board.sh` for the split this exists for.
 WEIRD_BLE="$ENV_WEIRD_BLE"
 

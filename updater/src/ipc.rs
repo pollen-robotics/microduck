@@ -831,6 +831,7 @@ impl Server {
             // working.
             | Call::PadStatus
             | Call::PadPair(_)
+            | Call::PadReset
             | Call::PadForget(_)
             // The two exceptions in that namespace go to `robotd` rather than `configd` — a
             // binding needs the skill list to check a name against — but from here the answer is

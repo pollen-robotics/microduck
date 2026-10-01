@@ -586,7 +586,7 @@ echo "    [ok] setup-board is idempotent on a second run"
 # single-quoted, so one would end it early and run the rest on the host — which is exactly what
 # happened once, and it presented as a grep failing on a file the fixture had just written.
 # Without --weird-ble it must touch nothing: most boards bond a pad under the BlueZ default, and
-# imposing `device` on them would make robotctl pause btd for every pairing for no reason.
+# imposing `device` on them would make configd pause btd for every pairing for no reason.
 if grep -qE "^[[:space:]]*Privacy[[:space:]]*=" /etc/bluetooth/main.conf; then
     echo "    [FAIL] setup-board set Privacy without --weird-ble"
     exit 1
@@ -614,7 +614,7 @@ echo "    [ok] --pause-btd-on-pair writes the marker and leaves Privacy alone"
 # passing on one this case left behind.
 rm -f /var/lib/robot/weird-ble
 
-# And with it: the setting, and the marker robotctl reads to decide whether to pause btd.
+# And with it: the setting, and the marker configd reads to decide whether to pause btd.
 DUCK_WEIRD_BLE=1 ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh \
     > /tmp/weird.log 2>&1
 grep -qE "^Privacy = device$" /etc/bluetooth/main.conf

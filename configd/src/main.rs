@@ -9,9 +9,10 @@ use std::sync::Arc;
 use clap::Parser;
 use configd::net::{FakeNet, Net};
 use configd::pad::{FakePads, Pads};
+use configd::pairing::{Pairing, SystemBoard};
 use configd::power;
 use configd::store::Store;
-use configd::{logs, pad, units};
+use configd::{logs, units};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -91,6 +92,19 @@ struct Args {
     /// reason to build the switch that allows it.
     #[arg(long, value_name = "SERIAL")]
     simulated: Option<String>,
+
+    /// `robotd.toml`, for `[pad_pairing]` — read at the start of every pairing session.
+    ///
+    /// `robotd`'s file rather than one of this daemon's own, as `mediad` reads `[media]` from it:
+    /// the schema and validation are `robotd-params`', so what `robotctl configure` writes is what
+    /// this reads.
+    #[arg(long)]
+    params: Option<PathBuf>,
+
+    /// `robotd`'s socket, which a pairing session quacks through. Best effort: a robot whose
+    /// `robotd` is down still pairs, silently.
+    #[arg(long, default_value = proto::socket::ROBOT)]
+    robotd_socket: PathBuf,
 }
 
 /// Who may change this robot's configuration.
@@ -173,6 +187,8 @@ fn resolve_gid(name: &str) -> Option<u32> {
 struct Service {
     net: Arc<dyn Net>,
     pads: Arc<dyn Pads>,
+    /// The one pairing session, shared by every caller. See `configd::pairing`.
+    pairing: Pairing,
     store: Store,
     policy: PeerPolicy,
     /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
@@ -250,7 +266,16 @@ async fn main() -> ExitCode {
     };
     tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
+    let board = SystemBoard {
+        params: args
+            .params
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(robotd_params::DEFAULT_PATH)),
+        params_explicit: args.params.is_some(),
+        robotd: args.robotd_socket.clone(),
+    };
     let service = Arc::new(Service {
+        pairing: Pairing::new(Arc::clone(&pads), Arc::new(board)),
         net,
         pads,
         store: Store::new(args.state_dir.join("config.json"), default_name),
@@ -545,6 +570,7 @@ async fn dispatch(
                 &proto::PadStatusResult {
                     pads,
                     driver: units::state(units::PADD).await,
+                    pairing: service.pairing.status(),
                 },
             ),
             Err(e) => {
@@ -552,11 +578,15 @@ async fn dispatch(
                 proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
             }
         },
-        proto::Call::PadPair(params) => {
-            let timeout = pad::pair_timeout(params.timeout_seconds);
-            tracing::info!(mac = ?params.mac, ?timeout, "pairing a gamepad");
-            reply(id, service.pads.pair(params.mac.as_deref(), timeout).await)
-        }
+        // Both answer at once, and the session runs after the reply: see `configd::pairing` for
+        // why, and for what a second press while one runs does.
+        proto::Call::PadPair(params) => proto::Response::ok(
+            Some(id),
+            &service
+                .pairing
+                .start(params.mac.clone(), params.timeout_seconds),
+        ),
+        proto::Call::PadReset => proto::Response::ok(Some(id), &service.pairing.reset()),
         proto::Call::PadForget(params) => reply(id, service.pads.forget(&params.mac).await),
 
         proto::Call::SystemReboot => {
