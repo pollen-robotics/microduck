@@ -278,6 +278,9 @@ fn permits(call: &proto::Call) -> bool {
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
         RobotSound(_) | RobotTheremin(_) | RobotChorale(_) => false,
+        // A held note re-sent every few hundred milliseconds is a stream, which is exactly what
+        // this radio is not for — and the keyboard it comes from is on a laptop, not a phone.
+        RobotNote(_) => false,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a

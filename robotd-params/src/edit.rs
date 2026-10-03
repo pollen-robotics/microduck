@@ -1073,6 +1073,7 @@ mod tests {
                 "duck_detector",
                 "chorale",
                 "theremin",
+                "midi",
                 "head_imu",
                 "audio",
                 "media",

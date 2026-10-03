@@ -90,6 +90,20 @@ const BUS_DROP_QUIET: Duration = Duration::from_secs(60);
 /// between them on a 20 ms tick twitches rather than sings. This is roughly how fast a jaw moves.
 const CHORALE_MOUTH_TAU_S: f64 = 0.09;
 
+/// How long the keyboard keeps the voice after the last `robot.note`, held key or not.
+///
+/// Opening the PCM is an `aplay` spawn, which is time between a key going down and the note — so
+/// between notes the instrument stays up, silent. `scripts/duck-midi` re-sends its state every
+/// 250 ms while it runs, so this only expires once the bridge has gone; then the quacks get the
+/// speaker back.
+const KEYS_IDLE: Duration = Duration::from_secs(10);
+
+/// How loud a keyboard note at full velocity is sung.
+///
+/// Above the chorale's per-voice level, which is set for four ducks summing in a room: a keyboard
+/// is one duck, and at that level it was a little quiet on its own.
+const KEYS_LEVEL: f64 = 0.8;
+
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
 /// Five seconds at 50 Hz. State is advisory: a client that cannot keep up gets a gap, never
@@ -643,6 +657,8 @@ struct RobotState {
     /// Whether this robot's config allows it to sing with others. Read once at startup, like the
     /// policies: `[chorale] accept`, false by default.
     chorale_accepted: bool,
+    /// Whether `[midi] enabled` lets this robot be played from a keyboard. Read once at startup.
+    keys_allowed: bool,
     /// `walk` or `roller`, as `robot.mode` reports it.
     ///
     /// Not constant any more: `robot.setMode` switches it while the robot runs, so this is stored
@@ -721,6 +737,7 @@ impl RobotState {
             theremin_ready: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
+            keys_allowed: params.midi.enabled,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
@@ -1967,6 +1984,13 @@ async fn control_loop<T: RobotIo>(
     // And how the head sways while singing, applied to the next tick's command.
     let mut chorale_head = [0.0f64; 4];
 
+    // The keyboard: `[midi] enabled`, and a voice to play it in. Its pitch is kept across ticks
+    // for the theremin's reason — a released key fades at the note that was played — and its mouth
+    // is slewed like the chorale's.
+    let keys_allowed = params.midi.enabled && params.audio.enabled;
+    let mut keys_hz = 0.0f64;
+    let mut keys_mouth = 0.0f64;
+
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
     let mut theremin_hz = 0.0f64;
@@ -3186,10 +3210,50 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // The keyboard: whatever note `robot.note` last held, sung in the chorale voice. After the
+        // theremin and the chorale, and yielding to both — they were asked for explicitly and are
+        // what the mouth is already doing, so a note arriving meanwhile is simply not sung.
+        let mut keys_up = false;
+        if keys_allowed {
+            let (note, age) = intents.note();
+            let busy = theremin_state.is_some() || chorale_state.is_some();
+            if busy || age >= KEYS_IDLE {
+                if let Some(voice) = voice.as_mut() {
+                    voice.keys_stop();
+                }
+                keys_mouth = 0.0;
+            } else {
+                keys_up = true;
+                // A quiet key opens the beak less: velocity is the one expressive thing a
+                // keyboard has, so it goes to the mouth as well as the level.
+                let (level, open) = match note {
+                    Some((midi, level)) => {
+                        keys_hz = sounds::chorale::midi_hz(f64::from(midi));
+                        (
+                            level * KEYS_LEVEL,
+                            sounds::chorale::Vowel::Ah.open() * (0.4 + 0.6 * level),
+                        )
+                    }
+                    None => (0.0, 0.0),
+                };
+                if let Some(voice) = voice.as_mut()
+                    && voice.keys_start()
+                {
+                    voice.keys_set(keys_hz, level, open);
+                }
+                let alpha = (period.as_secs_f64() / CHORALE_MOUTH_TAU_S).clamp(0.0, 1.0);
+                keys_mouth += (open - keys_mouth) * alpha;
+                if snapshot.enabled && bringup == Bringup::Ready {
+                    targets[duck_control::model::MOUTH_INDEX] =
+                        duck_control::model::mouth_target(keys_mouth);
+                }
+            }
+        }
+
         // The mouth is not part of any policy; the intent is the only thing that moves it.
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
-        if driving && theremin_state.is_none() && chorale_state.is_none() {
+        if driving && theremin_state.is_none() && chorale_state.is_none() && !keys_up {
             targets[duck_control::model::MOUTH_INDEX] =
                 duck_control::model::mouth_target(snapshot.mouth);
         }
@@ -3785,6 +3849,12 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
         // Same story for the wheee hold, which arrives per tick while the trigger is down.
         proto::Call::RobotSound(p) => {
             intents.request_sound(*p);
+            true
+        }
+        // And for a held key, re-sent while it is down. Gated here as `dispatch` gates the request,
+        // since a notification has nobody to refuse to.
+        proto::Call::RobotNote(p) if state.keys_allowed && state.has_voice => {
+            intents.set_note(p.note, p.level);
             true
         }
         _ => false,
@@ -4591,6 +4661,27 @@ fn dispatch(
                     accepted: true,
                     reason: None,
                 }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // A keyboard note, or silence. Refused for what this side can know — the switch, the
+        // voice — and never for circumstance: a theremin or chorale holding the voice is a reason
+        // the note goes unsung, decided on the tick, not a reason to tell the player no.
+        proto::Call::RobotNote(p) => {
+            let result = if !state.keys_allowed {
+                proto::IntentResult::refused(
+                    "this robot is not set up to be played — turn `[midi] enabled` on with \
+                     `robotctl configure`, which offers the robotd restart it needs",
+                )
+            } else if !state.has_voice {
+                proto::IntentResult::refused(
+                    "this robot has no voice: audio is disabled, or its bank is empty \
+                     (run `sounds ensure-bank`)",
+                )
+            } else {
+                intents.set_note(p.note, p.level);
+                proto::IntentResult::accepted()
             };
             proto::Response::ok(Some(id), &result)
         }
@@ -5859,6 +5950,60 @@ mod tests {
         assert!(accepted.accepted);
         assert_eq!(intents.take_sounds(), vec![proto::SoundTag::Chirp]);
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// The keyboard is off by default, and its refusal names the switch — "no" alone would send
+    /// somebody to debug their MIDI cable. Turned on, with a voice, a note reaches the intents
+    /// whether it arrives as a request or as the notification a held key is re-sent as.
+    #[test]
+    fn robot_note_is_refused_until_midi_is_enabled() {
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let note = proto::Call::RobotNote(proto::NoteParams {
+            note: Some(72),
+            level: 0.5,
+        });
+
+        let bank = std::env::temp_dir().join(format!("bank-keys-{}", std::process::id()));
+        std::fs::create_dir_all(bank.join("chirp")).unwrap();
+        std::fs::write(bank.join("chirp/chirp_a.wav"), b"RIFF").unwrap();
+        let mut params = Params::default();
+        params.audio.bank = bank.clone();
+
+        let off = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let refused: proto::IntentResult =
+            dispatch(&off, &intents, id(), &note).result_as().unwrap();
+        assert!(!refused.accepted);
+        assert!(refused.reason.unwrap().contains("[midi] enabled"));
+        assert!(
+            !apply_intent(&off, &intents, &note),
+            "nor as a notification"
+        );
+        assert_eq!(intents.note().0, None, "a refusal must not hold a note");
+
+        params.midi.enabled = true;
+        let on = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let accepted: proto::IntentResult =
+            dispatch(&on, &intents, id(), &note).result_as().unwrap();
+        assert!(accepted.accepted);
+        assert_eq!(intents.note().0, Some((72, 0.5)));
+        let release = proto::Call::RobotNote(proto::NoteParams {
+            note: None,
+            level: 1.0,
+        });
+        assert!(apply_intent(&on, &intents, &release));
+        assert_eq!(intents.note().0, None);
+        std::fs::remove_dir_all(&bank).ok();
     }
 
     /// A skill whose network was never configured is refused at the door with a reason —

@@ -907,7 +907,7 @@ arithmetic, it was that nothing read the answer.
 
 ### 4.5 What else the loop drives, and why none of it has a design page
 
-`robotd` grew four subsystems after slice 2 that are not control and not safety. They share a
+`robotd` grew five subsystems after slice 2 that are not control and not safety. They share a
 shape: each hangs off the tick, none may block it, and none can reach the bus except through the
 intents the loop already arbitrates.
 
@@ -916,6 +916,7 @@ intents the loop already arbitrates.
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
+| the keyboard | `robot.note` → the theremin's live writer in the chorale's voice; a held level that decays after a second, yielding to the theremin and the chorale | `method::ROBOT_NOTE`, and `scripts/duck-midi` for the client |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 
 Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not
@@ -925,11 +926,13 @@ behind `RobotIo`, because it has to keep answering when the motor bus does not.
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[the keyboard].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[the keyboard]: ../robot/cheatsheet.md#play-the-duck-from-a-midi-keyboard
 
 ## 5. Why it exists, and where it came from
 
