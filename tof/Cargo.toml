@@ -46,6 +46,12 @@ bmi088 = { git = "https://github.com/pollen-robotics/bmi088-rs", tag = "v0.1.2" 
 # `I2cdev`, the `embedded-hal` bus the driver is generic over. Linux-only by construction —
 # `i2cdev`'s `linux` module is the whole crate.
 linux-embedded-hal = "0.4"
+gpiocdev = { version = "0.8", default-features = false, features = ["uapi_v2"] }
+embedded-hal = "1.0"
+# Same filter and maths as bmi088-rs. Interrupt reads are validated before the filter is
+# advanced; Bmi088Ahrs::update_all would advance it before an overwritten read can be rejected.
+ahrs = { version = "0.8", features = ["std"] }
+nalgebra = "0.34.1"
 
 [build-dependencies]
 cc = "1"

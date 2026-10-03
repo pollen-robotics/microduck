@@ -423,7 +423,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 37;
+/// v38 adds optional head-IMU acquisition timing; existing t_ns retains read-completion semantics.
+pub const API_VERSION: u32 = 38;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4827,6 +4828,60 @@ pub struct HeadImuFrame {
     pub quat: [f32; 4],
     /// Chip temperature, °C.
     pub temp_c: f32,
+    /// Optional INT1 event/read timing. Polling frames omit it; event time is acc-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<HeadImuTiming>,
+}
+
+/// Kernel-observed acc INT1 event and host read window, on `HeadImuFrame::t_ns`'s
+/// `CLOCK_MONOTONIC` axis. Neither calibrated sampling-centre time nor gyro sample time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadImuTiming {
+    pub accel_data_ready_ns: u64,
+    /// Kernel GPIO line-event sequence number. A gap also reveals skipped/overwritten samples.
+    pub accel_event_seq: u32,
+    /// Host interval containing the sequential accelerometer and gyroscope I²C reads.
+    pub read_started_ns: u64,
+    pub read_finished_ns: u64,
+}
+
+#[cfg(test)]
+mod head_imu_timing_tests {
+    use super::*;
+
+    #[test]
+    fn old_head_imu_frames_have_no_invented_hardware_timestamp() {
+        let old = r#"{"seq":3,"at_us":10000,"t_ns":123456,"gyro":[0,0,0],"accel":[0,0,9.8],"quat":[1,0,0,0],"temp_c":24}"#;
+        let frame: HeadImuFrame = serde_json::from_str(old).unwrap();
+        assert_eq!(frame.t_ns, 123456);
+        assert!(frame.timing.is_none());
+        assert!(
+            !serde_json::to_value(frame)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("timing")
+        );
+    }
+
+    #[test]
+    fn interrupt_timing_round_trips_on_the_existing_notification_route() {
+        let frame = HeadImuFrame {
+            seq: 4,
+            t_ns: 123900,
+            timing: Some(HeadImuTiming {
+                accel_data_ready_ns: 123000,
+                accel_event_seq: 12,
+                read_started_ns: 123300,
+                read_finished_ns: 123800,
+            }),
+            ..Default::default()
+        };
+        let request = Request::notify_head_imu_frame(&frame);
+        let wire = serde_json::to_string(&request).unwrap();
+        let received: Request = serde_json::from_str(&wire).unwrap();
+        assert_eq!(received.as_head_imu_frame(), Some(frame));
+    }
 }
 
 /// See [`method::ROBOT_CHORALE`].
