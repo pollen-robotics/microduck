@@ -474,6 +474,28 @@ and says so.
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses
 `init`/`enable`/skills until it is stood up.
 
+### Picking the robot up
+
+A robot picked up mid-walk notices: about 0.2 s after it is lifted the legs settle into a standing
+stance and stay there, however you hold it — by the body or the head, upside down, spun round — and
+about 0.2 s after it is set down on its feet the policy takes it back. `[pickup] enabled = false`
+(`sudo robotctl configure`, then let it restart `robotd`) turns it off, and the legs keep walking in
+your hand until you press Start, as they used to.
+
+```
+journalctl -u robotd -f | grep -E 'picked up|put down|pickup'
+```
+
+`picked up — pausing the policy` and `put down — handing the robot back to the policy` are the two
+edges, each with the probability that crossed. While paused, `robotctl monitor` shows `PICKED UP`
+where it otherwise says `upright` (the policy reads `held`), and `robot.state` carries
+`safety.picked_up`. Only walking and standing are watched — a skill, a sit or a fall is never paused.
+
+**On by default.** The classifier was trained in simulation only; what would mean it is wrong is a
+pause while the robot is walking normally (the walk freezes for a moment, then resumes), or a robot
+that stays paused after being put down. `pause_threshold` and `resume_threshold` in the
+same section move the two edges; the design is [`robotd-design.md` §2.4.2](../design/robotd-design.md).
+
 ### Gamepad (`configd`)
 
 What each button *does* — and how to change it — is under **Policies and skills** above

@@ -398,7 +398,8 @@ cargo run -p xtask -- package \
     --include "docs/design/architecture.md=docs/architecture.md" \
     --include "docs/design/updater-design.md=docs/updater-design.md" \
     --include "deploy/README.md=docs/deploy.md" \
-    --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
+    --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx" \
+    --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx"
 
 
 echo "==> signing with $KEY"

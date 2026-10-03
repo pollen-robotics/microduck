@@ -1835,6 +1835,34 @@ mod tests {
         }
     }
 
+    /// The pick-up classifier ships inside the release like the petting one, for the same
+    /// reasons: small, a detector rather than a policy, versioned with the loop that feeds it —
+    /// its input is the loop's own feature layout, so a model from another release is the wrong
+    /// shape in the way no load check can see. A site that forgets it produces robots on which
+    /// `[pickup] enabled = true` logs "unavailable" once and the duck thrashes in the hand as
+    /// before.
+    #[test]
+    fn the_pickup_model_is_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("duck-control/models/pickup_detector.onnx")
+                .exists(),
+            "the vendored model is gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains(
+                    "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx"
+                ),
+                "{site} does not package the pick-up classifier"
+            );
+        }
+    }
+
     /// The duck detector left the release the way the policies did: it is seeded from the Hub
     /// by a script the release carries, and the model files themselves are no longer vendored.
     /// A site that still packages `models/duck_detect.*` would ship fourteen megabytes nothing

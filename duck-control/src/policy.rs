@@ -124,7 +124,7 @@ fn dylib_name() -> String {
 /// the probe passed, and `ort` panicked in `setup_api` on its own version check
 /// (`expected version >= '1.23.x', but got '1.20.1'`). The probe proves the file loads;
 /// nothing more. [`catching_ort_panics`] covers the rest, including panics we have not seen.
-fn ensure_runtime() -> Result<(), PolicyError> {
+pub(crate) fn ensure_runtime() -> Result<(), PolicyError> {
     static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
     let outcome = PROBE.get_or_init(|| {
         let name = dylib_name();
@@ -174,7 +174,9 @@ fn ensure_runtime() -> Result<(), PolicyError> {
 /// **`panic = "abort"` would defeat this.** The root `Cargo.toml` has no `[profile.release]`,
 /// so the default unwind strategy applies; adding one would silently turn this back into a
 /// dead control thread.
-fn catching_ort_panics<T>(work: impl FnOnce() -> Result<T, PolicyError>) -> Result<T, PolicyError> {
+pub(crate) fn catching_ort_panics<T>(
+    work: impl FnOnce() -> Result<T, PolicyError>,
+) -> Result<T, PolicyError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
         Err(PolicyError::RuntimePanic {
             detail: panic_message(payload),
@@ -536,7 +538,10 @@ fn shape_error(path: &Path, what: &'static str, expected: &str, got: String) -> 
 
 /// Require an exact rank and float32 type. Batch may be symbolic, but this runtime
 /// always supplies batch one; state layers and hidden width must be known at load.
-fn tensor_shape(path: &Path, outlet: &ort::value::Outlet) -> Result<Vec<i64>, PolicyError> {
+pub(crate) fn tensor_shape(
+    path: &Path,
+    outlet: &ort::value::Outlet,
+) -> Result<Vec<i64>, PolicyError> {
     match outlet.dtype() {
         ValueType::Tensor {
             ty: TensorElementType::Float32,

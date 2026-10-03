@@ -1072,6 +1072,7 @@ mod tests {
                 "safety",
                 "duck_detector",
                 "chorale",
+                "pickup",
                 "theremin",
                 "head_imu",
                 "audio",

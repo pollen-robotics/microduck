@@ -341,6 +341,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Sing with nearby ducks — off means silent AND invisible on the air",
     ),
+    // ── [pickup] ─────────────────────────────────────────────────────────────
+    feature(
+        "pickup.enabled",
+        Kind::Bool,
+        "Pause the policy while the robot is held, resume when put down",
+    ),
+    entry(
+        "pickup.model",
+        Kind::OptionalPath,
+        "Pick-up classifier; unset = the release's copy",
+    ),
+    entry(
+        "pickup.pause_threshold",
+        Kind::Float,
+        "Pause above this p(held), held for 100 ms",
+    ),
+    entry(
+        "pickup.resume_threshold",
+        Kind::Float,
+        "Resume below this p(held), held for 80 ms — higher resumes sooner after a put-down",
+    ),
     // ── [theremin] ───────────────────────────────────────────────────────────
     feature(
         "theremin.enabled",
@@ -693,6 +714,7 @@ mod tests {
                 "safety.limp_fall",
                 "duck_detector.enabled",
                 "chorale.accept",
+                "pickup.enabled",
                 "theremin.enabled",
                 "head_imu.enabled",
                 "audio.enabled",

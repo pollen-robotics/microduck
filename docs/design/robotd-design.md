@@ -577,6 +577,52 @@ The tuning is the feature, and it is asymmetric: a false positive is a fall the 
 *caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
 deliberately on the late side.
 
+#### 2.4.2 Being held is a fourth
+
+A policy has no idea its feet have left the floor. Picked up mid-walk, it keeps stepping, and the
+legs thrash in the hand until somebody presses Start — which is also the only way to get a robot
+that will hold still to be carried. `[pickup]` (on by default) notices instead: a small classifier,
+`duck_control::pickup`, reads the last second of what the loop already reads — gyro, projected
+gravity, joint positions and velocities, the target it commanded the tick before — and scores how
+likely it is that a hand is carrying the robot. Over 0.8 for 100 ms pauses the policy; under 0.35
+for 80 ms, once the pause is 300 ms old, hands it back.
+
+Paused is `driving` false (§1.4), like the limp-fall: the controller is not stepped, the targets
+come from the pause, and they reach the motors through `apply` with no exemption. The pause ramps
+from the policy's last target to a **pause pose** over 300 ms at the policy gain, and resuming is
+the ordinary rising edge of `driving`, so the controller is reset on the way back in. The pose is not
+home: home at walking gain is a balanced pose only for a policy that keeps balancing it, and in
+simulation a robot holding it on the floor tips past 40° within a second or two. The pause pose is
+the walking policy's own mean standing stance, which tips far more slowly and is the stance the
+policy expects to wake up in. That is also why resuming is the fast side of the band: a robot set
+down while paused is holding a fixed pose on the floor, and the sooner the policy has it back the
+less often it tips (in simulation, 3 % of set-downs at a 0.18 s median resume, 12 % at 0.30 s).
+
+It watches only the walking and standing networks in walk mode. A skill, a sit, the limp-fall, a
+disable or the shutdown sit owns the robot outright; any of them ends a pause and empties the
+window, and the next verdict waits for a full second of fresh history — the model was only shown
+complete windows, and one padded at startup paused a simulated robot a tenth of a second after
+boot. Roller mode is not watched at all: the model has never seen wheels.
+
+The model is trained entirely in simulation, in `microduck_rl` (`pickup/`, `scripts/pickup_*.py`):
+the deployed velstand walks, stands and falls under the training randomisation while a simulated
+hand — a mocap body welded softly to the trunk or the head — lifts, carries, holds it at any
+orientation including upside down, spins it, shakes it, sets it down and drops it. (The first
+model's hand only gripped the trunk and only passed through large tilts; on the robot it missed a
+duck lifted by the head and resumed when the duck was turned 180°.) The feature layout, the pause pose and the hysteresis timings
+are fixed there, which is why they are constants in `duck_control::pickup` and only the two
+thresholds are params: changing the rest here without retraining is the silent kind of wrong. The
+row carries servo current, but the shipped model drops it before its first layer — in simulation
+it separated held from standing far better than it does on a real robot. On the board the classifier
+costs a few tenths of a millisecond a tick (`cargo run --release -p duck-control --example
+pickup-bench` measures it there, next to a policy inference). The file ships in the release
+(`models/pickup_detector.onnx`), because its input is this loop's own layout and a model from
+another release is the wrong shape in a way no load check sees.
+
+Off means off: no model is opened and nothing is scored or recorded. A model that will not load is
+a warning rather than unhealthy, and a detector that errors mid-run lets go of any pause and starts
+over — it must never be what strands a robot paused.
+
 A spent pack is the other thing that moves the robot without being asked: with
 `safety.battery_empty_shutdown` (on by default), reaching the empty floor on the smoothed
 voltage sits the robot down and powers the board off. The EMA moves over ~10 s, so a load sag

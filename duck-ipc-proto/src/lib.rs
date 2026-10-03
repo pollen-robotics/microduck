@@ -3939,6 +3939,13 @@ pub struct SafetyState {
     /// requested gain when it decides the robot has fallen, and that override was invisible.
     #[serde(default)]
     pub gain: Option<u16>,
+    /// Somebody is holding the robot: the pick-up detector (`[pickup]`) has paused the policy
+    /// and the legs hold the pause pose until it is put back down. A state of the robot, like
+    /// `fallen`, rather than a policy — while it is true `policy` reads `held`.
+    ///
+    /// Absent from a `robotd` that predates the detector, which reads as never picked up.
+    #[serde(default)]
+    pub picked_up: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -6275,6 +6282,7 @@ mod tests {
                 limp: false,
                 gravity: [0.0, 0.0, -1.0],
                 gain: Some(200),
+                picked_up: false,
             },
             control_loop: LoopState {
                 hz: 49.8,

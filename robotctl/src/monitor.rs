@@ -449,6 +449,8 @@ fn stream_lines(mut client: Client, json: bool) -> Result<(), Failure> {
             state.control_loop.missed,
             if state.safety.fallen {
                 "FALLEN"
+            } else if state.safety.picked_up {
+                "PICKED"
             } else {
                 "ok    "
             },
@@ -3127,6 +3129,12 @@ fn fall_verdict(safety: &proto::SafetyState) -> Span<'static> {
             "FALLEN",
             Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
+    } else if safety.picked_up {
+        // Not an alarm: somebody has the robot in hand and the policy is paused for it.
+        Span::styled(
+            "PICKED UP",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled("upright", Style::new().fg(Color::Green))
     }
@@ -3805,6 +3813,33 @@ mod tests {
     /// What a row too narrow for everything gives up. The charge and the verdict are said
     /// whatever the width — the alternative is an alarm nobody knows fired — and it is the
     /// temperatures that go, all of them, rather than the row keeping the cooler of the two.
+    /// Being picked up is a state of the robot, shown where `upright` and `FALLEN` are — not a
+    /// policy name in the title — and a fall still outranks it.
+    #[test]
+    fn a_picked_up_robot_says_so_in_the_verdict() {
+        let mut safety = proto::SafetyState {
+            fallen: false,
+            limp: false,
+            gravity: [0.0, 0.0, -1.0],
+            gain: Some(200),
+            picked_up: true,
+        };
+        assert_eq!(fall_verdict(&safety).content, "PICKED UP");
+        safety.fallen = true;
+        assert_eq!(fall_verdict(&safety).content, "FALLEN");
+        safety.fallen = false;
+        safety.picked_up = false;
+        assert_eq!(fall_verdict(&safety).content, "upright");
+    }
+
+    /// A `robotd` from before the detector sends no `picked_up`; that is a robot nobody holds.
+    #[test]
+    fn a_frame_without_picked_up_reads_as_not_picked_up() {
+        let safety: proto::SafetyState =
+            serde_json::from_str(r#"{"fallen":false,"limp":false}"#).unwrap();
+        assert!(!safety.picked_up);
+    }
+
     #[test]
     fn a_narrow_row_keeps_the_charge_and_the_verdict_and_drops_the_trimmings() {
         let health = proto::HealthResult {
@@ -4831,6 +4866,7 @@ mod tests {
                 limp: false,
                 gravity: [0.0, 0.0, -1.0],
                 gain: Some(32),
+                picked_up: false,
             },
             control_loop: proto::LoopState {
                 hz: 50.0,

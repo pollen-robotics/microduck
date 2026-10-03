@@ -313,6 +313,30 @@ mode = "walk"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
 
+[pickup]
+# Pause the policy while somebody holds the robot, and resume it when the robot is put back
+# down — instead of the legs thrashing in the hand until somebody presses Start. A small
+# classifier reads the last second of what the loop already reads (gyro, gravity, joints,
+# what it commanded); paused, the robot ramps to the walking policy's own standing stance at
+# the policy gain, and the policy takes it back the moment it is on the floor.
+#
+# **On by default.** The model is trained in simulation only, and held up on the robot however it
+# was handled — by the body or the head, upside down, spun round. Off means nothing loaded and
+# nothing run. Only the walking and standing networks are watched — a skill, a sit or a
+# limp-fall is never paused. If it ever pauses a robot that is walking normally, this is the
+# switch.
+# enabled = true
+
+# The classifier. Ships in the release (models/pickup_detector.onnx); "none" disables it.
+# model = ".../current/models/pickup_detector.onnx"
+
+# The hysteresis on p(held): pause above pause_threshold for 100 ms, resume below
+# resume_threshold for 80 ms once the pause is 300 ms old. Resume is the quick side on purpose:
+# a paused robot set down on the floor is holding a fixed pose, and a fixed pose tips — the
+# sooner the policy has it back, the less often it does.
+# pause_threshold = 0.8
+# resume_threshold = 0.35
+
 [theremin]
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
 # opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this

@@ -70,6 +70,7 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
@@ -756,6 +757,50 @@ impl Default for ThereminParams {
             min_zones: hand.min_zones,
             statuses: hand.statuses,
             hold_ms: hand.hold.as_millis() as u64,
+        }
+    }
+}
+
+/// `[pickup]`: pause the policy while somebody holds the robot, resume when it is put down.
+///
+/// A classifier over the last second of what the loop already reads (`duck_control::pickup`,
+/// `docs/design/robotd-design.md` §2.4.2). **On by default** since the v2 model held up on the
+/// robot in every way it was handled (lifted by the body or the head, turned upside down, spun).
+/// Turned off, nothing is loaded and nothing runs — the loop is exactly what it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PickupParams {
+    /// Master switch.
+    pub enabled: bool,
+    /// The classifier. Absent means the release's copy; the literal `"none"` disables it.
+    pub model: Option<PathBuf>,
+    /// Pause once p(held) has stayed above this for 100 ms.
+    pub pause_threshold: f32,
+    /// Resume once p(held) has stayed below this for 80 ms (and the pause is 300 ms old).
+    /// Higher resumes sooner after a put-down — which is what keeps a paused robot, holding a
+    /// fixed pose, from tipping before the policy has it back — at the price of more false
+    /// resumes in the hand.
+    pub resume_threshold: f32,
+}
+
+impl Default for PickupParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: None,
+            pause_threshold: 0.8,
+            resume_threshold: 0.35,
+        }
+    }
+}
+
+impl PickupParams {
+    /// The classifier path, or `None` when disabled with the `"none"` sentinel.
+    pub fn model_resolved(&self) -> Option<PathBuf> {
+        match &self.model {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx")),
         }
     }
 }
@@ -2008,6 +2053,15 @@ pub enum ParamsError {
         min: f64,
         max: f64,
     },
+    #[error(
+        "{path}: pickup.resume_threshold ({resume}) must be below pickup.pause_threshold \
+         ({pause}), and both between 0 and 1 — they are a hysteresis band on a probability"
+    )]
+    Pickup {
+        path: String,
+        pause: f32,
+        resume: f32,
+    },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2109,6 +2163,15 @@ impl Params {
                     max,
                 });
             }
+        }
+        // An inverted band would pause and resume on the same probability, every tick.
+        let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
+        if !(0.0 < resume && resume < pause && pause < 1.0) {
+            return Err(ParamsError::Pickup {
+                path: path.display().to_string(),
+                pause,
+                resume,
+            });
         }
         Ok(())
     }
@@ -3140,6 +3203,43 @@ mod tests {
         assert_eq!(params.pad_drive.vy_min, -0.1);
     }
 
+    /// On by default, from the release's own copy of the model — a robot nobody configured stops
+    /// thrashing in the hand. `"none"` is the way to keep the switch on and load nothing.
+    #[test]
+    fn pickup_detection_ships_on_and_resolves_the_releases_model() {
+        let pickup = Params::default().pickup;
+        assert!(pickup.enabled);
+        assert_eq!(
+            pickup.model_resolved(),
+            Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx"))
+        );
+        let none = PickupParams {
+            model: Some(PathBuf::from("none")),
+            ..pickup
+        };
+        assert_eq!(none.model_resolved(), None);
+    }
+
+    /// The two thresholds are a hysteresis band. Inverted, the latch would pause and resume on
+    /// the same probability — refused, so `robotctl configure` cannot write it.
+    #[test]
+    fn an_inverted_pickup_band_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[pickup]\npause_threshold = 0.3\nresume_threshold = 0.5\n",
+        );
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("pickup.resume_threshold"), "{error}");
+        let path = write(dir.path(), "[pickup]\npause_threshold = 1.0\n");
+        assert!(Params::load(&path, true).is_err());
+        let path = write(
+            dir.path(),
+            "[pickup]\nenabled = true\nresume_threshold = 0.5\n",
+        );
+        assert!(Params::load(&path, true).unwrap().pickup.enabled);
+    }
+
     /// Each side of centre scales onto its own bound.
     #[test]
     fn pad_drive_scales_each_direction_onto_its_own_bound() {
@@ -3202,6 +3302,7 @@ mod tests {
         );
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
         assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
+        assert_eq!(from_file.pickup, built_in.pickup);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
             built_in.safety.battery_empty_shutdown

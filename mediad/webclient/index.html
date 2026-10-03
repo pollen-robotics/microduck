@@ -1423,7 +1423,7 @@ function onState(state) {
   $("t-loop").textContent = `${(loop.hz || 0).toFixed(1)} Hz · ${loop.missed || 0} missed`;
 
   const safety = state.safety || {};
-  const flags = [safety.fallen ? "fallen" : null, safety.limp ? "limp" : null].filter(Boolean);
+  const flags = [safety.fallen ? "fallen" : null, safety.picked_up ? "picked up" : null, safety.limp ? "limp" : null].filter(Boolean);
   $("t-safety").textContent = flags.length ? flags.join(" · ") : "upright";
   $("t-safety").className = flags.length ? "bad" : "";
 
