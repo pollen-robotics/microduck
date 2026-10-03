@@ -64,6 +64,9 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // A keyboard on the laptop, played through the duck: the same kind of thing as the
+        // theremin, and the reason it exists is a client on this transport (`scripts/duck-midi`).
+        RobotNote(_) => true,
 
         // The chorale is between robots, over BLE — a browser is neither in the room nor a duck.
         // Its daemon-to-daemon plumbing has even less business on a WebRTC channel.

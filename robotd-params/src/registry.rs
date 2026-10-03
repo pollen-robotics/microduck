@@ -373,6 +373,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
     ),
+    // ── [midi] ───────────────────────────────────────────────────────────────
+    feature(
+        "midi.enabled",
+        Kind::Bool,
+        "Be played as a keyboard instrument — off by default (robot.note, scripts/duck-midi)",
+    ),
     // ── [head_imu] ───────────────────────────────────────────────────────────
     feature(
         "head_imu.enabled",
@@ -694,6 +700,7 @@ mod tests {
                 "duck_detector.enabled",
                 "chorale.accept",
                 "theremin.enabled",
+                "midi.enabled",
                 "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",

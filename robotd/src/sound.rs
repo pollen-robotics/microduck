@@ -101,6 +101,9 @@ enum Ride {
     /// The chorale holds the PCM: a writer thread is rendering one part of a score at whatever
     /// position the loop last published.
     Singing,
+    /// A keyboard holds the PCM: the theremin's live writer, in the chorale's voice, playing
+    /// whatever note `robot.note` last asked for.
+    Keys,
 }
 
 /// The theremin's parameters, as the control loop hands them to the writer thread.
@@ -336,47 +339,73 @@ impl Sound {
             }
             return false;
         };
-        self.stop_child();
-
-        // A short ALSA buffer for the same reason as the short lead: this is an instrument,
-        // and every millisecond queued here is a millisecond between the hand and the note.
-        let child = Command::new("aplay")
-            .args([
-                "-q",
-                "-D",
-                &self.device,
-                "-t",
-                "raw",
-                "-f",
-                "S16_LE",
-                "-c",
-                "1",
-            ])
-            .args(["-r", &sounds::SR.to_string()])
-            .args(["--buffer-time=40000", "--period-time=10000"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let Ok(mut child) = child else {
-            tracing::debug!("aplay failed; no theremin");
-            return false;
-        };
-        let Some(mut stdin) = child.stdin.take() else {
-            return false;
-        };
-        self.child = Some(child);
-        self.ride = Ride::Theremin;
-
-        let live = Arc::new(Live::new());
-        self.live = Some(live.clone());
         // The variant is fixed rather than picked per performance: an instrument that
         // re-rolled its own wobble rate every time it was picked up would be a different
         // instrument every time, which is the one kind of variety a duck does not want.
-        let mut stream = Stream::wheee(&personality, 0);
+        if !self.start_live(Ride::Theremin, Stream::wheee(&personality, 0), "theremin") {
+            return false;
+        }
+        tracing::warn!(
+            seed = personality.seed,
+            "theremin: the PCM is an instrument"
+        );
+        true
+    }
+
+    /// Take the PCM to be played from a keyboard, in this duck's chorale voice.
+    ///
+    /// The theremin's writer with the chorale's voice in it: a live instrument is the same
+    /// mechanism whatever is playing it, and what a keyboard player wants to hear is the duck that
+    /// sings in the chorale, not the one that rides the wheee. Idempotent, like the theremin.
+    pub fn keys_start(&mut self) -> bool {
+        if self.ride == Ride::Keys && self.live.is_some() {
+            return true;
+        }
+        let Some(personality) = self.voice() else {
+            if !self.warned_missing {
+                self.warned_missing = true;
+                tracing::warn!(
+                    bank = %self.bank.display(),
+                    "no voice seed — this robot cannot be played (run `sounds ensure-bank`)"
+                );
+            }
+            return false;
+        };
+        // The soprano's variant: a keyboard is a melody, and the melody is the soprano's line.
+        let mut voice = Stream::choral(&personality, sounds::chorale::Part::Soprano as u32);
+        voice.set_speaker_rolloff(Some(SPEAKER_ROLLOFF_HZ));
+        if !self.start_live(Ride::Keys, voice, "keys") {
+            return false;
+        }
+        tracing::warn!(seed = personality.seed, "keys: the PCM is an instrument");
+        true
+    }
+
+    /// Put the keyboard down: fade, then let the PCM go. Idempotent.
+    pub fn keys_stop(&mut self) {
+        if self.ride != Ride::Keys {
+            return;
+        }
+        if let Some(live) = self.live.take() {
+            live.playing.store(false, Ordering::Relaxed);
+        }
+        self.ride = Ride::Landing;
+    }
+
+    /// Open the PCM and start a writer rendering `stream` from whatever [`Live`] parameters the
+    /// loop last stored — the theremin's arrangement, and now the keyboard's.
+    fn start_live(&mut self, ride: Ride, mut stream: Stream, name: &str) -> bool {
+        self.stop_child();
+        let Some(mut stdin) = self.open_synth_pcm() else {
+            return false;
+        };
+        self.ride = ride;
+
+        let live = Arc::new(Live::new());
+        self.live = Some(live.clone());
 
         let spawned = std::thread::Builder::new()
-            .name("theremin".into())
+            .name(name.into())
             .spawn(move || {
                 use std::io::Write;
                 block_sigpipe();
@@ -418,14 +447,11 @@ impl Sound {
                 }
             });
         if spawned.is_err() {
-            tracing::warn!("cannot spawn the theremin writer");
+            tracing::warn!(name, "cannot spawn the instrument writer");
+            self.live = None;
             self.stop_child();
             return false;
         }
-        tracing::warn!(
-            seed = personality.seed,
-            "theremin: the PCM is an instrument"
-        );
         true
     }
 
@@ -616,6 +642,11 @@ impl Sound {
         }
     }
 
+    /// What the keyboard should be sounding — [`Self::theremin_set`], under its own name.
+    pub fn keys_set(&self, hz: f64, level: f64, open: f64) {
+        self.theremin_set(hz, level, open);
+    }
+
     /// Put the instrument down: fade the note out, then let the PCM go.
     ///
     /// The writer owns the fade, so this returns at once and the child is reaped on a later
@@ -676,7 +707,7 @@ impl Sound {
         // the pad), and a ride restarting under a theremin would be an instrument that
         // stops whenever the player touches anything. The instrument keeps the PCM until
         // the loop takes it away; the trigger is simply inaudible while it does.
-        if matches!(self.ride, Ride::Theremin | Ride::Singing) {
+        if matches!(self.ride, Ride::Theremin | Ride::Singing | Ride::Keys) {
             return;
         }
         match hold {

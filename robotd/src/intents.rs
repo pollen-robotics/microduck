@@ -118,6 +118,15 @@ const SKILL_BITS: usize = 2;
 /// holding — or stopped existing. The stale hold lands the ride instead of looping forever.
 pub const WHEEE_HOLD_FRESH: Duration = Duration::from_millis(300);
 
+/// How fresh a `robot.note` must be to keep sounding. `scripts/duck-midi` re-sends a held key
+/// every 250 ms, so this is a few missed resends — and the longest a dead client's note rings on.
+pub const NOTE_FRESH: Duration = Duration::from_millis(1000);
+
+/// A note that is still being held: the client said it, and said it recently enough.
+fn held_note(note: Option<(u8, f64)>, age: Duration) -> Option<(u8, f64)> {
+    note.filter(|_| age < NOTE_FRESH)
+}
+
 /// What the wheee level says, as the loop consumes it. Three states rather than a bool
 /// because the two ways of *not* being held are different sounds: a client that spells out
 /// `hold: false` wants the ride cut where it stands (the prototype's release), while a hold
@@ -198,6 +207,9 @@ pub struct Intents {
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
     /// and the loop reads value + age so a dead client's ride decays instead of looping.
     wheee: ArcSwap<Stamped<bool>>,
+    /// The keyboard note, as a stamped level: `(midi, level)`, or `None` for a client that is
+    /// there and silent. Stamped like the wheee, so a client that stops re-sending releases it.
+    note: ArcSwap<Stamped<Option<(u8, f64)>>>,
     /// `robot.rebootMotors`, pending: the ids to reboot (empty = all). A mutex rather than an
     /// atomic because it carries a list; the loop takes it with `try_lock`, so it can never wait.
     reboot_motors: Mutex<Option<Vec<u8>>>,
@@ -288,6 +300,10 @@ impl Intents {
             reboot_motors: Mutex::new(None),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
+                at_us: 0,
+            }),
+            note: ArcSwap::from_pointee(Stamped {
+                value: None,
                 at_us: 0,
             }),
         }
@@ -405,6 +421,29 @@ impl Intents {
         } else {
             WheeeHold::Decayed
         }
+    }
+
+    /// A `robot.note`: the note to sing, or `None` for silence.
+    pub fn set_note(&self, note: Option<u8>, level: f64) {
+        self.note.store(Arc::new(Stamped {
+            value: note.map(|midi| (midi, level.clamp(0.0, 1.0))),
+            // Never zero, which is the "never played" stamp.
+            at_us: self.now_us().max(1),
+        }));
+    }
+
+    /// The keyboard as the loop consumes it: the note to sing now, if one is held and fresh, and
+    /// how long since a client last said anything at all — which is what decides whether the
+    /// instrument stays up between notes.
+    pub fn note(&self) -> (Option<(u8, f64)>, Duration) {
+        let stamp = self.note.load();
+        // Never played reads as forever ago, not as "since boot" — or the first seconds after a
+        // start would look like a keyboard that has just gone quiet, and take the voice for it.
+        if stamp.at_us == 0 {
+            return (None, Duration::MAX);
+        }
+        let age = Duration::from_micros(self.now_us().saturating_sub(stamp.at_us));
+        (held_note(stamp.value, age), age)
     }
 
     /// Ask for a drive-mode switch, by the code the caller and the loop agree on.
@@ -623,6 +662,25 @@ mod tests {
             hold: Some(false),
         });
         assert_eq!(intents.wheee_hold(), WheeeHold::Released);
+    }
+
+    /// A held key sounds, a released one does not, and one whose client stopped re-sending
+    /// releases on its own — a bridge that dies mid-note must not leave the duck singing.
+    #[test]
+    fn a_note_is_held_only_while_it_keeps_arriving() {
+        let intents = Intents::new();
+        assert_eq!(intents.note().0, None, "nothing has ever been played");
+
+        intents.set_note(Some(72), 1.4);
+        assert_eq!(intents.note().0, Some((72, 1.0)), "level is clamped");
+        intents.set_note(None, 1.0);
+        assert_eq!(intents.note().0, None);
+
+        assert_eq!(
+            held_note(Some((72, 0.5)), Duration::from_millis(250)),
+            Some((72, 0.5))
+        );
+        assert_eq!(held_note(Some((72, 0.5)), NOTE_FRESH), None);
     }
 
     /// Before any client has spoken, the twist must already look stale. A robot that comes

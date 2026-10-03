@@ -252,6 +252,11 @@ roulade = "$POLICIES/roulade.onnx"
 [chorale]
 accept = true
 
+# The same for being played from a keyboard: scripts/duck-midi at the console port's signalling
+# server (8443 + the duck's index) plays this duck through the laptop's speakers.
+[midi]
+enabled = true
+
 [audio]
 bank = "$STATE/sounds/DUCK"
 # plughw:aic3104 is the board's codec, and robotd passes it to aplay with -D, so on anything that is

@@ -421,6 +421,15 @@ mode = "walk"
 # Needs [audio] on, since a duck with no voice has nothing to sing with.
 # accept = false
 
+[midi]
+# The duck as a keyboard instrument: `robot.note` sings one note at a time in the duck's chorale
+# voice, and the mouth opens with it. `scripts/duck-midi` on a laptop turns a MIDI keyboard into
+# those calls, over the WebRTC control channel.
+#
+# **Off by default**, like the theremin: it holds the voice while it is being played and it moves
+# the mouth, so a duck nobody set up to be played refuses to be. Needs [audio] on.
+# enabled = false
+
 [media]
 # What mediad streams: the camera, and at what quality. Read by mediad at startup, so a change
 # here needs `systemctl restart mediad` — not robotd. `robotctl configure` offers the right one.

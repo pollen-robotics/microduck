@@ -738,6 +738,33 @@ Note that `robotctl monitor`'s ToF grid is stricter than the theremin — it mar
 outside 5/9 as `x`, *could not measure*. A grid full of `x` does not mean the sensor is
 broken; it means it is being pessimistic about numbers it does have.
 
+### Play the duck from a MIDI keyboard
+
+On a laptop on the duck's network, with the keyboard plugged in over USB:
+
+```
+scripts/duck-midi --list                          # which MIDI inputs the laptop sees
+scripts/duck-midi <duck>                          # its hostname or address — `duckctl ip` finds it
+scripts/duck-midi <duck> --midi Keystation --lowest 60 --transpose 12
+```
+
+The duck sings the keys you play in its chorale voice, at the pitch you pressed, and the beak
+opens with each note — wider the harder you hit the key. While a note sounds the head sways the
+way it does in the chorale, lifting on the high notes of whatever you are playing; between notes it
+waits, breathing and now and then cocking its head as if listening for the next one. That stops
+when the script does — a duck nobody is playing stays still. One note at a time: holding a chord sings
+the newest key, and letting it go falls back to one still held. `--lowest` leaves the keys below it
+alone; `--transpose` shifts everything by semitones. Ctrl-C stops it.
+
+**Off by default** — `[midi] enabled` in `robotd.toml`, set with `robotctl configure`, which offers
+the `robotd` restart. Until then the script prints the duck's refusal, which names the key.
+
+It goes over WebRTC on the local network, like the console, so the console cannot connect while it
+runs. It needs `uv` — the script installs its own dependencies on first run (`aiortc`, `mido`,
+`python-rtmidi`). A note the duck stops hearing about is released after a second, so killing the
+script or closing the laptop never leaves it holding one pitch. While the theremin or a chorale is
+running, notes are not sung.
+
 ### The ToF sensor (`tofd`)
 
 An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:

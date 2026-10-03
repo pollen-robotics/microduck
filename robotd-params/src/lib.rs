@@ -70,6 +70,7 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub midi: MidiParams,
     pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
@@ -771,6 +772,20 @@ impl ThereminParams {
             hold: std::time::Duration::from_millis(self.hold_ms),
         }
     }
+}
+
+/// `[midi]` — the duck as a keyboard instrument: `robot.note` sings one note at a time in its
+/// chorale voice, and `scripts/duck-midi` is what plays it from a MIDI keyboard on a laptop.
+///
+/// **Off by default, for the theremin's reason.** It is a party trick, it takes the voice for as
+/// long as a client keeps it up, and it moves the mouth — a duck nobody set up to be played should
+/// refuse to be, rather than start singing because something on the network asked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MidiParams {
+    /// Whether `robot.note` may sing at all. `false` — and derived rather than written out, so the
+    /// default cannot be changed by editing one word.
+    pub enabled: bool,
 }
 
 /// `[head_imu]` — the BMI088 on the head module, read by `tofd` and served as

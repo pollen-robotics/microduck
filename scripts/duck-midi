@@ -1,0 +1,409 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["aiortc>=1.9", "aiohttp", "mido", "python-rtmidi"]
+# ///
+"""Play a duck from a MIDI keyboard: the keys you press, the duck sings.
+
+    scripts/duck-midi --list                  # which MIDI inputs this laptop has
+    scripts/duck-midi olducky.local           # the first input, played through that duck
+    scripts/duck-midi 192.168.1.42 --midi "Keystation" --lowest 60
+
+The duck has to have opted in first — `[midi] enabled` in `robotctl configure`, off by default —
+and the refusal says so if it has not.
+
+**Monophonic, last note wins.** A duck has one voice, so holding a chord sings its newest key, and
+letting that go falls back to whichever key is still down — the way a monophonic synth plays,
+which keeps legato lines singing rather than dropping out between notes. Velocity is the level and
+how far the beak opens.
+
+**The note is a level that has to keep arriving.** A held key is re-sent every
+[`HEARTBEAT_S`], and the robot releases a note it has not heard about for a second — so killing
+this script, or the laptop going to sleep, never leaves a duck holding one pitch forever. Changes go
+as requests, so a refusal comes back with its reason; the re-sends are notifications.
+
+**Over WebRTC, on the duck's own network** — its signalling server at `ws://<duck>:8443`, the same
+`control` channel the console uses, and no account or relay. The camera comes along whether it is
+wanted or not: `webrtcsink` ends a session whose consumer answers its video `inactive` ("consumer
+refused media 0"), so the frames are received and dropped, which costs this laptop a decoder's
+worth of CPU. Taking the robot's session means its console cannot connect while this runs.
+
+The signalling client is `spaces/policy-playground/lan.py` from 2e8f1cc, cut down to what a
+keyboard needs; that commit has the loopback self-check that verified it against the protocol.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import itertools
+import json
+import logging
+import sys
+from typing import Any
+
+import aiohttp
+import mido
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.sdp import candidate_from_sdp
+
+logger = logging.getLogger("duck-midi")
+
+# What `mediad --port` defaults to, which is `webrtcsink`'s own signaller's default.
+SIGNALLING_PORT = 8443
+# What `mediad` calls the channel it opens on every consumer's peer connection.
+CONTROL_LABEL = "control"
+# How often a held key is re-sent. Robot-side the note goes stale after a second
+# (`robotd::intents::NOTE_FRESH`), so this is four chances.
+HEARTBEAT_S = 0.25
+
+
+def _patch_aiortc_dtls_ciphers() -> None:
+    """Let aiortc agree a cipher with the GStreamer `webrtcsink` a duck runs.
+
+    Without it aiortc and `webrtcsink` share no cipher, DTLS never completes, and the connection
+    hangs in `connecting` — which looks exactly like a network problem and is not one. Upstream is
+    aiortc PR #1392; copied from `reachy_mini.media.central_consumer`, flag name and all, so a
+    process that has both patches once.
+    """
+    from aiortc.rtcdtlstransport import RTCCertificate
+
+    if getattr(RTCCertificate, "_reachy_cipher_patched", False):
+        return
+    original = RTCCertificate._create_ssl_context
+    ciphers = (
+        b"ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:"
+        b"ECDHE-ECDSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA:"
+        b"ECDHE-RSA-AES128-GCM-SHA256"
+    )
+
+    def patched(self: Any, srtp_profiles: Any) -> Any:
+        context = original(self, srtp_profiles)
+        try:
+            context.set_cipher_list(ciphers)
+        except Exception as e:  # noqa: BLE001 - DTLS failing later says it better
+            logger.warning("dtls: set_cipher_list refused the list: %r", e)
+        return context
+
+    RTCCertificate._create_ssl_context = patched
+    RTCCertificate._reachy_cipher_patched = True
+
+
+_patch_aiortc_dtls_ciphers()
+
+
+class Duck:
+    """One WebRTC session with one duck on this network, for its control channel only."""
+
+    def __init__(self, host: str, port: int):
+        self.url = f"ws://{host}:{port}"
+        self.opened = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.error: str | None = None
+        self.meta: dict[str, Any] = {}
+        self._ids = itertools.count(1)
+        self._pending: dict[int, str] = {}
+        self._http: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._pc: RTCPeerConnection | None = None
+        self._channel: Any = None
+        self._session_id: str | None = None
+        self._remote_set = False
+        self._early_ice: list[dict[str, Any]] = []
+        self._pump_task: asyncio.Task[None] | None = None
+        # A refusal is printed once per reason, not once per key.
+        self._told: set[str] = set()
+
+    async def connect(self) -> None:
+        self._http = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, sock_connect=8)
+        )
+        try:
+            self._ws = await self._http.ws_connect(self.url, heartbeat=20)
+        except Exception:
+            await self._http.close()
+            raise
+        self._pump_task = asyncio.create_task(self._pump())
+
+    async def close(self) -> None:
+        if self._pump_task is not None:
+            self._pump_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._pump_task
+        if self._session_id and self._ws is not None and not self._ws.closed:
+            with contextlib.suppress(Exception):
+                await self._ws.send_json({"type": "endSession", "sessionId": self._session_id})
+        for closer in (self._pc, self._ws, self._http):
+            if closer is not None:
+                with contextlib.suppress(Exception):
+                    await closer.close()
+
+    # ── the robot API ────────────────────────────────────────────────────────
+
+    def note(self, midi: int | None, level: float, *, answered: bool) -> None:
+        """Say which note to sing now. `answered` for a change, so a refusal comes back."""
+        if self._channel is None or self._channel.readyState != "open":
+            return
+        message: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "method": "robot.note",
+            "params": {"note": midi, "level": round(level, 3)},
+        }
+        if answered:
+            message["id"] = next(self._ids)
+            self._pending[message["id"]] = "robot.note"
+        self._channel.send(json.dumps(message))
+
+    def _on_control(self, text: str) -> None:
+        try:
+            message = json.loads(text)
+        except ValueError:
+            return
+        if message.get("id") not in self._pending:
+            return  # a notification, or somebody else's reply
+        method = self._pending.pop(message["id"])
+        if "error" in message:
+            # `-32601` here is a duck from before `robot.note` existed, and the fix is updating it.
+            self._tell(f"{method}: {message['error'].get('message', message['error'])}")
+            return
+        result = message.get("result") or {}
+        if result.get("accepted") is False:
+            self._tell(f"the duck said no: {result.get('reason') or 'no reason given'}")
+
+    def _tell(self, line: str) -> None:
+        if line not in self._told:
+            self._told.add(line)
+            print(line, file=sys.stderr)
+
+    # ── signalling: the gst envelopes `webrtcsink`'s server speaks ──────────
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        assert self._ws is not None
+        await self._ws.send_json(message)
+
+    async def _pump(self) -> None:
+        assert self._ws is not None
+        try:
+            async for raw in self._ws:
+                if raw.type is aiohttp.WSMsgType.TEXT:
+                    await self._handle(json.loads(raw.data))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - reported, then the session is over
+            self.error = f"{type(e).__name__}: {e}"
+        self.error = self.error or "the duck closed the signalling socket"
+        self.closed.set()
+
+    async def _handle(self, message: dict[str, Any]) -> None:
+        kind = message.get("type")
+        logger.debug("← %s", json.dumps(message)[:200])
+        if kind == "welcome":
+            await self._send({"type": "list"})
+        elif kind == "list":
+            producers = message.get("producers") or []
+            if not producers:
+                self.error = "the duck's signalling server has no producer — is mediad's pipeline up?"
+                self.closed.set()
+                return
+            self.meta = producers[0].get("meta") or {}
+            # The producer offers and we answer: `webrtcsink` is the side that knows what it sends.
+            await self._send({"type": "startSession", "peerId": producers[0].get("id")})
+        elif kind == "sessionStarted":
+            self._session_id = message.get("sessionId")
+            self._build_pc()
+        elif kind == "peer":
+            if message.get("sdp"):
+                await self._on_offer(message["sdp"])
+            elif message.get("ice"):
+                if self._remote_set:
+                    await self._add_ice(message["ice"])
+                else:
+                    self._early_ice.append(message["ice"])
+        elif kind == "endSession":
+            self.error = "the duck ended the session"
+            self.closed.set()
+        elif kind == "error":
+            self.error = str(message.get("details") or "the signalling server refused something")
+            self.closed.set()
+
+    def _build_pc(self) -> None:
+        # No ICE servers: both ends are on one network, and host candidates pair immediately.
+        pc = RTCPeerConnection()
+        self._pc = pc
+
+        @pc.on("connectionstatechange")
+        async def on_state() -> None:
+            logger.info("peer connection: %s", pc.connectionState)
+            if pc.connectionState in ("failed", "closed"):
+                self.error = self.error or f"the peer connection {pc.connectionState}"
+                self.closed.set()
+
+        @pc.on("track")
+        def on_track(track: Any) -> None:
+            # Not wanted, and cannot be declined (see the module docs). Drained, so aiortc's queue
+            # of decoded frames does not grow for as long as this runs.
+            async def drain() -> None:
+                with contextlib.suppress(Exception):
+                    while True:
+                        await track.recv()
+
+            asyncio.ensure_future(drain())
+
+        @pc.on("datachannel")
+        def on_datachannel(channel: Any) -> None:
+            if channel.label != CONTROL_LABEL:
+                return
+            self._channel = channel
+            channel.on("message")(self._on_control)
+            channel.on("close")(lambda: self.closed.set())
+            if channel.readyState == "open":
+                self.opened.set()
+            channel.on("open")(lambda: self.opened.set())
+
+    async def _on_offer(self, sdp: dict[str, Any]) -> None:
+        if self._pc is None or sdp.get("type") != "offer":
+            return
+        await self._pc.setRemoteDescription(RTCSessionDescription(sdp=sdp["sdp"], type="offer"))
+        self._remote_set = True
+        for ice in self._early_ice:
+            await self._add_ice(ice)
+        self._early_ice = []
+        await self._pc.setLocalDescription(await self._pc.createAnswer())
+        # aiortc has gathered by the time that returns, so the answer carries every candidate.
+        await self._send(
+            {
+                "type": "peer",
+                "sessionId": self._session_id,
+                "sdp": {"type": "answer", "sdp": self._pc.localDescription.sdp},
+            }
+        )
+
+    async def _add_ice(self, ice: dict[str, Any]) -> None:
+        text = (ice.get("candidate") or "").strip()
+        if not text or self._pc is None:
+            return
+        try:
+            candidate = candidate_from_sdp(text.removeprefix("candidate:"))
+            candidate.sdpMid = ice.get("sdpMid")
+            if ice.get("sdpMLineIndex") is not None:
+                candidate.sdpMLineIndex = int(ice["sdpMLineIndex"])
+            await self._pc.addIceCandidate(candidate)
+        except Exception as e:  # noqa: BLE001 - one bad candidate is not a dead session
+            logger.debug("addIceCandidate failed: %r", e)
+
+
+class Keys:
+    """The keys held down, newest last — which is all monophonic last-note priority needs."""
+
+    def __init__(self) -> None:
+        self.held: list[tuple[int, float]] = []
+
+    def press(self, note: int, level: float) -> None:
+        self.release(note)
+        self.held.append((note, level))
+
+    def release(self, note: int) -> None:
+        self.held = [(n, v) for n, v in self.held if n != note]
+
+    def sounding(self) -> tuple[int, float] | None:
+        return self.held[-1] if self.held else None
+
+
+def pick_input(wanted: str | None) -> str:
+    names = mido.get_input_names()
+    if not names:
+        sys.exit("no MIDI inputs — is the keyboard plugged in? (`--list` shows what is seen)")
+    if wanted is None:
+        # A Linux ALSA sequencer lists its own "Midi Through" first, which never has a key on it.
+        real = [n for n in names if "through" not in n.lower()]
+        return (real or names)[0]
+    matches = [n for n in names if wanted.lower() in n.lower()]
+    if not matches:
+        sys.exit(f"no MIDI input matches {wanted!r}; there are: {', '.join(names)}")
+    return matches[0]
+
+
+async def play(args: argparse.Namespace) -> None:
+    loop = asyncio.get_running_loop()
+    events: asyncio.Queue[mido.Message] = asyncio.Queue()
+    name = pick_input(args.midi)
+    # rtmidi calls back on its own thread; the loop owns the keys and the channel.
+    port = mido.open_input(name, callback=lambda m: loop.call_soon_threadsafe(events.put_nowait, m))
+    print(f"keyboard: {name}")
+
+    duck = Duck(args.host, args.port)
+    try:
+        await duck.connect()
+    except Exception as e:  # noqa: BLE001 - a wrong address is the commonest failure, say it plainly
+        port.close()
+        sys.exit(f"no answer from {duck.url}: {e}")
+    try:
+        opened = asyncio.create_task(duck.opened.wait())
+        closed = asyncio.create_task(duck.closed.wait())
+        await asyncio.wait({opened, closed}, timeout=20, return_when=asyncio.FIRST_COMPLETED)
+        if not duck.opened.is_set():
+            sys.exit(f"no control channel: {duck.error or 'timed out negotiating'}")
+        print(f"duck: {duck.meta.get('name') or args.host} — play (ctrl-c to stop)")
+
+        keys = Keys()
+        sent: tuple[int, float] | None = None
+        while not duck.closed.is_set():
+            try:
+                message = await asyncio.wait_for(events.get(), timeout=HEARTBEAT_S)
+            except asyncio.TimeoutError:
+                message = None
+            if message is not None and message.type in ("note_on", "note_off"):
+                note = message.note + args.transpose
+                if message.note < args.lowest or not 0 <= note <= 127:
+                    continue
+                if message.type == "note_on" and message.velocity > 0:
+                    keys.press(note, message.velocity / 127)
+                else:
+                    keys.release(note)
+            now = keys.sounding()
+            if now != sent:
+                duck.note(*(now or (None, 1.0)), answered=True)
+                sent = now
+            elif message is None:
+                # Nothing happened for a heartbeat: say it again, so a held note stays held and
+                # the instrument stays up between notes.
+                duck.note(*(now or (None, 1.0)), answered=False)
+        print(f"session over: {duck.error}", file=sys.stderr)
+    finally:
+        duck.note(None, 1.0, answered=False)
+        await asyncio.sleep(0.05)  # let the release leave before the channel goes
+        port.close()
+        await duck.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("host", nargs="?", help="the duck: its hostname or address on this network")
+    parser.add_argument("--list", action="store_true", help="list MIDI inputs and exit")
+    parser.add_argument("--midi", help="MIDI input to use, by any part of its name")
+    parser.add_argument("--port", type=int, default=SIGNALLING_PORT, help="signalling port")
+    parser.add_argument(
+        "--lowest", type=int, default=0, metavar="NOTE",
+        help="ignore keys below this MIDI note (60 = middle C), to keep the bass end for yourself",
+    )
+    parser.add_argument(
+        "--transpose", type=int, default=0, metavar="SEMITONES",
+        help="shift every note by this many semitones before the duck sings it",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
+
+    if args.list:
+        for name in mido.get_input_names():
+            print(name)
+        return
+    if not args.host:
+        parser.error("which duck? give its hostname or address (`duckctl ip` finds it)")
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(play(args))
+
+
+if __name__ == "__main__":
+    main()

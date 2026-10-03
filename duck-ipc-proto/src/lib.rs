@@ -423,7 +423,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 37;
+///
+/// # v38 — `robot.note`
+///
+/// The duck as a keyboard instrument: one note at a time, sung in its chorale voice, held for as
+/// long as the client keeps saying so. Additive, same rule as every method before it; refused by a
+/// robot whose config has not opted in (`[midi] enabled`).
+pub const API_VERSION: u32 = 38;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -690,6 +696,19 @@ pub mod method {
     /// false by default: a chorale moves the mouth and the head, and a robot that began animating
     /// because another robot walked into the room would be doing unrequested motion.
     pub const ROBOT_CHORALE: &str = "robot.chorale";
+    /// Sing one note, or stop singing: the duck as a monophonic keyboard instrument, in its
+    /// chorale voice. The answer is [`super::IntentResult`].
+    ///
+    /// A **level**, not an event, and it decays. The note sounds while it keeps arriving — a
+    /// client holding a key re-sends it every few hundred milliseconds — and is released by
+    /// `note: null` or by going stale, so a bridge that dies mid-note does not leave the duck
+    /// singing one pitch forever. The instrument itself stays up a while after the last call, so
+    /// the next note does not wait on the audio device opening.
+    ///
+    /// Refused by a robot whose config has not opted in (`[midi] enabled`, off by default) and by
+    /// one with no voice. A note arriving while the theremin or a chorale holds the voice is
+    /// accepted and not sung: those were asked for first, and are what the mouth is doing.
+    pub const ROBOT_NOTE: &str = "robot.note";
     /// Sit down gracefully, then power the machine off. The prototype's Select long-press.
     pub const ROBOT_SHUTDOWN: &str = "robot.shutdown";
     /// Which drive mode this `robotd` is in: `walk` or `roller`.
@@ -1013,6 +1032,8 @@ pub enum Call {
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
+    /// Sing one note, or stop. A held level; see [`method::ROBOT_NOTE`].
+    RobotNote(NoteParams),
     /// `btd` subscribing to what it should advertise. Answered, then a stream of
     /// [`method::CHORALE_BEACON`] notifications.
     ChoraleSubscribe,
@@ -1188,6 +1209,7 @@ impl Call {
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
+            Call::RobotNote(_) => method::ROBOT_NOTE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
             Call::ChoraleHeard(_) => method::CHORALE_HEARD,
@@ -1371,6 +1393,7 @@ impl Call {
             | Call::RobotSound(_)
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
+            | Call::RobotNote(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
@@ -1487,6 +1510,7 @@ impl Call {
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
+            Call::RobotNote(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
             Call::RobotSubscribe(p) => encode(p),
@@ -1577,6 +1601,7 @@ impl Call {
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
+            method::ROBOT_NOTE => Call::RobotNote(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
             method::CHORALE_HEARD => Call::ChoraleHeard(decode(params)?),
@@ -1737,6 +1762,10 @@ pub mod test_support {
             Call::RobotSound(SoundParams {
                 tag: SoundTag::Chirp,
                 hold: None,
+            }),
+            Call::RobotNote(NoteParams {
+                note: Some(72),
+                level: 0.8,
             }),
             Call::RobotShutdown,
             Call::RobotMode,
@@ -4842,6 +4871,23 @@ pub struct ChoraleParams {
     pub piece: Option<u8>,
 }
 
+/// See [`method::ROBOT_NOTE`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoteParams {
+    /// The note to sing, as a MIDI number (60 is middle C, 69 is A4 = 440 Hz), or `None` for
+    /// silence. Absolute pitch, on the same reference every duck's chorale tunes to: a duck sings
+    /// the key you pressed, not a transposition into its own register.
+    pub note: Option<u8>,
+    /// How loud, 0..1 — a key's velocity over 127. Absent is full.
+    #[serde(default = "full_level")]
+    pub level: f64,
+}
+
+fn full_level() -> f64 {
+    1.0
+}
+
 /// Answer to [`Call::RobotChorale`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -5560,7 +5606,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            67,
+            68,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
