@@ -329,8 +329,10 @@
         <tr><th>battery</th><td id="t-battery">–</td></tr>
         <tr><th>temperatures</th><td id="t-temps">–</td></tr>
       </table>
-      <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz; the last three rows are
-        <code>robot.health</code>, polled, because none of it is on that stream.</p>
+      <p class="hint">The frame is <code>robot.subscribe</code> at 2 Hz. <code>mode</code> is
+        <code>robot.mode</code>, and <code>health</code>, <code>battery</code> and
+        <code>temperatures</code> are one polled <code>robot.health</code> — none of the four is on
+        that stream.</p>
     </section>
   </div>
 </main>

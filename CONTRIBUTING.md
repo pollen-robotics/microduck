@@ -104,7 +104,8 @@ scripts/        provision-board.sh · dev-push.sh + dev-build.Dockerfile (from y
                 robot-boot-check · robot-rescue (recovery, installed to /usr/local/sbin) ·
                 pad-link-test.sh · pad-stack-report.sh (gamepad radio, on the board) ·
                 board-test.sh · systemd-test.sh (CI) · cross-sysroot.sh (cross-builds) ·
-                bake-duck-mesh.py (the monitor's 3D model, run by hand)
+                bake-duck-mesh.py (the monitor's 3D model, run by hand) ·
+                check-frame-dating.py (does a frame and a sample share a clock, run by hand)
 docs/           robot/ (using one) · design/ (how it works) · project/ (roadmap, records) ·
                 ideas/ (not designed yet)
 ```

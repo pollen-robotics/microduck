@@ -539,35 +539,90 @@ the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::c
 arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
 the view to 27° rather than saving anything.
 
-## 11. Everything on the wire should carry the time it happened — **wanted**
+## 11. Everything on the wire should carry the time it happened — **built**
 
-Nothing this transport carries is timestamped at source today. A frame arrives when it arrives, a
-`robot.state` notification arrives when it arrives, and a consumer that wants to know *when* the
-robot saw or felt something has only its own clock to go on — which, over a relay on another
-continent, is off by whatever the path cost that second.
+Both halves are built. A sample and a frame each state when the robot saw them, on one clock, and
+the check this section asked for is `scripts/check-frame-dating.py`.
 
-That is fine for driving a robot you are watching, and it is the wrong shape for everything a
-remote consumer is interesting for. **SLAM is the case that makes it concrete**: monocular SLAM on
-a stream with no capture times can be run, and the moment somebody wants visual-inertial — the IMU
-this robot already has, at 50 Hz, on the same control channel — the two series cannot be related
-except by guessing. Timestamps applied at the far end measure the network, not the robot.
+**The control channel (v24).** `robot.state` and `tof.frame` carry `t_ns`, and so does
+`head_imu.frame`: `CLOCK_MONOTONIC` in nanoseconds, one clock every daemon on a board shares, so a
+sample from `robotd` and a frame from `tofd` go on one axis without an argument about two start
+times. `robotd-design.md` §Mapping telemetry owns the fields.
 
-Two halves, and they are not the same problem:
+**The media half.** A frame is dated twice, and the two are for different jobs.
 
-- **Media.** RTP timestamps are relative to a random offset, so they order frames and date none of
-  them. The mechanism for this is the `abs-capture-time` RTP header extension, which carries a
-  wall-clock capture time per packet and is what a receiver needs to line video up against
-  anything else. Whether `webrtcsink` will negotiate it, and what a browser and `aiortc` expose of
-  it, is the thing to check first — a header extension nothing on the receiving side surfaces buys
-  nothing.
-- **The control channel.** This one is ours and cheap: a monotonic reading, plus the boot epoch
-  that makes it comparable across processes, on every notification that describes a moment. The
-  cost is a field per message and an argument about which clock — and the answer has to be the
-  same one the media path ends up dating frames with, or the two series still cannot be joined.
+*RTCP sender reports* carry the NTP time of the moment they were written beside the RTP timestamp
+of that moment, and `configure_sender_reports` puts them on the robot's own clock:
+`ntp-time-source=clock-time` states that field in pipeline-clock time, and `rtcp-sync-send-time=false`
+makes it the *capture* time rather than the send time. The pipeline runs on `GstSystemClock`, which
+is `CLOCK_MONOTONIC` — the clock `t_ns` is read from — so a peer that reads `sr-ntptime` against
+`sr-rtptime` gets an answer already on the axis the samples are on. This is what the default could
+not do: `ntp` is `CLOCK_REALTIME` converted to the NTP epoch, which needs a clock that has been set,
+and this board has no battery-backed RTC and boots at 1970.
 
-Not built, and deliberately not started as part of the remote path: it changes what every
-notification looks like, so it wants its own decision and its own version bump rather than riding
-along with a transport. `remote-access-design.md` §9 carries it as open.
+*The RFC 6051 `ntp-64` header extension* is the second, and `wire_payloader_setup` adds it to every
+consumer's payloader. It exists because a report arrives once a second at best: a receiver with only
+reports interpolates between them and cannot date the frames before the first one, while the
+extension is written into the packets themselves, so every frame carries its own capture time from
+the first packet on. `rtpsession` fills it in on the way out, from the same buffer timestamp
+`rtcp-sync-send-time=false` puts on the report, so the two agree by construction rather than by two
+pieces of code being kept in step.
+
+**Capture time, not send time, because the driver stamps the buffer.** `rkisp` stamps with
+`ktime_get_ns()` at the ISP's frame start and `v4l2src` maps that into the PTS, so what travels is
+when the sensor saw the scene. The error this leaves is the frame-start-versus-exposure-start
+difference inside the sensor, and not the encoder, the queue or the network — which is the
+difference between a consumer that can fuse a camera with a ToF and one that can only display it.
+
+**The `abs-capture-time` extension is a dead end, and that is worth keeping written down.** This
+section named it as the mechanism and set finding a receiver as the first job. Nothing fills it:
+
+- `webrtcsink` configures TWCC, and the color-space extension on newer releases. Neither puts a
+  capture time on the wire.
+- `aiortc` does not read one: its extension map carries the stream id, `abs-send-time`, the offset,
+  the audio level and the sequence number.
+- No browser API carries a capture time. `webrtc-pc`'s `RTCRtpSynchronizationSource` is an empty
+  extension point and `webrtc-stats` has no such member. The editor's draft that would add one —
+  `webrtc-extensions`' `captureTimestamp` and `senderCaptureTimeOffset` on
+  `RTCRtpContributingSource` — is not implemented anywhere this was checked: Chromium 131 exposes
+  neither on `getSynchronizationSources()`, and its offer carries no `abs-capture-time` extmap.
+
+`ntp-64` is what replaced it, and the two are not alternatives: `ntp-64` is an RTP header extension
+with a receiver already in `rtpjitterbuffer`, where `abs-capture-time` had none.
+
+**What each kind of receiver gets.**
+
+| Receiver | capture time | how |
+|---|---|---|
+| GStreamer (`rtpbin`) | per frame, `GstReferenceTimestampMeta` on the buffer | `add-reference-timestamp-meta=true` on `rtpbin`; the id comes from the SDP's `extmap` |
+| a browser | the sender report's NTP time, and `rtpTimestamp` per frame | `getSynchronizationSources()`; `estimatedPlayoutTimestamp` reads directly in robot `t_ns` |
+| `aiortc` | nothing usable | it rebases RTP timestamps to the first packet, so a frame's RTP time no longer relates to the report |
+
+An `aiortc` peer would need a patch; a browser has both numbers and has to pair them itself. The
+GStreamer row is the one that needs no work from the receiver beyond a property, which is why
+`scripts/check-frame-dating.py` is written as a `webrtcsrc` pipeline.
+
+**FEC is the one thing that breaks it, and it is two GStreamer bugs rather than a design fault.**
+`webrtcsink` sends FEC to a consumer that asks for it, and `webrtcsrc` asks:
+`fec-type=ULP_RED` on every transceiver it creates. With ULPFEC in the stream, H.264 and ULPFEC
+packets alternate on one SSRC, and `rtpjitterbuffer` drops its RTP-to-NTP mapping on every payload
+type change — `gstrtpjitterbuffer.c` clears `last_known_ext_rtptime`/`last_known_ntpnstime` in the
+`priv->last_pt != pt` branch. The extension handling was fixed on `main` (`rtpredenc`/`rtpreddec`,
+MR !12185, so 1.30); the jitterbuffer half was still there in 1.28.6 and the board runs 1.26.2.
+
+Reported from a loopback `webrtcsink`/`webrtcsrc` pair, sent with FEC on both times and answered
+once each way: **2 frames of 302** carried a timestamp with FEC on, and **300 of 303, from the
+first frame,** with it off. A consumer
+therefore answers without FEC, which is negotiation and not a sender-side change, and the robot
+needs no change for it: FEC is negotiated per consumer, so a browser keeps it.
+
+**What is left.** Nothing in this repository. A consumer that wants the comparison
+`issue #220` asks for is `scripts/check-frame-dating.py`, which prints each frame's capture time
+beside the latest `robot.state` `t_ns`. `remote-access-design.md` §9 carries it.
+
+All of it is additive, so no `API_VERSION` bump was needed — the fields v24 added are ignored by an
+older client, and the media half changed nothing on the wire but which clock the existing fields
+state.
 
 ## 12. Deferred, with reasons
 
