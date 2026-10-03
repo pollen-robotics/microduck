@@ -21,6 +21,7 @@
 mod chorale;
 mod control;
 mod intents;
+mod keys;
 mod params;
 mod soc;
 mod sound;
@@ -103,6 +104,12 @@ const KEYS_IDLE: Duration = Duration::from_secs(10);
 /// Above the chorale's per-voice level, which is set for four ducks summing in a room: a keyboard
 /// is one duck, and at that level it was a little quiet on its own.
 const KEYS_LEVEL: f64 = 0.8;
+
+/// How fast the head moves between the keyboard's poses — singing, waiting, and back to wherever
+/// it was asked to look. Slower than the beak's: the sway and the tilt are already smooth, so this
+/// only shapes the hand-overs, and a head that snaps from a tilt into a sway on the first key of a
+/// phrase looks startled rather than musical.
+const KEYS_HEAD_TAU_S: f64 = 0.25;
 
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
@@ -1990,6 +1997,11 @@ async fn control_loop<T: RobotIo>(
     let keys_allowed = params.midi.enabled && params.audio.enabled;
     let mut keys_hz = 0.0f64;
     let mut keys_mouth = 0.0f64;
+    // The head while being played: the offset riding on the command, the tune's range for "high",
+    // and the clock both the sway and the waiting run on.
+    let mut keys_head = [0.0f64; 4];
+    let mut keys_range = keys::Range::default();
+    let keys_epoch = Instant::now();
 
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
@@ -2691,10 +2703,10 @@ async fn control_loop<T: RobotIo>(
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
             // singing stops so the head settles rather than snaps.
             head: [
-                head_ema[0] + chorale_head[0],
-                head_ema[1] + chorale_head[1],
-                head_ema[2] + chorale_head[2],
-                head_ema[3] + chorale_head[3],
+                head_ema[0] + chorale_head[0] + keys_head[0],
+                head_ema[1] + chorale_head[1] + keys_head[1],
+                head_ema[2] + chorale_head[2] + keys_head[2],
+                head_ema[3] + chorale_head[3] + keys_head[3],
             ],
             body: BodyPose {
                 z: body_ema[0],
@@ -3214,6 +3226,7 @@ async fn control_loop<T: RobotIo>(
         // theremin and the chorale, and yielding to both — they were asked for explicitly and are
         // what the mouth is already doing, so a note arriving meanwhile is simply not sung.
         let mut keys_up = false;
+        let mut keys_head_target = [0.0f64; 4];
         if keys_allowed {
             let (note, age) = intents.note();
             let busy = theremin_state.is_some() || chorale_state.is_some();
@@ -3222,8 +3235,17 @@ async fn control_loop<T: RobotIo>(
                     voice.keys_stop();
                 }
                 keys_mouth = 0.0;
+                keys_range.reset();
             } else {
                 keys_up = true;
+                // Swaying while a note sounds, waiting cutely between them — see `keys.rs`.
+                let t = tick_start
+                    .saturating_duration_since(keys_epoch)
+                    .as_secs_f64();
+                keys_head_target = match note {
+                    Some((midi, _)) => keys::singing(t, keys_range.reach(midi)),
+                    None => keys::waiting(t),
+                };
                 // A quiet key opens the beak less: velocity is the one expressive thing a
                 // keyboard has, so it goes to the mouth as well as the level.
                 let (level, open) = match note {
@@ -3248,6 +3270,13 @@ async fn control_loop<T: RobotIo>(
                         duck_control::model::mouth_target(keys_mouth);
                 }
             }
+        }
+        // Slewed whether or not the keyboard is up, so putting it down settles the head back to
+        // where it was asked to look rather than snapping it there. The offset rides on the next
+        // tick's command, as the chorale's does.
+        let alpha = (period.as_secs_f64() / KEYS_HEAD_TAU_S).clamp(0.0, 1.0);
+        for (offset, target) in keys_head.iter_mut().zip(keys_head_target) {
+            *offset += (target - *offset) * alpha;
         }
 
         // The mouth is not part of any policy; the intent is the only thing that moves it.

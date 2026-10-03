@@ -916,7 +916,7 @@ intents the loop already arbitrates.
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
-| the keyboard | `robot.note` → the theremin's live writer in the chorale's voice; a held level that decays after a second, yielding to the theremin and the chorale | `method::ROBOT_NOTE`, and `scripts/duck-midi` for the client |
+| `keys.rs` | `robot.note` → the theremin's live writer in the chorale's voice, a held level that decays after a second and yields to the theremin and the chorale; the head sways while singing and waits, cutely, between notes | the module header, `method::ROBOT_NOTE`, and `scripts/duck-midi` for the client |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 
 Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not

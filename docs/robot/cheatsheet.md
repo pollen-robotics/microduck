@@ -755,7 +755,10 @@ scripts/duck-midi <duck> --midi Keystation --lowest 60 --transpose 12
 ```
 
 The duck sings the keys you play in its chorale voice, at the pitch you pressed, and the beak
-opens with each note — wider the harder you hit the key. One note at a time: holding a chord sings
+opens with each note — wider the harder you hit the key. While a note sounds the head sways the
+way it does in the chorale, lifting on the high notes of whatever you are playing; between notes it
+waits, breathing and now and then cocking its head as if listening for the next one. That stops
+when the script does — a duck nobody is playing stays still. One note at a time: holding a chord sings
 the newest key, and letting it go falls back to one still held. `--lowest` leaves the keys below it
 alone; `--transpose` shifts everything by semitones. Ctrl-C stops it.
 
