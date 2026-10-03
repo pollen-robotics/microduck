@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Time a duck around `scene_challenge`. A scoreboard for `scripts/duck-sim keys`.
+
+    scripts/duck-sim                      # in one window: DUCK_SIM_SCENE=challenge
+    scripts/duck-race                     # in a second: the clock
+    scripts/duck-sim keys                 # in a third, or the second one after this exits
+
+Nothing here drives the duck or talks to `robotd` at all — it reads the simulator's own report of
+where the body is, the same `trunk` and `imu` a tool asking "did it stand up?" reads, and keeps
+score. So it cannot affect the run it is timing, and it does not care whether a person, a pad or a
+script is doing the driving.
+
+The clock starts when the duck first crosses 0.20 m, not when this is launched, so there is no
+rush to get to the keyboard.
+
+The clock is wall-clock, not sim time: a simulator running below real time
+(`scripts/duck-sim realtime`) adds its slowness to the run.
+"""
+import json
+import math
+import os
+import pathlib
+import socket
+import sys
+import time
+
+PORT = int(os.environ.get("DUCK_SIM_PORT", "7801"))
+BEST = pathlib.Path(os.environ.get("DUCK_SIM_STATE",
+                                   pathlib.Path.home() / ".cache/duck-sim")) / "race-best.json"
+
+# x, name. Lifted from the scene's own layout comment; a checkpoint is counted once, on the way
+# past, so walking back and forth does not farm them.
+CHECKPOINTS = [
+    (0.35, "gate"), (1.40, "slalom"), (2.50, "corridor"), (3.05, "ramp"),
+    (3.36, "platform"), (3.66, "steps"), (4.08, "curb"), (4.60, "roll wall"), (4.92, "the ball"),
+]
+START_X, FINISH_X = 0.20, 4.92
+FALL_PENALTY = 3.0          # seconds, and it is generous: a fall costs ~6 s of standing up anyway
+ROLL_BONUS = 5.0            # for going over the wall instead of round it
+
+# The wall spans y -0.40 to -0.05 and the gap is everything above it, so where you cross says
+# which way you went. Nothing else in the scene can tell them apart.
+WALL_X, WALL_Y_TOP = 4.55, -0.05
+
+
+def connect():
+    s = socket.socket()
+    s.settimeout(3)
+    try:
+        s.connect(("127.0.0.1", PORT))
+    except OSError as error:
+        sys.exit(f"no simulator on 127.0.0.1:{PORT} ({error}).\n"
+                 f"  DUCK_SIM_SCENE=challenge scripts/duck-sim")
+    f = s.makefile("rw")
+    f.write(json.dumps({"op": "hello", "protocol": 1}) + "\n")
+    f.flush()
+    f.readline()
+    return f
+
+
+class BodyGone(Exception):
+    """The simulator stopped answering — almost always its window being closed."""
+
+
+def read(f):
+    # Closing the MuJoCo window ends the simulator, and the daemons stay up, so a race in progress
+    # sees the socket drop mid-run. It arrives as a reset, an empty line, or half a line, and all
+    # three used to come out as a traceback on top of somebody's run.
+    try:
+        f.write('{"op":"read"}\n')
+        f.flush()
+        line = f.readline()
+    except OSError as error:
+        raise BodyGone(str(error)) from None
+    if not line:
+        raise BodyGone("the connection closed")
+    try:
+        return json.loads(line)
+    except ValueError:
+        raise BodyGone("a half-written answer") from None
+
+
+def clock(seconds):
+    return f"{int(seconds // 60)}:{seconds % 60:05.2f}"
+
+
+def load_best():
+    try:
+        return json.loads(BEST.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def main():
+    f = connect()
+    best = load_best()
+    print("\033[1mDUCK RACE\033[0m — scene_challenge")
+    if best:
+        print(f"  best: {clock(best['total'])} ({best['falls']} falls"
+              f"{', rolled the wall' if best.get('rolled') else ''})")
+    print("  walk past 0.20 m to start the clock. Ctrl-C to give up.\n")
+
+    started = None
+    done = set()
+    falls = 0
+    rolled = False
+    was_down = False
+    splits = []
+    try:
+        while True:
+            d = read(f)
+            x, y, _ = d["trunk"]
+            upright = d["imu"]["gravity"][2] < -0.7
+
+            if started is None:
+                if x > START_X:
+                    started = time.time()
+                    print("\033[32m   GO\033[0m")
+                else:
+                    print(f"\r   waiting at x={x:+.2f} ", end="", flush=True)
+                    time.sleep(0.1)
+                    continue
+
+            # A fall is the edge, not the state: lying there is one fall, not fifty.
+            if not upright and not was_down:
+                falls += 1
+                print(f"\r   \033[31mdown\033[0m ({falls}) at x={x:.2f}"
+                      f" — press u to get up{' ' * 20}")
+            was_down = not upright
+
+            if x > WALL_X and y < WALL_Y_TOP and not rolled and "roll wall" not in done:
+                rolled = True
+                print(f"\r   \033[35mOVER THE WALL\033[0m — {ROLL_BONUS:.0f} s{' ' * 24}")
+
+            for cx, name in CHECKPOINTS:
+                if x >= cx and name not in done:
+                    done.add(name)
+                    t = time.time() - started
+                    splits.append((name, t))
+                    print(f"\r   {clock(t)}  {name}{' ' * 30}")
+
+            if x >= FINISH_X:
+                break
+
+            raw = time.time() - started
+            print(f"\r   {clock(raw)}  x={x:4.2f}  falls {falls}"
+                  f"{'  rolled' if rolled else ''}   ", end="", flush=True)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("\n   gave up.")
+        return
+    except BodyGone as why:
+        print(f"\n   \033[31mthe simulator went away\033[0m ({why}) — no time recorded.\n"
+              "   (Closing the MuJoCo window stops it; see \"A duck outlives its body\" in\n"
+              "   docs/robot/simulation.md.) Start it again with:\n\n"
+              "     scripts/duck-sim down && DUCK_SIM_SCENE=challenge scripts/duck-sim\n")
+        return
+
+    raw = time.time() - started
+    total = raw + falls * FALL_PENALTY - (ROLL_BONUS if rolled else 0.0)
+    print(f"\n\033[1m   FINISH\033[0m  raw {clock(raw)}"
+          f"  +{falls * FALL_PENALTY:.0f}s falls"
+          f"{f'  -{ROLL_BONUS:.0f}s roll' if rolled else ''}"
+          f"  = \033[1m{clock(total)}\033[0m")
+
+    if best is None or total < best["total"]:
+        if best:
+            print(f"   \033[32mnew best\033[0m by {best['total'] - total:.2f} s")
+        else:
+            print("   \033[32mfirst time on the board\033[0m")
+        BEST.parent.mkdir(parents=True, exist_ok=True)
+        BEST.write_text(json.dumps({"total": total, "raw": raw, "falls": falls,
+                                    "rolled": rolled, "when": time.strftime("%Y-%m-%d %H:%M"),
+                                    "splits": splits}, indent=2))
+    else:
+        print(f"   best stands: {clock(best['total'])} ({total - best['total']:+.2f} s)")
+
+
+if __name__ == "__main__":
+    main()
