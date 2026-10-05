@@ -1957,17 +1957,31 @@ async fn control_loop<T: RobotIo>(
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
     // spawned when configured, with its own retry loop when arecord flaps.
+    //
+    // A configured card this board lacks means ALSA's `default` instead (resolve_devices).
+    let audio = params.audio.resolve_devices(&robotd_params::alsa_card_ids(
+        &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
+    ));
+    if params.audio.enabled
+        && let Some(card) = &audio.missing_card
+    {
+        tracing::info!(
+            configured = %params.audio.device,
+            missing = %card,
+            "no such sound card; playing and recording on ALSA's default"
+        );
+    }
     let mut voice = params
         .audio
         .enabled
-        .then(|| sound::Sound::new(params.audio.bank.clone(), params.audio.device.clone()));
+        .then(|| sound::Sound::new(params.audio.bank.clone(), audio.playback.clone()));
     let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
         && params.audio.pet_detect_resolved(params.policy.mode)
         && let Some(model) = params.audio.pet_model_resolved()
         && model.exists()
     {
         match pet_detect::worker::PetHandle::spawn(pet_detect::worker::PetConfig {
-            alsa_device: params.audio.capture_device(),
+            alsa_device: audio.capture.clone(),
             model_path: model.clone(),
             enter_threshold: params.audio.pet_enter_threshold,
             exit_threshold: params.audio.pet_exit_threshold,

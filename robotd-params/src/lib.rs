@@ -847,7 +847,8 @@ pub struct HeadImuParams {
 pub struct AudioParams {
     /// Master switch: no sounds, no mic worker.
     pub enabled: bool,
-    /// ALSA playback device — the TLV320AIC3104 codec.
+    /// ALSA playback device — the TLV320AIC3104 codec. When it names a card this board does
+    /// not have, [`AudioParams::resolve_devices`] falls back to ALSA's `default`.
     pub device: String,
     /// Where the per-robot voice bank lives. The release's postinstall renders it there
     /// (`sounds ensure-bank`), seeded from the SoC serial.
@@ -903,6 +904,34 @@ impl AudioParams {
             self.device.clone()
         } else {
             format!("{},0", self.device)
+        }
+    }
+
+    /// The playback and capture devices to use on a board whose ALSA cards are `cards` (the
+    /// ids in `/proc/asound/cards`, see [`alsa_card_ids`]).
+    ///
+    /// The configured device, unless it names a card that is not there — then ALSA's
+    /// `default` for both. The default device names the Zero 3W's HAT codec (`aic3104`), and a
+    /// board without it used to be silent and deaf with nothing in the journal above debug,
+    /// even when it has a perfectly good codec of its own. With the fallback, a board routes
+    /// `default` through its own ALSA configuration — the beta board's image points it at its
+    /// RK809 for playback and its face-board microphone for capture, two different cards,
+    /// which is why capture falls back to `default` too rather than to `default,0`.
+    ///
+    /// A device that names no card (`default`, a PCM from an asound.conf, a numeric card) is
+    /// used as written: there is nothing to check it against.
+    pub fn resolve_devices(&self, cards: &[String]) -> ResolvedAudio {
+        match named_card(&self.device) {
+            Some(card) if !cards.iter().any(|c| c == card) => ResolvedAudio {
+                playback: "default".to_owned(),
+                capture: "default".to_owned(),
+                missing_card: Some(card.to_owned()),
+            },
+            _ => ResolvedAudio {
+                playback: self.device.clone(),
+                capture: self.capture_device(),
+                missing_card: None,
+            },
         }
     }
 
@@ -2247,6 +2276,49 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
     Some((toml::Value::Table(table).try_into::<Params>(), ignored))
 }
 
+/// What [`AudioParams::resolve_devices`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAudio {
+    pub playback: String,
+    pub capture: String,
+    /// The card the configured device named and this board lacks, when the fallback was taken.
+    pub missing_card: Option<String>,
+}
+
+/// The card id an ALSA device string names, when it names one by id: `plughw:aic3104`,
+/// `hw:aic3104,0`, `plughw:CARD=aic3104,DEV=0`. `None` for anything else.
+fn named_card(device: &str) -> Option<&str> {
+    let (plugin, args) = device.split_once(':')?;
+    if plugin != "hw" && plugin != "plughw" {
+        return None;
+    }
+    let first = args.split(',').next()?;
+    let card = first.strip_prefix("CARD=").unwrap_or(first);
+    // A numeric card is an index, not an id: nothing to match against /proc/asound/cards.
+    (!card.is_empty() && !card.bytes().all(|b| b.is_ascii_digit())).then_some(card)
+}
+
+/// The card ids in the text of `/proc/asound/cards`, whose card lines read
+/// ` 0 [rockchiprk809  ]: simple-card - rockchip-rk809` (each followed by a description line).
+pub fn alsa_card_ids(proc_asound_cards: &str) -> Vec<String> {
+    proc_asound_cards
+        .lines()
+        .filter_map(|line| {
+            let (index, rest) = line.trim_start().split_once(' ')?;
+            if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let id = rest
+                .trim_start()
+                .strip_prefix('[')?
+                .split(']')
+                .next()?
+                .trim();
+            (!id.is_empty()).then(|| id.to_owned())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
@@ -2989,6 +3061,43 @@ mod tests {
             ..AudioParams::default()
         };
         assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
+    }
+
+    /// A board without the configured card plays and records on ALSA's `default`, which the
+    /// board's own ALSA configuration routes; one with it is untouched.
+    #[test]
+    fn a_missing_audio_card_falls_back_to_the_alsa_default() {
+        let beta = alsa_card_ids(concat!(
+            " 0 [rockchiprk809  ]: simple-card - rockchip-rk809\n",
+            "                      rockchip-rk809\n",
+            " 1 [facemic        ]: simple-card - face-mic\n",
+            "                      face-mic\n",
+        ));
+        assert_eq!(beta, ["rockchiprk809", "facemic"]);
+
+        let params = AudioParams::default();
+        let resolved = params.resolve_devices(&beta);
+        assert_eq!(resolved.playback, "default");
+        assert_eq!(resolved.capture, "default");
+        assert_eq!(resolved.missing_card.as_deref(), Some("aic3104"));
+
+        let zero3 = alsa_card_ids(" 0 [aic3104        ]: simple-card - aic3104\n");
+        let resolved = params.resolve_devices(&zero3);
+        assert_eq!(resolved.playback, "plughw:aic3104");
+        assert_eq!(resolved.capture, "plughw:aic3104,0");
+        assert_eq!(resolved.missing_card, None);
+
+        // Spellings that name a card are checked; ones that do not are used as written.
+        assert_eq!(named_card("plughw:CARD=aic3104,DEV=0"), Some("aic3104"));
+        assert_eq!(named_card("hw:aic3104,0"), Some("aic3104"));
+        assert_eq!(named_card("hw:1,0"), None);
+        assert_eq!(named_card("default"), None);
+        assert_eq!(named_card("dmix:aic3104"), None);
+        let custom = AudioParams {
+            device: "speaker".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(custom.resolve_devices(&[]).playback, "speaker");
     }
 
     /// An unprovisioned board must still come up. A daemon that refuses to start because a
