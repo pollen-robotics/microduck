@@ -815,6 +815,23 @@ session without touching the file, and `--imu-hz` trades rate for cost linearly.
 None of this touches depth: the ToF ranges either way, so the grid above works on
 a duck whose IMU has never been switched on.
 
+### The face LEDs
+
+```
+robotctl led list
+robotctl led set rgb:red on
+robotctl led set all off
+robotctl led blink cam:red
+robotctl led trigger green1:green heartbeat
+```
+
+The beta board's face has twelve LEDs (`face:<place>:<colour>`, on a GPIO expander), and these
+switch them through the kernel's LED class — names with or without the `face:` prefix, or `all`.
+A board without a face board says so. Nothing owns an LED yet, so this is the bench tool; once a
+daemon drives one (the camera LED as the streaming indicator, say), that daemon is its writer and
+`led set` only overrides it until the daemon next writes. A blink rate other than the default
+500/500 ms (`--on-ms`, `--off-ms`) needs `sudo`.
+
 ### The camera (`mediad`)
 
 A frame from the head camera, in the terminal. `robotctl monitor`, then **`c`**:

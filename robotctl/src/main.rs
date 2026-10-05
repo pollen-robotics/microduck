@@ -46,6 +46,7 @@ mod configure;
 mod duck;
 mod frame;
 mod imu_view;
+mod led;
 mod monitor;
 mod path_map;
 mod show;
@@ -149,6 +150,14 @@ enum Namespace {
     Robot {
         #[command(subcommand)]
         command: RobotCommand,
+    },
+
+    /// The face board's LEDs: list them, switch them, blink them. Bench tool for now — see
+    /// `robotctl led --help` and the module doc for who owns an LED once a daemon does.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Led {
+        #[command(subcommand)]
+        command: led::LedCommand,
     },
 
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
@@ -2724,6 +2733,7 @@ fn render_version(report: &VersionReport) -> String {
 }
 
 /// An error carrying the exit code it should produce.
+#[derive(Debug)]
 struct Failure {
     code: u8,
     message: String,
@@ -5080,6 +5090,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::Led { command } => {
+            return led::run(Path::new(led::LEDS_DIR), command);
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
