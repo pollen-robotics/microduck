@@ -82,12 +82,16 @@ version = "v3"
 [workspace.package]
 version = "0.15.1"
 edition = "2024"
-# 1.99 for the atomics' `try_update` (mediad), which replaced the now-deprecated
-# `fetch_update`. That also covers `std::fs::File::try_lock` (1.89), how the single-flight
-# update lock works without a dependency (updater/src/journal.rs), and edition 2024 (1.85).
-# Declared so a teammate on an older toolchain gets "requires rustc 1.99" instead of an
-# error about a method that does not exist.
-rust-version = "1.99"
+# 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
+# without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers
+# both. Declared so a teammate on an older toolchain gets "requires rustc 1.89" instead of
+# an error about a method that does not exist.
+#
+# A CEILING as well as a floor: the Yocto image builds every release from source with the
+# Rust its OE release ships -- 1.94.1 on wrynose -- so nothing here may need newer than that.
+# 0.15.1 raised this to 1.99 for the atomics' `try_update` and could not be built into an
+# image; mediad now spells those as compare-exchange loops. CONTRIBUTING.md has the rule.
+rust-version = "1.89"
 license = "Apache-2.0"
 
 [workspace.dependencies]

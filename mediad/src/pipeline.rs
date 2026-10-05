@@ -1931,13 +1931,21 @@ fn wire_consumers(
     if glib::subclass::signal::SignalId::lookup("consumer-removed", sink.type_()).is_some() {
         let leaving = consumers.clone();
         sink.connect("consumer-removed", false, move |_| {
-            // `try_update` rather than `fetch_sub`, so a spurious removal cannot wrap the count
-            // around to four billion viewers.
-            let _ = leaving.try_update(
+            // A saturating decrement rather than `fetch_sub`, so a spurious removal cannot wrap
+            // the count around to four billion viewers. Spelled as a compare-exchange loop rather
+            // than `try_update`/`fetch_update`: `try_update` needs Rust 1.99, which the Yocto
+            // image's toolchain (1.94) does not have, and 1.99 deprecates `fetch_update`, which
+            // CI's `-D warnings` turns into a failure. The loop is the same thing on every
+            // version.
+            let mut current = leaving.load(std::sync::atomic::Ordering::Relaxed);
+            while let Err(actual) = leaving.compare_exchange_weak(
+                current,
+                current.saturating_sub(1),
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |current| Some(current.saturating_sub(1)),
-            );
+            ) {
+                current = actual;
+            }
             None
         });
     } else {

@@ -18,7 +18,7 @@
 # holds on an x86 laptop too, where it costs qemu and the script says so.
 #
 # `rust:1-bookworm` floats to the newest 1.x rather than pinning: the workspace declares its own
-# floor (`rust-version = "1.99"`), so a toolchain below it fails with that message rather than
+# floor (`rust-version = "1.89"`), so a toolchain below it fails with that message rather than
 # with a missing method, and a pin here would be a second place to bump.
 FROM rust:1-bookworm
 
