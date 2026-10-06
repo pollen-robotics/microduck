@@ -181,6 +181,24 @@ The camera and the drive controls are on WebRTC and nothing else, so a robot wit
 has no console. Join it to one over the radio first — `duckctl wifi connect` below needs no network
 of its own.
 
+## Driving over WebRTC with a pad plugged into this machine
+
+```bash
+duckctl webrtc-drive --host 192.168.10.136
+```
+
+The pad on your desk drives the robot over the session the console uses: signalling on the
+robot's port 8443, its `control` channel, nothing installed or stopped on the robot. It is
+`padd` — the same program as on the robot — run here with a local socket standing in for
+`robotd`'s, and the robot's button bindings read over the channel (`pad.bindings`); the walking
+speeds have no call to read them by, so they are `padd`'s defaults. Without `--host` the robot is
+found over Bluetooth. Ctrl-C ends the session.
+
+The robot's own `padd` keeps running, which is harmless while no pad is connected to the robot —
+with one connected, both would drive.
+
+`padd` has to be on this machine, beside `duckctl` (`cargo install --path padd`).
+
 ## Always the same robot
 
 Put the name in the environment instead of on every command line:

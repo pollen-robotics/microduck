@@ -66,7 +66,14 @@ futures = "0.3"
 # developer sits at, and the interesting part of `open` is finding the robot, not spawning a process.
 webbrowser = "1.2.4"
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "signal"] }
+
+# `webrtc-drive`: the robot's own WebRTC session, from this machine. The signalling is the
+# WebSocket `mediad` already serves on 8443, and the peer connection is the one the console's
+# browser makes — here in Rust, so a pad on this desk can drive over it.
+webrtc = "0.21"
+tokio-tungstenite = "0.30"
+async-trait = "0.1"
 
 # `advwatch` measures how often an advertisement actually arrives. It lives here rather than with
 # `btd` for the same reason the client does: it is a scanner, and scanners run on laptops.
