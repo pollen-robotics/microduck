@@ -39,6 +39,7 @@ use webrtc::peer_connection::{
     RTCConfigurationBuilder, RTCIceCandidateInit, RTCPeerConnectionIceEvent,
     RTCPeerConnectionState, RTCSessionDescription, Registry, register_default_interceptors,
 };
+use webrtc::rtp_transceiver::RTCRtpTransceiverDirection;
 
 /// `mediad`'s signalling port (`--port`'s default there).
 pub const SIGNALLING_PORT: u16 = 8443;
@@ -399,6 +400,17 @@ async fn answer<P: PeerConnection>(pc: &P, offer: &str) -> Result<String, String
     pc.set_remote_description(offer)
         .await
         .map_err(|e| e.to_string())?;
+    // Decline every media section the robot offered. The camera is not wanted here and it is not
+    // free: the robot sends ~3.5 Mbit/s of H.264 to every consumer that accepts it, on the same
+    // transport as `control` — and `control` is reliable and ordered, so on a marginal link the
+    // video's congestion is a stall in the commands behind it. Answered `inactive`, `webrtcsink`
+    // sends this peer nothing but the datachannel.
+    for transceiver in pc.get_transceivers().await {
+        transceiver
+            .set_direction(RTCRtpTransceiverDirection::Inactive)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let answer = pc.create_answer(None).await.map_err(|e| e.to_string())?;
     let sdp = answer.sdp.clone();
     pc.set_local_description(answer)
