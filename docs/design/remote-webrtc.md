@@ -341,6 +341,17 @@ connection hangs — the exact bug `app-path-design.md` §7 records. One datacha
 stream with the same hazard, and `btd`'s answer works unchanged: route by method to a per-lane
 socket, pump each socket back, never correlate.
 
+### A driver that goes quiet sits the robot
+
+The deadman stops the walking half a second after the twists stop, but leaves the robot standing,
+and the client that would have sat it down cannot reach it any more. So `mediad` watches each
+session that has sent `robot.move` (`mediad/src/link_watch.rs`): quiet for a second, while the
+last twist asked for motion or the peer had been heartbeating a standstill — `padd` resends its
+zeros every 100 ms — is a lost link, and the robot plays "inquire" and sits down if it is
+standing. A session that closes counts the same way. The console's one stop after a key is
+released, and a session that never drove, never count: silence from those is a person, not a
+link.
+
 ## 6. Why `control`-only comes first, and what `teleop` will cost when it lands
 
 `intents.rs` stores each intent in an `ArcSwap` and takes last-writer-wins. That is correct today

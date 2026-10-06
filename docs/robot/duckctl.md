@@ -197,6 +197,11 @@ found over Bluetooth. Ctrl-C ends the session.
 The robot's own `padd` keeps running, which is harmless while no pad is connected to the robot —
 with one connected, both would drive.
 
+If the wifi drops while you drive, the robot stops walking within half a second, and after a
+second it asks where you went and sits down; ending the session with Ctrl-C sits it down too, as
+switching a pad off does. The camera is declined for the session: nothing here shows it, and
+sharing the link with it is what made driving lag.
+
 `padd` has to be on this machine, beside `duckctl` (`cargo install --path padd`).
 
 ## Always the same robot

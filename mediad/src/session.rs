@@ -24,6 +24,7 @@
 use duck_ipc_proto as proto;
 use tokio::sync::mpsc;
 
+use crate::link_watch::{self, LinkWatch};
 use crate::route::{self, Route};
 use crate::upstream::Pool;
 
@@ -126,17 +127,37 @@ pub async fn run(
     mut pool: Pool,
     media: Option<Media>,
 ) {
-    while let Some(line) = inbound.recv().await {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(reply) = handle(&line, &mut pool, media.as_ref()).await {
-            // A closed outbound means the peer is gone; there is nothing left to do for it.
-            if outbound.send(reply).await.is_err() {
-                break;
+    // A peer driving the robot that goes quiet is a lost link, and the robot sits — see
+    // `link_watch`. Checked a few times a second; the threshold is a second.
+    let mut watch = LinkWatch::new(std::time::Instant::now());
+    let mut check = tokio::time::interval(std::time::Duration::from_millis(200));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let robot = pool.socket(proto::Service::Robot);
+    loop {
+        tokio::select! {
+            line = inbound.recv() => {
+                let Some(line) = line else { break };
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                watch.line(&line, std::time::Instant::now());
+                if let Some(reply) = handle(&line, &mut pool, media.as_ref()).await {
+                    // A closed outbound means the peer is gone; there is nothing left to do for it.
+                    if outbound.send(reply).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            _ = check.tick() => {
+                if watch.lost(std::time::Instant::now()) {
+                    tokio::spawn(link_watch::sit_down(robot.clone()));
+                }
             }
         }
+    }
+    if watch.closed() {
+        tokio::spawn(link_watch::sit_down(robot));
     }
     tracing::debug!("control channel ended");
 }
@@ -421,6 +442,54 @@ mod tests {
             pad: dir.join("pad.sock"),
             tof: dir.join("tof.sock"),
         }
+    }
+
+    /// **A driver that goes quiet sits the robot.** A peer heartbeating a standstill — `padd` —
+    /// then nothing: after a second the robot is asked where its driver went, whether it is
+    /// sitting, and to sit. The fake answers "not sitting" and "accepted".
+    #[tokio::test]
+    async fn a_driver_that_goes_quiet_sits_the_robot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut robot_seen = fake_daemon(
+            dir.path(),
+            "robotd.sock",
+            vec![
+                r#"{"jsonrpc":"2.0","id":1,"result":{"mode":"walk","enabled":true,"slots":[],"skills":[],"sitting":false}}"#.into(),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"accepted":true}}"#.into(),
+            ],
+        );
+        let h = harness(sockets_in(dir.path()), dir);
+
+        for _ in 0..5 {
+            h.from_peer
+                .send(
+                    r#"{"jsonrpc":"2.0","method":"robot.move","params":{"vx":0,"vy":0,"vyaw":0}}"#
+                        .into(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !seen.iter().any(|l: &String| l.contains("sit_toggle")) {
+            let line = tokio::time::timeout_at(deadline, robot_seen.recv())
+                .await
+                .expect("the robot was never asked to sit")
+                .unwrap();
+            seen.push(line);
+        }
+        let position = |needle: &str| seen.iter().position(|l| l.contains(needle));
+        assert!(
+            position("inquire").is_some(),
+            "it asks where its driver went: {seen:?}"
+        );
+        assert!(
+            position("robot.policies") < position("sit_toggle"),
+            "{seen:?}"
+        );
+        drop(h);
     }
 
     /// A permitted call reaches the service that owns it, and its reply comes back.

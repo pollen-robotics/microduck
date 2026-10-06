@@ -102,6 +102,12 @@ impl Pool {
         }
     }
 
+    /// Where `service` listens — for a call this daemon makes on its own account rather than a
+    /// peer's, which must not share the peer's connections or its replies would reach the peer.
+    pub fn socket(&self, service: proto::Service) -> std::path::PathBuf {
+        self.sockets.path(service).to_path_buf()
+    }
+
     /// Send one line to `service` on `lane`'s connection, connecting first if needed.
     ///
     /// A daemon that restarted between two requests is ordinary here: `robotd` is the one an

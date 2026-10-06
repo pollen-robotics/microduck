@@ -21,6 +21,7 @@
 /// directions, and which sensor mode they belong to.
 pub mod camera;
 pub mod config;
+pub mod link_watch;
 /// The account credential `updaterd` writes, read by the two things here that need it.
 pub mod producer;
 /// The outward connection to the rendezvous service — what makes a duck reachable from off its
