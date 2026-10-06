@@ -288,10 +288,11 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///   published so no client has to carry a copy of the kinematics.
 /// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
 ///
-/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
-/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
-/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
-/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read back to
+/// back, so a peer can put a sample stamped with `t_ns` onto the wall-clock axis if it needs one.
+/// Media itself does not: `mediad` states its sender reports and its frames on `CLOCK_MONOTONIC`
+/// directly. Additive everywhere: an older client ignores fields it does not know, and an older
+/// daemon leaves them at their defaults (zero, or absent).
 ///
 /// # v25 — the whole skeleton's pose, for a viewer
 ///
@@ -5394,9 +5395,11 @@ macro_rules! log_startup_identity {
 
 /// The clocks every daemon stamps with, so no two of them disagree about which clock
 /// "monotonic" means. Nanoseconds. `monotonic` is `CLOCK_MONOTONIC` — what
-/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry; `realtime` is `CLOCK_REALTIME`, the
-/// clock RTCP sender reports are stated in, read together in `media.video` so a peer can
-/// relate the two.
+/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry, and what `mediad` states both its RTCP
+/// sender reports and the RFC 6051 `ntp-64` frame extension in (`remote-webrtc.md` §11), so a
+/// frame and a sample need no conversion to be compared. `realtime` is `CLOCK_REALTIME`, for a
+/// consumer that has a reason of its own to say what the wall clock read.
+/// [`ClockPair::now`] reads both back to back, which is what `media.video` publishes.
 pub mod clock {
     fn read(clock: libc::clockid_t) -> u64 {
         let mut ts = libc::timespec {
@@ -5420,6 +5423,60 @@ pub mod clock {
         read(libc::CLOCK_REALTIME)
     }
 
+    /// The two clocks read together — the pair `media.video` carries as
+    /// `mono_ns` / `real_ns`.
+    ///
+    /// A consumer holding one of these pairs can put anything stamped with
+    /// [`super::RobotState::t_ns`] or [`super::TofFrame::t_ns`] on the wall-clock axis RTCP
+    /// sender reports live on. Both clocks come off the same hardware source, so the offset
+    /// between them is a constant while nothing is adjusting either one, and the mapping is an
+    /// addition.
+    ///
+    /// **The mapping itself is the consumer's.** This crate carries what was read; a receiver
+    /// that wants a wall-clock moment applies the pair's offset to the reading it holds, which is
+    /// one subtraction and one addition on its own numbers. A method here would be this crate
+    /// guessing at which reading a caller means, and at what it does about the two things below.
+    ///
+    /// **The error is the pair's own read separation, and that is not a bound on NTP.** The offset
+    /// is a kernel *constant* rather than a rate that drifts with the age of the pair:
+    /// `CLOCK_REALTIME` and `CLOCK_MONOTONIC` are one count with an additive constant between them,
+    /// both reading `tk->tkr_mono`, and the constant is `offs_real`, which only
+    /// `tk_set_wall_to_mono` writes (`kernel/time/timekeeping.c`). NTP's frequency discipline is
+    /// not among its callers — `kernel/time/ntp.c` never calls it, and what tuning turns is
+    /// `tk->tkr_mono.mult`, which moves both clocks *together*. So there is no drift term to bound,
+    /// and `MAXFREQ` — **500000 ns/s, 500 ppm**, `include/linux/timex.h` — bounds something else:
+    /// how far the kernel will pull the shared *rate*. That is the number to quote for an interval
+    /// measured on this clock, not for this conversion.
+    ///
+    /// **What does move the offset is a step, and a leap second.** `CLOCK_REALTIME` "may have
+    /// discontinuities if the time is changed using `settimeofday(2)`" (`clock_gettime(2)`) while
+    /// `CLOCK_MONOTONIC` cannot go backwards, and a pair taken before one is wrong by an amount no
+    /// arithmetic over the pair can recover. This hardware does it: the board has no battery-backed
+    /// RTC and boots at 1970, so a pair taken before NTP first sets the clock is wrong by decades
+    /// while looking like an ordinary number. Whether the clock has been set is `updater`'s
+    /// judgement rather than this type's — `updater/src/preflight.rs` owns that floor — and a
+    /// consumer that needs the answer should ask there rather than test this pair's contents.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ClockPair {
+        /// `CLOCK_MONOTONIC`, nanoseconds.
+        pub mono_ns: u64,
+        /// `CLOCK_REALTIME`, nanoseconds since the Unix epoch.
+        pub real_ns: u64,
+    }
+
+    impl ClockPair {
+        /// Read both clocks, back to back. Both are served by the vDSO rather than a syscall, so
+        /// the two sit a median of tens of nanoseconds apart — measured, and not one instant. Not
+        /// a bound either: the figure moves with core frequency, and a preempted read is rare and
+        /// microseconds.
+        pub fn now() -> Self {
+            Self {
+                mono_ns: monotonic_ns(),
+                real_ns: realtime_ns(),
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         #[test]
@@ -5428,6 +5485,21 @@ pub mod clock {
             let b = super::monotonic_ns();
             assert!(b >= a);
             assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
+        }
+
+        /// The one identity a consumer relies on: a pair read back to back carries an offset, and
+        /// applying that offset to the pair's own reading gives back the wall clock it was read
+        /// with.
+        #[test]
+        fn a_pair_maps_its_own_instant_back_to_the_clock_it_was_read_with() {
+            let pair = super::ClockPair::now();
+            // This is the arithmetic, not the read separation: `real_ns - mono_ns` added back to
+            // `mono_ns` is `real_ns` exactly, whatever the two calls cost. Kept because it is the
+            // identity a consumer leans on before trusting the offset anywhere else — a bound on
+            // the separation is measured rather than asserted, and a tight one here would be a
+            // flaky test on a loaded board.
+            let offset = i128::from(pair.real_ns) - i128::from(pair.mono_ns);
+            assert_eq!(i128::from(pair.mono_ns) + offset, i128::from(pair.real_ns));
         }
     }
 }

@@ -1113,9 +1113,13 @@ projected gravity, and where the camera and the ToF sensor are. All three are ad
 
 - **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
   `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
-  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
-  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
-  wall-clock — can be put on the same axis.
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads the same
+  clock as `mono_ns`, with `real_ns` beside it, so a client that has a reason to say what the wall
+  clock read can do that itself; `proto::clock::ClockPair` is the pair and nothing more, and its
+  doc comment carries the two things that move the offset — a step, and a leap second. Media does
+  not need the pair at all: `remote-webrtc.md` §11 states every sender report and every frame on
+  `CLOCK_MONOTONIC` directly, so a picture and a sample are comparable without either side
+  converting.
 - **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
   it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
   anything yet; when it is, it streams beside `tof.frame`, not here.
