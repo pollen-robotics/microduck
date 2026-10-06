@@ -21,6 +21,7 @@
 mod chorale;
 mod control;
 mod head_imu;
+mod idle_head;
 mod intents;
 mod params;
 mod pickup;
@@ -2156,6 +2157,13 @@ async fn control_loop<T: RobotIo>(
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
     let mut chorale_head = [0.0f64; 4];
+    // The robot looking around while nothing is happening — see `idle_head`. Seeded from the
+    // clock, so two robots side by side do not glance in step.
+    let mut idle_head = idle_head::IdleHead::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64),
+    );
 
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
@@ -2977,19 +2985,44 @@ async fn control_loop<T: RobotIo>(
         } else {
             body_ema = [0.0; 3];
         }
+        // Still: the policy has the robot, nothing asks it to move or is moving it, nobody has
+        // steered the head lately, and it is not singing (the chorale owns the head then).
+        let still = was_driving
+            && !in_limp_fall
+            && !pickup_paused
+            && twist_target == [0.0; 3]
+            && twist_ema.iter().all(|v| v.abs() < 1e-3)
+            && snapshot.head_age >= idle_head::IDLE_AFTER
+            && chorale_head.iter().all(|v| v.abs() < 1e-3)
+            && controller.as_ref().is_some_and(|c| !c.busy());
+        let idle = idle_head.tick(tick_start, still, period);
+        // The breath moves the body pose, which only the standing network is trained on — and
+        // only while no client holds the body pose itself.
+        let breath = if !snapshot.pose.active
+            && controller
+                .as_ref()
+                .and_then(|c| c.driving())
+                .is_some_and(|d| d == control::Driving::Stand)
+        {
+            idle.body_z
+        } else {
+            0.0
+        };
+        let idle_offset = idle.head;
         let command = PolicyCommand {
             twist: twist_ema,
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
-            // singing stops so the head settles rather than snaps.
+            // singing stops so the head settles rather than snaps. The idle sweep rides the
+            // same way, and the two never overlap: singing is not still.
             head: [
-                head_ema[0] + chorale_head[0],
-                head_ema[1] + chorale_head[1],
-                head_ema[2] + chorale_head[2],
-                head_ema[3] + chorale_head[3],
+                head_ema[0] + chorale_head[0] + idle_offset[0],
+                head_ema[1] + chorale_head[1] + idle_offset[1],
+                head_ema[2] + chorale_head[2] + idle_offset[2],
+                head_ema[3] + chorale_head[3] + idle_offset[3],
             ],
             body: BodyPose {
-                z: body_ema[0],
+                z: body_ema[0] + breath,
                 roll: body_ema[1],
                 pitch: body_ema[2],
             },

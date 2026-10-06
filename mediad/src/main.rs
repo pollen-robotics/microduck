@@ -110,8 +110,8 @@ struct Args {
 
     /// How far the camera is mounted from upright, clockwise: 0, 90, 180 or 270.
     ///
-    /// **90 by default, because the head camera is mounted a quarter turn off**, and this is the one
-    /// place that fact is written down. It no longer means "rotate the pixels": it is told to
+    /// **The board's mount by default** (`Board::camera_mount_degrees`): 90 on the Zero 3W, whose
+    /// head camera is mounted a quarter turn off, and 0 on the beta, whose camera is upright. It no longer means "rotate the pixels": it is told to
     /// whoever displays the video, and they rotate for free — the console with a CSS transform on
     /// the GPU. Rotating here cost 145% of a core and 22 fps; `pipeline::Rotation` has the numbers.
     ///
@@ -220,22 +220,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
-    // should say so rather than opening a camera first.
-    // Validated even when the pipeline will not use it, because it is still what every consumer is
-    // told about the mount — a typo should not reach the console as a rotation nobody can apply.
-    // 90 whatever the source. The head camera is mounted a quarter turn off and every consumer is
-    // told so — and the *simulated* camera is rolled the same way on purpose, so that a frame from a
-    // duck in MuJoCo needs the same turn as a frame from a duck on the desk. Overridable, because a
-    // scene could mount it differently, but there is one default and it is the robot's.
-    let rotate = args.rotate.unwrap_or(90);
-    let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
-        Ok(rotation) => rotation,
-        Err(e) => {
-            tracing::error!(error = %e, "mediad cannot start");
-            return ExitCode::FAILURE;
-        }
-    };
     // What the stream is and what it looks for, from `[media]` and `[duck_detector]` — see
     // `--config` and `mediad::config`. One file, one read: `[duck_detector]` is `mediad`'s section
     // too, and a second config file for the second daemon that wants one is how a fleet ends
@@ -254,6 +238,24 @@ fn main() -> ExitCode {
         params.board.version,
         robotd_params::board::Board::declared(&config).is_some(),
     );
+    // Refused before anything starts: a bad angle is a typo on a command line, and the daemon
+    // should say so rather than opening a camera first.
+    // Validated even when the pipeline will not use it, because it is still what every consumer is
+    // told about the mount — a typo should not reach the console as a rotation nobody can apply.
+    // The board's mount whatever the source: a quarter turn on the Zero 3W, upright on the beta
+    // (`Board::camera_mount_degrees`). The *simulated* camera is rolled like the Zero 3W's on
+    // purpose, and a twin declares no board, so a frame from a duck in MuJoCo needs the same turn
+    // as a frame from a duck on the desk. Overridable, because a scene could mount it differently.
+    let rotate = args
+        .rotate
+        .unwrap_or_else(|| params.board.version.camera_mount_degrees());
+    let mount = match mediad::pipeline::Rotation::from_degrees(rotate) {
+        Ok(rotation) => rotation,
+        Err(e) => {
+            tracing::error!(error = %e, "mediad cannot start");
+            return ExitCode::FAILURE;
+        }
+    };
     let (media, detect) = (params.media, params.duck_detector);
 
     // **What will actually run, not what is configured.** `[media] quality` is the rung a camera

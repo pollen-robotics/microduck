@@ -36,16 +36,23 @@ JOINT_NAMES = [
     "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle",
 ]
 
-# Parts that exist in the CAD but are enclosed by shells: batteries, PCBs, brackets.
-# Invisible from outside, and at this decimation level their triangles would poke
-# through the shell that hides them — dropping them is both lighter and more correct.
+# Parts that exist in the CAD but are enclosed by shells: PCBs, brackets. Invisible
+# from outside, and at this decimation level their triangles would poke through the
+# shell that hides them — dropping them is both lighter and more correct. The battery
+# (`np_f970`) is not one of them: it rides outside the trunk and is drawn.
 HIDDEN = {
-    "np_f970",
     "pcb__raspberry_pi_zero_2_w",
     "elec_rpi_robot_hat_pcb",
     "power_support",
     "banana_pcb_locker",
     "motor_support",
+}
+
+# Colours the MJCF gets wrong, by mesh name, as 0–1 RGB. The CAD export paints the
+# battery the same light grey as the shells; the real NP-F970 pack is black, and drawn
+# light it reads as part of the body rather than the battery strapped to its back.
+RECOLOR = {
+    "np_f970": (0.16, 0.16, 0.18),
 }
 
 
@@ -176,7 +183,7 @@ def main() -> None:
                 {
                     "body": index,
                     "mesh": mesh_index(name),
-                    "rgb": materials[geom.get("material")],
+                    "rgb": RECOLOR.get(name, materials[geom.get("material")]),
                     "pos": parse_floats(geom.get("pos"), "0 0 0"),
                     "quat": parse_floats(geom.get("quat"), "1 0 0 0"),
                 }

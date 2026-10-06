@@ -63,9 +63,11 @@
 //! pad is bonded *and trusted*, so it reconnects by itself afterwards, and this process picks it up
 //! within a tick.
 //!
-//! Waiting with no pad is deliberately cheap and deliberately silent — nothing is sent, and
-//! `robotd`'s deadman holds the robot on its own. Inventing a zero command instead would mask a
-//! disconnected pad as someone's decision to stop.
+//! Waiting with no pad is deliberately cheap — no stick command is sent, and `robotd`'s deadman
+//! stops the walking on its own; inventing a zero command instead would mask a disconnected pad
+//! as someone's decision to stop. A pad that was *driving* and goes away is different: the robot
+//! asks where it went (a sound), and after a second sits down, so it is not left standing in the
+//! middle of a room. The pad coming back is greeted; A stands the robot up.
 //!
 //! Pairing is **not** done here: bonding a device needs root and BlueZ, and a `padd` holding
 //! either would stop being the unprivileged client whose whole value is having no special
@@ -183,6 +185,85 @@ struct Args {
 /// again is a wakeup every 20 ms, forever, for nothing. Half a second is imperceptible when someone
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// The pad gone this long sits the robot down. Past the deadman, which has already stopped any
+/// walking at half a second, and short enough that a robot left standing in the middle of a room
+/// is sitting before anybody wonders why it froze.
+const PAD_LOST_SIT: Duration = Duration::from_secs(1);
+
+/// How long to keep asking for that sit when the robot refuses it — mid-kick, mid-pick, mid-rise.
+/// Each refused move ends within a few seconds; past this, something else is going on and the
+/// journal says so rather than the pad asking forever.
+const PAD_LOST_SIT_TRIES: Duration = Duration::from_secs(5);
+
+/// How often to ask, while a sit is due. Faster than [`IDLE_POLL`] so the one-second promise holds.
+const PAD_LOST_POLL: Duration = Duration::from_millis(100);
+
+/// What to do about a pad that went away, tick by tick.
+///
+/// Only a pad that was *driving* can be lost: a `padd` that starts with no pad has nothing to
+/// react to, and must not sit a robot somebody else is driving.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PadLoss {
+    /// The pad is here, or never was.
+    #[default]
+    Present,
+    /// Gone since then; the sit is not due yet, or is being asked for.
+    Lost { since: Instant },
+    /// Gone, and the sit has been dealt with — done, or given up on.
+    Settled,
+}
+
+/// What [`PadLoss::tick`] asks the loop to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PadLossAction {
+    Nothing,
+    /// Try to sit the robot now; [`PadLoss::settle`] once it is, or ask again next poll.
+    Sit,
+    /// The tries ran out.
+    GiveUp,
+}
+
+impl PadLoss {
+    fn lost(&mut self, now: Instant) {
+        *self = Self::Lost { since: now };
+    }
+
+    /// The pad is back. True when it had been lost, for the greeting.
+    fn found(&mut self) -> bool {
+        let was_lost = *self != Self::Present;
+        *self = Self::Present;
+        was_lost
+    }
+
+    fn tick(&self, now: Instant) -> PadLossAction {
+        match *self {
+            Self::Lost { since } => {
+                let gone = now.duration_since(since);
+                if gone >= PAD_LOST_SIT + PAD_LOST_SIT_TRIES {
+                    PadLossAction::GiveUp
+                } else if gone >= PAD_LOST_SIT {
+                    PadLossAction::Sit
+                } else {
+                    PadLossAction::Nothing
+                }
+            }
+            Self::Present | Self::Settled => PadLossAction::Nothing,
+        }
+    }
+
+    /// The robot is sitting, or there was nothing to sit: stop asking.
+    fn settle(&mut self) {
+        if matches!(self, Self::Lost { .. }) {
+            *self = Self::Settled;
+        }
+    }
+
+    /// Whether the loop should poll quickly, because a sit is due or about to be.
+    fn pending(&self) -> bool {
+        matches!(self, Self::Lost { .. })
+    }
+}
 
 /// Start held this long brings the robot to its home pose with the motors stiff and the policy
 /// off: the "put everything back" button. Long enough that a press meant for the policy toggle
@@ -495,6 +576,8 @@ fn main() -> std::process::ExitCode {
     let mut driving = false;
     let mut start = HoldButton::default();
     let mut select = HoldButton::default();
+    // A driving pad that went away: the robot sits after a second — see `PadLoss`.
+    let mut pad_loss = PadLoss::default();
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
@@ -593,8 +676,31 @@ fn main() -> std::process::ExitCode {
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
             if driving {
-                tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
+                tracing::warn!(
+                    "pad gone — robotd's deadman stops the walking; sitting down in {PAD_LOST_SIT:?}"
+                );
                 driving = false;
+                pad_loss.lost(tick);
+                // Heard, because whoever lost the pad is looking at the robot, not the journal.
+                sound(&mut stream, proto::SoundTag::Inquire);
+            }
+            match pad_loss.tick(tick) {
+                PadLossAction::Nothing => {}
+                PadLossAction::Sit => match sit_if_standing(&mut stream, &mut next_id) {
+                    Ok(true) => pad_loss.settle(),
+                    // Refused — mid-move, typically. Asked again on the next poll.
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "sit request failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                PadLossAction::GiveUp => {
+                    tracing::warn!(
+                        "pad gone: the robot would not sit after {PAD_LOST_SIT_TRIES:?} of asking — leaving it as it is"
+                    );
+                    pad_loss.settle();
+                }
             }
             // A hold in flight was measured against the pad that just left: drop it, or a
             // Select still down when the pad returns lands its full hold time at once — a
@@ -605,13 +711,20 @@ fn main() -> std::process::ExitCode {
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
-            std::thread::sleep(IDLE_POLL);
+            std::thread::sleep(if pad_loss.pending() {
+                PAD_LOST_POLL
+            } else {
+                IDLE_POLL
+            });
             continue;
         };
 
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
+            if pad_loss.found() {
+                sound(&mut stream, proto::SoundTag::Greet);
+            }
         }
 
         // Every tick rather than on the transition above: a pad that drops and comes back between
@@ -1024,6 +1137,52 @@ fn ask_roller(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<Opt
     Ok(answer
         .and_then(|answer| answer.result_as::<proto::ModeResult>().ok())
         .map(|mode| mode.mode == "roller"))
+}
+
+/// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.
+fn sound(stream: &mut UnixStream, tag: proto::SoundTag) {
+    let call = proto::Call::RobotSound(proto::SoundParams { tag, hold: None });
+    if let Err(e) = notify(stream, &call) {
+        tracing::debug!(error = %e, "sound not sent");
+    }
+}
+
+/// Sit the robot down unless it is sitting already. `Ok(true)` when there is nothing left to do —
+/// sitting, sat down, or a policy that is not driving and so has nothing to sit with (the robot
+/// is then standing still at home, stiff, which is where a lost pad should leave it anyway).
+/// `Ok(false)` when the robot refused for a reason that passes, mid-move typically.
+///
+/// Asked rather than toggled blind: `sit_toggle` stands a seated robot up, and a pad dropping
+/// out next to a sitting robot must not do that.
+fn sit_if_standing(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<bool> {
+    let sitting = request(stream, next_id, &proto::Call::RobotPolicies)?
+        .and_then(|answer| answer.result_as::<proto::PoliciesResult>().ok())
+        .and_then(|policies| policies.sitting);
+    if sitting == Some(true) {
+        tracing::info!("pad gone: the robot is already sitting");
+        return Ok(true);
+    }
+    let call = proto::Call::RobotDo(proto::DoParams {
+        skill: "sit_toggle".to_owned(),
+    });
+    let result = request(stream, next_id, &call)?
+        .and_then(|answer| answer.result_as::<proto::IntentResult>().ok());
+    match result {
+        Some(result) if result.accepted => {
+            tracing::warn!("pad gone: sitting the robot down");
+            Ok(true)
+        }
+        // Not driving: nothing will sit it, and nothing needs to.
+        Some(result)
+            if result
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not driving")) =>
+        {
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Send a continuous intent: no `id`, no reply, nothing to wait for.
@@ -1629,5 +1788,51 @@ mod tests {
         assert_eq!(twist.vx, -ROLLER_BRAKE);
         assert_eq!(twist.vy, 0.0, "no strafe on wheels");
         assert_eq!(twist.vyaw, ROLLER_YAW);
+    }
+
+    /// A pad lost while driving: nothing for a second, then sit — asked again until the robot
+    /// takes it, for a few seconds, then given up on. Settled, it asks nothing more.
+    #[test]
+    fn a_lost_pad_sits_the_robot_after_a_second() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut loss = PadLoss::default();
+        assert_eq!(loss.tick(at(5_000)), PadLossAction::Nothing, "never lost");
+
+        loss.lost(t0);
+        assert!(loss.pending());
+        assert_eq!(loss.tick(at(900)), PadLossAction::Nothing);
+        assert_eq!(loss.tick(at(1_000)), PadLossAction::Sit);
+        assert_eq!(
+            loss.tick(at(3_000)),
+            PadLossAction::Sit,
+            "refused: ask again"
+        );
+        assert_eq!(loss.tick(at(6_000)), PadLossAction::GiveUp);
+
+        loss.settle();
+        assert!(!loss.pending());
+        assert_eq!(loss.tick(at(9_000)), PadLossAction::Nothing);
+    }
+
+    /// The pad coming back is greeted only when it had been lost, and stops any sit still due.
+    #[test]
+    fn a_pad_coming_back_is_greeted_once() {
+        let t0 = Instant::now();
+        let mut loss = PadLoss::default();
+        assert!(!loss.found(), "a pad that was never lost is not a return");
+
+        loss.lost(t0);
+        assert!(loss.found(), "back before the sit");
+        assert_eq!(
+            loss.tick(t0 + Duration::from_secs(2)),
+            PadLossAction::Nothing,
+            "and no sit after it is back"
+        );
+
+        loss.lost(t0);
+        loss.settle();
+        assert!(loss.found(), "back after the sit");
+        assert!(!loss.found(), "once");
     }
 }

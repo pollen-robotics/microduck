@@ -244,6 +244,9 @@ pub struct Snapshot {
     /// Age of the most recent *twist*, which is what the deadman guards. A stale head pose
     /// is harmless; a stale velocity walks the robot into a wall.
     pub twist_age: Duration,
+    /// How long since the head was last commanded — by anyone. The idle sweep waits on it, so a
+    /// client steering the head is never fought.
+    pub head_age: Duration,
     pub enabled: bool,
     /// The body-pose intent. The loop smooths `body` into `command.body` itself, because
     /// smoothing is per-tick state the intent slots must not own.
@@ -594,6 +597,7 @@ impl Intents {
                 body: BodyPose::default(),
             },
             twist_age: Duration::from_micros(now.saturating_sub(twist.at_us)),
+            head_age: Duration::from_micros(now.saturating_sub(head.at_us)),
             enabled: self.enabled.load(Ordering::Relaxed),
             pose,
             mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
