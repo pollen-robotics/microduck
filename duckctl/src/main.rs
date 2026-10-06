@@ -52,6 +52,8 @@ use duck_ble::framing::{self, Reassembler};
 use duck_ble::gatt::{RPC_UUID, SERVICE_UUID};
 use futures::StreamExt;
 
+mod drive;
+
 /// How long to look for a robot before giving up.
 ///
 /// Generous, because BLE discovery is genuinely slow and a robot advertises at whatever interval
@@ -478,6 +480,10 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
             become_program("scp", &scp_argv(&user, address, paths))
         }
+        Command::Drive { user, .. } => {
+            let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
+            drive::run(&user, address)
+        }
         Command::Open { print, port } => {
             let url = console_url(address, *port);
             if *print {
@@ -493,7 +499,7 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
                 .into()
             })
         }
-        // `run` only calls this for the four above; every other command's answer is its JSON.
+        // `run` only calls this for the five above; every other command's answer is its JSON.
         _ => Err("this command does not resolve an address".into()),
     }
 }
@@ -983,6 +989,26 @@ enum Command {
         )]
         command: Vec<String>,
     },
+    /// Drive the robot over wifi with a pad plugged into this machine.
+    ///
+    /// Runs `padd` here — the robot's own mapping, buttons and walking speeds — against `robotd`
+    /// forwarded over SSH. The robot's own `padd` is stopped for the session (`sudo` on the robot
+    /// asks for its password) and started again on the way out, however the session ends: Ctrl-C
+    /// stops driving and hands the robot back.
+    ///
+    /// `padd` has to be installed on this machine: `cargo install --path padd` and `cargo install
+    /// --path duckctl` from the repository put both side by side. `--host` skips the Bluetooth search when the
+    /// address is known, which also makes this work on a machine with no Bluetooth.
+    ///
+    /// The user resolves the way `ssh`'s does: `--user`, else `DUCK_BOARD_USER`, else `microduck`.
+    Drive {
+        /// The account on the robot. Without it, `DUCK_BOARD_USER`; without that, `microduck`.
+        #[arg(long, value_name = "USER")]
+        user: Option<String>,
+        /// The robot's address, instead of finding it over Bluetooth.
+        #[arg(long, value_name = "ADDRESS")]
+        host: Option<String>,
+    },
     /// Copy files to or from the robot with `scp`.
     ///
     /// A path that starts with `:` is on the robot: `duckctl scp report.md :/tmp/` sends one up,
@@ -1432,6 +1458,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         scp_refusal(paths)?;
     }
 
+    // An address on the command line needs no radio at all.
+    if let Command::Drive {
+        user,
+        host: Some(host),
+    } = &cli.command
+    {
+        let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
+        return drive::run(&user, host);
+    }
+
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
     // same thing and differ only in what they do with it. It connects to nothing at all: that is
     // what makes it the safe command to reach for when a robot cannot be reached, and it is also why
@@ -1444,7 +1480,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // service to it.
     let resolving = matches!(
         cli.command,
-        Command::Ip | Command::Open { .. } | Command::Ssh { .. } | Command::Scp { .. }
+        Command::Ip
+            | Command::Open { .. }
+            | Command::Ssh { .. }
+            | Command::Scp { .. }
+            | Command::Drive { .. }
     );
 
     let manager = Manager::new().await?;
@@ -2203,9 +2243,11 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
         // same question over a connection that costs a bond and a PIN.
-        Command::Ip | Command::Open { .. } | Command::Ssh { .. } | Command::Scp { .. } => {
-            ("net.status", serde_json::json!({}), REPLY_TIMEOUT)
-        }
+        Command::Ip
+        | Command::Open { .. }
+        | Command::Ssh { .. }
+        | Command::Scp { .. }
+        | Command::Drive { .. } => ("net.status", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Version => (
             "hello",
             serde_json::json!({ "api_version": duck_ipc_proto::API_VERSION }),

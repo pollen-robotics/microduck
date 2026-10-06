@@ -68,6 +68,11 @@ webbrowser = "1.2.4"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
+# `drive` ignores Ctrl-C itself while `padd` runs in the foreground, so the terminal's interrupt
+# stops `padd` and still leaves this process to put the robot's own `padd` back.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # `advwatch` measures how often an advertisement actually arrives. It lives here rather than with
 # `btd` for the same reason the client does: it is a scanner, and scanners run on laptops.
 [[example]]

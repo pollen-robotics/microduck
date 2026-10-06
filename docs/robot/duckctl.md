@@ -181,6 +181,34 @@ The camera and the drive controls are on WebRTC and nothing else, so a robot wit
 has no console. Join it to one over the radio first — `duckctl wifi connect` below needs no network
 of its own.
 
+## Driving with a pad plugged into this machine
+
+```bash
+duckctl drive
+```
+```bash
+duckctl drive --host 192.168.10.136
+```
+
+The pad on your desk drives the robot over wifi, with the robot's own mapping, button bindings and
+walking speeds. It is `padd` — the same program as on the robot — run here against `robotd`'s
+socket forwarded over SSH. `--host` skips the Bluetooth search, and makes this work on a machine
+with no Bluetooth.
+
+For the session the robot's own `padd` is stopped, so a pad paired to the robot cannot fight
+yours, and `sudo` on the robot asks for its password for that. Ctrl-C ends the session and starts
+the robot's `padd` again — however the session ends, a dropped link included; if even that fails,
+`duckctl ssh -- sudo systemctl start padd` or a reboot puts it back.
+
+`padd` has to be on this machine, beside `duckctl`:
+
+```bash
+cargo install --path padd
+cargo install --path duckctl
+```
+
+On Linux that build needs `libudev`'s headers (`libudev-dev`), for reading the pad.
+
 ## Always the same robot
 
 Put the name in the environment instead of on every command line:
