@@ -441,18 +441,20 @@ fn main() -> std::process::ExitCode {
         // process as it always has, and systemd brings back a `padd` with a fresh connection.
         mapper.tick(&frame_in, &config, tick, &mut out, &mut frame);
         for o in out.drain(..) {
-            let result = match &o {
-                Out::Notify(call) => notify(&mut stream, call).map(|()| None),
-                Out::Request(call) => request(&mut stream, &mut next_id, call),
+            let (call, result) = match &o {
+                Out::Notify(call) => (call, notify(&mut stream, call).map(|()| None)),
+                Out::Request(call) => (call, request(&mut stream, &mut next_id, call)),
             };
             match result {
                 Ok(response) => {
-                    if let Out::Request(call) = &o {
+                    if let Out::Request(_) = &o {
                         pad_map::report(call, response.as_ref());
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "send failed");
+                    // Named by the call, because the line this replaced named what failed —
+                    // "init failed", "skill request failed" — and the journal is all there is.
+                    tracing::error!(error = %e, call = call.method(), "send failed");
                     return std::process::ExitCode::FAILURE;
                 }
             }
