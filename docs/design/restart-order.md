@@ -77,7 +77,7 @@ On today's release `units_to_restart` is exactly:
 configd, mediad, netpadd, padd, robotd, tofd
 ```
 
-in that order — alphabetical, so the order is identical on every board and in every test. `padd` and `netpadd` pick themselves by `ExecCondition=` on `[netpad] enabled`, so the restart order between them does not matter. Nothing
+in that order — alphabetical, so the order is identical on every board and in every test. Exactly one of `padd` and `netpadd` runs, chosen by `ExecCondition=` on `[netpad] enabled` — `netpadd/systemd/netpadd.service` says why that and not `Conflicts=` — so the restart order between them does not matter. Nothing
 was added to `deploy/updater.toml` to put `mediad` and `tofd` in that list, and nothing needed to
 be: both ship a unit with an `[Install]` section, which is the whole rule.
 
@@ -407,15 +407,15 @@ unchanged: a stopped unit and a daemon that published nothing are still not stal
    gamepad or no camera still updates and walks. Then `robot-boot-check.timer` is enabled *without*
    `--now`. Redundant with the hook and harmless; it is also the path for a release older than the
    hook. A unit the release ships that this function does not know is installed, reported, and left
-   alone. `tofd` is named as known but gets no `enable_unit` of its own: the hook enabled it a step
-   earlier and nothing depends on it, so there is no ordering for this function to have an opinion
+   alone. `tofd` and `netpadd` are named as known but get no `enable_unit` of their own: the hook enabled them a step
+   earlier and nothing depends on them, so there is no ordering for this function to have an opinion
    about.
 4. `install_token_dropin`: write the `GITHUB_TOKEN` drop-in, `daemon-reload`, and
    `systemctl try-restart updaterd` — `daemon-reload` alone would leave the *running* `updaterd`
    without the token, which is every board.
 
 `DUCK_FORCE_REINSTALL=1` adds `stop_for_reinstall` before step 2: `systemctl stop` on `padd`,
-`tofd`, `btd`, `configd`, `robotd`, `updaterd`, in that order. Nothing is live while the swap happens, and there is
+`netpadd`, `tofd`, `btd`, `configd`, `robotd`, `updaterd`, in that order. Nothing is live while the swap happens, and there is
 no health gate behind it.
 
 ## 7. Diagnosing a skew
@@ -425,7 +425,7 @@ Two version numbers are legitimately different at once, and which pair it is dec
 | observation | means |
 |---|---|
 | `updaterd` or `btd` behind the installed release, for a few seconds after an update | expected — the deferred restart has not fired yet |
-| `btd`, `robotd`, `configd`, `padd`, `mediad` or `tofd` disagreeing with `current` at all, persistently | the restart did not take effect *and* §5 did not fix it — so either `updaterd` has not restarted since, or its restart failed (journal, at `error`) |
+| `btd`, `robotd`, `configd`, `padd`, `netpadd`, `mediad` or `tofd` disagreeing with `current` at all, persistently | the restart did not take effect *and* §5 did not fix it — so either `updaterd` has not restarted since, or its restart failed (journal, at `error`) |
 | `updaterd` behind it, persistently | the deferred restart never landed, and §5 will not fix this one. `robotctl update apply daemon` repairs it — it reports `already_current` with `updaterd` in `stale` and schedules the restart. `systemctl restart updaterd` is the same fix by hand; either way the journal has why it did not land |
 | any daemon reporting `restarting` | it exited and systemd is bringing it back. For a few seconds after an update, that is the restart itself. Persistently, the daemon cannot start at all — `mediad` with the camera flex unplugged is the case this row exists for — and §5 leaves it alone, since a daemon that is not running has no identity to compare. `journalctl -u <name> -b` has why it exits |
 | any daemon reporting `failed` | it could not start and systemd has stopped retrying. Same journal, and unlike `stopped` nobody chose it |

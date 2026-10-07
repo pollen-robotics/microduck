@@ -9,6 +9,9 @@
 //! the way an API only the phone app uses inevitably would. The cost is a socket hop: tens
 //! of microseconds against a 20 ms tick.
 //!
+//! With `[netpad] enabled = true` this daemon stands down and `netpadd` takes pad state from a
+//! program on the LAN instead, through the same mapping (`pad-map`): `docs/robot/udp-pad.md`.
+//!
 //! ## The mapping
 //!
 //! Laid out so that each part of the pad has one job: the face buttons and bumpers run skills,

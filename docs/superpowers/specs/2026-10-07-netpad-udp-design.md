@@ -67,17 +67,9 @@ separate commit that touches nothing else.
 
 ## 2. Wire format
 
-One datagram per state. Every field is little-endian, and the whole packet is 28 bytes:
-
-| offset | size | field | |
-|---|---|---|---|
-| 0 | 4 | magic | `b"DKPD"` |
-| 4 | 1 | version | `1` |
-| 5 | 1 | flags | reserved, sent 0, ignored |
-| 6 | 4 | seq | u32, +1 per datagram, wraps |
-| 10 | 4 | t_ms | u32, the client's own clock; logged for jitter only, never compared with the robot's |
-| 14 | 12 | axes | i16 ×6: lx ly rx ry (±32767 → ±1), lt rt (0..32767 → 0..1) |
-| 26 | 2 | buttons | u16: 0 A · 1 B · 2 X · 3 Y · 4 LB · 5 RB · 6 Start · 7 Select · 8 Up · 9 Down · 10 Left · 11 Right |
+One datagram per state, 28 bytes, little-endian. The table is owned by
+[`docs/robot/udp-pad.md`](../../robot/udp-pad.md) so the format has one home. In short: magic `DKPD`, version `1`, a reserved flags byte, `seq`,
+`t_ms`, six i16 axes and a u16 of buttons.
 
 - **The client sends raw values.** `pad-map` applies the deadzone, as it does for `padd`.
 - **Wrong magic, a packet shorter than 28 bytes, or an unknown version:** the packet is dropped and

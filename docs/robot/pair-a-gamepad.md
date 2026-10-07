@@ -1,7 +1,8 @@
 # Pair a gamepad
 
 Once per pad. After this, `padd.service` drives whatever pad is connected, from boot — nothing to
-start, and nothing that dies with your ssh session.
+start, and nothing that dies with your ssh session. A pad on another machine on the LAN can drive the robot
+over UDP instead — [`udp-pad.md`](udp-pad.md).
 
 ## Put the pad in pairing mode
 

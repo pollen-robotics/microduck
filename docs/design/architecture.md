@@ -66,7 +66,8 @@ is still a robot you can update.
 
 **`btd`, `padd` and `mediad` own nothing of the robot.** They are transports. `btd` forwards a
 subset of the API from BLE to whichever socket answers it; `padd` reads a gamepad and sends the
-same intents an app would; `mediad` carries the same calls over a WebRTC data channel and owns only
+same intents an app would (`netpadd` does the same for pad state sent over UDP on the LAN, see
+[`../robot/udp-pad.md`](../robot/udp-pad.md)); `mediad` carries the same calls over a WebRTC data channel and owns only
 the pipeline. All three are replaceable without touching robot behaviour, and all three are
 exercised daily, so the API an app will use cannot quietly rot. `tofd` is the odd one out: it owns
 one sensor, publishes frames, and reads nothing (§1).
@@ -84,6 +85,7 @@ counter ([`updater-design.md`](updater-design.md)).
 | `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
+| `netpadd` | nothing — gamepad transport over UDP on the LAN, instead of `padd` ([`udp-pad.md`](../robot/udp-pad.md)) | UDP `[netpad] port` | `/run/robotd.sock` |
 | `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
 | `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus, or SPI on the beta board (`tof::link`) |
 | `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |

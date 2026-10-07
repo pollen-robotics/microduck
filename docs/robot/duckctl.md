@@ -616,6 +616,16 @@ Pairing a pad is a different namespace and a different daemon — `pad.pair` and
 `configd`'s, reached with `call`. These two are `robotd`'s, because checking a skill name needs
 the list of skills.
 
+## A pad on this machine, over UDP
+
+```bash
+duckctl udp-pad $(duckctl ip)
+```
+
+Reads the first gamepad plugged into this machine and sends its state to a duck whose
+`[netpad] enabled` is true, so no Bluetooth is involved. `--hz` (10 to 100, default 30) is the most it
+sends a second. It is a LAN tool, and [`udp-pad.md`](udp-pad.md) has the setup and the wire format.
+
 ## Anything else — `call`
 
 ```bash
