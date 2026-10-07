@@ -51,6 +51,7 @@ own the mechanism is the bug.
 | [`remote-access-design.md`](design/remote-access-design.md) | Reaching a duck from outside the LAN: the Hugging Face account, the device flow, and the bridge to a rendezvous service. |
 | [`boot-recovery-net.md`](design/boot-recovery-net.md) | Falling back to golden when the release that booted cannot start its daemons. |
 | [`simulation.md`](design/simulation.md) | The twin: where the seam between daemon and body is, the body protocol, the fake radio, the containers, and what it is and is not a twin of. |
+| [`autonomous-brain.md`](design/autonomous-brain.md) | A proposal for the autonomous brain: one client, built on prediction, above the shipped policies — and an implementation running in simulation. |
 
 ## `project/` — you are running the project
 
