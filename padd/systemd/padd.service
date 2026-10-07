@@ -40,7 +40,13 @@ Type=exec
 # Stands down when `[netpad] enabled` gives the pad to netpadd — see netpadd.service for why this
 # is a condition and not Conflicts=. An unreadable config answers "run": a bad file never leaves
 # somebody without the Bluetooth pad.
-ExecCondition=/opt/robot/daemon/current/bin/padd --should-run
+#
+# Asked only when this release ships netpadd. A rollback skips postinstall, so this unit stays
+# while `current` points at an older padd that has no `--should-run`: clap would exit 2, systemd
+# would read that as "skip", and the rollback — the safety net — would leave the robot with no pad
+# and nothing reporting a failure. A release without netpadd is one without the selector, so there
+# is nothing to ask and padd runs.
+ExecCondition=/bin/sh -c '[ ! -x /opt/robot/daemon/current/bin/netpadd ] || exec /opt/robot/daemon/current/bin/padd --should-run'
 ExecStart=/opt/robot/daemon/current/bin/padd
 
 # Unprivileged, and this one is not a hardening choice — it is the point of the process. `padd` has

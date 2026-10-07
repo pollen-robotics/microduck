@@ -247,6 +247,10 @@ Because `select` and the reverts skip `hooks/postinstall`, they also never *remo
 downgrade to a release predating a daemon leaves that daemon's unit installed, pointing at a binary
 the older release does not contain; the unit fails, and since it is in the restart set, the failed
 restart fails the transition (`../project/install-path-gap.md`).
+The unit files that stay behind must also work with the older binaries `current` now points at:
+`padd.service` asks `padd --should-run` only when the active release ships `netpadd`, because an
+older `padd` has no such flag, and a condition that exits 2 is a skip, not a failure — a rollback
+would leave the robot with no pad and nothing saying so.
 
 ## 4. At boot
 
