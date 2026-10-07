@@ -312,7 +312,7 @@ mod tests {
         params.netpad.port = 0; // any free port; `serve` reports which
         let (port_tx, port_rx) = tokio::sync::oneshot::channel();
         let args = Args::for_test(sock, dir.path().join("none.toml"));
-        tokio::spawn(serve(args, params, Some(port_tx)));
+        let serving = tokio::spawn(serve(args, params, Some(port_tx)));
         let port = port_rx.await.unwrap();
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -337,6 +337,9 @@ mod tests {
             methods.push(m.unwrap());
         }
         assert_eq!(methods[0], "robot.mode", "the roller question comes first");
+        // Alive on both sides of the silence: a `serve` that had returned would send nothing too,
+        // and pass the silence check below for the wrong reason.
+        assert!(!serving.is_finished(), "serve exited while driving");
 
         // Silence: after the timeout nothing more is sent.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -349,5 +352,6 @@ mod tests {
             late.is_empty(),
             "sent after the client went quiet: {late:?}"
         );
+        assert!(!serving.is_finished(), "serve exited during the silence");
     }
 }
