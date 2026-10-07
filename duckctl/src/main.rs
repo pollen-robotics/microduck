@@ -38,6 +38,8 @@
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
 //! the machine that talks to the same robot every day. See [`Target`].
 
+mod udp_pad;
+
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -1124,6 +1126,17 @@ enum Command {
     /// Which pad button runs which skill.
     #[command(subcommand)]
     Pad(Pad),
+    /// Drive a duck running `netpadd` from the pad plugged into this machine, over UDP on the LAN.
+    ///
+    /// No Bluetooth: give the duck's address (`duckctl ip` prints it). The duck needs
+    /// `[netpad] enabled = true` — docs/robot/udp-pad.md.
+    UdpPad {
+        /// The duck's address, optionally with `:port` (default 4210).
+        host: String,
+        /// Most datagrams a second.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
+        hz: u32,
+    },
     /// Reboot it.
     Reboot,
     /// Send any method, for whatever is not wrapped above.
@@ -1420,6 +1433,10 @@ async fn main() -> std::process::ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    // Before anything Bluetooth: this command talks UDP to an address it was given.
+    if let Command::UdpPad { host, hz } = &cli.command {
+        return udp_pad::run(host, *hz);
+    }
     // Read once, here, so everything below asks `target` rather than the environment: which robot
     // was chosen and who chose it is one decision, and a second reader of `DUCK_ROBOT` could
     // disagree with the first.
@@ -2199,6 +2216,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
         // request: there is no method to send, and connecting is the thing it exists not to do.
         Command::Scan => unreachable!("scan returns before anything connects"),
+        Command::UdpPad { .. } => unreachable!("handled before discovery"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the

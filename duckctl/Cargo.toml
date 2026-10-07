@@ -38,6 +38,11 @@ duck-ble = { path = "../duck-ble" }
 # rather than kept as a number here that could drift.
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 
+# `udp-pad` sends the pad plugged into this machine to a duck's `netpadd`: the wire format and
+# the button bits come from the crate the robot decodes them with, `gilrs` reads the pad.
+pad-map = { path = "../pad-map" }
+gilrs = "0.11"
+
 # `btleplug` rather than `bluer`, because this runs on a developer's machine: CoreBluetooth on
 # macOS, BlueZ on Linux, WinRT on Windows. `bluer` would make the client Linux-only, which defeats
 # the point of having one.
