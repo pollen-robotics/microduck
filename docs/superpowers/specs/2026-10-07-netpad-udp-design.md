@@ -81,7 +81,7 @@ One datagram per state. Every field is little-endian, and the whole packet is 28
 
 - **The client sends raw values.** `pad-map` applies the deadzone, as it does for `padd`.
 - **Wrong magic, a packet shorter than 28 bytes, or an unknown version:** the packet is dropped and
-  counted, and logged once per peer. A version-1 packet *longer* than 28 bytes is accepted and its
+  counted, and logged with the running count at most once every 10 s. A version-1 packet *longer* than 28 bytes is accepted and its
   tail is ignored, so fields can be added without a version bump. Set reserved button bits are
   ignored and logged once.
 
@@ -103,15 +103,20 @@ tests run without a runtime.
      dropped. Otherwise the source becomes the locked peer.
    - **Freshness.** The datagram is dropped unless `seq.wrapping_sub(last_seq) as i32 > 0`. After a
      timeout, any `seq` is accepted, so a client that restarts is picked up again.
-   - **Edges.** The new `buttons` are diffed against the last accepted state, and the result is
+   - **Edges.** The first datagram after a timeout makes no edges: its buttons are taken as
+     already held, so a reconnecting client never fires the skill on a button it was holding.
+     After that, the new `buttons` are diffed against the last accepted state, and the result is
      OR-ed into the pending `pressed` / `released` sets. Edges are therefore found per datagram, not
      per tick, and a press and release that both land between two sends are not lost.
    - **The latest state replaces the held state.**
 3. **Send.** `pad-map` runs once and its calls go to `robotd`. This happens when the state changed
    or edges are pending and at least `1/max_hz` has passed since the last send. Otherwise it happens
    at the slot. In-between states are merged, and nothing accumulates.
-4. **Periodic tick.** While the client is alive, `pad-map` also runs every `1/max_hz` even with no
-   new datagram. This keeps hold timing and `Continuous`'s heartbeat the same as `padd`'s.
+4. **Fallback tick.** While the client is alive, `pad-map` also runs every `HEARTBEAT` (100 ms,
+   `padd`'s own) even with no new datagram, so hold timing and the stationary heartbeat continue
+   across lost packets. It is deliberately slower than `1/max_hz`: a periodic tick at the cap would
+   keep every slot occupied and make a real change wait for the next one. The client's keepalive
+   carries the steady state at `hz`.
 5. **Timeout.** If no datagram is accepted for `timeout_ms`, `netpadd` sends **nothing**, as `padd`
    does with no pad. `robotd`'s deadman (`[safety] deadman_ms`, 500) holds the robot, holds in
    flight are reset (`HoldButton::reset`), and the peer lock is released. The transition is logged
@@ -119,8 +124,8 @@ tests run without a runtime.
 
 **Writes to `robotd`** are bounded by `tokio::time::timeout` at one send interval. A `robotd` that
 stops reading must not freeze the receive loop and let datagrams pile up behind it. A timed-out or
-failed write closes the connection, and `netpadd` reconnects with the same 5 s back-off `padd` has
-from systemd. The `robot.mode` question asked once a second (roller shaping) is also
+failed write ends the process: `Restart=always` brings `netpadd` back after 5 s, exactly as `padd`
+does when `robotd` goes away. Exiting also drops every belief about the robot (`up`, the mode). The `robot.mode` question asked once a second (roller shaping) is also
 timeout-bounded, and its reply is read on the same connection.
 
 `timeout_ms` must be below `deadman_ms`, or `netpadd` would keep re-sending a dead client's last
@@ -137,7 +142,7 @@ enforces that) and commented defaults in `deploy/robotd.toml`:
 | key | default | |
 |---|---|---|
 | `enabled` | `false` | UDP is the pad source and `padd` stands down |
-| `port` | `4210` | UDP port, bound on all interfaces |
+| `port` | `4210` | UDP port, bound on IPv4 `0.0.0.0` |
 | `max_hz` | `30` | cap on how often intents are sent to `robotd`; 1–100, refused outside |
 | `timeout_ms` | `250` | silence after which the client counts as gone; must be < `[safety] deadman_ms` |
 
@@ -152,9 +157,9 @@ updater runs `systemctl restart` on every shipped unit with an `[Install]` secti
 
 Instead, **the selector is the config key**, and each unit asks it before starting:
 
-- **`padd.service`** gains `ExecCondition=/opt/robot/daemon/current/bin/padd --standing-down`. It
+- **`padd.service`** gains `ExecCondition=/opt/robot/daemon/current/bin/padd --should-run`. It
   exits 1, so systemd skips the unit, when `[netpad] enabled = true`, and 0 otherwise.
-- **`netpadd.service`** has `ExecCondition=… netpadd --selected`, the inverse.
+- **`netpadd.service`** has `ExecCondition=… netpadd --should-run`, the inverse.
 
 A skipped condition is not a failure, so `Restart=always` does not loop and the update's restart
 step still succeeds. Boot, update and manual restarts all reach the same answer from the same key. A
@@ -164,7 +169,7 @@ somebody without a pad.
 `netpadd.service` copies `padd.service`'s hardening, with these differences:
 
 - `User=netpadd`, with only the `robot` group added, and no `input`.
-- `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`.
+- `RestrictAddressFamilies=AF_UNIX AF_INET`. It binds IPv4 `0.0.0.0` only.
 - `RuntimeDirectory=netpadd` for `identity.json`, so `robotctl health` and the updater's startup
   check see it the way they see `padd`.
 
