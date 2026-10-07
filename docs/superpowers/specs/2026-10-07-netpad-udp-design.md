@@ -87,12 +87,18 @@ One datagram per state. Every field is little-endian, and the whole packet is 28
 
 ## 3. The receive path
 
-`netpadd` is a single thread around one UDP socket. There are no locks and no channels.
+`netpadd` runs on tokio: a `current_thread` runtime and **one task** that owns the
+`tokio::net::UdpSocket`, the connection to `robotd` (`tokio::net::UnixStream`) and the receive state.
+There are no locks and no channels: one task means a single owner, and a single thread means no
+scheduling jitter from a work-stealing pool. The decision logic is a pure state machine
+(`(time, source, bytes)` in, "send now / next deadline" out), so the tokio loop is thin glue and the
+tests run without a runtime.
 
-1. **It blocks in `recv` with a timeout set to the next deadline:** the next send slot, the
-   periodic tick, or the client timeout.
-2. **When a datagram arrives, it drains the socket non-blocking until `WouldBlock`.** Each datagram
-   is then handled in arrival order:
+1. **The loop waits in `tokio::select!` (`biased`, socket first).** One arm is `recv_from`; the
+   other is `sleep_until` the next deadline: the next send slot, the periodic tick, or the client
+   timeout.
+2. **When a datagram arrives, it drains the socket with `try_recv_from` until `WouldBlock`.** Each
+   datagram is then handled in arrival order:
    - **Peer lock.** If a peer is locked and the source address is a different one, the datagram is
      dropped. Otherwise the source becomes the locked peer.
    - **Freshness.** The datagram is dropped unless `seq.wrapping_sub(last_seq) as i32 > 0`. After a
@@ -110,6 +116,12 @@ One datagram per state. Every field is little-endian, and the whole packet is 28
    does with no pad. `robotd`'s deadman (`[safety] deadman_ms`, 500) holds the robot, holds in
    flight are reset (`HoldButton::reset`), and the peer lock is released. The transition is logged
    once at `warn` in each direction.
+
+**Writes to `robotd`** are bounded by `tokio::time::timeout` at one send interval. A `robotd` that
+stops reading must not freeze the receive loop and let datagrams pile up behind it. A timed-out or
+failed write closes the connection, and `netpadd` reconnects with the same 5 s back-off `padd` has
+from systemd. The `robot.mode` question asked once a second (roller shaping) is also
+timeout-bounded, and its reply is read on the same connection.
 
 `timeout_ms` must be below `deadman_ms`, or `netpadd` would keep re-sending a dead client's last
 state up to the deadman. A config that breaks this is refused at load and the error names both keys.
@@ -178,7 +190,7 @@ The plan must also:
 - **`pad-map`:** `padd`'s existing tests, moved. They pass unchanged before and after the refactor.
 - **Wire:** a round trip; rejection of bad magic, short packets and unknown versions; an over-long
   v1 packet accepted.
-- **Receive logic, as a pure state machine fed `(time, source, bytes)`:**
+- **Receive logic, as the pure state machine of §3 (no runtime needed):**
   - `seq` ordering, wrap at `u32::MAX`, and acceptance of any `seq` after a timeout
   - peer lock and its release
   - press and release inside one send interval producing a tap
