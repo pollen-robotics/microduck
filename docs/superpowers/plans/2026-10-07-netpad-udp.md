@@ -35,7 +35,7 @@ from it.
   |---|---|---|
   | `enabled` | `false` | |
   | `port` | `4210` | |
-  | `max_hz` | `30` | 1–100, refused outside |
+  | `max_hz` | `30` | 10–100, refused outside |
   | `timeout_ms` | `250` | must be `< [safety] deadman_ms` |
 
 - **No version-difference workarounds.** A skew is logged and served. Only a malformed or
@@ -108,7 +108,7 @@ from it.
     /// The cap is a divisor and a promise about latency: zero divides by it, and a rate above
     /// what a pad link carries only spends the robot's socket.
     #[test]
-    fn netpad_max_hz_outside_one_to_a_hundred_is_refused() {
+    fn netpad_max_hz_outside_ten_to_a_hundred_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         for bad in ["0", "101"] {
             let path = write(dir.path(), &format!("[netpad]\nmax_hz = {bad}\n"));
@@ -206,10 +206,10 @@ impl Default for NetpadParams {
 ```rust
         // Refused rather than clamped, like `control.hz`: the editor should say which value it
         // was not going to guess at.
-        if !(1..=100).contains(&self.netpad.max_hz) {
+        if !(10..=100).contains(&self.netpad.max_hz) {
             return Err(ParamsError::Netpad {
                 path: path.display().to_string(),
-                reason: format!("netpad.max_hz ({}) must be 1–100", self.netpad.max_hz),
+                reason: format!("netpad.max_hz ({}) must be 10–100", self.netpad.max_hz),
             });
         }
         if self.netpad.timeout_ms == 0 || self.netpad.timeout_ms >= self.safety.deadman_ms {
@@ -2323,7 +2323,7 @@ pub fn run(host: &str, hz: u32) -> Result<(), Box<dyn std::error::Error>> {
         /// The duck's address, optionally with `:port` (default 4210).
         host: String,
         /// Most datagrams a second.
-        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=100))]
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
         hz: u32,
     },
 ```

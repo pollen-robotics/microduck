@@ -2365,11 +2365,12 @@ impl Params {
             }
         }
         // Refused rather than clamped, like `control.hz`: the editor should say which value it
-        // was not going to guess at.
-        if !(1..=100).contains(&self.netpad.max_hz) {
+        // was not going to guess at. The floor is 10 because netpadd's 100 ms fallback tick must
+        // not be faster than the cap, and below a few Hz a held stick would outrun robotd's deadman.
+        if !(10..=100).contains(&self.netpad.max_hz) {
             return Err(ParamsError::Netpad {
                 path: path.display().to_string(),
-                reason: format!("netpad.max_hz ({}) must be 1–100", self.netpad.max_hz),
+                reason: format!("netpad.max_hz ({}) must be 10–100", self.netpad.max_hz),
             });
         }
         // Gated on `enabled` because robotd loads this file too: a board not using netpad must
@@ -3555,15 +3556,20 @@ mod tests {
     /// The cap is a divisor and a promise about latency: zero divides by it, and a rate above
     /// what a pad link carries only spends the robot's socket.
     #[test]
-    fn netpad_max_hz_outside_one_to_a_hundred_is_refused() {
+    fn netpad_max_hz_outside_ten_to_a_hundred_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        for bad in ["0", "101"] {
+        for bad in ["0", "9", "101"] {
             let path = write(dir.path(), &format!("[netpad]\nmax_hz = {bad}\n"));
             let error = Params::load(&path, true).expect_err("refused").to_string();
             assert!(error.contains("netpad.max_hz"), "{error}");
         }
-        let path = write(dir.path(), "[netpad]\nmax_hz = 100\n");
-        assert_eq!(Params::load(&path, true).expect("valid").netpad.max_hz, 100);
+        for good in [10, 100] {
+            let path = write(dir.path(), &format!("[netpad]\nmax_hz = {good}\n"));
+            assert_eq!(
+                Params::load(&path, true).expect("valid").netpad.max_hz,
+                good
+            );
+        }
     }
 
     /// A client timeout at or past the deadman would keep re-sending a dead client's last

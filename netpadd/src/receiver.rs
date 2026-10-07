@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use pad_map::wire::{Packet, WireError};
 use pad_map::{Buttons, PadFrame};
 
+/// Assumes `min_interval <= fallback`, which `[netpad] max_hz >= 10` guarantees in robotd-params.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     /// `1 / [netpad] max_hz`.
@@ -59,6 +60,7 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(timing: Timing) -> Self {
+        debug_assert!(timing.min_interval <= timing.fallback);
         Self {
             timing,
             peer: None,

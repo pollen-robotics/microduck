@@ -561,5 +561,5 @@ mode = "walk"
 # [netpad]
 # enabled = false
 # port = 4210
-# max_hz = 30          # intent frames a second to robotd, at most
+# max_hz = 30          # intent frames a second to robotd, at most, 10–100
 # timeout_ms = 250     # silence that counts as the client gone; below [safety] deadman_ms

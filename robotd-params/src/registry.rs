@@ -543,7 +543,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "netpad.max_hz",
         Kind::Integer,
-        "Most intent frames a second sent to robotd, 1–100",
+        "Most intent frames a second sent to robotd, 10–100",
     ),
     entry(
         "netpad.timeout_ms",

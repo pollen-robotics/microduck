@@ -143,7 +143,7 @@ enforces that) and commented defaults in `deploy/robotd.toml`:
 |---|---|---|
 | `enabled` | `false` | UDP is the pad source and `padd` stands down |
 | `port` | `4210` | UDP port, bound on IPv4 `0.0.0.0` |
-| `max_hz` | `30` | cap on how often intents are sent to `robotd`; 1–100, refused outside |
+| `max_hz` | `30` | cap on how often intents are sent to `robotd`; 10–100, refused outside |
 | `timeout_ms` | `250` | silence after which the client counts as gone; must be < `[safety] deadman_ms` |
 
 All four are read at startup. Changing one takes a restart of `padd` and `netpadd` (§5).
