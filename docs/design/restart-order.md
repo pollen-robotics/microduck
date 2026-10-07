@@ -255,9 +255,9 @@ would leave the robot with no pad and nothing saying so.
 ## 4. At boot
 
 systemd starts the daemons from `multi-user.target`, and `robot-boot-check.timer` arms the
-recovery check for 180 seconds in. There is **no ordering between the daemons**
-beyond `padd` after `robotd` (advisory — `padd` exits and retries every 5 s if the socket is absent)
-and `btd` after `dbus`/`bluetooth`. Nothing waits on `updaterd`, and `updaterd` waits on nothing but
+recovery check for 180 seconds in. There is **no ordering between the daemons** beyond `padd` and
+`netpadd` after `robotd` (advisory — each exits and retries every 5 s if the socket is absent) and
+`btd` after `dbus`/`bluetooth`. Nothing waits on `updaterd`, and `updaterd` waits on nothing but
 `network-online.target`, which is `Wants` rather than `Requires`.
 
 On this board `hci0` does not exist until roughly 73 s after power-on, so `btd` retries for an

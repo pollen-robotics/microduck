@@ -179,8 +179,9 @@ The plan must also:
 - **Sequence numbers.** `seq` starts at a random value, so a restart cannot look like a stale
   sender.
 - **No pad on the laptop:** it sends nothing, and the robot times out.
-- **Output.** It prints one status line: packets sent, and the current mode guessed from D-pad
-  edges.
+- **Output.** It prints a running count of packets sent, and a line when something changes: a
+  send failing (with the likely cause when nothing is listening), sends recovering, and the pad
+  on the laptop found or gone.
 
 ## 7. Testing
 
