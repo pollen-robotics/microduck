@@ -3239,6 +3239,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pad-map"
+version = "0.16.0"
+dependencies = [
+ "duck-ipc-proto",
+ "pad-imu",
+ "robotd-params",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "padd"
 version = "0.16.0"
 dependencies = [
@@ -3248,6 +3260,7 @@ dependencies = [
  "gilrs",
  "libc",
  "pad-imu",
+ "pad-map",
  "robotd-params",
  "serde",
  "serde_json",

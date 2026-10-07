@@ -1,0 +1,16 @@
+[package]
+name = "pad-map"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "What a gamepad means to a duck: pad state in, intents out — shared by padd and netpadd"
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+robotd-params = { path = "../robotd-params" }
+pad-imu = { path = "../pad-imu" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

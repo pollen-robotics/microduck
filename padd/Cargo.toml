@@ -27,6 +27,8 @@ robotd-params = { path = "../robotd-params" }
 # The pad's IMU as an attitude — the same filter `robotctl monitor` draws from, so the head goes
 # where the picture says the pad is.
 pad-imu = { path = "../pad-imu" }
+# What a button means: the mapping itself, shared with `netpadd` so the two never drift.
+pad-map = { path = "../pad-map" }
 clap = { workspace = true, features = ["derive"] }
 gilrs = "0.11"
 # Only to serialise the tap's own lines; the wire types themselves live in duck-ipc-proto.
