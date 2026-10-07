@@ -2907,6 +2907,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
+name = "netpadd"
+version = "0.16.0"
+dependencies = [
+ "clap",
+ "duck-ipc-proto",
+ "pad-map",
+ "robotd-params",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nfc"
 version = "0.16.0"
 dependencies = [

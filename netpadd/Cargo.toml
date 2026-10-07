@@ -1,0 +1,20 @@
+[package]
+name = "netpadd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A gamepad over UDP, from a program on the LAN, as an intent client"
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+pad-map = { path = "../pad-map" }
+robotd-params = { path = "../robotd-params" }
+clap = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "test-util"] }
+tempfile = "3.27.0"
