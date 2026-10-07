@@ -3,9 +3,9 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib>=3.8", "numpy>=1.26", "pandas>=2.1"]
 # ///
-"""Charts and a summary for a run of `endurance.py`.
+"""Charts and a summary for a run of `robotctl endurance`.
 
-    uv run scripts/battery-test/plot.py <run dir> [<run dir> ...]
+    uv run scripts/endurance-plot.py <run dir> [<run dir> ...]
 
 Writes into each run directory:
 
@@ -387,7 +387,7 @@ def compare(runs: list[tuple[Path, pd.DataFrame]], out: Path) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("runs", nargs="+", type=Path, help="run directories written by endurance.py")
+    p.add_argument("runs", nargs="+", type=Path, help="run directories written by robotctl endurance")
     args = p.parse_args()
     loaded = []
     for run in args.runs:

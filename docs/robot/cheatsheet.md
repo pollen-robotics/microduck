@@ -498,6 +498,34 @@ pause while the robot is walking normally (the walk freezes for a moment, then r
 that stays paused after being put down. `pause_threshold` and `resume_threshold` in the
 same section move the two edges; the design is [`robotd-design.md` §2.4.2](../design/robotd-design.md).
 
+### Battery and heat test
+
+```
+sudo robotctl endurance
+robotctl endurance status
+sudo robotctl endurance stop
+```
+
+Walks, stands and sits at random, for random lengths, within half a metre of where it started, until
+the battery is empty — and logs the charge, every thermal zone, the CPU clock and throttle, servo
+temperature and current, and odometry every 10 s. It starts in the background as the
+`robotctl-endurance` unit and returns, so you can close the ssh session; `journalctl -u
+robotctl-endurance -f` is the live view. Put the robot on clear floor first, with no pad connected:
+an idle pad sends zero velocities that cancel these.
+
+At 0% `robotd` sits the robot down and powers off by itself; from 2% on the test stops driving so as
+not to fight that, and only logs. Every row is on disk as it is written, so after the reboot the run
+is in `/var/lib/endurance/<hostname>-<time>/` — `samples.csv`, `events.csv`, `meta.json`. Copy it
+off and draw it on your machine:
+
+```
+scp -r microduck@<duck>:/var/lib/endurance/ . && uv run scripts/endurance-plot.py endurance/<run>
+```
+
+`stop` leaves the robot standing. `--dry-run` logs without moving — the idle-drain baseline — and
+`--out` on an existing run directory appends to it, so a restarted test stays one battery curve.
+Walk speed, turn rate, the radius and the activity mix are options; `--help` lists them.
+
 ### Gamepad (`configd`)
 
 What each button *does* — and how to change it — is under **Policies and skills** above
