@@ -72,7 +72,7 @@ address (`duck.local:4210`) overrides the default, and `--hz` (10 to 100, defaul
 will send a second. It sends the moment anything changes and otherwise a keepalive every `1/hz`, so
 the robot can tell a still pad from a gone one. With no pad on the laptop it sends nothing, and the
 robot times it out as it would a Bluetooth pad that went away. `Ctrl-C` ends it, and the robot
-stops within `timeout_ms`.
+stops once `robotd`'s deadman runs out.
 
 ## Writing your own sender
 
@@ -106,7 +106,7 @@ for b in (64, 0, 64, 0):                  # Start, release, Start, release
     s.sendto(pkt(seq, 0, b), ("duck.local", 4210)); seq += 1; time.sleep(1.5)
 for _ in range(90):                        # 3 s forward at 30 Hz
     s.sendto(pkt(seq, 32767), ("duck.local", 4210)); seq += 1; time.sleep(1/30)
-# then silence: the robot stops
+# then silence: the robot stops once the deadman runs out
 ```
 
 The rules a sender follows, and why:
