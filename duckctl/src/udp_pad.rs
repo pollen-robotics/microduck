@@ -128,7 +128,7 @@ fn target(host: &str) -> String {
     }
 }
 
-const GILRS: [(Button, Buttons); 12] = [
+const GILRS: [(Button, Buttons); 13] = [
     (Button::South, Buttons::A),
     (Button::East, Buttons::B),
     (Button::West, Buttons::X),
@@ -141,6 +141,8 @@ const GILRS: [(Button, Buttons); 12] = [
     (Button::DPadDown, Buttons::DOWN),
     (Button::DPadLeft, Buttons::LEFT),
     (Button::DPadRight, Buttons::RIGHT),
+    // Home — Xbox, PS. gilrs calls the middle button `Mode`.
+    (Button::Mode, Buttons::HOME),
 ];
 
 /// How often the pad is read. Faster than any `hz` worth sending, so a change is seen within a

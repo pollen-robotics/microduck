@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use pad_map::{Config, Continuous, HEARTBEAT, Mapper, Out};
+use duck_ipc_proto as proto;
+use pad_map::{Config, Continuous, HEARTBEAT, Mapper, Out, PadLoss, PadLossAction};
 use receiver::{Accept, Receiver, Step, Timing};
 
 #[derive(Parser, Debug)]
@@ -172,9 +173,15 @@ async fn serve(
         .ok();
     let (mut malformed, mut malformed_logged) = (0u64, None::<Instant>);
     let mut reserved_logged = false;
+    // A client that was driving and went quiet: the robot sits after a second — `pad_map::loss`,
+    // the same as `padd` does for a Bluetooth pad.
+    let mut pad_loss = PadLoss::default();
 
     loop {
-        let wake = rx.deadline().map_or(housekeeping, |d| d.min(housekeeping));
+        let mut wake = rx.deadline().map_or(housekeeping, |d| d.min(housekeeping));
+        if pad_loss.pending() {
+            wake = wake.min(Instant::now() + pad_map::loss::PAD_LOST_POLL);
+        }
         tokio::select! {
             biased;
             got = socket.recv_from(&mut buf) => {
@@ -184,7 +191,16 @@ async fn serve(
                 while let Some((n, from)) = next {
                     let now = Instant::now();
                     match rx.on_datagram(now, from, &buf[..n]) {
-                        Accept::Connected => tracing::warn!(%from, "pad client connected — driving"),
+                        Accept::Connected => {
+                            tracing::warn!(%from, "pad client connected — driving");
+                            // What it holds was pressed before we saw it. `Gone` already spent a
+                            // hold in flight; this covers the first client after a start, which
+                            // had no `Gone` before it — every update, every `robotctl configure`.
+                            mapper.pad_gone();
+                            if pad_loss.found() {
+                                sound(&mut robot, proto::SoundTag::Greet).await;
+                            }
+                        }
                         Accept::Malformed(e) => {
                             malformed += 1;
                             if malformed_logged.is_none_or(|at| now.duration_since(at) >= MALFORMED_LOG) {
@@ -229,13 +245,37 @@ async fn serve(
             }
         }
 
+        match pad_loss.tick(now) {
+            PadLossAction::Nothing => {}
+            PadLossAction::Sit => match sit_if_standing(&mut robot).await {
+                Ok(true) => pad_loss.settle(),
+                // Refused — mid-move, typically. Asked again on the next poll.
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "sit request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            },
+            PadLossAction::GiveUp => {
+                tracing::warn!(
+                    "pad gone: the robot would not sit after {:?} of asking — leaving it as it is",
+                    pad_map::loss::PAD_LOST_SIT_TRIES
+                );
+                pad_loss.settle();
+            }
+        }
+
         match rx.poll(now) {
             Step::Idle => {}
             Step::Gone => {
                 tracing::warn!(
-                    "pad client gone — sending nothing; robotd's deadman holds the robot"
+                    "pad client gone — robotd's deadman stops the walking; sitting down in {:?}",
+                    pad_map::loss::PAD_LOST_SIT
                 );
                 mapper.pad_gone();
+                pad_loss.lost(now);
+                // Heard, because whoever lost the pad is looking at the robot, not the journal.
+                sound(&mut robot, proto::SoundTag::Inquire).await;
             }
             Step::Tick(pad) => {
                 mapper.tick(&pad, &config, now, &mut out, &mut frame);
@@ -266,6 +306,25 @@ async fn serve(
     }
 }
 
+/// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.
+async fn sound(robot: &mut robotd::Robotd, tag: proto::SoundTag) {
+    if let Err(e) = robot.notify(&pad_map::loss::sound(tag)).await {
+        tracing::debug!(error = %e, "sound not sent");
+    }
+}
+
+/// Sit the robot down unless it is sitting already. `Ok(true)` when there is nothing left to do,
+/// `Ok(false)` when the robot refused for a reason that passes — `pad_map::loss` reads the
+/// answers.
+async fn sit_if_standing(robot: &mut robotd::Robotd) -> std::io::Result<bool> {
+    let policies = robot.request(&proto::Call::RobotPolicies).await?;
+    if pad_map::loss::already_sitting(policies.as_ref()) {
+        return Ok(true);
+    }
+    let answer = robot.request(&pad_map::loss::sit_call()).await?;
+    Ok(pad_map::loss::sit_settled(answer.as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,8 +332,10 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// A fake robotd: answers every request with an accepted IntentResult, and `robot.mode`
-    /// with walk; collects every method name it is sent.
-    async fn fake_robotd(path: std::path::PathBuf) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    /// with walk; collects every method it is sent, with its params.
+    async fn fake_robotd(
+        path: std::path::PathBuf,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)> {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -296,7 +357,7 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                let _ = tx.send(method);
+                let _ = tx.send((method, v["params"].clone()));
             }
         });
         rx
@@ -334,24 +395,131 @@ mod tests {
             let m = tokio::time::timeout_at(deadline, seen.recv())
                 .await
                 .expect("a move in 2 s");
-            methods.push(m.unwrap());
+            methods.push(m.unwrap().0);
         }
         assert_eq!(methods[0], "robot.mode", "the roller question comes first");
         // Alive on both sides of the silence: a `serve` that had returned would send nothing too,
         // and pass the silence check below for the wrong reason.
         assert!(!serving.is_finished(), "serve exited while driving");
 
-        // Silence: after the timeout nothing more is sent.
+        // Silence: after the timeout no motion is sent. (What is sent instead — the sound, then
+        // the sit — is `a_client_gone_sits_the_robot_after_a_second`.)
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         while seen.try_recv().is_ok() {}
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let late: Vec<_> = std::iter::from_fn(|| seen.try_recv().ok())
-            .filter(|m| m != "robot.mode")
+            .map(|(m, _)| m)
+            .filter(|m| m == "robot.move" || m == "robot.head" || m == "robot.pose")
             .collect();
         assert!(
             late.is_empty(),
-            "sent after the client went quiet: {late:?}"
+            "motion sent after the client went quiet: {late:?}"
         );
         assert!(!serving.is_finished(), "serve exited during the silence");
+    }
+
+    /// Start `serve` against a fake robotd, and a client socket aimed at it.
+    async fn start() -> (
+        tempfile::TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+        tokio::task::JoinHandle<std::process::ExitCode>,
+        tokio::net::UdpSocket,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("robotd.sock");
+        let seen = fake_robotd(sock.clone()).await;
+        let mut params = robotd_params::Params::default();
+        params.netpad.port = 0;
+        let (port_tx, port_rx) = tokio::sync::oneshot::channel();
+        let args = Args::for_test(sock, dir.path().join("none.toml"));
+        let serving = tokio::spawn(serve(args, params, Some(port_tx)));
+        let port = port_rx.await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(("127.0.0.1", port)).await.unwrap();
+        (dir, seen, serving, client)
+    }
+
+    /// Send `buttons` at 30 Hz for `ms`, from `seq` on; returns the next seq.
+    async fn hold(
+        client: &tokio::net::UdpSocket,
+        mut seq: u32,
+        buttons: pad_map::Buttons,
+        ms: u64,
+    ) -> u32 {
+        let until = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while tokio::time::Instant::now() < until {
+            let p = Packet::from_axes(seq, 0, [0.0; 4], [0.0, 0.0], buttons);
+            client.send(&p.encode()).await.unwrap();
+            seq = seq.wrapping_add(1);
+            tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+        }
+        seq
+    }
+
+    fn drain(
+        seen: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> Vec<(String, serde_json::Value)> {
+        std::iter::from_fn(|| seen.try_recv().ok())
+            .filter(|(m, _)| m != "robot.mode")
+            .collect()
+    }
+
+    /// The first client after `netpadd` starts — at every update and every `robotctl configure`
+    /// — already holding Start. No `Gone` came first to spend the hold, so the connection must:
+    /// letting go stands nothing up.
+    #[tokio::test]
+    async fn a_first_client_holding_start_stands_nothing_up() {
+        let (_dir, mut seen, serving, client) = start().await;
+        let seq = hold(&client, 1, pad_map::Buttons::START, 400).await;
+        hold(&client, seq, pad_map::Buttons::NONE, 200).await;
+        let sent = drain(&mut seen);
+        assert!(
+            !sent
+                .iter()
+                .any(|(m, _)| m == "robot.init" || m == "robot.enable"),
+            "{sent:?}"
+        );
+        assert!(!serving.is_finished());
+    }
+
+    /// The client going quiet is a pad going away, as `padd` has it: the robot asks where it went,
+    /// sits a second later, and greets it when it comes back.
+    #[tokio::test]
+    async fn a_client_gone_sits_the_robot_after_a_second() {
+        let (_dir, mut seen, serving, client) = start().await;
+        let seq = hold(&client, 1, pad_map::Buttons::NONE, 100).await;
+        drain(&mut seen);
+
+        // Silent: gone at timeout_ms (250), the sit due a second after that.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let early = drain(&mut seen);
+        assert!(
+            early
+                .iter()
+                .any(|(m, p)| m == "robot.sound" && p["tag"] == "inquire"),
+            "the robot asks where the pad went: {early:?}"
+        );
+        assert!(
+            !early.iter().any(|(m, _)| m == "robot.do"),
+            "not yet: {early:?}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let later = drain(&mut seen);
+        assert!(
+            later
+                .iter()
+                .any(|(m, p)| m == "robot.do" && p["skill"] == "sit_toggle"),
+            "sits after a second: {later:?}"
+        );
+
+        hold(&client, seq.wrapping_add(1000), pad_map::Buttons::NONE, 100).await;
+        let back = drain(&mut seen);
+        assert!(
+            back.iter()
+                .any(|(m, p)| m == "robot.sound" && p["tag"] == "greet"),
+            "greeted: {back:?}"
+        );
+        assert!(!serving.is_finished());
     }
 }

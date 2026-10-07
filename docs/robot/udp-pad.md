@@ -73,8 +73,8 @@ It reads the first gamepad plugged into the laptop and sends its state. A port o
 address (`duck.local:4210`) overrides the default, and `--hz` (10 to 100, default 30) is the most it
 will send a second. It sends the moment anything changes and otherwise a keepalive every `1/hz`, so
 the robot can tell a still pad from a gone one. With no pad on the laptop it sends nothing, and the
-robot times it out as it would a Bluetooth pad that went away. `Ctrl-C` ends it, and the robot
-stops once `robotd`'s deadman runs out.
+robot times it out as it would a Bluetooth pad that went away. `Ctrl-C` ends it: the robot stops
+once `robotd`'s deadman runs out, and sits down a second after that.
 
 ## Writing your own sender
 
@@ -88,10 +88,10 @@ One datagram carries the whole state. Every field is little-endian, and the pack
 | 6 | 4 | seq | u32, +1 per datagram, wraps |
 | 10 | 4 | t_ms | u32, the sender's own clock; logged for jitter, never compared with the robot's |
 | 14 | 12 | axes | i16 ×6: lx ly rx ry (±32767 maps to ±1, up is positive), lt rt (0..32767 maps to 0..1) |
-| 26 | 2 | buttons | u16: bit 0 A, 1 B, 2 X, 3 Y, 4 LB, 5 RB, 6 Start, 7 Select, 8 Up, 9 Down, 10 Left, 11 Right |
+| 26 | 2 | buttons | u16: bit 0 A, 1 B, 2 X, 3 Y, 4 LB, 5 RB, 6 Start, 7 Select, 8 Up, 9 Down, 10 Left, 11 Right, 12 Home |
 
 Send raw stick values. The robot applies the deadzone, as it does for a Bluetooth pad, so a sender
-that applies its own would do it twice. Bits 12 to 15 of `buttons` are reserved: the receiver
+that applies its own would do it twice. Bits 13 to 15 of `buttons` are reserved: the receiver
 ignores them and logs it once. A version-1 packet *longer* than 28 bytes is accepted and the tail is
 ignored, so a field can be added later without a version bump.
 
@@ -120,7 +120,7 @@ hold(5, buttons=START); hold(60)              # tap Start: robot.init, and 2 s t
 hold(5, buttons=START); hold(10)              # tap Start again: the policy on
 hold(90, ly=32767)                            # 3 s forward
 s.sendto(pkt((seq - 50) % 2**32, ly=-32767), DUCK)  # stale: dropped, never walks backwards
-# then silence: netpadd sends nothing, and robotd's deadman stops the robot
+# then silence: robotd's deadman stops the robot, and it sits down a second later
 ```
 
 The rules a sender follows, and why:
@@ -145,12 +145,16 @@ The rules a sender follows, and why:
 - **The first sender holds it.** The robot locks to the address of the first datagram it accepts and
   drops datagrams from any other address until that one has been silent for `timeout_ms`. Two
   people cannot fight over one duck.
-- **Silence is the client gone.** After `timeout_ms` with nothing accepted, `netpadd` sends *nothing*,
-  exactly as `padd` does with no pad, and `robotd`'s deadman (`[safety] deadman_ms`) holds the
-  robot. In-flight holds are reset and the lock is released. The journal says so once, at `warn`,
-  in each direction: `pad client connected` and `pad client gone`.
-- **The first datagram after a silence fires nothing.** Its buttons are taken as already held, so a
-  client that reconnects with Start down does not stand the robot up or sit it down — not when it
+- **Silence is the client gone.** After `timeout_ms` with nothing accepted, `netpadd` sends no more
+  stick commands, and `robotd`'s deadman (`[safety] deadman_ms`) stops the walking. In-flight holds
+  are reset and the lock is released. Then it does what `padd` does when a Bluetooth pad drops
+  out: the robot asks where the pad went (a sound), and a second later sits down if it is standing,
+  so it is not left frozen in the middle of a room. A robot that refuses — mid-kick, mid-rise — is
+  asked again for a few seconds, then left as it is. While it waits, `robotd` has it look around
+  on its own. The client coming back is greeted with another sound. The journal says so once, at
+  `warn`, in each direction: `pad client connected` and `pad client gone`.
+- **The first datagram after a silence, or after `netpadd` starts, fires nothing.** Its buttons
+  are taken as already held, so a client that connects with Start down does not stand the robot up or sit it down — not when it
   comes back, not while it stays down, not when it is let go. Any sequence number is accepted after
   a silence, so a restarted sender is picked up within `timeout_ms`: until the old one counts as
   gone, the new sender's random `seq` may read as stale and be dropped.
