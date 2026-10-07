@@ -143,6 +143,11 @@ struct Args {
     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
     config: PathBuf,
 
+    /// Exit 0 if this daemon should run — `[netpad] enabled` is off — and 1 if `netpadd` has the
+    /// pad. For `ExecCondition=`; nothing else is started.
+    #[arg(long)]
+    should_run: bool,
+
     /// How often to read the pad, 1–1000 Hz. Matching the control rate exactly buys nothing —
     /// the loop reads the latest value once per tick — but staying at or above it keeps the
     /// added latency under one tick.
@@ -225,6 +230,14 @@ fn main() -> std::process::ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if args.should_run {
+        return if pad_map::udp_selected(&args.config) {
+            std::process::ExitCode::from(1)
+        } else {
+            std::process::ExitCode::SUCCESS
+        };
+    }
 
     // Before anything that can fail, and before the gamepad subsystem especially: `padd` was the
     // one daemon whose journal could not say which build was running, which came up while chasing

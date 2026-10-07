@@ -32,3 +32,22 @@ pub fn udp_selected(config: &std::path::Path) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_selector_reads_netpad_enabled_and_a_bad_file_keeps_bluetooth() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("robotd.toml");
+        std::fs::write(&p, "[netpad]\nenabled = true\n").unwrap();
+        assert!(super::udp_selected(&p));
+        std::fs::write(&p, "[netpad]\nenabled = false\n").unwrap();
+        assert!(!super::udp_selected(&p));
+        std::fs::write(&p, "[netpad\n").unwrap();
+        assert!(!super::udp_selected(&p), "unreadable → padd");
+        assert!(
+            !super::udp_selected(&dir.path().join("missing.toml")),
+            "absent → defaults → padd"
+        );
+    }
+}
