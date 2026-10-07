@@ -29,8 +29,8 @@ pub struct HoldButton {
     held_since: Option<Instant>,
     /// How many thresholds this hold has crossed.
     fired: usize,
-    /// The pad went away during a hold that had already fired. Whatever is still held when it
-    /// comes back is the tail of that hold, and does nothing until the release.
+    /// The pad went away during a hold. Whatever is still held when it comes back is the tail of
+    /// that hold, and does nothing until the release.
     spent: bool,
 }
 
@@ -87,14 +87,15 @@ impl HoldButton {
     /// against *that* pad's button, and carrying it onto the next pad would turn a button still
     /// held across a long dropout into its longest action on the first tick back.
     ///
-    /// A hold that already fired is marked spent rather than forgotten, because what it did is a
-    /// fact about the robot rather than about the pad: the release that follows must stay silent,
-    /// and the rest of the hold must not reach the next threshold from a fresh start.
+    /// The hold is marked spent rather than forgotten, fired or not. A button still down when the
+    /// pad comes back was pressed against the pad that left, and the reconnection carries no edge
+    /// to say so: timed from a fresh start, its release would be a tap (Start's `robot.init`, a
+    /// rest from Select) and its length could reach a threshold nobody asked for. A hold that did
+    /// fire must also keep its release silent. `spent` clears on the first tick that reads the
+    /// button up, so a pad that comes back with nothing held loses nothing.
     pub fn reset(&mut self) {
         self.held_since = None;
-        if self.fired > 0 {
-            self.spent = true;
-        }
+        self.spent = true;
     }
 }
 
@@ -209,6 +210,42 @@ mod tests {
             ),
             HoldAction::Reached(0)
         );
+    }
+
+    /// A pad dropping out mid-hold, before anything fired, spends the hold too: the button still
+    /// down when the pad comes back is the tail of a press made to the pad that left, and
+    /// neither its length nor its release is a request. Only a release seen after the reset
+    /// makes the next press an ordinary one again.
+    #[test]
+    fn a_pad_dropout_before_a_threshold_spends_the_hold_too() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut start = HoldButton::default();
+        assert_eq!(start.tick(true, false, at(0), &START), HoldAction::Nothing);
+
+        // Pad gone with Start down, back with it still down, held well past the way home.
+        start.reset();
+        assert_eq!(
+            start.tick(true, false, at(500), &START),
+            HoldAction::Nothing
+        );
+        assert_eq!(
+            start.tick(true, false, at(500) + HOME_HOLD, &START),
+            HoldAction::Nothing,
+            "a hold begun against the pad that left does not go home"
+        );
+        assert_eq!(
+            start.tick(false, true, at(3_000), &START),
+            HoldAction::Nothing,
+            "and its release is not a tap"
+        );
+
+        // Once that release has been seen, a tap is a tap again.
+        assert_eq!(
+            start.tick(true, false, at(4_000), &START),
+            HoldAction::Nothing
+        );
+        assert_eq!(start.tick(false, true, at(4_100), &START), HoldAction::Tap);
     }
 
     /// A pad dropping out after the torque cut does not let the rest of that hold power the

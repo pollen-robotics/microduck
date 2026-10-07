@@ -337,6 +337,59 @@ mod tests {
         tick(r.poll(ms(t, 100)));
     }
 
+    /// Start held when the client drops, still held when it comes back, then let go: the first
+    /// datagram back makes no edges, so without the hold being spent the mapping would time a
+    /// fresh hold from the reconnection and call the release a tap — `robot.init` from a thumb
+    /// that was only ever resting on the button. The receiver and the mapping together, as
+    /// `main.rs` wires them, ask for nothing at all.
+    #[test]
+    fn start_held_across_a_dropout_asks_for_nothing() {
+        use pad_map::{Config, Mapper, Out};
+
+        let (mut r, t) = (rx(), Instant::now());
+        let cfg = Config {
+            bindings: robotd_params::PadParams::default(),
+            imu_head: robotd_params::PadImuHeadControlParams::default(),
+            drive: robotd_params::PadDriveParams::default(),
+            deadzone: 0.1,
+            max_head: 2.5,
+            roller: false,
+        };
+        let mut mapper = Mapper::new();
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let mut requests = Vec::new();
+        let mut run = |r: &mut Receiver, now: Instant| match r.poll(now) {
+            Step::Tick(pad) => {
+                mapper.tick(&pad, &cfg, now, &mut out, &mut frame);
+                requests.extend(out.drain(..).filter(|o| matches!(o, Out::Request(_))));
+            }
+            Step::Gone => mapper.pad_gone(),
+            Step::Idle => {}
+        };
+
+        r.on_datagram(t, addr(A), &pkt(1, Buttons::NONE, 0.0));
+        run(&mut r, t);
+        r.on_datagram(ms(t, 50), addr(A), &pkt(2, Buttons::START, 0.0));
+        run(&mut r, ms(t, 50));
+        run(&mut r, ms(t, 150));
+        run(&mut r, ms(t, 300)); // the timeout: Gone, and the holds reset
+        assert_eq!(r.deadline(), None, "the client is gone");
+
+        // Back with Start still down, held for longer than the way home, then let go.
+        r.on_datagram(ms(t, 1_000), addr(A), &pkt(3, Buttons::START, 0.0));
+        let mut seq = 3;
+        for at in (1_000..=3_000).step_by(50) {
+            seq += 1;
+            r.on_datagram(ms(t, at), addr(A), &pkt(seq, Buttons::START, 0.0));
+            run(&mut r, ms(t, at));
+        }
+        r.on_datagram(ms(t, 3_050), addr(A), &pkt(seq + 1, Buttons::NONE, 0.0));
+        run(&mut r, ms(t, 3_050));
+        run(&mut r, ms(t, 3_200));
+
+        assert!(requests.is_empty(), "asked for {requests:?}");
+    }
+
     #[test]
     fn malformed_is_reported_and_changes_nothing() {
         let (mut r, t) = (rx(), Instant::now());
