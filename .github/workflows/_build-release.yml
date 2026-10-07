@@ -142,6 +142,9 @@ jobs:
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
           cp target/aarch64-unknown-linux-gnu/release/padd staged/
+          # netpadd is the same intent client fed by UDP instead of Bluetooth. Its unit is enabled
+          # beside padd's and an ExecCondition on `[netpad] enabled` picks which of the two runs.
+          cp target/aarch64-unknown-linux-gnu/release/netpadd staged/
           # mediad is the WebRTC gateway. Its unit carries an [Install] section, so postinstall
           # enables it and an update restarts it like any other daemon
           # (docs/design/restart-order.md §1). It was once shipped inert, and this comment
@@ -187,6 +190,8 @@ jobs:
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
+            --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
             --include "mediad/systemd/mediad.service=systemd/mediad.service" \
             --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \

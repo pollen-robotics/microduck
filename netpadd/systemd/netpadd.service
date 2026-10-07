@@ -1,0 +1,57 @@
+# netpadd — a gamepad over UDP, as an intent client. See netpadd/src/main.rs.
+#
+# Install to /etc/systemd/system/netpadd.service.
+#
+# Enabled at boot like padd, and exactly one of the two runs: both ask `[netpad] enabled` in
+# ExecCondition=, which is the whole selection. Not Conflicts=: the updater restarts every shipped
+# unit in alphabetical order (docs/design/restart-order.md §1), so padd would restart after this one
+# and stop it, and every update would hand the robot back to Bluetooth. A skipped condition is not a
+# failure, so Restart=always does not loop on it and the update's restart step still succeeds.
+
+[Unit]
+Description=Robot gamepad over UDP, intent client
+Documentation=file:///opt/robot/daemon/current/docs/robot/udp-pad.md
+# As padd: after robotd, never requiring it. A robotd that is not there yet is retried in 5 s.
+After=robotd.service local-fs.target network.target
+
+[Service]
+Type=exec
+ExecCondition=/opt/robot/daemon/current/bin/netpadd --should-run
+ExecStart=/opt/robot/daemon/current/bin/netpadd
+
+# Unprivileged, for padd's reason: an intent client with no special access. It needs robotd's
+# 0660 socket and nothing else — no `input`, since the pad is on the other end of the network.
+User=netpadd
+Group=netpadd
+SupplementaryGroups=robot
+
+Restart=always
+RestartSec=5s
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+# robotd's unix socket and the pad's IPv4 UDP port. No AF_NETLINK: there is no device to watch.
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+# /run/netpadd/identity.json, for `robotctl health` and the updater's startup check — see padd.service.
+RuntimeDirectory=netpadd
+
+[Install]
+WantedBy=multi-user.target

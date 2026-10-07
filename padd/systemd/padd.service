@@ -37,6 +37,10 @@ After=bluetooth.service
 
 [Service]
 Type=exec
+# Stands down when `[netpad] enabled` gives the pad to netpadd — see netpadd.service for why this
+# is a condition and not Conflicts=. An unreadable config answers "run": a bad file never leaves
+# somebody without the Bluetooth pad.
+ExecCondition=/opt/robot/daemon/current/bin/padd --should-run
 ExecStart=/opt/robot/daemon/current/bin/padd
 
 # Unprivileged, and this one is not a hardening choice — it is the point of the process. `padd` has

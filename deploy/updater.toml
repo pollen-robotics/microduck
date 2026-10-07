@@ -90,7 +90,7 @@ keep_previous = 1
 # xtask's packaging tests keep this list aligned with every release recipe.
 required_files = [
     "bin/updaterd", "bin/robotctl", "bin/robotd", "bin/configd", "bin/btd",
-    "bin/padd", "bin/mediad", "bin/sounds", "bin/pet-detect", "bin/pet-features",
+    "bin/padd", "bin/netpadd", "bin/mediad", "bin/sounds", "bin/pet-detect", "bin/pet-features",
     "bin/tofd", "bin/nfcd",
 ]
 

@@ -7,9 +7,9 @@ three different documents, and the answer decides how a skew is diagnosed.
 Everything here is read from the code, and each step names the function that owns it. Where a
 narrative comment elsewhere disagrees with this page, the comment is the bug.
 
-## 1. The seven daemons, and the unit that is not one
+## 1. The eight daemons, and the unit that is not one
 
-A release ships seven daemons — `robotd`, `configd`, `btd`, `padd`, `mediad`, `tofd`, `updaterd` —
+A release ships eight daemons — `robotd`, `configd`, `btd`, `padd`, `netpadd`, `mediad`, `tofd`, `updaterd` —
 each `ExecStart`ing a path under `/opt/robot/daemon/current/bin/`, so each is stale the instant the
 symlink moves, and each is either restarted by the update or restarted after it.
 
@@ -23,6 +23,7 @@ no `[Install]` section, and that is what keeps it out — see §1.1.
 | `robotd` | yes | — |
 | `configd` | yes | — |
 | `padd` | yes | — |
+| `netpadd` | yes | — |
 | `mediad` | yes | — |
 | `tofd` | yes | — |
 | `updaterd` | **never** — it is the process performing the update | yes |
@@ -73,10 +74,10 @@ units an update cannot touch are exactly the two it exists to watch.
 On today's release `units_to_restart` is exactly:
 
 ```
-configd, mediad, padd, robotd, tofd
+configd, mediad, netpadd, padd, robotd, tofd
 ```
 
-in that order — alphabetical, so the order is identical on every board and in every test. Nothing
+in that order — alphabetical, so the order is identical on every board and in every test. `padd` and `netpadd` pick themselves by `ExecCondition=` on `[netpad] enabled`, so the restart order between them does not matter. Nothing
 was added to `deploy/updater.toml` to put `mediad` and `tofd` in that list, and nothing needed to
 be: both ship a unit with an `[Install]` section, which is the whole rule.
 
@@ -119,7 +120,7 @@ onto the release carrying it. This cost a confused round of "the hook ran and lo
 | 9 | arm the boot counter (`pending.json`), *before* the swap | no |
 | 10 | swap `current` → `releases/<ver>` | no |
 | 11 | **`hooks/postinstall`** (cwd = `releases/<ver>`) | **starts newly shipped units** |
-| 12 | `on_apply` — `systemctl restart` each unit from §1, one at a time | **configd, mediad, padd, robotd, tofd** |
+| 12 | `on_apply` — `systemctl restart` each unit from §1, one at a time | **configd, mediad, netpadd, padd, robotd, tofd** |
 | 13 | `releases/<ver>/bin/updaterd --self-test` | no |
 | 14 | health gate: poll `robotd` over its socket, every 500 ms, up to 30 s | no |
 | 15 | confirm the boot counter, prune old releases | no |
