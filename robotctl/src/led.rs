@@ -5,10 +5,9 @@
 //! says so). This is the bench tool for them: list, switch, blink, or hand one to a kernel
 //! trigger.
 //!
-//! It writes sysfs itself rather than asking a daemon, because no daemon owns an LED yet. When
-//! one does — the camera LED for `mediad`'s streaming indicator (architecture.md §7), a status
-//! LED for whoever owns that status — that daemon is the LED's single writer (§1.1, invariant 4)
-//! and this stays a way to look and to try things out. The image gives the `robot` group write
+//! It writes sysfs itself rather than asking a daemon, which makes it an override: every LED has
+//! an owning daemon (architecture.md §3.2), and a write here holds until that daemon next has a
+//! change to show. It is a way to look and to try things out. The image gives the `robot` group write
 //! access to `brightness` and `trigger`; `delay_on`/`delay_off` only appear once the `timer`
 //! trigger is set and are root's, so a custom blink rate needs sudo while the default 500/500
 //! does not.

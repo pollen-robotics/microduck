@@ -3868,6 +3868,7 @@ mod tests {
                 ready: true,
                 stale_blocks: 400,
                 consecutive_stale_blocks: proto::ImuHealth::FROZEN_RUN,
+                ..Default::default()
             }),
             ..a_health()
         };
@@ -3881,6 +3882,7 @@ mod tests {
                 ready: true,
                 stale_blocks: 9,
                 consecutive_stale_blocks: 1,
+                ..Default::default()
             }),
             ..a_health()
         };

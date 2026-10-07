@@ -393,7 +393,17 @@ pub struct Channel {
     pub outbound: mpsc::Sender<String>,
 }
 
-/// Build and start the pipeline. Returns it, plus a stream of control channels — one per peer.
+/// What [`start`] hands back, in the order it describes them.
+pub type Started = (
+    gst::Pipeline,
+    mpsc::Receiver<Channel>,
+    Frames,
+    Option<StreamBranch>,
+    Consumers,
+);
+
+/// Build and start the pipeline. Returns it, plus a stream of control channels — one per peer —
+/// and the live count of peers being encoded for.
 ///
 /// The pipeline is returned rather than kept here so the caller owns its lifetime: dropping it
 /// stops the session, which is what a shutdown should do.
@@ -402,12 +412,7 @@ pub fn start(
     producer: &crate::producer::Producer,
     settings: &Settings,
     relays: Arc<crate::turn::Relays>,
-) -> Result<(
-    gst::Pipeline,
-    mpsc::Receiver<Channel>,
-    Frames,
-    Option<StreamBranch>,
-)> {
+) -> Result<Started> {
     let &Settings {
         port,
         bitrate,
@@ -758,7 +763,7 @@ pub fn start(
         fps,
         "signalling server listening"
     );
-    Ok((pipeline, channels_rx, frames, stream_branch))
+    Ok((pipeline, channels_rx, frames, stream_branch, consumers))
 }
 
 /// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! videoconvert ! enc !
@@ -1883,11 +1888,12 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Live count of what the consumers see, so [`meter_capture_rate`] can report it.
+/// Live count of what the consumers see, so [`meter_capture_rate`] can report it and the camera
+/// LED can follow it.
 ///
 /// An `AtomicU32` rather than a lock: it is written from `consumer-added`/`consumer-removed` on
 /// GStreamer threads and read from the capture probe on another, and neither may block the other.
-type Consumers = Arc<std::sync::atomic::AtomicU32>;
+pub type Consumers = Arc<std::sync::atomic::AtomicU32>;
 
 /// Count frames where they enter the pipeline, not where they leave it, and publish what we see.
 ///
@@ -2574,7 +2580,7 @@ mod tests {
             fps: 15,
             rotation: Rotation::None,
         };
-        let (pipeline, _channels, frames, _stream) = start(
+        let (pipeline, _channels, frames, _stream, _peers) = start(
             Source::Test,
             &producer,
             &settings,

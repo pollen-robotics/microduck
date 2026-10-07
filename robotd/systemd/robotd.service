@@ -66,6 +66,13 @@ NoNewPrivileges=yes
 ProtectKernelTunables=yes
 RestrictSUIDSGID=yes
 
+# The face LEDs this daemon owns (`docs/design/architecture.md` §3.2). ProtectKernelTunables makes
+# /sys read-only, so their directory is handed back; `-` because a Zero 3W has none. The daemon
+# switches them off when it stops cleanly — ExecStopPost does it when it did not, so a crashed
+# robotd cannot leave an LED claiming something it has stopped keeping true.
+ReadWritePaths=-/sys/devices/platform/face-leds
+ExecStopPost=-/bin/sh -c 'cd /sys/class/leds 2>/dev/null || exit 0; for l in face:gr2:green face:gr2:red face:gr1:green face:gr1:red face:green1:green face:green2:green face:rgb:red face:rgb:green face:rgb:blue; do echo 0 > "$$l/brightness"; done 2>/dev/null; exit 0'
+
 # stderr → journal; level via RUST_LOG.
 #
 # `info` is safe to ship: the control loop logs one summary line every five minutes and

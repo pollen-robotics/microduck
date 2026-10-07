@@ -74,6 +74,18 @@ impl Board {
         }
     }
 
+    /// How far this board's head camera is mounted from upright, in degrees clockwise.
+    ///
+    /// The Zero 3W's IMX219 sits a quarter turn off; the beta's GC2093 sits the right way up.
+    /// `mediad` tells every consumer this angle (`media.video`'s `rotate`) unless `--rotate`
+    /// overrides it, so a consumer turns the picture by what this board needs and nothing else.
+    pub fn camera_mount_degrees(self) -> u32 {
+        match self {
+            Board::Zero3 => 90,
+            Board::Beta => 0,
+        }
+    }
+
     /// The last release this board gets, or `None` while it is supported.
     ///
     /// **Setting this is how a board is retired, and it is the only step.** From the release that
@@ -249,6 +261,15 @@ mod tests {
         let all_retired = |_| Some("0.21.0");
         let v = semver::Version::new(0, 22, 0);
         assert_eq!(min_hw_rev_given(&v, all_retired), None);
+    }
+
+    /// The Zero 3W's camera is a quarter turn off and the beta's is upright — a beta told 90°
+    /// showed every consumer a sideways picture.
+    #[test]
+    fn each_board_mounts_its_camera_its_own_way() {
+        assert_eq!(Board::Zero3.camera_mount_degrees(), 90);
+        assert_eq!(Board::Beta.camera_mount_degrees(), 0);
+        assert_eq!(Board::default().camera_mount_degrees(), 90);
     }
 
     #[test]

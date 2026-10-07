@@ -37,6 +37,7 @@
 //! D-pad right     head + move — left stick walks and turns, right stick looks around
 //! D-pad left      move — the sticks walk, strafe and turn
 //! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
+//! Home            flashlight on / off (a board with one)
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
 //! Select, 2–4 s   let go: sit, rest pose, then torque off and every servo rebooted
@@ -66,9 +67,12 @@
 //! pad is bonded *and trusted*, so it reconnects by itself afterwards, and this process picks it up
 //! within a tick.
 //!
-//! Waiting with no pad is deliberately cheap and deliberately silent — nothing is sent, and
-//! `robotd`'s deadman holds the robot on its own. Inventing a zero command instead would mask a
-//! disconnected pad as someone's decision to stop.
+//! Waiting with no pad is deliberately cheap — no stick command is sent, and `robotd`'s deadman
+//! stops the walking on its own; inventing a zero command instead would mask a disconnected pad
+//! as someone's decision to stop. A pad that was *driving* and goes away is different: the robot
+//! asks where it went (a sound), and after a second sits down, so it is not left standing in the
+//! middle of a room. The pad coming back is greeted; A stands the robot up. `pad_map::loss` owns
+//! that, and `netpadd` does the same when its UDP client goes quiet.
 //!
 //! Pairing is **not** done here: bonding a device needs root and BlueZ, and a `padd` holding
 //! either would stop being the unprivileged client whose whole value is having no special
@@ -98,7 +102,10 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
-use pad_map::{BINDINGS_POLL, Buttons, Config, Continuous, Mapper, Out, PadFrame, read_bindings};
+use pad_map::{
+    BINDINGS_POLL, Buttons, Config, Continuous, Mapper, Out, PadFrame, PadLoss, PadLossAction,
+    read_bindings,
+};
 
 #[cfg(target_os = "linux")]
 mod tap;
@@ -196,7 +203,7 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 /// The gilrs name for each wire bit. gilrs calls the *bumpers* `LeftTrigger`/`RightTrigger` and
 /// the analogue triggers `LeftTrigger2`/`RightTrigger2` — getting that backwards binds a skill to
 /// a control nobody presses.
-const GILRS: [(Button, Buttons); 12] = [
+const GILRS: [(Button, Buttons); 13] = [
     (Button::South, Buttons::A),
     (Button::East, Buttons::B),
     (Button::West, Buttons::X),
@@ -209,6 +216,8 @@ const GILRS: [(Button, Buttons); 12] = [
     (Button::DPadDown, Buttons::DOWN),
     (Button::DPadLeft, Buttons::LEFT),
     (Button::DPadRight, Buttons::RIGHT),
+    // Home — Xbox, PS. gilrs calls the middle button `Mode`.
+    (Button::Mode, Buttons::HOME),
 ];
 
 fn bit(button: Button) -> Buttons {
@@ -324,6 +333,8 @@ fn main() -> std::process::ExitCode {
     let mut mapper = Mapper::new();
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
+    // A driving pad that went away: the robot sits after a second — see `pad_map::loss`.
+    let mut pad_loss = PadLoss::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -396,8 +407,33 @@ fn main() -> std::process::ExitCode {
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
             if driving {
-                tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
+                tracing::warn!(
+                    "pad gone — robotd's deadman stops the walking; sitting down in {:?}",
+                    pad_map::loss::PAD_LOST_SIT
+                );
                 driving = false;
+                pad_loss.lost(tick);
+                // Heard, because whoever lost the pad is looking at the robot, not the journal.
+                sound(&mut stream, proto::SoundTag::Inquire);
+            }
+            match pad_loss.tick(tick) {
+                PadLossAction::Nothing => {}
+                PadLossAction::Sit => match sit_if_standing(&mut stream, &mut next_id) {
+                    Ok(true) => pad_loss.settle(),
+                    // Refused — mid-move, typically. Asked again on the next poll.
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "sit request failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                },
+                PadLossAction::GiveUp => {
+                    tracing::warn!(
+                        "pad gone: the robot would not sit after {:?} of asking — leaving it as it is",
+                        pad_map::loss::PAD_LOST_SIT_TRIES
+                    );
+                    pad_loss.settle();
+                }
             }
             // A hold in flight was measured against the pad that just left: drop it, or a
             // Select still down when the pad returns lands its full hold time at once — a
@@ -406,13 +442,20 @@ fn main() -> std::process::ExitCode {
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
-            std::thread::sleep(IDLE_POLL);
+            std::thread::sleep(if pad_loss.pending() {
+                pad_map::loss::PAD_LOST_POLL
+            } else {
+                IDLE_POLL
+            });
             continue;
         };
 
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
+            if pad_loss.found() {
+                sound(&mut stream, proto::SoundTag::Greet);
+            }
         }
 
         // Every tick rather than on the transition above: a pad that drops and comes back between
@@ -495,6 +538,25 @@ fn ask_roller(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<Opt
     Ok(answer
         .and_then(|answer| answer.result_as::<proto::ModeResult>().ok())
         .map(|mode| mode.mode == "roller"))
+}
+
+/// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.
+fn sound(stream: &mut UnixStream, tag: proto::SoundTag) {
+    if let Err(e) = notify(stream, &pad_map::loss::sound(tag)) {
+        tracing::debug!(error = %e, "sound not sent");
+    }
+}
+
+/// Sit the robot down unless it is sitting already. `Ok(true)` when there is nothing left to do,
+/// `Ok(false)` when the robot refused for a reason that passes — `pad_map::loss` reads the
+/// answers.
+fn sit_if_standing(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<bool> {
+    let policies = request(stream, next_id, &proto::Call::RobotPolicies)?;
+    if pad_map::loss::already_sitting(policies.as_ref()) {
+        return Ok(true);
+    }
+    let answer = request(stream, next_id, &pad_map::loss::sit_call())?;
+    Ok(pad_map::loss::sit_settled(answer.as_ref()))
 }
 
 /// Send a continuous intent: no `id`, no reply, nothing to wait for.

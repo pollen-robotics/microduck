@@ -241,10 +241,9 @@ mode = "walk"
 #
 # The only thing the daemon does about a fall. With it off, a fall changes nothing: the
 # policy keeps driving and the humans stay in charge, which is the prototype's behaviour.
-# OFF by default: the hand-back at the end is to the standing network, and the default
-# configuration (velstand as `walk`, `stand` unset) loads none. Set it to true on a robot
-# that runs a standing policy.
-# limp_fall = false
+# ON by default. With the default configuration (velstand as `walk`, `stand` unset) there is
+# no standing network, and the hand-back is to velstand at zero command, which stands still.
+# limp_fall = true
 
 # When a fall counts as started. This is the whole feature, and both ways of getting it
 # wrong are real: too early and the robot limps out of leans it would have walked off —

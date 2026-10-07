@@ -733,7 +733,7 @@ mod tests {
         let find = |key: &str| rows.iter().find(|r| r.entry.key == key).expect("known");
         assert_eq!(find("control.hz").effective(), "50");
         assert_eq!(find("policy.mode").effective(), "walk");
-        assert_eq!(find("safety.limp_fall").effective(), "false");
+        assert_eq!(find("safety.limp_fall").effective(), "true");
         assert_eq!(find("policy.voltage_adapt").effective(), "true");
         assert_eq!(find("audio.pet_detect").effective(), "unset");
     }

@@ -9,6 +9,7 @@ mod bindings;
 mod buttons;
 mod continuous;
 mod hold;
+pub mod loss;
 mod mapper;
 pub mod wire;
 
@@ -16,6 +17,7 @@ pub use bindings::{BINDINGS_POLL, read_bindings};
 pub use buttons::Buttons;
 pub use continuous::{Continuous, HEARTBEAT};
 pub use hold::{HoldAction, HoldButton};
+pub use loss::{PadLoss, PadLossAction};
 pub use mapper::{Config, Mapper, Out, PadFrame, report};
 
 /// Whether `[netpad] enabled` hands the pad to `netpadd`. The one question both units'

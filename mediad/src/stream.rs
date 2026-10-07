@@ -523,6 +523,11 @@ impl Streamer {
         serde_json::json!({ "streaming": false, "was": was.as_ref().map(|l| l.config.url.clone()) })
     }
 
+    /// Whether frames are going out, for the camera LED.
+    pub fn is_streaming(&self) -> bool {
+        self.live.lock().expect("not poisoned").is_some()
+    }
+
     /// What is streaming and how it is going.
     pub fn status(&self) -> serde_json::Value {
         let live = self.live.lock().expect("not poisoned");

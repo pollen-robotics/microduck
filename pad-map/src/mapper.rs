@@ -360,6 +360,18 @@ impl Mapper {
             })));
         }
 
+        // Home: the flashlight. Not bindable — it is not a skill, and the robot owns the toggle.
+        // A request, so a board without a flashlight says so in the journal rather than not at
+        // all.
+        if pad.pressed.contains(Buttons::HOME) {
+            out.push(Out::Request(proto::Call::RobotFlashlight(
+                proto::FlashlightParams {
+                    toggle: true,
+                    ..Default::default()
+                },
+            )));
+        }
+
         // X held: keep a chaining skill going. The robot starts another when a request lands
         // near the end of the current one, so "held" is spelled "resent every tick" — as a
         // notification, because fifty answered requests a second would spend their time waiting
@@ -574,6 +586,42 @@ mod tests {
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change
     /// it again, a stick inside the deadzone walks nothing, and A's edge runs A's binding.
+    /// Home toggles the flashlight, on its edge: once per press, held or not, and the robot owns
+    /// the toggle.
+    #[test]
+    fn home_toggles_the_flashlight_once_per_press() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let flashlight = |out: &[Out]| {
+            out.iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        Out::Request(proto::Call::RobotFlashlight(proto::FlashlightParams {
+                            toggle: true,
+                            ..
+                        }))
+                    )
+                })
+                .count()
+        };
+
+        let pad = PadFrame {
+            pressed: Buttons::HOME,
+            held: Buttons::HOME,
+            ..Default::default()
+        };
+        m.tick(&pad, &cfg, t, &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 1, "{out:?}");
+
+        let pad = PadFrame {
+            held: Buttons::HOME,
+            ..Default::default()
+        };
+        m.tick(&pad, &cfg, t, &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "held is not a second press");
+    }
+
     #[test]
     fn a_frame_becomes_the_intents_padd_always_sent() {
         let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());

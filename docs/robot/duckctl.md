@@ -226,6 +226,13 @@ duckctl --name <robot-name> info
 Name, serial and uptime.
 
 ```bash
+duckctl --name <robot-name> quack
+```
+
+The robot quacks in its own voice — every voice is generated from the serial — so the duck that
+answers is the one the name reached. A muted robot refuses and says so rather than staying silent.
+
+```bash
 duckctl --name <robot-name> name <new-name>
 ```
 

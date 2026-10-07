@@ -20,8 +20,10 @@ impl Buttons {
     pub const DOWN: Self = Self(1 << 9);
     pub const LEFT: Self = Self(1 << 10);
     pub const RIGHT: Self = Self(1 << 11);
+    /// The middle button — Home, Xbox, PS. The flashlight, on a board with one.
+    pub const HOME: Self = Self(1 << 12);
     /// Every bit that means something. The rest are reserved.
-    pub const KNOWN: u16 = 0x0FFF;
+    pub const KNOWN: u16 = 0x1FFF;
 
     /// The six bindable buttons, by their `[pad]` config name, in `[pad]`'s order.
     pub const BINDABLE: [(Self, &'static str); 6] = [

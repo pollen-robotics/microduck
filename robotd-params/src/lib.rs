@@ -2000,9 +2000,8 @@ pub struct SafetyParams {
     pub battery_empty_shutdown: bool,
 
     /// Go limp *while falling*, to land soft instead of fighting the floor all the way
-    /// down. **Off by default** since the velstand gait became the default walk (set v5):
-    /// the hand-back it ends with is to the standing network, which the default configuration
-    /// no longer loads. Turn it on with a robot that runs a standing policy.
+    /// down. **On by default.** With the default velstand gait (set v5) no standing network
+    /// is loaded, so the hand-back is to velstand at zero command, which stands still.
     ///
     /// The only thing the daemon does about a fall. Drop to `gain_limp`, let the robot
     /// collapse, pose it back to standing once it has landed, then hand it to the standing
@@ -2077,7 +2076,7 @@ impl Default for SafetyParams {
             deadman_ms: 500,
             gain_limp: 50,
             battery_empty_shutdown: true,
-            limp_fall: false,
+            limp_fall: true,
             limp_fall_tilt_z: -0.90,
             limp_fall_predict_z: -0.5,
             limp_fall_lookahead_ms: 300,

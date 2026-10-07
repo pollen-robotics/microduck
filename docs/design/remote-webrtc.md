@@ -578,7 +578,7 @@ along with a transport. `remote-access-design.md` §9 carries it as open.
 - **Multi-peer video.** One media session at a time, plus control-only clients. Simulcast and
   encode-once-send-many are a real project.
 - **Consent and the streaming indicator.** `architecture.md` §7 wants explicit per-session consent
-  and a visible indicator, and is right that they are cheap now and expensive later. They need
-  hardware that exists — an LED under software control — which is not yet established.
+  and a visible indicator, and is right that they are cheap now and expensive later. The indicator
+  exists on the beta board — its camera LED, `architecture.md` §3.2; consent does not yet.
 - **TURN.** LAN-only needs none. A bridge does, and it costs real bandwidth; that decision belongs
   with the rendezvous service, not here.

@@ -251,6 +251,17 @@ impl DynamixelIo {
         Ok(missing)
     }
 
+    /// Does the IMU board answer a ping?
+    ///
+    /// Asked apart from [`Self::missing_servos`] because the census covers servos only, and a
+    /// silent IMU board otherwise surfaces as the first [`RobotIo::read`] failing — which, from
+    /// outside, looks exactly like no robot at all.
+    pub fn imu_answers(&mut self) -> Result<bool> {
+        self.controller
+            .ping(IMU_DXL_ID)
+            .map_err(|e| IoError::Bus(format!("ping imu {IMU_DXL_ID}: {e}")))
+    }
+
     /// Flash a factory-fresh servo so it takes the place of the one that is missing.
     ///
     /// A new XL330 answers as ID 1 at 57 600 baud. Neither is used on this bus, so when exactly

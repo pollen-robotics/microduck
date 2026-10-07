@@ -569,7 +569,16 @@ the switch off, the right stick poses the head in that mode. `padd` picks the ch
 second; no restart.
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
-if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
+if `padd` dies. **If the pad drops out while driving**, the robot asks where it went (a rising
+quack), and after a second sits down if it was standing — kicks and picks are let finish first.
+When the pad comes back it greets you with a quack; A stands the robot up.
+
+**Left alone, the robot looks around.** After 2 s with the policy running, no motion asked for
+and nobody steering the head, it glances about every few seconds — mostly left and right, a
+little up and down, now and then with a curious tilt — holds each look, drifts very slightly
+while it does, and breathes (a millimetre of height, standing only). The longer nothing happens
+the calmer it gets. It fades in and out, and any stick or head command takes the head back. In
+the D-pad's head modes the pad keeps the head, so this only happens in move mode. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
 shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. The
 other skills ride along: sit and the kicks work on wheels too, as the prototype has it.
 
@@ -847,13 +856,16 @@ robotctl led set rgb:red on
 robotctl led set all off
 robotctl led blink cam:red
 robotctl led trigger green1:green heartbeat
+robotctl flashlight on --color cyan
+robotctl flashlight toggle
 ```
 
-The beta board's face has twelve LEDs (`face:<place>:<colour>`, on a GPIO expander), and these
-switch them through the kernel's LED class — names with or without the `face:` prefix, or `all`.
-A board without a face board says so. Nothing owns an LED yet, so this is the bench tool; once a
-daemon drives one (the camera LED as the streaming indicator, say), that daemon is its writer and
-`led set` only overrides it until the daemon next writes. A blink rate other than the default
+The beta board's face has twelve LEDs (`face:<place>:<colour>`, on a GPIO expander), and `led`
+switches them through the kernel's LED class — names with or without the `face:` prefix, or `all`.
+A board without a face board says so. Each LED has an owning daemon, and what it shows is
+[`architecture.md` §3.2](../design/architecture.md#32-the-face-leds); `led set` overrides it only
+until that daemon next has a change to show, so this is the bench tool. `flashlight` asks `robotd`,
+which owns that LED, and is what the pad's Home button does. A blink rate other than the default
 500/500 ms (`--on-ms`, `--off-ms`) needs `sudo`.
 
 ### The camera (`mediad`)

@@ -202,8 +202,8 @@ mod tests {
             buttons: 0xF001,
             ..Default::default()
         };
-        assert_eq!(p.held(), Buttons::A);
-        assert_eq!(p.reserved(), 0xF000);
+        assert_eq!(p.held(), Buttons::A | Buttons::HOME, "bit 12 is Home");
+        assert_eq!(p.reserved(), 0xE000);
     }
 
     #[test]

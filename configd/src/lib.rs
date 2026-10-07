@@ -27,6 +27,8 @@
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod identity;
+/// The network LED. `architecture.md` §3.2.
+pub mod indicator;
 pub mod logs;
 pub mod net;
 #[cfg(target_os = "linux")]

@@ -343,6 +343,32 @@ what a client needs when things are broken — which is why it cannot live in
 **Config is state, not actions.** "Connect to this wifi", "restart", "apply
 update", "select model" are actions, dispatched as RPC to the owning service.
 
+### 3.2 The face LEDs
+
+The beta board's face carries twelve LEDs on a GPIO expander, which its device tree names
+`face:<place>:<colour>` under `/sys/class/leds`. An LED shows a piece of state, so it follows
+invariant 4: **each LED has one writer, the daemon that owns what it shows.** A Zero 3W has none of
+them, and every owner does nothing on a board without its LED.
+
+| LED | sysfs | Owner | Shows |
+|---|---|---|---|
+| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
+| Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
+| Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
+| Network | `gb:{green,blue}` | `configd` | Blue when reachable from outside the LAN (the relay is registered with a live heartbeat); otherwise green on wifi, blinking green while joining, off without. |
+| Battery | `gr1:{green,red}`, `green2`, `green1` (bottom to top) | `robotd` | A three-step gauge filling up from `gr1`: three green above 70%, two above 40%, one above 15%; then `gr1` red, blinking at 5% and below. 3% hysteresis on each step. Off until the first reading. |
+
+The network LED reads one fact it does not own: whether `mediad`'s relay is registered, from the
+file `mediad` publishes for readers (`/run/mediad/remote.json`). It still has one writer, because
+green and blue from two daemons would show both at once.
+
+Every owner writes only on a change, which leaves `robotctl led` usable as a bench override until
+the owner next has something new to say; switches its LEDs off when it stops; and has an
+`ExecStopPost` in its unit that does the same when it crashes. The units hand
+`/sys/devices/platform/face-leds` back to the daemon, because `ProtectKernelTunables` makes `/sys`
+read-only. [`duck_ipc_proto::led`](../../duck-ipc-proto/src/led.rs) is the shared writer and the
+names.
+
 ## 4. The robot API
 
 ### 4.1 One definition, many transports
@@ -480,7 +506,8 @@ It is a camera and microphone in someone's home.
 
 - **Explicit consent** to start a remote session (per-session, or a clear
   persistent opt-in the user can revoke).
-- **Visible on-robot indicator** whenever streaming is active.
+- **Visible on-robot indicator** whenever streaming is active. On the beta board, the camera
+  LED (§3.2).
 - DTLS-SRTP keeps media encrypted end-to-end **even through a TURN relay** —
   worth stating plainly to clients.
 - BLE provisioning writes carry wifi credentials: that characteristic must be

@@ -21,7 +21,9 @@
 mod chorale;
 mod control;
 mod head_imu;
+mod idle_head;
 mod intents;
+mod leds;
 mod params;
 mod pickup;
 mod posture;
@@ -549,6 +551,8 @@ struct RobotState {
     /// While waiting: the servo IDs the last ping round found silent. Empty once the bus is up,
     /// and when the port would not open at all — then nothing was asked.
     startup_missing: ArcSwap<Vec<u8>>,
+    /// While waiting: every servo answered and the IMU board did not. False once the bus is up.
+    startup_imu_missing: AtomicBool,
     /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
@@ -577,6 +581,13 @@ struct RobotState {
     imu_stale_run: AtomicU64,
     imu_ready: AtomicBool,
     shutdown: AtomicBool,
+    /// What `robot.flashlight` last asked for, as [`leds::Flashlight`] stores it.
+    flashlight: AtomicU8,
+    /// Whether this board has a flashlight, so `robot.flashlight` refuses on one that does not
+    /// rather than accepting into the dark. Read once: an LED does not appear on a running board.
+    has_flashlight: bool,
+    /// Wakes the LED task now, rather than at its next second — a flashlight press, the shutdown.
+    leds_changed: tokio::sync::Notify,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
     /// What `btd` should be advertising, published when it changes.
@@ -712,6 +723,7 @@ impl RobotState {
             consecutive_errors: AtomicU32::new(0),
             startup_bus_failures: AtomicU32::new(0),
             startup_missing: ArcSwap::from_pointee(Vec::new()),
+            startup_imu_missing: AtomicBool::new(false),
             battery_v: AtomicU64::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
@@ -722,6 +734,9 @@ impl RobotState {
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
+            flashlight: AtomicU8::new(0),
+            has_flashlight: leds::flashlight_fitted(),
+            leds_changed: tokio::sync::Notify::new(),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             head_imu_tx: tokio::sync::broadcast::Sender::new(head_imu::FRAME_BUFFER),
@@ -787,6 +802,7 @@ impl RobotState {
                     ready: self.imu_ready.load(Ordering::Relaxed),
                     stale_blocks: self.imu_stale_blocks.load(Ordering::Relaxed),
                     consecutive_stale_blocks: self.imu_stale_run.load(Ordering::Relaxed),
+                    missing: self.startup_imu_missing.load(Ordering::Relaxed),
                 }),
             };
 
@@ -825,6 +841,14 @@ impl RobotState {
                         } else {
                             "are they"
                         },
+                    ));
+                }
+                // Every servo answering is a robot, whatever the first read went on to do.
+                if self.startup_imu_missing.load(Ordering::Relaxed) {
+                    return degraded(format!(
+                        "the IMU board (id {}) is not answering on the motor bus after \
+                         {waiting} attempts; is it plugged in?",
+                        duck_control::model::IMU_DXL_ID,
                     ));
                 }
                 return degraded(format!(
@@ -1063,6 +1087,8 @@ async fn main() -> ExitCode {
         }
     };
 
+    let leds = tokio::spawn(leds::run(Arc::clone(&state)));
+
     let serving = serve(
         Arc::clone(&state),
         Arc::clone(&intents),
@@ -1083,7 +1109,10 @@ async fn main() -> ExitCode {
     // Ask the loop to stop and let it finish the tick it is in, rather than aborting
     // mid-transaction and leaving a half-written packet on the bus.
     state.shutdown.store(true, Ordering::Relaxed);
+    state.leds_changed.notify_one();
     let _ = control.join();
+    // Bounded: an LED write that hangs on the expander must not hold the daemon up.
+    let _ = tokio::time::timeout(Duration::from_secs(1), leds).await;
     let _ = std::fs::remove_file(&args.socket);
     code
 }
@@ -1302,15 +1331,28 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
         let mut missing = Vec::new();
-        if let Some(io) = open_bus(bus, state.board, attempt, &mut missing) {
-            state.startup_bus_failures.store(0, Ordering::Relaxed);
-            state.startup_missing.store(Arc::new(Vec::new()));
-            return Some(io);
+        let mut imu_missing = false;
+        if let Some(mut io) = open_bus(bus, state.board, attempt, &mut missing) {
+            match imu_answers(&mut io, attempt) {
+                Some(true) => {
+                    state.startup_bus_failures.store(0, Ordering::Relaxed);
+                    state.startup_missing.store(Arc::new(Vec::new()));
+                    state.startup_imu_missing.store(false, Ordering::Relaxed);
+                    return Some(io);
+                }
+                Some(false) => imu_missing = true,
+                // The ping itself failed: a bus fault, not an answer, so health keeps the
+                // generic wording rather than send someone looking for an unplugged board.
+                None => {}
+            }
         }
         attempt += 1;
         // Published before sleeping, so `robot.health` can name the cause immediately — and
-        // which servos, when some answered and these did not.
+        // which servos, when some answered and these did not, or that it is the IMU board.
         state.startup_missing.store(Arc::new(missing));
+        state
+            .startup_imu_missing
+            .store(imu_missing, Ordering::Relaxed);
         state.startup_bus_failures.store(attempt, Ordering::Relaxed);
 
         // Nothing to retry on a platform that has no bus at all.
@@ -1365,7 +1407,9 @@ fn open_bus(
         return None;
     }
     match io.check_registers() {
-        Ok(0) => tracing::info!("motor registers already correct"),
+        // Gated too: a board waiting on its IMU board gets this far every attempt.
+        Ok(0) if loud => tracing::info!("motor registers already correct"),
+        Ok(0) => {}
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
         Err(e) => {
             if loud {
@@ -1379,6 +1423,44 @@ fn open_bus(
         }
     }
     Some(io)
+}
+
+/// Does the IMU board answer, now that every servo has?
+///
+/// Outside [`open_bus`] because `init` shares that and has no use for orientation: ramping to
+/// the home pose must keep working on a robot with its IMU unplugged. The daemon does need it,
+/// and without this ping the first combined read is what fails — and health, with nothing more
+/// specific to go on, blames the whole bus.
+///
+/// `None` when the ping could not be made at all, which says nothing about the board.
+#[cfg(target_os = "linux")]
+fn imu_answers(io: &mut BusIo, attempt: u32) -> Option<bool> {
+    let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
+    let id = duck_control::model::IMU_DXL_ID;
+    match io.imu_answers() {
+        Ok(true) => Some(true),
+        Ok(false) => {
+            if loud {
+                tracing::error!(
+                    attempt,
+                    id,
+                    "every servo answered and the IMU board did not; waiting, is it plugged in?"
+                );
+            }
+            Some(false)
+        }
+        Err(e) => {
+            if loud {
+                tracing::error!(error = %e, attempt, id, "cannot ping the IMU board; waiting");
+            }
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn imu_answers(_io: &mut BusIo, _attempt: u32) -> Option<bool> {
+    Some(true)
 }
 
 /// The motor-swap path: if exactly one expected servo is silent and a factory-fresh one
@@ -2156,6 +2238,13 @@ async fn control_loop<T: RobotIo>(
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
     let mut chorale_head = [0.0f64; 4];
+    // The robot looking around while nothing is happening — see `idle_head`. Seeded from the
+    // clock, so two robots side by side do not glance in step.
+    let mut idle_head = idle_head::IdleHead::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64),
+    );
 
     // The note the theremin is holding, kept across ticks so a hand leaving the frame fades
     // the note at its own pitch instead of gliding to the bottom of the range on its way out.
@@ -2977,19 +3066,44 @@ async fn control_loop<T: RobotIo>(
         } else {
             body_ema = [0.0; 3];
         }
+        // Still: the policy has the robot, nothing asks it to move or is moving it, nobody has
+        // steered the head lately, and it is not singing (the chorale owns the head then).
+        let still = was_driving
+            && !in_limp_fall
+            && !pickup_paused
+            && twist_target == [0.0; 3]
+            && twist_ema.iter().all(|v| v.abs() < 1e-3)
+            && snapshot.head_age >= idle_head::IDLE_AFTER
+            && chorale_head.iter().all(|v| v.abs() < 1e-3)
+            && controller.as_ref().is_some_and(|c| !c.busy());
+        let idle = idle_head.tick(tick_start, still, period);
+        // The breath moves the body pose, which only the standing network is trained on — and
+        // only while no client holds the body pose itself.
+        let breath = if !snapshot.pose.active
+            && controller
+                .as_ref()
+                .and_then(|c| c.driving())
+                .is_some_and(|d| d == control::Driving::Stand)
+        {
+            idle.body_z
+        } else {
+            0.0
+        };
+        let idle_offset = idle.head;
         let command = PolicyCommand {
             twist: twist_ema,
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
-            // singing stops so the head settles rather than snaps.
+            // singing stops so the head settles rather than snaps. The idle sweep rides the
+            // same way, and the two never overlap: singing is not still.
             head: [
-                head_ema[0] + chorale_head[0],
-                head_ema[1] + chorale_head[1],
-                head_ema[2] + chorale_head[2],
-                head_ema[3] + chorale_head[3],
+                head_ema[0] + chorale_head[0] + idle_offset[0],
+                head_ema[1] + chorale_head[1] + idle_offset[1],
+                head_ema[2] + chorale_head[2] + idle_offset[2],
+                head_ema[3] + chorale_head[3] + idle_offset[3],
             ],
             body: BodyPose {
-                z: body_ema[0],
+                z: body_ema[0] + breath,
                 roll: body_ema[1],
                 pitch: body_ema[2],
             },
@@ -4987,6 +5101,21 @@ fn dispatch(
             proto::Response::ok(Some(id), &result)
         }
 
+        // The task that owns the LED switches it; this only records what was asked and wakes it.
+        proto::Call::RobotFlashlight(p) => {
+            let result = if state.has_flashlight {
+                let current = state.flashlight.load(Ordering::Relaxed);
+                state
+                    .flashlight
+                    .store(leds::flashlight_after(current, p), Ordering::Relaxed);
+                state.leds_changed.notify_one();
+                proto::IntentResult::accepted()
+            } else {
+                proto::IntentResult::refused("this board has no flashlight")
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         // Sit, then power the machine off. Never refused for being inconvenient — a robot
         // that cannot sit (no sitstand policy, not driving) cuts torque and powers off
         // directly, which is still what was asked for.
@@ -5884,19 +6013,14 @@ mod tests {
         );
     }
 
-    /// Limp-fall ships OFF (the default gait has no standing network to hand back to), and
-    /// switched on it must refuse a fallen robot nothing.
+    /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
     /// and init are never refused for gravity, whatever the mode is set to.
     #[test]
-    fn limp_fall_ships_off_and_refuses_nothing() {
-        let mut params = Params::default();
-        assert!(
-            !params.safety.limp_fall,
-            "off by default: velstand loads no standing policy"
-        );
-        params.safety.limp_fall = true;
+    fn limp_fall_ships_on_and_refuses_nothing() {
+        let params = Params::default();
+        assert!(params.safety.limp_fall, "on by default");
 
         let s = RobotState::new(
             &params,
@@ -6351,6 +6475,34 @@ mod tests {
             ],
             "the answer must be exactly what the head was sent"
         );
+    }
+
+    /// A board without a flashlight says so; one with it records the toggle for the LED task.
+    #[test]
+    fn robot_flashlight_is_refused_without_one_and_toggles_with_one() {
+        let intents = Intents::new();
+        let toggle = proto::Call::RobotFlashlight(proto::FlashlightParams {
+            toggle: true,
+            ..Default::default()
+        });
+        let ask = |s: &RobotState| -> proto::IntentResult {
+            dispatch(s, &intents, proto::Id::Number(1), &toggle)
+                .result_as()
+                .unwrap()
+        };
+
+        let mut s = state();
+        s.has_flashlight = false;
+        let refused = ask(&s);
+        assert!(!refused.accepted);
+        assert!(refused.reason.is_some(), "a refusal must say why");
+        assert_eq!(s.flashlight.load(Ordering::Relaxed), 0);
+
+        s.has_flashlight = true;
+        assert!(ask(&s).accepted);
+        assert_ne!(s.flashlight.load(Ordering::Relaxed), 0);
+        assert!(ask(&s).accepted);
+        assert_eq!(s.flashlight.load(Ordering::Relaxed), 0);
     }
 
     /// `robotctl quack` exists to answer "which duck am I talking to", and it answers by
@@ -7774,6 +7926,34 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("is it plugged in?"), "{reason}");
+    }
+
+    /// Every servo answering and the IMU board silent is a robot with its IMU unplugged, not "no
+    /// robot on the motor bus" — which is what this said, because the first combined read was the
+    /// only thing that ever asked the IMU anything.
+    #[test]
+    fn health_names_a_silent_imu_board_rather_than_the_whole_bus() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        s.startup_bus_failures.store(4, Ordering::Relaxed);
+        s.startup_imu_missing.store(true, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(
+            health.degraded,
+            "a bench board must not roll a release back"
+        );
+        assert!(health.imu.expect("always attached").missing);
+        let reason = health.reason.unwrap();
+        assert!(
+            reason.starts_with("the IMU board (id 200) is not answering"),
+            "{reason}"
+        );
+        assert!(!reason.contains("no robot"), "{reason}");
     }
 
     /// **The regression.** A bus that cannot be *opened* — or whose register check fails,

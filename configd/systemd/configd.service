@@ -97,6 +97,13 @@ MemoryDenyWriteExecute=yes
 CapabilityBoundingSet=
 StateDirectory=robot/config
 
+# The face LEDs this daemon owns (`docs/design/architecture.md` §3.2). ProtectKernelTunables makes
+# /sys read-only, so their directory is handed back; `-` because a Zero 3W has none. The daemon
+# switches them off when it stops cleanly — ExecStopPost does it when it did not, so a crashed
+# configd cannot leave an LED claiming something it has stopped keeping true.
+ReadWritePaths=-/sys/devices/platform/face-leds
+ExecStopPost=-/bin/sh -c 'cd /sys/class/leds 2>/dev/null || exit 0; for l in face:gb:green face:gb:blue; do echo 0 > "$$l/brightness"; done 2>/dev/null; exit 0'
+
 # stderr → journal; level via RUST_LOG. The startup identity line is at `warn` so it survives
 # RUST_LOG=warn on a long-running board.
 #

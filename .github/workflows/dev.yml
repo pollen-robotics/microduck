@@ -37,7 +37,10 @@ jobs:
     # Not in a fork. A contributor's push runs this in their fork, where the dev key does not
     # exist, so every run ended red at the signing step — a failure that says nothing about the
     # change and hides one that does. `ci.yml` on the pull request is what checks their work.
-    if: ${{ !github.event.repository.fork }}
+    #
+    # Not for Dependabot either, for the same reason: its pushes run with Dependabot secrets
+    # only, so the dev key is empty, and a version bump is nothing anyone installs on a board.
+    if: ${{ !github.event.repository.fork && github.actor != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

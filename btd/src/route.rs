@@ -270,14 +270,22 @@ fn permits(call: &proto::Call) -> bool {
         // assuming a list; an unknown name is refused with the names it does know.
         RobotDo(_) => true,
 
-        // Harmless and rather charming from a phone — but it rides the same refusal as the
-        // rest of robot.* until the app path exists to want it: opening one call to the
-        // radio ahead of a client that can use it buys nothing and widens the surface.
+        // **A quack is how you tell ducks apart**, and that is a question asked from the room:
+        // every voice is seeded from the SoC serial, so the robot that answers in its own voice
+        // is the one this link reached. `duckctl quack` is the client that wanted it — the
+        // radio's version of `robotctl quack`. One request, not a stream, and it moves nothing.
+        RobotSound(_) => true,
+
+        // Harmless and rather charming from a phone — but they ride the same refusal as the
+        // rest of robot.* until the app path exists to want them: opening a call to the radio
+        // ahead of a client that can use it buys nothing and widens the surface.
         //
         // The theremin sits here rather than with motor control even though it moves the
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotSound(_) | RobotTheremin(_) | RobotChorale(_) => false,
+        RobotTheremin(_) | RobotChorale(_) => false,
+        // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
+        RobotFlashlight(_) => false,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a
@@ -718,6 +726,17 @@ mod tests {
         for (call, want) in expected {
             assert_eq!(upstream_for(&call), Some(want), "{}", call.method());
         }
+    }
+
+    /// **A quack crosses the radio.** `duckctl quack` answers "which duck is this link talking
+    /// to", and a refusal here would make it a command that never sounds.
+    #[test]
+    fn a_quack_reaches_robotd() {
+        let quack = proto::Call::RobotSound(proto::SoundParams {
+            tag: proto::SoundTag::Chirp,
+            hold: None,
+        });
+        assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
     }
 
     /// **A phone can ask for a skill, see what the robot has, and change what it runs.**

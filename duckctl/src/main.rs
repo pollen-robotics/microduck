@@ -31,6 +31,7 @@
 //! cargo run -p duckctl -- wifi scan
 //! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
 //! cargo run -p duckctl -- name "Ducky"
+//! cargo run -p duckctl -- --name duck-d041 quack
 //! cargo run -p duckctl -- call robot.health
 //! cargo run -p duckctl -- logs robotd -n 100
 //! ```
@@ -1073,6 +1074,11 @@ enum Command {
     Update(Update),
     /// Name, serial and uptime.
     Info,
+    /// Play this robot's quack — the loudest way to tell ducks apart.
+    ///
+    /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
+    /// that answers, in a voice that is only its own, is the one `--name` reached.
+    Quack,
     /// Is the control loop healthy?
     Health,
     /// Wifi.
@@ -2231,6 +2237,14 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         ),
         Command::Update(update) => return update_request_line(update),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Quack => (
+            proto::method::ROBOT_SOUND,
+            serde_json::to_value(proto::SoundParams {
+                tag: proto::SoundTag::Chirp,
+                hold: None,
+            })?,
+            REPLY_TIMEOUT,
+        ),
         // A journal read is a `journalctl` spawn on the robot plus a reply several times larger
         // than any other, chunked at 20 bytes a notification — seconds rather than milliseconds,
         // so it gets the slow budget for the same reason `wifi scan` does.
