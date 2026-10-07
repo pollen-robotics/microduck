@@ -531,6 +531,25 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Full turn right, rad/s — negative",
     ),
+    // ── [netpad] ─────────────────────────────────────────────────────────────
+    //
+    // The pad over UDP. `enabled` picks between `padd` and `netpadd`; restart both after.
+    entry(
+        "netpad.enabled",
+        Kind::Bool,
+        "Drive from UDP (netpadd) instead of the Bluetooth pad (padd) — restart both after",
+    ),
+    entry("netpad.port", Kind::Integer, "UDP port netpadd listens on"),
+    entry(
+        "netpad.max_hz",
+        Kind::Integer,
+        "Most intent frames a second sent to robotd, 1–100",
+    ),
+    entry(
+        "netpad.timeout_ms",
+        Kind::Integer,
+        "Silence after which the UDP client counts as gone — below safety.deadman_ms",
+    ),
 ];
 
 /// Sections that changed name: `(old, new)`.

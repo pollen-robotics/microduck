@@ -1119,7 +1119,8 @@ mod tests {
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad",
                 "pad_imu_head_control",
-                "pad_drive"
+                "pad_drive",
+                "netpad"
             ]
         );
     }

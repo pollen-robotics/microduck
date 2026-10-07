@@ -552,3 +552,14 @@ mode = "walk"
 # vy_min = -0.3
 # vyaw_max = 1.5
 # vyaw_min = -1.5
+
+# ── Pad over UDP ────────────────────────────────────────────────────────────────────────────
+#
+# Read by `padd` and `netpadd`. On, `netpadd` takes gamepad state from a program on the LAN —
+# `duckctl udp-pad`, or your own; docs/robot/udp-pad.md has the wire format — and `padd` stands
+# down. Restart both after changing it: `sudo systemctl restart padd netpadd`.
+# [netpad]
+# enabled = false
+# port = 4210
+# max_hz = 30          # intent frames a second to robotd, at most
+# timeout_ms = 250     # silence that counts as the client gone; below [safety] deadman_ms

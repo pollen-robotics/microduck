@@ -95,6 +95,8 @@ pub struct Params {
     pub pad_imu_head_control: PadImuHeadControlParams,
     /// How fast full stick deflection drives the robot. `padd` reads this as well.
     pub pad_drive: PadDriveParams,
+    /// The pad over UDP: `netpadd` reads this, and so does `padd`, to know whether to stand down.
+    pub netpad: NetpadParams,
 }
 
 /// The pad's walking speed limits: what full stick deflection asks for, per axis and per
@@ -157,6 +159,36 @@ impl PadDriveParams {
             deflection * max
         } else {
             -deflection * min
+        }
+    }
+}
+
+/// A gamepad over UDP, from a program on the LAN — `netpadd`. `docs/robot/udp-pad.md` owns it.
+///
+/// `enabled` is the switch between the two pad daemons, not a feature flag on one: both units ask
+/// it in `ExecCondition=`, so exactly one of `padd` and `netpadd` runs, and an update's restart of
+/// every shipped unit reaches the same answer as a boot does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NetpadParams {
+    /// UDP is the pad source; `padd` stands down.
+    pub enabled: bool,
+    /// The UDP port, bound on IPv4 0.0.0.0.
+    pub port: u16,
+    /// At most this many intent frames a second reach robotd. A change is sent at once when the
+    /// last send is at least one interval old, otherwise at the next slot — never queued.
+    pub max_hz: u32,
+    /// Silence after which the client counts as gone, and nothing more is sent.
+    pub timeout_ms: u64,
+}
+
+impl Default for NetpadParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 4210,
+            max_hz: 30,
+            timeout_ms: 250,
         }
     }
 }
@@ -2208,6 +2240,8 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error("{path}: {reason}")]
+    Netpad { path: String, reason: String },
     #[error(
         "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
@@ -2329,6 +2363,28 @@ impl Params {
                     max,
                 });
             }
+        }
+        // Refused rather than clamped, like `control.hz`: the editor should say which value it
+        // was not going to guess at.
+        if !(1..=100).contains(&self.netpad.max_hz) {
+            return Err(ParamsError::Netpad {
+                path: path.display().to_string(),
+                reason: format!("netpad.max_hz ({}) must be 1–100", self.netpad.max_hz),
+            });
+        }
+        // Gated on `enabled` because robotd loads this file too: a board not using netpad must
+        // never fail to load over a section it does not read.
+        if self.netpad.enabled
+            && (self.netpad.timeout_ms == 0 || self.netpad.timeout_ms >= self.safety.deadman_ms)
+        {
+            return Err(ParamsError::Netpad {
+                path: path.display().to_string(),
+                reason: format!(
+                    "netpad.timeout_ms ({}) must be above 0 and below safety.deadman_ms ({}) — \
+                     past the deadman it would re-send a dead client's last stick",
+                    self.netpad.timeout_ms, self.safety.deadman_ms
+                ),
+            });
         }
         // An inverted band would pause and resume on the same probability, every tick.
         let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
@@ -3494,6 +3550,66 @@ mod tests {
         let params = Params::load(&path, true).expect("valid");
         assert_eq!(params.pad_drive.vx_min, 0.0);
         assert_eq!(params.pad_drive.vy_min, -0.1);
+    }
+
+    /// The cap is a divisor and a promise about latency: zero divides by it, and a rate above
+    /// what a pad link carries only spends the robot's socket.
+    #[test]
+    fn netpad_max_hz_outside_one_to_a_hundred_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["0", "101"] {
+            let path = write(dir.path(), &format!("[netpad]\nmax_hz = {bad}\n"));
+            let error = Params::load(&path, true).expect_err("refused").to_string();
+            assert!(error.contains("netpad.max_hz"), "{error}");
+        }
+        let path = write(dir.path(), "[netpad]\nmax_hz = 100\n");
+        assert_eq!(Params::load(&path, true).expect("valid").netpad.max_hz, 100);
+    }
+
+    /// A client timeout at or past the deadman would keep re-sending a dead client's last
+    /// stick until robotd stops the robot anyway — the timeout would protect nothing. Only
+    /// checked when netpad is on: robotd loads this file too, and a board that does not use
+    /// netpad must never fail to load over it.
+    #[test]
+    fn netpad_timeout_must_be_below_the_deadman() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[netpad]\nenabled = true\ntimeout_ms = 500\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("netpad.timeout_ms"), "{error}");
+        assert!(error.contains("safety.deadman_ms"), "{error}");
+
+        let path = write(dir.path(), "[netpad]\nenabled = true\ntimeout_ms = 0\n");
+        assert!(
+            Params::load(&path, true).is_err(),
+            "zero is always timed out"
+        );
+
+        let path = write(
+            dir.path(),
+            "[netpad]\nenabled = true\ntimeout_ms = 500\n[safety]\ndeadman_ms = 800\n",
+        );
+        assert_eq!(
+            Params::load(&path, true).expect("valid").netpad.timeout_ms,
+            500
+        );
+
+        let path = write(dir.path(), "[netpad]\nenabled = false\ntimeout_ms = 500\n");
+        assert_eq!(
+            Params::load(&path, true)
+                .expect("off is not checked")
+                .netpad
+                .timeout_ms,
+            500
+        );
+    }
+
+    #[test]
+    fn netpad_defaults_are_off_on_4210_at_30_hz() {
+        let n = NetpadParams::default();
+        assert_eq!(
+            (n.enabled, n.port, n.max_hz, n.timeout_ms),
+            (false, 4210, 30, 250)
+        );
     }
 
     /// On by default, from the release's own copy of the model — a robot nobody configured stops
