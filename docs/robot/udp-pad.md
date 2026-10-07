@@ -45,8 +45,10 @@ active
 ```
 
 `padd` inactive and `netpadd` active is the UDP pad. The reverse is the Bluetooth pad. Both active
-cannot happen, and neither active means the one that should be running has failed — `journalctl -u
-netpadd -b` has why.
+means one of them was started on an older answer: both units select from the same key, so after a
+hand edit that restarted only one, the other runs on until it is restarted too — restart both, or
+change the key with `robotctl configure`, which does. Neither active means the one that should be
+running has failed — `journalctl -u netpadd -b` has why.
 
 To go back to Bluetooth, set `netpad.enabled = false` (or reset the key) and restart the same two
 units. A configuration that cannot be read counts as off, so a damaged file never leaves somebody
@@ -93,20 +95,32 @@ that applies its own would do it twice. Bits 12 to 15 of `buttons` are reserved:
 ignores them and logs it once. A version-1 packet *longer* than 28 bytes is accepted and the tail is
 ignored, so a field can be added later without a version bump.
 
-A sender in a dozen lines of Python — Start twice to stand and then walk, then three seconds
-forward, then silence:
+A sender in Python. It sends the whole state thirty times a second for as long as it is driving —
+a sender that pauses for longer than `timeout_ms` is gone, and the next datagram is a fresh
+connection whose buttons count as already held, so a press sent on its own after a pause does
+nothing. It opens with a neutral pad, taps Start to stand the robot up, keeps sending a still pad
+while it stands, taps Start again to turn the policy on, walks forward for three seconds, then
+sends one stale datagram the robot drops, and falls silent:
 
 ```python
-import socket, struct, time
+import random, socket, struct, time
+DUCK, START = ("duck.local", 4210), 1 << 6
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+seq = random.getrandbits(32)                  # a restarted sender is not mistaken for a stale one
 def pkt(seq, ly=0, buttons=0):
-    return b"DKPD" + struct.pack("<BBII6hH", 1, 0, seq, 0, 0, ly, 0, 0, 0, 0, buttons)
-seq = 1
-for b in (64, 0, 64, 0):                  # Start, release, Start, release
-    s.sendto(pkt(seq, 0, b), ("duck.local", 4210)); seq += 1; time.sleep(1.5)
-for _ in range(90):                        # 3 s forward at 30 Hz
-    s.sendto(pkt(seq, 32767), ("duck.local", 4210)); seq += 1; time.sleep(1/30)
-# then silence: the robot stops once the deadman runs out
+    t_ms = int(time.monotonic() * 1000) % 2**32
+    return b"DKPD" + struct.pack("<BBII6hH", 1, 0, seq, t_ms, 0, ly, 0, 0, 0, 0, buttons)
+def hold(frames, ly=0, buttons=0):            # the same state, every 1/30 s
+    global seq
+    for _ in range(frames):
+        seq = (seq + 1) % 2**32
+        s.sendto(pkt(seq, ly, buttons), DUCK); time.sleep(1 / 30)
+hold(10)                                      # a still pad first
+hold(5, buttons=START); hold(60)              # tap Start: robot.init, and 2 s to stand
+hold(5, buttons=START); hold(10)              # tap Start again: the policy on
+hold(90, ly=32767)                            # 3 s forward
+s.sendto(pkt((seq - 50) % 2**32, ly=-32767), DUCK)  # stale: dropped, never walks backwards
+# then silence: netpadd sends nothing, and robotd's deadman stops the robot
 ```
 
 The rules a sender follows, and why:
@@ -136,8 +150,10 @@ The rules a sender follows, and why:
   robot. In-flight holds are reset and the lock is released. The journal says so once, at `warn`,
   in each direction: `pad client connected` and `pad client gone`.
 - **The first datagram after a silence fires nothing.** Its buttons are taken as already held, so a
-  client that reconnects with Start down does not stand the robot up or sit it down. Any sequence
-  number is accepted after a silence, so a restarted sender is picked up at once.
+  client that reconnects with Start down does not stand the robot up or sit it down — not when it
+  comes back, not while it stays down, not when it is let go. Any sequence number is accepted after
+  a silence, so a restarted sender is picked up within `timeout_ms`: until the old one counts as
+  gone, the new sender's random `seq` may read as stale and be dropped.
 - **Malformed datagrams are dropped.** Wrong magic, fewer than 28 bytes, or an unknown version: the
   datagram is dropped and counted, and the count is logged at most once every 10 seconds, so
   something noisy on the port cannot flood the journal.
