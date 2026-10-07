@@ -57,8 +57,8 @@ hz = 50
 
 # Per-tick EMA smoothing on incoming commands: `cmd += alpha * (target - cmd)`. The
 # prototype's `--cmd-alpha` / `--head-alpha` — a stick snap becomes a ramp the gait can
-# follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist; `head_alpha` covers
-# head targets and the body pose.
+# follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist and the body pose;
+# `head_alpha` covers head targets.
 # cmd_alpha = 0.2
 # head_alpha = 0.2
 

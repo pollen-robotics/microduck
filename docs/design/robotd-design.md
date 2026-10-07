@@ -865,6 +865,15 @@ distinguishes a loop being woken late from a loop doing too much, and those have
 `safeToRestart` is false while the policy is enabled and the robot is moving: restarting motor
 control mid-stride is how a robot falls over (`updater-design.md` §7.2).
 
+#### 3.4.1 A completed twist stop
+
+The smoothed twist is an EMA, which approaches zero and never reaches it. `SmoothedTwist` in
+`robotd/src/main.rs` gives the stop an end: when the target after the deadman is exactly zero and
+every component is within `1e-6` (m/s, or rad/s for yaw), the twist becomes `Stopped` and the
+policy receives `[0.0; 3]`. A nonzero target stays `Active` even when the filter rounds to zero.
+`moving`, and so `safeToRestart`, and the idle head's `still` all read that state, so there is one
+rule for "stopped".
+
 ### 3.5 Maintenance is a separate namespace
 
 `init`, emergency torque-off, calibration and raw joint writes are not intents. They live in their
@@ -1101,6 +1110,7 @@ Each test's comment says which failure it exists to prevent, per the repo conven
 | policy path in params, default = release dir | updates carry the policy; devs override it |
 | adopt current pose on start | an update must not move a standing robot |
 | bring-up as a state machine, not a flag | `set_torque` is a transaction per joint |
+| the twist filter has a `Stopped` state | `safeToRestart` must not depend on floating-point underflow (§3.4.1) |
 | the fall verdict reports, it does not gate | what to do about a fall is a control decision (§2.4) |
 | ~~no odometry~~ — reversed | `monitor`'s path map reads it, and it is one `kinematics` pass on a sample the loop already took (§4.4) |
 | the priority chain keeps the runtime's shape | the skills were tuned against its quirks |
