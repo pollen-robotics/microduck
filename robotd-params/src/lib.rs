@@ -21,6 +21,7 @@ pub mod edit;
 pub mod registry;
 
 pub mod pad_axes;
+pub mod pad_modes;
 pub use pad_axes::{PadAxesParams, PadBodyParams, PadHeadParams};
 
 use std::path::{Path, PathBuf};
@@ -99,6 +100,7 @@ pub struct Params {
     /// How fast full stick deflection drives the robot. `padd` reads this as well.
     pub pad_drive: PadDriveParams,
     pub pad_axes: PadAxesParams,
+    pub pad_modes: pad_modes::PadModesParams,
     pub pad_head: PadHeadParams,
     pub pad_body: PadBodyParams,
     pub pad_roller: PadRollerParams,
@@ -2386,6 +2388,9 @@ impl Params {
         if !(self.pad_axes.deadzone.is_finite() && (0.0..1.0).contains(&self.pad_axes.deadzone)) {
             return Err(invalid("pad_axes.deadzone", "must be finite and in [0, 1)"));
         }
+        self.pad_modes
+            .validate(&self.pad_axes)
+            .map_err(|reason| invalid("pad_modes", reason))?;
         for (key, binding) in self.pad_axes.bindings() {
             if !(binding.gain.is_finite() && binding.gain >= 0.0) {
                 return Err(invalid(

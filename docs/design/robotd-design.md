@@ -921,7 +921,7 @@ A TOML file read at startup and, for the most part, **not watched**. It lives ou
 
 Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
 than steps towards watching the whole file. `padd` stats the file once a second and re-reads
-the controller sections (`[pad]`, `[pad_axes]`, `[pad_drive]`, `[pad_head]`, `[pad_body]`,
+the controller sections (`[pad]`, `[pad_modes]`, `[pad_axes]`, `[pad_drive]`, `[pad_head]`, `[pad_body]`,
 `[pad_roller]` and `[pad_imu_head_control]`) when the mtime moves: a binding is changed from a phone, and restarting
 `padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
 Controller settings are replaced together after validation; a failed live read keeps the last
@@ -938,8 +938,43 @@ and tilt radians). Defaults reproduce the previous commands, including asymmetri
 roller push/brake. These are requested commands, not actuator limits or guarantees that a policy
 can reach the requested pose.
 
-D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
-`head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
+`[[pad_modes.profiles]]` replaces the shipped four-profile list with any nonempty list of named
+profiles. Each has a stable `id`, a display `name`, an optional direct-selection `button`, and
+optional `drive`, `head` and `body` channel mappings. Channels can be combined freely. Omitted
+channels are inactive; an inactive movement channel sends a zero twist. Bindings use the same
+`source`, `invert` and `gain` shape, with the existing shared physical limits. The first profile
+is used at startup and after Home. Rename or reorder preserves the active profile by id; removing
+it selects the first remaining profile and releases body/head commands it no longer controls.
+A file with no explicit profiles inherits the four shipped profiles and its `[pad_axes]` edits;
+with explicit profiles, `[pad_axes]` supplies only the shared deadzone.
+
+`[pad_modes] next_button` and `previous_button` cycle through this list on press edges, wrapping
+at either end; `none` disables the action. Each profile's `button` selects it directly. Available
+buttons are A/B/X/Y, bumpers, D-pad directions and stick clicks. Ambiguous button assignments,
+duplicate ids, blank names and invalid gains are refused. A mode-switch button takes precedence
+over its skill, including X's held resend. Start/Select holds and Home keep their robot actions.
+For example, two profiles and one cycling button reproduce the prototype X toggle:
+
+```toml
+[pad_modes]
+next_button = "x"
+
+[[pad_modes.profiles]]
+id = "walk"
+name = "Walking"
+[pad_modes.profiles.drive.vx]
+gain = 0.5
+
+[[pad_modes.profiles]]
+id = "look"
+name = "Looking"
+[pad_modes.profiles.head]
+```
+
+`imu_head` permits controller tilt in a profile when `[pad_imu_head_control] enabled` is on;
+pressing its selection button again re-centres. `imu_drive` optionally supplies separate stick
+mappings while tilt controls the head. The shipped head + move profile uses the full `drive`
+mapping in that case. Tilt still follows `[pad_head]` limits.
 Smoothing remains in `robotd`'s `[control]` settings. `padd --deadzone` and `--max-head` remain
 explicit overrides of the corresponding file settings for bench use.
 

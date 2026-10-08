@@ -216,6 +216,19 @@ const PAD_LOST_SIT: Duration = Duration::from_secs(1);
 /// journal says so rather than the pad asking forever.
 const PAD_LOST_SIT_TRIES: Duration = Duration::from_secs(5);
 
+/// Mode-switch buttons cannot launch or resend their former skill, including held X.
+fn button_skill<'a>(
+    config: &'a robotd_params::Params,
+    profiles: &[robotd_params::pad_modes::PadMode],
+    button: &str,
+) -> Option<&'a str> {
+    if config.pad_modes.select(profiles, 0, button).is_some() {
+        None
+    } else {
+        config.pad.skill(button)
+    }
+}
+
 /// How often to ask, while a sit is due. Faster than [`IDLE_POLL`] so the one-second promise holds.
 const PAD_LOST_POLL: Duration = Duration::from_millis(100);
 
@@ -384,6 +397,7 @@ impl HoldButton {
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Mode {
     /// D-pad left. Left stick walks and strafes, right stick turns.
     Drive,
@@ -398,31 +412,62 @@ enum Mode {
     BodyPose,
 }
 
-impl Mode {
-    /// Whether this mode sends head poses, so leaving it has a head to put back.
-    fn poses_head(self) -> bool {
-        matches!(self, Self::Head | Self::HeadDrive | Self::BodyPose)
-    }
-}
-
 /// What has to be sent when the sticks stop meaning `from` and start meaning `to`.
 ///
 /// Leaving a mode puts back what it moved, because nothing else will: a body left leaning or a
 /// head left turned stays that way, and the next mode does not send the joints the last one did.
 /// Moving between modes that all pose the head keeps the head, since the next one goes on posing
 /// it.
-fn mode_exit_calls(from: Mode, to: Mode) -> Vec<proto::Call> {
+fn profile_exit_calls(
+    from: &robotd_params::pad_modes::PadMode,
+    to: &robotd_params::pad_modes::PadMode,
+) -> Vec<proto::Call> {
     let mut calls = Vec::new();
-    if from == Mode::BodyPose && to != Mode::BodyPose {
+    if from.body.is_some() && to.body.is_none() {
         calls.push(proto::Call::RobotPose(proto::PoseParams {
             active: false,
             ..Default::default()
         }));
     }
-    if from.poses_head() && !to.poses_head() {
+    if from.head.is_some() && to.head.is_none() {
         calls.push(proto::Call::RobotHead(proto::HeadParams::default()));
     }
     calls
+}
+
+/// Stable ids retain the active mode across renames/reordering; removal selects the first mode.
+fn refresh_profile(
+    current: &mut robotd_params::pad_modes::PadMode,
+    profiles: &[robotd_params::pad_modes::PadMode],
+) -> (Vec<proto::Call>, bool) {
+    let next = profiles
+        .iter()
+        .find(|p| p.id == current.id)
+        .unwrap_or(&profiles[0]);
+    let calls = profile_exit_calls(current, next);
+    let reset_reference = current.id != next.id
+        || current.imu_head != next.imu_head
+        || current.head.is_some() != next.head.is_some();
+    *current = next.clone();
+    (calls, reset_reference)
+}
+
+fn mode_button(button: Button) -> Option<&'static str> {
+    Some(match button {
+        Button::South => "a",
+        Button::East => "b",
+        Button::West => "x",
+        Button::North => "y",
+        Button::LeftTrigger => "lb",
+        Button::RightTrigger => "rb",
+        Button::DPadUp => "dpad_up",
+        Button::DPadRight => "dpad_right",
+        Button::DPadDown => "dpad_down",
+        Button::DPadLeft => "dpad_left",
+        Button::LeftThumb => "left_stick",
+        Button::RightThumb => "right_stick",
+        _ => return None,
+    })
 }
 
 /// How often to look for a rewritten config. See the loop.
@@ -575,8 +620,7 @@ fn main() -> std::process::ExitCode {
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — A sit, B ground pick, LB/RB kicks, triggers mouth; D-pad up head, \
-         right head + move, left move, down body + head; Start stands up then toggles the policy, \
+        "driving — mode and skill buttons follow config; triggers mouth; Start stands up then toggles the policy, \
          Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
     );
 
@@ -591,7 +635,8 @@ fn main() -> std::process::ExitCode {
     let mut config_at = config_mtime(&args.config);
     let mut config_checked = Instant::now();
 
-    let mut mode = Mode::Drive;
+    let mut profiles = pad_config.pad_modes.effective(&pad_config.pad_axes);
+    let mut mode = profiles[0].clone();
     // The pad attitude that reads as "head centred" while head + move follows the pad's IMU.
     // `None` whenever it is not following — another mode, the feature off, no IMU, or the pad
     // gone: a reference taken against one pad means nothing to the next.
@@ -628,6 +673,17 @@ fn main() -> std::process::ExitCode {
             &args,
             &mut pad_config,
         ) {
+            profiles = pad_config.pad_modes.effective(&pad_config.pad_axes);
+            let (exit, reset_reference) = refresh_profile(&mut mode, &profiles);
+            for call in exit {
+                if let Err(e) = notify(&mut stream, &call) {
+                    tracing::error!(error = %e, "send failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            if reset_reference {
+                imu_reference = None;
+            }
             match ask_roller(&mut stream, &mut next_id) {
                 Ok(Some(now)) if now != roller => {
                     roller = now;
@@ -648,7 +704,7 @@ fn main() -> std::process::ExitCode {
         // connected, a Start or Select from the *other* one would otherwise steer a robot
         // whose sticks belong to somebody else.
         let pad_id = gilrs.gamepads().next().map(|(id, _)| id);
-        let mut wanted_mode: Option<Mode> = None;
+        let mut wanted_mode: Option<robotd_params::pad_modes::PadMode> = None;
         // Which bindable buttons went down this tick, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
@@ -664,28 +720,22 @@ fn main() -> std::process::ExitCode {
                 // so they are read off their state every tick and their release here.
                 gilrs::EventType::ButtonReleased(Button::Start, _) => start_released = true,
                 gilrs::EventType::ButtonReleased(Button::Select, _) => select_released = true,
-                gilrs::EventType::ButtonPressed(button, _) => match button {
-                    // The six bindable ones. What each runs is `[pad]` in the config; this
-                    // only knows which physical control was pressed.
-                    //
-                    // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
-                    // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
-                    // a skill to a control nobody presses.
-                    Button::South => pressed.push("a"),
-                    Button::East => pressed.push("b"),
-                    Button::West => pressed.push("x"),
-                    Button::North => pressed.push("y"),
-                    Button::LeftTrigger => pressed.push("lb"),
-                    Button::RightTrigger => pressed.push("rb"),
-                    // The D-pad picks what the sticks mean.
-                    Button::DPadUp => wanted_mode = Some(Mode::Head),
-                    Button::DPadRight => wanted_mode = Some(Mode::HeadDrive),
-                    Button::DPadLeft => wanted_mode = Some(Mode::Drive),
-                    Button::DPadDown => wanted_mode = Some(Mode::BodyPose),
-                    // Home. Not bindable: it is not a skill, and the robot owns the toggle.
-                    Button::Mode => flashlight = true,
-                    _ => {}
-                },
+                gilrs::EventType::ButtonPressed(button, _) => {
+                    if let Some(name) = mode_button(button) {
+                        let current = wanted_mode.as_ref().unwrap_or(&mode);
+                        let index = profiles
+                            .iter()
+                            .position(|p| p.id == current.id)
+                            .unwrap_or(0);
+                        if let Some(next) = pad_config.pad_modes.select(&profiles, index, name) {
+                            wanted_mode = Some(profiles[next].clone());
+                        } else if pad_config.pad.skill(name).is_some() {
+                            pressed.push(name);
+                        }
+                    } else if button == Button::Mode {
+                        flashlight = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -834,13 +884,13 @@ fn main() -> std::process::ExitCode {
             // The disable comes first so the policy cannot pick the robot up again the moment the
             // ramp ends, which is what `robot.init` alone does on a robot that is driving.
             tracing::warn!("Start held — home pose, motors stiff, policy off");
-            for call in mode_exit_calls(mode, Mode::Drive) {
+            for call in profile_exit_calls(&mode, &profiles[0]) {
                 if let Err(e) = notify(&mut stream, &call) {
                     tracing::error!(error = %e, "send failed");
                     return std::process::ExitCode::FAILURE;
                 }
             }
-            mode = Mode::Drive;
+            mode = profiles[0].clone();
             imu_reference = None;
             let disable = proto::Call::RobotEnable(proto::EnableParams {
                 on: false,
@@ -857,24 +907,20 @@ fn main() -> std::process::ExitCode {
 
         if let Some(next) = wanted_mode {
             if next != mode {
-                for call in mode_exit_calls(mode, next) {
+                for call in profile_exit_calls(&mode, &next) {
                     if let Err(e) = notify(&mut stream, &call) {
                         tracing::error!(error = %e, "send failed");
                         return std::process::ExitCode::FAILURE;
                     }
                 }
                 mode = next;
-                tracing::info!(?mode, "mode");
+                tracing::info!(mode = %mode.name, mode_id = %mode.id, "mode");
             }
             // Head + move follows the pad's IMU when it can, from wherever the pad is at the
             // press — and pressing it again re-centres, which is how a person beats the gyro's
             // yaw drift without a magnetometer.
-            imu_reference = if mode == Mode::HeadDrive {
-                attitude
-            } else {
-                None
-            };
-            if mode == Mode::HeadDrive {
+            imu_reference = if mode.imu_head { attitude } else { None };
+            if mode.imu_head {
                 if imu_reference.is_some() {
                     tracing::info!("IMU head control: following the pad from here");
                 } else if pad_config.pad_imu_head_control.enabled
@@ -897,7 +943,7 @@ fn main() -> std::process::ExitCode {
         // one with the list it does have, which is a better error than this side could give.
         for button in &pressed {
             // An empty binding is a button switched off on purpose, not a fault.
-            let skill = pad_config.pad.skill(button).unwrap_or_default();
+            let skill = button_skill(&pad_config, &profiles, button).unwrap_or_default();
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -934,7 +980,7 @@ fn main() -> std::process::ExitCode {
         // Whatever X is bound to, nothing by default: a skill that does not chain simply refuses
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
-        let held = pad_config.pad.skill("x").unwrap_or_default();
+        let held = button_skill(&pad_config, &profiles, "x").unwrap_or_default();
         if pad.is_pressed(Button::West)
             && !pressed.contains(&"x")
             && !held.is_empty()
@@ -1045,12 +1091,12 @@ fn main() -> std::process::ExitCode {
         }
 
         frame.clear();
-        let imu = if mode == Mode::HeadDrive {
+        let imu = if mode.imu_head {
             imu_reference.zip(attitude)
         } else {
             None
         };
-        append_stick_frame(&mut frame, mode, sticks, &pad_config, roller, imu);
+        append_profile_frame(&mut frame, &mode, sticks, &pad_config, roller, imu);
 
         if let Err(e) = continuous.send(&mut stream, &frame, tick) {
             tracing::error!(error = %e, "send failed");
@@ -1064,17 +1110,16 @@ fn main() -> std::process::ExitCode {
 }
 
 /// Build commands from normalized stick bindings; mode transitions remain in the loop.
-fn append_stick_frame(
+fn append_profile_frame(
     frame: &mut Vec<proto::Call>,
-    mode: Mode,
+    mode: &robotd_params::pad_modes::PadMode,
     sticks: [f64; 4],
     config: &robotd_params::Params,
     roller: bool,
     imu: Option<([f32; 4], [f32; 4])>,
 ) {
-    let axes = &config.pad_axes;
     let value =
-        |binding: &robotd_params::pad_axes::AxisBinding| binding.evaluate(sticks, axes.deadzone);
+        |b: &robotd_params::pad_axes::AxisBinding| b.evaluate(sticks, config.pad_axes.deadzone);
     let head = &config.pad_head;
     let scale = robotd_params::PadDriveParams::scale;
     let roller_limits = config.pad_roller.limits();
@@ -1083,83 +1128,93 @@ fn append_stick_frame(
     } else {
         &config.pad_drive
     };
-    let movement = |vx, vy, yaw| {
-        proto::Call::RobotMove(proto::MoveParams {
-            vx: scale(vx, limits.vx_min, limits.vx_max),
-            vy: scale(vy, limits.vy_min, limits.vy_max),
-            vyaw: scale(yaw, limits.vyaw_min, limits.vyaw_max),
-        })
+    let imu = if mode.imu_head { imu } else { None };
+    let drive = if imu.is_some() {
+        mode.imu_drive.as_ref().or(mode.drive.as_ref())
+    } else {
+        mode.drive.as_ref()
     };
-    let pose_head = |neck, pitch, yaw, roll| {
-        proto::Call::RobotHead(proto::HeadParams {
-            neck_pitch: neck * head.neck_pitch_max,
-            head_pitch: pitch * head.head_pitch_max,
-            head_yaw: yaw * head.head_yaw_max,
-            head_roll: roll * head.head_roll_max,
-        })
-    };
-    match mode {
-        Mode::Drive => {
-            let a = &axes.drive;
-            frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
-        }
-        Mode::HeadDrive => {
-            if let Some((reference, now)) = imu {
-                let a = &axes.drive;
-                frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
-                let mut h = head_from_pad(
-                    pad_imu::relative(reference, now),
-                    config.pad_imu_head_control.gain,
-                    f64::MAX,
-                );
-                h.neck_pitch = h
-                    .neck_pitch
-                    .clamp(-head.neck_pitch_max, head.neck_pitch_max);
-                h.head_pitch = h
-                    .head_pitch
-                    .clamp(-head.head_pitch_max, head.head_pitch_max);
-                h.head_yaw = h.head_yaw.clamp(-head.head_yaw_max, head.head_yaw_max);
-                h.head_roll = h.head_roll.clamp(-head.head_roll_max, head.head_roll_max);
-                frame.push(proto::Call::RobotHead(h));
-            } else {
-                let a = &axes.head_drive;
-                frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
-                frame.push(pose_head(
-                    value(&a.neck_pitch),
-                    value(&a.head_pitch),
-                    value(&a.head_yaw),
-                    value(&a.head_roll),
-                ));
-            }
-        }
-        Mode::Head => {
-            let a = &axes.head;
-            frame.push(movement(0.0, 0.0, 0.0));
-            frame.push(pose_head(
-                value(&a.neck_pitch),
-                value(&a.head_pitch),
-                value(&a.head_yaw),
-                value(&a.head_roll),
-            ));
-        }
-        Mode::BodyPose => {
-            let a = &axes.body_pose;
-            let body = &config.pad_body;
-            frame.push(movement(0.0, 0.0, 0.0));
-            frame.push(proto::Call::RobotPose(proto::PoseParams {
-                z: scale(value(&a.z), body.z_min, body.z_max),
-                pitch: value(&a.pitch) * body.pitch_max,
-                roll: value(&a.roll) * body.roll_max,
-                active: true,
-            }));
-            frame.push(pose_head(
-                value(&a.neck_pitch),
-                value(&a.head_pitch),
-                value(&a.head_yaw),
-                value(&a.head_roll),
-            ));
-        }
+    let (vx, vy, yaw) = drive
+        .map(|a| (value(&a.vx), value(&a.vy), value(&a.vyaw)))
+        .unwrap_or_default();
+    frame.push(proto::Call::RobotMove(proto::MoveParams {
+        vx: scale(vx, limits.vx_min, limits.vx_max),
+        vy: scale(vy, limits.vy_min, limits.vy_max),
+        vyaw: scale(yaw, limits.vyaw_min, limits.vyaw_max),
+    }));
+    if let Some(a) = &mode.body {
+        let body = &config.pad_body;
+        frame.push(proto::Call::RobotPose(proto::PoseParams {
+            z: scale(value(&a.z), body.z_min, body.z_max),
+            pitch: value(&a.pitch) * body.pitch_max,
+            roll: value(&a.roll) * body.roll_max,
+            active: true,
+        }));
     }
+    if let Some(a) = &mode.head {
+        let h = if let Some((reference, now)) = imu {
+            let mut h = head_from_pad(
+                pad_imu::relative(reference, now),
+                config.pad_imu_head_control.gain,
+                f64::MAX,
+            );
+            h.neck_pitch = h
+                .neck_pitch
+                .clamp(-head.neck_pitch_max, head.neck_pitch_max);
+            h.head_pitch = h
+                .head_pitch
+                .clamp(-head.head_pitch_max, head.head_pitch_max);
+            h.head_yaw = h.head_yaw.clamp(-head.head_yaw_max, head.head_yaw_max);
+            h.head_roll = h.head_roll.clamp(-head.head_roll_max, head.head_roll_max);
+            h
+        } else {
+            proto::HeadParams {
+                neck_pitch: value(&a.neck_pitch) * head.neck_pitch_max,
+                head_pitch: value(&a.head_pitch) * head.head_pitch_max,
+                head_yaw: value(&a.head_yaw) * head.head_yaw_max,
+                head_roll: value(&a.head_roll) * head.head_roll_max,
+            }
+        };
+        frame.push(proto::Call::RobotHead(h));
+    }
+}
+
+#[cfg(test)]
+fn test_profile(mode: Mode, config: &robotd_params::Params) -> robotd_params::pad_modes::PadMode {
+    let id = match mode {
+        Mode::Drive => "drive",
+        Mode::Head => "head",
+        Mode::HeadDrive => "head_drive",
+        Mode::BodyPose => "body_pose",
+    };
+    robotd_params::pad_modes::PadModesParams::default()
+        .effective(&config.pad_axes)
+        .into_iter()
+        .find(|p| p.id == id)
+        .unwrap()
+}
+#[cfg(test)]
+fn mode_exit_calls(from: Mode, to: Mode) -> Vec<proto::Call> {
+    let config = robotd_params::Params::default();
+    profile_exit_calls(&test_profile(from, &config), &test_profile(to, &config))
+}
+#[cfg(test)]
+fn append_stick_frame(
+    frame: &mut Vec<proto::Call>,
+    mode: Mode,
+    sticks: [f64; 4],
+    config: &robotd_params::Params,
+    roller: bool,
+    imu: Option<([f32; 4], [f32; 4])>,
+) {
+    append_profile_frame(
+        frame,
+        &test_profile(mode, config),
+        sticks,
+        config,
+        roller,
+        imu,
+    );
 }
 
 /// Whether this robot is on wheels, by asking it. `None` for an answer that did not say.
@@ -2192,5 +2247,113 @@ mod tests {
         loss.settle();
         assert!(loss.found(), "back after the sit");
         assert!(!loss.found(), "once");
+    }
+    #[test]
+    fn x_mode_switching_consumes_both_the_press_and_held_skill() {
+        let mut config = robotd_params::Params::default();
+        config.pad.x = "roulade".into();
+        config.pad_modes.profiles = config
+            .pad_modes
+            .effective(&config.pad_axes)
+            .into_iter()
+            .take(2)
+            .collect();
+        config.pad_modes.next_button = "x".into();
+        let profiles = config.pad_modes.effective(&config.pad_axes);
+        assert_eq!(mode_button(Button::West), Some("x"));
+        assert_eq!(mode_button(Button::LeftTrigger), Some("lb"));
+        assert_eq!(mode_button(Button::Start), None);
+        assert_eq!(button_skill(&config, &profiles, "x"), None);
+        assert_eq!(button_skill(&config, &profiles, "a"), Some("sit_toggle"));
+        assert_eq!(config.pad_modes.select(&profiles, 0, "x"), Some(1));
+        assert_eq!(config.pad_modes.select(&profiles, 1, "x"), Some(0));
+    }
+    #[test]
+    fn named_profiles_can_combine_channels_and_have_independent_gains() {
+        let config = robotd_params::Params::default();
+        let profiles = config.pad_modes.effective(&config.pad_axes);
+        let mut custom = profiles[0].clone();
+        custom.id = "custom".into();
+        custom.name = "Slow movement and posture".into();
+        custom.drive.as_mut().unwrap().vx.gain = 0.25;
+        custom.body = profiles[3].body.clone();
+        custom.head = profiles[1].head.clone();
+        let mut frame = Vec::new();
+        append_profile_frame(
+            &mut frame,
+            &custom,
+            [0.0, 1.0, 0.0, 0.0],
+            &config,
+            false,
+            None,
+        );
+        assert_eq!(frame.len(), 3);
+        match &frame[0] {
+            proto::Call::RobotMove(p) => assert!((p.vx - 0.075).abs() < 1e-6),
+            _ => panic!("movement missing"),
+        }
+        match &frame[1] {
+            proto::Call::RobotPose(p) => {
+                assert!(p.active);
+                assert!((p.z - 0.010).abs() < 1e-6);
+            }
+            _ => panic!("body pose missing"),
+        }
+        assert!(matches!(&frame[2], proto::Call::RobotHead(_)));
+        let exit = profile_exit_calls(&custom, &profiles[0]);
+        assert!(matches!(&exit[0], proto::Call::RobotPose(p) if !p.active));
+        assert!(
+            matches!(&exit[1], proto::Call::RobotHead(p) if p == &proto::HeadParams::default())
+        );
+    }
+    #[test]
+    fn profile_reload_preserves_selection_on_rename_and_cleans_up_a_removed_mode() {
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        let mut config = robotd_params::Params::default();
+        let profiles = config.pad_modes.effective(&config.pad_axes);
+        let mut current = profiles[3].clone();
+        let mut renamed = current.clone();
+        renamed.name = "Crouch and look".into();
+        config.pad_modes.profiles = vec![profiles[0].clone(), renamed];
+        let mut editor = robotd_params::edit::Model::load(&path).unwrap();
+        editor
+            .set_pad_modes(config.pad_modes.profiles.clone())
+            .unwrap();
+        editor.save().unwrap();
+        let args = Args::try_parse_from(["padd", "--config", path.to_str().unwrap()]).unwrap();
+        let start = Instant::now();
+        let mut checked = start;
+        let mut modified = config_mtime(&path);
+        let (exit, reset) = refresh_profile(&mut current, &config.pad_modes.profiles);
+        assert!(exit.is_empty());
+        assert!(!reset);
+        assert_eq!(current.name, "Crouch and look");
+        config.pad_modes.profiles.remove(1);
+        let mut editor = robotd_params::edit::Model::load(&path).unwrap();
+        editor
+            .set_pad_modes(config.pad_modes.profiles.clone())
+            .unwrap();
+        editor.save().unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(50))
+            .unwrap();
+        assert!(poll_config(
+            start + CONFIG_POLL,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config
+        ));
+        let (exit, reset) =
+            refresh_profile(&mut current, &config.pad_modes.effective(&config.pad_axes));
+        assert_eq!(current.id, "drive");
+        assert!(reset);
+        assert!(matches!(&exit[0], proto::Call::RobotPose(p) if !p.active));
+        assert!(
+            matches!(&exit[1], proto::Call::RobotHead(p) if p == &proto::HeadParams::default())
+        );
     }
 }

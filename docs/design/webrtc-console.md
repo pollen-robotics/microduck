@@ -306,20 +306,26 @@ Three constraints on it:
 
 ### 4.1 Controller configuration
 
-Open the console with `duckctl open`, connect, then select **Controller**. Select the stick
-mode to edit its mappings; change a button menu to assign one of this robot's skills or
+Open the console with `duckctl open`, connect, then select **Controller**. Select **Edit mode**
+to edit a profile. **Add mode** copies the selected profile with a new id;
+rename it, enable its control channels, adjust its axes, or remove it. **Move up/down** changes
+cycling order and startup selection. Choose a direct-selection button for each profile, or set
+**Next mode button** / **Previous mode button** to cycle the list. With two profiles and Next
+assigned to X, each X press toggles between them. Buttons assigned to mode switching have their
+skill fields disabled. The dropdown chooses what to edit, and the controller buttons switch
+the active mode. Change a button menu to assign one of this robot's skills or
 **No action** to disable it. **Save** writes the batch to `/etc/robot/robotd.toml`;
 `padd` reloads it within a second. **Cancel** discards local edits. **Restore defaults**
 stages removal of controller overrides and needs Save before it changes the robot.
 Keyboard driving is suspended while this tab is visible. Existing unsaved edits survive
 a lost connection, and inputs are disabled until the control channel returns.
 
-API v42 adds `pad.config` (typed settings, effective values, defaults and choices from the
+API v43 provides `pad.config` (typed settings, the named profile list, effective values, defaults and choices from the
 robot's parameter registry) and `pad.setConfig` (`changes` keyed by parameter path, with
 JSON null meaning remove the override). The latter permits only controller parameters,
 validates the whole batch and uses the terminal editor's atomic writer, preserving other
 settings and comments. An invalid batch leaves the file untouched. Both methods use the
-existing control-channel authorization and BLE PIN gate. The runtime must support v42;
+existing control-channel authorization and BLE PIN gate. The runtime must support v43;
 older robots report the unsupported method in the editor. The parameter ownership and
 mapping semantics live in [robotd-design.md](robotd-design.md#42-params).
 

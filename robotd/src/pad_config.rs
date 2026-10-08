@@ -13,6 +13,7 @@ fn controller_key(key: &str) -> bool {
         Some(
             "pad"
                 | "pad_axes"
+                | "pad_modes"
                 | "pad_drive"
                 | "pad_head"
                 | "pad_body"
@@ -41,10 +42,10 @@ fn value(kind: Kind, text: &str) -> Result<Value, String> {
 
 pub fn report(path: &Path, skills: Vec<String>) -> Result<proto::PadConfigResult, String> {
     let model = Model::load(path)?;
-    let settings = model
+    let mut settings = model
         .rows()
         .into_iter()
-        .filter(|row| controller_key(row.entry.key))
+        .filter(|row| controller_key(row.entry.key) && row.entry.key != "pad_modes.profiles")
         .map(|row| {
             let (kind, choices) = match row.entry.kind {
                 Kind::Bool => (proto::PadSettingKind::Boolean, vec![]),
@@ -67,6 +68,23 @@ pub fn report(path: &Path, skills: Vec<String>) -> Result<proto::PadConfigResult
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let config: robotd_params::Params =
+        toml::from_str(&model.rendered()).map_err(|e| e.to_string())?;
+    let defaults = robotd_params::Params::default();
+    settings.push(proto::PadSetting {
+        key: "pad_modes.profiles".into(),
+        kind: proto::PadSettingKind::Modes,
+        description: "Named modes, in cycling and startup order".into(),
+        value: serde_json::to_value(config.pad_modes.effective(&config.pad_axes))
+            .map_err(|e| e.to_string())?,
+        default_value: serde_json::to_value(defaults.pad_modes.effective(&defaults.pad_axes))
+            .map_err(|e| e.to_string())?,
+        overridden: !config.pad_modes.profiles.is_empty(),
+        choices: robotd_params::pad_modes::MODE_BUTTONS
+            .iter()
+            .map(|s| (*s).into())
+            .collect(),
+    });
     Ok(proto::PadConfigResult { settings })
 }
 
@@ -92,6 +110,12 @@ fn apply_checked(
             model.pending.insert(entry.key, Edit::Clear);
             continue;
         };
+        if key == "pad_modes.profiles" {
+            let profiles =
+                serde_json::from_value(input.clone()).map_err(|e| format!("invalid modes: {e}"))?;
+            model.set_pad_modes(profiles)?;
+            continue;
+        }
         let text = match (entry.kind, input) {
             (Kind::Bool, Value::Bool(v)) => v.to_string(),
             (Kind::Float, Value::Number(v)) => v.to_string(),
@@ -170,5 +194,61 @@ mod tests {
         assert!(written.contains("# keep this"));
         assert!(written.contains("hz = 50"));
         assert!(!written.contains("gain"));
+    }
+    #[test]
+    fn two_named_modes_with_x_cycling_roundtrip_and_invalid_modes_leave_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "# keep me\n[control]\nhz = 50\n").unwrap();
+        let defaults = robotd_params::Params::default();
+        let mut modes = defaults.pad_modes.effective(&defaults.pad_axes);
+        modes.truncate(2);
+        modes[0].name = "Slow walk".into();
+        modes[1].name = "Look around".into();
+        modes[0].drive.as_mut().unwrap().vx.gain = 0.25;
+        for m in &mut modes {
+            m.button = None;
+        }
+        let patch = proto::PadConfigPatch {
+            changes: serde_json::from_value(
+                json!({ "pad_modes.profiles": modes, "pad_modes.next_button": "x" }),
+            )
+            .unwrap(),
+        };
+        assert!(apply(&path, &patch, &[]).accepted);
+        let config = robotd_params::Params::load(&path, true).unwrap();
+        assert_eq!(config.pad_modes.profiles.len(), 2);
+        assert_eq!(config.pad_modes.profiles[0].name, "Slow walk");
+        assert_eq!(config.pad_modes.next_button, "x");
+        assert_eq!(
+            config.pad_modes.select(&config.pad_modes.profiles, 1, "x"),
+            Some(0)
+        );
+        let report = report(&path, vec![]).unwrap();
+        let row = report
+            .settings
+            .iter()
+            .find(|s| s.key == "pad_modes.profiles")
+            .unwrap();
+        assert_eq!(row.value[1]["name"], json!("Look around"));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep me"));
+        assert!(saved.contains("hz = 50"));
+        modes[0].drive.as_mut().unwrap().vx.gain = -1.0;
+        let invalid = proto::PadConfigPatch {
+            changes: serde_json::from_value(json!({"pad_modes.profiles": modes, "pad.a": ""}))
+                .unwrap(),
+        };
+        assert!(!apply(&path, &invalid, &[]).accepted);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        let reset = proto::PadConfigPatch {
+            changes: serde_json::from_value(
+                json!({"pad_modes.profiles": null, "pad_modes.next_button": null}),
+            )
+            .unwrap(),
+        };
+        assert!(apply(&path, &reset, &[]).accepted);
+        let config = robotd_params::Params::load(&path, true).unwrap();
+        assert_eq!(config.pad_modes.effective(&config.pad_axes).len(), 4);
     }
 }

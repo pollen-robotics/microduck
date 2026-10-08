@@ -456,7 +456,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// [`Call::PadConfig`] reports typed controller settings and defaults from the robot's schema.
 /// [`Call::PadSetConfig`] validates and persists a controller-only batch of edits atomically.
-pub const API_VERSION: u32 = 42;
+///
+/// # v43 — named controller profiles and configurable selection buttons
+///
+/// `pad.config` includes a Modes setting for the profile list; `pad.setConfig` can replace
+/// or reset it together with the cycling buttons in one validated batch.
+pub const API_VERSION: u32 = 43;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4614,6 +4619,7 @@ pub enum PadSettingKind {
     Boolean,
     Choice,
     Skill,
+    Modes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

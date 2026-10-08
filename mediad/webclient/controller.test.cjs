@@ -35,3 +35,26 @@ test('returning to the loaded value drops the edit; choosing its default sends r
   draft.set(settings[1], 1);
   assert.deepEqual(changes(draft), { 'pad_axes.drive.vx.gain': null });
 });
+
+test('named profiles are staged structurally and cancel/reset restore the robot list', () => {
+  const setting = { key: 'pad_modes.profiles', value: [{ id: 'walk', name: 'Walk' }, { id: 'look', name: 'Look' }], default_value: [{ id: 'drive', name: 'Move' }], overridden: true };
+  const draft = new context.ControllerDraft({ settings: [setting] });
+  const list = JSON.parse(JSON.stringify(draft.value(setting)));
+  list[0].name = 'Slow walk'; list.push({ id: 'third', name: 'Custom' });
+  draft.set(setting, list);
+  assert.equal(setting.value[0].name, 'Walk');
+  assert.equal(draft.value(setting).length, 3);
+  draft.set(setting, JSON.parse(JSON.stringify(setting.value)));
+  assert.equal(draft.dirty, false);
+  draft.set(setting, list); draft.cancel(); assert.equal(draft.value(setting).length, 2);
+  draft.reset(); assert.deepEqual(changes(draft), { 'pad_modes.profiles': null });
+});
+
+test('returning profile axes to shipped values writes them explicitly instead of reviving legacy overrides', () => {
+  const profile = gain => [{ id: 'walk', name: 'Walking', drive: { vx: { source: 'left_y', invert: false, gain } } }];
+  const setting = { key: 'pad_modes.profiles', kind: 'modes', value: profile(0.5), default_value: profile(1), overridden: false };
+  const draft = new context.ControllerDraft({ settings: [setting] });
+  draft.set(setting, JSON.parse(JSON.stringify(setting.default_value)));
+  assert.deepEqual(changes(draft), { 'pad_modes.profiles': profile(1) });
+  draft.reset(); assert.deepEqual(changes(draft), { 'pad_modes.profiles': null });
+});

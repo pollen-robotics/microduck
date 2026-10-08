@@ -41,7 +41,7 @@ pub enum Kind {
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
     IntegerList,
-    /// A **repeating table** — `[[policy.skill]]` — rather than a single value.
+    /// A **repeating table**, such as `[[policy.skill]]` or controller profiles, rather than a single value.
     ///
     /// Listed here and not editable in place. Not an oversight and not laziness: every other
     /// kind is one value with one cursor position, and a repeating table is a list a person adds
@@ -471,6 +471,21 @@ pub const REGISTRY: &[Entry] = &[
         "media.sensor",
         Kind::Choice(crate::MEDIA_SENSOR_LABELS),
         "Head camera sensor — board follows the declared board; naming one forces it",
+    ),
+    feature(
+        "pad_modes.profiles",
+        Kind::Table,
+        "Named controller profiles — edit in the Controller tab or [[pad_modes.profiles]]",
+    ),
+    feature(
+        "pad_modes.next_button",
+        Kind::Choice(crate::pad_modes::MODE_BUTTONS),
+        "Button to cycle to the next controller mode; none disables cycling",
+    ),
+    feature(
+        "pad_modes.previous_button",
+        Kind::Choice(crate::pad_modes::MODE_BUTTONS),
+        "Button to cycle to the previous controller mode; none disables cycling",
     ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
@@ -1067,6 +1082,9 @@ mod tests {
                 Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
                 // A repeating table's probe is one empty entry — enough to prove the key parses
                 // as a table array, which is the thing being asserted.
+                Kind::Table if entry.key == "pad_modes.profiles" => {
+                    "[[pad_modes.profiles]]\nid = \"probe\"\nname = \"Probe\"\n".to_owned()
+                }
                 Kind::Table => {
                     format!("[[{section}.{key}]]\nname = \"probe\"\nduration = 1.0\n")
                 }
@@ -1144,6 +1162,9 @@ mod tests {
                 "media.quality",
                 // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
+                "pad_modes.profiles",
+                "pad_modes.next_button",
+                "pad_modes.previous_button",
                 "pad.a",
                 "pad.b",
                 "pad.x",
