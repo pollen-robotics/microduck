@@ -75,6 +75,8 @@ pub struct Params {
     pub theremin: ThereminParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
+    /// The onboard map. `mapd` reads this, not `robotd`.
+    pub map: MapParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
     ///
@@ -944,6 +946,42 @@ impl HeadImuParams {
         match board {
             board::Board::Zero3 => "tofd",
             board::Board::Beta => "robotd",
+        }
+    }
+}
+
+/// `[map]` — `mapd`, the onboard map and where the robot is in it.
+///
+/// `mapd` builds the map from the same two streams any client can subscribe to — `robot.state`
+/// and `tof.frame` — and keeps it across reboots. It maps only where the robot **stops**: a stop
+/// is a few seconds of frames from one place, voted into one rigid view, and the views are what
+/// the map is made of. A robot that never stops never maps, and that is by design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MapParams {
+    /// Build the map at all. Off, `mapd` answers `map.status` with why and subscribes to nothing.
+    pub enabled: bool,
+    /// Where the map is kept, across updates and reboots.
+    pub path: PathBuf,
+    /// Seconds between saves while the map is changing. It is also saved on shutdown; this
+    /// bounds what a power cut loses.
+    pub autosave_s: u64,
+    /// The state stream's rate, Hz. Poses are interpolated between samples, so this is a trade of
+    /// CPU for nothing much below 25: the mapper's own work is a few milliseconds per stop.
+    pub state_hz: u32,
+    /// How long before its stamp a depth frame's light was collected, milliseconds — the stamp is
+    /// taken when the frame is read. A wrong value smears walls while the head turns.
+    pub tof_latency_ms: f64,
+}
+
+impl Default for MapParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: PathBuf::from("/var/lib/mapd/map.json"),
+            autosave_s: 60,
+            state_hz: 25,
+            tof_latency_ms: 10.0,
         }
     }
 }

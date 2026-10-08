@@ -1,0 +1,54 @@
+# The onboard map: where the robot is in its home (docs/design/mapping-design.md).
+#
+# A client of robotd and tofd like any other, and its own process for the reason tofd is: a
+# mapping bug, a slow relocalization search or a corrupt map file must never reach the control
+# loop. Nothing depends on this unit; the robot walks without it.
+[Unit]
+Description=Robot onboard map
+Documentation=file:///opt/robot/daemon/current/docs/architecture.md
+After=local-fs.target
+# No ordering on robotd or tofd: both feeds reconnect on their own, which is also what carries
+# the map through an update restarting them.
+
+[Service]
+Type=exec
+ExecStart=/opt/robot/daemon/current/bin/mapd
+User=mapd
+Group=mapd
+# robot — to subscribe to robot.state and tof.frame, and to hand the map socket to the same group
+SupplementaryGroups=robot
+Restart=always
+RestartSec=5s
+# Background work: a relocalization search is a second or two of one core, and it must lose every
+# argument about the CPU to the control loop.
+Nice=10
+# The map lives here, across updates and rollbacks — it is the robot's, not the release's.
+StateDirectory=mapd
+StateDirectoryMode=0750
+RuntimeDirectory=mapd
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+# Long enough to write the map on the way out.
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

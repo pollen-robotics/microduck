@@ -433,6 +433,13 @@ impl Mapper {
         OccupancyGrid::render(&kfs, &path, res, self.cfg.keyframe.footprint_m)
     }
 
+    /// Stops in the map proper, and stops kept apart in islands.
+    pub fn counts(&self) -> (usize, usize) {
+        let main = self.main_island();
+        let in_map = self.island.iter().filter(|&&i| i == main).count();
+        (in_map, self.island.len() - in_map)
+    }
+
     /// The robot's pose in the map now, when it knows it.
     pub fn pose(&self) -> Option<Pose2> {
         match self.loc {

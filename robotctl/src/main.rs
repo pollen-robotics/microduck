@@ -48,6 +48,7 @@ mod duck;
 mod frame;
 mod imu_view;
 mod led;
+mod map;
 mod monitor;
 mod path_map;
 mod show;
@@ -116,6 +117,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::MEDIA)]
     media_socket: PathBuf,
 
+    /// Path to `mapd`'s socket, which `map` reads the map and the pose from.
+    #[arg(long, global = true, default_value = proto::socket::MAP)]
+    map_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -168,6 +173,13 @@ enum Namespace {
     /// rotation has no compass. Served by robotd on a beta; on a zero3 it is tofd's, and this
     /// says so. Ctrl-C to stop.
     HeadImu,
+
+    /// The onboard map: where the robot is in its home, the map itself, and forgetting it.
+    /// Served by `mapd`. It maps where the robot stops and looks around.
+    Map {
+        #[command(subcommand)]
+        command: Option<map::MapCommand>,
+    },
 
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
@@ -5338,6 +5350,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::HeadImu => {
             return run_head_imu(&cli.robot_socket);
+        }
+        Namespace::Map { command } => {
+            return map::run(&cli.map_socket, command);
         }
         Namespace::Led { command } => {
             return led::run(Path::new(led::LEDS_DIR), command);

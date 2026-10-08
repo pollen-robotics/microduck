@@ -861,6 +861,15 @@ impl Server {
                 ),
             ),
 
+            // And again for the map: `mapd` owns it.
+            Call::MapStatus | Call::MapStream | Call::MapGrid(_) | Call::MapWipe => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "map.* is served by mapd, on /run/mapd/map.sock",
+                ),
+            ),
+
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
             Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),

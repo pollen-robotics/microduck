@@ -2665,6 +2665,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mapd"
+version = "0.16.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "duck-ipc-proto",
+ "libc",
+ "maploc",
+ "robotd-params",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "maploc"
 version = "0.16.1"
 dependencies = [

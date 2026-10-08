@@ -69,7 +69,8 @@ subset of the API from BLE to whichever socket answers it; `padd` reads a gamepa
 same intents an app would; `mediad` carries the same calls over a WebRTC data channel and owns only
 the pipeline. All three are replaceable without touching robot behaviour, and all three are
 exercised daily, so the API an app will use cannot quietly rot. `tofd` is the odd one out: it owns
-one sensor, publishes frames, and reads nothing (§1).
+one sensor, publishes frames, and reads nothing (§1). `mapd` owns only the map: it subscribes to
+the robot and the sensor like any client, and sends the robot nothing.
 
 **Releases are swapped, not patched.** A build lands as a whole directory under
 `/opt/robot/daemon/releases/<version>/`; `updaterd` verifies its signature, moves the
@@ -86,6 +87,7 @@ counter ([`updater-design.md`](updater-design.md)).
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
 | `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
 | `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus, or SPI on the beta board (`tof::link`) |
+| `mapd` | the onboard map and where the robot is in it ([`mapping-design.md`](mapping-design.md)) | `/run/mapd/map.sock` (`map.*`) | `robotd` and `tofd`, as a subscriber — it commands nothing |
 | `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |
 
 Where the state lives, and what survives an update:
@@ -132,6 +134,7 @@ safety authority sits (§6).
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
 | `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |
 | `tofd` | the head ToF sensor: an 8×8 depth matrix on the HAT's I²C bus | Perception, so split from `robotd` for the reason below. Owns one sensor and publishes frames; reads nothing. A board with no sensor fitted runs it anyway and says so |
+| `mapd` | the onboard map, and where the robot is in it | A client of `robotd` and `tofd`, split out so a mapping bug, a slow relocalization search or a corrupt map file never reaches the control loop. Commands nothing. [`mapping-design.md`](mapping-design.md) |
 | `updaterd` | update engine | See `updater-design.md` |
 
 Splitting `mediad` from `robotd` is deliberate: a media/perception crash must not

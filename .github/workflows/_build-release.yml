@@ -157,6 +157,8 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/tofd staged/
           # The NFC reader daemon, the same way: a board with no reader runs it, and it says so.
           cp target/aarch64-unknown-linux-gnu/release/nfcd staged/
+          # The onboard map, built from robotd's and tofd's streams.
+          cp target/aarch64-unknown-linux-gnu/release/mapd staged/
 
           cargo run -p xtask -- package \
             --version "${{ inputs.version }}" \
@@ -193,6 +195,8 @@ jobs:
             --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
             --include "nfc/systemd/nfcd.service=systemd/nfcd.service" \
             --include "nfc/systemd/sysusers.d/nfcd.conf=systemd/sysusers.d/nfcd.conf" \
+            --include "mapd/systemd/mapd.service=systemd/mapd.service" \
+            --include "mapd/systemd/sysusers.d/mapd.conf=systemd/sysusers.d/mapd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \

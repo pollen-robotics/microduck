@@ -406,6 +406,28 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the head IMU at all — default off on zero3 (BMI088, ~4% of a core), on on beta (LSM6DSV16X, fused on the chip)",
     ),
+    // ── [map] ────────────────────────────────────────────────────────────────
+    feature(
+        "map.enabled",
+        Kind::Bool,
+        "Build the onboard map from the ToF and the legs (mapd); it maps where the robot stops",
+    ),
+    entry("map.path", Kind::Text, "Where the map is kept"),
+    entry(
+        "map.autosave_s",
+        Kind::Integer,
+        "Seconds between saves while the map changes — what a power cut can lose",
+    ),
+    entry(
+        "map.state_hz",
+        Kind::Integer,
+        "How often mapd reads the robot state, Hz",
+    ),
+    entry(
+        "map.tof_latency_ms",
+        Kind::Float,
+        "How long before its stamp a depth frame was captured, ms — wrong smears walls",
+    ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
         "audio.enabled",
@@ -733,6 +755,7 @@ mod tests {
                 "pickup.enabled",
                 "theremin.enabled",
                 "head_imu.enabled",
+                "map.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",

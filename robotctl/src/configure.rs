@@ -98,6 +98,8 @@ fn apply_for(key: &str) -> Option<Apply> {
     let (section, name) = key.split_once('.')?;
     Some(match section {
         "media" | "duck_detector" => Apply::Restart("mediad"),
+        // `mapd` reads `[map]` once, at startup; restarting it saves the map on the way down.
+        "map" => Apply::Restart("mapd"),
         // `updaterd` reads the board before every check, for the hardware revision a release is
         // checked against (`robotd_params::board::Board::declared`). Nothing else reads it yet.
         "board" => Apply::Live("updaterd"),

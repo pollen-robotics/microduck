@@ -91,7 +91,7 @@ keep_previous = 1
 required_files = [
     "bin/updaterd", "bin/robotctl", "bin/robotd", "bin/configd", "bin/btd",
     "bin/padd", "bin/mediad", "bin/sounds", "bin/pet-detect", "bin/pet-features",
-    "bin/tofd", "bin/nfcd",
+    "bin/tofd", "bin/nfcd", "bin/mapd",
 ]
 
 # `golden` is deliberately unset until 1.0.0 exists.

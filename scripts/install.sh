@@ -388,7 +388,7 @@ stop_for_reinstall() {
     # Absent units are not a problem to report: a board running an older release simply has no
     # configd or btd, and warning about them on every forced re-install trains people to ignore
     # the warnings that matter.
-    for unit in padd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
+    for unit in mapd.service padd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
         [ -f "${UNIT_DIR}/${unit}" ] || continue
         systemctl stop "$unit" 2>/dev/null || warn "could not stop ${unit}"
     done
@@ -637,7 +637,7 @@ stop_instead() {
 quiet_the_release_units() {
     [ -n "$NO_START" ] || return 0
     say "DUCK_NO_START: undoing the enables hooks/postinstall just did"
-    for unit in padd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
+    for unit in mapd.service padd.service tofd.service nfcd.service btd.service configd.service robotd.service updaterd.service; do
         [ -f "${UNIT_DIR}/${unit}" ] || continue
         stop_instead "$unit"
     done
@@ -837,6 +837,9 @@ install_units() {
             tofd.service) ;;
             # Likewise: enabled by postinstall, and nothing waits on it — no reader is a log line.
             nfcd.service) ;;
+            # Likewise: a client of robotd and tofd that reconnects to both on its own, and
+            # nothing waits on the map.
+            mapd.service) ;;
             robot-boot-check.timer) ;;
             # Started by its timer, never enabled. See above.
             robot-boot-check.service) ;;

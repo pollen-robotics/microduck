@@ -1113,6 +1113,7 @@ mod tests {
                 "pickup",
                 "theremin",
                 "head_imu",
+                "map",
                 "audio",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's

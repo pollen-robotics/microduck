@@ -50,6 +50,7 @@ own the mechanism is the bug.
 | [`webrtc-console.md`](design/webrtc-console.md) | The WebRTC client: serving it from the robot, finding the robot, and what the page should be. |
 | [`remote-access-design.md`](design/remote-access-design.md) | Reaching a duck from outside the LAN: the Hugging Face account, the device flow, and the bridge to a rendezvous service. |
 | [`boot-recovery-net.md`](design/boot-recovery-net.md) | Falling back to golden when the release that booted cannot start its daemons. |
+| [`mapping-design.md`](design/mapping-design.md) | `mapd` and `maploc`: the onboard map from the ToF and the legs, a stop as the unit of mapping, losing and finding itself, what is kept. |
 | [`simulation.md`](design/simulation.md) | The twin: where the seam between daemon and body is, the body protocol, the fake radio, the containers, and what it is and is not a twin of. |
 
 ## `project/` — you are running the project

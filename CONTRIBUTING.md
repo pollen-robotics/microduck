@@ -83,6 +83,7 @@ the daemons — one crate each, one unit each, all in the same release artifact
   padd/           gamepad → intents — an ordinary socket client, no privileged access
   mediad/         camera, mic, WebRTC, the remote gateway, and the console it serves
   tof/            tofd: the head's 8×8 depth sensor. Publishes frames, reads nothing
+  mapd/           the onboard map: a client of robotd and tofd, keeps the map, answers map.*
   nfc/            nfcd: the NFC reader. A touched tag names a gamepad, and configd pairs it
 
 the libraries they drive — no sockets, no systemd, nothing starts them
@@ -90,6 +91,7 @@ the libraries they drive — no sockets, no systemd, nothing starts them
   duck-control/   the control core: model · bus · IMU · observations · policy · safety
   kinematics/     the MJCF model and forward kinematics; head and hand chains
   odometry/       where the robot has been, from foot contacts and the IMU
+  maploc/         mapping and localization from the ToF and odometry — mapd's algorithm
   sounds/         synthesis, per-robot voice personality, the chorale's score
   pet-detect/     a small CNN that hears head scratches on the onboard mic
   robotd-params/  robotd's startup parameters: schema, defaults, validation

@@ -451,7 +451,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// for servo power being off — about a robot whose fifteen servos had just answered their pings.
 /// Additive: absent from an older `robotd`, and `false` reads as "not told", which is what the old
 /// wording assumed anyway.
-pub const API_VERSION: u32 = 41;
+///
+/// # v42 — `map.*`, the onboard map
+///
+/// A new service, `mapd`, on [`socket::MAP`]: [`method::MAP_STATUS`], [`method::MAP_STREAM`],
+/// [`method::MAP_GRID`] and [`method::MAP_WIPE`] — where the robot is in its own map, and the map.
+/// New routes: a release predating `mapd` has no socket to answer them, and a transport that
+/// forwards them says so by name.
+pub const API_VERSION: u32 = 42;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -511,6 +518,10 @@ pub mod socket {
     /// Under `/run/tofd/` for the same reason as the pad's: it is that unit's
     /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
     pub const TOF: &str = "/run/tofd/tof.sock";
+
+    /// `mapd`'s map and pose — every [`super::method`] in the `map.*` namespace. Under `/run/mapd/`
+    /// for the same reason as the depth stream's.
+    pub const MAP: &str = "/run/mapd/map.sock";
 
     /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
@@ -960,6 +971,23 @@ pub mod method {
 
     /// One head-IMU sample, pushed after [`HEAD_IMU_STREAM`].
     pub const HEAD_IMU_FRAME: &str = "head_imu.frame";
+
+    // ── map.* ────────────────────────────────────────────────────────────────
+    //
+    // `mapd`'s, on [`super::socket::MAP`]. It builds the map from `robot.state` and `tof.frame`,
+    // the way any client could, and owns nothing else: the robot does not need it to walk.
+
+    /// Where the robot is in its map, whether it knows, and how big the map is.
+    pub const MAP_STATUS: &str = "map.status";
+    /// Subscribe to the pose: answered with the status, then [`MAP_STATE`] notifications at a few
+    /// hertz until the connection closes.
+    pub const MAP_STREAM: &str = "map.stream";
+    /// One pose update, pushed after [`MAP_STREAM`].
+    pub const MAP_STATE: &str = "map.state";
+    /// The map itself, as an occupancy grid.
+    pub const MAP_GRID: &str = "map.grid";
+    /// Forget the map and start a new one from where the robot stands.
+    pub const MAP_WIPE: &str = "map.wipe";
 }
 
 /// JSON-RPC error codes.
@@ -1169,6 +1197,11 @@ pub enum Call {
     /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
     /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
+    /// Answered by `mapd`; see [`method::MAP_STATUS`].
+    MapStatus,
+    MapStream,
+    MapGrid(MapGridParams),
+    MapWipe,
 }
 
 /// The service that owns the answer to a call.
@@ -1189,6 +1222,8 @@ pub enum Service {
     Pad,
     /// `tofd` — the depth stream.
     Tof,
+    /// `mapd` — the map and the pose in it.
+    Map,
 }
 
 /// How long answering a call holds a connection, and therefore which connection carries it.
@@ -1299,6 +1334,10 @@ impl Call {
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
             Call::HeadImuStream => method::HEAD_IMU_STREAM,
+            Call::MapStatus => method::MAP_STATUS,
+            Call::MapStream => method::MAP_STREAM,
+            Call::MapGrid(_) => method::MAP_GRID,
+            Call::MapWipe => method::MAP_WIPE,
         }
     }
 
@@ -1347,6 +1386,9 @@ impl Call {
                 // able to ask which account a robot thinks it belongs to.
                 | Call::AccountLogin(_)
                 | Call::AccountLogout
+                // Forgetting the map throws away what the robot learned of its home over hours,
+                // and nothing brings it back. Asking where it is stays ungated.
+                | Call::MapWipe
         )
     }
 
@@ -1494,6 +1536,13 @@ impl Call {
             Call::TofStream => (Tof, Stream),
             Call::HeadImuStream => (Tof, Stream),
 
+            // ── mapd ────────────────────────────────────────────────────────
+            //
+            // Status and grid are lookups of what the mapper already holds; the grid is rendered
+            // on demand, a few milliseconds for a house. A wipe deletes a file.
+            Call::MapStatus | Call::MapGrid(_) | Call::MapWipe => (Map, Prompt),
+            Call::MapStream => (Map, Stream),
+
             // ── answered by no service ──────────────────────────────────────
             //
             // The PIN check belongs to the transport, which is the whole point of it: BLE cannot
@@ -1603,7 +1652,11 @@ impl Call {
             | Call::PadInput
             | Call::TofStream
             | Call::HeadImuStream
+            | Call::MapStatus
+            | Call::MapStream
+            | Call::MapWipe
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
+            Call::MapGrid(p) => encode(p),
         }
     }
 
@@ -1702,6 +1755,13 @@ impl Call {
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             method::HEAD_IMU_STREAM => Call::HeadImuStream,
+            method::MAP_STATUS => Call::MapStatus,
+            method::MAP_STREAM => Call::MapStream,
+            method::MAP_GRID => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::MapGrid(decode(params.or(Some(&empty)))?)
+            }
+            method::MAP_WIPE => Call::MapWipe,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -1895,6 +1955,10 @@ pub mod test_support {
             Call::PadInput,
             Call::TofStream,
             Call::HeadImuStream,
+            Call::MapStatus,
+            Call::MapStream,
+            Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
+            Call::MapWipe,
         ]
     }
 }
@@ -1987,6 +2051,24 @@ impl Request {
             method: method::TOF_FRAME.to_owned(),
             params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
         }
+    }
+
+    /// A map pose notification: no `id`.
+    pub fn notify_map_state(state: &MapState) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::MAP_STATE.to_owned(),
+            params: Some(serde_json::to_value(state).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a map pose notification back.
+    pub fn as_map_state(&self) -> Option<MapState> {
+        if self.method != method::MAP_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
     }
 
     /// Read a depth-frame notification back.
@@ -4889,6 +4971,94 @@ pub struct PadInputResult {
     pub reason: Option<String>,
 }
 
+/// A pose in the map: metres, metres, radians. The map's frame is wherever its first stop was,
+/// facing the way the robot faced then — a map has no north.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapPose {
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+}
+
+/// Where the robot is in its map — [`method::MAP_STATE`], and the heart of [`MapStatusResult`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapState {
+    /// `CLOCK_MONOTONIC` of the robot state this pose was computed from — the clock
+    /// [`RobotState::t_ns`] uses.
+    pub t_ns: u64,
+    /// The pose, while the robot knows it. Absent while it is lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pose: Option<MapPose>,
+    /// Why it does not know where it is: `boot` (it has not recognised anything since it started),
+    /// `carried`, `fell`, or `contradiction` (what it sees stopped matching the map). Absent while
+    /// it knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost: Option<String>,
+    /// A stop is being collected: the robot is standing still and its views are going into the
+    /// map. What makes the map grow — it maps only where it stops and looks.
+    pub collecting: bool,
+    /// Stops in the map proper.
+    pub keyframes: u32,
+}
+
+/// Answer to [`Call::MapStatus`], and the first answer to [`Call::MapStream`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapStatusResult {
+    pub state: MapState,
+    /// Why it is not mapping at all: a `robotd` or `tofd` it cannot reach, a robot predating the
+    /// telemetry the map needs. Absent while the inputs flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Loop closures and relocalizations since `mapd` started.
+    pub loops: u32,
+    pub relocalizations: u32,
+    /// Stops kept apart from the map: made while lost and not yet recognised in it.
+    pub island_keyframes: u32,
+    /// Where the map is kept, and when it was last written there (seconds since the epoch).
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<u64>,
+}
+
+/// Parameters of [`Call::MapGrid`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MapGridParams {
+    /// Cell size, metres. Absent is `mapd`'s default; it is clamped to what the map can carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub res_m: Option<f64>,
+}
+
+/// Answer to [`Call::MapGrid`]: the occupancy grid, as `mapd` renders it from its keyframes now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapGridResult {
+    pub res_m: f64,
+    /// Map coordinates of the low corner of cell (0, 0).
+    pub origin: [f64; 2],
+    pub width: u32,
+    pub height: u32,
+    /// One character per cell, row-major from the lowest y: `?` unknown, `.` free, `#` occupied.
+    /// Text rather than numbers because it is what a grid of three states is — a third of the
+    /// bytes of a JSON array, and readable in a terminal.
+    pub cells: String,
+    /// Where each stop of the map was made.
+    pub keyframes: Vec<MapPose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pose: Option<MapPose>,
+}
+
+/// Answer to [`Call::MapWipe`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapWipeResult {
+    /// Stops forgotten.
+    pub keyframes: u32,
+}
+
 /// Answer to [`Call::TofStream`].
 ///
 /// Describes the sensor rather than merely accepting, for the same reason
@@ -5714,6 +5884,7 @@ mod tests {
                             | Call::PadInput
                             | Call::TofStream
                             | Call::HeadImuStream
+                            | Call::MapStream
                     ),
                     "{} is on the Stream lane but is not a subscription",
                     call.method()
@@ -5726,7 +5897,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            69,
+            73,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -5959,6 +6130,9 @@ mod tests {
                 // needs on a robot it is not allowed to reconfigure.
                 method::PAD_PAIR,
                 method::PAD_FORGET,
+                // Forgetting the map is not recoverable. `map.status` and `map.grid` must stay off
+                // this list: where a robot thinks it is is the first question about a lost one.
+                method::MAP_WIPE,
             ]
         );
     }

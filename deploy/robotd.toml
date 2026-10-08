@@ -436,6 +436,23 @@ mode = "walk"
 # sensor fitted. Depth is unaffected either way.
 # enabled = true
 
+[map]
+# The onboard map, built by mapd from the robot state and the ToF, and where the robot is in it
+# (`robotctl map`). It maps only where the robot stops and looks around: a stop of a few seconds is
+# one view, and the views are the map. Kept across updates and reboots; after a reboot the robot
+# does not know where it is until a stop or two recognise somewhere it has been.
+enabled = true
+path = "/var/lib/mapd/map.json"
+# Seconds between saves while the map changes, and so what a power cut can lose. Also saved when
+# mapd stops.
+autosave_s = 60
+# How often mapd reads the robot state. Poses are interpolated between samples, so more buys
+# little and costs JSON parsing.
+state_hz = 25
+# How long before its timestamp a depth frame was captured. Wrong, and walls smear while the head
+# turns.
+# tof_latency_ms = 10.0
+
 [chorale]
 # Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
 # conducting duck's beat counter is the timebase, and the parts are worked out from each duck's own
