@@ -5284,6 +5284,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.pad_socket,
                 &cli.tof_socket,
                 &cli.media_socket,
+                &cli.map_socket,
                 hz,
                 json,
             );

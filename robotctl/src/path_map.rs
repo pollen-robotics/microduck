@@ -11,6 +11,7 @@
 //! standing over the robot's starting pose. The origin is marked `+`, the
 //! robot `●` with a short ray for its heading.
 
+use duck_ipc_proto as proto;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -70,6 +71,17 @@ impl PathMap {
                 .collect();
             self.min_step *= 2.0;
         }
+    }
+
+    /// The recorded track, (x, y), oldest first — for drawing it over a view that owns its own
+    /// projection, the map's.
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
+    /// Where the robot is now, if it has been seen.
+    pub fn here(&self) -> Option<(f64, f64, f64)> {
+        self.here
     }
 
     /// How wide the tracked world currently is, metres — the number the panel
@@ -142,16 +154,104 @@ impl PathMap {
     }
 }
 
-/// A braille dot grid with per-cell colour and a few character overrides.
+/// Seen-clear floor: a background fill rather than dots, so a room reads as a surface. An indexed
+/// colour (256-colour dark grey) rather than RGB, so it renders everywhere the monitor does.
+const FLOOR: Color = Color::Indexed(236);
+
+/// The map `mapd` serves, top-down in the same orientation as the odometry track: the map's +x up
+/// the screen, +y screen-left. Floor seen clear is a dark fill, obstacles bright braille covering
+/// their whole footprint, stops dim dots, the robot's track in the map red, the robot yellow.
+///
+/// The first map view drew one dot per wall cell over a sparse floor stipple, and a real lap
+/// rendered as scattered stars; filling each cell's footprint is what joins a wall's cells into a
+/// line and a floor's into a surface. The panel never grows — the world scales to fit, because the
+/// point of a map is seeing all of it.
+///
+/// `track` is the robot's pose history **in the map frame**, never raw odometry: after a reboot or
+/// a loop closure the two frames differ, and odometry drawn over the map reads as a bug.
+pub fn draw_map(grid_msg: &proto::MapGridResult, track: &PathMap, area: Rect, buf: &mut Buffer) {
+    let (w, h) = (area.width as usize * 2, area.height as usize * 4);
+    let (cols, rows) = (grid_msg.width as usize, grid_msg.height as usize);
+    let cells = grid_msg.cells.as_bytes();
+    if w < 8 || h < 8 || cols == 0 || rows == 0 || cells.len() != cols * rows {
+        return;
+    }
+    let cell = grid_msg.res_m;
+    let (span_x, span_y) = (cols as f64 * cell, rows as f64 * cell);
+    // Map x runs up the screen and map y across it, so x is measured against the panel's height.
+    let scale =
+        ((h - 1) as f64 / span_x.max(MIN_SPAN_M)).min((w - 1) as f64 / span_y.max(MIN_SPAN_M));
+    let centre = (
+        grid_msg.origin[0] + span_x / 2.0,
+        grid_msg.origin[1] + span_y / 2.0,
+    );
+    let dot = |x: f64, y: f64| -> (isize, isize) {
+        (
+            (w as f64 / 2.0 - (y - centre.1) * scale).round() as isize,
+            (h as f64 / 2.0 - (x - centre.0) * scale).round() as isize,
+        )
+    };
+
+    let mut grid = Grid::new(area.width as usize, area.height as usize);
+    for j in 0..rows {
+        for i in 0..cols {
+            let v = cells[j * cols + i];
+            if v == b'?' {
+                continue;
+            }
+            let x0 = grid_msg.origin[0] + i as f64 * cell;
+            let y0 = grid_msg.origin[1] + j as f64 * cell;
+            let (a, b) = (dot(x0, y0), dot(x0 + cell, y0 + cell));
+            if v == b'#' {
+                grid.fill(a, b, Some(Color::Gray));
+            } else {
+                grid.shade(a, b);
+            }
+        }
+    }
+    for k in &grid_msg.keyframes {
+        grid.set(dot(k.x, k.y), Some(Color::DarkGray));
+    }
+    let pts = track.points();
+    for pair in pts.windows(2) {
+        grid.line(
+            dot(pair[0].0, pair[0].1),
+            dot(pair[1].0, pair[1].1),
+            Some(Color::Red),
+        );
+    }
+    if let Some(p) = grid_msg
+        .pose
+        .as_ref()
+        .map(|p| (p.x, p.y, p.yaw))
+        .or(track.here())
+    {
+        let (x, y, yaw) = p;
+        let reach = 5.0 / scale;
+        grid.line(
+            dot(x, y),
+            dot(x + reach * yaw.cos(), y + reach * yaw.sin()),
+            Some(Color::Yellow),
+        );
+        grid.mark(dot(x, y), '●', Color::Yellow);
+    }
+    grid.paint(area, buf);
+}
+
+/// A braille dot grid with per-cell colour, a floor shade per dot, and a few character overrides.
 struct Grid {
     w: usize,
     h: usize,
     /// Braille dot mask per cell (`U+2800 + mask` is the glyph).
     dots: Vec<u8>,
     color: Vec<Option<Color>>,
+    /// Floor dots, one mask per cell like `dots`. A cell mostly covered paints its background.
+    shade: Vec<u8>,
     /// A character that replaces the braille in its cell — markers beat track.
     over: Vec<Option<(char, Color)>>,
 }
+
+const BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 impl Grid {
     fn new(w: usize, h: usize) -> Self {
@@ -160,7 +260,42 @@ impl Grid {
             h,
             dots: vec![0; w * h],
             color: vec![None; w * h],
+            shade: vec![0; w * h],
             over: vec![None; w * h],
+        }
+    }
+
+    /// The dot rectangle spanned by two corners, clipped to the panel.
+    fn rect(&self, a: (isize, isize), b: (isize, isize)) -> Option<(isize, isize, isize, isize)> {
+        let (x0, x1) = (
+            a.0.min(b.0).max(0),
+            a.0.max(b.0).min(self.w as isize * 2 - 1),
+        );
+        let (y0, y1) = (
+            a.1.min(b.1).max(0),
+            a.1.max(b.1).min(self.h as isize * 4 - 1),
+        );
+        (x0 <= x1 && y0 <= y1).then_some((x0, x1, y0, y1))
+    }
+
+    fn fill(&mut self, a: (isize, isize), b: (isize, isize), color: Option<Color>) {
+        if let Some((x0, x1, y0, y1)) = self.rect(a, b) {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    self.set((x, y), color);
+                }
+            }
+        }
+    }
+
+    fn shade(&mut self, a: (isize, isize), b: (isize, isize)) {
+        if let Some((x0, x1, y0, y1)) = self.rect(a, b) {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let cell = (y as usize / 4) * self.w + x as usize / 2;
+                    self.shade[cell] |= BITS[y as usize % 4][x as usize % 2];
+                }
+            }
         }
     }
 
@@ -172,7 +307,6 @@ impl Grid {
         let cell = (y / 4) * self.w + x / 2;
         // The braille bit layout: dots 1-2-3-7 down the left column, 4-5-6-8
         // down the right.
-        const BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
         self.dots[cell] |= BITS[y % 4][x % 2];
         if color.is_some() {
             self.color[cell] = color;
@@ -222,6 +356,11 @@ impl Grid {
             for col in 0..self.w {
                 let cell = row * self.w + col;
                 let pos = (area.x + col as u16, area.y + row as u16);
+                // Floor: the background, once at least half the cell is floor — a surface reads
+                // as a room where a stipple reads as noise.
+                if self.shade[cell].count_ones() >= 4 {
+                    buf[pos].set_bg(FLOOR);
+                }
                 if let Some((glyph, color)) = self.over[cell] {
                     buf[pos].set_char(glyph).set_style(Style::new().fg(color));
                 } else if self.dots[cell] != 0 {
@@ -241,6 +380,48 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wall must ink the panel as a line, floor must fill its background, and the robot must be
+    /// its yellow marker — the three things a glance at the map is for.
+    #[test]
+    fn the_map_draws_walls_floor_and_the_robot() {
+        // 10 × 10 cells of 0.1 m: a wall along the top (max x) row, floor elsewhere.
+        let mut cells = String::new();
+        for _y in 0..10 {
+            for x in 0..10 {
+                cells.push(if x == 9 { '#' } else { '.' });
+            }
+        }
+        let grid = proto::MapGridResult {
+            res_m: 0.1,
+            origin: [0.0, 0.0],
+            width: 10,
+            height: 10,
+            cells,
+            keyframes: vec![],
+            pose: Some(proto::MapPose {
+                x: 0.5,
+                y: 0.5,
+                yaw: 0.0,
+            }),
+        };
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(area);
+        draw_map(&grid, &PathMap::new(), area, &mut buf);
+        let top: String = (0..20).map(|x| buf[(x, 0)].symbol().to_owned()).collect();
+        assert!(
+            top.chars().filter(|c| *c != ' ').count() >= 10,
+            "no wall along the top: {top:?}"
+        );
+        let robot = (0..10)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .find(|&p| buf[p].symbol() == "●");
+        assert!(robot.is_some(), "no robot marker");
+        assert!(
+            (0..10).any(|y| (0..20).any(|x| buf[(x, y)].bg == FLOOR)),
+            "no floor fill"
+        );
+    }
 
     fn painted(map: &PathMap, w: u16, h: u16) -> Vec<String> {
         let area = Rect::new(0, 0, w, h);

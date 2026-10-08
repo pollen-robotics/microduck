@@ -307,6 +307,12 @@ enum Update {
     /// The health poll is not answering. Not fatal either: it is a connection of its own, and
     /// the state stream ending is what [`Self::Ended`] is for.
     HealthLost(String),
+    /// `mapd`'s status: where the robot is in its map, or why it does not know.
+    Map(Box<proto::MapStatusResult>),
+    /// The map itself, fetched again whenever the status says it changed.
+    MapGrid(Box<proto::MapGridResult>),
+    /// `mapd` is not answering. Not fatal: mapping is optional, and off by default.
+    MapLost(String),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -319,6 +325,7 @@ pub fn run(
     pad_socket: &Path,
     tof_socket: &Path,
     media_socket: &Path,
+    map_socket: &Path,
     hz: u32,
     json: bool,
 ) -> Result<(), Failure> {
@@ -361,6 +368,7 @@ pub fn run(
     let camera_tx = tx.clone();
     let tx_for_tof = tx.clone();
     let health_tx = tx.clone();
+    let map_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
 
     // Held for as long as the view lives, not dropped: it is the write half of the subscription,
@@ -394,6 +402,10 @@ pub fn run(
     // and the reason why is on this answer and nowhere else.
     let health_socket = robot_socket.to_path_buf();
     thread::spawn(move || poll_health(&health_socket, &health_tx));
+
+    // A fifth: `mapd`, polled like the health. Its absence draws the odometry track instead.
+    let map_socket = map_socket.to_path_buf();
+    thread::spawn(move || poll_map(&map_socket, &map_tx));
 
     // The camera has no reader thread yet, and deliberately: `media.frame` is a *request*, and one
     // is only made while the block is open. `live` owns the toggle, so it owns the thread.
@@ -691,6 +703,65 @@ fn read_camera(socket: &Path, tx: &mpsc::Sender<Update>, asked_for: &Receiver<bo
 ///
 /// **It reconnects**, for the reason the pad reader does: `robotd` restarts during every update,
 /// and a session that outlived one would otherwise be permanently blind to the pack.
+/// How often `mapd` is asked where the robot is. The grid is fetched again only when the status
+/// says the map changed, or every [`MAP_GRID_REFRESH`] in case it moved without growing (a loop
+/// closure bends the map and adds no stop).
+const MAP_POLL: Duration = Duration::from_millis(500);
+const MAP_GRID_REFRESH: Duration = Duration::from_secs(10);
+/// The grid's resolution here: fine enough that a wall is a line in a braille panel.
+const MAP_RES_M: f64 = 0.05;
+
+fn poll_map(socket: &Path, tx: &mpsc::Sender<Update>) {
+    loop {
+        if let Err(why) = ask_map(socket, tx)
+            && tx.send(Update::MapLost(why)).is_err()
+        {
+            return; // the UI is gone
+        }
+        thread::sleep(PAD_RETRY);
+    }
+}
+
+/// One connection to `mapd`, polled until something ends it.
+fn ask_map(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), String> {
+    let mut client = Client::connect_to("mapd", socket).map_err(|e| e.message)?;
+    // What the grid last fetched reflected: stops, loops, relocalizations.
+    let mut fetched_for = None;
+    let mut fetched_at = Instant::now();
+    loop {
+        let status: proto::MapStatusResult = client
+            .call(&proto::Call::MapStatus)
+            .map_err(|e| e.message)
+            .and_then(|r| {
+                r.result_as()
+                    .map_err(|e| format!("mapd answered unreadably: {e}"))
+            })?;
+        let version = (status.state.keyframes, status.loops, status.relocalizations);
+        let stale = fetched_for != Some(version) || fetched_at.elapsed() >= MAP_GRID_REFRESH;
+        let mapping = status.unavailable.is_none() || status.state.keyframes > 0;
+        if tx.send(Update::Map(Box::new(status))).is_err() {
+            return Ok(()); // the UI is gone
+        }
+        if stale && mapping {
+            let grid: proto::MapGridResult = client
+                .call(&proto::Call::MapGrid(proto::MapGridParams {
+                    res_m: Some(MAP_RES_M),
+                }))
+                .map_err(|e| e.message)
+                .and_then(|r| {
+                    r.result_as()
+                        .map_err(|e| format!("mapd answered unreadably: {e}"))
+                })?;
+            fetched_for = Some(version);
+            fetched_at = Instant::now();
+            if tx.send(Update::MapGrid(Box::new(grid))).is_err() {
+                return Ok(());
+            }
+        }
+        thread::sleep(MAP_POLL);
+    }
+}
+
 fn poll_health(socket: &Path, tx: &mpsc::Sender<Update>) {
     loop {
         if let Err(why) = ask_health(socket, tx)
@@ -1426,6 +1497,14 @@ struct View {
     health_at: Option<Instant>,
     /// Why the health poll is not answering, when it is not.
     health_lost: Option<String>,
+    /// `mapd`'s last status and map, and why it is not answering when it is not.
+    map_status: Option<proto::MapStatusResult>,
+    map_grid: Option<proto::MapGridResult>,
+    map_lost: Option<String>,
+    /// The robot's track in the **map** frame, from the map's poses — never odometry, whose frame
+    /// differs from the map's after a reboot or a loop closure. Restarted when the robot is lost,
+    /// so a relocalization does not draw a line across the room.
+    map_track: path_map::PathMap,
 }
 
 impl View {
@@ -1458,6 +1537,10 @@ impl View {
             health: None,
             health_at: None,
             health_lost: None,
+            map_status: None,
+            map_grid: None,
+            map_lost: None,
+            map_track: path_map::PathMap::new(),
         }
     }
 
@@ -1566,6 +1649,26 @@ impl View {
                 self.health_at = Some(Instant::now());
                 self.health_lost = None;
                 Ok(true)
+            }
+            Update::Map(status) => {
+                match status.state.pose {
+                    Some(p) => self.map_track.observe(p.x, p.y, p.yaw),
+                    None => self.map_track = path_map::PathMap::new(),
+                }
+                self.map_status = Some(*status);
+                self.map_lost = None;
+                Ok(self.show_duck)
+            }
+            Update::MapGrid(grid) => {
+                self.map_grid = Some(*grid).filter(|g| g.width > 0);
+                Ok(self.show_duck)
+            }
+            Update::MapLost(why) => {
+                // The last map is kept on screen: it was true when it arrived, and a `mapd`
+                // restarting under an update does not unmap the house.
+                self.map_lost = Some(why);
+                self.map_status = None;
+                Ok(self.show_duck)
             }
             Update::HealthLost(why) => {
                 // The last reading is **kept**, not cleared: it was true when it arrived, and
@@ -1812,18 +1915,64 @@ impl View {
         }
     }
 
-    /// The odometry track, top-down: boot-forward is up, the origin is `+`, the
-    /// robot is `●` with a heading ray. See [`path_map`].
+    /// The map when `mapd` has one, otherwise the odometry track: boot-forward is up, the
+    /// origin is `+`, the robot is `●` with a heading ray. See [`path_map`].
     fn render_path(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let block = Block::bordered().title(" path ").title_bottom(
-            // The zoom level, or the caption is a shape with no size.
-            Line::from(format!(" {:.1} m across ", self.path.extent_m()))
-                .dim()
-                .right_aligned(),
-        );
+        if let Some(grid) = &self.map_grid {
+            let block = Block::bordered()
+                .title(format!(" map · {} ", self.map_caption()))
+                .title_bottom(
+                    Line::from(format!(
+                        " {:.1} × {:.1} m ",
+                        f64::from(grid.width) * grid.res_m,
+                        f64::from(grid.height) * grid.res_m
+                    ))
+                    .dim()
+                    .right_aligned(),
+                );
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            path_map::draw_map(grid, &self.map_track, inner, frame.buffer_mut());
+            return;
+        }
+        let block = Block::bordered()
+            .title(format!(" path · {} ", self.map_caption()))
+            .title_bottom(
+                // The zoom level, or the caption is a shape with no size.
+                Line::from(format!(" {:.1} m across ", self.path.extent_m()))
+                    .dim()
+                    .right_aligned(),
+            );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.path.draw(inner, frame.buffer_mut());
+    }
+
+    /// What the map is doing, in a few words for the panel's title.
+    fn map_caption(&self) -> String {
+        let Some(s) = &self.map_status else {
+            return if self.map_lost.is_some() {
+                "no mapd".to_owned()
+            } else {
+                "map…".to_owned()
+            };
+        };
+        if let Some(why) = &s.unavailable
+            && s.state.keyframes == 0
+        {
+            return if why.contains("enabled = false") {
+                "map off".to_owned()
+            } else {
+                "not mapping".to_owned()
+            };
+        }
+        let what = match (&s.state.pose, &s.state.lost) {
+            (_, Some(why)) => format!("lost ({why})"),
+            (Some(_), None) if s.state.collecting => "looking".to_owned(),
+            (Some(_), None) => "tracking".to_owned(),
+            (None, None) => "waiting for a stop".to_owned(),
+        };
+        format!("{} stops · {what}", s.state.keyframes)
     }
 
     /// The whole-robot block: what was asked of it, what it did, and what it can feel.
