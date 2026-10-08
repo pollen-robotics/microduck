@@ -921,8 +921,28 @@ A TOML file read at startup and, for the most part, **not watched**. It lives ou
 
 Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
 than steps towards watching the whole file. `padd` stats the file once a second and re-reads
-`[pad]`, `[pad_imu_head_control]` and `[pad_drive]` when the mtime moves: a binding is changed from a phone, and restarting
+the controller sections (`[pad]`, `[pad_axes]`, `[pad_drive]`, `[pad_head]`, `[pad_body]`,
+`[pad_roller]` and `[pad_imu_head_control]`) when the mtime moves: a binding is changed from a phone, and restarting
 `padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+Controller settings are replaced together after validation; a failed live read keeps the last
+valid configuration. At startup, a missing or invalid file uses the built-in defaults.
+
+`[pad_axes]` selects logical gilrs axes (`left_x`, `left_y`, `right_x`, `right_y`, `none`) for
+robot commands, separately for `drive`, `head`, `head_drive` and `body_pose`. Each binding has
+`source`, `invert` and a nonnegative `gain`; omitted fields inherit the mode's shipped binding,
+including its sign. Values below `deadzone` are zeroed without rescaling the remaining travel,
+then inverted, multiplied by gain, clamped to ±1, and scaled to physical command limits.
+`none` or gain zero disables a binding. Limits live in `[pad_drive]` (walking m/s and rad/s),
+`[pad_roller]` (the same on wheels), `[pad_head]` (per-joint radians) and `[pad_body]` (height metres
+and tilt radians). Defaults reproduce the previous commands, including asymmetric crouch and
+roller push/brake. These are requested commands, not actuator limits or guarantees that a policy
+can reach the requested pose.
+
+D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
+`head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
+Smoothing remains in `robotd`'s `[control]` settings. `padd --deadzone` and `--max-head` remain
+explicit overrides of the corresponding file settings for bench use.
+
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
 `robotctl policy add` lands a skill without taking motor control away from a standing robot.
 Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,

@@ -531,6 +531,396 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Full turn right, rad/s — negative",
     ),
+    entry(
+        "pad_axes.deadzone",
+        Kind::Float,
+        "Stick deflection below this counts as centre",
+    ),
+    entry(
+        "pad_axes.drive.vx.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vx",
+    ),
+    entry(
+        "pad_axes.drive.vx.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.drive.vx.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.drive.vy.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vy",
+    ),
+    entry(
+        "pad_axes.drive.vy.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.drive.vy.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vyaw",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.drive.vyaw.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling neck_pitch",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head.neck_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_pitch",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head.head_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_yaw",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head.head_yaw.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_roll",
+    ),
+    entry(
+        "pad_axes.head.head_roll.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head.head_roll.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vx",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.vx.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vy",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.vy.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling vyaw",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.vyaw.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling neck_pitch",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.neck_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_pitch",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.head_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_yaw",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.head_yaw.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_roll",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.head_drive.head_roll.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.z.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling z",
+    ),
+    entry(
+        "pad_axes.body_pose.z.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.z.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling pitch",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling roll",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.roll.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling neck_pitch",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.neck_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_pitch",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.head_pitch.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_yaw",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.head_yaw.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.source",
+        Kind::Choice(crate::pad_axes::AXIS_SOURCES),
+        "Stick axis controlling head_roll",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.invert",
+        Kind::Bool,
+        "Reverse the selected axis",
+    ),
+    entry(
+        "pad_axes.body_pose.head_roll.gain",
+        Kind::Float,
+        "Sensitivity before clamping to full command",
+    ),
+    entry(
+        "pad_head.neck_pitch_max",
+        Kind::Float,
+        "pad_head neck_pitch_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_head.head_pitch_max",
+        Kind::Float,
+        "pad_head head_pitch_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_head.head_yaw_max",
+        Kind::Float,
+        "pad_head head_yaw_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_head.head_roll_max",
+        Kind::Float,
+        "pad_head head_roll_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_body.z_min",
+        Kind::Float,
+        "pad_body z_min: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_body.z_max",
+        Kind::Float,
+        "pad_body z_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_body.pitch_max",
+        Kind::Float,
+        "pad_body pitch_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_body.roll_max",
+        Kind::Float,
+        "pad_body roll_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vx_min",
+        Kind::Float,
+        "pad_roller vx_min: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vx_max",
+        Kind::Float,
+        "pad_roller vx_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vy_min",
+        Kind::Float,
+        "pad_roller vy_min: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vy_max",
+        Kind::Float,
+        "pad_roller vy_max: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vyaw_min",
+        Kind::Float,
+        "pad_roller vyaw_min: metres or radians (per second for drive)",
+    ),
+    entry(
+        "pad_roller.vyaw_max",
+        Kind::Float,
+        "pad_roller vyaw_max: metres or radians (per second for drive)",
+    ),
 ];
 
 /// Sections that changed name: `(old, new)`.
@@ -596,6 +986,22 @@ mod tests {
         fields
     }
 
+    fn collect_missing(key: &str, registry: &[&str], missing: &mut Vec<String>) {
+        if registry.contains(&key) {
+            return;
+        }
+        if registry
+            .iter()
+            .any(|entry| entry.starts_with(&format!("{key}.")))
+        {
+            for field in fields_of(key) {
+                collect_missing(&format!("{key}.{field}"), registry, missing);
+            }
+        } else {
+            missing.push(key.to_owned());
+        }
+    }
+
     /// The drift-proofing this module exists for: the registry names every key `Params`
     /// has — `Option` fields included — and nothing else. Add a field or a section and this
     /// test lists exactly the keys the registry (and so `robotctl configure`) does not know.
@@ -633,9 +1039,7 @@ mod tests {
         for section in &sections {
             for field in fields_of(section) {
                 let key = format!("{section}.{field}");
-                if !registry.contains(&key.as_str()) {
-                    missing.push(key);
-                }
+                collect_missing(&key, &registry, &mut missing);
             }
         }
         assert!(
@@ -647,7 +1051,7 @@ mod tests {
         for entry in REGISTRY {
             let (section, key) = entry
                 .key
-                .split_once('.')
+                .rsplit_once('.')
                 .expect("registry keys are section.key");
             let probe = match entry.kind {
                 Kind::Bool => format!("[{section}]\n{key} = true\n"),
@@ -693,7 +1097,7 @@ mod tests {
             let Kind::Choice(choices) = entry.kind else {
                 continue;
             };
-            let (section, key) = entry.key.split_once('.').expect("section.key");
+            let (section, key) = entry.key.rsplit_once('.').expect("section.key");
             for choice in choices {
                 let toml = format!("[{section}]\n{key} = \"{choice}\"\n");
                 assert!(
