@@ -14,6 +14,7 @@ FROM python:3.13-slim
 # alternative was nginx, which is a package, a config file and a user to get wrong for a page.
 WORKDIR /app
 COPY index.html /app/index.html
+COPY controller.js /app/controller.js
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

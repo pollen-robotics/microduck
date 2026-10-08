@@ -24,6 +24,7 @@ mod head_imu;
 mod idle_head;
 mod intents;
 mod leds;
+mod pad_config;
 mod params;
 mod pickup;
 mod posture;
@@ -5184,6 +5185,19 @@ fn dispatch(
         }
 
         proto::Call::PadBind(p) => proto::Response::ok(Some(id), &bind_pad_request(p, state)),
+        proto::Call::PadConfig => {
+            match pad_config::report(&state.config_path, do_names(&state.policies.load())) {
+                Ok(report) => proto::Response::ok(Some(id), &report),
+                Err(reason) => proto::Response::err(
+                    Some(id),
+                    proto::Error::new(proto::code::INVALID_PARAMS, reason),
+                ),
+            }
+        }
+        proto::Call::PadSetConfig(p) => proto::Response::ok(
+            Some(id),
+            &pad_config::apply(&state.config_path, p, &do_names(&state.policies.load())),
+        ),
 
         proto::Call::RobotSkills => proto::Response::ok(Some(id), &skills_report(state)),
 

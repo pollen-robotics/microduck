@@ -94,6 +94,18 @@ fn router(page: String, frame_socket: PathBuf) -> Router {
     Router::new()
         .route("/", get(move || std::future::ready(Html(page))))
         .route(
+            "/controller.js",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/javascript; charset=utf-8",
+                    )],
+                    include_str!("../webclient/controller.js"),
+                )
+            }),
+        )
+        .route(
             "/frame",
             get(move || snapshot(frame_socket.clone(), slots.clone())),
         )
@@ -135,6 +147,28 @@ async fn snapshot(socket: PathBuf, slots: Arc<tokio::sync::Semaphore>) -> axum::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn controller_editor_asset_is_served_by_the_embedded_console() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(page(8443), PathBuf::from("unused.sock")))
+                .await
+                .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/controller.js"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        let body = response.bytes().await.unwrap();
+        assert_eq!(body.as_ref(), include_bytes!("../webclient/controller.js"));
+        server.abort();
+    }
 
     /// The PNG comes out upright, because a picture is the one reply with nowhere to carry the
     /// mount angle. A quarter turn swaps the axes and moves the bright pixel; an upright mount

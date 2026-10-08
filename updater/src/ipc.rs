@@ -839,6 +839,8 @@ impl Server {
             // the same either way: not this daemon.
             | Call::PadBindings
             | Call::PadBind(_)
+            | Call::PadConfig
+            | Call::PadSetConfig(_)
             | Call::RobotSkills
             | Call::RobotSetSkill(_)
             | Call::RobotRemoveSkill(_) => Response::err(

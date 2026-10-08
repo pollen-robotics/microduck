@@ -277,7 +277,7 @@ exactly as before.
 
 ## 4. The page becomes a console
 
-**Landed** — `mediad/webclient/index.html`, still one file and still no build step.
+**Landed** — `mediad/webclient/index.html` and the embedded `controller.js`, with no build step.
 
 The permitted subset is large and almost none of it is reachable from the page. Reorganised
 around what a person came to do:
@@ -287,6 +287,7 @@ around what a person came to do:
 | **header** | robot name, release, API version — from `hello` and `system.info`, sent automatically when the channel opens, not clicked |
 | **video** | plus link quality from `getStats()`: bitrate, fps, loss, RTT. Today a stream that degrades is a picture that looks worse and a log that says nothing |
 | **drive** | keys and an on-screen stick → `robot.move` at a fixed rate; drag on the video → `robot.look` |
+| **controller** | a separate tab for stick sources, direction, sensitivity, deadzone, travel/speed limits and button skills; edits are staged until Save |
 | **posture** | `robot.enable`, `init`, `relax`, `stop`, `shutdown` — confirm on the last two |
 | **do / sound** | the `Do` and `Sound` enums as menus |
 | **telemetry** | `robot.subscribe` at 2 Hz into a live panel: mode, health |
@@ -300,9 +301,31 @@ Three constraints on it:
   A label, not a big red circle.
 - **A version difference is a banner, not a locked door.** `hello` reporting skew says so and the
   page keeps working — same rule `duck-btctl` settled on in #102.
-- **Still one file, still no build step.** That constraint is why the client is runnable at all
-  and it survives. If it outgrows one file it becomes three — `index.html`, `app.js`, `app.css`,
-  three `include_str!`s, still no build step, still no npm.
+- **No build step.** The HTML and controller script are embedded in `mediad`, and the Space
+  publisher copies both. There is no frontend framework or package installation.
+
+### 4.1 Controller configuration
+
+Open the console with `duckctl open`, connect, then select **Controller**. Select the stick
+mode to edit its mappings; change a button menu to assign one of this robot's skills or
+**No action** to disable it. **Save** writes the batch to `/etc/robot/robotd.toml`;
+`padd` reloads it within a second. **Cancel** discards local edits. **Restore defaults**
+stages removal of controller overrides and needs Save before it changes the robot.
+Keyboard driving is suspended while this tab is visible. Existing unsaved edits survive
+a lost connection, and inputs are disabled until the control channel returns.
+
+API v42 adds `pad.config` (typed settings, effective values, defaults and choices from the
+robot's parameter registry) and `pad.setConfig` (`changes` keyed by parameter path, with
+JSON null meaning remove the override). The latter permits only controller parameters,
+validates the whole batch and uses the terminal editor's atomic writer, preserving other
+settings and comments. An invalid batch leaves the file untouched. Both methods use the
+existing control-channel authorization and BLE PIN gate. The runtime must support v42;
+older robots report the unsupported method in the editor. The parameter ownership and
+mapping semantics live in [robotd-design.md](robotd-design.md#42-params).
+
+The draft tests run with `node --test mediad/webclient/controller.test.cjs` (Node 22+,
+no npm dependencies). Rust tests exercise typed edits, rejection of an invalid batch without
+partial writes, default restoration, comment preservation and the embedded script's HTTP route.
 
 Driving from the page is also the first real test of two claims `remote-webrtc.md` makes and
 nothing has exercised: that the deadman stops the robot when a session drops (§6), and that

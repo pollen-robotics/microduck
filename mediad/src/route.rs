@@ -131,7 +131,7 @@ fn permits(call: &proto::Call) -> bool {
         // `padd` re-reads `[pad]` every second and a binding held in memory would be reverted.
         // So a LAN peer changes something that outlives the session. Named rather than hidden;
         // the answer is authorisation on this transport, not a smaller surface.
-        PadBindings | PadBind(_) => true,
+        PadBindings | PadBind(_) | PadConfig | PadSetConfig(_) => true,
 
         // The skill table. With `policy.fetch` above, this is what makes the whole path reachable
         // from a browser: pull a stranger's policy onto the board, give it a name and a length,
@@ -485,6 +485,8 @@ mod tests {
             }),
             proto::Call::RobotReloadPolicies,
             proto::Call::PadBindings,
+            proto::Call::PadConfig,
+            proto::Call::PadSetConfig(proto::PadConfigPatch::default()),
             proto::Call::PadBind(proto::PadBindParams {
                 button: "x".to_owned(),
                 skill: Some("polite-bow".to_owned()),

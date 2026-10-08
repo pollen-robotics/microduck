@@ -339,7 +339,7 @@ fn permits(call: &proto::Call) -> bool {
         //
         // A name is checked against the skills this robot has before anything is written, so the
         // failure mode is a refusal naming them rather than a button that does nothing.
-        PadBindings | PadBind(_) => true,
+        PadBindings | PadBind(_) | PadConfig | PadSetConfig(_) => true,
 
         // The skill table: what this robot can be asked to do, and adding to it. The last thing
         // in the policy path that only a terminal on the robot could reach — `[[policy.skill]]`
@@ -552,6 +552,18 @@ pub fn refusal(call: &proto::Call) -> proto::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn controller_configuration_reaches_robotd_on_the_prompt_lane() {
+        for call in [
+            proto::Call::PadConfig,
+            proto::Call::PadSetConfig(proto::PadConfigPatch::default()),
+        ] {
+            assert_eq!(
+                destination_for(&call),
+                Some((Upstream::Robot, Lane::Prompt))
+            );
+        }
+    }
     use super::*;
     // The shared list, not a local copy. Two copies of this had already drifted — 115 lines here
     // against 82 — which is how `pad.input` came to be missing from one of them.
