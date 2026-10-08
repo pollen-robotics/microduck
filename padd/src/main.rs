@@ -465,6 +465,28 @@ fn reload_config(path: &Path, args: &Args, current: &mut robotd_params::Params) 
     }
 }
 
+/// The loop and tests share the actual file-change detection, with no sleeping in tests.
+fn poll_config(
+    tick: Instant,
+    checked: &mut Instant,
+    modified: &mut Option<std::time::SystemTime>,
+    args: &Args,
+    current: &mut robotd_params::Params,
+) -> bool {
+    if tick.duration_since(*checked) < CONFIG_POLL {
+        return false;
+    }
+    *checked = tick;
+    let now = config_mtime(&args.config);
+    if now != *modified {
+        *modified = now;
+        if reload_config(&args.config, args, current) {
+            tracing::info!("controller configuration reloaded");
+        }
+    }
+    true
+}
+
 /// The head pose for a pad attitude relative to its reference.
 ///
 /// `relative` is body → world of the pad now, in the frame of the reference — [`pad_imu::relative`].
@@ -599,15 +621,13 @@ fn main() -> std::process::ExitCode {
         // Once a second, not every tick: a `stat` at 50 Hz to catch a file somebody edits by
         // hand a few times a week is work for nothing, and a second is faster than typing the
         // next command.
-        if tick.duration_since(config_checked) >= CONFIG_POLL {
-            config_checked = tick;
-            let now = config_mtime(&args.config);
-            if now != config_at {
-                config_at = now;
-                if reload_config(&args.config, &args, &mut pad_config) {
-                    tracing::info!("controller configuration reloaded");
-                }
-            }
+        if poll_config(
+            tick,
+            &mut config_checked,
+            &mut config_at,
+            &args,
+            &mut pad_config,
+        ) {
             match ask_roller(&mut stream, &mut next_id) {
                 Ok(Some(now)) if now != roller => {
                     roller = now;
@@ -1833,6 +1853,223 @@ mod tests {
             panic!("body pose")
         };
         assert_eq!(body.z, -0.025);
+    }
+
+    /// Independent full-deflection examples pin every axis in every mode to the old mapping.
+    #[test]
+    fn every_default_stick_axis_has_the_expected_direction_and_command() {
+        let config = robotd_params::Params::default();
+        // Flattened commands: vx, vy, vyaw, neck_pitch, head_pitch, head_yaw,
+        // head_roll, body_z, body_pitch, body_roll. No evaluator used for expected values.
+        let cases = [
+            (
+                Mode::Drive,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Drive,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Drive,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (Mode::Drive, [0.0, 0.0, 0.0, 1.0], [0.0; 10]),
+            (
+                Mode::Head,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2618],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.010, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+        ];
+        for (mode, positive, expected) in cases {
+            for direction in [-1.0, 1.0] {
+                let sticks = positive.map(|v| v * direction);
+                let calls = stick_calls(mode, &config, false, sticks);
+                let mut actual = [0.0; 10];
+                for call in &calls {
+                    match call {
+                        proto::Call::RobotMove(m) => {
+                            actual[..3].copy_from_slice(&[m.vx, m.vy, m.vyaw])
+                        }
+                        proto::Call::RobotHead(h) => actual[3..7].copy_from_slice(&[
+                            h.neck_pitch,
+                            h.head_pitch,
+                            h.head_yaw,
+                            h.head_roll,
+                        ]),
+                        proto::Call::RobotPose(b) => {
+                            assert!(b.active);
+                            actual[7..].copy_from_slice(&[b.z, b.pitch, b.roll]);
+                        }
+                        _ => panic!("unexpected command"),
+                    }
+                }
+                let mut expected = expected.map(|v| v * direction);
+                if mode == Mode::BodyPose && direction < 0.0 && positive[1] != 0.0 {
+                    expected[7] = -0.025;
+                }
+                assert_eq!(actual, expected, "{mode:?}, sticks {sticks:?}");
+                assert_eq!(
+                    calls.len(),
+                    match mode {
+                        Mode::Drive => 1,
+                        Mode::BodyPose => 3,
+                        _ => 2,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_edits_are_polled_and_change_commands_without_a_restart() {
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        let write = |text: &str, revision| {
+            std::fs::write(&path, text).unwrap();
+            // Explicit timestamps avoid sleeps and filesystem timestamp-resolution races.
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(revision))
+                .unwrap();
+        };
+        write("", 10);
+        let args = Args::try_parse_from(["padd", "--config", path.to_str().unwrap()]).unwrap();
+        let mut config = read_config(&path, &args).unwrap();
+        let start = Instant::now();
+        let mut checked = start;
+        let mut modified = config_mtime(&path);
+        write("[pad_axes.drive.vx]\nsource = 'right_y'\ngain = 0.5\n", 20);
+        assert!(!poll_config(
+            start + Duration::from_millis(999),
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config
+        ));
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.0
+        );
+        assert!(poll_config(
+            start + CONFIG_POLL,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config
+        ));
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.15
+        );
+        // Invalid edit, then valid correction: use the actual poll path in both cases.
+        write("[pad_axes]\ndeadzone = 1.0\n", 30);
+        poll_config(
+            start + CONFIG_POLL * 2,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config,
+        );
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.15
+        );
+        write("[pad_axes.drive.vx]\nsource = 'right_y'\ngain = 0.8\n", 40);
+        poll_config(
+            start + CONFIG_POLL * 3,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config,
+        );
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.24
+        );
     }
 
     #[test]

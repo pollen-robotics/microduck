@@ -1140,6 +1140,20 @@ mod tests {
                 .edit(entry("pad_axes.drive.vyaw.gain"), "1.0")
                 .unwrap();
             model.save().unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let document: toml::Value = toml::from_str(&written).unwrap();
+            assert!(
+                document["pad_axes"]["drive"]["vyaw"].get("gain").is_none(),
+                "override still written: {written}"
+            );
+            assert_eq!(
+                document["pad_axes"]["drive"]["vyaw"]["invert"].as_bool(),
+                Some(false)
+            );
+            assert!(written.contains("# my pad"));
+            if text.contains("# reverse steering") {
+                assert!(written.contains("# reverse steering"));
+            }
             assert_eq!(
                 crate::Params::load(&path, true)
                     .unwrap()
