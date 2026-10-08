@@ -1059,6 +1059,11 @@ fn live(
                         view.toggle_duck();
                         fresh = true;
                     }
+                    // The map (or the odometry path) over the whole terminal, and back.
+                    KeyCode::Char('m') => {
+                        view.fullscreen_map = !view.fullscreen_map;
+                        fresh = true;
+                    }
                     KeyCode::Char('[') | KeyCode::Left => {
                         view.orbit_duck(-0.25);
                         fresh = true;
@@ -1469,6 +1474,9 @@ struct View {
     /// Is the robot view wanted? Distinct from whether it is *drawn*: it also needs a
     /// state to pose from, a terminal wide enough, and a model that parsed.
     show_duck: bool,
+    /// The map panel fills the terminal (`m`). A house drawn in the ten rows under the robot
+    /// view is a thumbnail; this is how it is read.
+    fullscreen_map: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
     /// ToF beams through the head FK, so the depth grid can name the floor.
@@ -1525,6 +1533,7 @@ impl View {
             no_robot,
             duck: duck::DuckView::new(),
             show_duck: true,
+            fullscreen_map: false,
             path: path_map::PathMap::new(),
             reprojector: kinematics::tof::Reprojector::alpha(),
             tof: None,
@@ -1657,18 +1666,18 @@ impl View {
                 }
                 self.map_status = Some(*status);
                 self.map_lost = None;
-                Ok(self.show_duck)
+                Ok(self.show_duck || self.fullscreen_map)
             }
             Update::MapGrid(grid) => {
                 self.map_grid = Some(*grid).filter(|g| g.width > 0);
-                Ok(self.show_duck)
+                Ok(self.show_duck || self.fullscreen_map)
             }
             Update::MapLost(why) => {
                 // The last map is kept on screen: it was true when it arrived, and a `mapd`
                 // restarting under an update does not unmap the house.
                 self.map_lost = Some(why);
                 self.map_status = None;
-                Ok(self.show_duck)
+                Ok(self.show_duck || self.fullscreen_map)
             }
             Update::HealthLost(why) => {
                 // The last reading is **kept**, not cleared: it was true when it arrived, and
@@ -1709,6 +1718,11 @@ impl View {
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        // The whole terminal is the map; everything else waits behind `m`.
+        if self.fullscreen_map {
+            self.render_path(frame, area);
+            return;
+        }
         let Some(rows) = self.latest.as_ref().map(joint_rows) else {
             // No robot state — either `robotd` has not sent one yet, or there is no `robotd` to
             // connect to. Either way the pad block is still drawn when it is open: it reads a
@@ -1918,9 +1932,15 @@ impl View {
     /// The map when `mapd` has one, otherwise the odometry track: boot-forward is up, the
     /// origin is `+`, the robot is `●` with a heading ray. See [`path_map`].
     fn render_path(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let hint = if self.fullscreen_map {
+            " m back "
+        } else {
+            " m fills the screen "
+        };
         if let Some(grid) = &self.map_grid {
             let block = Block::bordered()
                 .title(format!(" map · {} ", self.map_caption()))
+                .title_bottom(Line::from(hint).dim().left_aligned())
                 .title_bottom(
                     Line::from(format!(
                         " {:.1} × {:.1} m ",
@@ -1937,6 +1957,7 @@ impl View {
         }
         let block = Block::bordered()
             .title(format!(" path · {} ", self.map_caption()))
+            .title_bottom(Line::from(hint).dim().left_aligned())
             .title_bottom(
                 // The zoom level, or the caption is a shape with no size.
                 Line::from(format!(" {:.1} m across ", self.path.extent_m()))
