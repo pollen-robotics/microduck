@@ -126,6 +126,11 @@ fn apply_for(key: &str) -> Option<Apply> {
         // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
+        // `[roller]` is two daemons' section: the three networks ride the `[policy]` reload
+        // (`Params::load` hands them to it), and the stick speeds are `padd`'s, live like
+        // `[pad_drive]`.
+        "roller" if matches!(name, "walk" | "stand" | "crouch") => Apply::Reload("robotd"),
+        "roller" => Apply::Live("padd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "theremin"
         | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
@@ -1174,6 +1179,28 @@ mod tests {
         let plan = plan_for(&m);
         assert_eq!(plan.restart, vec!["robotd"]);
         assert_eq!(plan.live, vec!["padd"]);
+    }
+
+    /// `[roller]` belongs to two daemons. Its networks are `robotd`'s and ride the `[policy]`
+    /// reload, so trying a roller network does not take motor control away; its stick speeds
+    /// are `padd`'s and apply within a second, so offering a restart for them would drop the pad
+    /// session to change a number padd already has.
+    #[test]
+    fn the_roller_section_reloads_its_networks_and_hands_its_speeds_to_padd() {
+        for key in ["roller.walk", "roller.stand", "roller.crouch"] {
+            let mut m = model("");
+            m.edit(entry(key), "/srv/mine.onnx").expect("valid");
+            let plan = plan_for(&m);
+            assert_eq!(plan.reload, vec!["robotd"], "{key}");
+            assert!(plan.restart.is_empty(), "{key}: the motors stay powered");
+        }
+        for (key, value) in [("roller.vyaw_max", "0.4"), ("roller.vx_min", "-0.4")] {
+            let mut m = model("");
+            m.edit(entry(key), value).expect("valid");
+            let plan = plan_for(&m);
+            assert!(plan.is_quiet(), "{key} must not ask for anything: {plan:?}");
+            assert_eq!(plan.live, vec!["padd"], "{key}");
+        }
     }
 
     /// `[policy]` reloads instead of restarting — except the two keys a reload does not carry.

@@ -946,6 +946,12 @@ load *and* the tuning defaults, so every unset field resolves per mode and movin
 wheels is one line plus a restart. It is a preset, not a variant: the roller line is the
 prototype's, rebased on the alpha defaults.
 
+The roller's own networks — `walk`, `stand` (none by default) and `crouch` — and its stick speeds
+are a section of their own, `[roller]`. On wheels those three take the place of `[policy]`'s walk,
+stand and ground pick, which are the walking robot's, so trying a roller network cannot write
+over the walking one: a slot loaded while rolling is written to `[roller]`. Everything else in
+`[policy]` serves both modes.
+
 ### 4.3 The gamepad is a client
 
 `padd` reads `gilrs` and sends intents over `robotd`'s socket. Its own crate, so a gamepad stack

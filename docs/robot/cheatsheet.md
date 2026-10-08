@@ -579,7 +579,9 @@ little up and down, now and then with a curious tilt — holds each look, drifts
 while it does, and breathes (a millimetre of height, standing only). The longer nothing happens
 the calmer it gets. It fades in and out, and any stick or head command takes the head back. In
 the D-pad's head modes the pad keeps the head, so this only happens in move mode. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. The
+shaping automatically — asymmetric push/brake, no strafe, turning capped at 0.3 rad/s — and B
+triggers the crouch. Those speeds and the roller's own networks (walk, stand, crouch) are the
+`[roller]` section of `robotctl configure`. The
 other skills ride along: sit and the kicks work on wheels too, as the prototype has it.
 
 **`robot.setMode` switches between the two**, for when you have just put wheels on the duck or

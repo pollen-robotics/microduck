@@ -120,7 +120,8 @@ enabled = true
 
 # Drive mode: "walk" (legs, the default) or "roller". The mode changes which policies load
 # AND the tuning defaults below — every value left unset resolves per mode, so switching a
-# robot to the roller is this one line plus `systemctl restart robotd`. The roller preset
+# robot to the roller is this one line plus `systemctl restart robotd`. The roller's own
+# networks and stick speeds are [roller], below. The roller preset
 # is the prototype launcher's, rebased on the alpha defaults as its installer now is:
 # roller.onnx as the locomotion policy, the crouch on the ground-pick trigger (3.0 s, 0.8),
 # action_scale 0.8 — and everything else as walking has it: sit/stand, kicks, roulade, the
@@ -142,6 +143,8 @@ mode = "walk"
 # robotd checks that at load rather than discovering it mid-stride. (microduck_runtime also
 # ships a 51-D family — legacy 3-value command — which robotd refuses at load with
 # "observation width is 51, expected 61".)
+#
+# walk, stand and ground_pick are the walking robot's; on wheels [roller] has its own.
 #
 # Walk-mode defaults, spelled out, all under /opt/robot/policies/current/:
 # walk        = "velstand.onnx"          walks on a twist, stands still at zero command
@@ -202,6 +205,32 @@ mode = "walk"
 # robot's response steady as the pack sags. On by default.
 # voltage_adapt = true
 # nominal_voltage = 7.4
+
+[roller]
+# The robot on wheels: its own networks, and how fast the pad drives it. Only read while
+# `policy.mode` is "roller" (or after `robot.setMode` to it).
+#
+# The three policies take the place of [policy]'s walk, stand and ground_pick on wheels —
+# those three are the walking robot's — so trying a roller network never writes over the
+# walking one. The same rules as there: unset is the default in /opt/robot/policies/current,
+# "none" disables a slot, and `robotctl policy load <slot> <file>` on a rolling robot writes
+# here. robotd takes a change on a reload; `robotctl configure` asks for one.
+#
+# walk   = "roller.onnx"          locomotion on wheels
+# stand  = "none"                 a standing network, selected at zero command as walking's is.
+#                                 None by default: the roller network runs at every velocity,
+#                                 as the prototype's roller line has it
+# crouch = "roller_crouch.onnx"   the B-button crouch, in the ground-pick slot
+
+# What full stick deflection asks for on wheels, read by `padd` like [pad_drive], which it
+# replaces in roller mode: signed bounds, a `_min` is negative, and no strafe. The defaults
+# are the prototype's roller preset — push harder than you can brake, and its launch line's
+# `--max-angular-vel 0.3`. What the pad asks for, not a limit on the robot: the policy only
+# follows commands inside the range it was trained on.
+# vx_max = 0.6
+# vx_min = -0.5
+# vyaw_max = 0.3
+# vyaw_min = -0.3
 
 [safety]
 # The fall verdict: is the robot down? On projected gravity in the trunk frame — upright
@@ -540,7 +569,7 @@ mode = "walk"
 # while walking, per axis and per direction; the stick is linear between centre and each bound.
 # Signed in the robot's frame — vx forward, vy left, vyaw counter-clockwise from above — so each
 # `_min` is negative, and zero switches that direction off. A positive `_min` is refused rather
-# than guessed at. Roller mode keeps its own shaping.
+# than guessed at. Roller mode uses [roller]'s instead.
 #
 # This is what the pad asks for, not a limit on the robot: the policy only follows commands
 # inside the range it was trained on.

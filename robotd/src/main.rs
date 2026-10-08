@@ -494,7 +494,10 @@ fn drop_unloadable_overrides_with(
         .as_deref()
         .is_some_and(params::is_none_sentinel)
     {
-        tracing::error!("[policy] walk = \"none\" cannot be honoured; using this robot's own");
+        tracing::error!(
+            key = Slot::Walk.config_key(policy_params.mode),
+            "walk = \"none\" cannot be honoured; using this robot's own"
+        );
         errors.set(
             Slot::Walk,
             "the walking policy cannot be switched off; using this robot's own".to_owned(),
@@ -1909,13 +1912,10 @@ fn try_controller(
                 .collect(),
         };
         match Policy::load(&paths, DEFAULT_STANDING_THRESHOLD) {
-            Ok(mut policy) => {
-                // Roller mode has no standing network — command magnitude stops selecting
-                // it. Nothing else reserves it: limp-fall hands back by *letting* the
-                // standing network be selected, which is what stands the robot up.
-                if policy_cfg.mode == Mode::Roller {
-                    policy.set_standing_disabled(true);
-                }
+            Ok(policy) => {
+                // Roller mode stands only on a network `[roller] stand` names: the magnitude rule
+                // selects it at zero command as walking's is, and with none named — the
+                // default — there is nothing to select.
                 tracing::warn!(
                     mode = policy_cfg.mode.as_str(),
                     walk = %policy_cfg.walk.display(),
@@ -4881,7 +4881,10 @@ fn load_policy_request(
         Some(slot) => vec![slot],
         None => Slot::ALL.to_vec(),
     };
-    let recorded = match params::edit::set_slots(&state.config_path, &slots, path.as_deref()) {
+    // The key is the running mode's: on wheels `walk`, `stand` and `ground_pick` are `[roller]`'s.
+    let mode = mode_of(state.mode.load(Ordering::Relaxed));
+    let recorded = match params::edit::set_slots(&state.config_path, mode, &slots, path.as_deref())
+    {
         Ok(recorded) => recorded,
         Err(e) => return proto::IntentResult::refused(e),
     };
@@ -8204,6 +8207,42 @@ mod tests {
             reason.contains("robotd.toml"),
             "it says the file moved: {reason}"
         );
+    }
+
+    /// On wheels, the slot is `[roller]`'s. A reset of `walk` while rolling clears the roller's
+    /// key and leaves the walking robot's alone — the other way round, the next boot on legs
+    /// would lose its gait to a reset somebody did on wheels.
+    #[test]
+    fn a_reset_while_rolling_clears_the_roller_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(
+            &config,
+            "[policy]\nwalk = \"/srv/legs.onnx\"\n\n[roller]\nwalk = \"/srv/wheels.onnx\"\n",
+        )
+        .expect("write");
+
+        let mut params = Params::default();
+        params.policy.mode = Mode::Roller;
+        let s = RobotState::new(&params, &config, false, false);
+        let intents = Arc::new(Intents::new());
+
+        let result: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLoadPolicy(proto::LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: None,
+            }),
+        )
+        .result_as()
+        .unwrap();
+
+        assert!(result.accepted);
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(!written.contains("wheels.onnx"), "{written}");
+        assert!(written.contains("legs.onnx"), "{written}");
     }
 
     /// `robotd`'s working directory is not the caller's, so a relative path names a different

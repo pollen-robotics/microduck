@@ -70,6 +70,8 @@ pub struct Params {
     pub control: Control,
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
+    /// The roller's own policies and stick speeds. [`RollerParams`] says who reads which.
+    pub roller: RollerParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
@@ -103,7 +105,7 @@ pub struct Params {
 /// Each axis has a bound per direction, signed in the robot's own frame — `vx` forward, `vy` to
 /// the left, `vyaw` counter-clockwise seen from above — so a `_min` is the bound in the negative
 /// direction and is itself negative (or zero, to forbid that direction). The stick is linear
-/// between centre and either bound. Walk mode only: roller mode keeps its own shaping.
+/// between centre and either bound. Walk mode only: roller mode uses [`RollerParams`]'s.
 ///
 /// This is what the *pad* asks for, not a limit on the robot. A `robot.move` from anywhere else
 /// is not bounded by it, and the policy only follows commands inside the range it was trained
@@ -1120,13 +1122,16 @@ pub struct PolicyParams {
     /// Policy paths. Absent means the mode's default inside the release directory, so a
     /// normal update ships them; point one elsewhere to try a build without cutting a
     /// release. The literal `"none"` disables a slot outright — the prototype's convention.
+    ///
+    /// `walk`, `stand` and `ground_pick` are the *walking* robot's: on wheels those three slots
+    /// come from `[roller]` instead (see [`RollerParams`]). The rest serve both modes.
     pub walk: Option<PathBuf>,
     /// Standing policy. Without one the walking policy runs at every velocity.
     pub stand: Option<PathBuf>,
     /// Commanded sit↔stand (posture flag in the twist `vx` slot). Sit toggle and the shutdown
     /// sit both need it.
     pub sitstand: Option<PathBuf>,
-    /// Phase-scripted ground pick. In roller mode this slot holds the crouch.
+    /// Phase-scripted ground pick. In roller mode the slot holds `[roller] crouch` instead.
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
@@ -1171,6 +1176,86 @@ pub struct PolicyParams {
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
+    /// `[roller]`'s three policy slots, carried here so everything that resolves a
+    /// `PolicyParams` — the loop, a live `robot.setMode`, a reload — sees the roller's networks
+    /// without being handed a second struct. Not a key of `[policy]`: [`Params::load`] copies
+    /// it from [`Params::roller`], which is the one the file spells.
+    #[serde(skip)]
+    pub roller: RollerSlots,
+}
+
+/// The roller robot: its own three networks, and what the pad's sticks ask of it.
+///
+/// **Its own section because it is its own robot.** Walking and rolling share sit/stand, the
+/// kicks and the roulade, but locomotion, standing and the B-button move are trained per mode —
+/// and with one `[policy] walk` key for both, trying a new roller network meant writing over the
+/// walking one. Here each mode keeps its own, and `policy.mode` (or `robot.setMode`) picks.
+///
+/// The policies are read by `robotd`, the speeds by `padd` — which is why `robotctl configure`
+/// reloads the one and has nothing to ask for the other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RollerParams {
+    /// Locomotion on wheels. Absent: `roller.onnx`.
+    pub walk: Option<PathBuf>,
+    /// Standing on wheels, selected at zero command as walking's is. Absent loads none — the
+    /// prototype's roller line skips every standing transition — so the roller network runs at
+    /// every velocity.
+    pub stand: Option<PathBuf>,
+    /// The B-button move: the crouch, in the ground-pick slot. Absent: `roller_crouch.onnx`.
+    pub crouch: Option<PathBuf>,
+    /// Full stick forward (push), m/s.
+    pub vx_max: f64,
+    /// Full stick back (brake), m/s — negative.
+    pub vx_min: f64,
+    /// Full turn left, rad/s.
+    pub vyaw_max: f64,
+    /// Full turn right, rad/s — negative.
+    pub vyaw_min: f64,
+}
+
+impl Default for RollerParams {
+    /// The prototype's roller shaping: push 0.6, brake 0.5, and the roller launch line's
+    /// `--max-angular-vel 0.3`, which were constants in `padd` until they moved here.
+    fn default() -> Self {
+        Self {
+            walk: None,
+            stand: None,
+            crouch: None,
+            vx_max: 0.6,
+            vx_min: -0.5,
+            vyaw_max: 0.3,
+            vyaw_min: -0.3,
+        }
+    }
+}
+
+impl RollerParams {
+    /// Each axis as `(name, min, max)`, for validation and logging. No strafe: wheels.
+    pub fn axes(&self) -> [(&'static str, f64, f64); 2] {
+        [
+            ("vx", self.vx_min, self.vx_max),
+            ("vyaw", self.vyaw_min, self.vyaw_max),
+        ]
+    }
+
+    /// The three policy slots, as [`PolicyParams::roller`] carries them.
+    pub fn slots(&self) -> RollerSlots {
+        RollerSlots {
+            walk: self.walk.clone(),
+            stand: self.stand.clone(),
+            crouch: self.crouch.clone(),
+        }
+    }
+}
+
+/// `[roller]`'s policy keys, as a [`PolicyParams`] carries them. Same meaning per field as on
+/// [`RollerParams`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RollerSlots {
+    pub walk: Option<PathBuf>,
+    pub stand: Option<PathBuf>,
+    pub crouch: Option<PathBuf>,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -1672,9 +1757,15 @@ impl Slot {
         }
     }
 
-    /// `section.key`, which is what the registry and `toml_edit` want.
-    pub fn config_key(self) -> String {
-        format!("policy.{}", self.as_str())
+    /// `section.key`, which is what the registry and `toml_edit` want — for one mode, because
+    /// on wheels `walk`, `stand` and `ground_pick` are `[roller]`'s (`ground_pick` as `crouch`).
+    pub fn config_key(self, mode: Mode) -> String {
+        match (self, mode) {
+            (Slot::Walk, Mode::Roller) => "roller.walk".to_owned(),
+            (Slot::Stand, Mode::Roller) => "roller.stand".to_owned(),
+            (Slot::GroundPick, Mode::Roller) => "roller.crouch".to_owned(),
+            _ => format!("policy.{}", self.as_str()),
+        }
     }
 
     /// Parse a slot name off the wire. `None` for anything else, so a caller can refuse with
@@ -1803,29 +1894,38 @@ impl PolicyParams {
 
     /// What config says about one slot: `None` unset (resolve the mode's default), `Some("none")`
     /// disabled outright, `Some(path)` an override.
+    ///
+    /// Answered for this mode: on wheels, `walk`, `stand` and `ground_pick` are `[roller]`'s.
     pub fn slot(&self, slot: Slot) -> &Option<PathBuf> {
-        match slot {
-            Slot::Walk => &self.walk,
-            Slot::Stand => &self.stand,
-            Slot::SitStand => &self.sitstand,
-            Slot::GroundPick => &self.ground_pick,
-            Slot::KickLeft => &self.kick_left,
-            Slot::KickRight => &self.kick_right,
-            Slot::Roulade => &self.roulade,
+        match (slot, self.mode) {
+            (Slot::Walk, Mode::Roller) => &self.roller.walk,
+            (Slot::Stand, Mode::Roller) => &self.roller.stand,
+            (Slot::GroundPick, Mode::Roller) => &self.roller.crouch,
+            (Slot::Walk, Mode::Walk) => &self.walk,
+            (Slot::Stand, Mode::Walk) => &self.stand,
+            (Slot::SitStand, _) => &self.sitstand,
+            (Slot::GroundPick, Mode::Walk) => &self.ground_pick,
+            (Slot::KickLeft, _) => &self.kick_left,
+            (Slot::KickRight, _) => &self.kick_right,
+            (Slot::Roulade, _) => &self.roulade,
         }
     }
 
     /// Set or clear one slot's override. Clearing is what `robotctl policy reset` does, and it
     /// is why this takes an `Option` rather than having a second method for it.
+    /// Like [`Self::slot`], for this mode.
     pub fn set_slot(&mut self, slot: Slot, path: Option<PathBuf>) {
-        let field = match slot {
-            Slot::Walk => &mut self.walk,
-            Slot::Stand => &mut self.stand,
-            Slot::SitStand => &mut self.sitstand,
-            Slot::GroundPick => &mut self.ground_pick,
-            Slot::KickLeft => &mut self.kick_left,
-            Slot::KickRight => &mut self.kick_right,
-            Slot::Roulade => &mut self.roulade,
+        let field = match (slot, self.mode) {
+            (Slot::Walk, Mode::Roller) => &mut self.roller.walk,
+            (Slot::Stand, Mode::Roller) => &mut self.roller.stand,
+            (Slot::GroundPick, Mode::Roller) => &mut self.roller.crouch,
+            (Slot::Walk, Mode::Walk) => &mut self.walk,
+            (Slot::Stand, Mode::Walk) => &mut self.stand,
+            (Slot::SitStand, _) => &mut self.sitstand,
+            (Slot::GroundPick, Mode::Walk) => &mut self.ground_pick,
+            (Slot::KickLeft, _) => &mut self.kick_left,
+            (Slot::KickRight, _) => &mut self.kick_right,
+            (Slot::Roulade, _) => &mut self.roulade,
         };
         *field = path;
     }
@@ -1866,9 +1966,10 @@ impl PolicyParams {
             // The prototype's roller preset, since rebased on the alpha defaults: roller
             // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
             // kicks, the trained low-pass — as the walking mode has it. `stand` stays
-            // unloaded, deliberately: the prototype loads the standing network in roller
-            // mode and then skips every standing transition while `roller_mode` is set, so
-            // it never runs — not loading it is the same robot without the dead session.
+            // unloaded unless `[roller] stand` names one: the prototype loads the standing
+            // network in roller mode and then skips every standing transition while
+            // `roller_mode` is set, so it never runs — not loading it is the same robot
+            // without the dead session.
             Mode::Roller => (
                 "roller.onnx",
                 None,
@@ -1906,11 +2007,11 @@ impl PolicyParams {
             // health rule exists to prevent. `robot.loadPolicy` refuses to write it and
             // `drop_unloadable_overrides` clears it at startup and reports degraded; this is the
             // floor under both.
-            walk: path(&self.walk, Some(walk_default))
+            walk: path(self.slot(Slot::Walk), Some(walk_default))
                 .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
-            stand: path(&self.stand, stand),
-            sitstand: path(&self.sitstand, sitstand),
-            ground_pick: path(&self.ground_pick, ground_pick),
+            stand: path(self.slot(Slot::Stand), stand),
+            sitstand: path(self.slot(Slot::SitStand), sitstand),
+            ground_pick: path(self.slot(Slot::GroundPick), ground_pick),
             kick_left: skill_file("kick_left"),
             kick_right: skill_file("kick_right"),
             roulade: skill_file("roulade"),
@@ -2032,6 +2133,7 @@ impl Default for PolicyParams {
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
+            roller: RollerSlots::default(),
         }
     }
 }
@@ -2208,12 +2310,13 @@ pub enum ParamsError {
         max: u32,
     },
     #[error(
-        "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
+        "{path}: {section}.{axis}_min must be zero or negative and {section}.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
          vx_min = -0.2"
     )]
     PadDrive {
         path: String,
+        section: &'static str,
         axis: &'static str,
         min: f64,
         max: f64,
@@ -2290,6 +2393,8 @@ impl Params {
                 })?
             }
         };
+        let mut params = params;
+        params.policy.roller = params.roller.slots();
         params.validate(path)?;
         Ok(params)
     }
@@ -2319,10 +2424,19 @@ impl Params {
         // back would then walk the robot *forward*. Refused rather than taken as its absolute
         // value, because the editor should say which of the two readings it was not going to
         // guess.
-        for (axis, min, max) in self.pad_drive.axes() {
+        let drive = self
+            .pad_drive
+            .axes()
+            .map(|(axis, min, max)| ("pad_drive", axis, min, max));
+        let roller = self
+            .roller
+            .axes()
+            .map(|(axis, min, max)| ("roller", axis, min, max));
+        for (section, axis, min, max) in drive.into_iter().chain(roller) {
             if !(min.is_finite() && max.is_finite() && min <= 0.0 && max >= 0.0) {
                 return Err(ParamsError::PadDrive {
                     path: path.display().to_string(),
+                    section,
                     axis,
                     min,
                     max,
@@ -2467,17 +2581,19 @@ mod tests {
     /// because it is itself pinned complete against serde's own field list.
     #[test]
     fn every_slot_is_a_registry_key() {
-        for slot in super::Slot::ALL {
-            let key = slot.config_key();
-            let entry = crate::registry::REGISTRY
-                .iter()
-                .find(|e| e.key == key)
-                .unwrap_or_else(|| panic!("{key} is not a key of robotd.toml"));
-            assert_eq!(
-                entry.kind,
-                crate::registry::Kind::OptionalPath,
-                "{key} must be a path slot"
-            );
+        for mode in [super::Mode::Walk, super::Mode::Roller] {
+            for slot in super::Slot::ALL {
+                let key = slot.config_key(mode);
+                let entry = crate::registry::REGISTRY
+                    .iter()
+                    .find(|e| e.key == key)
+                    .unwrap_or_else(|| panic!("{key} is not a key of robotd.toml"));
+                assert_eq!(
+                    entry.kind,
+                    crate::registry::Kind::OptionalPath,
+                    "{key} must be a path slot"
+                );
+            }
         }
     }
 
@@ -3604,6 +3720,7 @@ mod tests {
             built_in.update_gate.min_achieved_hz
         );
         assert_eq!(from_file.pad_drive, built_in.pad_drive);
+        assert_eq!(from_file.roller, built_in.roller);
         assert_eq!(
             from_file.update_gate.stall_periods,
             built_in.update_gate.stall_periods
@@ -3750,6 +3867,90 @@ mod tests {
         );
         assert_eq!(p.legs_lowpass, Some(0.7));
         assert_eq!(p.gain, 200);
+    }
+
+    /// **Each mode runs its own section's networks.** `[roller]` names the roller's walk, stand
+    /// and crouch; `[policy]`'s walk, stand and ground pick are the walking robot's and must not
+    /// leak onto wheels — or back. This is the whole reason the section exists: trying a roller
+    /// network used to mean writing over the walking one in the same key.
+    #[test]
+    fn each_mode_runs_its_own_sections_networks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[policy]\nmode = \"roller\"\nwalk = \"/srv/legs.onnx\"\nstand = \"/srv/legs-stand.onnx\"\n\
+             ground_pick = \"/srv/pick.onnx\"\n\n\
+             [roller]\nwalk = \"/srv/wheels.onnx\"\nstand = \"/srv/wheels-stand.onnx\"\n\
+             crouch = \"/srv/crouch.onnx\"\n",
+        );
+        let mut params = Params::load(&path, true).unwrap().policy;
+
+        let rolling = params.resolved();
+        assert_eq!(rolling.walk, PathBuf::from("/srv/wheels.onnx"));
+        assert_eq!(
+            rolling.stand.as_deref(),
+            Some(Path::new("/srv/wheels-stand.onnx")),
+            "a roller stand named in [roller] is loaded"
+        );
+        assert_eq!(
+            rolling.ground_pick.as_deref(),
+            Some(Path::new("/srv/crouch.onnx"))
+        );
+
+        // A live `robot.setMode` flips the mode on the same params, and the walking networks
+        // come back with it.
+        params.mode = Mode::Walk;
+        let walking = params.resolved();
+        assert_eq!(walking.walk, PathBuf::from("/srv/legs.onnx"));
+        assert_eq!(
+            walking.stand.as_deref(),
+            Some(Path::new("/srv/legs-stand.onnx"))
+        );
+        assert_eq!(
+            walking.ground_pick.as_deref(),
+            Some(Path::new("/srv/pick.onnx"))
+        );
+    }
+
+    /// A slot set or cleared while rolling is the roller's: `drop_unloadable_overrides` and
+    /// `robot.loadPolicy` go through these two, and either reaching `[policy]` from a roller
+    /// would change what the walking robot loads.
+    #[test]
+    fn slots_follow_the_mode() {
+        let mut p = PolicyParams {
+            mode: Mode::Roller,
+            ..Default::default()
+        };
+        p.set_slot(Slot::GroundPick, Some(PathBuf::from("/srv/crouch.onnx")));
+        p.set_slot(Slot::SitStand, Some(PathBuf::from("/srv/sit.onnx")));
+        assert_eq!(
+            p.roller.crouch.as_deref(),
+            Some(Path::new("/srv/crouch.onnx"))
+        );
+        assert_eq!(p.ground_pick, None);
+        assert_eq!(
+            p.sitstand.as_deref(),
+            Some(Path::new("/srv/sit.onnx")),
+            "sit/stand is shared"
+        );
+        assert_eq!(p.slot(Slot::GroundPick), &p.roller.crouch);
+        assert_eq!(Slot::GroundPick.config_key(Mode::Roller), "roller.crouch");
+        assert_eq!(Slot::SitStand.config_key(Mode::Roller), "policy.sitstand");
+    }
+
+    /// The roller's stick speeds are signed bounds like `[pad_drive]`'s, refused the same way —
+    /// a positive `vx_min` would make full stick back push the robot forward.
+    #[test]
+    fn roller_speeds_are_signed_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[roller]\nvyaw_max = 0.4\nvyaw_min = -0.4\n");
+        let roller = Params::load(&path, true).unwrap().roller;
+        assert_eq!(roller.vyaw_max, 0.4);
+        assert_eq!(roller.vx_max, 0.6, "unset keys keep the prototype's push");
+
+        let path = write(dir.path(), "[roller]\nvx_min = 0.5\n");
+        let error = Params::load(&path, true).unwrap_err().to_string();
+        assert!(error.contains("roller.vx_min"), "{error}");
     }
 
     /// `"none"` disables an optional slot outright — the prototype's `--sitstand-policy None`

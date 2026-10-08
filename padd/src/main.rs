@@ -51,8 +51,8 @@
 //!
 //! ## Roller mode
 //!
-//! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
-//! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
+//! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes `[roller]`'s —
+//! by default the prototype's preset, asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
 //! heading — and B triggers the crouch that lives in the ground-pick slot. The other
 //! skills ride along on wheels, as the rebased roller line has them. Switching between walk and
 //! roller is `robot.setMode`; it is no longer on the pad.
@@ -368,13 +368,6 @@ const BODY_MAX_Z_UP: f64 = 0.010;
 const BODY_MAX_Z_DOWN: f64 = 0.025;
 const BODY_MAX_ANGLE: f64 = 0.2618;
 
-/// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
-/// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
-/// roller launch line's `--max-angular-vel 0.3`, unchanged across both of its eras.
-const ROLLER_PUSH: f64 = 0.6;
-const ROLLER_BRAKE: f64 = 0.5;
-const ROLLER_YAW: f64 = 0.3;
-
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,7 +415,8 @@ fn mode_exit_calls(from: Mode, to: Mode) -> Vec<proto::Call> {
 /// How often to look for a rewritten config. See the loop.
 const BINDINGS_POLL: Duration = Duration::from_secs(1);
 
-/// The button bindings, the IMU head switch and the walking speeds, or the defaults.
+/// The button bindings, the IMU head switch, the walking speeds and the roller's, or the
+/// defaults.
 ///
 /// A file that will not parse is never a reason to leave somebody without a pad: the defaults
 /// are a working robot, and the reason is logged. That matters more here than elsewhere because
@@ -434,20 +428,24 @@ fn read_bindings(
     robotd_params::PadParams,
     robotd_params::PadImuHeadControlParams,
     robotd_params::PadDriveParams,
+    robotd_params::RollerParams,
 ) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
             let pad = params.pad;
             let imu_head = params.pad_imu_head_control;
             let drive = params.pad_drive;
+            let roller = params.roller;
             tracing::info!(
                 a = %pad.a, b = %pad.b, x = %pad.x, y = %pad.y, lb = %pad.lb, rb = %pad.rb,
                 pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
                 vx = ?(drive.vx_min, drive.vx_max), vy = ?(drive.vy_min, drive.vy_max),
                 vyaw = ?(drive.vyaw_min, drive.vyaw_max),
+                roller_vx = ?(roller.vx_min, roller.vx_max),
+                roller_vyaw = ?(roller.vyaw_min, roller.vyaw_max),
                 "button bindings"
             );
-            (pad, imu_head, drive)
+            (pad, imu_head, drive, roller)
         }
         Err(e) => {
             tracing::warn!(
@@ -459,6 +457,7 @@ fn read_bindings(
                 robotd_params::PadParams::default(),
                 robotd_params::PadImuHeadControlParams::default(),
                 robotd_params::PadDriveParams::default(),
+                robotd_params::RollerParams::default(),
             )
         }
     }
@@ -561,7 +560,7 @@ fn main() -> std::process::ExitCode {
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the default mapping is the
     // fallback, and the reason is logged.
-    let (mut bindings, mut imu_head_cfg, mut drive) = read_bindings(&args.config);
+    let (mut bindings, mut imu_head_cfg, mut drive, mut rolling) = read_bindings(&args.config);
     // When the file was last written, so a change is picked up without a restart. `padd` holds
     // no motor control and no session state — the whole of it is this table — so re-reading is a
     // swap between two ticks rather than anything to sequence.
@@ -603,7 +602,7 @@ fn main() -> std::process::ExitCode {
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
-                (bindings, imu_head_cfg, drive) = read_bindings(&args.config);
+                (bindings, imu_head_cfg, drive, rolling) = read_bindings(&args.config);
                 tracing::warn!("button bindings reloaded");
             }
             match ask_roller(&mut stream, &mut next_id) {
@@ -1024,6 +1023,7 @@ fn main() -> std::process::ExitCode {
         let limits = DriveLimits {
             roller,
             drive: &drive,
+            rolling: &rolling,
         };
 
         // This tick's continuous intents, as one frame. Reused rather than built fresh:
@@ -1118,27 +1118,25 @@ struct DriveLimits<'a> {
     roller: bool,
     /// `[pad_drive]`: each direction of each axis onto its own signed bound.
     drive: &'a robotd_params::PadDriveParams,
+    /// `[roller]`'s speeds, used instead while `roller` is set.
+    rolling: &'a robotd_params::RollerParams,
 }
 
 impl DriveLimits<'_> {
     /// A velocity from three stick axes: forward/back, strafe and turn. Which physical axis is
     /// which depends on the mode; the shaping does not.
     fn walk(&self, forward: f64, strafe: f64, turn: f64) -> proto::MoveParams {
+        let scale = robotd_params::PadDriveParams::scale;
         if self.roller {
-            // The prototype's roller shaping: push harder than you can brake, no strafe,
-            // heading capped independently of the walking limits.
+            // The roller shaping: its own push and brake, no strafe, heading capped
+            // independently of the walking limits.
+            let r = self.rolling;
             return proto::MoveParams {
-                vx: forward
-                    * if forward >= 0.0 {
-                        ROLLER_PUSH
-                    } else {
-                        ROLLER_BRAKE
-                    },
+                vx: scale(forward, r.vx_min, r.vx_max),
                 vy: 0.0,
-                vyaw: -turn * ROLLER_YAW,
+                vyaw: scale(-turn, r.vyaw_min, r.vyaw_max),
             };
         }
-        let scale = robotd_params::PadDriveParams::scale;
         let d = self.drive;
         proto::MoveParams {
             vx: scale(forward, d.vx_min, d.vx_max),
@@ -1784,9 +1782,14 @@ mod tests {
             vx_min: -0.2,
             ..Default::default()
         };
+        let rolling = robotd_params::RollerParams {
+            vyaw_max: 0.4,
+            ..Default::default()
+        };
         let walking = DriveLimits {
             roller: false,
             drive: &drive,
+            rolling: &rolling,
         };
         // Left stick up and to the left: forward, turning left.
         let twist = walking.walk(1.0, 0.0, -1.0);
@@ -1804,9 +1807,15 @@ mod tests {
             ..walking
         };
         let twist = rolling.walk(-1.0, 1.0, -1.0);
-        assert_eq!(twist.vx, -ROLLER_BRAKE);
+        assert_eq!(twist.vx, -0.5, "the prototype's brake");
         assert_eq!(twist.vy, 0.0, "no strafe on wheels");
-        assert_eq!(twist.vyaw, ROLLER_YAW);
+        assert_eq!(twist.vyaw, 0.4, "[roller] vyaw_max, not the walking limit");
+        assert_eq!(
+            rolling.walk(1.0, 0.0, 1.0).vyaw,
+            -0.3,
+            "each direction its own bound"
+        );
+        assert_eq!(rolling.walk(1.0, 0.0, 0.0).vx, 0.6, "the prototype's push");
     }
 
     /// A pad lost while driving: nothing for a second, then sit — asked again until the robot

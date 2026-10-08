@@ -675,7 +675,16 @@ pub fn set_board(path: &Path, board: crate::board::Board) -> Result<(), String> 
 ///
 /// Every slot is written in one document and one save, so a whole-robot reset cannot leave four
 /// keys cleared and three not.
-pub fn set_slots(path: &Path, slots: &[crate::Slot], to: Option<&Path>) -> Result<bool, String> {
+///
+/// `mode` is the mode the robot is *running*, which picks the key: on wheels `walk`, `stand` and
+/// `ground_pick` are `[roller]`'s, so a roller network loaded while rolling cannot land in the
+/// walking robot's key and be loaded the next time it walks.
+pub fn set_slots(
+    path: &Path,
+    mode: crate::Mode,
+    slots: &[crate::Slot],
+    to: Option<&Path>,
+) -> Result<bool, String> {
     let mut model = Model::load(path)?;
     let before = model.rendered();
     let value = match to {
@@ -683,7 +692,7 @@ pub fn set_slots(path: &Path, slots: &[crate::Slot], to: Option<&Path>) -> Resul
         None => "unset".to_owned(),
     };
     for slot in slots {
-        let key = slot.config_key();
+        let key = slot.config_key(mode);
         let entry = REGISTRY
             .iter()
             .find(|e| e.key == key)
@@ -1107,6 +1116,7 @@ mod tests {
                 "control",
                 "update_gate",
                 "policy",
+                "roller",
                 "safety",
                 "duck_detector",
                 "chorale",
@@ -1370,12 +1380,14 @@ mod tests {
     /// and did nothing at the next boot.
     #[test]
     fn every_slot_resolves_to_a_key_robotd_reads() {
-        for slot in crate::Slot::ALL {
-            let key = slot.config_key();
-            assert!(
-                REGISTRY.iter().any(|e| e.key == key),
-                "{key} is not a key robotd knows"
-            );
+        for mode in [crate::Mode::Walk, crate::Mode::Roller] {
+            for slot in crate::Slot::ALL {
+                let key = slot.config_key(mode);
+                assert!(
+                    REGISTRY.iter().any(|e| e.key == key),
+                    "{key} is not a key robotd knows"
+                );
+            }
         }
     }
 
@@ -1395,7 +1407,7 @@ mod tests {
 
         let mine = Path::new("/srv/mine.onnx");
         assert_eq!(
-            set_slots(&config, &[crate::Slot::Walk], Some(mine)),
+            set_slots(&config, crate::Mode::Walk, &[crate::Slot::Walk], Some(mine)),
             Ok(true)
         );
         let written = std::fs::read_to_string(&config).expect("read");
@@ -1403,7 +1415,10 @@ mod tests {
         assert!(written.contains("# hand-written"), "{written}");
         assert!(written.contains("# which gait"), "{written}");
 
-        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(true));
+        assert_eq!(
+            set_slots(&config, crate::Mode::Walk, &[crate::Slot::Walk], None),
+            Ok(true)
+        );
         let cleared = std::fs::read_to_string(&config).expect("read");
         assert!(!cleared.contains("/srv/mine.onnx"), "{cleared}");
         assert!(
@@ -1422,7 +1437,10 @@ mod tests {
         let config = dir.path().join("robotd.toml");
         std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").expect("write");
 
-        assert_eq!(set_slots(&config, &crate::Slot::ALL, None), Ok(true));
+        assert_eq!(
+            set_slots(&config, crate::Mode::Walk, &crate::Slot::ALL, None),
+            Ok(true)
+        );
         let cleared = std::fs::read_to_string(&config).expect("read");
         assert!(!cleared.contains("walk ="), "{cleared}");
         assert!(
@@ -1439,13 +1457,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("robotd.toml");
         std::fs::write(&config, "[policy]\nmode = \"walk\"\n").expect("write");
-        assert_eq!(set_slots(&config, &crate::Slot::ALL, None), Ok(false));
-        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(false));
+        assert_eq!(
+            set_slots(&config, crate::Mode::Walk, &crate::Slot::ALL, None),
+            Ok(false)
+        );
+        assert_eq!(
+            set_slots(&config, crate::Mode::Walk, &[crate::Slot::Walk], None),
+            Ok(false)
+        );
 
         std::fs::write(&config, "[policy]\nwalk = \"/srv/mine.onnx\"\n").expect("write");
         assert_eq!(
             set_slots(
                 &config,
+                crate::Mode::Walk,
                 &[crate::Slot::Walk],
                 Some(Path::new("/srv/mine.onnx"))
             ),
@@ -1463,8 +1488,49 @@ mod tests {
         let config = dir.path().join("robotd.toml");
         std::fs::write(&config, "[policy]\nwalk = \"/srv/never-loaded.onnx\"\n").expect("write");
 
-        assert_eq!(set_slots(&config, &[crate::Slot::Walk], None), Ok(true));
+        assert_eq!(
+            set_slots(&config, crate::Mode::Walk, &[crate::Slot::Walk], None),
+            Ok(true)
+        );
         let cleared = std::fs::read_to_string(&config).expect("read");
         assert!(!cleared.contains("never-loaded"), "{cleared}");
+    }
+
+    /// A network loaded on wheels is the roller's. Writing it to `[policy] walk` would make the
+    /// walking robot load a roller network at its next boot — the reason `[roller]` exists.
+    #[test]
+    fn a_load_while_rolling_writes_the_roller_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\nmode = \"roller\"\n").expect("write");
+
+        let mine = Path::new("/srv/fast-roller.onnx");
+        let crouch = Path::new("/srv/crouch.onnx");
+        assert_eq!(
+            set_slots(
+                &config,
+                crate::Mode::Roller,
+                &[crate::Slot::Walk],
+                Some(mine)
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            set_slots(
+                &config,
+                crate::Mode::Roller,
+                &[crate::Slot::GroundPick],
+                Some(crouch)
+            ),
+            Ok(true)
+        );
+        let params = Params::load(&config, true).expect("robotd would start on it");
+        assert_eq!(params.roller.walk.as_deref(), Some(mine));
+        assert_eq!(params.roller.crouch.as_deref(), Some(crouch));
+        assert_eq!(
+            params.policy.walk, None,
+            "the walking robot's key is untouched"
+        );
+        assert_eq!(params.policy.ground_pick, None);
     }
 }

@@ -169,12 +169,12 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "policy.walk",
         Kind::OptionalPath,
-        "Walking policy; unset = this robot's own",
+        "Walking policy (walk mode); unset = this robot's own",
     ),
     entry(
         "policy.stand",
         Kind::OptionalPath,
-        "Standing policy; unset = this robot's own",
+        "Standing policy (walk mode); unset = this robot's own",
     ),
     entry(
         "policy.sitstand",
@@ -184,7 +184,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "policy.ground_pick",
         Kind::OptionalPath,
-        "Ground-pick policy (roller: the crouch)",
+        "Ground-pick policy (walk mode; on wheels see roller.crouch)",
     ),
     entry("policy.kick_left", Kind::OptionalPath, "Left-kick policy"),
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
@@ -243,6 +243,41 @@ pub const REGISTRY: &[Entry] = &[
         "policy.nominal_voltage",
         Kind::Float,
         "Reference voltage the gains were identified at",
+    ),
+    // ── [roller] ─────────────────────────────────────────────────────────────
+    //
+    // The robot on wheels. The three policies are `robotd`'s and take the place of `[policy]`'s
+    // walk, stand and ground pick while `policy.mode` is `roller`; the speeds are `padd`'s.
+    entry(
+        "roller.walk",
+        Kind::OptionalPath,
+        "Roller locomotion policy; unset = roller.onnx",
+    ),
+    entry(
+        "roller.stand",
+        Kind::OptionalPath,
+        "Roller standing policy, at zero command; unset = none",
+    ),
+    entry(
+        "roller.crouch",
+        Kind::OptionalPath,
+        "Roller crouch (B button); unset = roller_crouch.onnx",
+    ),
+    entry(
+        "roller.vx_max",
+        Kind::Float,
+        "Full stick forward (push), m/s",
+    ),
+    entry(
+        "roller.vx_min",
+        Kind::Float,
+        "Full stick back (brake), m/s — negative",
+    ),
+    entry("roller.vyaw_max", Kind::Float, "Full turn left, rad/s"),
+    entry(
+        "roller.vyaw_min",
+        Kind::Float,
+        "Full turn right, rad/s — negative",
     ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
