@@ -540,7 +540,7 @@ mode = "walk"
 # while walking, per axis and per direction; the stick is linear between centre and each bound.
 # Signed in the robot's frame — vx forward, vy left, vyaw counter-clockwise from above — so each
 # `_min` is negative, and zero switches that direction off. A positive `_min` is refused rather
-# than guessed at. Roller mode keeps its own shaping.
+# than guessed at. Roller limits are configured separately under [pad_roller].
 #
 # This is what the pad asks for, not a limit on the robot: the policy only follows commands
 # inside the range it was trained on.
@@ -551,3 +551,41 @@ mode = "walk"
 # vy_min = -0.3
 # vyaw_max = 1.5
 # vyaw_min = -1.5
+
+# ── Pad joystick axes ──────────────────────────────────────────────────────────────────────
+# Same file as [pad] button bindings; all controller settings reload within a second.
+# Only overrides need to be written. Modes: drive, head, head_drive, body_pose.
+# Every command binding has source (left_x/left_y/right_x/right_y/none), invert and gain.
+# Missing fields keep the binding's defaults, including direction. Gain is applied before
+# clamping to full deflection and scaling to physical limits. No deadzone rescaling.
+# [pad_axes]
+# deadzone = 0.1
+#
+# Example: steer with the left stick instead of the right, at lower sensitivity.
+# [pad_axes.drive.vyaw]
+# source = "left_x"
+# gain = 0.7
+# invert = true
+#
+# Head limits in radians. Also bound controller-IMU head targets.
+# [pad_head]
+# neck_pitch_max = 2.5
+# head_pitch_max = 2.5
+# head_yaw_max = 2.5
+# head_roll_max = 2.5
+#
+# Body height in metres, tilt in radians; pitch is unbound by default.
+# [pad_body]
+# z_min = -0.025
+# z_max = 0.010
+# pitch_max = 0.2618
+# roll_max = 0.2618
+#
+# Roller-mode speed limits in m/s and rad/s. Strafe is disabled by default.
+# [pad_roller]
+# vx_min = -0.5
+# vx_max = 0.6
+# vy_min = 0.0
+# vy_max = 0.0
+# vyaw_min = -0.3
+# vyaw_max = 0.3

@@ -109,7 +109,13 @@ fn apply_for(key: &str) -> Option<Apply> {
         // "padd picks this up within a second".
         //
         // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
-        "pad" | "pad_imu_head_control" | "pad_drive" => Apply::Live("padd"),
+        "pad"
+        | "pad_imu_head_control"
+        | "pad_drive"
+        | "pad_axes"
+        | "pad_head"
+        | "pad_body"
+        | "pad_roller" => Apply::Live("padd"),
         // Whichever daemon reads this board's head IMU, once, at startup: `tofd` for the
         // `zero3`'s BMI088 (it shares the HAT's bus with the ToF; `tof/src/config.rs` says why
         // it reads robotd's file), `robotd` for the `beta`'s LSM6DSV16X. The board is the
@@ -1134,10 +1140,10 @@ mod tests {
         assert!(plan.restart.is_empty(), "and it needs no restart");
     }
 
-    /// `[pad]`, `[pad_imu_head_control]` and `[pad_drive]` are live: padd re-reads them, so there is nothing to offer.
+    /// Controller sections are live: padd re-reads them, so there is nothing to offer.
     ///
     /// The inverse of the `[head_imu]` bug and the same mistake — a mapping that does not
-    /// describe the daemon. `padd` stats the file every second and re-reads both sections when
+    /// describe the daemon. `padd` stats the file every second and re-reads its settings when
     /// the mtime moves, which is why `robotctl pad bind` prints "padd picks this up within a
     /// second" rather than offering anything. Restarting it to apply what applies by itself
     /// takes the pad session down, and robotd's deadman then zeroes the velocity of whatever was
@@ -1151,11 +1157,20 @@ mod tests {
             "pad_imu_head_control.gain",
             "pad_drive.vx_max",
             "pad_drive.vyaw_min",
+            "pad_axes.drive.vyaw.gain",
+            "pad_head.head_yaw_max",
+            "pad_body.roll_max",
+            "pad_roller.vyaw_max",
         ] {
             let mut m = model("");
             let value = match key {
                 "pad_imu_head_control.enabled" => "true",
-                "pad_imu_head_control.gain" | "pad_drive.vx_max" => "0.5",
+                "pad_imu_head_control.gain"
+                | "pad_drive.vx_max"
+                | "pad_axes.drive.vyaw.gain"
+                | "pad_head.head_yaw_max"
+                | "pad_body.roll_max"
+                | "pad_roller.vyaw_max" => "0.5",
                 "pad_drive.vyaw_min" => "-1.0",
                 _ => "walk",
             };

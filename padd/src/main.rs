@@ -141,7 +141,7 @@ struct Args {
     #[arg(long, default_value = "/run/robotd.sock")]
     socket: PathBuf,
 
-    /// Where the button bindings are read from — the same file everything else is configured in.
+    /// Where controller settings are read from — the same file everything else is configured in.
     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
     config: PathBuf,
 
@@ -160,16 +160,18 @@ struct Args {
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
     hz: u32,
 
-    /// Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero,
+    /// Override pad_axes.deadzone. Deflection below this counts as centre.
+    /// Analogue sticks rarely rest at exactly zero,
     /// and without this the robot creeps. The prototype's value.
-    #[arg(long, default_value_t = 0.1)]
-    deadzone: f64,
+    #[arg(long, value_parser = parse_deadzone)]
+    deadzone: Option<f64>,
 
-    /// Full-deflection head travel, radians. The head command feeds the policy's
+    /// Override every pad_head limit. Full-deflection head travel, radians.
+    /// The head command feeds the policy's
     /// observation rather than a servo directly, so this is the prototype's generous 2.5 —
     /// the network itself decides how far the head actually goes.
-    #[arg(long, default_value_t = 2.5)]
-    max_head: f64,
+    #[arg(long, value_parser = parse_max_head)]
+    max_head: Option<f64>,
 
     /// Where to serve the raw input tap: the pad's own event stream, for `robotctl monitor`.
     ///
@@ -186,6 +188,23 @@ struct Args {
 /// again is a wakeup every 20 ms, forever, for nothing. Half a second is imperceptible when someone
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
+
+fn parse_deadzone(text: &str) -> Result<f64, String> {
+    let value: f64 = text.parse().map_err(|_| "expected a number")?;
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err("deadzone must be finite and in [0, 1)".to_owned())
+    }
+}
+fn parse_max_head(text: &str) -> Result<f64, String> {
+    let value: f64 = text.parse().map_err(|_| "expected a number")?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err("max-head must be finite and nonnegative".to_owned())
+    }
+}
 
 /// The pad gone this long sits the robot down. Past the deadman, which has already stopped any
 /// walking at half a second, and short enough that a robot left standing in the middle of a room
@@ -362,19 +381,6 @@ impl HoldButton {
     }
 }
 
-/// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
-/// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
-const BODY_MAX_Z_UP: f64 = 0.010;
-const BODY_MAX_Z_DOWN: f64 = 0.025;
-const BODY_MAX_ANGLE: f64 = 0.2618;
-
-/// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
-/// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
-/// roller launch line's `--max-angular-vel 0.3`, unchanged across both of its eras.
-const ROLLER_PUSH: f64 = 0.6;
-const ROLLER_BRAKE: f64 = 0.5;
-const ROLLER_YAW: f64 = 0.3;
-
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,48 +426,65 @@ fn mode_exit_calls(from: Mode, to: Mode) -> Vec<proto::Call> {
 }
 
 /// How often to look for a rewritten config. See the loop.
-const BINDINGS_POLL: Duration = Duration::from_secs(1);
+const CONFIG_POLL: Duration = Duration::from_secs(1);
 
-/// The button bindings, the IMU head switch and the walking speeds, or the defaults.
-///
-/// A file that will not parse is never a reason to leave somebody without a pad: the defaults
-/// are a working robot, and the reason is logged. That matters more here than elsewhere because
-/// this is re-read while running — a half-saved file caught mid-write must not take the buttons
-/// away, and the next read a second later gets the finished one.
-fn read_bindings(
+/// A bad live edit must not change what a held stick means.
+fn read_config(
     path: &Path,
-) -> (
-    robotd_params::PadParams,
-    robotd_params::PadImuHeadControlParams,
-    robotd_params::PadDriveParams,
-) {
-    match robotd_params::Params::load(path, false) {
-        Ok(params) => {
-            let pad = params.pad;
-            let imu_head = params.pad_imu_head_control;
-            let drive = params.pad_drive;
-            tracing::info!(
-                a = %pad.a, b = %pad.b, x = %pad.x, y = %pad.y, lb = %pad.lb, rb = %pad.rb,
-                pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
-                vx = ?(drive.vx_min, drive.vx_max), vy = ?(drive.vy_min, drive.vy_max),
-                vyaw = ?(drive.vyaw_min, drive.vyaw_max),
-                "button bindings"
-            );
-            (pad, imu_head, drive)
+    args: &Args,
+) -> Result<robotd_params::Params, robotd_params::ParamsError> {
+    let mut params = robotd_params::Params::load(path, false)?;
+    apply_cli_overrides(&mut params, args);
+    Ok(params)
+}
+
+fn apply_cli_overrides(params: &mut robotd_params::Params, args: &Args) {
+    if let Some(deadzone) = args.deadzone {
+        params.pad_axes.deadzone = deadzone;
+    }
+    if let Some(max_head) = args.max_head {
+        params.pad_head = robotd_params::PadHeadParams {
+            neck_pitch_max: max_head,
+            head_pitch_max: max_head,
+            head_yaw_max: max_head,
+            head_roll_max: max_head,
+        };
+    }
+}
+
+fn reload_config(path: &Path, args: &Args, current: &mut robotd_params::Params) -> bool {
+    match read_config(path, args) {
+        Ok(next) => {
+            *current = next;
+            true
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "cannot read the button bindings; using the default mapping"
-            );
-            (
-                robotd_params::PadParams::default(),
-                robotd_params::PadImuHeadControlParams::default(),
-                robotd_params::PadDriveParams::default(),
-            )
+        Err(error) => {
+            tracing::warn!(%error, "controller config rejected; keeping last valid configuration");
+            false
         }
     }
+}
+
+/// The loop and tests share the actual file-change detection, with no sleeping in tests.
+fn poll_config(
+    tick: Instant,
+    checked: &mut Instant,
+    modified: &mut Option<std::time::SystemTime>,
+    args: &Args,
+    current: &mut robotd_params::Params,
+) -> bool {
+    if tick.duration_since(*checked) < CONFIG_POLL {
+        return false;
+    }
+    *checked = tick;
+    let now = config_mtime(&args.config);
+    if now != *modified {
+        *modified = now;
+        if reload_config(&args.config, args, current) {
+            tracing::info!("controller configuration reloaded");
+        }
+    }
+    true
 }
 
 /// The head pose for a pad attitude relative to its reference.
@@ -558,15 +581,15 @@ fn main() -> std::process::ExitCode {
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
-    // The button bindings, read once like every other daemon reads its config. A file that will
-    // not parse is not a reason to leave somebody without a pad: the default mapping is the
-    // fallback, and the reason is logged.
-    let (mut bindings, mut imu_head_cfg, mut drive) = read_bindings(&args.config);
+    // Defaults keep a pad usable at startup; a bad live edit keeps the last valid mapping.
+    let mut pad_config = robotd_params::Params::default();
+    apply_cli_overrides(&mut pad_config, &args);
+    reload_config(&args.config, &args, &mut pad_config);
     // When the file was last written, so a change is picked up without a restart. `padd` holds
     // no motor control and no session state — the whole of it is this table — so re-reading is a
     // swap between two ticks rather than anything to sequence.
-    let mut bindings_at = config_mtime(&args.config);
-    let mut bindings_checked = Instant::now();
+    let mut config_at = config_mtime(&args.config);
+    let mut config_checked = Instant::now();
 
     let mut mode = Mode::Drive;
     // The pad attitude that reads as "head centred" while head + move follows the pad's IMU.
@@ -598,14 +621,13 @@ fn main() -> std::process::ExitCode {
         // Once a second, not every tick: a `stat` at 50 Hz to catch a file somebody edits by
         // hand a few times a week is work for nothing, and a second is faster than typing the
         // next command.
-        if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
-            bindings_checked = tick;
-            let now = config_mtime(&args.config);
-            if now != bindings_at {
-                bindings_at = now;
-                (bindings, imu_head_cfg, drive) = read_bindings(&args.config);
-                tracing::warn!("button bindings reloaded");
-            }
+        if poll_config(
+            tick,
+            &mut config_checked,
+            &mut config_at,
+            &args,
+            &mut pad_config,
+        ) {
             match ask_roller(&mut stream, &mut next_id) {
                 Ok(Some(now)) if now != roller => {
                     roller = now;
@@ -738,13 +760,13 @@ fn main() -> std::process::ExitCode {
             tap.watch(&pad);
             // Every tick, like the bindings: switching the feature on in the config has to start
             // the IMU reader without a restart, and off has to let it go.
-            tap.imu_control(imu_head_cfg.enabled);
+            tap.imu_control(pad_config.pad_imu_head_control.enabled);
         }
 
         // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
         // said something believable. `None` is every other case, and head + move then poses the
         // head from the right stick.
-        let attitude = if imu_head_cfg.enabled {
+        let attitude = if pad_config.pad_imu_head_control.enabled {
             tap.as_ref().and_then(|tap| tap.attitude())
         } else {
             None
@@ -855,7 +877,9 @@ fn main() -> std::process::ExitCode {
             if mode == Mode::HeadDrive {
                 if imu_reference.is_some() {
                     tracing::info!("IMU head control: following the pad from here");
-                } else if imu_head_cfg.enabled && tap.as_ref().is_some_and(|tap| tap.has_imu()) {
+                } else if pad_config.pad_imu_head_control.enabled
+                    && tap.as_ref().is_some_and(|tap| tap.has_imu())
+                {
                     // The IMU is there and has not spoken yet — a second after connecting,
                     // typically. Saying so beats silently doing the other thing.
                     tracing::warn!(
@@ -873,7 +897,7 @@ fn main() -> std::process::ExitCode {
         // one with the list it does have, which is a better error than this side could give.
         for button in &pressed {
             // An empty binding is a button switched off on purpose, not a fault.
-            let skill = bindings.skill(button).unwrap_or_default();
+            let skill = pad_config.pad.skill(button).unwrap_or_default();
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -910,7 +934,7 @@ fn main() -> std::process::ExitCode {
         // Whatever X is bound to, nothing by default: a skill that does not chain simply refuses
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
-        let held = bindings.skill("x").unwrap_or_default();
+        let held = pad_config.pad.skill("x").unwrap_or_default();
         if pad.is_pressed(Button::West)
             && !pressed.contains(&"x")
             && !held.is_empty()
@@ -965,14 +989,13 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        let deadzone = |v: f32| {
-            let v = v as f64;
-            if v.abs() < args.deadzone { 0.0 } else { v }
-        };
-        let left_x = deadzone(pad.value(Axis::LeftStickX));
-        let left_y = deadzone(pad.value(Axis::LeftStickY));
-        let right_x = deadzone(pad.value(Axis::RightStickX));
-        let right_y = deadzone(pad.value(Axis::RightStickY));
+        let sticks = [
+            Axis::LeftStickX,
+            Axis::LeftStickY,
+            Axis::RightStickX,
+            Axis::RightStickY,
+        ]
+        .map(|axis| pad.value(axis) as f64);
 
         // Either trigger opens the mouth; the max wins, as in the prototype — where RT
         // also chirps and LT rides the wheee, which they now do here too.
@@ -1021,85 +1044,13 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        let limits = DriveLimits {
-            roller,
-            drive: &drive,
-        };
-
-        // This tick's continuous intents, as one frame. Reused rather than built fresh:
-        // a `Vec` per tick is an allocation fifty times a second to say what the sticks
-        // were doing, which is the shape of thing this loop is meant not to do.
         frame.clear();
-        match mode {
-            Mode::Drive => frame.push(proto::Call::RobotMove(limits.walk(left_y, left_x, right_x))),
-            Mode::HeadDrive => match (imu_reference, attitude) {
-                // The pad's tilt has the head, so the sticks keep the whole drive mapping. In the
-                // same frame: the pad's tilt and the sticks describe one instant.
-                (Some(reference), Some(now)) => {
-                    frame.push(proto::Call::RobotMove(limits.walk(left_y, left_x, right_x)));
-                    frame.push(proto::Call::RobotHead(head_from_pad(
-                        pad_imu::relative(reference, now),
-                        imu_head_cfg.gain,
-                        args.max_head,
-                    )));
-                }
-                // Left stick walks and turns — no strafe, the right stick is busy — and the right
-                // stick looks around, with the signs head mode uses for its left stick.
-                _ => {
-                    frame.push(proto::Call::RobotMove(limits.walk(left_y, 0.0, left_x)));
-                    frame.push(proto::Call::RobotHead(proto::HeadParams {
-                        neck_pitch: 0.0,
-                        head_pitch: -right_y * args.max_head,
-                        head_yaw: -right_x * args.max_head,
-                        head_roll: 0.0,
-                    }));
-                }
-            },
-            Mode::Head => {
-                // The body must not keep its last velocity while the sticks are posing the
-                // head. The deadman would catch it eventually; a robot that keeps walking
-                // because you started moving its head is a bad enough surprise to be
-                // explicit about.
-                //
-                // In the same frame as the head rather than a notification of its own: the
-                // two describe one instant, and sending them separately was two `write_all`
-                // and two `flush` syscalls a tick to say so.
-                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
-                // The prototype's alpha mapping, signs included (its head_pitch/head_yaw
-                // joint axes are inverted relative to stick direction — verified on
-                // hardware there, kept verbatim here).
-                frame.push(proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: right_y * args.max_head,
-                    head_pitch: -left_y * args.max_head,
-                    head_yaw: -left_x * args.max_head,
-                    head_roll: right_x * args.max_head,
-                }));
-            }
-            Mode::BodyPose => {
-                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
-                frame.push(proto::Call::RobotPose(proto::PoseParams {
-                    z: left_y
-                        * if left_y >= 0.0 {
-                            BODY_MAX_Z_UP
-                        } else {
-                            BODY_MAX_Z_DOWN
-                        },
-                    // No forward/back tilt here: the right stick has the head. The side lean
-                    // keeps the old body mode's sign, moved from the right stick to the left.
-                    pitch: 0.0,
-                    roll: left_x * BODY_MAX_ANGLE,
-                    active: true,
-                }));
-                // The same look-around as head + move, so the right stick means one thing
-                // wherever it poses the head.
-                frame.push(proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: 0.0,
-                    head_pitch: -right_y * args.max_head,
-                    head_yaw: -right_x * args.max_head,
-                    head_roll: 0.0,
-                }));
-            }
-        }
+        let imu = if mode == Mode::HeadDrive {
+            imu_reference.zip(attitude)
+        } else {
+            None
+        };
+        append_stick_frame(&mut frame, mode, sticks, &pad_config, roller, imu);
 
         if let Err(e) = continuous.send(&mut stream, &frame, tick) {
             tracing::error!(error = %e, "send failed");
@@ -1112,40 +1063,101 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// How full deflection maps to velocity, for the modes that walk.
-#[derive(Debug, Clone, Copy)]
-struct DriveLimits<'a> {
+/// Build commands from normalized stick bindings; mode transitions remain in the loop.
+fn append_stick_frame(
+    frame: &mut Vec<proto::Call>,
+    mode: Mode,
+    sticks: [f64; 4],
+    config: &robotd_params::Params,
     roller: bool,
-    /// `[pad_drive]`: each direction of each axis onto its own signed bound.
-    drive: &'a robotd_params::PadDriveParams,
-}
-
-impl DriveLimits<'_> {
-    /// A velocity from three stick axes: forward/back, strafe and turn. Which physical axis is
-    /// which depends on the mode; the shaping does not.
-    fn walk(&self, forward: f64, strafe: f64, turn: f64) -> proto::MoveParams {
-        if self.roller {
-            // The prototype's roller shaping: push harder than you can brake, no strafe,
-            // heading capped independently of the walking limits.
-            return proto::MoveParams {
-                vx: forward
-                    * if forward >= 0.0 {
-                        ROLLER_PUSH
-                    } else {
-                        ROLLER_BRAKE
-                    },
-                vy: 0.0,
-                vyaw: -turn * ROLLER_YAW,
-            };
+    imu: Option<([f32; 4], [f32; 4])>,
+) {
+    let axes = &config.pad_axes;
+    let value =
+        |binding: &robotd_params::pad_axes::AxisBinding| binding.evaluate(sticks, axes.deadzone);
+    let head = &config.pad_head;
+    let scale = robotd_params::PadDriveParams::scale;
+    let roller_limits = config.pad_roller.limits();
+    let limits = if roller {
+        &roller_limits
+    } else {
+        &config.pad_drive
+    };
+    let movement = |vx, vy, yaw| {
+        proto::Call::RobotMove(proto::MoveParams {
+            vx: scale(vx, limits.vx_min, limits.vx_max),
+            vy: scale(vy, limits.vy_min, limits.vy_max),
+            vyaw: scale(yaw, limits.vyaw_min, limits.vyaw_max),
+        })
+    };
+    let pose_head = |neck, pitch, yaw, roll| {
+        proto::Call::RobotHead(proto::HeadParams {
+            neck_pitch: neck * head.neck_pitch_max,
+            head_pitch: pitch * head.head_pitch_max,
+            head_yaw: yaw * head.head_yaw_max,
+            head_roll: roll * head.head_roll_max,
+        })
+    };
+    match mode {
+        Mode::Drive => {
+            let a = &axes.drive;
+            frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
         }
-        let scale = robotd_params::PadDriveParams::scale;
-        let d = self.drive;
-        proto::MoveParams {
-            vx: scale(forward, d.vx_min, d.vx_max),
-            // `vy` is positive to the left; stick-left reads negative on every pad gilrs
-            // normalises.
-            vy: scale(-strafe, d.vy_min, d.vy_max),
-            vyaw: scale(-turn, d.vyaw_min, d.vyaw_max),
+        Mode::HeadDrive => {
+            if let Some((reference, now)) = imu {
+                let a = &axes.drive;
+                frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
+                let mut h = head_from_pad(
+                    pad_imu::relative(reference, now),
+                    config.pad_imu_head_control.gain,
+                    f64::MAX,
+                );
+                h.neck_pitch = h
+                    .neck_pitch
+                    .clamp(-head.neck_pitch_max, head.neck_pitch_max);
+                h.head_pitch = h
+                    .head_pitch
+                    .clamp(-head.head_pitch_max, head.head_pitch_max);
+                h.head_yaw = h.head_yaw.clamp(-head.head_yaw_max, head.head_yaw_max);
+                h.head_roll = h.head_roll.clamp(-head.head_roll_max, head.head_roll_max);
+                frame.push(proto::Call::RobotHead(h));
+            } else {
+                let a = &axes.head_drive;
+                frame.push(movement(value(&a.vx), value(&a.vy), value(&a.vyaw)));
+                frame.push(pose_head(
+                    value(&a.neck_pitch),
+                    value(&a.head_pitch),
+                    value(&a.head_yaw),
+                    value(&a.head_roll),
+                ));
+            }
+        }
+        Mode::Head => {
+            let a = &axes.head;
+            frame.push(movement(0.0, 0.0, 0.0));
+            frame.push(pose_head(
+                value(&a.neck_pitch),
+                value(&a.head_pitch),
+                value(&a.head_yaw),
+                value(&a.head_roll),
+            ));
+        }
+        Mode::BodyPose => {
+            let a = &axes.body_pose;
+            let body = &config.pad_body;
+            frame.push(movement(0.0, 0.0, 0.0));
+            frame.push(proto::Call::RobotPose(proto::PoseParams {
+                z: scale(value(&a.z), body.z_min, body.z_max),
+                pitch: value(&a.pitch) * body.pitch_max,
+                roll: value(&a.roll) * body.roll_max,
+                active: true,
+            }));
+            frame.push(pose_head(
+                value(&a.neck_pitch),
+                value(&a.head_pitch),
+                value(&a.head_yaw),
+                value(&a.head_roll),
+            ));
         }
     }
 }
@@ -1776,37 +1788,364 @@ mod tests {
         assert!(mode_exit_calls(Mode::BodyPose, Mode::BodyPose).is_empty());
     }
 
-    /// Head + move drives with the left stick alone — forward and turn, no strafe — and on wheels
-    /// it takes the roller shaping like every other walking mode.
-    #[test]
-    fn head_and_move_walks_and_turns_from_the_left_stick() {
-        let drive = robotd_params::PadDriveParams {
-            vx_min: -0.2,
-            ..Default::default()
+    fn stick_calls(
+        mode: Mode,
+        config: &robotd_params::Params,
+        roller: bool,
+        sticks: [f64; 4],
+    ) -> Vec<proto::Call> {
+        let mut frame = Vec::new();
+        append_stick_frame(&mut frame, mode, sticks, config, roller, None);
+        frame
+    }
+    fn move_params(calls: &[proto::Call]) -> &proto::MoveParams {
+        let proto::Call::RobotMove(value) = &calls[0] else {
+            panic!("expected movement")
         };
-        let walking = DriveLimits {
-            roller: false,
-            drive: &drive,
+        value
+    }
+    fn head_params(calls: &[proto::Call]) -> &proto::HeadParams {
+        let proto::Call::RobotHead(value) = calls.last().unwrap() else {
+            panic!("expected head")
         };
-        // Left stick up and to the left: forward, turning left.
-        let twist = walking.walk(1.0, 0.0, -1.0);
-        assert_eq!(twist.vx, 0.3);
-        assert_eq!(twist.vy, 0.0);
-        assert_eq!(twist.vyaw, 1.5, "stick left turns left (positive yaw)");
-        assert_eq!(
-            walking.walk(-1.0, 0.0, 0.0).vx,
-            -0.2,
-            "reverse has its own cap"
-        );
+        value
+    }
 
-        let rolling = DriveLimits {
-            roller: true,
-            ..walking
+    /// Empty config must preserve every mode's signs, limits and stopped-body behavior.
+    #[test]
+    fn default_sticks_match_the_existing_controller() {
+        let config = robotd_params::Params::default();
+        let sticks = [-0.4, 0.6, 0.8, -1.0];
+        for roller in [false, true] {
+            let calls = stick_calls(Mode::Drive, &config, roller, sticks);
+            let m = move_params(&calls);
+            assert!((m.vx - if roller { 0.36 } else { 0.18 }).abs() < 1e-12);
+            assert!((m.vy - if roller { 0.0 } else { 0.12 }).abs() < 1e-12);
+            assert!((m.vyaw - if roller { -0.24 } else { -1.2 }).abs() < 1e-12);
+            let calls = stick_calls(Mode::HeadDrive, &config, roller, sticks);
+            let m = move_params(&calls);
+            assert_eq!(m.vy, 0.0);
+            assert!((m.vyaw - if roller { 0.12 } else { 0.6 }).abs() < 1e-12);
+            let h = head_params(&calls);
+            assert_eq!(
+                (h.neck_pitch, h.head_pitch, h.head_yaw, h.head_roll),
+                (0.0, 2.5, -2.0, 0.0)
+            );
+        }
+        let calls = stick_calls(Mode::Head, &config, false, sticks);
+        let m = move_params(&calls);
+        assert_eq!((m.vx, m.vy, m.vyaw), (0.0, 0.0, 0.0));
+        let h = head_params(&calls);
+        assert_eq!(
+            (h.neck_pitch, h.head_pitch, h.head_yaw, h.head_roll),
+            (-2.5, -1.5, 1.0, 2.0)
+        );
+        let calls = stick_calls(Mode::BodyPose, &config, false, sticks);
+        let proto::Call::RobotPose(body) = &calls[1] else {
+            panic!("body pose")
         };
-        let twist = rolling.walk(-1.0, 1.0, -1.0);
-        assert_eq!(twist.vx, -ROLLER_BRAKE);
-        assert_eq!(twist.vy, 0.0, "no strafe on wheels");
-        assert_eq!(twist.vyaw, ROLLER_YAW);
+        assert_eq!(body.z, 0.006);
+        assert_eq!(body.pitch, 0.0);
+        assert_eq!(body.roll, -0.4 * 0.2618);
+        assert!(body.active);
+        let calls = stick_calls(Mode::BodyPose, &config, false, [0.0, -1.0, 0.0, 0.0]);
+        let proto::Call::RobotPose(body) = &calls[1] else {
+            panic!("body pose")
+        };
+        assert_eq!(body.z, -0.025);
+    }
+
+    /// Independent full-deflection examples pin every axis in every mode to the old mapping.
+    #[test]
+    fn every_default_stick_axis_has_the_expected_direction_and_command() {
+        let config = robotd_params::Params::default();
+        // Flattened commands: vx, vy, vyaw, neck_pitch, head_pitch, head_yaw,
+        // head_roll, body_z, body_pitch, body_roll. No evaluator used for expected values.
+        let cases = [
+            (
+                Mode::Drive,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Drive,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Drive,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (Mode::Drive, [0.0, 0.0, 0.0, 1.0], [0.0; 10]),
+            (
+                Mode::Head,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::Head,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.3, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::HeadDrive,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2618],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.010, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                Mode::BodyPose,
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0, -2.5, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+        ];
+        for (mode, positive, expected) in cases {
+            for direction in [-1.0, 1.0] {
+                let sticks = positive.map(|v| v * direction);
+                let calls = stick_calls(mode, &config, false, sticks);
+                let mut actual = [0.0; 10];
+                for call in &calls {
+                    match call {
+                        proto::Call::RobotMove(m) => {
+                            actual[..3].copy_from_slice(&[m.vx, m.vy, m.vyaw])
+                        }
+                        proto::Call::RobotHead(h) => actual[3..7].copy_from_slice(&[
+                            h.neck_pitch,
+                            h.head_pitch,
+                            h.head_yaw,
+                            h.head_roll,
+                        ]),
+                        proto::Call::RobotPose(b) => {
+                            assert!(b.active);
+                            actual[7..].copy_from_slice(&[b.z, b.pitch, b.roll]);
+                        }
+                        _ => panic!("unexpected command"),
+                    }
+                }
+                let mut expected = expected.map(|v| v * direction);
+                if mode == Mode::BodyPose && direction < 0.0 && positive[1] != 0.0 {
+                    expected[7] = -0.025;
+                }
+                assert_eq!(actual, expected, "{mode:?}, sticks {sticks:?}");
+                assert_eq!(
+                    calls.len(),
+                    match mode {
+                        Mode::Drive => 1,
+                        Mode::BodyPose => 3,
+                        _ => 2,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_edits_are_polled_and_change_commands_without_a_restart() {
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        let write = |text: &str, revision| {
+            std::fs::write(&path, text).unwrap();
+            // Explicit timestamps avoid sleeps and filesystem timestamp-resolution races.
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(revision))
+                .unwrap();
+        };
+        write("", 10);
+        let args = Args::try_parse_from(["padd", "--config", path.to_str().unwrap()]).unwrap();
+        let mut config = read_config(&path, &args).unwrap();
+        let start = Instant::now();
+        let mut checked = start;
+        let mut modified = config_mtime(&path);
+        write("[pad_axes.drive.vx]\nsource = 'right_y'\ngain = 0.5\n", 20);
+        assert!(!poll_config(
+            start + Duration::from_millis(999),
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config
+        ));
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.0
+        );
+        assert!(poll_config(
+            start + CONFIG_POLL,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config
+        ));
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.15
+        );
+        // Invalid edit, then valid correction: use the actual poll path in both cases.
+        write("[pad_axes]\ndeadzone = 1.0\n", 30);
+        poll_config(
+            start + CONFIG_POLL * 2,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config,
+        );
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.15
+        );
+        write("[pad_axes.drive.vx]\nsource = 'right_y'\ngain = 0.8\n", 40);
+        poll_config(
+            start + CONFIG_POLL * 3,
+            &mut checked,
+            &mut modified,
+            &args,
+            &mut config,
+        );
+        assert_eq!(
+            move_params(&stick_calls(
+                Mode::Drive,
+                &config,
+                false,
+                [0.0, 0.0, 0.0, 1.0]
+            ))
+            .vx,
+            0.24
+        );
+    }
+
+    #[test]
+    fn custom_axes_gains_and_limits_reach_the_commands() {
+        use robotd_params::pad_axes::{AxisBinding, AxisSource};
+        let mut c = robotd_params::Params::default();
+        c.pad_axes.drive.vx = AxisBinding {
+            source: AxisSource::RightY,
+            invert: true,
+            gain: 4.0,
+        };
+        c.pad_axes.drive.vyaw.source = AxisSource::None;
+        c.pad_drive.vx_min = -0.2;
+        let calls = stick_calls(Mode::Drive, &c, false, [0.0, 0.0, 1.0, 0.5]);
+        assert_eq!(move_params(&calls).vx, -0.2);
+        assert_eq!(move_params(&calls).vyaw, 0.0);
+        c.pad_head.head_yaw_max = 0.7;
+        c.pad_axes.head.head_yaw.source = AxisSource::RightY;
+        c.pad_axes.head.head_yaw.gain = 0.5;
+        assert_eq!(
+            head_params(&stick_calls(Mode::Head, &c, false, [0.0, 0.0, 0.0, 1.0])).head_yaw,
+            -0.35
+        );
+        c.pad_body.pitch_max = 0.2;
+        c.pad_axes.body_pose.pitch.source = AxisSource::RightX;
+        let calls = stick_calls(Mode::BodyPose, &c, false, [0.0, 0.0, 1.0, 0.0]);
+        let proto::Call::RobotPose(body) = &calls[1] else {
+            panic!("body pose")
+        };
+        assert_eq!(body.pitch, 0.2);
+        c.pad_roller.vyaw_max = 0.1;
+        let calls = stick_calls(Mode::HeadDrive, &c, true, [-1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(move_params(&calls).vyaw, 0.1);
+    }
+
+    #[test]
+    fn imu_head_mode_uses_drive_bindings_and_per_joint_head_limits() {
+        use robotd_params::pad_axes::AxisSource;
+        let mut config = robotd_params::Params::default();
+        config.pad_axes.drive.vx.source = AxisSource::RightY;
+        config.pad_axes.head_drive.vx.source = AxisSource::None;
+        config.pad_head.head_pitch_max = 0.1;
+        let reference = [1.0, 0.0, 0.0, 0.0];
+        let angle = 0.25_f32;
+        let now = [angle.cos(), 0.0, angle.sin(), 0.0];
+        let mut calls = Vec::new();
+        append_stick_frame(
+            &mut calls,
+            Mode::HeadDrive,
+            [0.0, 0.0, 0.0, 1.0],
+            &config,
+            false,
+            Some((reference, now)),
+        );
+        assert_eq!(move_params(&calls).vx, 0.3);
+        assert!((head_params(&calls).head_pitch.abs() - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invalid_reload_keeps_the_previous_mapping_and_cli_overrides_win() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        let args =
+            Args::try_parse_from(["padd", "--deadzone", "0.2", "--max-head", "0.8"]).unwrap();
+        let mut config = robotd_params::Params::default();
+        std::fs::write(&path, "[pad_axes.drive.vx]\nsource = 'right_y'\n").unwrap();
+        assert!(reload_config(&path, &args, &mut config));
+        assert_eq!(config.pad_axes.deadzone, 0.2);
+        assert_eq!(config.pad_head.head_yaw_max, 0.8);
+        let before = config.pad_axes.clone();
+        std::fs::write(&path, "[pad_axes]\ndeadzone = 1.0\n").unwrap();
+        assert!(!reload_config(&path, &args, &mut config));
+        assert_eq!(config.pad_axes, before);
+        for bad in ["nan", "-1", "1"] {
+            assert!(Args::try_parse_from(["padd", "--deadzone", bad]).is_err());
+        }
     }
 
     /// A pad lost while driving: nothing for a second, then sit — asked again until the robot

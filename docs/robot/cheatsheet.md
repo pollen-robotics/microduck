@@ -498,6 +498,34 @@ pause while the robot is walking normally (the walk freezes for a moment, then r
 that stays paused after being put down. `pause_threshold` and `resume_threshold` in the
 same section move the two edges; the design is [`robotd-design.md` §2.4.2](../design/robotd-design.md).
 
+### Changing joystick mappings
+
+Run `sudo robotctl configure`, then search for `pad_axes` to select axes, directions and gains.
+Head, body and roller limits are under `pad_head`, `pad_body` and `pad_roller`; walking speed
+limits remain under `pad_drive`. These share `/etc/robot/robotd.toml` with the `[pad]` button
+bindings, and apply within a second without restarting.
+
+For example, forward/back on the right stick and steering on the left, with gentler steering:
+
+```toml
+[pad_axes.drive.vx]
+source = "right_y"
+
+[pad_axes.drive.vyaw]
+source = "left_x"
+gain = 0.7
+
+[pad_drive]
+vx_min = -0.2
+vx_max = 0.3
+```
+
+The steering binding keeps its default inversion; set `invert = false` to reverse it. Use
+`source = "none"` to disable a command. Remove an override to restore that mode's default.
+An invalid edit is logged and the previous mapping stays active.
+The full evaluation order and IMU behavior are in
+[controller configuration](../design/robotd-design.md#42-params).
+
 ### Gamepad (`configd`)
 
 What each button *does* — and how to change it — is under **Policies and skills** above
