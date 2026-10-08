@@ -316,3 +316,138 @@ fn debug_reloc_without_drift() {
         eprintln!("no drift: error {e:.3} m {a:.1}°");
     }
 }
+
+/// The real robot's fall, as its journal told it: the pick-up detector fires for a third of a
+/// second as the stumble begins, then the robot lands a little way off and stands back up. That is
+/// not a carry — nobody takes a duck anywhere in 0.36 s — and searching the whole map for it, as
+/// the first cut did, left the robot lost for good in a thin map. It must look nearby.
+#[test]
+fn a_stumble_is_searched_for_nearby_and_found() {
+    let mut r = mapped_room();
+    let n_before = r.events.len();
+    let here = r.robot.truth;
+    let mut steps = vec![Step::Stumble {
+        by: Pose2::new(0.15, -0.10, 0.5),
+    }];
+    let after = here.compose(Pose2::new(0.15, -0.10, 0.5));
+    steps.extend(wander([after.x, after.y]));
+    let Run {
+        mapper,
+        robot,
+        events,
+    } = &mut r;
+    robot.run(&steps, &mut |o| {
+        match o {
+            Out::State(s) => mapper.on_state(s),
+            Out::Depth(f) => mapper.on_depth(f),
+        }
+        events.extend(mapper.take_events());
+    });
+    let after = &r.events[n_before..];
+    assert!(
+        after.iter().any(|e| matches!(
+            e,
+            Event::Lost {
+                cause: maploc::mapper::LostCause::Bumped
+            }
+        )),
+        "a third of a second in the air was taken for a carry: {:?}",
+        after
+            .iter()
+            .filter(|e| matches!(e, Event::Lost { .. }))
+            .collect::<Vec<_>>()
+    );
+    for e in after {
+        if let Event::Searched { scope, outcome, .. } = e {
+            eprintln!("search ({scope}): {outcome}");
+        }
+    }
+    let n = relocalized_after(after).expect("never relocalized after a stumble");
+    // Judged at the stop that relocalized, against the map where it landed: the nearest stop of
+    // the first lap carries the map's own error there, and a relocalization can only be as right
+    // as the map it lands in.
+    let node = after
+        .iter()
+        .find_map(|e| match e {
+            Event::Relocalized { node, .. } => Some(*node),
+            _ => None,
+        })
+        .unwrap();
+    let truth_at = |id: usize| {
+        r.robot
+            .truth_at(r.mapper.keyframes()[id].t_start_ns)
+            .unwrap()
+    };
+    let (pose, truth) = (r.mapper.graph().nodes[node], truth_at(node));
+    let nearest = (0..16)
+        .min_by(|&a, &b| truth_at(a).dist(truth).total_cmp(&truth_at(b).dist(truth)))
+        .unwrap();
+    let map_err = wrap(r.mapper.graph().nodes[nearest].yaw - truth_at(nearest).yaw);
+    let a = wrap(wrap(pose.yaw - truth.yaw) - map_err)
+        .abs()
+        .to_degrees();
+    let e = pose.dist(truth);
+    eprintln!(
+        "relocalized after {n} stops: {e:.3} m off, {a:.1}° beyond the map's own heading error"
+    );
+    assert!(n <= 3);
+    // Two first-lap stops overlap here — the map's origin, fixed, and the lap's end, ~3° off it —
+    // and the match may land on either, so the heading allowance is that disagreement plus a degree.
+    assert!(e < RELOC_M && a < 4.5, "{e:.3} m {a:.1}°");
+}
+
+#[test]
+#[ignore]
+fn debug_stumble_without_drift() {
+    let drift = if std::env::var("DRIFT").is_ok() {
+        realistic_drift()
+    } else {
+        Drift::NONE
+    };
+    let mut steps = first_stop();
+    steps.extend(lap());
+    let mut r = run(
+        Mapper::new(MapperConfig::default()),
+        Robot::new(living_room(), Pose2::new(1.0, 0.8, 0.0), drift),
+        &steps,
+    );
+    let n0 = r.events.len();
+    let after = r.robot.truth.compose(Pose2::new(0.15, -0.10, 0.5));
+    let mut steps = vec![Step::Stumble {
+        by: Pose2::new(0.15, -0.10, 0.5),
+    }];
+    steps.extend(wander([after.x, after.y]));
+    let Run {
+        mapper,
+        robot,
+        events,
+    } = &mut r;
+    robot.run(&steps, &mut |o| {
+        match o {
+            Out::State(s) => mapper.on_state(s),
+            Out::Depth(f) => mapper.on_depth(f),
+        }
+        events.extend(mapper.take_events());
+    });
+    for e in &r.events[n0..] {
+        match e {
+            Event::Keyframe { id, .. } => {
+                let kf = &r.mapper.keyframes()[*id as usize];
+                let t = r.robot.truth_at(kf.t_start_ns).unwrap();
+                let p = r.mapper.graph().nodes[*id as usize];
+                eprintln!(
+                    "kf {id} truth {:.2} {:.2} {:.1}° node {:.2} {:.2} {:.1}°",
+                    t.x,
+                    t.y,
+                    t.yaw.to_degrees(),
+                    p.x,
+                    p.y,
+                    p.yaw.to_degrees()
+                );
+            }
+            other => eprintln!("{other:?}"),
+        }
+    }
+    let (e, a) = err(r.mapper.pose().unwrap(), r.robot.truth);
+    eprintln!("no drift: {e:.3} m {a:.1}°");
+}

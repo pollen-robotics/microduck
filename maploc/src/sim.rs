@@ -147,6 +147,9 @@ pub enum Step {
     /// Picked up, carried to a pose, put down. Odometry position freezes while carried (its feet
     /// are in the air); the gyro keeps the heading.
     Carry { to: Pose2 },
+    /// A stumble: the pick-up detector fires for a third of a second while the robot lurches by
+    /// `by` (in its own frame), the way a fall begins on the real robot.
+    Stumble { by: Pose2 },
 }
 
 pub struct Robot {
@@ -239,6 +242,19 @@ impl Robot {
                         self.tick(Pose2::IDENTITY, false, false, 0.0, sink);
                     }
                     self.head_yaw = 0.0;
+                }
+                Step::Stumble { by } => {
+                    let to = self.truth.compose(by);
+                    for _ in 0..18 {
+                        self.tick(Pose2::IDENTITY, false, true, 0.0, sink);
+                    }
+                    let dyaw = wrap(to.yaw - self.truth.yaw);
+                    self.truth = to;
+                    self.odom.yaw = wrap(self.odom.yaw + dyaw * (1.0 + self.drift.yaw_scale));
+                    // Getting back up: a second of limp-and-pose before it stands again.
+                    for _ in 0..50 {
+                        self.tick(Pose2::IDENTITY, true, false, 0.0, sink);
+                    }
                 }
                 Step::Carry { to } => {
                     for _ in 0..100 {

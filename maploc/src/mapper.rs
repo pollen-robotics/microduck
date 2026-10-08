@@ -100,6 +100,18 @@ pub struct MapperConfig {
     pub agree_rad: f64,
     /// After a carry, how far the gyro's heading is trusted.
     pub carry_yaw_tol_rad: f64,
+    /// A pick-up shorter than this is not a carry. On the robot it is a stumble — the pick-up
+    /// detector fires as a fall begins (measured: "picked up" for 0.36 s, then the limp fall) —
+    /// and nobody carries a duck anywhere in under two seconds. It is searched for nearby.
+    pub brief_pickup_s: f64,
+    pub bumped_xy_tol_m: f64,
+    pub bumped_yaw_tol_rad: f64,
+    /// A nearby search that has failed this many stops gives up its position and searches the
+    /// whole map, keeping only the heading — the hint was wrong, or the map is too thin there.
+    pub local_search_keyframes: usize,
+    /// The heading tolerance of that whole-map fallback: wider than a carry's, because whatever
+    /// made the hint wrong may have turned the robot too.
+    pub fallback_yaw_tol_rad: f64,
     /// After a fall, how far the pose is trusted.
     pub fall_xy_tol_m: f64,
     pub fall_yaw_tol_rad: f64,
@@ -147,6 +159,11 @@ impl Default for MapperConfig {
             agree_m: 0.15,
             agree_rad: 4f64.to_radians(),
             carry_yaw_tol_rad: 15f64.to_radians(),
+            brief_pickup_s: 2.0,
+            bumped_xy_tol_m: 0.5,
+            bumped_yaw_tol_rad: 25f64.to_radians(),
+            local_search_keyframes: 4,
+            fallback_yaw_tol_rad: 30f64.to_radians(),
             fall_xy_tol_m: 0.5,
             fall_yaw_tol_rad: 20f64.to_radians(),
             boot_xy_tol_m: 0.3,
@@ -162,6 +179,8 @@ impl Default for MapperConfig {
 pub enum LostCause {
     Boot,
     Carried,
+    /// Picked up for a moment and put back — a stumble, a nudge, the start of a fall.
+    Bumped,
     Fell,
     /// Stops stopped agreeing with the map.
     Contradiction,
@@ -229,6 +248,17 @@ pub enum Event {
         kind: EdgeKind,
         from: usize,
         to: usize,
+    },
+    /// A relocalization search, and how it went: where it looked, what it found, and which gate
+    /// refused it if one did. Logged every time — a robot that stays lost must say why.
+    Searched {
+        node: usize,
+        /// `nearby`, `heading`, `parked` or `anywhere`.
+        scope: &'static str,
+        half_xy: f64,
+        half_yaw: f64,
+        found: Option<Pose2>,
+        outcome: String,
     },
 }
 
@@ -311,6 +341,9 @@ pub struct Mapper {
     lost_keyframes: usize,
     last_pose: Option<Pose2>,
     flags: (bool, bool),
+    /// When the current pick-up began, and the map-from-odometry transform from before it.
+    pickup_since: Option<u64>,
+    broke_from: Option<Pose2>,
     events: Vec<Event>,
 }
 
@@ -349,6 +382,8 @@ impl Mapper {
             lost_keyframes: 0,
             last_pose: None,
             flags: (false, false),
+            pickup_since: None,
+            broke_from: None,
             events: Vec::new(),
         }
     }
@@ -484,10 +519,15 @@ impl Mapper {
         let act = s.activity;
         // Carries and falls end the chain the moment they begin.
         if act.picked_up && !self.flags.0 {
+            self.pickup_since = Some(s.t_ns);
             self.break_chain(LostCause::Carried);
+        }
+        if !act.picked_up && self.flags.0 {
+            self.put_down(s.t_ns);
         }
         if act.fallen && !self.flags.1 {
             self.break_chain(LostCause::Fell);
+            self.fell_while_lost();
         }
         self.flags = (act.picked_up, act.fallen);
 
@@ -568,6 +608,61 @@ impl Mapper {
         }
     }
 
+    /// Put back down. A brief pick-up was a bump, not a carry: look nearby rather than
+    /// everywhere.
+    fn put_down(&mut self, t_ns: u64) {
+        let held_s = self
+            .pickup_since
+            .take()
+            .map_or(f64::INFINITY, |t0| t_ns.saturating_sub(t0) as f64 * 1e-9);
+        if let (
+            Loc::Lost {
+                cause: LostCause::Carried,
+                ..
+            },
+            Some(map_from_odom),
+        ) = (self.loc, self.broke_from)
+            && held_s < self.cfg.brief_pickup_s
+            && self.lost_keyframes == 0
+        {
+            self.loc = Loc::Lost {
+                cause: LostCause::Bumped,
+                hint: Hint::Pose {
+                    map_from_odom,
+                    xy_tol: self.cfg.bumped_xy_tol_m,
+                    yaw_tol: self.cfg.bumped_yaw_tol_rad,
+                },
+            };
+            self.events.push(Event::Lost {
+                cause: LostCause::Bumped,
+            });
+        }
+    }
+
+    /// A fall while already lost: the robot may have slid and turned further than the hint
+    /// allows — widen a nearby search to a fall's tolerances.
+    fn fell_while_lost(&mut self) {
+        if let Loc::Lost {
+            cause,
+            hint:
+                Hint::Pose {
+                    map_from_odom,
+                    xy_tol,
+                    yaw_tol,
+                },
+        } = self.loc
+        {
+            self.loc = Loc::Lost {
+                cause,
+                hint: Hint::Pose {
+                    map_from_odom,
+                    xy_tol: xy_tol.max(self.cfg.fall_xy_tol_m),
+                    yaw_tol: yaw_tol.max(self.cfg.fall_yaw_tol_rad),
+                },
+            };
+        }
+    }
+
     fn break_chain(&mut self, cause: LostCause) {
         self.builder = None;
         self.still_since = None;
@@ -577,6 +672,7 @@ impl Mapper {
         self.pending_reloc = None;
         if let Loc::Tracking { map_from_odom } = self.loc {
             self.last_pose = self.pose().or(self.last_pose);
+            self.broke_from = Some(map_from_odom);
             let hint = match cause {
                 LostCause::Carried => Hint::Heading {
                     odom_to_map_yaw: map_from_odom.yaw,
@@ -587,7 +683,7 @@ impl Mapper {
                     xy_tol: self.cfg.fall_xy_tol_m,
                     yaw_tol: self.cfg.fall_yaw_tol_rad,
                 },
-                LostCause::Boot | LostCause::Contradiction => Hint::None,
+                LostCause::Boot | LostCause::Contradiction | LostCause::Bumped => Hint::None,
             };
             if self.keyframes.is_empty() {
                 // Nothing mapped yet: there is nothing to be lost from. Start over wherever it
@@ -865,13 +961,54 @@ impl Mapper {
     }
 
     fn wide_ok(&self, m: &MatchResult, margin: f64, span: f64) -> bool {
-        m.rank == 3
-            && margin >= self.cfg.wide_min_margin
-            && m.hit_frac >= self.cfg.wide_min_hit_frac
-            && m.known_frac >= self.cfg.min_known_frac
-            && m.conflict_frac <= self.cfg.max_conflict
-            && m.n_points >= self.cfg.min_match_points
-            && span >= self.cfg.wide_min_span_rad
+        self.wide_refusal(m, margin, span).is_none()
+    }
+
+    /// The first gate a wide match fails, said with its numbers — `None` when it passes them all.
+    fn wide_refusal(&self, m: &MatchResult, margin: f64, span: f64) -> Option<String> {
+        let c = &self.cfg;
+        if span < c.wide_min_span_rad {
+            return Some(format!(
+                "the stops see too little: {:.0}° < {:.0}°",
+                span.to_degrees(),
+                c.wide_min_span_rad.to_degrees()
+            ));
+        }
+        if m.n_points < c.min_match_points {
+            return Some(format!(
+                "too few obstacles: {} < {}",
+                m.n_points, c.min_match_points
+            ));
+        }
+        if m.rank < 3 {
+            return Some(format!("pins {} of 3 directions", m.rank));
+        }
+        if m.hit_frac < c.wide_min_hit_frac {
+            return Some(format!(
+                "fits poorly: {:.0}% on walls < {:.0}%",
+                100.0 * m.hit_frac,
+                100.0 * c.wide_min_hit_frac
+            ));
+        }
+        if m.known_frac < c.min_known_frac {
+            return Some(format!(
+                "mostly off the map: {:.0}% known",
+                100.0 * m.known_frac
+            ));
+        }
+        if m.conflict_frac > c.max_conflict {
+            return Some(format!(
+                "contradicts seen floor: {:.0}%",
+                100.0 * m.conflict_frac
+            ));
+        }
+        if margin < c.wide_min_margin {
+            return Some(format!(
+                "ambiguous: margin {margin:.1} < {:.1}",
+                c.wide_min_margin
+            ));
+        }
+        None
     }
 
     fn agrees(&self, a: Pose2, b: Pose2) -> bool {
@@ -1060,6 +1197,25 @@ impl Mapper {
         if all.is_empty() {
             return;
         }
+        // A nearby search that keeps failing was given a wrong hint, or the map is thin there:
+        // keep the heading, drop the position.
+        let hint = match hint {
+            Hint::Pose { map_from_odom, .. }
+                if self.lost_keyframes > self.cfg.local_search_keyframes =>
+            {
+                Hint::Heading {
+                    odom_to_map_yaw: map_from_odom.yaw,
+                    tol: self.cfg.fallback_yaw_tol_rad,
+                }
+            }
+            h => h,
+        };
+        let scope = match hint {
+            Hint::Pose { .. } => "nearby",
+            Hint::Parked { .. } if self.lost_keyframes == 1 => "parked",
+            Hint::Heading { .. } => "heading",
+            _ => "anywhere",
+        };
         let (center, half_xy, half_yaw, nodes) = match hint {
             Hint::Pose {
                 map_from_odom,
@@ -1106,7 +1262,17 @@ impl Mapper {
                 )
             }
         };
+        let searched = |found: Option<Pose2>, outcome: String| Event::Searched {
+            node,
+            scope,
+            half_xy,
+            half_yaw,
+            found,
+            outcome,
+        };
         let Some(field) = self.field_of(&nodes) else {
+            self.events
+                .push(searched(None, "no mapped obstacles near the hint".into()));
             return;
         };
         let win = Window {
@@ -1116,9 +1282,13 @@ impl Mapper {
             step_yaw: 2f64.to_radians(),
         };
         let Some(w) = match_wide(&field, &scan, win, &self.cfg.matcher) else {
+            self.events
+                .push(searched(None, "this stop saw no obstacles".into()));
             return;
         };
-        if !self.wide_ok(&w.best, w.margin, scan.span_rad) {
+        if let Some(why) = self.wide_refusal(&w.best, w.margin, scan.span_rad) {
+            self.events
+                .push(searched(Some(w.best.pose), format!("refused — {why}")));
             self.pending_reloc = None;
             // A parked hint only holds for the first stop after boot; fall back to the whole map.
             if let (Hint::Parked { .. }, LostCause::Boot) = (hint, cause) {
@@ -1138,11 +1308,31 @@ impl Mapper {
             implied,
             ref_node,
         };
+        let found = Some(this.m.pose);
+        let margin = w.margin;
         match self.pending_reloc.take() {
             Some(prev) if self.island[prev.node] == isl && self.agrees(prev.implied, implied) => {
+                self.events.push(searched(
+                    found,
+                    "agrees with the stop before — joining the map".into(),
+                ));
                 self.join(isl, implied, &[prev, this]);
             }
-            _ => self.pending_reloc = Some(this),
+            prev => {
+                let outcome = match prev {
+                    Some(prev) if self.island[prev.node] == isl => {
+                        let d = prev.implied.between(implied);
+                        format!(
+                            "candidate (margin {margin:.1}), {:.2} m {:.0}° from the stop before's — the next must agree",
+                            d.x.hypot(d.y),
+                            d.yaw.to_degrees()
+                        )
+                    }
+                    _ => format!("candidate (margin {margin:.1}) — the next stop must agree"),
+                };
+                self.events.push(searched(found, outcome));
+                self.pending_reloc = Some(this);
+            }
         }
     }
 

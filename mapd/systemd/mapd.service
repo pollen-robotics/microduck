@@ -24,7 +24,9 @@ RestartSec=5s
 Nice=10
 # The map lives here, across updates and rollbacks — it is the robot's, not the release's.
 StateDirectory=mapd
-StateDirectoryMode=0750
+# Traversable, not listable, by others; the map file itself is handed to `robot`, so the people who
+# may read the map over the socket may also copy the file to look at why a robot stayed lost.
+StateDirectoryMode=0751
 RuntimeDirectory=mapd
 
 NoNewPrivileges=yes

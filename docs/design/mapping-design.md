@@ -106,9 +106,18 @@ odometry frame, heading arbitrary). Each leaves the mapper lost with what it sti
 | cause | hint | search |
 |---|---|---|
 | carried | the heading | the whole map, ±`carry_yaw_tol_rad` |
+| bumped — picked up for under `brief_pickup_s` | the pose | ±`bumped_xy_tol_m`, ±`bumped_yaw_tol_rad` |
 | fell | the pose, roughly | ±`fall_xy_tol_m`, ±`fall_yaw_tol_rad` |
 | boot | where it was switched off | there first, then the whole map at every heading |
 | contradiction | the predicted pose | ±1 m |
+
+**A brief pick-up is not a carry.** On the robot the pick-up detector fires as a fall begins —
+measured on graphite: "picked up" for 0.36 s, put down, then the limp fall 0.06 s later. Read as a
+carry, that threw the position away and searched a thin map everywhere, and the robot never found
+itself. Nobody carries a duck anywhere in two seconds, so a pick-up that short is searched for
+nearby. A nearby search (bumped, fell, contradiction) that fails `local_search_keyframes` stops in a
+row keeps only the heading and widens to the whole map, ±`fallback_yaw_tol_rad`. Every search is
+logged with the gate that refused it (`relocalization search:` in `journalctl -u mapd`).
 
 *Contradiction* is the fourth way: two consecutive stops whose obstacles land on floor the map saw
 clear, or nowhere near the walls it predicts. Neither stop touches the map.
@@ -118,7 +127,7 @@ one is searched for with the island's last `composite_keyframes` stops as one wi
 consecutive searches agree, the island is joined to the map and tracking resumes. An island that
 is never recognised stays an island: it is kept, and it is not drawn.
 
-`map.status` says which state it is in, and why (`lost`: `boot`, `carried`, `fell`,
+`map.status` says which state it is in, and why (`lost`: `boot`, `carried`, `bumped`, `fell`,
 `contradiction`).
 
 ## 5. What is kept

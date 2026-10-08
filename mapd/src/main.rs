@@ -192,6 +192,13 @@ fn bind(socket: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// Make the saved map readable by `GROUP`: the same people the socket serves, and the ones who
+/// copy the file off a robot to replay why it stayed lost.
+pub fn share_with_robot_group(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
+    give_to_group(path, GROUP)
+}
+
 /// Hand the socket to `GROUP`, so the people who may watch `robot.state` may read the map. The
 /// same as `tofd`'s, including that a missing group is a warning: a laptop has none.
 fn give_to_group(socket: &Path, group: &str) -> std::io::Result<()> {

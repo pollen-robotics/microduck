@@ -104,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Lost { .. } => lost += 1,
                 Event::Relocalized { .. } => reloc += 1,
                 Event::Discarded { .. } => discarded += 1,
+                Event::Searched { .. } => {}
             }
             if !quiet {
                 println!("{ev:?}");

@@ -77,6 +77,7 @@ pub fn lost_name(c: LostCause) -> &'static str {
     match c {
         LostCause::Boot => "boot",
         LostCause::Carried => "carried",
+        LostCause::Bumped => "bumped",
         LostCause::Fell => "fell",
         LostCause::Contradiction => "contradiction",
     }
@@ -239,6 +240,9 @@ impl Worker {
         let session = self.mapper.session();
         match store::save(&self.path, &session) {
             Ok(()) => {
+                if let Err(e) = crate::share_with_robot_group(&self.path) {
+                    tracing::debug!(error = %e, "the map file stays private to mapd");
+                }
                 self.dirty = false;
                 self.last_save = Instant::now();
                 self.saved_pose = self.mapper.pose();
@@ -339,6 +343,22 @@ fn log_event(e: &Event) {
             y = format!("{:.2}", pose.y),
             yaw_deg = format!("{:.0}", pose.yaw.to_degrees()),
             "relocalized"
+        ),
+        Event::Searched {
+            node,
+            scope,
+            half_xy,
+            half_yaw,
+            found,
+            outcome,
+        } => tracing::info!(
+            node,
+            scope,
+            window = format!("±{:.2} m ±{:.0}°", half_xy, half_yaw.to_degrees()),
+            found = found
+                .map(|p| format!("{:.2} {:.2} {:.0}°", p.x, p.y, p.yaw.to_degrees()))
+                .unwrap_or_default(),
+            "relocalization search: {outcome}"
         ),
         Event::EdgeRejected { kind, from, to } => {
             tracing::info!(?kind, from, to, "edge rejected by the optimized map")

@@ -96,6 +96,7 @@ fn render_status(s: &proto::MapStatusResult) -> String {
             match why.as_str() {
                 "boot" => "it recognises the map after a stop or two somewhere it has been",
                 "carried" => "put down, it looks for itself at the next stops",
+                "bumped" => "knocked or stumbled; it looks for itself nearby at the next stops",
                 "fell" => "it looks for itself near where it fell",
                 _ => "what it sees stopped matching the map; it is searching",
             }

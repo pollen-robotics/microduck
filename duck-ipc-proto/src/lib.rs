@@ -4992,7 +4992,8 @@ pub struct MapState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pose: Option<MapPose>,
     /// Why it does not know where it is: `boot` (it has not recognised anything since it started),
-    /// `carried`, `fell`, or `contradiction` (what it sees stopped matching the map). Absent while
+    /// `carried`, `bumped` (picked up for a moment — a stumble, the start of a fall — and looking
+    /// nearby), `fell`, or `contradiction` (what it sees stopped matching the map). Absent while
     /// it knows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost: Option<String>,
