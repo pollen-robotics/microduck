@@ -960,6 +960,9 @@ impl HeadImuParams {
 #[serde(deny_unknown_fields, default)]
 pub struct MapParams {
     /// Build the map at all. Off, `mapd` answers `map.status` with why and subscribes to nothing.
+    ///
+    /// **Off by default** until it has been measured on a board: its standing cost is parsing the
+    /// state stream at `state_hz`, and nobody has watched that on an A55 yet.
     pub enabled: bool,
     /// Where the map is kept, across updates and reboots.
     pub path: PathBuf,
@@ -977,7 +980,7 @@ pub struct MapParams {
 impl Default for MapParams {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             path: PathBuf::from("/var/lib/mapd/map.json"),
             autosave_s: 60,
             state_hz: 25,

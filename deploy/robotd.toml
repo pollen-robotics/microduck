@@ -441,7 +441,10 @@ mode = "walk"
 # (`robotctl map`). It maps only where the robot stops and looks around: a stop of a few seconds is
 # one view, and the views are the map. Kept across updates and reboots; after a reboot the robot
 # does not know where it is until a stop or two recognise somewhere it has been.
-enabled = true
+#
+# **Off by default** until its cost on the board has been measured: mapd parses the robot state
+# stream at state_hz while it runs. Turn it on, then `sudo systemctl restart mapd`.
+enabled = false
 path = "/var/lib/mapd/map.json"
 # Seconds between saves while the map changes, and so what a power cut can lose. Also saved when
 # mapd stops.
