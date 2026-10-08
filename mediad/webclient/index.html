@@ -192,6 +192,23 @@
   #raw { flex: 1; min-width: 18rem; font: 12px ui-monospace, monospace; }
   pre { margin: 0; padding: .5rem; background: var(--fill); border-radius: 4px; height: 16rem;
         overflow: auto; white-space: pre-wrap; font: 12px/1.45 ui-monospace, monospace; }
+  [hidden] { display: none !important; }
+  .console-tabs { display: flex; gap: .5rem; margin: 1rem auto; max-width: 1400px; padding: 0 1rem; }
+  .console-tabs button[aria-pressed="true"] { background: var(--fill); border-color: var(--out); }
+  #controller-panel { width: 100%; max-width: 1100px; margin: 0 auto; padding: 1rem; }
+  #controller-panel h2 { font-size: 1.25rem; text-transform: none; }
+  .controller-fields { display: grid; align-items: start; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 1rem; margin: 1rem 0; }
+  .controller-fields fieldset { border: 1px solid var(--line); border-radius: 8px; min-width: 0; padding: 1rem; }
+  .controller-fields legend { padding: 0 .4rem; font-weight: 600; }
+  .controller-field { display: grid; grid-template-columns: 1fr minmax(75px, 45%); align-items: center; gap: .5rem; margin: .7rem 0; font-size: .85rem; }
+  .controller-field small { grid-column: 2; opacity: .6; font-size: .7rem; }
+  .controller-field input, .controller-field select { width: 100%; min-width: 0; box-sizing: border-box; }
+  .controller-field input[type="checkbox"] { width: auto; justify-self: start; }
+  .controller-axis { border-top: 1px solid var(--line); padding-top: .5rem; }
+  .controller-axis h3 { font-size: .9rem; }
+  .mode-editor { margin-top: 1rem; }
+  .mode-editor > label { display: inline-flex; align-items: center; gap: .5rem; margin: .7rem 1rem .2rem 0; }
+  .controller-error { color: var(--bad); }
 </style>
 
 </head>
@@ -218,7 +235,37 @@
 <div id="alert" hidden><span id="alert-text"></span><button id="alert-close"
   title="dismiss" aria-label="dismiss this message">&times;</button></div>
 
-<main>
+<nav class="console-tabs" aria-label="Console views">
+  <button id="view-drive" aria-pressed="true">Drive</button>
+  <button id="view-controller" aria-pressed="false">Controller</button>
+</nav>
+<section id="controller-panel" hidden aria-label="Controller configuration">
+  <h2>Controller</h2>
+  <p>Choose what your sticks and buttons do. Changes stay local until you save.</p>
+  <form>
+    <label>Edit mode <select data-controller-mode aria-label="Edit mode"></select></label>
+    <div data-mode-edit class="mode-editor">
+      <div class="row">
+        <button type="button" data-mode-add>Add mode</button>
+        <button type="button" data-mode-remove>Remove mode</button>
+        <button type="button" data-mode-up>Move up</button>
+        <button type="button" data-mode-down>Move down</button>
+      </div>
+      <label>Name <input data-mode-name required></label>
+      <label>Direct selection button <select data-mode-button></select></label>
+      <p class="dim">The first mode is used at startup. Next / Previous buttons cycle in this order. A mode-switch button takes priority over its skill.</p>
+    </div>
+    <div data-controller-fields class="controller-fields"></div>
+    <div class="row">
+      <button type="submit" data-controller-save disabled>Save</button>
+      <button type="button" data-controller-cancel disabled>Cancel</button>
+      <button type="button" data-controller-reset disabled>Restore defaults</button>
+      <button type="button" data-controller-load>Reload</button>
+    </div>
+    <p data-controller-status role="status" aria-live="polite">Connect to a robot to edit its controller.</p>
+  </form>
+</section>
+<main id="drive-panel">
   <section id="s-video">
     <h2>video</h2>
     <!-- The wrapper is the *upright* picture and the video is turned inside it, because the robot
@@ -361,6 +408,7 @@
   <pre id="log"></pre>
 </details>
 
+<script src="controller.js"></script>
 <script>
 "use strict";
 
@@ -863,6 +911,7 @@ $("robots").onchange = () => {
     if (pc) { pc.close(); pc = null; }
     setDc("no control channel"); setLive(false);
     stopTelemetry();
+    controllerEditor.connectionChanged();
   }
   send({ type: "list" });
 };
@@ -873,6 +922,7 @@ function teardown() {
   setLive(false);
   setConnectLabel();
   ws = null; stream = null; sessionId = null; control = null;
+  controllerEditor.connectionChanged();
   wanted = false; starting = false;
   stopTelemetry();
   if (pc) { pc.close(); pc = null; }
@@ -1071,6 +1121,7 @@ async function onSignalling(raw) {
         if (pc) { pc.close(); pc = null; }
         setState("signalling"); setDc("no control channel"); setLive(false);
         stopTelemetry();
+        controllerEditor.connectionChanged();
         break;
 
       // Only the rendezvous sends these two. The robot's own signalling server has no notion of
@@ -1202,11 +1253,14 @@ function newPeerConnection() {
       // the most useful thing on the screen.
       setLive(true); clearAlert();
       startTelemetry();
+      controllerEditor.connectionChanged();
+      if (!controllerPanel.hidden) controllerEditor.refresh();
     };
     control.onclose = () => {
       setDc("control closed", "bad");
       setLive(false);
       stopTelemetry();
+      controllerEditor.connectionChanged();
       // The detector's boxes came down this channel; with it gone they are stale by definition.
       clearDetections("–");
     };
@@ -1514,7 +1568,7 @@ addEventListener("keydown", (event) => {
   // Keys are the robot's while nothing text-shaped has focus — the raw box in the drawer is a
   // text field, and typing `robot.mode` into it should not walk the robot across the room. The
   // optional call is for a keydown whose target is the document itself, which has no `matches`.
-  if (event.target?.matches?.("input, textarea, select")) return;
+  if (!controllerPanel.hidden || event.target?.matches?.("input, textarea, select")) return;
   const key = event.key.toLowerCase();
   if (!["w", "a", "s", "d", "q", "e", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) return;
   event.preventDefault();
@@ -1748,6 +1802,22 @@ $("send").onclick = () => {
   log("out", "control →", line);
   control.send(line);
 };
+
+const controllerPanel = document.getElementById('controller-panel');
+const drivePanel = document.getElementById('drive-panel');
+const controllerEditor = createControllerEditor(controllerPanel, call, open);
+function showConsoleView(controller) {
+  keys.clear();
+  Object.assign(padTwist, { vx: 0, vy: 0, vyaw: 0 });
+  refreshTwist();
+  controllerPanel.hidden = !controller;
+  drivePanel.hidden = controller;
+  document.getElementById('view-controller').setAttribute('aria-pressed', String(controller));
+  document.getElementById('view-drive').setAttribute('aria-pressed', String(!controller));
+  if (controller) controllerEditor.refresh();
+}
+document.getElementById('view-controller').addEventListener('click', () => showConsoleView(true));
+document.getElementById('view-drive').addEventListener('click', () => showConsoleView(false));
 </script>
 
 </body>

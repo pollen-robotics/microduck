@@ -70,6 +70,7 @@ impl Row {
 #[derive(Debug, Clone)]
 pub enum Edit {
     Set(toml_edit::Value),
+    Collection(toml_edit::Item),
     Clear,
 }
 
@@ -155,6 +156,7 @@ impl Model {
             .map(|entry| {
                 let set = match self.pending.get(entry.key) {
                     Some(Edit::Set(value)) => Some(render(value)),
+                    Some(Edit::Collection(item)) => Some(item.to_string()),
                     Some(Edit::Clear) => None,
                     None => self.file_value(entry.key).map(|v| render(&v)),
                 };
@@ -272,7 +274,12 @@ impl Model {
             // A repeating table is not one value with one cursor, so this editor lists it and
             // points at the commands that do manage it. See `Kind::Table`.
             Kind::Table => {
-                return Err("edit the one-shot skills with `robotctl policy`".to_owned());
+                return Err(if entry.key == "pad_modes.profiles" {
+                    "edit controller profiles in the Controller tab or [[pad_modes.profiles]]"
+                        .to_owned()
+                } else {
+                    "edit the one-shot skills with `robotctl policy`".to_owned()
+                });
             }
             // Six numbers from a calibration, where a typo is a plausible wrong answer rather
             // than an error. Written by whatever measured them, not typed into an editor.
@@ -341,7 +348,7 @@ impl Model {
         for (key, edit) in &self.pending {
             let (section, name) = key.rsplit_once('.').expect("section.key");
             match edit {
-                Edit::Set(value) => {
+                Edit::Set(_) | Edit::Collection(_) => {
                     let mut item = doc.as_item_mut();
                     for part in section.split('.') {
                         let table = item.as_table_like_mut().expect("validated table");
@@ -351,7 +358,11 @@ impl Model {
                         item = table.get_mut(part).expect("just inserted");
                     }
                     let table = item.as_table_like_mut().expect("validated table");
-                    let value = toml_edit::Item::Value(value.clone());
+                    let value = match edit {
+                        Edit::Set(v) => toml_edit::Item::Value(v.clone()),
+                        Edit::Collection(v) => v.clone(),
+                        Edit::Clear => unreachable!(),
+                    };
                     if let Some(existing) = table.get_mut(name) {
                         *existing = value;
                     } else {
@@ -370,6 +381,29 @@ impl Model {
             }
         }
         doc.to_string()
+    }
+
+    /// Replace the named profile list as one edit, using the same lock, validation and save.
+    pub fn set_pad_modes(
+        &mut self,
+        profiles: Vec<crate::pad_modes::PadMode>,
+    ) -> Result<(), String> {
+        if profiles.is_empty() {
+            return Err("keep at least one mode; use reset to restore shipped modes".into());
+        }
+        #[derive(serde::Serialize)]
+        struct Modes {
+            profiles: Vec<crate::pad_modes::PadMode>,
+        }
+        let text = toml::to_string(&Modes { profiles }).map_err(|e| e.to_string())?;
+        let doc: DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| e.to_string())?;
+        self.pending.insert(
+            "pad_modes.profiles",
+            Edit::Collection(doc["profiles"].clone()),
+        );
+        Ok(())
     }
 
     /// Add or replace one `[[policy.skill]]` entry, by name.
@@ -1188,6 +1222,7 @@ mod tests {
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
+                "pad_modes",
                 "pad",
                 "pad_imu_head_control",
                 "pad_drive",

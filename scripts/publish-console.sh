@@ -61,11 +61,12 @@ trap 'rm -rf "$STAGE"' EXIT
 # but not yet committed publishes under its parent's revision, so two different pages can carry
 # the same stamp — which is exactly the confusion this stamp exists to end.
 REVISION=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-PAGE_HASH=$(shasum "$PAGE" | cut -c1-8)
+PAGE_HASH=$(cat "$PAGE" "$REPO_ROOT/mediad/webclient/controller.js" | shasum | cut -c1-8)
 STAMP=$(date -u +%Y-%m-%dT%H:%MZ)
 sed -e "s/{{API_VERSION}}/$API_VERSION/g" \
     -e "s|{{CONSOLE_BUILD}}|$REVISION/$PAGE_HASH $STAMP|g" "$PAGE" > "$STAGE/index.html"
 cp "$CARD" "$STAGE/README.md"
+cp "$REPO_ROOT/mediad/webclient/controller.js" "$STAGE/controller.js"
 # The Space is a Docker Space: it serves the page and substitutes its own OAuth client id into it.
 cp "$SPACE_DIR/Dockerfile" "$SPACE_DIR/entrypoint.sh" "$STAGE/"
 
@@ -101,15 +102,15 @@ fi
 
 CLONE="$STAGE/space"
 git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
-cp "$STAGE/index.html" "$STAGE/README.md" "$STAGE/Dockerfile" "$STAGE/entrypoint.sh" "$CLONE/"
+cp "$STAGE/index.html" "$STAGE/README.md" "$STAGE/Dockerfile" "$STAGE/entrypoint.sh" "$STAGE/controller.js" "$CLONE/"
 
 cd "$CLONE"
-if git diff --quiet; then
+git add index.html controller.js README.md Dockerfile entrypoint.sh
+if git diff --cached --quiet; then
     echo "the Space already serves this page"
     exit 0
 fi
 
-git add index.html README.md Dockerfile entrypoint.sh
 git commit -q -m "Console from microduck $REVISION (api v$API_VERSION)"
 git push
 echo "pushed. The Space rebuilds in a few seconds."

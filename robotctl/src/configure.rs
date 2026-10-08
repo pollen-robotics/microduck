@@ -113,6 +113,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         | "pad_imu_head_control"
         | "pad_drive"
         | "pad_axes"
+        | "pad_modes"
         | "pad_head"
         | "pad_body"
         | "pad_roller" => Apply::Live("padd"),
@@ -245,6 +246,7 @@ pub fn summary(model: &Model) -> Vec<String> {
             let edit = model.pending.get(row.entry.key)?;
             Some(match edit {
                 Edit::Set(value) => format!("{} = {}", row.entry.key, render(value)),
+                Edit::Collection(_) => format!("{} → updated profiles", row.entry.key),
                 Edit::Clear => format!("{} → default ({})", row.entry.key, row.default),
             })
         })

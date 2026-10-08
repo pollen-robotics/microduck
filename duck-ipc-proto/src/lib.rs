@@ -451,7 +451,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// for servo power being off — about a robot whose fifteen servos had just answered their pings.
 /// Additive: absent from an older `robotd`, and `false` reads as "not told", which is what the old
 /// wording assumed anyway.
-pub const API_VERSION: u32 = 41;
+///
+/// # v42 — controller configuration in the console
+///
+/// [`Call::PadConfig`] reports typed controller settings and defaults from the robot's schema.
+/// [`Call::PadSetConfig`] validates and persists a controller-only batch of edits atomically.
+///
+/// # v43 — named controller profiles and configurable selection buttons
+///
+/// `pad.config` includes a Modes setting for the profile list; `pad.setConfig` can replace
+/// or reset it together with the cycling buttons in one validated batch.
+pub const API_VERSION: u32 = 43;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -901,6 +911,8 @@ pub mod method {
     pub const PAD_FORGET: &str = "pad.forget";
     pub const PAD_BINDINGS: &str = "pad.bindings";
     pub const PAD_BIND: &str = "pad.bind";
+    pub const PAD_CONFIG: &str = "pad.config";
+    pub const PAD_SET_CONFIG: &str = "pad.setConfig";
     pub const ROBOT_SKILLS: &str = "robot.skills";
     pub const ROBOT_SET_SKILL: &str = "robot.setSkill";
     pub const ROBOT_REMOVE_SKILL: &str = "robot.removeSkill";
@@ -1159,6 +1171,8 @@ pub enum Call {
     PadForget(PadForgetParams),
     PadBindings,
     PadBind(PadBindParams),
+    PadConfig,
+    PadSetConfig(PadConfigPatch),
     RobotSkills,
     RobotSetSkill(SkillParams),
     RobotRemoveSkill(SkillNameParams),
@@ -1293,6 +1307,8 @@ impl Call {
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadBindings => method::PAD_BINDINGS,
             Call::PadBind(_) => method::PAD_BIND,
+            Call::PadConfig => method::PAD_CONFIG,
+            Call::PadSetConfig(_) => method::PAD_SET_CONFIG,
             Call::RobotSkills => method::ROBOT_SKILLS,
             Call::RobotSetSkill(_) => method::ROBOT_SET_SKILL,
             Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
@@ -1473,7 +1489,9 @@ impl Call {
             // Routing is per method throughout this table — `policy.*` goes to `updaterd` while
             // `robot.loadPolicy` goes to `robotd`, for the same concept — so this costs nothing
             // mechanically. It is only worth a comment because the name suggests otherwise.
-            Call::PadBindings | Call::PadBind(_) => (Robot, Prompt),
+            Call::PadBindings | Call::PadBind(_) | Call::PadConfig | Call::PadSetConfig(_) => {
+                (Robot, Prompt)
+            }
 
             // The skill table. `robotd` writes it and reloads itself afterwards, so one call is
             // enough — and it is the daemon that has to accept the result either way.
@@ -1570,6 +1588,7 @@ impl Call {
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
             Call::PadBind(p) => encode(p),
+            Call::PadSetConfig(p) => encode(p),
             Call::RobotSetSkill(p) => encode(p),
             Call::RobotRemoveSkill(p) => encode(p),
             Call::Status
@@ -1599,6 +1618,7 @@ impl Call {
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadBindings
+            | Call::PadConfig
             | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
@@ -1696,6 +1716,8 @@ impl Call {
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_BINDINGS => Call::PadBindings,
             method::PAD_BIND => Call::PadBind(decode(params)?),
+            method::PAD_CONFIG => Call::PadConfig,
+            method::PAD_SET_CONFIG => Call::PadSetConfig(decode(params)?),
             method::ROBOT_SKILLS => Call::RobotSkills,
             method::ROBOT_SET_SKILL => Call::RobotSetSkill(decode(params)?),
             method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
@@ -1888,6 +1910,16 @@ pub mod test_support {
                 name: "polite-bow".into(),
             }),
             Call::PadBindings,
+            Call::PadConfig,
+            Call::PadSetConfig(PadConfigPatch {
+                changes: serde_json::from_value(serde_json::json!({
+                    "pad.a": "sit_toggle",
+                    "pad_axes.drive.vx.gain": 0.7,
+                    "pad_axes.drive.vx.invert": true,
+                    "pad_axes.drive.vx.source": null
+                }))
+                .unwrap(),
+            }),
             Call::PadBind(PadBindParams {
                 button: "x".into(),
                 skill: Some("polite-bow".into()),
@@ -4567,6 +4599,40 @@ pub struct PadBindParams {
     pub skill: Option<String>,
 }
 
+/// Atomic controller-only edits. Null removes an override; absent keys are untouched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PadConfigPatch {
+    pub changes: std::collections::BTreeMap<String, Option<Value>>,
+}
+
+/// Values and choices come from the robot's schema, never a copy in the browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PadConfigResult {
+    pub settings: Vec<PadSetting>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadSettingKind {
+    Number,
+    Boolean,
+    Choice,
+    Skill,
+    Modes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PadSetting {
+    pub key: String,
+    pub kind: PadSettingKind,
+    pub description: String,
+    pub value: Value,
+    pub default_value: Value,
+    pub overridden: bool,
+    pub choices: Vec<String>,
+}
+
 /// Answer to [`Call::PadBindings`].
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PadBindingsResult {
@@ -5726,7 +5792,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            69,
+            71,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

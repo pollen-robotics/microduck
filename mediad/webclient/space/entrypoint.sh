@@ -26,6 +26,7 @@ if [ -z "${OAUTH_CLIENT_ID:-}" ]; then
 fi
 
 mkdir -p /srv
+cp /app/controller.js /srv/controller.js
 
 # Python rather than `sed`, because the value being substituted is now JSON: a provider URL is
 # full of the characters a `sed` replacement treats as syntax, and one of them silently produces
