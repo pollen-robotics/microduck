@@ -1146,11 +1146,44 @@ projected gravity, and where the camera and the ToF sensor are. All three are ad
   `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
   wall-clock — can be put on the same axis.
 - **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
-  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
-  anything yet; when it is, it streams beside `tof.frame`, not here.
+  it (`docs/design/robotd-design.md` §IMU). The head BMI088 is a separate `head_imu.stream`
+  from `tofd`, with its own acquisition timing below; it is not an input to the walking policy.
 - **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
   `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
   answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
   zero). The kinematics stay in one crate; a client asks rather than transcribes.
 
 Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.
+
+### Head-IMU acquisition timing (API v42)
+
+`head_imu.frame` keeps its existing fields, units, sensor axes and Madgwick filter (beta 0.1).
+`t_ns` remains host read/fusion completion, including occasional temperature reads. Polling
+frames omit the optional `timing` member; old frames decode without an invented event time.
+
+The head IMU is still off unless `[head_imu] enabled = true` or `--imu`. With both
+`--imu-int1-gpiochip PATH --imu-int1-line OFFSET`, `tofd` uses the stock HAT's acc INT1 signal
+(R25 to header pin 15) for GPIO v2 rising-edge acquisition. Choose chip/offset from this board's
+`gpioinfo`, not physical-pin numbers. Linux 5.10+ and GPIO access are required; a systemd drop-in
+with `SupplementaryGroups=gpio` extends the existing `i2c robot` groups when the device is owned
+by `gpio`. Without the two options, the original polling path remains.
+
+The default stays 100 Hz. INT1 mode accepts 25/50/100/200 Hz and sets acc ODR accordingly;
+gyro ODR is 100 Hz at the two lower rates and otherwise matches. ODR is not filter cutoff.
+
+`timing` contains the kernel `CLOCK_MONOTONIC` edge time `accel_data_ready_ns`, the per-request
+`accel_event_seq`, and `read_started_ns`/`read_finished_ns` for the sequential I²C reads. Stale,
+duplicate, overlong or observed overlapping reads are discarded before fusion advances. Sequence
+gaps expose skipped events while `seq` continues to count published frames. GPIO failure or
+silence reports unavailable and retries with backoff; it does not substitute polling timestamps.
+
+Initialization refuses a kernel-bound BMI088, verifies chip IDs, maps DRDY alone onto INT1
+and preserves INT2 routing. It saves/restores modified registers before releasing GPIO on
+cooperative exit or initialization failure. The pinned driver's `ACC_PWR_CONF` address is 0x7d
+(the power-control register); INT1 initialization explicitly uses 0x7c/0x7d to wake a cold acc.
+
+Use `accel_data_ready_ns` for acc-ready event time. This is not a calibrated physical sampling
+centre: sensor group delay and GPIO capture latency remain unmeasured. Gyro INT3/INT4 are
+unconnected, so no gyro timestamp or simultaneous six-axis sampling is inferred. Sensor-to-sensor
+Data Sync needs extra wiring and is outside this stock-HAT integration. Camera alignment remains
+separate (`remote-webrtc.md` §11).

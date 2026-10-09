@@ -456,6 +456,8 @@ mod reader {
                             accel: sample.accel,
                             quat: sample.quat,
                             temp_c,
+                            // The FIFO read has no INT1 event to time, like every polling frame.
+                            timing: None,
                         });
                     }
                 }

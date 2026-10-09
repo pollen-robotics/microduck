@@ -19,14 +19,12 @@
 //! raw sensor axes. Placing the sample in the head frame (the IMU is rigid to the camera) is a
 //! `kinematics` job for the consumer, not this daemon's.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use duck_ipc_proto as proto;
 
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
 #[cfg(target_os = "linux")]
@@ -39,6 +37,15 @@ use linux_embedded_hal::I2cdev;
 
 #[cfg(target_os = "linux")]
 use tof::link::BUS_CANDIDATES;
+
+#[cfg(target_os = "linux")]
+#[path = "imu_interrupt.rs"]
+mod interrupt;
+
+pub struct Int1Line {
+    pub chip: PathBuf,
+    pub line: u32,
+}
 
 /// Madgwick convergence rate. 0.1 is the crate's recommended starting point: fast enough to track
 /// a walking head, slow enough not to chase gyro noise.
@@ -133,10 +140,15 @@ impl ImuStatus {
 pub fn imu_loop(
     bus: Option<&Path>,
     hz: u8,
+    int1: Option<Int1Line>,
     status: &ImuStatus,
     frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
     shutdown: &Arc<AtomicBool>,
 ) {
+    if let Some(line) = int1 {
+        interrupt::run(bus, hz, &line, status, frames, shutdown);
+        return;
+    }
     let started = Instant::now();
     let period = Duration::from_secs_f64(1.0 / f64::from(hz.max(1)));
     let mut seq = 0u64;
@@ -193,6 +205,7 @@ pub fn imu_loop(
                         accel,
                         quat,
                         temp_c,
+                        timing: None,
                     });
                 }
                 Err(e) => {
@@ -222,10 +235,21 @@ pub fn imu_loop(
 pub fn imu_loop(
     _bus: Option<&Path>,
     _hz: u8,
+    int1: Option<Int1Line>,
     status: &ImuStatus,
     _frames: &tokio::sync::broadcast::Sender<proto::HeadImuFrame>,
     _shutdown: &Arc<AtomicBool>,
 ) {
+    if let Some(line) = int1 {
+        // Use the fields here too: requesting an IRQ on a laptop is an explicit unavailable
+        // path, not a reason to silently substitute polling timestamps.
+        status.lost(format!(
+            "head IMU INT1 at {}:{} requires Linux",
+            line.chip.display(),
+            line.line
+        ));
+        return;
+    }
     status.lost("the head IMU is on an I2C bus, which exists only on Linux".to_owned());
 }
 

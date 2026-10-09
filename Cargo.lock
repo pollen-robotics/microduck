@@ -1775,6 +1775,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpiocdev"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a6009ef6766dd62a7f5933d379d357ae89eaee4e9c2455b6596f359627660a1"
+dependencies = [
+ "gpiocdev-uapi",
+ "thiserror",
+]
+
+[[package]]
+name = "gpiocdev-uapi"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb1a3ace06ef708255a33e738ec7a5e7718fe8e53bd9a39299b4f1cd4b13e9a3"
+dependencies = [
+ "bitflags 2.13.1",
+ "ioctl-sys",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
 name = "gstreamer"
 version = "0.24.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2377,6 +2399,12 @@ dependencies = [
  "core-foundation-sys",
  "mach2",
 ]
+
+[[package]]
+name = "ioctl-sys"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bd11f3a29434026f5ff98c730b668ba74b1033637b8817940b54d040696133c"
 
 [[package]]
 name = "ipnet"
@@ -4703,13 +4731,17 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "tof"
 version = "0.16.1"
 dependencies = [
+ "ahrs",
  "anyhow",
  "bmi088",
  "cc",
  "clap",
  "duck-ipc-proto",
+ "embedded-hal",
+ "gpiocdev",
  "libc",
  "linux-embedded-hal",
+ "nalgebra",
  "robotd-params",
  "serde",
  "serde_json",

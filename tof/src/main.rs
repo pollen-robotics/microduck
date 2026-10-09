@@ -40,6 +40,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 mod config;
 mod imu;
+#[cfg(any(target_os = "linux", test))]
+mod imu_timing;
 mod status;
 use imu::ImuStatus;
 use status::Status;
@@ -130,9 +132,18 @@ struct Args {
     #[arg(long)]
     fake: bool,
 
-    /// Head-IMU (BMI088) sample rate, Hz. The chip's default bandwidth is 100 Hz.
+    /// Head-IMU acquisition rate, Hz. INT1 mode also sets the accelerometer ODR.
     #[arg(long, default_value_t = 100)]
     imu_hz: u8,
+
+    /// GPIO chip carrying BMI088 accelerometer INT1. With --imu-int1-line, opt into
+    /// data-ready acquisition; without both options the existing polling path is unchanged.
+    #[arg(long, requires = "imu_int1_line")]
+    imu_int1_gpiochip: Option<PathBuf>,
+
+    /// Line offset within --imu-int1-gpiochip, not a physical header-pin number.
+    #[arg(long, requires = "imu_int1_gpiochip")]
+    imu_int1_line: Option<u32>,
 
     /// Read the head IMU for this session, whatever `[head_imu] enabled` says.
     ///
@@ -274,11 +285,23 @@ async fn main() -> std::process::ExitCode {
             (imu_status.clone(), imu_frames.clone(), shutdown.clone());
         let bus = args.bus.clone();
         let hz = args.imu_hz;
+        let int1 = args
+            .imu_int1_gpiochip
+            .clone()
+            .zip(args.imu_int1_line)
+            .map(|(chip, line)| imu::Int1Line { chip, line });
         Some(
             std::thread::Builder::new()
                 .name("head-imu".to_owned())
                 .spawn(move || {
-                    imu::imu_loop(bus.as_deref(), hz, &imu_status, &imu_frames, &shutdown)
+                    imu::imu_loop(
+                        bus.as_deref(),
+                        hz,
+                        int1,
+                        &imu_status,
+                        &imu_frames,
+                        &shutdown,
+                    )
                 })
                 .expect("spawn the head-imu thread"),
         )
@@ -850,6 +873,37 @@ async fn write_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_wiring_must_be_a_complete_pair_and_old_arguments_still_select_polling() {
+        let defaults = Args::try_parse_from(["tofd"]).unwrap();
+        assert_eq!(
+            defaults.imu_hz, 100,
+            "keep the upstream acquisition default"
+        );
+        assert!(defaults.imu_int1_gpiochip.is_none());
+        assert!(defaults.imu_int1_line.is_none());
+        let polling = Args::try_parse_from(["tofd", "--imu", "--imu-hz", "25"]).unwrap();
+        assert!(polling.imu_int1_gpiochip.is_none());
+        assert!(polling.imu_int1_line.is_none());
+        assert_eq!(polling.imu_hz, 25);
+        assert!(Args::try_parse_from(["tofd", "--imu-int1-gpiochip", "/dev/gpiochip3"]).is_err());
+        assert!(Args::try_parse_from(["tofd", "--imu-int1-line", "8"]).is_err());
+        let interrupt = Args::try_parse_from([
+            "tofd",
+            "--imu",
+            "--imu-int1-gpiochip",
+            "/dev/gpiochip3",
+            "--imu-int1-line",
+            "8",
+        ])
+        .unwrap();
+        assert_eq!(interrupt.imu_int1_line, Some(8));
+        assert_eq!(
+            interrupt.imu_int1_gpiochip.as_deref(),
+            Some(Path::new("/dev/gpiochip3"))
+        );
+    }
 
     /// **A connection that has asked for nothing wants nothing**, and one that asked for depth
     /// does not want the IMU. `accept` used to subscribe to both channels before reading a byte
