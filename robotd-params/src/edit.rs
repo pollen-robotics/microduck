@@ -1114,6 +1114,7 @@ mod tests {
                 "theremin",
                 "head_imu",
                 "audio",
+                "emotions",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.

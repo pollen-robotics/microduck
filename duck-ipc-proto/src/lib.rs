@@ -2901,7 +2901,8 @@ pub struct SubscribeResult {
     pub ground_pick: Option<String>,
     /// The configurable one-shot skills this robot has, in priority order, and the names
     /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
-    /// has is now config: a client learns them here instead of assuming five.
+    /// has is now config: a client learns them here instead of assuming five. The emotions in
+    /// `[emotions] dir` come last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }

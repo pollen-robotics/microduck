@@ -127,7 +127,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "theremin"
-        | "pickup" | "audio" => Apply::Restart("robotd"),
+        | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
     })
 }

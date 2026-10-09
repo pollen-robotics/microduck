@@ -982,7 +982,7 @@ arithmetic, it was that nothing read the answer.
 
 ### 4.5 What else the loop drives, and why none of it has a design page
 
-`robotd` grew four subsystems after slice 2 that are not control and not safety. They share a
+`robotd` grew five subsystems after slice 2 that are not control and not safety. They share a
 shape: each hangs off the tick, none may block it, and none can reach the bus except through the
 intents the loop already arbitrates.
 
@@ -991,6 +991,7 @@ intents the loop already arbitrates.
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
+| `emotion.rs` | an emotion = keyframes and a wav from `[emotions] dir`, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 
 Plus `soc.rs`, which reads the board's own thermal zones and clock ceiling out of `sysfs` — not

@@ -72,6 +72,7 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub emotions: EmotionsParams,
     pub theremin: ThereminParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
@@ -1079,6 +1080,23 @@ impl AudioParams {
             Some(p) if is_none_sentinel(p) => None,
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
+}
+
+/// `[emotions]` — where the emotions `robot.do` plays are kept: `<name>.json` keyframes and
+/// `<name>.wav` beside them. Read once at startup; a directory that is not there is a robot with
+/// no emotions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmotionsParams {
+    pub dir: PathBuf,
+}
+
+impl Default for EmotionsParams {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/robot/emotions"),
         }
     }
 }
