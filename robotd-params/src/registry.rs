@@ -439,6 +439,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "…and ends below this one (hysteresis)",
     ),
+    // ── [emotions] ───────────────────────────────────────────────────────────
+    entry(
+        "emotions.dir",
+        Kind::Text,
+        "Emotions robot.do plays: <name>.json keyframes and <name>.wav",
+    ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
         "media.source",

@@ -34,6 +34,9 @@ const THEREMIN_UP: u8 = 1;
 const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
+
+/// "No emotion pending" in [`Intents::emotion`].
+const EMOTION_NONE: u32 = u32::MAX;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -172,6 +175,9 @@ pub struct Intents {
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
+    /// A pending emotion, by its index in the loaded library, or [`EMOTION_NONE`]. The last
+    /// request wins, as with the mode switch.
+    emotion: std::sync::atomic::AtomicU32,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
     /// A rest was requested: the shutdown's sit and rest pose, ending limp instead of powered off.
@@ -286,6 +292,7 @@ impl Intents {
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
+            emotion: std::sync::atomic::AtomicU32::new(EMOTION_NONE),
             shutdown: AtomicBool::new(false),
             rest: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
@@ -352,6 +359,23 @@ impl Intents {
             1 << (index + SKILL_BITS),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Queue an emotion by its index in the loaded library — see `emotion`.
+    pub fn request_emotion(&self, index: usize) {
+        self.emotion
+            .store(index as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the pending emotion, if any.
+    pub fn take_emotion(&self) -> Option<usize> {
+        match self
+            .emotion
+            .swap(EMOTION_NONE, std::sync::atomic::Ordering::Relaxed)
+        {
+            EMOTION_NONE => None,
+            index => Some(index as usize),
+        }
     }
 
     /// Take the pending skill requests, leaving none. Once per tick, like the power request.

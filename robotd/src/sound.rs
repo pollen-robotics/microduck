@@ -302,9 +302,32 @@ impl Sound {
             }
             return;
         };
+        self.spawn(&wav, blocking);
+    }
+
+    /// Play one wav file the way [`Self::play`] plays a bank sound: an emotion's own sound,
+    /// which is a file beside its keyframes rather than a tag in the bank.
+    pub fn play_file(&mut self, wav: &Path) {
+        if self.ride != Ride::Off {
+            tracing::debug!(wav = %wav.display(), "sound skipped: the wheee ride has the PCM");
+            return;
+        }
+        self.stop_child();
+        self.spawn(wav, false);
+    }
+
+    /// Cut a one-shot short: an emotion's sound when the emotion is. Never a ride, a theremin or
+    /// a chorale, which hold the PCM for reasons of their own.
+    pub fn stop(&mut self) {
+        if self.ride == Ride::Off {
+            self.stop_child();
+        }
+    }
+
+    fn spawn(&mut self, wav: &Path, blocking: bool) {
         let child = Command::new("aplay")
             .args(["-q", "-D", &self.device])
-            .arg(&wav)
+            .arg(wav)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -312,7 +335,7 @@ impl Sound {
         match child {
             Ok(mut c) if blocking => wait_bounded(&mut c, BLOCKING_PLAY_MAX),
             Ok(c) => self.child = Some(c),
-            Err(e) => tracing::debug!(error = %e, tag, "aplay failed"),
+            Err(e) => tracing::debug!(error = %e, wav = %wav.display(), "aplay failed"),
         }
     }
 

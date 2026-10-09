@@ -20,6 +20,7 @@
 
 mod chorale;
 mod control;
+mod emotion;
 mod head_imu;
 mod idle_head;
 mod intents;
@@ -655,6 +656,9 @@ struct RobotState {
     /// accepting it into silence. Read once at startup, like the policies: the postinstall
     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
     has_voice: bool,
+    /// The emotions `robot.do` plays, from `[emotions] dir`. Read once at startup, like the voice
+    /// bank: adding one is copying its files and restarting this daemon.
+    emotions: emotion::Library,
     /// Whether a theremin can be picked up: the params allow one, and the depth stream is
     /// actually delivering frames. Published by the loop rather than read once at startup,
     /// because unlike a voice bank the sensor comes and goes — `tofd` restarts, the ToF
@@ -753,6 +757,7 @@ impl RobotState {
             policy_enabled: params.policy.enabled,
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
+            emotions: emotion::Library::load(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
@@ -2238,6 +2243,8 @@ async fn control_loop<T: RobotIo>(
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
     let mut chorale_head = [0.0f64; 4];
+    // The emotion being played, if any — see `emotion`.
+    let mut playing: Option<emotion::Playing> = None;
     // The robot looking around while nothing is happening — see `idle_head`. Seeded from the
     // clock, so two robots side by side do not glance in step.
     let mut idle_head = idle_head::IdleHead::new(
@@ -2347,7 +2354,17 @@ async fn control_loop<T: RobotIo>(
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
-        let snapshot = intents.snapshot();
+        let mut snapshot = intents.snapshot();
+        // An emotion in progress has the head, the body and the beak, and holds the robot still.
+        if let Some(p) = playing.as_ref() {
+            match p.frame(tick_start) {
+                Some(frame) => frame.apply(&mut snapshot),
+                None => {
+                    tracing::info!(emotion = %p.name, "emotion over");
+                    playing = None;
+                }
+            }
+        }
         let (gated, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
@@ -2511,6 +2528,47 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
+            }
+        }
+
+        // Emotions, like the skills above: started on a robot the policy drove last tick with no
+        // move in flight, and over the moment that stops being true, sound included. One at a
+        // time: a request while one plays is dropped. X re-sends while held, so an emotion on X
+        // plays again when it ends, the way a chaining skill would.
+        let can_emote = was_driving && shutdown_sit.is_none() && !safety.fallen();
+        if let Some(index) = intents.take_emotion()
+            && let Some((name, wanted)) = state.emotions.get(index)
+        {
+            if playing.is_some() {
+                tracing::debug!(emotion = name, "emotion dropped: one is playing");
+            } else if can_emote && controller.as_ref().is_some_and(|c| !c.busy()) {
+                tracing::warn!(emotion = name, "emotion started");
+                if let (Some(voice), Some(wav)) = (voice.as_mut(), wanted.sound()) {
+                    voice.play_file(wav);
+                }
+                playing = Some(emotion::Playing::start(
+                    name,
+                    Arc::clone(wanted),
+                    tick_start,
+                ));
+            } else {
+                tracing::debug!(emotion = name, "emotion refused: not driving, or busy");
+            }
+        }
+        if playing.is_some() && !can_emote {
+            playing = None;
+            if let Some(voice) = voice.as_mut() {
+                voice.stop();
+            }
+        }
+        if let Some(p) = playing.as_mut()
+            && p.sit_due(tick_start)
+            && let Some(c) = controller.as_mut()
+            && !c.is_sitting()
+        {
+            match c.sit_toggle() {
+                Ok(_) => tracing::info!(emotion = %p.name, "emotion: sitting down"),
+                Err(reason) => tracing::info!(emotion = %p.name, reason, "emotion: sit refused"),
             }
         }
 
@@ -4717,7 +4775,7 @@ fn ramp_target(
 fn pad_bindings_report(config: &std::path::Path, state: &RobotState) -> proto::PadBindingsResult {
     let bindings = params::edit::pad_bindings(config).unwrap_or_default();
     let defaults = params::PadParams::default();
-    let known = do_names(&state.policies.load());
+    let known = do_names(&state.policies.load(), &state.emotions);
 
     proto::PadBindingsResult {
         bindings: params::PadParams::BUTTONS
@@ -4764,7 +4822,7 @@ fn bind_pad_request(p: &proto::PadBindParams, state: &RobotState) -> proto::Inte
     };
 
     if !wanted.is_empty() {
-        let known = do_names(&state.policies.load());
+        let known = do_names(&state.policies.load(), &state.emotions);
         if !known.iter().any(|s| s == wanted) {
             return proto::IntentResult::refused(format!(
                 "this robot has no skill called {wanted:?} — it has {}",
@@ -4926,7 +4984,10 @@ fn load_policy_request(
 ///
 /// Both are conditional on the policy behind them being loaded, because a robot whose `sitstand`
 /// slot is switched off genuinely cannot sit.
-fn do_names(policies: &PolicyNames) -> Vec<String> {
+///
+/// The emotions come last: a policy skill of the same name wins, because it is the one
+/// [`queue_skill`] finds first.
+fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if policies.ground_pick.is_some() {
         names.push("ground_pick".to_owned());
@@ -4935,6 +4996,7 @@ fn do_names(policies: &PolicyNames) -> Vec<String> {
         names.push("sit_toggle".to_owned());
     }
     names.extend(policies.skills.iter().cloned());
+    names.extend(emotions.names().map(str::to_owned));
     names
 }
 
@@ -4954,7 +5016,13 @@ fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
                 intents.request_skill(index);
                 true
             }
-            None => false,
+            None => match state.emotions.index(name) {
+                Some(index) => {
+                    intents.request_emotion(index);
+                    true
+                }
+                None => false,
+            },
         },
     }
 }
@@ -5023,7 +5091,7 @@ fn dispatch(
             } else if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
             } else {
-                let known = do_names(&state.policies.load());
+                let known = do_names(&state.policies.load(), &state.emotions);
                 proto::IntentResult::refused(if known.is_empty() {
                     "this robot has no skills configured".to_owned()
                 } else {
@@ -5295,7 +5363,14 @@ fn dispatch(
                     stand: policies.stand.clone(),
                     sitstand: policies.sitstand.clone(),
                     ground_pick: policies.ground_pick.clone(),
-                    skills: policies.skills.clone(),
+                    // The emotions too: this list is the names `robot.do` answers to, and it is
+                    // what `robotctl pad bind` checks a name against.
+                    skills: policies
+                        .skills
+                        .iter()
+                        .cloned()
+                        .chain(state.emotions.names().map(str::to_owned))
+                        .collect(),
                     unavailable: state.policy_error.load_full().map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
@@ -5799,21 +5874,27 @@ mod tests {
     /// config entries, so they are absent from `skills` while being perfectly good asks.
     #[test]
     fn the_daemon_driven_skills_count_as_skills() {
-        let names = do_names(&PolicyNames {
-            ground_pick: Some("alpha_ground_pick.onnx".to_owned()),
-            sitstand: Some("alpha_sitstand.onnx".to_owned()),
-            skills: vec!["roulade".to_owned()],
-            ..Default::default()
-        });
+        let names = do_names(
+            &PolicyNames {
+                ground_pick: Some("alpha_ground_pick.onnx".to_owned()),
+                sitstand: Some("alpha_sitstand.onnx".to_owned()),
+                skills: vec!["roulade".to_owned()],
+                ..Default::default()
+            },
+            &emotion::Library::default(),
+        );
         assert_eq!(names, ["ground_pick", "sit_toggle", "roulade"]);
 
         // And a slot switched off takes its name away, because that robot really cannot sit.
-        let without = do_names(&PolicyNames {
-            ground_pick: None,
-            sitstand: None,
-            skills: vec!["roulade".to_owned()],
-            ..Default::default()
-        });
+        let without = do_names(
+            &PolicyNames {
+                ground_pick: None,
+                sitstand: None,
+                skills: vec!["roulade".to_owned()],
+                ..Default::default()
+            },
+            &emotion::Library::default(),
+        );
         assert_eq!(without, ["roulade"]);
     }
 
@@ -6646,6 +6727,55 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+    }
+
+    /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the
+    /// names a button is bound against — on this side and in the subscribe answer `robotctl pad
+    /// bind` checks. Missing either is a button refused for an emotion the robot plays fine.
+    #[test]
+    fn robot_do_queues_an_emotion_and_lists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("yes.json"),
+            r#"{"keyframes": [{"t": 0.0}]}"#,
+        )
+        .unwrap();
+        let mut params = Params::default();
+        params.emotions.dir = dir.path().to_owned();
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Intents::new();
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
+
+        let accepted: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: "yes".into(),
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(accepted.accepted);
+        assert_eq!(intents.take_emotion(), Some(0));
+        assert_eq!(intents.take_skills().skills, 0, "not a policy skill");
+
+        assert!(do_names(&s.policies.load(), &s.emotions).contains(&"yes".to_owned()));
+        let ack: proto::SubscribeResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(2),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(1) }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(ack.skills.contains(&"yes".to_owned()), "{:?}", ack.skills);
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via

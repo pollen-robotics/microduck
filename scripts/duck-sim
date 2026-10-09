@@ -261,6 +261,11 @@ bank = "$STATE/sounds/DUCK"
 # words were being executed, and "plughw:aic3104: not found" is a confusing thing to read.
 device = "default"
 
+# The emotions robot.do plays, a NAME.json and a NAME.wav each. On a board they are in
+# /var/lib/robot/emotions; here, copy them into this directory before starting.
+[emotions]
+dir = "$STATE/emotions"
+
 # Its own depth sensor. On a board this is /run/tofd/tof.sock and needs no saying; here every duck
 # has one and they must not share.
 [theremin]

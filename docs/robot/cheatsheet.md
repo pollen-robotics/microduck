@@ -364,6 +364,30 @@ picks what the sticks mean, and held Select cuts torque and powers the robot off
 being able to lose to a config edit. A name is checked against what the robot actually has, so a
 typo is refused with the list rather than becoming a dead button.
 
+#### Emotions
+
+An emotion is a head, body and beak animation with its sound: a nod, a sigh, a laugh. Each is two
+files in `/var/lib/robot/emotions/`, `<name>.json` (keyframes) and `<name>.wav`, and its name is a
+skill like any other. The set made for Microduck is `robot/emotions/` in
+[microduck_emotions](https://github.com/pollen-robotics/microduck_emotions):
+
+```
+scp -r robot/emotions <you>@<duck>:/tmp/
+sudo mkdir -p /var/lib/robot/emotions && sudo cp /tmp/emotions/* /var/lib/robot/emotions/
+sudo systemctl restart robotd
+```
+
+```
+robotctl robot do sad
+sudo robotctl pad bind y sad
+```
+
+While one plays it has the head, the body pose and the beak, the sticks wait, and another request
+is dropped until it ends; on X, which re-sends while held, it plays again for as long as X is held.
+A keyframe with `"skill": "sit"` sits the robot down (devastated); it stays seated, and the sit
+toggle stands it up. The directory is read once at startup, so new files need the restart;
+`[emotions] dir` moves it, and in the simulator it is `~/.cache/duck-sim/emotions`.
+
 #### Putting it all back
 
 ```
