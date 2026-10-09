@@ -99,6 +99,47 @@ in the monitor and the head use one filter, so where the drawn pad points is whe
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
 to fix it.
 
+## When the left stick and buttons work but the right stick and triggers do nothing
+
+The pad is connected and `padd` is driving, so nothing is wrong with the link — but turning, the
+mouth and the head ignore the pad. `padd` says why when the pad connects:
+
+```bash
+robotctl logs padd
+```
+
+```
+WARN padd: pad has no SDL mapping, so its sticks and triggers will mostly not read — add one with
+SDL_GAMECONTROLLERCONFIG (docs/robot/pair-a-gamepad.md) pad="Xbox Wireless Controller"
+guid=050000005e040000130b000023050000
+```
+
+`gilrs`, the library `padd` reads the pad with, learns which evdev axis is which stick from an SDL
+mapping it looks up by the pad's GUID — and on Linux that GUID contains the pad's **firmware
+version**. A pad on a firmware nobody has added to the database falls back to a default layout
+that has this pad's right stick as a trigger and its triggers as nothing. The left stick and the
+buttons still work, which is what makes it look like a pad that is merely unresponsive.
+
+An Xbox Wireless Controller over Bluetooth is covered for every 5.xx firmware, so this should not
+happen to one. For any other pad, put its mapping in `padd`'s environment. The `guid` in the log
+line is the first field of a mapping, and `SDL_GameControllerDB` has the rest for most pads:
+
+```bash
+sudo systemctl edit padd
+```
+
+```ini
+[Service]
+Environment="SDL_GAMECONTROLLERCONFIG=<guid>,<pad name>,a:b0,b:b1,...,platform:Linux,"
+```
+
+```bash
+sudo systemctl restart padd
+```
+
+Moving the sticks while `robotctl monitor` shows the pad block (`p`) tells you which axis a stick
+is on, so you can write the mapping if the database does not have one.
+
 ## Forget one
 
 ```bash

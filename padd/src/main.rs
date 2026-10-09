@@ -97,7 +97,9 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use duck_ipc_proto as proto;
-use gilrs::{Axis, Button, Gilrs};
+use gilrs::{Axis, Button, GilrsBuilder, MappingSource};
+
+mod mappings;
 
 #[cfg(target_os = "linux")]
 mod tap;
@@ -506,7 +508,12 @@ fn main() -> std::process::ExitCode {
     // exactly that question across all five.
     duck_ipc_proto::log_startup_identity!("padd");
 
-    let mut gilrs = match Gilrs::new() {
+    // Mappings for pads `gilrs` ships none for, handed over *before* its own database so the
+    // database still wins wherever it knows a pad — see `mappings` for why a pad can be missing.
+    let mut gilrs = match GilrsBuilder::new()
+        .add_mappings(&mappings::xbox_series_ble())
+        .build()
+    {
         Ok(gilrs) => gilrs,
         Err(e) => {
             tracing::error!(error = %e, "no gamepad subsystem");
@@ -726,6 +733,24 @@ fn main() -> std::process::ExitCode {
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
+            // `gilrs` says "No mapping found for UUID" once, without the pad's name or what it costs.
+            // A pad it has no layout for still moves its left stick and presses its buttons, and
+            // looks like one that is merely unresponsive: the right stick and triggers are the part
+            // that goes missing.
+            match pad.mapping_source() {
+                MappingSource::SdlMappings => {}
+                MappingSource::Driver => tracing::info!(
+                    pad = pad.name(),
+                    guid = %mappings::guid_text(pad.uuid()),
+                    "pad has no SDL mapping; using gilrs's default layout"
+                ),
+                MappingSource::None => tracing::warn!(
+                    pad = pad.name(),
+                    guid = %mappings::guid_text(pad.uuid()),
+                    "pad has no SDL mapping, so its sticks and triggers will mostly not read — \
+                     add one with SDL_GAMECONTROLLERCONFIG (docs/robot/pair-a-gamepad.md)"
+                ),
+            }
             if pad_loss.found() {
                 sound(&mut stream, proto::SoundTag::Greet);
             }
