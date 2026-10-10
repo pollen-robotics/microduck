@@ -612,6 +612,13 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
             .unwrap_or_else(|| "the robot refused".to_owned());
         return Err(Failure::new(exit::REFUSED, reason));
     }
+    // A pad quack opens the beak — either trigger holds the mouth for the press — so a quack
+    // over the wire reads the same way: beak open for the length of a chirp, then shut. The
+    // mouth is a never-refused intent, so a duck that cannot move it still quacks as before.
+    const BEAK_OPEN: Duration = Duration::from_millis(400);
+    let _ = client.call(&proto::Call::RobotMouth(proto::MouthParams { open: 1.0 }));
+    std::thread::sleep(BEAK_OPEN);
+    let _ = client.call(&proto::Call::RobotMouth(proto::MouthParams { open: 0.0 }));
     println!("🦆");
     Ok(())
 }
