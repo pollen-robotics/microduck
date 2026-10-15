@@ -634,6 +634,10 @@ async fn serve(args: Args) -> ExitCode {
     // unless something renews it. `docs/design/remote-access-design.md` §2.7.
     server.spawn_account_maintenance();
 
+    // Unconditional too: the post-install hook may have failed to move the policy set up to this
+    // release's pin on a slow link, and nothing else would retry before the next release.
+    server.spawn_policy_floor();
+
     // The scheduler is what makes `min_supported` effective: without it the floor is
     // inert, because a robot only learns of it when someone opens the app.
     match check_interval {

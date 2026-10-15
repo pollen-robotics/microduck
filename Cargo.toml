@@ -46,8 +46,9 @@ runtime = "v2.3.2"
 # should not re-ship six megabytes of unchanged weights.
 #
 # Same shape as the three pins above and for the same reason: `scripts/seed-policies.sh` runs from
-# inside a release and cannot read this file, so it carries the literals and a test asserts the
-# two agree.
+# inside a release and cannot read this file, so it carries the literals — as does `updaterd`
+# (`updater::policy::FLOOR_*`), which finishes a move the hook ran out of time for — and a test
+# asserts the three agree.
 #
 # `version` is a tag in the Hub repo, and it is a *minimum*: what a freshly provisioned board
 # installs, and the oldest official set this daemon's defaults load — a board below it is moved

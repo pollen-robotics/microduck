@@ -112,6 +112,29 @@ impl Source {
     }
 }
 
+/// The oldest official set this daemon runs with: `[workspace.metadata.policies]` in Cargo.toml.
+///
+/// `scripts/seed-policies.sh` carries the same pin and moves a board up to it from the
+/// post-install hook, but that hook gives each file eight seconds so that it fits under its own
+/// timeout — and a board on a slow link fails that and keeps the old set until the next release.
+/// So the daemon carries it too, and [`below_floor`] is what `updaterd` checks after starting, to
+/// finish the move on its own time. An xtask test holds the three copies together.
+pub const FLOOR_REPO: &str = "pollen-robotics/microduck-policies";
+pub const FLOOR_VERSION: &str = "v8";
+
+/// Whether the installed set is ours and older than [`FLOOR_VERSION`] — the seeder's rule for a
+/// set to move up, and nothing wider: a set past the pin, from another repo, with no `.source`
+/// record, or whose version is not a number is left where it is.
+pub fn below_floor(root: &Path) -> bool {
+    let Some(source) = installed(root) else {
+        return false;
+    };
+    match (version_of(&source.version), version_of(FLOOR_VERSION)) {
+        (Some(have), Some(want)) => source.repo == FLOOR_REPO && have < want,
+        _ => false,
+    }
+}
+
 /// The set `current` points at, and what it says about itself.
 pub fn installed(root: &Path) -> Option<Source> {
     let text = std::fs::read_to_string(root.join("current").join(SOURCE_FILE)).ok()?;
@@ -1051,6 +1074,36 @@ mod tests {
             installed_files(root),
             vec!["alpha_walking.onnx".to_string()],
             "but the policies are plainly there"
+        );
+    }
+
+    /// Only our set, and only below the pin, is moved up — the seeder's rule, so the hook and the
+    /// daemon never disagree about which boards they are for.
+    #[test]
+    fn only_our_set_below_the_pin_is_below_the_floor() {
+        let at = |repo: &str, version: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let set = dir.path().join("releases/seed-x");
+            std::fs::create_dir_all(&set).unwrap();
+            std::fs::write(
+                set.join(SOURCE_FILE),
+                format!("repo={repo}\nversion={version}\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("releases/seed-x", dir.path().join("current")).unwrap();
+            below_floor(dir.path())
+        };
+        assert!(at(FLOOR_REPO, "v1"));
+        assert!(!at(FLOOR_REPO, FLOOR_VERSION));
+        assert!(
+            !at(FLOOR_REPO, "v999"),
+            "past the pin: moved there on purpose"
+        );
+        assert!(!at("someone/else", "v1"), "not ours");
+        assert!(!at(FLOOR_REPO, "bouncy"), "not a version");
+        assert!(
+            !below_floor(tempfile::tempdir().unwrap().path()),
+            "nothing installed"
         );
     }
 }

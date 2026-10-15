@@ -1187,7 +1187,7 @@ mod tests {
         }
     }
 
-    /// **The pin is in two places and they must agree.** `seed-policies.sh` runs from inside a
+    /// **The pin is in three places and they must agree.** `seed-policies.sh` runs from inside a
     /// release and cannot read Cargo.toml, so it carries the repo and the version as literals —
     /// the same trap `setup-gstreamer.sh` and `setup-board.sh` already carry, where a drift is a
     /// board running weights nobody can name.
@@ -1208,6 +1208,18 @@ mod tests {
             assert!(
                 script.contains(&expected),
                 "seed-policies.sh must carry the line {expected:?}"
+            );
+        }
+
+        // And `updaterd`, which finishes a move to the pin the post-install hook could not.
+        let updater = std::fs::read_to_string(root.join("updater/src/policy.rs")).unwrap();
+        for expected in [
+            format!("pub const FLOOR_VERSION: &str = \"{version}\";"),
+            format!("pub const FLOOR_REPO: &str = \"{repo}\";"),
+        ] {
+            assert!(
+                updater.contains(&expected),
+                "updater/src/policy.rs must carry the line {expected:?}"
             );
         }
     }

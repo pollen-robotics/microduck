@@ -97,6 +97,12 @@ impl PeerPolicy {
     }
 }
 
+/// The pin's first retry after a failed install, doubling up to the second. Short enough that a
+/// board whose Wi-Fi was only briefly bad is caught up within minutes, long enough not to spend an
+/// evening hammering the Hub from a board that cannot reach it.
+const POLICY_FLOOR_FIRST_RETRY: Duration = Duration::from_secs(60);
+const POLICY_FLOOR_MAX_RETRY: Duration = Duration::from_secs(30 * 60);
+
 pub struct Server {
     /// Held by whichever task is running a mutating operation. Read-only requests
     /// use `try_lock` so they stay answerable while that happens.
@@ -311,6 +317,60 @@ impl Server {
     /// still has an account that stops working after thirty days.
     pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
+    }
+
+    /// Move a policy set below this daemon's pin up to it, retrying until it lands.
+    ///
+    /// The post-install hook tries first (`scripts/seed-policies.sh`), but with eight seconds a
+    /// file so that it fits under the hook's timeout; on a slow link that fails, the board keeps
+    /// its old set, and nothing would try again until the next release. This has no deadline: it
+    /// takes the engine as `policy.install` does, so it never overlaps an update or an install
+    /// somebody asked for, and backs off between attempts. A board at or past the pin — the
+    /// common case, and every board after one success — returns at once without a request.
+    pub fn spawn_policy_floor(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            let root = Path::new(crate::policy::POLICY_ROOT);
+            let mut wait = POLICY_FLOOR_FIRST_RETRY;
+            while crate::policy::below_floor(root) {
+                let attempt = match server.engine.try_lock() {
+                    // Asked again under the lock: a `policy update` that finished while this
+                    // waited may have moved the board past the pin, and must not be undone.
+                    Ok(engine) if crate::policy::below_floor(root) => {
+                        tracing::warn!(
+                            pin = crate::policy::FLOOR_VERSION,
+                            "the policy set is below this daemon's pin; installing it"
+                        );
+                        Some(
+                            engine
+                                .install_policies(Some(crate::policy::FLOOR_VERSION))
+                                .await,
+                        )
+                    }
+                    Ok(_) => return,
+                    Err(_) => None,
+                };
+                match attempt {
+                    Some(Ok(result)) => {
+                        tracing::warn!(
+                            installed = %result.installed,
+                            previous = ?result.previous,
+                            reloaded = result.reloaded,
+                            "policy set moved up to this daemon's pin"
+                        );
+                        return;
+                    }
+                    Some(Err(e)) => tracing::warn!(
+                        error = %e,
+                        retry_in_secs = wait.as_secs(),
+                        "could not install the pinned policy set; the robot keeps the one it has"
+                    ),
+                    None => tracing::debug!("policy floor: an update is in progress; waiting"),
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(POLICY_FLOOR_MAX_RETRY);
+            }
+        })
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for

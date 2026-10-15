@@ -66,7 +66,8 @@ FALLBACK_FILES="velstand.onnx alpha_sitstand.onnx alpha_ground_pick.onnx ball_ki
 # Per-file, because `hooks/postinstall` runs inside an update under a 120-second hook timeout and
 # a hook that times out fails the update and rolls it back. Ten files at eight seconds is 80,
 # which leaves the rest of the hook room; a link that cannot move 800 KB in eight seconds is one
-# the fallback below is for, and the next update tries again.
+# the fallback below is for, and `updaterd` finishes the move once it is running, with no deadline
+# (updater::policy::below_floor).
 CURL_OPTS="--fail --location --silent --show-error --connect-timeout 5 --max-time 8"
 
 # Where a set came from, written beside it.
@@ -176,7 +177,8 @@ done
 if [ "$ok" = no ]; then
     # Nothing partial ever goes live, and nothing already installed is disturbed. A half-published
     # revision or a link that was down leaves the board exactly as it was — on the previous set if
-    # it has one, with none if it does not — and the pin is retried at the next update. A board
+    # it has one, with none if it does not — and `updaterd` retries the pin in the background once
+    # the update is done (`spawn_policy_floor`), without this hook's timeout. A board
     # below the minimum that stays there is one whose daemon cannot load its default gait; robotd
     # then reports unhealthy and the update rolls back, which is the honest outcome and the
     # message above is the reason.

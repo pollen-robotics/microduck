@@ -279,7 +279,7 @@ needs and a release has no business carrying. The duck detector followed the sam
 release — `scripts/seed-detector.sh`, `/opt/robot/detector/current`, `robotctl duck-detector
 check/update`, a pin in `[workspace.metadata.detector]` — with a fixed file list in place of the
 manifest, since its two files have fixed names (`docs/project/npu-bringup.md`). The pin lives in `[workspace.metadata.policies]`
-and as literals in the script, with a test asserting they agree — `setup-gstreamer.sh`'s trap,
+and as literals in the script and in `updaterd` (below), with a test asserting they agree — `setup-gstreamer.sh`'s trap,
 because a script that runs from inside a release cannot read the manifest.
 
 **The pin is a minimum, not a ceiling**, and that distinction is load-bearing. It ships inside
@@ -299,8 +299,18 @@ is unchanged touches no network — which matters because the post-install hook 
 120-second timeout and a hook that times out rolls the update back. It never installs a partial
 download: everything lands in a staging directory and `current` moves only once the whole set has
 arrived. And it does not replace a working set with an older one when a fetch fails — a
-half-published revision leaves the board on the gait it had, and the pin is retried at the next
-update.
+half-published revision leaves the board on the gait it had.
+
+**`updaterd` finishes what the hook could not.** The hook gives each file eight seconds so that it
+fits under its own timeout, and a slow link does not: graphite-skaterboi on bad Wi-Fi moved 82 KB
+of a 794 KB file in that time, kept v5 under a release pinned to v8, and nothing would have tried
+again before the next release. So the daemon carries the pin too (`updater::policy::FLOOR_*`, a
+third copy the same xtask test holds to Cargo.toml), and after every start a background task
+installs it when the set is ours and below it — the seeder's rule exactly, so the two never
+disagree about which boards they are for. It has no deadline, takes the engine lock as
+`policy.install` does so it never overlaps an update, re-reads the set under that lock so a
+`policy update` past the pin is never undone, and backs off from a minute to half an hour between
+failures. A board at or past the pin makes no request at all.
 
 Nothing is signed, and that follows §2 rather than contradicting it: this is the same download a
 person could make, into a directory `robotd` shape-checks everything out of. The shape gate is
