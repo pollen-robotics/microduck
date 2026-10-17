@@ -718,10 +718,12 @@ wait_for_socket() {
 # smallest client that sends one. Resent at 10 Hz because `robotd` expires an intent 500 ms after
 # they stop arriving, which is what makes a dropped connection stop the robot rather than run it
 # into a wall.
+# The pretrained walking policies need ~0.24 m/s to initiate walking
+# from rest. Default to 0.30 m/s for a reliable start.
 drive() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
     say "walking forward for 8 s"
-    python3 - "$SOCK" "${1:-0.15}" "${2:-0.0}" <<'PY'
+    python3 - "$SOCK" "${1:-0.30}" "${2:-0.0}" <<'PY'
 import json, socket, sys, time
 sock, vx, vyaw = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 s = socket.socket(socket.AF_UNIX); s.connect(sock)
