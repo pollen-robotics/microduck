@@ -342,6 +342,9 @@
     <span id="release" class="pill dim">release unknown</span>
     <span id="api" class="pill dim">api unknown</span>
     <span id="signalling" class="pill dim"></span>
+    <!-- The OS update page of a Yocto robot (microduck_yocto's microduck-osupdate, port 8090).
+         Shown only once that port answers, so a robot without it shows nothing. -->
+    <a id="os-update" class="pill" hidden target="_blank" rel="noopener">OS update</a>
   </div>
 
   <div class="row">
@@ -401,6 +404,18 @@ const PARAMS = new URLSearchParams(location.search);
 const REMOTE = PARAMS.get("mode")
   ? PARAMS.get("mode") === "remote"
   : !SERVED_BY_ROBOT && location.protocol === "https:";
+
+// The OS update page lives on the robot itself (port 8090, microduck_yocto's
+// microduck-osupdate), so it is only reachable from a page on the robot's LAN. A
+// no-cors fetch resolves when something answers there and rejects when the port is
+// closed -- a robot without it, or not a Yocto one -- and the link stays hidden.
+// Remote, through the rendezvous, there is no path to that port yet.
+if (SERVED_BY_ROBOT && !REMOTE) {
+  const osUrl = `http://${location.hostname}:8090/`;
+  fetch(osUrl, { mode: "no-cors", cache: "no-store" })
+    .then(() => { const a = document.getElementById("os-update"); a.href = osUrl; a.hidden = false; })
+    .catch(() => {});
+}
 
 // Where this page mints its own relay credentials, addressed as the Space it is rather than
 // through `turn.fastrtc.org` — that alias is a dangling delegation and answers nothing
