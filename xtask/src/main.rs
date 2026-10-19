@@ -90,7 +90,8 @@ enum Command {
         #[arg(long)]
         min_supported: Option<semver::Version>,
 
-        /// Extra files to include, as `src=dest` (e.g. a post-install hook).
+        /// Extra files to include, as `src=dest` (e.g. a post-install hook). A directory is
+        /// every file directly in it, under `dest/`.
         #[arg(long = "include")]
         includes: Vec<String>,
 
@@ -355,7 +356,24 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0o644
             };
-            append_file(&mut builder, Path::new(src), dest, mode)?;
+            let src = Path::new(src);
+            if src.is_dir() {
+                // Sorted, so the same tree packs into the same archive.
+                let mut files: Vec<_> = std::fs::read_dir(src)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<Result<_, _>>()?;
+                files.retain(|p| p.is_file());
+                files.sort();
+                for file in files {
+                    let name = file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| format!("{}: not a UTF-8 file name", file.display()))?;
+                    append_file(&mut builder, &file, &format!("{dest}/{name}"), mode)?;
+                }
+            } else {
+                append_file(&mut builder, src, dest, mode)?;
+            }
         }
 
         // The preinstall hook, always, generated from its template.
@@ -1886,6 +1904,28 @@ mod tests {
             assert!(
                 text.contains("=models/pet_detect.onnx"),
                 "{site} does not package the petting classifier"
+            );
+        }
+    }
+
+    /// The emotions ship inside the release, and robotd loads them from there
+    /// (`emotion::Library::load_release`). A site that forgets them produces robots on which every
+    /// pad button bound to an emotion is refused as an unknown skill.
+    #[test]
+    fn the_emotions_are_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("robotd/emotions/yes.json").exists(),
+            "the vendored emotions are gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("--include \"robotd/emotions=emotions\""),
+                "{site} does not package the emotions"
             );
         }
     }

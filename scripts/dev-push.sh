@@ -407,7 +407,8 @@ cargo run -p xtask -- package \
     --include "docs/design/updater-design.md=docs/updater-design.md" \
     --include "deploy/README.md=docs/deploy.md" \
     --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx" \
-    --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx"
+    --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx" \
+    --include "robotd/emotions=emotions"
 
 
 echo "==> signing with $KEY"

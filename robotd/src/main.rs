@@ -853,7 +853,7 @@ impl RobotState {
             policy_enabled: params.policy.enabled,
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
-            emotions: emotion::Library::load(&params.emotions.dir),
+            emotions: emotion::Library::load_release(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,

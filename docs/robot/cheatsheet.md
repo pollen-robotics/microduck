@@ -378,13 +378,15 @@ typo is refused with the list rather than becoming a dead button.
 #### Emotions
 
 An emotion is a head, body and beak animation with its sound: a nod, a sigh, a laugh. Each is two
-files in `/var/lib/robot/emotions/`, `<name>.json` (keyframes) and `<name>.wav`, and its name is a
-skill like any other. The set made for Microduck is `robot/emotions/` in
-[microduck_emotions](https://github.com/pollen-robotics/microduck_emotions):
+files, `<name>.json` (keyframes) and `<name>.wav`, and its name is a skill like any other. **The
+set made for Microduck ships with every release** — `angry`, `curious`, `defiant`, `devastated`,
+`excited`, `impatient`, `laugh`, `mmh`, `mock`, `no`, `sad`, `yes`, `yes_fast`, from
+[microduck_emotions](https://github.com/pollen-robotics/microduck_emotions) — so there is nothing
+to install. Your own go in `/var/lib/robot/emotions/`, and one there with a shipped name replaces
+it:
 
 ```
-scp -r robot/emotions <you>@<duck>:/tmp/
-sudo mkdir -p /var/lib/robot/emotions && sudo cp /tmp/emotions/* /var/lib/robot/emotions/
+sudo mkdir -p /var/lib/robot/emotions && sudo cp mine.json mine.wav /var/lib/robot/emotions/
 sudo systemctl restart robotd
 ```
 
@@ -397,7 +399,7 @@ While one plays it has the head, the body pose and the beak, the sticks wait, an
 is dropped until it ends; on X, which re-sends while held, it plays again for as long as X is held.
 A keyframe with `"skill": "sit"` sits the robot down (devastated); it stays seated, and the sit
 toggle stands it up. The directory is read once at startup, so new files need the restart;
-`[emotions] dir` moves it, and in the simulator it is `~/.cache/duck-sim/emotions`.
+`[emotions] dir` moves it, and in the simulator it is the checkout's `robotd/emotions/`.
 
 #### Putting it all back
 

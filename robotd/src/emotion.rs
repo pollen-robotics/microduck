@@ -1,9 +1,13 @@
 //! Emotions: a head, body and beak timeline with a sound, played as a skill.
 //!
-//! An emotion is two files in `[emotions] dir`, named after it: `sad.json`, the keyframes, and
-//! `sad.wav`, the sound, which starts with them. `robot.do sad` plays it, so it goes on a pad
-//! button like any skill (`robotctl pad bind y sad`), and adding one is copying two files and
-//! restarting `robotd` — no release.
+//! An emotion is two files named after it: `sad.json`, the keyframes, and `sad.wav`, the sound,
+//! which starts with them. `robot.do sad` plays it, so it goes on a pad button like any skill
+//! (`robotctl pad bind y sad`).
+//!
+//! **The set ships inside the release** (`robotd/emotions/`, packaged as `emotions/`, regenerated
+//! by `scripts/vendor-emotions.py`), so every robot on a release has them with nothing to install.
+//! `[emotions] dir` is read on top: a file there adds an emotion or replaces the shipped one of the
+//! same name, which is copying two files and restarting `robotd` — no release.
 //!
 //! **It drives the policy's commands, nothing below them.** While it plays, the head command, the
 //! body pose and the mouth come from the keyframes and the twist is zero, exactly as if one client
@@ -177,6 +181,24 @@ impl Library {
     ///
     /// A directory that is not there is a robot with no emotions, not a fault. A file that will
     /// not parse is skipped with a warning naming it, so one bad file does not cost the others.
+    /// The emotions the running release ships, then `own` on top — see [`Library::layered`].
+    pub fn load_release(own: &Path) -> Self {
+        Self::layered(&Path::new(robotd_params::RELEASE_DIR).join("emotions"), own)
+    }
+
+    /// `shipped`, then `own` on top: an emotion in `own` replaces the shipped one of the same name
+    /// and keeps its place, and a new one is added after them.
+    pub fn layered(shipped: &Path, own: &Path) -> Self {
+        let mut library = Self::load(shipped);
+        for (name, emotion) in Self::load(own).0 {
+            match library.index(&name) {
+                Some(i) => library.0[i].1 = emotion,
+                None => library.0.push((name, emotion)),
+            }
+        }
+        library
+    }
+
     pub fn load(dir: &Path) -> Self {
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -352,5 +374,51 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    /// The robot's own folder adds to the shipped set and wins a name they share, and either
+    /// may be missing.
+    #[test]
+    fn the_robots_own_emotions_go_on_top_of_the_shipped_ones() {
+        let (shipped, own) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let key = r#"{"keyframes": [{"t": 0.0}]}"#;
+        for name in ["no", "yes"] {
+            std::fs::write(shipped.path().join(format!("{name}.json")), key).unwrap();
+        }
+        std::fs::write(own.path().join("yes.json"), key).unwrap();
+        std::fs::write(own.path().join("yes.wav"), b"RIFF").unwrap();
+        std::fs::write(own.path().join("sad.json"), key).unwrap();
+
+        let library = Library::layered(shipped.path(), own.path());
+        assert_eq!(library.names().collect::<Vec<_>>(), ["no", "yes", "sad"]);
+        let (_, yes) = library.get(library.index("yes").unwrap()).unwrap();
+        assert_eq!(yes.sound(), Some(own.path().join("yes.wav").as_path()));
+
+        let absent = shipped.path().join("absent");
+        assert_eq!(Library::layered(&absent, own.path()).names().count(), 2);
+        assert_eq!(Library::layered(shipped.path(), &absent).names().count(), 2);
+    }
+
+    /// The vendored set parses: every file the release ships is one robotd plays, with its
+    /// sound, including the four the pad binds by default.
+    #[test]
+    fn the_shipped_emotions_all_load() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("emotions");
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "json")
+            })
+            .count();
+        let library = Library::load(&dir);
+        assert_eq!(library.names().count(), files, "one skipped");
+        for name in ["yes", "no", "excited", "devastated"] {
+            let (_, e) = library.get(library.index(name).expect(name)).unwrap();
+            assert!(e.sound().is_some(), "{name} has no sound");
+        }
     }
 }

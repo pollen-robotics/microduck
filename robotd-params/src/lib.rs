@@ -1485,9 +1485,10 @@ impl AudioParams {
     }
 }
 
-/// `[emotions]` — where the emotions `robot.do` plays are kept: `<name>.json` keyframes and
-/// `<name>.wav` beside them. Read once at startup; a directory that is not there is a robot with
-/// no emotions.
+/// `[emotions]` — the robot's own emotions, `<name>.json` keyframes and `<name>.wav` beside them,
+/// read once at startup on top of the set the release ships (`emotions/` in [`RELEASE_DIR`]): a
+/// file here adds one or replaces the shipped one of the same name. A directory that is not there
+/// is a robot with only the shipped set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct EmotionsParams {
