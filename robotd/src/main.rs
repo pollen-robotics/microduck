@@ -47,8 +47,10 @@ use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyError, Poli
 use duck_control::safety::{Safety, SafetyConfig};
 use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
 use duck_ipc_proto as proto;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use control::{Controller, Driving, SkillTuning, Tuning};
 use intents::Intents;
@@ -4255,13 +4257,13 @@ fn start_head_imu(state: &Arc<RobotState>, params: &Params, no_hardware: bool) {
 /// is coming (an IMU that is off or absent never wakes the channel).
 async fn stream_head_imu(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
-    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    lines: &mut Lines,
     frames: &mut tokio::sync::broadcast::Receiver<proto::HeadImuFrame>,
 ) -> std::io::Result<()> {
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                if line?.is_none() {
+            line = next_line(lines) => {
+                if let Incoming::Closed = line? {
                     return Ok(());
                 }
             }
@@ -4276,6 +4278,31 @@ async fn stream_head_imu(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
             },
         }
+    }
+}
+
+/// A connection's requests, one per line.
+type Lines = FramedRead<tokio::net::unix::OwnedReadHalf, LinesCodec>;
+
+enum Incoming {
+    Line(String),
+    /// A line past [`MAX_LINE`], refused as it arrived rather than once it ended.
+    TooLarge,
+    Closed,
+}
+
+async fn next_line(lines: &mut Lines) -> std::io::Result<Incoming> {
+    match lines.next().await {
+        Some(Ok(line)) => Ok(Incoming::Line(line)),
+        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+            // After a decode error `FramedRead` yields one `None`, at once, and then reads on
+            // with the codec discarding up to the next newline. Taken here, so that `None` is not
+            // mistaken for the client going away.
+            let _ = lines.next().await;
+            Ok(Incoming::TooLarge)
+        }
+        Some(Err(LinesCodecError::Io(e))) => Err(e),
+        None => Ok(Incoming::Closed),
     }
 }
 
@@ -4316,7 +4343,9 @@ async fn handle(
     stream: UnixStream,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    // The codec enforces the cap while reading. `lines()` would hold an unterminated line in
+    // memory however long it grew, and only then be measured against it.
+    let mut lines = FramedRead::new(read_half, LinesCodec::new_with_max_length(MAX_LINE));
 
     // `None` until the client subscribes. Once set, the connection is both a request
     // channel and a state stream, so the loop below waits on whichever speaks first.
@@ -4332,10 +4361,10 @@ async fn handle(
         // beacon is due for `btd`. Written as nested selects rather than one, because the two
         // streams are independent options and a client normally has neither.
         let line = match (states.as_mut(), beacons.as_mut()) {
-            (None, None) => lines.next_line().await?,
+            (None, None) => next_line(&mut lines).await?,
             (None, Some(rx)) => {
                 tokio::select! {
-                    line = lines.next_line() => line?,
+                    line = next_line(&mut lines) => line?,
                     received = rx.recv() => {
                         match received {
                             Ok(advertise) => {
@@ -4359,7 +4388,7 @@ async fn handle(
             (Some(rx), beacon_rx) => {
                 let mut pending = beacon_rx;
                 tokio::select! {
-                    line = lines.next_line() => line?,
+                    line = next_line(&mut lines) => line?,
                     received = async {
                         match pending.as_mut() {
                             Some(rx) => rx.recv().await,
@@ -4409,17 +4438,20 @@ async fn handle(
                 }
             }
         };
-        let Some(line) = line else { return Ok(()) };
+        let line = match line {
+            Incoming::Line(line) => line,
+            Incoming::TooLarge => {
+                let response = proto::Response::err(
+                    None,
+                    proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
+                );
+                write_line(&mut write_half, &response).await?;
+                continue;
+            }
+            Incoming::Closed => return Ok(()),
+        };
 
         if line.trim().is_empty() {
-            continue;
-        }
-        if line.len() > MAX_LINE {
-            let response = proto::Response::err(
-                None,
-                proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
-            );
-            write_line(&mut write_half, &response).await?;
             continue;
         }
 
@@ -5761,6 +5793,43 @@ mod mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line cap must bound what is buffered, not just what is parsed: a peer that never sends
+    /// a newline must be told no while it is still writing, and the connection must survive it.
+    #[tokio::test]
+    async fn an_unterminated_oversized_request_is_refused_while_it_arrives() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let state = Arc::new(RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let (server, client) = UnixStream::pair().unwrap();
+        tokio::spawn(handle(state, Arc::new(Intents::new()), server));
+        let (read_half, mut writer) = client.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        writer.write_all(&vec![b'x'; MAX_LINE + 1]).await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("an oversized line must be refused before its newline arrives")
+            .unwrap();
+        let response: proto::Response = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response.error.unwrap().code, proto::code::INVALID_REQUEST);
+
+        let hello = format!(
+            "xxxx\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"hello\",\"params\":{{\"api_version\":{}}}}}\n",
+            proto::API_VERSION
+        );
+        writer.write_all(hello.as_bytes()).await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let response: proto::Response = serde_json::from_str(line.trim()).unwrap();
+        assert!(response.error.is_none(), "{line}");
+    }
 
     /// A `RobotState` over a real config file, for the two calls that write one.
     fn state_over(text: &str) -> (tempfile::TempDir, Arc<RobotState>) {
