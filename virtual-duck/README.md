@@ -192,14 +192,20 @@ The test also confirms that every voice loads in every pitch, and that nothing c
 manual runs covered the home screen, walking over the launcher and other apps, the long-press menu
 with the ✕, 📍 then a tap, and throwing.
 
-Not yet run on a device:
-- talking, because the emulator has no microphone;
-- dropping the duck on the ✕;
-- hearing the voices. They are designed and checked by measurement, and need a listen on a real
-  phone speaker.
+It also runs on a real phone. A screen recording on an Android phone shows:
+- the home screen, with the duck rolling and dancing, and the voice and pitch settings;
+- the duck walking out over the app switcher and a browser;
+- the long-press menu with the ✕, and 📍 then a tap;
+- the duck chasing and kicking its ball.
 
-It has **not** yet run on a phone. Treat frame rate and battery as unmeasured: the emulator renders
-in software, at about 2 fps, which says nothing about a phone's GPU.
+Not yet checked on a phone:
+- talking;
+- dropping the duck on the ✕;
+- the voices through a phone speaker, since the recording has no sound. They are designed and
+  checked by measurement, and need a listen.
+
+Frame rate and battery are unmeasured. The emulator renders in software at about 2 fps, and the
+phone recording shows the duck running but measures neither.
 
 To test on an emulator, start it with `-gpu swangle_indirect`. With `swiftshader_indirect` and
 `host` the emulator process itself crashed once the duck was drawing. To get a screenshot of what
