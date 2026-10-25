@@ -205,12 +205,17 @@ impl Store {
     /// Delete old releases, keeping the active one, `keep_previous` most recent
     /// others, and `golden` unconditionally.
     ///
+    /// Releases a rollback could land on — older than the active one and not in
+    /// `known_bad` — are kept before any other, so a failed update left on disk
+    /// cannot take the slot of the good release before it.
+    ///
     /// Golden is exempt from the count so the never-brick guarantee doesn't
     /// silently expire as versions accumulate (`docs/design/updater-design.md` §8.2).
     pub fn prune(
         &self,
         keep_previous: usize,
         golden: Option<&semver::Version>,
+        known_bad: &[semver::Version],
     ) -> Result<Vec<semver::Version>, Error> {
         let active = self.current()?;
         let installed = self.list()?;
@@ -223,9 +228,12 @@ impl Store {
             .filter(|v| Some(v) != active.as_ref() && Some(v) != golden)
             .collect();
 
-        // Newest first, so `keep_previous` retains the most recent — those are the
-        // plausible rollback targets.
-        candidates.sort_by(|a, b| b.cmp(a));
+        // Rollback targets first, then newest first, so `keep_previous` retains the
+        // most recent of the releases a rollback could actually use.
+        let target = |v: &semver::Version| {
+            active.as_ref().is_none_or(|active| v < active) && !known_bad.contains(v)
+        };
+        candidates.sort_by(|a, b| target(b).cmp(&target(a)).then_with(|| b.cmp(a)));
 
         let doomed: Vec<_> = candidates.into_iter().skip(keep_previous).collect();
 
@@ -407,7 +415,7 @@ mod tests {
         }
         store.swap_to(&v("1.3.0")).unwrap();
 
-        let removed = store.prune(1, None).unwrap();
+        let removed = store.prune(1, None, &[]).unwrap();
 
         assert_eq!(removed, vec![v("1.1.0"), v("1.0.0")]);
         assert_eq!(store.list().unwrap(), vec![v("1.3.0"), v("1.2.0")]);
@@ -426,11 +434,28 @@ mod tests {
         store.swap_to(&v("1.3.0")).unwrap();
 
         let golden = v("1.0.0");
-        let removed = store.prune(1, Some(&golden)).unwrap();
+        let removed = store.prune(1, Some(&golden), &[]).unwrap();
 
         assert!(!removed.contains(&golden));
         assert!(store.release_dir(&golden).is_dir(), "golden must survive");
         assert_eq!(removed, vec![v("1.1.0")]);
+    }
+
+    /// A release that failed and was rolled back stays on disk, and is the newest
+    /// one below the next good update. Kept by age alone it took the only slot, and
+    /// the good release before it — the one thing a rollback could land on — went.
+    #[test]
+    fn prune_keeps_the_rollback_target_over_a_known_bad_release() {
+        let (_dir, store) = scratch();
+        for s in ["1.1.0", "1.2.0", "1.3.0"] {
+            fs::create_dir_all(store.release_dir(&v(s))).unwrap();
+        }
+        store.swap_to(&v("1.3.0")).unwrap();
+
+        let removed = store.prune(1, None, &[v("1.2.0")]).unwrap();
+
+        assert_eq!(removed, vec![v("1.2.0")]);
+        assert_eq!(store.list().unwrap(), vec![v("1.3.0"), v("1.1.0")]);
     }
 
     #[test]
@@ -441,8 +466,8 @@ mod tests {
         }
         store.swap_to(&v("1.2.0")).unwrap();
 
-        store.prune(1, None).unwrap();
-        let second = store.prune(1, None).unwrap();
+        store.prune(1, None, &[]).unwrap();
+        let second = store.prune(1, None, &[]).unwrap();
         assert!(second.is_empty(), "second prune should find nothing");
     }
 
