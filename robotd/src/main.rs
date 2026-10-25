@@ -4702,29 +4702,6 @@ fn set_skill_request(
         Some(path) => Some(std::path::PathBuf::from(path)),
         None => existing.as_ref().and_then(|s| s.path.clone()),
     };
-    // **Through the same gate `robot.loadPolicy` puts a slot's file through**, and for a sharper
-    // reason here: a skill is not one of `Slot::ALL`, so the startup check that drops an
-    // unloadable *slot* override never looks at it. Without this, a skill pointed at something
-    // that is not a policy is accepted, the reload it triggers fails building the controller,
-    // the robot keeps what it had, and the only trace is a log line — the caller is told the
-    // skill was added and finds out by pressing the button.
-    if let Some(path) = &path
-        && !params::is_none_sentinel(path)
-    {
-        if !path.exists() {
-            return proto::IntentResult::refused(format!("no such file: {}", path.display()));
-        }
-        // Only when the error is about the *file*. A board with no ONNX runtime cannot validate
-        // anything, and refusing a config edit on those grounds would send somebody to replace a
-        // policy that is fine — the same distinction `drop_unloadable_overrides` draws at
-        // startup, and what `PolicyError::path` exists for.
-        if let Err(e) = duck_control::policy::validate(path)
-            && e.path().is_some()
-        {
-            return proto::IntentResult::refused(e.to_string());
-        }
-    }
-
     let skill = params::SkillDef {
         name: p.name.clone(),
         path,
@@ -4754,6 +4731,30 @@ fn set_skill_request(
                 .or(existing.as_ref().and_then(|s| s.params.gain_ratio)),
         },
     };
+
+    // **Through the same gate `robot.loadPolicy` puts a slot's file through**, and for a sharper
+    // reason here: a skill is not one of `Slot::ALL`, so the startup check that drops an
+    // unloadable *slot* override never looks at it. Without this, a skill pointed at something
+    // that is not a policy is accepted, the reload it triggers fails building the controller,
+    // the robot keeps what it had, and the only trace is a log line — the caller is told the
+    // skill was added and finds out by pressing the button.
+    //
+    // The file the controller will open, not just the one the call named: with no `path`, a skill
+    // is `POLICY_DIR/<name>.onnx`, and one that is not there fails the whole policy load.
+    if let Some(path) = skill.resolved_path() {
+        if !path.exists() {
+            return proto::IntentResult::refused(format!("no such file: {}", path.display()));
+        }
+        // Only when the error is about the *file*. A board with no ONNX runtime cannot validate
+        // anything, and refusing a config edit on those grounds would send somebody to replace a
+        // policy that is fine — the same distinction `drop_unloadable_overrides` draws at
+        // startup, and what `PolicyError::path` exists for.
+        if let Err(e) = duck_control::policy::validate(&path)
+            && e.path().is_some()
+        {
+            return proto::IntentResult::refused(e.to_string());
+        }
+    }
 
     if let Err(e) = params::edit::set_skill(&state.config_path, &skill) {
         return proto::IntentResult::refused(e);
@@ -5851,6 +5852,26 @@ mod tests {
         );
         assert!(!result.accepted);
         assert!(result.reason.unwrap_or_default().contains("no such file"));
+    }
+
+    /// Leaving `path` out names a file too — `POLICY_DIR/<name>.onnx` — and when it is not there
+    /// the entry fails the whole policy load just the same, so it is refused the same way.
+    #[test]
+    fn a_new_skill_with_no_path_and_no_file_is_refused() {
+        let (cfg, state) = state_over("");
+        let result = set_skill_request(
+            &proto::SkillParams {
+                name: "polite-bow".to_owned(),
+                duration: Some(4.0),
+                ..Default::default()
+            },
+            &state,
+            &Intents::default(),
+        );
+        assert!(!result.accepted, "{result:?}");
+        assert!(result.reason.unwrap_or_default().contains("no such file"));
+        let written = std::fs::read_to_string(cfg.path().join("robotd.toml")).unwrap_or_default();
+        assert!(!written.contains("polite-bow"), "{written}");
     }
 
     /// The two the daemon drives itself may not become table entries: an entry answering to
