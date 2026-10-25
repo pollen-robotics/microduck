@@ -100,8 +100,12 @@ impl IdleHead {
     }
 
     /// How long the robot has to be still before this starts.
+    ///
+    /// Validation only promises finite and nonnegative, and past ~1.8e19 s `from_secs_f64`
+    /// panics — on the control thread, the first time the robot stands still. Longer than a
+    /// `Duration` holds is never.
     pub fn after(&self) -> Duration {
-        Duration::from_secs_f64(self.tuning.after_s)
+        Duration::try_from_secs_f64(self.tuning.after_s).unwrap_or(Duration::MAX)
     }
 
     /// One tick. `still` says nothing is asking for motion right now — the caller decides what
@@ -352,6 +356,17 @@ mod tests {
             out.push(idle.tick(now, still, DT));
         }
         (now, out)
+    }
+
+    /// `after_s = 1e20` passes validation, and asking how long that is panicked the control
+    /// thread. It is a wait that never ends.
+    #[test]
+    fn a_delay_past_what_a_duration_holds_is_never() {
+        let p = IdleParams {
+            after_s: 1e20,
+            ..IdleParams::default()
+        };
+        assert_eq!(IdleHead::new(p, 1).after(), Duration::MAX);
     }
 
     /// Nothing before the idle delay; after it, it looks around within its bounds, in yaw and
