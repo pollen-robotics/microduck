@@ -113,6 +113,10 @@ pub fn parse(bytes: &[u8]) -> Result<Import, MidiError> {
 
     let mut raws: Vec<Raw> = Vec::new();
     let mut names: Vec<String> = Vec::new();
+    // Every track's own name, by track index, whether or not it had notes — what a group's name
+    // is looked up in. `names` above is a different list, of the tracks that sang, and a group
+    // index is not an index into it.
+    let mut track_names: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     // Microseconds per quarter note. 500_000 is MIDI's default — 120 bpm.
     let mut micros_per_beat = 500_000f64;
@@ -248,6 +252,7 @@ pub fn parse(bytes: &[u8]) -> Result<Import, MidiError> {
                 velocity,
             );
         }
+        track_names.push(name.clone());
         if raws.iter().any(|r| {
             groups
                 .iter()
@@ -267,7 +272,17 @@ pub fn parse(bytes: &[u8]) -> Result<Import, MidiError> {
         return Err(MidiError::NoNotes);
     }
     let bpm = 60_000_000.0 / micros_per_beat.max(1.0);
-    let (notes, casting, mut assign_dropped) = assign(&mut raws, &names, ticks_per_beat);
+    // A group is a (track, channel), and a name belongs to a track — so groups and tracks are not
+    // the same count, and a group's name is its own track's. A track carrying two channels has
+    // one name for two lines and cannot say which is which, so its groups are seated by pitch.
+    let mut group_names = vec![String::new(); groups.len()];
+    for (&(track, _), &group) in &groups {
+        let lines = groups.keys().filter(|(t, _)| *t == track).count();
+        if lines == 1 {
+            group_names[group] = track_names[track].clone();
+        }
+    }
+    let (notes, casting, mut assign_dropped) = assign(&mut raws, &group_names, ticks_per_beat);
     dropped.append(&mut assign_dropped);
 
     Ok(Import {
@@ -823,6 +838,41 @@ mod tests {
         assert_eq!(import.score.notes.len(), 2, "{:?}", import.score.notes);
         let pitches: Vec<u8> = import.score.notes.iter().map(|n| n.midi).collect();
         assert!(pitches.contains(&60) && pitches.contains(&48));
+    }
+
+    /// A track carrying two channels is two groups, and the parts named after it must still be
+    /// read from the right tracks. Counting a group as a track lent every later group the next
+    /// track's name: the alto line was "named Tenor", the tenor line "named Bass", and the real
+    /// bass was left the alto's seat. The shared staff's own name cannot say which of its two
+    /// lines is which, so those two are seated by pitch.
+    #[test]
+    fn a_track_with_two_channels_does_not_shift_the_names_after_it() {
+        // Soprano and alto on one staff, on channels 0 and 1, then a named tenor and bass.
+        let mut upper = Builder::new()
+            .track(Some("Soprano/Alto"), 0, &[(0, 480, 72, 80)])
+            .tracks
+            .remove(0);
+        let alto = Builder::new()
+            .track(None, 1, &[(0, 480, 67, 80)])
+            .tracks
+            .remove(0);
+        // Splice the alto's events in ahead of the soprano track's end-of-track meta.
+        upper.truncate(upper.len() - 4);
+        upper.extend_from_slice(&alto);
+        let bytes = Builder {
+            tracks: vec![upper],
+            division: 480,
+        }
+        .track(Some("Tenor"), 2, &[(0, 480, 60, 80)])
+        .track(Some("Bass"), 3, &[(0, 480, 48, 80)])
+        .build();
+
+        let import = parse(&bytes).expect("parses");
+        let sings = |part| import.score.line(part).next().expect("sings").midi;
+        assert_eq!(sings(Part::Soprano), 72);
+        assert_eq!(sings(Part::Alto), 67);
+        assert_eq!(sings(Part::Tenor), 60, "the track named Tenor sings tenor");
+        assert_eq!(sings(Part::Bass), 48, "the track named Bass sings bass");
     }
 
     /// More than four voices is reported rather than silently dropped — a chorale has four parts
