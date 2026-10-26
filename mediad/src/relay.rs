@@ -345,8 +345,10 @@ impl Welcome {
     fn heartbeat(&self, timings: &Timings) -> Duration {
         let (min, max) = timings.heartbeat_bounds;
         match self.recommended_heartbeat_interval_seconds {
+            // `try_`, because a finite number of seconds can still be more than a `Duration`
+            // holds, and `from_secs_f64` panics on it.
             Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
-                Duration::from_secs_f64(seconds).clamp(min, max)
+                Duration::try_from_secs_f64(seconds).map_or(max, |d| d.clamp(min, max))
             }
             _ => timings.heartbeat_fallback,
         }
@@ -1494,6 +1496,11 @@ mod tests {
             HEARTBEAT_FALLBACK
         );
         assert_eq!(welcome(Some(-1.0)).heartbeat(&timings), HEARTBEAT_FALLBACK);
+        assert_eq!(
+            welcome(Some(1e20)).heartbeat(&timings),
+            HEARTBEAT_BOUNDS.1,
+            "a number past what a Duration holds is too slow, not a panic"
+        );
     }
 
     /// The messages this robot has to recognise, as the service spells them.
