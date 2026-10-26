@@ -407,3 +407,89 @@ fn every_include_lands_where_the_workflow_says() {
         }
     }
 }
+
+/// Package `binaries` (stubs, created in the order given) and return the artifact's bytes.
+fn package_stubs(binaries: &[&str]) -> Vec<u8> {
+    let root = root();
+    let manifest: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml"))
+            .expect("parse Cargo.toml");
+    let version = manifest["workspace"]["package"]["version"]
+        .as_str()
+        .expect("workspace version");
+
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let bin_dir = scratch.path().join("staged");
+    std::fs::create_dir_all(&bin_dir).expect("staging dir");
+    for name in binaries {
+        std::fs::write(bin_dir.join(name), format!("#!/bin/false {name}\n")).expect("stub");
+    }
+    let out = scratch.path().join("dist");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .current_dir(&root)
+        .args([
+            "package",
+            "--version",
+            version,
+            "--channel",
+            "daemon",
+            "--zstd-level",
+            "1",
+        ])
+        .arg("--bin-dir")
+        .arg(&bin_dir)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run xtask package");
+    assert!(
+        output.status.success(),
+        "xtask package failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read(out.join(format!("daemon-{version}.tar.zst"))).expect("artifact")
+}
+
+/// The binaries go into the archive in a fixed order, so the same inputs make the same archive.
+///
+/// `updater-design.md` §16 promises that — fixed mtimes, "so a rebuild can be compared against
+/// what shipped" — but the binaries were appended in `read_dir` order, which is the filesystem's:
+/// hash order on ext4, seeded per filesystem, so two CI runners packing identical binaries got two
+/// different sha256s. Asserted on the entry order rather than by packing twice, because two
+/// directories on one filesystem usually enumerate alike and that comparison would pass on the
+/// bug it is meant to catch.
+#[test]
+fn binaries_are_packaged_in_a_fixed_order() {
+    let names = [
+        "zeta", "robotd", "alpha", "updaterd", "mid", "btd", "nfcd", "configd",
+    ];
+    let bytes = package_stubs(&names);
+
+    let decoder = zstd::Decoder::new(bytes.as_slice()).expect("zstd frame");
+    let order: Vec<String> = tar::Archive::new(decoder)
+        .entries()
+        .expect("tar entries")
+        .map(|e| {
+            e.expect("tar entry")
+                .path()
+                .expect("path")
+                .display()
+                .to_string()
+        })
+        .filter(|p| p.starts_with("bin/"))
+        .collect();
+
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order.len(), names.len(), "{order:?}");
+    assert_eq!(order, sorted, "binaries packed in directory order");
+
+    // And the property itself: created in the opposite order, the same inputs, the same bytes.
+    let mut reversed = names;
+    reversed.reverse();
+    assert_eq!(
+        package_stubs(&reversed),
+        bytes,
+        "same inputs, different archive"
+    );
+}

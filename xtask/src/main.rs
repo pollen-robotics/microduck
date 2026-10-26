@@ -323,9 +323,17 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
         let encoder = zstd::Encoder::new(file, args.zstd_level)?.auto_finish();
         let mut builder = tar::Builder::new(encoder);
 
+        // Sorted before anything is appended: `read_dir` yields entries in whatever order the
+        // filesystem keeps them — hash order on ext4, with a per-filesystem seed — so the same
+        // binaries packed on two machines made two archives with two sha256s. The fixed mtime
+        // below only makes a rebuild comparable if the order is fixed too.
+        let mut paths = std::fs::read_dir(&args.bin_dir)?
+            .map(|entry| entry.map(|e| e.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        paths.sort();
+
         let mut shipped = Vec::new();
-        for entry in std::fs::read_dir(&args.bin_dir)? {
-            let path = entry?.path();
+        for path in paths {
             if !path.is_file() {
                 continue;
             }
@@ -341,7 +349,6 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
         if shipped.is_empty() {
             return Err(format!("no binaries found in {}", args.bin_dir.display()).into());
         }
-        shipped.sort();
 
         for include in &args.includes {
             let (src, dest) = include
