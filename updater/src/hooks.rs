@@ -172,18 +172,15 @@ pub async fn run(
         }
     };
 
+    // stderr is kept whole within the cap and stdout gets what is left. Stdout comes first and a
+    // hook's reason for failing comes last — `die` in `hooks/preinstall` writes it to stderr — so
+    // cutting the joined text at the cap threw away exactly that line whenever an `apt` run had
+    // already printed 8 KiB, and the update failed with only the progress output to show for it.
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    cut_at_char_boundary(&mut stderr, MAX_OUTPUT);
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    if text.len() > MAX_OUTPUT {
-        // Cut on a char boundary: `from_utf8_lossy` can place a multi-byte character (often a
-        // 3-byte U+FFFD for invalid input) straddling the cap, and a bare `truncate` panics on
-        // that — inside `Engine::apply`, where it kills the unattended-update task for good.
-        let mut end = MAX_OUTPUT;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
+    cut_at_char_boundary(&mut text, MAX_OUTPUT - stderr.len());
+    text.push_str(&stderr);
 
     if !output.status.success() {
         return Err(Error::Hook {
@@ -219,6 +216,21 @@ pub async fn run(
         exit_code: output.status.code(),
         output: text,
     })
+}
+
+/// Shorten `text` to at most `max` bytes.
+///
+/// On a char boundary: `from_utf8_lossy` can place a multi-byte character (often a 3-byte U+FFFD
+/// for invalid input) straddling the cap, and a bare `truncate` panics on that — inside
+/// `Engine::apply`, where it kills the unattended-update task for good.
+fn cut_at_char_boundary(text: &mut String, max: usize) {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +468,46 @@ mod tests {
             }
             other => panic!("expected Hook error, got {other:?}"),
         }
+    }
+
+    /// A failing hook's reason must survive a long run of output before it.
+    ///
+    /// stdout comes first and the reason comes last, on stderr, which is where `die` puts it. With
+    /// the cap applied to the two joined, a hook whose `apt` had already printed 8 KiB failed with
+    /// nothing but progress lines in its error, and the update log could not say why.
+    #[tokio::test]
+    async fn a_failure_reason_on_stderr_survives_long_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hook(
+            dir.path(),
+            HookKind::PreInstall,
+            "#!/bin/sh\nhead -c 20000 /dev/zero | tr '\\0' 'a'\n\
+             echo 'preinstall: ONNX Runtime 1.16 is below the floor' >&2\nexit 1\n",
+        );
+
+        let err = run(
+            dir.path(),
+            HookKind::PreInstall,
+            &ctx(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        let Error::Hook { detail, .. } = err else {
+            panic!("expected Error::Hook, got {err:?}");
+        };
+        assert!(
+            detail.contains("ONNX Runtime 1.16 is below the floor"),
+            "the reason was cut off: {} bytes ending {:?}",
+            detail.len(),
+            &detail[detail.len().saturating_sub(40)..]
+        );
+        assert!(
+            detail.len() <= MAX_OUTPUT + 64,
+            "still capped: {}",
+            detail.len()
+        );
     }
 
     /// The `ETXTBSY` retry, driven deterministically rather than hoped for.
