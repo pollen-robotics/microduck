@@ -117,3 +117,43 @@ impl Bus for Spidev {
         Ok(())
     }
 }
+
+/// Off Linux there is no spidev to open, as there is no serial port: the type exists so `nfcd`
+/// builds and the suite runs on a Mac, and the daemon says why it has nothing to watch.
+#[cfg(not(target_os = "linux"))]
+pub struct Spidev {
+    never: std::convert::Infallible,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Spidev {
+    pub fn open(_path: &std::path::Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the NFC reader is only driven on Linux",
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Bus for Spidev {
+    fn transfer(&mut self, _tx: &[u8], _rx: &mut [u8]) -> io::Result<()> {
+        match self.never {}
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use super::*;
+
+    /// `nfcd` names `Spidev` unconditionally, so without this stand-in the daemon — and with it
+    /// `cargo test --workspace` — did not compile on a Mac. Opening one says why, the way
+    /// `Serial::open` does, rather than pretending there is a bus.
+    #[test]
+    fn off_linux_a_spidev_cannot_be_opened_and_says_why() {
+        let err = Spidev::open(std::path::Path::new("/dev/spidev1.0"))
+            .err()
+            .expect("no spidev off Linux");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+}
