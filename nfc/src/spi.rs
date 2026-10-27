@@ -94,6 +94,14 @@ impl Bus for Spidev {
         let mut out = vec![0u8; len];
         out[..tx.len()].copy_from_slice(tx);
         let mut back = vec![0u8; len];
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var("NFC_TRACE").is_ok()) {
+            eprint!("spi >>");
+            for b in tx.iter().take(12) {
+                eprint!(" {b:02X}");
+            }
+            eprintln!();
+        }
         let transfer = ioctl::Transfer {
             tx_buf: out.as_ptr() as u64,
             rx_buf: back.as_mut_ptr() as u64,
@@ -112,6 +120,13 @@ impl Bus for Spidev {
         };
         if done < 0 {
             return Err(io::Error::last_os_error());
+        }
+        if *TRACE.get().unwrap() {
+            eprint!("spi <<");
+            for b in back[tx.len()..].iter().take(12) {
+                eprint!(" {b:02X}");
+            }
+            eprintln!();
         }
         rx.copy_from_slice(&back[tx.len()..]);
         Ok(())

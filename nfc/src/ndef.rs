@@ -224,6 +224,15 @@ mod tests {
         assert_eq!(parse(&[TLV_NDEF, 0, TLV_TERMINATOR]).unwrap(), vec![]);
     }
 
+    /// Phone NFC apps write a Lock Control TLV ahead of the record; the walk has to skip
+    /// unknown TLVs by their length, which is what keeps such a tag readable.
+    #[test]
+    fn a_lock_tlv_ahead_of_the_message_is_walked_past() {
+        let mut tag = vec![0x01, 0x03, 0xA0, 0x0C, 0x34]; // a phone app's lock TLV
+        tag.extend(text_tag(PAIRING));
+        assert!(asks_to_pair(&parse(&tag).unwrap()));
+    }
+
     #[test]
     fn only_the_pairing_text_itself_asks_to_pair() {
         let asks = |r: Record| asks_to_pair(&[r]);
