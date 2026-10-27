@@ -522,6 +522,7 @@ WHY
   Your duck is up. From here:
 
     scripts/duck-sim drive        walk it forward, then stop
+    scripts/duck-sim keys         drive it from the keyboard
     scripts/duck-sim ctl health   or anything else robotctl does
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
@@ -714,14 +715,43 @@ wait_for_socket() {
     return 1
 }
 
+# **A duck can outlive its body.** Closing the MuJoCo window stops the simulator — the body
+# server exits with the viewer, by design and without a word — while `robotd` and `tofd` carry
+# on against a port with nothing behind it. Each failed read counts toward the update gate's
+# limit (ten consecutive failures by default), at which point `health` answers *unhealthy*;
+# until then every drive command is accepted and does nothing at all. Full version in
+# `docs/robot/simulation.md`.
+#
+# So anything that means to move the duck asks first, and says this rather than nothing.
+body_up() {
+    python3 -c "import socket,sys
+s = socket.socket(); s.settimeout(0.5)
+sys.exit(s.connect_ex(('127.0.0.1', $PORT)))" 2>/dev/null
+}
+
+require_body() {
+    body_up && return 0
+    die "the body is gone — nothing is listening on 127.0.0.1:$PORT.
+  The daemons are still running, so they will accept commands and the duck will not move. Closing
+  the MuJoCo window stops the simulator; \`scripts/duck-sim simlog\` has its last words.
+
+    scripts/duck-sim down && scripts/duck-sim"
+}
+
 # Walking has no robotctl subcommand — intents come from a pad or the console — so this is the
 # smallest client that sends one. Resent at 10 Hz because `robotd` expires an intent 500 ms after
 # they stop arriving, which is what makes a dropped connection stop the robot rather than run it
 # into a wall.
+#
+# **0.3, because below about 0.25 the walking policy does not walk.** The standing threshold
+# is 0.05, so anything above it selects the walking network while the policy's own output stays
+# near flat — the duck shuffles in place and looks broken. 0.3 clears the knee with margin and
+# still walks at a watchable 0.12 m/s. Measurements in `docs/robot/simulation.md`.
 drive() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    require_body
     say "walking forward for 8 s"
-    python3 - "$SOCK" "${1:-0.15}" "${2:-0.0}" <<'PY'
+    python3 - "$SOCK" "${1:-0.3}" "${2:-0.0}" <<'PY'
 import json, socket, sys, time
 sock, vx, vyaw = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 s = socket.socket(socket.AF_UNIX); s.connect(sock)
@@ -733,6 +763,166 @@ for _ in range(80):
     time.sleep(0.1)
 PY
     say "stopped — the intent expires on its own"
+}
+
+# The same intent, held by a person instead of a countdown.
+#
+# On a robot this is the pad or the console; here `padd` wants a real gamepad and the console
+# wants a camera — so a plain terminal had no way to drive the duck by hand at all. Roughly the
+# smallest thing that fixes that: raw-mode stdin, the 10 Hz resend `drive` already does, and the
+# same `robot.move` the console sends.
+#
+# The step is the walking floor rather than something finer, because a first keypress that produces
+# a duck shuffling on the spot is the confusion this branch exists to remove — measurements in
+# `docs/robot/simulation.md`.
+keys() {
+    [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
+    [ -t 0 ] || die "keys needs a terminal — it reads the keyboard directly."
+    require_body
+    python3 - "$SOCK" <<'PY'
+import json, os, select, socket, sys, termios, tty
+
+# Forward is the walking floor (measurements in `docs/robot/simulation.md`). Yaw has the same
+# shape and a much higher knee — 4 s per run, 0.6 turns the duck 4 degrees and 1.0 turns it 7,
+# which is a duck standing still; 1.5 turns it 168. So one press of an arrow is a real turn or
+# it is nothing, and there is no useful value in between to offer.
+STEP, TURN, CAP = 0.3, 1.5, 0.6
+DEBUG = bool(os.environ.get("DUCK_SIM_KEYS_DEBUG"))
+HELP = ("arrows drive · space stop · u up · r roulade · k/l kick · q quit")
+
+
+def one(fd, timeout):
+    """One character from the terminal, or None if none arrived in `timeout`.
+
+    **The descriptor, never a buffered file.** Reading a `/dev/tty` opened by `open()` a character
+    at a time takes the ESC and leaves `[A` in Python's own buffer — where `select` on the
+    descriptor cannot see it, so the tail looks like it never came, the arrow is discarded as a bare
+    ESC, and its two leftover characters turn up as keystrokes later. `os.read` has no buffer to
+    hide in. `scripts/infer_policy.py` in `microduck_rl` carries the same note for the same reason.
+    """
+    if not select.select([fd], [], [], timeout)[0]:
+        return None
+    data = os.read(fd, 1)
+    return data.decode(errors="ignore") if data else None
+
+
+def arrow(fd):
+    """The letter of an arrow key, or the character itself for anything else.
+
+    An arrow is three bytes — ESC, then `[` or `O`, then one of ABCD. `O` as well as `[` because a
+    terminal in application cursor mode sends that instead, and which mode a terminal is in is not
+    this script's business.
+
+    **One byte at a time with a wait, not one read of the lot.** The three bytes usually arrive
+    together and a single read gets them — but nothing promises that, and over ssh or a slow pty
+    they can split. A read that takes what is there and moves on then drops the arrow and feeds the
+    tail back as two stray keystrokes, which is a key that works on one machine and not another.
+    50 ms is far longer than the rest of a real sequence takes and short enough that a bare ESC
+    does not hang.
+    """
+    first = one(fd, 0)
+    if first is None:
+        return ""
+    if first != "\x1b":
+        return first.lower()
+    if one(fd, 0.05) not in ("[", "O"):
+        return ""
+    return one(fd, 0.05) or ""
+
+# **The keyboard is /dev/tty, not stdin.** This program arrives on stdin (`python3 - <<PY`, the
+# same shape `drive` uses), so `sys.stdin` is the heredoc and already at EOF — reading keys from it
+# gets "Inappropriate ioctl for device" from `termios`, or silence. The controlling terminal has to
+# be opened by name.
+try:
+    kb = open("/dev/tty")
+except OSError as error:
+    sys.exit(f"no terminal to read: {error}")
+
+sock = sys.argv[1]
+s = socket.socket(socket.AF_UNIX); s.connect(sock)
+f = s.makefile("w")
+
+def send(method, params):
+    f.write(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}) + "\n")
+    f.flush()
+
+
+def call(method, params):
+    """One discrete call, answered. `robot.enable` and `robot.do` are request methods
+    (`duck-ipc-proto`): a notification would swallow a refusal — a skill already running,
+    say — and the key would seem to do nothing. A fresh connection each, so the answer
+    cannot land in the middle of the 10 Hz `robot.move` stream above."""
+    try:
+        c = socket.socket(socket.AF_UNIX); c.settimeout(3); c.connect(sock)
+        g = c.makefile("rw")
+        g.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                            "params": params}) + "\n")
+        g.flush()
+        answer = json.loads(g.readline() or "{}")
+    except (OSError, ValueError) as error:
+        print(f"\r{method} failed: {error}", flush=True)
+        return
+    finally:
+        try:
+            c.close()
+        except (NameError, OSError):
+            pass
+    # Quiet when it works — the status line already says what the duck is doing — and
+    # loud when it does not, which is the whole point of asking instead of telling.
+    result = answer.get("result", {})
+    if not result.get("accepted"):
+        print(f"\r{method} refused: {result.get('reason', answer)}", flush=True)
+
+vx = vyaw = 0.0
+old = termios.tcgetattr(kb)
+print(HELP)
+try:
+    tty.setcbreak(kb.fileno())
+    while True:
+        # The resend is the loop, and a keypress is whatever arrived since the last one. Waiting
+        # on the key instead would let the intent go stale between presses, and `robotd` would
+        # stop the duck 500 ms into every pause.
+        if select.select([kb], [], [], 0.1)[0]:
+            key = arrow(kb.fileno())
+            # `DUCK_SIM_KEYS_DEBUG=1` answers the only question worth asking when a key does
+            # nothing: did the terminal send what this thinks it did. Nothing else here can for
+            # arrows and space — a move intent is a notification, and `robotd` does not log one
+            # per tick at 10 Hz. (`u`, `r`, `k`, `l` answer for themselves now.)
+            if DEBUG and key:
+                print(f"\rkey {key!r}", flush=True)
+            if key in ("q", "\x03"):
+                break
+            # A, B, C, D are up, down, right, left — the order is the terminal's, not a choice
+            # anybody would make, so it is spelled out rather than trusted to read clearly.
+            elif key == "A":     vx = min(vx + STEP, CAP)      # up
+            elif key == "B":     vx = max(vx - STEP, -CAP)     # down
+            elif key == "D":     vyaw = min(vyaw + TURN, TURN) # left
+            elif key == "C":     vyaw = max(vyaw - TURN, -TURN)# right
+            elif key == " ":     vx = vyaw = 0.0
+            # **A duck on its face stays there.** Fall detection cuts the gait and waits: the
+            # standing policy only takes over when the robot is handed back to it, which on a
+            # robot is somebody picking it up and on a pad is a button. Without this, one topple
+            # ends the session — and on an obstacle course toppling is the whole point.
+            elif key == "u":
+                vx = vyaw = 0.0
+                call("robot.enable", {"on": True})
+            elif key in ("r", "k", "l"):
+                call("robot.do", {"skill": {"r": "roulade", "k": "kick_left",
+                                            "l": "kick_right"}[key]})
+            print(f"\rvx {vx:+.2f}  vyaw {vyaw:+.2f}   ", end="", flush=True)
+        send("robot.move", {"vx": vx, "vy": 0.0, "vyaw": vyaw})
+except KeyboardInterrupt:
+    # Ctrl-C arrives here, not in the loop: under `setcbreak` ISIG stays on, so the
+    # `"\x03"` branch below never sees it — without this the quit prints a traceback.
+    pass
+finally:
+    # Both halves matter: a terminal left in cbreak echoes nothing at the next prompt, and a duck
+    # left with an intent walks until the deadman catches it half a second later.
+    termios.tcsetattr(kb, termios.TCSADRAIN, old)
+    send("robot.move", {"vx": 0.0, "vy": 0.0, "vyaw": 0.0})
+    print()
+PY
+    say "stopped"
 }
 
 # How fast the world is actually running. The daemons' loops are wall-clock, so a simulator below
@@ -1109,6 +1299,7 @@ case "${1:-up}" in
     shell)   shift; shell "$@" ;;
     down)    down_containers; down ;;
     drive)   shift; drive "$@" ;;
+    keys)    keys ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
     status)  ctl health | head -4; upright ;;
@@ -1116,5 +1307,5 @@ case "${1:-up}" in
     log)     tail -f "$STATE/robotd.log" ;;
     simlog)  tail -f "$STATE/body.log" ;;
     realtime) realtime ;;
-    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
+    *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, keys, monitor, ctl, log, simlog, status, realtime" ;;
 esac

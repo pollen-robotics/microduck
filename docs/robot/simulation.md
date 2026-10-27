@@ -62,7 +62,9 @@ user did not exist, so its unit never started — a class `up` cannot see at all
 ```sh
 scripts/duck-sim                # a MuJoCo window opens, the duck stands up, and it is yours
 scripts/duck-sim status         # health, and whether it is standing
-scripts/duck-sim drive          # walk forward for 8 s (args: vx vyaw, default 0.15 0)
+scripts/duck-sim drive          # walk forward for 8 s (args: vx vyaw, default 0.3 0)
+scripts/duck-sim keys           # drive it from the keyboard: arrows, space, u, r, k/l, q
+scripts/duck-race               # time it round scene_challenge (needs DUCK_SIM_SCENE=challenge)
 scripts/duck-sim ctl health     # anything robotctl does, aimed at this duck
 scripts/duck-sim monitor        # robotctl monitor: joints, IMU, ToF, sticks
 scripts/duck-sim log            # robotd's log
@@ -80,6 +82,15 @@ sockets, which is the only thing that is different from a robot: on a board the 
 To talk to it from your own tools, the sockets are `~/.cache/duck-sim/duck-a.sock` (robotd; `duck.sock`
 is a link to whichever duck `ctl` talks to) and `~/.cache/duck-sim/duck-a-tof.sock`, and the body is
 on TCP port 7801.
+
+`DUCK_SIM_SCENE=challenge scripts/duck-sim` swaps the bare floor for an obstacle course — a gate,
+a slalom, a corridor, a ramp and steps, a curb, rubble, a roll wall, and a ball with a goal — and
+`scripts/duck-race` times a run round it: nine checkpoints, +3 s a fall, −5 s for going over the
+wall instead of round it, personal best in `~/.cache/duck-sim/race-best.json`. The scenes live in
+`microduck_rl` (`src/mjlab_microduck/robot/microduck/scene_challenge.xml`,
+`scene_playground.xml`); the clock only reads the body's own position report, so it cannot affect
+the run it times. The clock is wall-clock: if the simulator is running below real time (check with
+`scripts/duck-sim realtime`), the slowness counts against the run.
 
 ## Several ducks, each a machine you log into
 
@@ -161,7 +172,7 @@ Environment variables, all optional:
 | `DUCK_SIM_RL` | `~/Pollen/microduck_rl` | Where `duck-body`, the scenes and the ONNX runtime are. |
 | `DUCK_SIM_STATE` | `~/.cache/duck-sim` | Sockets, logs, params, the rootfs and the ducks' overlays. Short on purpose: a unix socket path is capped at about 108 bytes. |
 | `DUCK_SIM_DUCKS` | `1` | How many ducks; `boot N` sets it too. |
-| `DUCK_SIM_SCENE` | bare floor | A scene name (`apartment`) or a path. |
+| `DUCK_SIM_SCENE` | bare floor | A scene name (`apartment`, `challenge`, `playground`) or a path. |
 | `DUCK_SIM_CAMERAS` | none | Which ducks render a camera: `a`, `a,c`, `all`. |
 | `DUCK_SIM_DUCK` | `duck-a` | Which duck `ctl` and `monitor` talk to. |
 | `DUCK_SIM_KEYFRAME` | `SIT` | Where a duck starts: `SIT` folded on the floor (the standing policy rises from it), `HOME`, `STAND`, `FOLD`. |
@@ -177,6 +188,20 @@ they cannot balance it. `scripts/duck-sim realtime` reports the factor, and `boo
 many ducks, or too many cameras, and the ducks do not get slow — they go *unhealthy* at the 45 Hz
 gate, and in the container form the updater starts rolling releases back. Fewer ducks, fewer
 cameras, or a headless viewer are the fixes, in that order.
+
+**A walking command below about 0.25 does not walk.** The standing threshold is 0.05, so a smaller
+command still selects the walking policy — `monitor` says `walk`, and the full command comes back as
+applied — but the policy's own output is near flat down there and the duck shuffles on the spot.
+Measured over 4 s: 0.15 moves it 6 mm, 0.25 moves it 0.32 m, 0.3 moves it 0.47 m. If a duck looks
+like it is refusing to walk, ask for more speed before suspecting the simulator.
+
+**A duck outlives its body.** Closing the MuJoCo window stops the simulator, and the daemons keep
+running against a port with nothing behind it. Every failed read counts toward the update gate's
+limit (ten consecutive failures by default), so `robotctl health` first keeps answering *healthy*
+while the count climbs and then flips to *unhealthy: … consecutive bus read failures* — either way
+commands are accepted and nothing moves. The other evidence is `bus write failed … Connection
+refused` at 50 Hz in the log. `drive` and `keys` check for the body first and say so; everything
+else does not.
 
 **Ducks do not hot-join.** MuJoCo compiles its model, so changing the number of ducks restarts the
 simulator. The daemons survive that: `RemoteIo` reconnects on the next tick, and a duck whose body
