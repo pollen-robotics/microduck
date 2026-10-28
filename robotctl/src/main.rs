@@ -3710,10 +3710,7 @@ mod goto_parse_tests {
             target(&["robotctl", "robot", "goto", "tag", "0", "--look-only"]),
             (vec!["tag".into(), "0".into()], true, false)
         );
-        assert_eq!(
-            target(&["robotctl", "robot", "goto", "--look-only", "tag", "2"]).1,
-            true
-        );
+        assert!(target(&["robotctl", "robot", "goto", "--look-only", "tag", "2"]).1);
         assert_eq!(
             target(&[
                 "robotctl", "robot", "goto", "-0.1", "0", "-90", "--foot", "left"
