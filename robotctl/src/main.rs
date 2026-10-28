@@ -3523,7 +3523,7 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             );
         } else {
             println!(
-                "on tag {id}'s footprints: {:.0} mm, {:.1}° off (as the camera sees it)",
+                "on tag {id}'s footprints — walked the last stretch from a sighting {:.0} mm, {:.1}° off the staging pose",
                 distance * 1000.0,
                 heading.to_degrees()
             );

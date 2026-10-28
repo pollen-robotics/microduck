@@ -381,14 +381,18 @@ fn locate(config: &Path, robot_socket: &Path, id: u32) -> Result<Option<Pose>, F
 /// footprints themselves it is under the head, out of the gaze the policy allows (seen: the loop lost it there).
 const STAGE_M: f64 = 0.22;
 /// At the staging pose when a fresh sighting puts it this close to the feet; then the last stretch is walked
-/// blind, straight ahead.
-const STAGED_M: f64 = 0.03;
-const STAGED_RAD: f64 = 0.09;
+/// blind, straight ahead. What one sighting and one walk can settle to, not tighter: on a beta successive
+/// sightings at the staging pose wandered 3–10° in heading, and FootstepNet calls a goal reached within 2 cm / 5° —
+/// at 3 cm / 5° the loop spent its rounds on 2–3 cm corrections the walker barely took.
+const STAGED_M: f64 = 0.05;
+const STAGED_RAD: f64 = 0.21;
 /// Longest leg walked on one sighting. Farther goals are approached in legs, re-seeing the tag after each: the
 /// estimate improves as the robot closes in, and FootstepNet was trained on goals within ±1 m.
 const LEG_M: f64 = 0.8;
-/// Sighting → walk → re-sighting rounds before reporting where it got to.
-const ROUNDS: usize = 5;
+/// Sighting → walk → re-sighting rounds; the last one always walks the last stretch. Few on purpose: every walk
+/// ends squaring the feet and handing back, so each correction costs several steps (seen: five rounds of 2–3 cm
+/// corrections read as a robot shuffling for nothing). Typically one approach, one re-sight, the last stretch.
+const ROUNDS: usize = 3;
 
 /// Where the robot stands now: the midpoint of its sole centres (7 mm ahead of the foot sites) and their mean
 /// heading, in the odometry's world — forward kinematics on the measured joints, oriented by the IMU, placed by
@@ -590,7 +594,6 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64
     robot.hello()?;
     let trunk_height = robot_state(robot_socket)?.odom.position[2].max(0.08);
     let mut tag_world: Option<[f64; 3]> = None;
-    let mut miss = (f64::INFINITY, f64::INFINITY);
     for round in 0..ROUNDS {
         // Look where the tag was last seen; else (first round, or lost) sweep the floor in front.
         let mut seen = None;
@@ -636,13 +639,15 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64
         ];
         let (dx, dy) = (stage[0] - here[0], stage[1] - here[1]);
         let distance = dx.hypot(dy);
-        miss = (distance, wrap(stage[2] - here[2]).abs());
+        let miss = (distance, wrap(stage[2] - here[2]).abs());
         eprintln!(
             "  staging pose {:.0} mm, {:.1}° from the feet",
             miss.0 * 1000.0,
             miss.1.to_degrees()
         );
-        if miss.0 < STAGED_M && miss.1 < STAGED_RAD {
+        // Settled — or out of rounds: the last stretch is walked on the latest sighting either way, never left
+        // undone (it was, once: "on the footprints" 22 cm behind them).
+        if (miss.0 < STAGED_M && miss.1 < STAGED_RAD) || round + 1 == ROUNDS {
             eprintln!("  last {:.2} m onto the footprints…", STAGE_M);
             walk_to(&mut robot, robot_socket, goal)?;
             return Ok(miss);
@@ -664,7 +669,7 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64
         );
         walk_to(&mut robot, robot_socket, target)?;
     }
-    Ok(miss)
+    unreachable!("the last round always walks the last stretch")
 }
 
 #[cfg(test)]
