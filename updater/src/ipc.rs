@@ -22,9 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use crate::config::AutoApply;
 use crate::engine::{ApplyOptions, Engine};
@@ -476,18 +478,28 @@ impl Server {
     async fn handle_connection(self: Arc<Self>, stream: UnixStream) -> std::io::Result<()> {
         let peer = stream.peer_cred().ok();
         let (read_half, mut write_half) = stream.into_split();
-        let mut lines = BufReader::new(read_half).lines();
+        // The codec enforces the cap while reading. `lines()` would hold an unterminated line in
+        // memory however long it grew, and only then be measured against it.
+        let mut lines = FramedRead::new(read_half, LinesCodec::new_with_max_length(MAX_LINE));
 
-        while let Some(line) = lines.next_line().await? {
+        while let Some(line) = lines.next().await {
+            let line = match line {
+                Ok(line) => line,
+                Err(LinesCodecError::MaxLineLengthExceeded) => {
+                    let response = Response::err(
+                        None,
+                        proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
+                    );
+                    write_line(&mut write_half, &response).await?;
+                    // After a decode error `FramedRead` yields one `None` and then reads on, with
+                    // the codec discarding up to the next newline. Taking that `None` here keeps
+                    // it from ending the loop, and the connection.
+                    let _ = lines.next().await;
+                    continue;
+                }
+                Err(LinesCodecError::Io(e)) => return Err(e),
+            };
             if line.trim().is_empty() {
-                continue;
-            }
-            if line.len() > MAX_LINE {
-                let response = Response::err(
-                    None,
-                    proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
-                );
-                write_line(&mut write_half, &response).await?;
                 continue;
             }
 
