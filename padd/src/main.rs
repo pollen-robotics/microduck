@@ -36,6 +36,9 @@
 //! D-pad up        head mode — the sticks pose the head, the body holds still
 //! D-pad right     head + move — left stick walks and turns, right stick looks around
 //! D-pad left      move — the sticks walk, strafe and turn
+//!                 pressed again: precision — a stick flick is one nudge skill (left stick forward,
+//!                 back, left, right, snapped to its main axis; right stick left/right turns), a
+//!                 chirp going in and a coo coming out; the next left press drives again
 //! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
 //! Home            flashlight on / off (a board with one)
 //! Start           first press stands up, then toggles the policy

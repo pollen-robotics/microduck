@@ -24,12 +24,57 @@ enum Mode {
     /// D-pad down. Body + head: the left stick crouches and leans the standing robot sideways,
     /// the right stick looks around. The body does not walk.
     BodyPose,
+    /// D-pad left pressed again while driving (and again to leave). A stick flick is one
+    /// precision nudge — a trained one-shot skill that moves the robot 1.5 cm or turns it 7.5° and
+    /// stops still: the left stick forward, back, left or right, snapped to its dominant axis so a
+    /// slightly diagonal finger is still a pure request; the right stick left or right turns. The
+    /// walk is fed a zero twist meanwhile. See [`precision_nudge`].
+    Precision,
 }
 
 impl Mode {
     /// Whether this mode sends head poses, so leaving it has a head to put back.
     fn poses_head(self) -> bool {
         matches!(self, Self::Head | Self::HeadDrive | Self::BodyPose)
+    }
+}
+
+/// How far a stick must go for a flick to be a nudge, and how close to the centre both sticks must
+/// come back before the next one counts. Far apart on purpose: a stick drifting back through the
+/// middle of its travel must not read as a second flick.
+pub const NUDGE_FLICK: f64 = 0.6;
+pub const NUDGE_CENTRE: f64 = 0.3;
+
+/// The nudge skills a flick asks for, by name (`robotctl policy add nudge_fwd …`). A robot without
+/// them answers the request with the skills it does have, which `report` logs.
+const NUDGE_FWD: &str = "nudge_fwd";
+const NUDGE_BACK: &str = "nudge_back";
+const NUDGE_LEFT: &str = "nudge_left";
+const NUDGE_RIGHT: &str = "nudge_right";
+const NUDGE_TURN_LEFT: &str = "nudge_turn_left";
+const NUDGE_TURN_RIGHT: &str = "nudge_turn_right";
+
+/// The nudge a precision-mode frame asks for, if any: the left stick first, snapped to whichever of
+/// its axes is further out (forward/back or left/right, never between), else the right stick's
+/// left/right as a turn. Signs are gilrs's — up and right read positive — so right is a nudge to
+/// the robot's right and a clockwise turn.
+pub fn precision_nudge(left_x: f64, left_y: f64, right_x: f64) -> Option<&'static str> {
+    if left_x.abs().max(left_y.abs()) >= NUDGE_FLICK {
+        Some(if left_y.abs() >= left_x.abs() {
+            if left_y > 0.0 { NUDGE_FWD } else { NUDGE_BACK }
+        } else if left_x > 0.0 {
+            NUDGE_RIGHT
+        } else {
+            NUDGE_LEFT
+        })
+    } else if right_x.abs() >= NUDGE_FLICK {
+        Some(if right_x > 0.0 {
+            NUDGE_TURN_RIGHT
+        } else {
+            NUDGE_TURN_LEFT
+        })
+    } else {
+        None
     }
 }
 
@@ -150,6 +195,9 @@ pub struct Mapper {
     /// `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
     /// Starts false: padd starts with the robot, and a robotd restart restarts padd too.
     up: bool,
+    /// Precision mode: both sticks have been back near the centre since the last nudge, so the
+    /// next flick counts. False on entering the mode, so a stick already held does not fire.
+    nudge_armed: bool,
 }
 
 impl Default for Mapper {
@@ -168,6 +216,7 @@ impl Mapper {
             prev_rt: 0.0,
             prev_lt: 0.0,
             up: false,
+            nudge_armed: false,
         }
     }
 
@@ -216,6 +265,15 @@ impl Mapper {
             if pad.pressed.contains(button) {
                 wanted_mode = Some(mode);
             }
+        }
+        // D-pad left pressed while already driving enters precision mode; pressed in precision
+        // mode it goes back to driving. Every other arrow leaves precision for its own mode.
+        if wanted_mode == Some(Mode::Drive) && pad.pressed.contains(Buttons::LEFT) {
+            wanted_mode = Some(if self.mode == Mode::Drive {
+                Mode::Precision
+            } else {
+                Mode::Drive
+            });
         }
         // Which bindable buttons went down this frame, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this mapping does not know.
@@ -285,6 +343,24 @@ impl Mapper {
                 for call in mode_exit_calls(self.mode, next) {
                     out.push(Out::Notify(call));
                 }
+                // The mode is otherwise invisible on the robot: a chirp going in, a coo coming out.
+                if next == Mode::Precision || self.mode == Mode::Precision {
+                    let tag = if next == Mode::Precision {
+                        proto::SoundTag::Chirp
+                    } else {
+                        proto::SoundTag::Coo
+                    };
+                    out.push(Out::Notify(proto::Call::RobotSound(proto::SoundParams {
+                        tag,
+                        hold: None,
+                    })));
+                }
+                if next == Mode::Precision {
+                    self.nudge_armed = false;
+                    tracing::info!(
+                        "precision mode: a stick flick is one nudge; D-pad left to leave"
+                    );
+                }
                 self.mode = next;
                 tracing::info!(mode = ?self.mode, "mode");
             }
@@ -325,6 +401,25 @@ impl Mapper {
             out.push(Out::Request(proto::Call::RobotDo(proto::DoParams {
                 skill: skill.to_owned(),
             })));
+        }
+
+        // Precision mode: one nudge per flick. Answered, so a refusal says why in the journal — a
+        // nudge already running (robotd refuses a skill mid-flight; the flick is dropped, not
+        // queued), or a robot without the nudge skills (it lists the ones it has).
+        if self.mode == Mode::Precision {
+            let centred = pad.left_x.abs().max(pad.left_y.abs()) < NUDGE_CENTRE
+                && pad.right_x.abs() < NUDGE_CENTRE;
+            if centred {
+                self.nudge_armed = true;
+            } else if self.nudge_armed
+                && let Some(skill) = precision_nudge(pad.left_x, pad.left_y, pad.right_x)
+            {
+                tracing::info!(skill, "precision nudge");
+                out.push(Out::Request(proto::Call::RobotDo(proto::DoParams {
+                    skill: skill.to_owned(),
+                })));
+                self.nudge_armed = false;
+            }
         }
 
         // Home: the flashlight. Not bindable — it is not a skill, and the robot owns the toggle.
@@ -518,6 +613,9 @@ fn stick_frame(
                 &a.head_roll,
             ));
         }
+        // A fresh zero twist every tick rather than none: the twist's age feeds robotd's deadman,
+        // and a nudge is a skill that does not read it anyway.
+        Mode::Precision => frame.push(proto::Call::RobotMove(proto::MoveParams::default())),
         Mode::BodyPose => {
             frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
             let (a, body) = (&cfg.axes.body_pose, &cfg.body);
@@ -678,6 +776,151 @@ mod tests {
             frame.iter().any(|c| matches!(c, proto::Call::RobotHead(_))),
             "still head mode"
         );
+    }
+
+    fn nudges(out: &[Out]) -> Vec<String> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Request(proto::Call::RobotDo(proto::DoParams { skill }))
+                    if skill.starts_with("nudge_") =>
+                {
+                    Some(skill.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sounds(out: &[Out]) -> Vec<proto::SoundTag> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Notify(proto::Call::RobotSound(proto::SoundParams { tag, .. })) => Some(*tag),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press(button: Buttons) -> PadFrame {
+        PadFrame {
+            pressed: button,
+            held: button,
+            ..Default::default()
+        }
+    }
+
+    /// D-pad left pressed again while driving enters precision mode, with a chirp; pressed again
+    /// it leaves, with a coo. The first left only (re)selects driving, as it always did.
+    #[test]
+    fn d_pad_left_twice_enters_precision_and_again_leaves() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.tick(&press(Buttons::UP), &cfg, t, &mut out, &mut frame);
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::Drive, "from head mode, left is plain driving");
+        assert!(sounds(&out).is_empty());
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::Precision);
+        assert_eq!(sounds(&out), vec![proto::SoundTag::Chirp]);
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::Drive);
+        assert_eq!(sounds(&out), vec![proto::SoundTag::Coo]);
+    }
+
+    /// A flick is one nudge, snapped to the stick's dominant axis; holding it does not repeat, and
+    /// the stick must come back near the centre before the next one counts. Meanwhile the walk
+    /// gets a zero twist every tick.
+    #[test]
+    fn a_flick_is_one_pure_nudge_and_holding_does_not_repeat() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        // padd starts driving, so one left press is "left again while driving"
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::Precision);
+        let stick = |lx: f64, ly: f64, rx: f64| PadFrame {
+            left_x: lx,
+            left_y: ly,
+            right_x: rx,
+            ..Default::default()
+        };
+        // centred: arms; then a slightly diagonal flick forward is a pure forward nudge
+        m.tick(&stick(0.0, 0.0, 0.0), &cfg, t, &mut out, &mut frame);
+        assert_eq!(
+            frame,
+            vec![proto::Call::RobotMove(proto::MoveParams::default())]
+        );
+        m.tick(&stick(0.35, 0.9, 0.0), &cfg, t, &mut out, &mut frame);
+        assert_eq!(nudges(&out), vec!["nudge_fwd"]);
+        assert_eq!(
+            frame,
+            vec![proto::Call::RobotMove(proto::MoveParams::default())],
+            "no twist"
+        );
+        // held, and wandering through the middle of its travel: nothing more
+        for ly in [0.9, 0.7, 0.45, 0.8] {
+            m.tick(&stick(0.0, ly, 0.0), &cfg, t, &mut out, &mut frame);
+            assert!(nudges(&out).is_empty(), "ly {ly}: {out:?}");
+        }
+        // back to the centre, then a flick left (mostly sideways) and one with the right stick
+        m.tick(&stick(0.1, 0.1, 0.0), &cfg, t, &mut out, &mut frame);
+        m.tick(&stick(-0.8, 0.4, 0.0), &cfg, t, &mut out, &mut frame);
+        assert_eq!(nudges(&out), vec!["nudge_left"]);
+        m.tick(&stick(0.0, 0.0, 0.0), &cfg, t, &mut out, &mut frame);
+        m.tick(&stick(0.0, 0.0, 0.9), &cfg, t, &mut out, &mut frame);
+        assert_eq!(nudges(&out), vec!["nudge_turn_right"]);
+    }
+
+    #[test]
+    fn every_direction_snaps_to_its_nudge() {
+        assert_eq!(precision_nudge(0.0, 1.0, 0.0), Some("nudge_fwd"));
+        assert_eq!(precision_nudge(0.2, -0.7, 0.0), Some("nudge_back"));
+        assert_eq!(precision_nudge(-0.9, 0.5, 0.0), Some("nudge_left"));
+        assert_eq!(precision_nudge(0.7, 0.69, 0.0), Some("nudge_right"));
+        assert_eq!(precision_nudge(0.0, 0.0, -0.8), Some("nudge_turn_left"));
+        assert_eq!(precision_nudge(0.0, 0.0, 0.8), Some("nudge_turn_right"));
+        assert_eq!(precision_nudge(0.5, 0.5, 0.5), None, "short of a flick");
+        // the right stick's up/down is not a nudge
+        assert_eq!(precision_nudge(0.0, 0.0, 0.1), None);
+    }
+
+    /// A stick already deflected when the mode starts is not a flick; any other arrow leaves the
+    /// mode, and holding Start (home) resets it to driving.
+    #[test]
+    fn entering_with_a_held_stick_does_not_fire_and_other_ways_out() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let mut held_fwd = press(Buttons::LEFT);
+        held_fwd.left_y = 1.0;
+        m.tick(&held_fwd, &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::Precision);
+        let still_held = PadFrame {
+            left_y: 1.0,
+            ..Default::default()
+        };
+        m.tick(&still_held, &cfg, t, &mut out, &mut frame);
+        assert!(nudges(&out).is_empty(), "{out:?}");
+        m.tick(&press(Buttons::DOWN), &cfg, t, &mut out, &mut frame);
+        assert_eq!(m.mode, Mode::BodyPose);
+        assert_eq!(sounds(&out), vec![proto::SoundTag::Coo]);
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        m.tick(&press(Buttons::LEFT), &cfg, t, &mut out, &mut frame);
+        assert_eq!(
+            m.mode,
+            Mode::Precision,
+            "from body pose: left drives, left again is precision"
+        );
+        let start = PadFrame {
+            held: Buttons::START,
+            ..Default::default()
+        };
+        m.tick(&start, &cfg, t, &mut out, &mut frame);
+        m.tick(
+            &start,
+            &cfg,
+            t + HOME_HOLD + std::time::Duration::from_millis(50),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(m.mode, Mode::Drive, "Start held goes home in driving mode");
     }
 
     /// Head + move with an IMU pad re-centres on every press: the reference is the pad's attitude
