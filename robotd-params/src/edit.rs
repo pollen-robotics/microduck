@@ -402,6 +402,12 @@ impl Model {
         if skill.chain {
             entry["chain"] = toml_edit::value(true);
         }
+        if skill.phase {
+            entry["phase"] = toml_edit::value(true);
+        }
+        if let Some(sound) = &skill.sound {
+            entry["sound"] = toml_edit::value(sound.display().to_string());
+        }
         // Only what differs from a plain zero-command one-shot. A file full of explicit
         // defaults is the unreadable thing this whole editor exists to avoid.
         if skill.command != [0.0; 3] {

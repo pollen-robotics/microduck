@@ -1522,6 +1522,16 @@ pub struct SkillDef {
     #[serde(default)]
     pub chain: bool,
 
+    /// Feed the twist slots the phase encoding `[cos 2πφ, sin 2πφ, 0]` instead of `command`,
+    /// with φ going 0 → 1 over `duration` — the ground pick's command, for a one-shot trained on
+    /// a phase clock (an expressive motion has to know where in its timeline it is).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phase: bool,
+
+    /// A `.wav` played from the skill's first tick, the way an emotion's sound is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<PathBuf>,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
@@ -1882,6 +1892,8 @@ fn fallback_skills() -> Vec<SkillDef> {
         command: [0.0; 3],
         unwind: [0.0; 3],
         unwind_s: 0.0,
+        phase: false,
+        sound: None,
         params: SkillOverrides::default(),
     };
     vec![
@@ -1896,6 +1908,8 @@ fn fallback_skills() -> Vec<SkillDef> {
             command: [0.0; 3],
             unwind: [0.0; 3],
             unwind_s: 0.0,
+            phase: false,
+            sound: None,
             params: SkillOverrides::default(),
         },
         kick("kick_left", "ball_kick_left.onnx"),

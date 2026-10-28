@@ -217,6 +217,19 @@ enum SkillPhase {
     Unwinding,
 }
 
+/// The twist a skill is fed this tick. A phase skill runs on the ground pick's clock encoding, φ
+/// from 0 at its first tick to 1 as its window closes; any other one gets its constant command.
+fn skill_twist(d: &robotd_params::SkillDef, phase: SkillPhase, remaining: f64) -> [f64; 3] {
+    match phase {
+        SkillPhase::Holding if d.phase && d.duration > 0.0 => {
+            let angle = std::f64::consts::TAU * (1.0 - remaining / d.duration).clamp(0.0, 1.0);
+            [angle.cos(), angle.sin(), 0.0]
+        }
+        SkillPhase::Holding => d.command,
+        SkillPhase::Unwinding => d.unwind,
+    }
+}
+
 /// Which network drove the robot on the last step, as a policy change needs to know it.
 ///
 /// [`Net`] with the skill index replaced by the skill's name, because an index is only meaningful
@@ -502,6 +515,11 @@ impl Controller {
         Some(grasp_mouth(mouth, close, phase))
     }
 
+    /// The sound a skill plays from its first tick, if its entry names one.
+    pub fn skill_sound(&self, index: usize) -> Option<&std::path::Path> {
+        self.skills.skills.get(index)?.sound.as_deref()
+    }
+
     /// Every one-shot skill this robot has, in priority order — what a client may ask for.
     pub fn skill_names(&self) -> Vec<String> {
         self.skills
@@ -701,10 +719,7 @@ impl Controller {
             // exactly that. Only the twist differs, and for most skills it is zero too, which is
             // what made the kick and roulade arms the same arm.
             let def = self.skills.skills.get(active.index);
-            let twist = def.map_or([0.0; 3], |d| match active.phase {
-                SkillPhase::Holding => d.command,
-                SkillPhase::Unwinding => d.unwind,
-            });
+            let twist = def.map_or([0.0; 3], |d| skill_twist(d, active.phase, active.remaining));
             let label = def.map_or(std::borrow::Cow::Borrowed("skill"), |d| {
                 std::borrow::Cow::Owned(match active.phase {
                     SkillPhase::Holding => d.name.clone(),
@@ -963,6 +978,38 @@ mod tests {
     fn the_ground_pick_cutoff_is_the_prototypes() {
         assert_eq!(robotd_params::DEFAULT_GROUND_PICK_END_PHASE, 0.7);
         assert_eq!(robotd_params::DEFAULT_SITSTAND_RISE_S, 1.0);
+    }
+
+    /// A phase skill is fed the ground pick's clock over its own duration; a plain one its command.
+    #[test]
+    fn a_phase_skill_runs_on_its_own_clock() {
+        let def = robotd_params::SkillDef {
+            name: "sassy".into(),
+            duration: 4.0,
+            phase: true,
+            command: [0.3, 0.0, 0.0],
+            ..Default::default()
+        };
+        let at = |remaining: f64| skill_twist(&def, SkillPhase::Holding, remaining);
+        assert_eq!(at(4.0), [1.0, 0.0, 0.0], "phase 0 at the first tick");
+        let half = at(2.0);
+        assert!(
+            (half[0] + 1.0).abs() < 1e-9 && half[1].abs() < 1e-9,
+            "{half:?}"
+        );
+        let quarter = at(3.0);
+        assert!(
+            quarter[0].abs() < 1e-9 && (quarter[1] - 1.0).abs() < 1e-9,
+            "{quarter:?}"
+        );
+        let plain = robotd_params::SkillDef {
+            phase: false,
+            ..def
+        };
+        assert_eq!(
+            skill_twist(&plain, SkillPhase::Holding, 2.0),
+            [0.3, 0.0, 0.0]
+        );
     }
 
     /// The grasp's beak plays the schedule it was trained with — closed as it starts, open on the

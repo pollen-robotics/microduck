@@ -1109,6 +1109,16 @@ enum PolicyCommand {
         /// The twist fed while it unwinds. Zeros unless given.
         #[arg(long, value_name = "X,Y,Z")]
         unwind_command: Option<String>,
+        /// Drive it on a phase clock — `[cos 2πφ, sin 2πφ, 0]`, φ 0 → 1 over `--hold` — instead
+        /// of a constant command, as a policy trained like the ground pick expects.
+        #[arg(long, conflicts_with = "command")]
+        phase: bool,
+        /// A `.wav` on this robot played from its first tick.
+        #[arg(long)]
+        sound: Option<PathBuf>,
+        /// Scale raw policy output into joint offsets with this, when it was trained with its own.
+        #[arg(long)]
+        action_scale: Option<f64>,
         #[arg(long)]
         json: bool,
     },
@@ -4118,6 +4128,9 @@ fn run_policy_skill(
         unwind,
         command: command_spec,
         unwind_command,
+        phase,
+        sound,
+        action_scale,
         json,
     } = command
     else {
@@ -4209,8 +4222,13 @@ fn run_policy_skill(
         unwind_s: unwind
             .or_else(|| from_manifest.as_ref().and_then(|m| m.unwind_s))
             .unwrap_or(0.0),
+        phase: *phase,
+        sound: sound
+            .as_ref()
+            .map(|s| s.canonicalize().unwrap_or_else(|_| s.clone())),
         params: robotd_params::SkillOverrides {
-            action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
+            action_scale: action_scale
+                .or_else(|| from_manifest.as_ref().and_then(|m| m.action_scale)),
             ..Default::default()
         },
     };

@@ -2609,7 +2609,13 @@ async fn control_loop<T: RobotIo>(
                             .cloned()
                             .unwrap_or_else(|| index.to_string());
                         match controller.start_skill(index) {
-                            Ok(true) => tracing::warn!(skill = %name, "skill started"),
+                            Ok(true) => {
+                                tracing::warn!(skill = %name, "skill started");
+                                let wav = controller.skill_sound(index).map(Path::to_path_buf);
+                                if let (Some(voice), Some(wav)) = (voice.as_mut(), wav) {
+                                    voice.play_file(&wav);
+                                }
+                            }
                             Ok(false) => {}
                             Err(reason) => {
                                 tracing::debug!(skill = %name, reason, "skill refused");
@@ -4834,6 +4840,9 @@ fn set_skill_request(
             .chain
             .or(existing.as_ref().map(|s| s.chain))
             .unwrap_or(false),
+        // Not on the wire: kept from the entry a file edit put there.
+        phase: existing.as_ref().is_some_and(|s| s.phase),
+        sound: existing.as_ref().and_then(|s| s.sound.clone()),
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale
