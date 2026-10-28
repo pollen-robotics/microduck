@@ -4075,6 +4075,30 @@ fn run_policy(
     }
 }
 
+/// Fetch `[policy] footstep_control`'s two networks into the library, through `updaterd`. Returns where they
+/// landed — the paths `robotd` resolves the switch to.
+pub(crate) fn fetch_footsteps(updater_socket: &Path) -> Result<Vec<PathBuf>, String> {
+    fetch_footsteps_inner(updater_socket).map_err(|f| f.message)
+}
+
+fn fetch_footsteps_inner(updater_socket: &Path) -> Result<Vec<PathBuf>, Failure> {
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let mut paths = Vec::new();
+    for file in robotd_params::FOOTSTEPS_FILES {
+        let result = result_of(client.call(&proto::Call::PolicyFetch(
+            proto::PolicyFetchParams {
+                repo: robotd_params::FOOTSTEPS_REPO.to_owned(),
+                revision: None,
+                file: Some(file.to_owned()),
+            },
+        ))?)?;
+        let fetched: proto::PolicyFetchResult = decode(&result)?;
+        paths.push(PathBuf::from(fetched.path));
+    }
+    Ok(paths)
+}
+
 /// Fetch a policy named as `org/name[@revision][:file]`, and say what arrived.
 ///
 /// Through `updaterd`, the process with a network stack — this binary deliberately does not link
@@ -5445,7 +5469,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &cli.socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }

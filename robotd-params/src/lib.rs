@@ -62,6 +62,20 @@ pub const DETECTOR_DIR: &str = "/opt/robot/detector/current";
 /// having to look it up. `updater::policy::LIBRARY_ROOT` is the same string on the writing side.
 pub const POLICY_LIBRARY: &str = "/var/lib/robot/policies";
 
+/// The Hub repo `[policy] footstep_control` runs from: the footstep policy and its planner, fetched into the
+/// library by `robotctl configure` when the switch goes on.
+pub const FOOTSTEPS_REPO: &str = "apirrone/microduck-footsteps";
+/// The two files in [`FOOTSTEPS_REPO`]: footstep policy, FootstepNet planner.
+pub const FOOTSTEPS_FILES: [&str; 2] = ["footsteps.onnx", "footstepnet.onnx"];
+
+/// Where [`FOOTSTEPS_REPO`]'s `file` lands in the library — `policy.fetch`'s `<org>/<name>/<revision>/` layout.
+pub fn footsteps_library_path(file: &str) -> PathBuf {
+    PathBuf::from(POLICY_LIBRARY)
+        .join(FOOTSTEPS_REPO)
+        .join("main")
+        .join(file)
+}
+
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 
@@ -1377,14 +1391,14 @@ pub struct PolicyParams {
     pub kick_right: Option<PathBuf>,
     /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
     pub roulade: Option<PathBuf>,
-    /// Footstep-tracking policy (microduck_rl `Mjlab-Footsteps-*`): while the stick is held, walking goes through
-    /// it, one planned footstep at a time, toward a goal the stick pushes ahead of the robot. Needs
-    /// `footstep_planner` too. Unset (the default) is a robot without it; walk mode only.
+    /// Walk on placed footsteps: while the stick is held the footstep policy drives, one step at a time, the
+    /// step proportional to the stick; `robotctl robot footsteps` walks printed patterns. Off by default; on,
+    /// `robotctl configure` fetches both networks from [`FOOTSTEPS_REPO`]. Walk mode only.
+    pub footstep_control: bool,
+    /// Override the footstep policy file (default: [`FOOTSTEPS_REPO`]'s, in the library).
     pub footsteps: Option<PathBuf>,
-    /// The FootstepNet planner ONNX that feeds `footsteps` (Hub `apirrone/microduck-footstepnet`).
+    /// Override the FootstepNet planner file (default: [`FOOTSTEPS_REPO`]'s, in the library).
     pub footstep_planner: Option<PathBuf>,
-    /// How far ahead the stick's goal is, as seconds of the commanded twist. Absent: 1.0.
-    pub footstep_horizon_s: Option<f64>,
     /// Scales raw policy output into a joint offset. Absent resolves per mode: 0.9 walking
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
@@ -1969,7 +1983,6 @@ pub struct ResolvedPolicy {
     pub roulade: Option<PathBuf>,
     pub footsteps: Option<PathBuf>,
     pub footstep_planner: Option<PathBuf>,
-    pub footstep_horizon_s: f64,
     pub action_scale: f64,
     pub standing_action_scale: f64,
     pub standing_gain_ratio: f64,
@@ -2108,6 +2121,17 @@ impl PolicyParams {
             }
         };
 
+        let footstep_path = |field: &Option<PathBuf>, file: &str| -> Option<PathBuf> {
+            if !self.footstep_control || self.mode != Mode::Walk {
+                return None;
+            }
+            match field {
+                Some(p) if is_none_sentinel(p) => None,
+                Some(p) => Some(p.clone()),
+                None => Some(footsteps_library_path(file)),
+            }
+        };
+
         let (walk_default, stand, sitstand, ground_pick) = match self.mode {
             // The velstand gait (set v5) walks on a twist and stands still at zero command,
             // so no standing network is loaded by default: with `stand` unset the walking
@@ -2170,11 +2194,9 @@ impl PolicyParams {
             kick_left: skill_file("kick_left"),
             kick_right: skill_file("kick_right"),
             roulade: skill_file("roulade"),
-            // No release default: footsteps are opt-in, and the roller has no feet to place.
-            footsteps: path(&self.footsteps, None).filter(|_| self.mode == Mode::Walk),
-            footstep_planner: path(&self.footstep_planner, None)
-                .filter(|_| self.mode == Mode::Walk),
-            footstep_horizon_s: self.footstep_horizon_s.unwrap_or(1.0),
+            // Opt-in, and the roller has no feet to place. Default files: the Hub repo's, in the library.
+            footsteps: footstep_path(&self.footsteps, FOOTSTEPS_FILES[0]),
+            footstep_planner: footstep_path(&self.footstep_planner, FOOTSTEPS_FILES[1]),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -2285,9 +2307,9 @@ impl Default for PolicyParams {
             kick_left: None,
             kick_right: None,
             roulade: None,
+            footstep_control: false,
             footsteps: None,
             footstep_planner: None,
-            footstep_horizon_s: None,
             action_scale: None,
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.
@@ -2845,6 +2867,42 @@ pub fn alsa_card_ids(proc_asound_cards: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `footstep_control` is the one switch a person trying footsteps touches: off (the default) is a robot
+    /// without them whatever the paths say; on resolves both to the fetched Hub files, which `robotctl
+    /// configure` puts exactly there; a path overrides; the roller never footsteps.
+    #[test]
+    fn footstep_control_resolves_to_the_fetched_files() {
+        let mut p = PolicyParams {
+            footsteps: Some(PathBuf::from("/tmp/f.onnx")),
+            ..Default::default()
+        };
+        let off = p.resolved_with(None);
+        assert_eq!((off.footsteps, off.footstep_planner), (None, None));
+
+        p.footstep_control = true;
+        p.footsteps = None;
+        let on = p.resolved_with(None);
+        assert_eq!(
+            on.footsteps.as_deref(),
+            Some(std::path::Path::new(
+                "/var/lib/robot/policies/apirrone/microduck-footsteps/main/footsteps.onnx"
+            ))
+        );
+        assert_eq!(
+            on.footstep_planner,
+            Some(footsteps_library_path("footstepnet.onnx"))
+        );
+
+        p.footsteps = Some(PathBuf::from("/tmp/f.onnx"));
+        assert_eq!(
+            p.resolved_with(None).footsteps,
+            Some(PathBuf::from("/tmp/f.onnx"))
+        );
+
+        p.mode = Mode::Roller;
+        assert_eq!(p.resolved_with(None).footsteps, None);
+    }
     /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
     /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
     /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the

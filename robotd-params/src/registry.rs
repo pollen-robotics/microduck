@@ -190,19 +190,19 @@ pub const REGISTRY: &[Entry] = &[
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
     entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
     entry(
+        "policy.footstep_control",
+        Kind::Bool,
+        "Walk on placed footsteps (stick = step size); fetches apirrone/microduck-footsteps",
+    ),
+    entry(
         "policy.footsteps",
         Kind::OptionalPath,
-        "Footstep-tracking policy: the stick walks planned footsteps; needs footstep_planner",
+        "Footstep policy file; unset = the fetched apirrone/microduck-footsteps one",
     ),
     entry(
         "policy.footstep_planner",
         Kind::OptionalPath,
-        "FootstepNet planner ONNX feeding the footstep policy",
-    ),
-    entry(
-        "policy.footstep_horizon_s",
-        Kind::OptionalFloat,
-        "Footsteps: stick goal look-ahead, seconds of twist; unset 1.0",
+        "FootstepNet planner file; unset = the fetched apirrone/microduck-footsteps one",
     ),
     entry(
         "policy.action_scale",

@@ -39,7 +39,7 @@
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
-use duck_footstep_control::{CarrotParams, Follower, Foot, PatternRun, Pose2, carrot_goal};
+use duck_footstep_control::{Follower, Foot, PatternRun, Pose2, compose, stick_step};
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -52,9 +52,10 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 const CHAIN_WINDOW: f64 = 0.15;
 
 /// Stick released this long, footstepping hands back to the gait at the next touchdown. Long enough that a
-/// stick passing through centre does not drop out of footsteps; the robot steps in place meanwhile, squaring
-/// its feet up under the neutral goal, so the gait takes over from a parallel stance.
-const FOOTSTEP_IDLE_S: f64 = 0.75;
+/// stick passing through centre does not drop out of footsteps; the robot steps in place meanwhile (a released
+/// stick is the neutral step), so the gait takes over from a parallel stance. Was 0.75 s: three or four steps in
+/// place after letting go read as "too many steps" on the robot.
+const FOOTSTEP_IDLE_S: f64 = 0.4;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
@@ -71,8 +72,9 @@ pub struct Tuning {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Trained with 0.7.
     pub legs_lowpass: Option<f64>,
-    /// Footstepping: how far ahead of the stance the stick's goal is, in seconds of the commanded twist.
-    pub footstep_horizon_s: f64,
+    /// Footstepping: the twist of a fully deflected stick (vx, vy, ωz) — full deflection on an axis is that
+    /// axis's full step. The pad's `[pad_drive]` defaults; a robot with other pad ranges saturates early or late.
+    pub footstep_full_twist: [f64; 3],
 }
 
 impl Default for Tuning {
@@ -84,7 +86,7 @@ impl Default for Tuning {
             gain: 200,
             head_lowpass: Some(0.5),
             legs_lowpass: Some(0.7),
-            footstep_horizon_s: CarrotParams::default().horizon_s,
+            footstep_full_twist: [0.4, 0.3, 1.0],
         }
     }
 }
@@ -366,38 +368,34 @@ impl Controller {
             self.footstepping = true;
             self.follower.reset();
         }
-        let horizon = self.tuning.footstep_horizon_s;
-        let planner = self.policy.planner_mut()?;
-        let spacing = planner.options().feet_spacing;
-        let max_steps = CarrotParams::default().max_steps;
-        let goal = |pose, foot| carrot_goal(pose, foot, twist, horizon, spacing);
-        match self
-            .follower
-            .update(planner, support, soles, goal, None, max_steps)
-        {
-            Ok(_) if self.footstep_idle >= FOOTSTEP_IDLE_S && self.follower.switched() => {
-                self.footstepping = false;
-                None
-            }
-            Ok(command) => {
-                if self.follower.switched()
-                    && let Some((distance, heading)) = self.follower.last_error()
-                {
-                    tracing::debug!(
-                        miss_mm = distance * 1000.0,
-                        miss_deg = heading.to_degrees(),
-                        planned = self.follower.plan().steps.len(),
-                        "footstep touchdown"
-                    );
-                }
-                Some(command)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "footstep planner failed; handing back to the gait");
-                self.footstepping = false;
-                None
-            }
+        let options = self.policy.planner_mut()?.options().clone();
+        let step = stick_step(twist, self.tuning.footstep_full_twist, &options);
+        let spacing = options.feet_spacing;
+        // The landing, relative to the neutral place beside the support foot, fixed at the touchdown for the
+        // whole swing as in training.
+        let target = |support, foot: Foot| {
+            compose(
+                compose(support, [0.0, foot.other().side() * spacing, 0.0]),
+                step,
+            )
+        };
+        let command = self.follower.update_scripted(support, soles, target);
+        if !self.follower.switched() {
+            return Some(command);
         }
+        if self.footstep_idle >= FOOTSTEP_IDLE_S {
+            self.footstepping = false;
+            return None;
+        }
+        if let Some((distance, heading)) = self.follower.last_error() {
+            tracing::debug!(
+                miss_mm = distance * 1000.0,
+                miss_deg = heading.to_degrees(),
+                step = ?step,
+                "footstep touchdown"
+            );
+        }
+        Some(command)
     }
 
     /// The network that drove on the last step, or `None` before there was one.

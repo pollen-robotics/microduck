@@ -1,6 +1,6 @@
 //! From a plan to the footstep policy's command, replanned at every touchdown.
 
-use crate::planner::{Obstacle, Plan, Planner, PlannerError, StepNet};
+use crate::planner::{Obstacle, Plan, Planner, PlannerError, PlannerOptions, StepNet};
 use crate::pose::{Foot, Pose2, compose, relative};
 
 /// The joystick's goal: where a constant twist would carry the stance in `horizon_s` seconds.
@@ -48,6 +48,36 @@ pub fn carrot_goal(
     };
     let moved = [vx * sx - vy * cx, vx * cx + vy * sx, theta];
     (compose(compose(centre, moved), [0.0, half, 0.0]), swing)
+}
+
+/// The swing foot's step for a held stick: each axis of `twist` as a fraction of its full deflection `full`
+/// (m/s, m/s, rad/s) times that axis's step limit, clipped like FootstepNet clips — a neutral-relative step in the
+/// robot's own frame (x forward, y left, θ counter-clockwise), whichever foot swings.
+///
+/// Proportional on purpose. Planning toward a goal a stick pushes ahead (the first version) made every
+/// deflection a full step: FootstepNet reaches any goal in the fewest steps, and below a step it only aims
+/// within its 2 cm / 5° reached tolerance — 1 cm asked gave 0.5 cm, 2 cm gave 1.7 cm (seen on the robot: "a
+/// small angle or a full one makes the same step size"). The policy was trained on exactly this target.
+pub fn stick_step(twist: [f64; 3], full: [f64; 3], options: &PlannerOptions) -> [f64; 3] {
+    let frac = |v: f64, f: f64| {
+        if f > 0.0 {
+            (v / f).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let fx = frac(twist[0], full[0]);
+    let dx = fx
+        * if fx >= 0.0 {
+            options.max_dx_forward
+        } else {
+            options.max_dx_backward
+        };
+    options.clip([
+        dx,
+        frac(twist[1], full[1]) * options.max_dy,
+        frac(twist[2], full[2]) * options.max_dtheta,
+    ])
 }
 
 /// Follows a plan one touchdown at a time.
@@ -180,6 +210,47 @@ mod tests {
                 "{r:?}"
             );
         }
+    }
+
+    fn options() -> PlannerOptions {
+        PlannerOptions {
+            max_dx_forward: 0.05,
+            max_dx_backward: 0.05,
+            max_dy: 0.02,
+            max_dtheta: 0.52,
+            tolerance_distance: 0.02,
+            tolerance_angle: 0.087,
+            obstacle_max_radius: 0.12,
+            foot_length: 0.054,
+            foot_width: 0.041,
+            feet_spacing: SPACING,
+        }
+    }
+
+    /// The step is proportional to the stick on every axis — a quarter deflection is a quarter step — and full
+    /// deflection on one axis is that axis's limit. The "every deflection is a full step" regression guard.
+    #[test]
+    fn stick_step_is_proportional() {
+        let full = [0.4, 0.3, 1.0];
+        let o = options();
+        let s = stick_step([0.1, 0.0, 0.0], full, &o);
+        assert!(
+            (s[0] - 0.0125).abs() < 1e-12 && s[1] == 0.0 && s[2] == 0.0,
+            "{s:?}"
+        );
+        let s = stick_step([0.4, 0.0, 0.0], full, &o);
+        assert!((s[0] - 0.05).abs() < 1e-12, "{s:?}");
+        let s = stick_step([-0.2, 0.0, 0.0], full, &o);
+        assert!((s[0] + 0.025).abs() < 1e-12, "{s:?}");
+        let s = stick_step([0.0, -0.15, 0.5], full, &o);
+        assert!(
+            (s[1] + 0.01).abs() < 1e-12 && (s[2] - 0.26).abs() < 1e-12,
+            "{s:?}"
+        );
+        // Past full deflection it saturates; two full axes share the ellipsoid.
+        let s = stick_step([0.8, 0.3, 0.0], full, &o);
+        let norm = ((s[0] / 0.05).powi(2) + (s[1] / 0.02).powi(2)).sqrt();
+        assert!((norm - 1.0).abs() < 1e-9, "{s:?}");
     }
 
     /// Forward stick moves the goal straight ahead by v·T; a pure turn rotates the stance about its centre. The

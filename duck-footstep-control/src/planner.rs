@@ -25,6 +25,32 @@ impl PlannerOptions {
     pub fn from_json(json: &str) -> Result<Self, PlannerError> {
         serde_json::from_str(json).map_err(|e| PlannerError::Options(e.to_string()))
     }
+
+    /// A neutral-relative step clipped to these limits as FootstepNet's env clips them: the box (± forward
+    /// limit, ± `max_dy`, ± `max_dtheta`), then the ellipsoid with the backward limit behind.
+    pub fn clip(&self, step: [f64; 3]) -> [f64; 3] {
+        let high = [self.max_dx_forward, self.max_dy, self.max_dtheta];
+        let mut a = step;
+        for (v, h) in a.iter_mut().zip(high) {
+            *v = v.clamp(-h, h);
+        }
+        let factor = [
+            if a[0] >= 0.0 {
+                self.max_dx_forward
+            } else {
+                self.max_dx_backward
+            },
+            self.max_dy,
+            self.max_dtheta,
+        ];
+        let norm = a
+            .iter()
+            .zip(factor)
+            .map(|(v, f)| (v / f).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if norm > 1.0 { a.map(|v| v / norm) } else { a }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,35 +162,17 @@ impl<N: StepNet> Planner<N> {
         if !raw.iter().all(|v| v.is_finite()) {
             return Err(PlannerError::Net(format!("non-finite step {raw:?}")));
         }
-        let o = &self.options;
         let mut a = raw.map(f64::from);
         if support_foot == Foot::Left {
             a[1] = -a[1];
             a[2] = -a[2];
         }
-        let high = [o.max_dx_forward, o.max_dy, o.max_dtheta];
-        for (v, h) in a.iter_mut().zip(high) {
-            *v = v.clamp(-h, h);
-        }
-        let factor = [
-            if a[0] >= 0.0 {
-                o.max_dx_forward
-            } else {
-                o.max_dx_backward
-            },
-            o.max_dy,
-            o.max_dtheta,
-        ];
-        let norm = a
-            .iter()
-            .zip(factor)
-            .map(|(v, f)| (v / f).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        if norm > 1.0 {
-            a = a.map(|v| v / norm);
-        }
-        Ok(a)
+        Ok(self.options.clip(a))
+    }
+
+    /// Clip a neutral-relative step to the limits the planner was trained with: the box, then the ellipsoid.
+    pub fn clip(&self, step: [f64; 3]) -> [f64; 3] {
+        self.options.clip(step)
     }
 
     /// The goal foot within `tolerance_distance` and `tolerance_angle` of the goal pose.

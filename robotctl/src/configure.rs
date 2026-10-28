@@ -373,8 +373,9 @@ enum Focus {
 /// Run the editor. Returns once the user has left, with everything saved or discarded.
 ///
 /// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
-/// reload — the editor is useful on a board where nothing is running.
-pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
+/// reload — the editor is useful on a board where nothing is running. `updater_socket` only when
+/// `[policy] footstep_control` was switched on, to fetch its networks.
+pub fn run(path: &Path, robot_socket: &Path, updater_socket: &Path) -> Result<(), String> {
     // An interactive editor and nothing else: piped in or out, there is no sensible
     // behaviour to fall back to, and ratatui would panic trying to open the terminal.
     if !crate::monitor::stdout_is_a_terminal() {
@@ -573,6 +574,29 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
     let saved = outcome?;
     if !saved {
         return Ok(());
+    }
+
+    // Switching footstep control on is the whole install for the person trying it: fetch both networks before
+    // robotd re-reads the file, so the reload finds them. A failed fetch is said, not fatal — robotd walks
+    // without footsteps until the files are there.
+    let footsteps_on =
+        robotd_params::Params::load(path, true).is_ok_and(|p| p.policy.footstep_control);
+    if footsteps_on && edited.iter().any(|key| key == "policy.footstep_control") {
+        println!(
+            "footstep_control on — fetching {}…",
+            robotd_params::FOOTSTEPS_REPO
+        );
+        match crate::fetch_footsteps(updater_socket) {
+            Ok(paths) => {
+                for path in paths {
+                    println!("  {}", path.display());
+                }
+            }
+            Err(e) => println!(
+                "  could not fetch them ({e}) — robotd walks without footsteps until it can; \
+                 switch footstep_control off and on again to retry"
+            ),
+        }
     }
 
     if !agreed.restart.is_empty() {

@@ -17,7 +17,7 @@ mod pattern;
 mod planner;
 mod pose;
 
-pub use follower::{CarrotParams, Follower, carrot_goal};
+pub use follower::{CarrotParams, Follower, carrot_goal, stick_step};
 pub use pattern::{Miss, PatternRun, stance_frame};
 pub use planner::{Obstacle, Plan, Planner, PlannerError, PlannerOptions, StepNet};
 pub use pose::{Foot, Pose2, compose, relative, wrap};

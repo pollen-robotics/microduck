@@ -1009,27 +1009,31 @@ the loop's own rate rather than the prototype's separate 100 Hz. That cost is th
 "no odometry" decision in §7 was reversed rather than re-argued: the objection was never the
 arithmetic, it was that nothing read the answer.
 
-#### 4.4.1 Footsteps: the stick walks planned footsteps
+#### 4.4.1 Footsteps: the stick places the feet
 
-Opt-in, walk mode only: `[policy] footsteps` (a footstep-tracking policy, microduck_rl
-`Mjlab-Footsteps-*`) and `footstep_planner` (FootstepNet, Hub `apirrone/microduck-footstepnet`),
-both or neither — one alone fails the load like any broken bundle. With them, a held stick no
-longer feeds the gait a velocity: the controller runs the footstep net, whose twist slots carry
-the swing foot's **target pose** `(dx, dy, dyaw)` in the support sole frame.
+Opt-in, walk mode only: `[policy] footstep_control = true` (off by default). Switching it on in
+`robotctl configure` fetches the footstep policy and its FootstepNet planner from the Hub repo
+`apirrone/microduck-footsteps` into the policy library (`policy.fetch`, the same path as `policy
+load`), and the reload that follows loads them; `footsteps` / `footstep_planner` override either
+file. On but not fetched is a robot that walks as before and says so in the journal — a try-out
+switch must not leave a robot holding a pose.
 
-The odometry is what makes it work, which is why it lives here. The support foot is the
+With it on, a held stick no longer feeds the gait a velocity: the controller runs the footstep
+net, whose twist slots carry the swing foot's **target pose** `(dx, dy, dyaw)` in the support sole
+frame. The odometry is what makes it work, which is why it lives here: the support foot is the
 odometry's anchor foot, and a change of anchor is a touchdown — the same rule the policy was
-trained against. At every touchdown `duck-footstep-control`'s follower replans: the stick's twist,
-integrated along its arc for `footstep_horizon_s` (default 1 s) from the stance centre, is the
-goal; FootstepNet rolls a plan to it from the support sole (`Odometry::sole_poses`, sole centres
-7 mm ahead of the foot sites); the plan's first step is the target for the whole swing. The
-planner runs inside the tick — one small MLP per planned step, at most eight per touchdown — so
-it is loaded and warmed with the policies, never at a tick.
+trained against. At every touchdown the swing foot's target is fixed for the whole swing: the
+neutral place beside the support (`feet_spacing` from the planner's metadata) moved by the stick,
+each axis's deflection times that axis's step limit, clipped like FootstepNet clips
+(`duck_footstep_control::stick_step`). Proportional on purpose — the first version planned with
+FootstepNet toward a goal the stick pushed ahead, and every deflection came out a full step,
+because the planner reaches a goal in the fewest steps and only aims within its 2 cm / 5° reached
+tolerance below that. FootstepNet stays loaded (its limits and geometry are the contract) for goal
+walking.
 
-A released stick puts the goal on the neutral stance: the robot squares its feet and steps in
-place, and after 0.75 s idle hands back to the gait at the next touchdown, never with a foot in
-the air. A planner error hands back at once. Body-pose mode and every skill outrank it, as they
-outrank walking.
+A released stick is the neutral step: the robot squares its feet and steps in place, and after
+0.4 s idle hands back to the gait at the next touchdown, never with a foot in the air. Body-pose
+mode and every skill outrank it, as they outrank walking.
 
 **Scripted patterns** (`robot.footsteps`, `robotctl robot footsteps pattern.json`) are for checking
 placement against marks on the floor: microduck_rl `scripts/footsteps_patterns.py` prints FootstepNet

@@ -1949,7 +1949,11 @@ fn try_controller(
             gain: policy_cfg.gain,
             head_lowpass: policy_cfg.head_lowpass,
             legs_lowpass: policy_cfg.legs_lowpass,
-            footstep_horizon_s: policy_cfg.footstep_horizon_s,
+            footstep_full_twist: {
+                // `[pad_drive]` is not in the policy config; its defaults are what a stock pad sends at full stick.
+                let pad = params::PadDriveParams::default();
+                [pad.vx_max, pad.vy_max, pad.vyaw_max]
+            },
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,
@@ -1960,13 +1964,30 @@ fn try_controller(
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
         };
+        // `footstep_control` on before the files were fetched is a robot that walks as before and says why,
+        // not one that holds a pose: the switch is a try-out, and the fetch is `robotctl configure`'s.
+        let (footsteps, footstep_planner) = match (
+            &policy_cfg.footsteps,
+            &policy_cfg.footstep_planner,
+        ) {
+            (Some(policy), Some(planner)) if !policy.exists() || !planner.exists() => {
+                tracing::warn!(
+                    policy = %policy.display(),
+                    planner = %planner.display(),
+                    "footstep_control is on but its networks are not on this robot; walking without it — \
+                     switch it off and on in `sudo robotctl configure` to fetch them"
+                );
+                (None, None)
+            }
+            (policy, planner) => (policy.clone(), planner.clone()),
+        };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
             stand: policy_cfg.stand.clone(),
             sitstand: policy_cfg.sitstand.clone(),
             ground_pick: policy_cfg.ground_pick.clone(),
-            footsteps: policy_cfg.footsteps.clone(),
-            footstep_planner: policy_cfg.footstep_planner.clone(),
+            footsteps: footsteps.clone(),
+            footstep_planner: footstep_planner.clone(),
             // Only the skills whose file resolves — a slot switched off with `"none"` is
             // already filtered out by `resolved_skills`.
             skills: policy_cfg
@@ -6804,8 +6825,7 @@ mod tests {
         assert!(intents.take_footsteps().is_none());
 
         let mut params = Params::default();
-        params.policy.footsteps = Some(PathBuf::from("/opt/footsteps.onnx"));
-        params.policy.footstep_planner = Some(PathBuf::from("/opt/footstepnet.onnx"));
+        params.policy.footstep_control = true;
         let equipped = RobotState::new(
             &params,
             std::path::Path::new("/test/robotd.toml"),
