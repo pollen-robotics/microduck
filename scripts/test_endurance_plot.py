@@ -22,10 +22,12 @@ def write_run(run: Path, lap_version: str | None, events: list[tuple[float, str,
     if lap_version:
         seg["lap"] = lap_version
     (run / "meta.json").write_text(json.dumps({"segments": [seg]}))
-    rows = ["wall,t_s,robotd,battery_v,battery_pct,throttled,motor_max_c,motor_hottest,activity,lap,step"]
+    rows = ["wall,t_s,robotd,battery_v,battery_pct,throttled,motor_max_c,motor_mean_c,"
+            "motor_hottest,activity,lap,step"]
     for i in range(12):
         lap = 1 + i // 4
-        rows.append(f"{1000 + 10 * i},{10 * i},up,8.0,{97 - i},0,{30 + i},knee,walk,{lap},A1.fwd")
+        rows.append(f"{1000 + 10 * i},{10 * i},up,8.0,{97 - i},0,{30 + i},{25 + i},knee,walk,"
+                    f"{lap},A1.fwd")
     (run / "samples.csv").write_text("\n".join(rows) + "\n")
     lines = ["wall,t_s,kind,detail"] + [f"{1000 + t},{t},{k},{d}" for t, k, d in events]
     (run / "events.csv").write_text("\n".join(lines) + "\n")
@@ -116,4 +118,4 @@ def test_a_stress_run_gets_a_pdf_report(tmp_path):
 
     assert out == run / "report.pdf"
     assert out.read_bytes()[:5] == b"%PDF-"
-    assert out.read_bytes().count(b"/Type /Page\n") + out.read_bytes().count(b"/Type /Page ") >= 3
+    assert out.read_bytes().count(b"/Type /Page\n") + out.read_bytes().count(b"/Type /Page ") >= 4

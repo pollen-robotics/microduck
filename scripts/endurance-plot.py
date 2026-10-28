@@ -147,7 +147,7 @@ def end_label(ax, x, y, text, color=INK_2) -> None:
                 fontsize=8, color=color)
 
 
-def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
+def timeline_figure(run: Path, df: pd.DataFrame, ev: pd.DataFrame):
     temps = temp_columns(df)
     has_motor = df.get("motor_max_c", pd.Series(dtype=float)).notna().any()
     has_current = df.get("motor_current_ma", pd.Series(dtype=float)).notna().any()
@@ -231,6 +231,11 @@ def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
     fig.legend(handles=handles, loc="upper right", ncol=len(handles), bbox_to_anchor=(0.99, 0.995))
     fig.suptitle(run.name, x=0.01, ha="left", fontweight="bold", color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
+    fig = timeline_figure(run, df, ev)
     fig.savefig(run / "timeline.png", dpi=130)
     plt.close(fig)
 
@@ -686,14 +691,10 @@ def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFr
             pdf.savefig(fig)
             plt.close(fig)
 
-        # 3 — timeline, as drawn for the PNG
-        if (run / "timeline.png").exists():
-            fig = _page(pdf, "Timeline")
-            ax = fig.add_axes([0.03, 0.02, 0.94, 0.86])
-            ax.imshow(plt.imread(run / "timeline.png"))
-            ax.axis("off")
-            pdf.savefig(fig)
-            plt.close(fig)
+        # 3 — timeline, drawn again rather than pasted from the PNG, so it stays sharp
+        fig = timeline_figure(run, df, ev)
+        pdf.savefig(fig)
+        plt.close(fig)
 
         # 4 — incidents
         ev = ev.sort_values("wall").copy()
