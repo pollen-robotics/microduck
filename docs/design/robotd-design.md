@@ -1041,7 +1041,16 @@ sole centre or for the stance centre, anchored in the odometry's world. At every
 planner replans from the support sole where it actually landed, so tracking errors are corrected
 on the way; when the goal foot stands on the goal the other foot squares up beside it and the
 robot hands back, journaling the final miss. Goals beyond 1.5 m (FootstepNet trained on ±1 m) are
-refused, and a plan still walking after 70 touchdowns is given up.
+refused, and a plan still walking after 70 touchdowns is given up. A goal may also be given in
+the odometry's world (`odom: true`), which is what `robotctl robot goto tag ID` sends: it sweeps
+the head over the floor (`robot.look`), takes raw frames from `mediad` (`media.frame`), finds the
+AprilTag (tag36h11, the C reference detector), undistorts its corners with the robot's
+calibration, turns them by the frame's `rotate` into the upright camera that `frames.camera`
+describes, solves the tag's pose and chains it through `robot.state` (camera in trunk, IMU,
+odometry) into the world; the goal is the stance printed on the tag's sheet
+(`scripts/footstep_tag_sheet.py`, constants shared with `robotctl/src/tag.rs`). All of it is a
+client of what the daemons already publish; the placement is only as good as the camera
+calibration, so a robot without its own `[media.intrinsics]` uses the family's lens model.
 
 **Scripted patterns** (`robot.footsteps`, `robotctl robot footsteps pattern.json`) are for checking
 placement against marks on the floor: microduck_rl `scripts/footsteps_patterns.py` prints FootstepNet

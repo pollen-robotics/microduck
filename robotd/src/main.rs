@@ -3622,7 +3622,7 @@ async fn control_loop<T: RobotIo>(
                         proto::FootSide::Left => duck_footstep_control::Foot::Left,
                         proto::FootSide::Right => duck_footstep_control::Foot::Right,
                     });
-                    controller.start_goal([g.x, g.y, g.yaw], foot);
+                    controller.start_goal([g.x, g.y, g.yaw], foot, g.odom);
                 }
                 if let Some(steps) = intents.take_footsteps() {
                     controller.start_pattern(
@@ -6884,6 +6884,7 @@ mod tests {
                 y: 0.1,
                 yaw: 0.5,
                 foot: Some(proto::FootSide::Left),
+                odom: false,
             })
         };
         let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &goal(0.3))

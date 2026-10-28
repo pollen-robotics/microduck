@@ -297,14 +297,18 @@ impl Controller {
     /// Walk to `goal` (`[x, y, yaw]` in the robot's frame now — the stance frame) with FootstepNet replanning at
     /// every touchdown; `foot` puts that sole centre on it, `None` the stance centre. Replaces any pattern or goal
     /// in progress. Dropped without the footstep networks, which the IPC side refuses first.
-    pub fn start_goal(&mut self, goal: Pose2, foot: Option<Foot>) {
+    pub fn start_goal(&mut self, goal: Pose2, foot: Option<Foot>, in_world: bool) {
         if !self.policy.has_footsteps() {
             tracing::warn!("footstep goal dropped: no footstep policy loaded");
             return;
         }
         tracing::info!(x = goal[0], y = goal[1], yaw_deg = goal[2].to_degrees(), foot = ?foot, "footstep goal");
         self.pattern = None;
-        self.goal = Some(GoalRun::new(goal, foot));
+        self.goal = Some(if in_world {
+            GoalRun::in_world(goal, foot)
+        } else {
+            GoalRun::new(goal, foot)
+        });
         self.footstepping = true;
         self.footstep_idle = 0.0;
     }

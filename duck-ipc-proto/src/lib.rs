@@ -1925,6 +1925,7 @@ pub mod test_support {
                 y: -0.1,
                 yaw: 0.5,
                 foot: Some(FootSide::Right),
+                odom: false,
             }),
             Call::RobotSound(SoundParams {
                 tag: SoundTag::Chirp,
@@ -2582,6 +2583,10 @@ pub struct FootstepGoalParams {
     pub yaw: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foot: Option<FootSide>,
+    /// The goal is in the contact odometry's world frame — `robot.state`'s `odom` — rather than the robot's
+    /// frame when asked. What a client that located something in the world (a tag seen by the camera) sends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub odom: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

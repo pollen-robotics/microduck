@@ -52,6 +52,7 @@ mod led;
 mod monitor;
 mod path_map;
 mod show;
+mod tag;
 mod vetbook;
 
 /// Exit codes. Stable — CI asserts on these.
@@ -614,20 +615,21 @@ enum RobotCommand {
         json: bool,
     },
 
-    /// Walk to a pose with planned footsteps: X forward and Y left in metres, THETA in degrees (left positive),
-    /// in the robot's frame right now — origin midway between its feet.
+    /// Walk to a pose with planned footsteps: `goto X Y THETA`, X forward and Y left in metres, THETA in
+    /// degrees (left positive), in the robot's frame right now — origin midway between its feet. Or
+    /// `goto tag ID`: scan the floor with the head for printed AprilTag ID (tag36h11, the sheets from
+    /// `scripts/footstep_tag_sheet.py`) and stand on its footprints.
     ///
     /// `--foot left` puts the left sole's centre there (`right` likewise); without it the robot's centre goes
     /// there. FootstepNet replans at every touchdown, the other foot squares up at the end, and the robot hands
     /// back to the gait; the final miss is in `journalctl -u robotd | grep footstep`. Needs
     /// `[policy] footstep_control`; the stick cancels it. `robotctl robot goto 0.3 0 0` walks 30 cm ahead,
-    /// `goto 0 0 90` turns left in place.
+    /// `goto 0 0 90` turns left in place, `goto tag 3` walks onto tag 3's sheet.
     #[command(allow_negative_numbers = true)]
     Goto {
-        x: f64,
-        y: f64,
-        /// Degrees, counter-clockwise (left) positive.
-        theta: f64,
+        /// `X Y THETA`, or `tag ID`.
+        #[arg(num_args = 2..=3, required = true, allow_hyphen_values = true)]
+        target: Vec<String>,
         #[arg(long, value_enum)]
         foot: Option<GotoFoot>,
         #[arg(long)]
@@ -3468,6 +3470,30 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         ));
     }
 
+    // `goto tag ID` is a scan and a few calls, not one request.
+    if let RobotCommand::Goto { target, json, .. } = &command
+        && target[0] == "tag"
+    {
+        let id: u32 = target
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .filter(|_| target.len() == 2)
+            .ok_or_else(|| Failure::new(exit::USAGE, "usage: goto tag ID (a number)".into()))?;
+        let (goal, distance) = tag::goto_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
+        if *json {
+            println!(
+                "{}",
+                serde_json::json!({ "tag": id, "goal": goal, "distance_m": distance })
+            );
+        } else {
+            println!(
+                "tag {id} found — walking {distance:.2} m onto its footprints; the miss is in \
+                 `journalctl -u robotd | grep footstep`"
+            );
+        }
+        return Ok(());
+    }
+
     let mut client = Client::connect_to("robotd", socket)?;
     client.hello()?;
 
@@ -3495,21 +3521,16 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             proto::Call::RobotFootsteps(read_footstep_pattern(file)?),
             *json,
         ),
-        RobotCommand::Goto {
-            x,
-            y,
-            theta,
-            foot,
-            json,
-        } => (
+        RobotCommand::Goto { target, foot, json } => (
             proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
-                x: *x,
-                y: *y,
-                yaw: theta.to_radians(),
+                x: goto_number(target, 0)?,
+                y: goto_number(target, 1)?,
+                yaw: goto_number(target, 2)?.to_radians(),
                 foot: foot.map(|f| match f {
                     GotoFoot::Left => proto::FootSide::Left,
                     GotoFoot::Right => proto::FootSide::Right,
                 }),
+                odom: false,
             }),
             *json,
         ),
@@ -3590,11 +3611,12 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
-        RobotCommand::Goto {
-            x, y, theta, foot, ..
-        } => println!(
-            "walking to ({x:+.2} m, {y:+.2} m, {theta:+.0}°){} — the miss is in \
+        RobotCommand::Goto { target, foot, .. } => println!(
+            "walking to ({} m, {} m, {}°){} — the miss is in \
              `journalctl -u robotd | grep footstep`",
+            target[0],
+            target[1],
+            target[2],
             match foot {
                 Some(GotoFoot::Left) => " with the left foot",
                 Some(GotoFoot::Right) => " with the right foot",
@@ -3608,6 +3630,20 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// `goto X Y THETA`'s `i`th number.
+fn goto_number(target: &[String], i: usize) -> Result<f64, Failure> {
+    target
+        .get(i)
+        .filter(|_| target.len() == 3)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            Failure::new(
+                exit::USAGE,
+                "usage: goto X Y THETA (metres, metres, degrees) or goto tag ID".into(),
+            )
+        })
 }
 
 /// Which foot `robot goto` places on the goal.

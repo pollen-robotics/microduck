@@ -29,6 +29,8 @@ pub enum GoalOutcome {
 pub struct GoalRun {
     goal: Pose2,
     foot: Option<Foot>,
+    /// `goal` is already in the odometry's world frame, not the stance frame at the start.
+    in_world: bool,
     world: Option<(Pose2, Foot)>,
     touchdowns: u32,
     /// The goal foot landed on the goal; the other is stepping up beside it.
@@ -41,10 +43,19 @@ impl GoalRun {
         Self {
             goal,
             foot,
+            in_world: false,
             world: None,
             touchdowns: 0,
             squaring: false,
             outcome: None,
+        }
+    }
+
+    /// A goal given in the odometry's world frame (where the soles are), e.g. a tag the camera located.
+    pub fn in_world(goal: Pose2, foot: Option<Foot>) -> Self {
+        Self {
+            in_world: true,
+            ..Self::new(goal, foot)
         }
     }
 
@@ -71,7 +82,11 @@ impl GoalRun {
         soles: [Pose2; 2],
     ) -> Result<Option<[f64; 3]>, PlannerError> {
         let (goal, goal_foot) = *self.world.get_or_insert_with(|| {
-            let anchor = stance_frame(soles);
+            let anchor = if self.in_world {
+                [0.0; 3]
+            } else {
+                stance_frame(soles)
+            };
             follower.reset();
             match self.foot {
                 Some(foot) => (compose(anchor, self.goal), foot),
