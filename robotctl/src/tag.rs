@@ -62,13 +62,22 @@ struct Camera {
 }
 
 impl Camera {
-    /// This robot's calibration (`[media.intrinsics]`), else the family's, scaled to a `width`×`height` frame.
+    /// This robot's calibration (`[media.intrinsics]`), else its board's camera family's, scaled to a `width`×`height` frame.
     /// Refuses another aspect ratio: a crop is not a resize, and which part was cropped is not knowable.
     fn for_frame(config: &Path, width: u32, height: u32) -> Result<Self, String> {
         let own = robotd_params::Params::load(config, false)
             .ok()
             .and_then(|p| p.media.intrinsics);
-        let cal = own.unwrap_or_else(robotd_params::CameraIntrinsics::alpha);
+        // Else this board's camera family, as `mediad` publishes it: an alpha's lens on a beta is ~1.5×
+        // off in focal length, which would put a tag at two-thirds of its distance.
+        let family = || match robotd_params::board::Board::detected()
+            .unwrap_or_default()
+            .camera_sensor()
+        {
+            robotd_params::CameraSensor::Imx219 => robotd_params::CameraIntrinsics::alpha(),
+            robotd_params::CameraSensor::Gc2093 => robotd_params::CameraIntrinsics::beta(),
+        };
+        let cal = own.unwrap_or_else(family);
         let s = f64::from(width) / f64::from(cal.width);
         if (f64::from(height) / f64::from(cal.height) - s).abs() > 1e-3 {
             return Err(format!(
@@ -295,7 +304,9 @@ fn find_tag(header: &proto::MediaFrameHeader, uyvy: &[u8], id: u32) -> Option<[[
         .add_family_bits(Family::tag_36h11(), 1)
         .build()
         .ok()?;
-    detector.set_decimation(2.0);
+    // Full resolution: a few frames per scan, and the beta's ~85° lens makes a 100 mm tag ~70 px at 1 m —
+    // halved, too close to the detector's limit.
+    detector.set_decimation(1.0);
     detector
         .detect(&image)
         .into_iter()
