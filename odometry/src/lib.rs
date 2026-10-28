@@ -49,6 +49,10 @@ const SWITCH_CONFIRM_TICKS: u32 = 2;
 const LEFT: usize = 0;
 const RIGHT: usize = 1;
 
+/// The sole centre in the `*_foot` site frame (x forward): the frame footsteps are planned and tracked in
+/// (`microduck_rl/src/mjlab_microduck/footsteps.py`, `SOLE_CENTER_IN_SITE`).
+pub const SOLE_CENTRE_IN_SITE: [f64; 3] = [0.007, 0.0, 0.0];
+
 pub struct Odometry {
     model: &'static Model,
     feet: [SiteId; 2],
@@ -73,6 +77,8 @@ pub struct Odometry {
     /// True until the first update seeds `anchor_xy` from the actual startup
     /// pose, so the trunk starts at (0, 0) instead of offset by the foot.
     needs_init: bool,
+    /// Planar sole-centre poses `[x, y, yaw]` of the left and right foot in the world frame.
+    soles: [[f64; 3]; 2],
 }
 
 impl Odometry {
@@ -97,6 +103,7 @@ impl Odometry {
             pending: None,
             pending_ticks: 0,
             needs_init: true,
+            soles: [[0.0; 3]; 2],
         }
     }
 
@@ -172,6 +179,15 @@ impl Odometry {
         }
 
         self.yaw = rot.yaw();
+        for (sole, pose) in self.soles.iter_mut().zip(&feet) {
+            let centre = rot.rotate(pose.transform_point(SOLE_CENTRE_IN_SITE));
+            let yaw = (rot * pose.quat).yaw();
+            *sole = [
+                self.position[0] + centre[0],
+                self.position[1] + centre[1],
+                yaw,
+            ];
+        }
     }
 
     /// Trunk position in the world frame, metres. Z is height above the ground
@@ -194,6 +210,12 @@ impl Odometry {
     /// Which foot carries the anchor: 0 = left, 1 = right.
     pub fn anchor_foot(&self) -> usize {
         self.anchor_foot
+    }
+
+    /// Planar pose `[x, y, yaw]` of each sole centre ([`SOLE_CENTRE_IN_SITE`]) in the world frame, left then
+    /// right — what the footstep planner plans from and the footstep policy's targets are expressed against.
+    pub fn sole_poses(&self) -> [[f64; 3]; 2] {
+        self.soles
     }
 
     /// Trunk position from the anchor: the contact point sits at
@@ -328,6 +350,42 @@ mod tests {
     /// A robot standing still is at the origin and stays there — the first
     /// update seeds the anchor so the trunk starts at (0, 0), and constant
     /// inputs must not integrate into drift.
+    /// The footstep follower plans from these: at the zero pose the soles sit side by side (left on +y) under
+    /// the trunk, heading where the trunk heads; a yawed IMU turns them with it about the trunk. A wrong sign or
+    /// frame here sends every footstep target sideways.
+    #[test]
+    fn sole_poses_follow_the_trunk_heading() {
+        for yaw in [0.0, 0.5, -2.0] {
+            let mut odo = Odometry::alpha();
+            odo.update(&[0.0; JOINT_NAMES.len()], yaw_quat(yaw));
+            let [l, r] = odo.sole_poses();
+            let [px, py, _] = odo.position();
+            for s in [l, r] {
+                assert!(
+                    (s[2] - yaw).abs() < 1e-9,
+                    "sole yaw {} vs trunk {yaw}",
+                    s[2]
+                );
+            }
+            // Left minus right, in the trunk frame: all lateral, positive.
+            let (dx, dy) = (l[0] - r[0], l[1] - r[1]);
+            let (fwd, lat) = (
+                dx * yaw.cos() + dy * yaw.sin(),
+                -dx * yaw.sin() + dy * yaw.cos(),
+            );
+            assert!(
+                fwd.abs() < 1e-6 && (0.05..0.15).contains(&lat),
+                "fwd {fwd} lat {lat}"
+            );
+            // Midpoint below the trunk, offset forward by the sole-centre shift only (to FK precision).
+            let (mx, my) = ((l[0] + r[0]) / 2.0 - px, (l[1] + r[1]) / 2.0 - py);
+            assert!(
+                (mx * mx + my * my).sqrt() < 0.03,
+                "soles {mx}, {my} from the trunk"
+            );
+        }
+    }
+
     #[test]
     fn standing_still_stays_at_the_origin() {
         let mut odo = Odometry::alpha();

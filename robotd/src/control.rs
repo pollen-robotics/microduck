@@ -39,6 +39,7 @@
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
+use duck_footstep_control::{CarrotParams, Follower, Foot, Pose2, carrot_goal};
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -49,6 +50,11 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// request landed within the last few ticks". 150 ms is seven ticks — generous against a
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
+
+/// Stick released this long, footstepping hands back to the gait at the next touchdown. Long enough that a
+/// stick passing through centre does not drop out of footsteps; the robot steps in place meanwhile, squaring
+/// its feet up under the neutral goal, so the gait takes over from a parallel stance.
+const FOOTSTEP_IDLE_S: f64 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
@@ -65,6 +71,8 @@ pub struct Tuning {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Trained with 0.7.
     pub legs_lowpass: Option<f64>,
+    /// Footstepping: how far ahead of the stance the stick's goal is, in seconds of the commanded twist.
+    pub footstep_horizon_s: f64,
 }
 
 impl Default for Tuning {
@@ -76,6 +84,7 @@ impl Default for Tuning {
             gain: 200,
             head_lowpass: Some(0.5),
             legs_lowpass: Some(0.7),
+            footstep_horizon_s: CarrotParams::default().horizon_s,
         }
     }
 }
@@ -192,6 +201,8 @@ pub enum Driving {
     /// variant rather than a flag beside `SitStand`.
     Seated,
     GroundPick,
+    /// The footstep policy, walking a plan.
+    Footsteps,
     /// A one-shot skill, by its config name.
     Skill(String),
 }
@@ -204,6 +215,7 @@ impl std::fmt::Display for Driving {
             Driving::SitStand => f.write_str("sitstand"),
             Driving::Seated => f.write_str("seated"),
             Driving::GroundPick => f.write_str("ground_pick"),
+            Driving::Footsteps => f.write_str("footsteps"),
             Driving::Skill(name) => f.write_str(name),
         }
     }
@@ -241,6 +253,13 @@ pub struct Controller {
     auto_rise: bool,
     /// The network the last [`Self::step`] ran. `None` before the first.
     last_net: Option<Net>,
+    /// Support foot and both sole poses from the contact odometry, set every tick by the caller
+    /// ([`Self::set_odometry`]); `None` until the estimator runs. Footstepping needs it and stays off without.
+    odometry: Option<(Foot, [Pose2; 2])>,
+    /// Walking on planned footsteps: on while the stick is held and for [`FOOTSTEP_IDLE_S`] after.
+    footstepping: bool,
+    footstep_idle: f64,
+    follower: Follower,
 }
 
 impl Controller {
@@ -257,6 +276,70 @@ impl Controller {
             sit_settle: 0.0,
             auto_rise: false,
             last_net: None,
+            odometry: None,
+            footstepping: false,
+            footstep_idle: 0.0,
+            follower: Follower::new(),
+        }
+    }
+
+    /// This tick's contact odometry: the support (anchor) foot, 0 = left, and the left and right sole-centre
+    /// poses `[x, y, yaw]`. `None` while the estimator is not running.
+    pub fn set_odometry(&mut self, odometry: Option<(usize, [Pose2; 2])>) {
+        self.odometry = odometry.map(|(foot, soles)| (Foot::from_index(foot), soles));
+    }
+
+    /// The footstep command for this tick, or `None` to let the gait drive.
+    ///
+    /// On while the stick is held; after it is released the robot keeps stepping (toward the neutral stance)
+    /// for [`FOOTSTEP_IDLE_S`], then hands back at a touchdown — between swings, not mid-air. Any planner
+    /// failure hands back at once: a wrong gait is better than a dead control thread.
+    fn footstep_twist(&mut self, twist: [f64; 3], dt: f64) -> Option<[f64; 3]> {
+        let (support, soles) = self.odometry?;
+        if !self.policy.has_footsteps() {
+            return None;
+        }
+        let held = twist.iter().map(|v| v * v).sum::<f64>().sqrt()
+            > duck_control::policy::DEFAULT_STANDING_THRESHOLD;
+        self.footstep_idle = if held { 0.0 } else { self.footstep_idle + dt };
+        if !self.footstepping {
+            if !held {
+                return None;
+            }
+            self.footstepping = true;
+            self.follower.reset();
+        }
+        let horizon = self.tuning.footstep_horizon_s;
+        let planner = self.policy.planner_mut()?;
+        let spacing = planner.options().feet_spacing;
+        let max_steps = CarrotParams::default().max_steps;
+        let goal = |pose, foot| carrot_goal(pose, foot, twist, horizon, spacing);
+        match self
+            .follower
+            .update(planner, support, soles, goal, None, max_steps)
+        {
+            Ok(_) if self.footstep_idle >= FOOTSTEP_IDLE_S && self.follower.switched() => {
+                self.footstepping = false;
+                None
+            }
+            Ok(command) => {
+                if self.follower.switched()
+                    && let Some((distance, heading)) = self.follower.last_error()
+                {
+                    tracing::debug!(
+                        miss_mm = distance * 1000.0,
+                        miss_deg = heading.to_degrees(),
+                        planned = self.follower.plan().steps.len(),
+                        "footstep touchdown"
+                    );
+                }
+                Some(command)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "footstep planner failed; handing back to the gait");
+                self.footstepping = false;
+                None
+            }
         }
     }
 
@@ -268,6 +351,7 @@ impl Controller {
             Net::SitStand if self.sit == Sit::Sitting => Driving::Seated,
             Net::SitStand => Driving::SitStand,
             Net::GroundPick => Driving::GroundPick,
+            Net::Footsteps => Driving::Footsteps,
             Net::Skill(index) => Driving::Skill(
                 self.skills
                     .skills
@@ -639,12 +723,27 @@ impl Controller {
                     if body_active {
                         c.twist = [0.0; 3];
                     }
-                    let standing = self.policy.will_stand(c.twist_magnitude())
-                        || (body_active && self.policy.has_standing());
-                    if standing {
-                        (Net::Stand, c, "stand".into())
+                    let footstep = if body_active {
+                        None
                     } else {
-                        (Net::Walk, c, "walk".into())
+                        self.footstep_twist(c.twist, dt)
+                    };
+                    if body_active {
+                        self.footstepping = false;
+                    }
+                    if let Some(target) = footstep {
+                        // Head and body slots stay live: the footstep policy tracks the head command as the
+                        // walking recipe does, and its body slot is the gait's.
+                        c.twist = target;
+                        (Net::Footsteps, c, "footsteps".into())
+                    } else {
+                        let standing = self.policy.will_stand(c.twist_magnitude())
+                            || (body_active && self.policy.has_standing());
+                        if standing {
+                            (Net::Stand, c, "stand".into())
+                        } else {
+                            (Net::Walk, c, "walk".into())
+                        }
                     }
                 }
             }
@@ -767,6 +866,7 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duck_footstep_control::relative;
 
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
@@ -801,6 +901,119 @@ mod tests {
                 .unwrap()
                 .targets
         );
+    }
+
+    fn footstep_controller() -> Controller {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../duck-control/tests/fixtures");
+        let policy = Policy::load(
+            &duck_control::policy::PolicyPaths {
+                walk: fixtures.join("feedforward.onnx"),
+                footsteps: Some(fixtures.join("feedforward.onnx")),
+                footstep_planner: Some(fixtures.join("footstepnet.onnx")),
+                ..Default::default()
+            },
+            0.05,
+        )
+        .unwrap();
+        Controller::new(policy, Tuning::default(), SkillTuning::default())
+    }
+
+    /// Feet side by side at the origin, 95 mm apart, facing +x.
+    const SOLES: [Pose2; 2] = [[0.0, 0.0475, 0.0], [0.0, -0.0475, 0.0]];
+
+    /// The stick drives the footstep net only while the estimator runs: without odometry the follower has no
+    /// support foot to plan from, and the gait must keep the robot walking rather than stall.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn stick_footsteps_only_with_odometry() {
+        let mut controller = footstep_controller();
+        let sensors = duck_control::Sensors::default();
+        let forward = Command {
+            twist: [0.2, 0.0, 0.0],
+            ..Command::default()
+        };
+        controller.set_odometry(None);
+        let step = controller
+            .step(&sensors, &forward, false, 0.02, 1.0)
+            .unwrap();
+        assert_eq!(step.label, "walk");
+        controller.set_odometry(Some((0, SOLES)));
+        let step = controller
+            .step(&sensors, &forward, false, 0.02, 1.0)
+            .unwrap();
+        assert_eq!(step.label, "footsteps");
+        assert_eq!(controller.driving(), Some(Driving::Footsteps));
+        // Forward stick, left support: the right foot's first target is ahead, beside the left one.
+        let target = relative(SOLES[0], controller.follower.target());
+        assert!(target[0] > 0.02 && target[1] < -0.07, "{target:?}");
+    }
+
+    /// Releasing the stick hands back to the gait — but only after the idle delay AND at a touchdown, never
+    /// with a foot in the air; a held stick never hands back.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn release_hands_back_at_a_touchdown() {
+        let mut controller = footstep_controller();
+        let sensors = duck_control::Sensors::default();
+        let held = Command {
+            twist: [0.2, 0.0, 0.0],
+            ..Command::default()
+        };
+        let released = Command::default();
+        controller.set_odometry(Some((0, SOLES)));
+        assert_eq!(
+            controller
+                .step(&sensors, &held, false, 0.02, 1.0)
+                .unwrap()
+                .label,
+            "footsteps"
+        );
+        // Released, same support foot for a full second: past the delay, but no touchdown yet.
+        for _ in 0..50 {
+            assert_eq!(
+                controller
+                    .step(&sensors, &released, false, 0.02, 1.0)
+                    .unwrap()
+                    .label,
+                "footsteps"
+            );
+        }
+        // The swing foot lands: hand back on that tick.
+        controller.set_odometry(Some((1, SOLES)));
+        assert_eq!(
+            controller
+                .step(&sensors, &released, false, 0.02, 1.0)
+                .unwrap()
+                .label,
+            "walk"
+        );
+        // And a fresh press starts over.
+        assert_eq!(
+            controller
+                .step(&sensors, &held, false, 0.02, 1.0)
+                .unwrap()
+                .label,
+            "footsteps"
+        );
+    }
+
+    /// One of the two footstep files without the other is a broken install, refused at load rather than a
+    /// robot that silently cannot footstep.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn footsteps_without_a_planner_is_refused() {
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../duck-control/tests/fixtures");
+        let result = Policy::load(
+            &duck_control::policy::PolicyPaths {
+                walk: fixtures.join("feedforward.onnx"),
+                footsteps: Some(fixtures.join("feedforward.onnx")),
+                ..Default::default()
+            },
+            0.05,
+        );
+        assert!(result.is_err());
     }
 
     /// The prototype's **current alpha configuration** — its built-in defaults, which the

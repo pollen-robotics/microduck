@@ -8,6 +8,7 @@ description = "Robot control daemon — skeleton"
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 duck-control = { path = "../duck-control" }
+duck-footstep-control = { path = "../duck-footstep-control" }
 robotd-params = { path = "../robotd-params" }
 kinematics = { path = "../kinematics" }
 odometry = { path = "../odometry" }

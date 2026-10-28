@@ -1874,6 +1874,9 @@ fn change_disturbs(
         Driving::SitStand => before.sitstand != after.sitstand,
         Driving::Seated => false,
         Driving::GroundPick => before.ground_pick != after.ground_pick,
+        Driving::Footsteps => {
+            before.footsteps != after.footsteps || before.footstep_planner != after.footstep_planner
+        }
         Driving::Skill(_) => before.skills != after.skills,
     }
 }
@@ -1943,6 +1946,7 @@ fn try_controller(
             gain: policy_cfg.gain,
             head_lowpass: policy_cfg.head_lowpass,
             legs_lowpass: policy_cfg.legs_lowpass,
+            footstep_horizon_s: policy_cfg.footstep_horizon_s,
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,
@@ -1958,6 +1962,8 @@ fn try_controller(
             stand: policy_cfg.stand.clone(),
             sitstand: policy_cfg.sitstand.clone(),
             ground_pick: policy_cfg.ground_pick.clone(),
+            footsteps: policy_cfg.footsteps.clone(),
+            footstep_planner: policy_cfg.footstep_planner.clone(),
             // Only the skills whose file resolves — a slot switched off with `"none"` is
             // already filtered out by `resolved_skills`.
             skills: policy_cfg
@@ -1982,6 +1988,8 @@ fn try_controller(
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
+                    footsteps = ?policy_cfg.footsteps.as_ref().map(|p| p.display().to_string()),
+                    footstep_planner = ?policy_cfg.footstep_planner.as_ref().map(|p| p.display().to_string()),
                     limp_fall,
                     "policy loaded"
                 );
@@ -3585,6 +3593,12 @@ async fn control_loop<T: RobotIo>(
             }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
+                // The footstep follower reads the same estimate the state stream reports, from this tick.
+                controller.set_odometry(
+                    safety
+                        .imu_ready()
+                        .then(|| (odometry.anchor_foot(), odometry.sole_poses())),
+                );
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
                     Ok(step) => (
                         step.targets,

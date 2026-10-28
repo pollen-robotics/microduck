@@ -1377,6 +1377,14 @@ pub struct PolicyParams {
     pub kick_right: Option<PathBuf>,
     /// Episodic forward roll. Ships by default in both modes, as the prototype now does.
     pub roulade: Option<PathBuf>,
+    /// Footstep-tracking policy (microduck_rl `Mjlab-Footsteps-*`): while the stick is held, walking goes through
+    /// it, one planned footstep at a time, toward a goal the stick pushes ahead of the robot. Needs
+    /// `footstep_planner` too. Unset (the default) is a robot without it; walk mode only.
+    pub footsteps: Option<PathBuf>,
+    /// The FootstepNet planner ONNX that feeds `footsteps` (Hub `apirrone/microduck-footstepnet`).
+    pub footstep_planner: Option<PathBuf>,
+    /// How far ahead the stick's goal is, as seconds of the commanded twist. Absent: 1.0.
+    pub footstep_horizon_s: Option<f64>,
     /// Scales raw policy output into a joint offset. Absent resolves per mode: 0.9 walking
     /// (the prototype's alpha default), 0.8 roller.
     pub action_scale: Option<f64>,
@@ -1959,6 +1967,9 @@ pub struct ResolvedPolicy {
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
     pub roulade: Option<PathBuf>,
+    pub footsteps: Option<PathBuf>,
+    pub footstep_planner: Option<PathBuf>,
+    pub footstep_horizon_s: f64,
     pub action_scale: f64,
     pub standing_action_scale: f64,
     pub standing_gain_ratio: f64,
@@ -2159,6 +2170,11 @@ impl PolicyParams {
             kick_left: skill_file("kick_left"),
             kick_right: skill_file("kick_right"),
             roulade: skill_file("roulade"),
+            // No release default: footsteps are opt-in, and the roller has no feet to place.
+            footsteps: path(&self.footsteps, None).filter(|_| self.mode == Mode::Walk),
+            footstep_planner: path(&self.footstep_planner, None)
+                .filter(|_| self.mode == Mode::Walk),
+            footstep_horizon_s: self.footstep_horizon_s.unwrap_or(1.0),
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -2269,6 +2285,9 @@ impl Default for PolicyParams {
             kick_left: None,
             kick_right: None,
             roulade: None,
+            footsteps: None,
+            footstep_planner: None,
+            footstep_horizon_s: None,
             action_scale: None,
             standing_action_scale: 1.0,
             // The prototype's `--standing-kp-ratio`.

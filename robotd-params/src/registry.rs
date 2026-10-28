@@ -190,6 +190,21 @@ pub const REGISTRY: &[Entry] = &[
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
     entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
     entry(
+        "policy.footsteps",
+        Kind::OptionalPath,
+        "Footstep-tracking policy: the stick walks planned footsteps; needs footstep_planner",
+    ),
+    entry(
+        "policy.footstep_planner",
+        Kind::OptionalPath,
+        "FootstepNet planner ONNX feeding the footstep policy",
+    ),
+    entry(
+        "policy.footstep_horizon_s",
+        Kind::OptionalFloat,
+        "Footsteps: stick goal look-ahead, seconds of twist; unset 1.0",
+    ),
+    entry(
         "policy.action_scale",
         Kind::OptionalFloat,
         "Policy output to joint offset; unset resolves per mode",

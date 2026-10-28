@@ -1009,6 +1009,28 @@ the loop's own rate rather than the prototype's separate 100 Hz. That cost is th
 "no odometry" decision in §7 was reversed rather than re-argued: the objection was never the
 arithmetic, it was that nothing read the answer.
 
+#### 4.4.1 Footsteps: the stick walks planned footsteps
+
+Opt-in, walk mode only: `[policy] footsteps` (a footstep-tracking policy, microduck_rl
+`Mjlab-Footsteps-*`) and `footstep_planner` (FootstepNet, Hub `apirrone/microduck-footstepnet`),
+both or neither — one alone fails the load like any broken bundle. With them, a held stick no
+longer feeds the gait a velocity: the controller runs the footstep net, whose twist slots carry
+the swing foot's **target pose** `(dx, dy, dyaw)` in the support sole frame.
+
+The odometry is what makes it work, which is why it lives here. The support foot is the
+odometry's anchor foot, and a change of anchor is a touchdown — the same rule the policy was
+trained against. At every touchdown `duck-footstep-control`'s follower replans: the stick's twist,
+integrated along its arc for `footstep_horizon_s` (default 1 s) from the stance centre, is the
+goal; FootstepNet rolls a plan to it from the support sole (`Odometry::sole_poses`, sole centres
+7 mm ahead of the foot sites); the plan's first step is the target for the whole swing. The
+planner runs inside the tick — one small MLP per planned step, at most eight per touchdown — so
+it is loaded and warmed with the policies, never at a tick.
+
+A released stick puts the goal on the neutral stance: the robot squares its feet and steps in
+place, and after 0.75 s idle hands back to the gait at the next touchdown, never with a foot in
+the air. A planner error hands back at once. Body-pose mode and every skill outrank it, as they
+outrank walking.
+
 ### 4.5 What else the loop drives, and why none of it has a design page
 
 `robotd` grew five subsystems after slice 2 that are not control and not safety. They share a

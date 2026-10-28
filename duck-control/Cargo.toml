@@ -12,6 +12,8 @@ description = "Robot control core: model, bus, sensing"
 # hand. Not a door onto IPC: nothing here speaks to a socket, and `robotd` already links
 # both crates, so no binary gains a dependency from this edge.
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# The footstep planner loop; `footsteps` runs its network on the same `ort` as the policies.
+duck-footstep-control = { path = "../duck-footstep-control" }
 serde = { workspace = true }
 # The simulator link speaks newline-delimited JSON — see `sim` for why a packed struct shared
 # between two repositories in two languages is the worse trade.

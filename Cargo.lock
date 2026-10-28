@@ -1191,6 +1191,7 @@ dependencies = [
 name = "duck-control"
 version = "0.17.9"
 dependencies = [
+ "duck-footstep-control",
  "duck-ipc-proto",
  "libloading 0.8.9",
  "ort",
@@ -1228,6 +1229,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "duck-footstep-control"
+version = "0.17.9"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4051,6 +4061,7 @@ dependencies = [
  "arc-swap",
  "clap",
  "duck-control",
+ "duck-footstep-control",
  "duck-ipc-proto",
  "kinematics",
  "libc",
