@@ -635,7 +635,7 @@ Same background unit, battery hand-off and files as `endurance`, under `/var/lib
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
 `fallen_unprovoked`, `wall_guard` and `square_guard`. `scripts/endurance-plot.py` draws one run or
-overlays several.
+overlays several, and writes each stress run a `report.pdf` to read or pass on.
 
 ### Gamepad (`configd`)
 

@@ -86,3 +86,34 @@ def test_overlay_refuses_mixed_lap_versions(tmp_path):
     assert why is not None
     assert "duck-b" in why and "stress-v2" in why
     assert plot.mixed_laps([a, c]) is None
+
+
+def test_each_fall_is_paired_with_how_it_ended(tmp_path):
+    events = lap_events(0, ["1.50 s", None, "9.70 s after the reset"])
+    events.append((12.0, "fallen_unprovoked", ""))
+    events.append((13.0, "got_up", "2.00 s"))
+    events.append((20.0, "fall_triggered", "backward"))
+    events.append((35.0, "gave_up", "still down after the reset; torque off"))
+    run = write_run(tmp_path / "duck-a", "stress-v1", events)
+    _, ev = plot.load(run)
+
+    falls = plot.fall_outcomes(ev)
+
+    assert list(falls["outcome"]) == ["up", "no_fall", "up_after_reset", "up", "gave_up"]
+    assert list(falls["provoked"]) == [True, True, True, False, True]
+    assert falls["seconds"].iloc[2] == pytest.approx(9.7)
+    assert set(falls["lap"]) == {1}
+
+
+def test_a_stress_run_gets_a_pdf_report(tmp_path):
+    events = lap_events(0, ["1.50 s", None, "9.70 s after the reset"])
+    events.insert(1, (0.5, "activity", "walk A1.fwd"))
+    events.append((30.0, "getup_failed", "still down after 7 s"))
+    run = write_run(tmp_path / "duck-a", "stress-v1", events)
+    df, ev = plot.load(run)
+
+    out = plot.stress_report(run, df, ev, plot.stress_laps(df, ev), plot.read_meta(run))
+
+    assert out == run / "report.pdf"
+    assert out.read_bytes()[:5] == b"%PDF-"
+    assert out.read_bytes().count(b"/Type /Page\n") + out.read_bytes().count(b"/Type /Page ") >= 3

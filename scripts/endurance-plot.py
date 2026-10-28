@@ -18,6 +18,8 @@ Writes into each run directory:
 For a stress run it also writes:
 
     getup.png      every get-up's time against the lap it happened in
+    report.pdf     the same, to read or pass on: an overview (headline numbers, how each fall
+                   ended, get-up times), the per-lap table, the timeline and every incident
     summary.md     … plus a table per lap: falls, get-ups, failures, guards, battery, hottest servo
 
 Given several runs it also writes `compare.png` beside the first, battery against time for each —
@@ -525,6 +527,198 @@ def compare_laps(runs: list[tuple[Path, pd.DataFrame]], out: Path) -> None:
     plt.close(fig)
 
 
+OUTCOMES = {  # how a fall ended, in the order the bars stack; gray is not an outcome to count
+    "up": ("got up", SERIES[0]),
+    "up_after_reset": ("got up after the reset", SERIES[3]),
+    "gave_up": ("gave up", CRITICAL),
+    "no_fall": ("policy caught it", OTHER_COLOR),
+}
+INCIDENTS = ["getup_failed", "long_reset", "gave_up", "fallen_unprovoked", "odometry_jump",
+             "robotd_unreachable", "connection_lost", "no_tof", "enable_timeout", "rise_timeout",
+             "sit_timeout", "fatal", "signal", "stop"]
+A4 = (11.69, 8.27)
+
+
+def fall_outcomes(ev: pd.DataFrame) -> pd.DataFrame:
+    """One row per fall, provoked or not, with the lap it was in, how it ended and in how long."""
+    ev = ev.sort_values("wall")
+    lap, open_fall, rows = 0, None, []
+    for e in ev.itertuples():
+        if e.kind == "lap_start":
+            lap += 1
+        elif e.kind in ("fall_triggered", "fallen_unprovoked"):
+            open_fall = {"lap": lap, "h": e.h, "provoked": e.kind == "fall_triggered"}
+        elif open_fall and e.kind in ("got_up", "no_fall", "gave_up"):
+            reset = e.kind == "got_up" and "reset" in str(e.detail)
+            outcome = {"got_up": "up_after_reset" if reset else "up"}.get(e.kind, e.kind)
+            seconds = getup_seconds(e.detail) if e.kind == "got_up" else float("nan")
+            rows.append({**open_fall, "outcome": outcome, "seconds": seconds})
+            open_fall = None
+    return pd.DataFrame(rows, columns=["lap", "h", "provoked", "outcome", "seconds"])
+
+
+def _tile(ax, x, w, value, label, color=INK) -> None:
+    ax.add_patch(plt.Rectangle((x, 0.05), w, 0.9, transform=ax.transAxes, facecolor="white",
+                               edgecolor=GRID, linewidth=1))
+    ax.text(x + 0.012, 0.55, value, transform=ax.transAxes, fontsize=20, fontweight="bold",
+            color=color, va="center")
+    ax.text(x + 0.012, 0.2, label, transform=ax.transAxes, fontsize=8.5, color=INK_2, va="center")
+
+
+def _page(pdf, title: str, subtitle: str = ""):
+    fig = plt.figure(figsize=A4)
+    fig.text(0.04, 0.95, title, fontsize=16, fontweight="bold", color=INK, va="top")
+    if subtitle:
+        fig.text(0.04, 0.905, subtitle, fontsize=9.5, color=INK_2, va="top")
+    return fig
+
+
+def _table(ax, header: list[str], rows: list[list[str]], widths: list[float] | None = None,
+           left: int = 0) -> None:
+    """A table filling `ax` from the top; the first `left` columns are text, aligned left."""
+    ax.axis("off")
+    t = ax.table(cellText=rows, colLabels=header, loc="upper left", cellLoc="right",
+                 colLoc="right", colWidths=widths)
+    t.auto_set_font_size(False)
+    t.set_fontsize(8.5)
+    t.scale(1, 1.35)
+    for (r, c), cell in t.get_celld().items():
+        if c < left:
+            cell.get_text().set_horizontalalignment("left")
+            cell.PAD = 0.03
+        cell.set_edgecolor(GRID)
+        cell.set_linewidth(0.6)
+        if r == 0:
+            cell.set_text_props(fontweight="bold", color=INK)
+            cell.set_facecolor("#f1f0ec")
+        else:
+            cell.set_facecolor("white" if r % 2 else SURFACE)
+            cell.get_text().set_color(INK)
+
+
+def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFrame,
+                  meta: dict) -> Path:
+    """`report.pdf`: an overview page, the per-lap table, the timeline and the incident log."""
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    out = run / "report.pdf"
+    falls = fall_outcomes(ev)
+    provoked = falls[falls["provoked"]]
+    seg = (meta.get("segments") or [{}])[0]
+    minutes = (df["wall"].iloc[-1] - df["wall"].iloc[0]) / 60 if len(df) else 0
+    batt = df["battery_pct"].dropna() if "battery_pct" in df else pd.Series(dtype=float)
+    subtitle = "  ·  ".join(x for x in [
+        str(seg.get("host") or run.name), str(seg.get("started_utc") or ""),
+        f"lap {lap_version(meta) or '?'}", f"{len(laps)} laps", f"{minutes:.0f} min logged",
+        f"battery {batt.iloc[0]:.0f}% → {batt.iloc[-1]:.0f}%" if len(batt) else ""] if x)
+    count = lambda o, f=provoked: int((f["outcome"] == o).sum())  # noqa: E731
+    fell = len(provoked) - count("no_fall")
+    times = falls.loc[falls["outcome"] == "up", "seconds"]
+
+    with PdfPages(out) as pdf:
+        # 1 — overview
+        fig = _page(pdf, f"Stress test — {run.name}", subtitle)
+        tiles = fig.add_axes([0.04, 0.72, 0.92, 0.14])
+        tiles.axis("off")
+        w, gap = 0.155, 0.014
+        for i, (value, label, color) in enumerate([
+            (f"{len(provoked)}", "falls provoked", INK),
+            (f"{100 * fell / len(provoked):.0f}%" if len(provoked) else "–",
+             "of the cuts made it fall", INK),
+            (f"{times.median():.2f} s" if len(times) else "–", "median get-up (first try)", INK),
+            (f"{count('up_after_reset', falls)}", "needed the 2 s reset", INK),
+            (f"{count('gave_up', falls)}", "gave up", CRITICAL if count("gave_up", falls) else INK),
+            (f"{int((~falls['provoked']).sum())}", "falls nobody asked for", INK),
+        ]):
+            _tile(tiles, i * (w + gap), w, value, label, color)
+
+        bars = fig.add_axes([0.06, 0.16, 0.4, 0.46])
+        per_lap = (provoked.groupby(["lap", "outcome"]).size().unstack(fill_value=0)
+                   .reindex(columns=list(OUTCOMES), fill_value=0))
+        bottom = np.zeros(len(per_lap))
+        for key, (label, color) in OUTCOMES.items():
+            bars.bar(per_lap.index, per_lap[key], bottom=bottom, color=color, label=label,
+                     width=0.7, edgecolor=SURFACE, linewidth=2)
+            bottom += per_lap[key].to_numpy()
+        bars.set_title("How each provoked fall ended, lap by lap")
+        bars.set_xlabel("lap")
+        bars.set_ylabel("falls")
+        bars.xaxis.set_major_locator(MaxNLocator(integer=True))
+        bars.yaxis.set_major_locator(MaxNLocator(integer=True))
+        bars.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=4)
+
+        dots = fig.add_axes([0.55, 0.16, 0.41, 0.46])
+        for key in ["up", "up_after_reset"]:
+            f = falls[falls["outcome"] == key]
+            dots.scatter(f["lap"], f["seconds"], s=22, color=OUTCOMES[key][1],
+                         edgecolor=SURFACE, linewidth=1, label=OUTCOMES[key][0], zorder=3)
+        med = falls[falls["outcome"] == "up"].groupby("lap")["seconds"].median()
+        dots.plot(med.index, med.to_numpy(), color=INK_2, linewidth=1.5, label="median, first try")
+        dots.set_title("Get-up time, every fall")
+        dots.set_xlabel("lap")
+        dots.set_ylabel("seconds")
+        dots.set_ylim(bottom=0)
+        dots.xaxis.set_major_locator(MaxNLocator(integer=True))
+        dots.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=3)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 2 — per lap
+        fig = _page(pdf, "Lap by lap", "falls: provoked  ·  got up: every fall, provoked or "
+                    "not  ·  failed: still down at 7 s  ·  unasked: falls nobody provoked  ·  "
+                    "square, wall: guard trips")
+
+        def num(v, fmt):
+            return "–" if pd.isna(v) else format(v, fmt)
+
+        rows = [[str(lap), str(int(r["falls"])), str(int(r["no_fall"])), str(int(r["got_up"])),
+                 num(r["getup_median_s"], ".2f"), num(r["getup_max_s"], ".2f"),
+                 str(int(r["getup_failed"])), str(int(r["gave_up"])),
+                 str(int(r["fallen_unprovoked"])), str(int(r["square_guard"])),
+                 str(int(r["wall_guard"])), num(r["battery_pct"], ".0f"),
+                 num(r["motor_max_c"], ".0f")] for lap, r in laps.iterrows()]
+        header = ["lap", "falls", "no fall", "got up", "median s", "max s", "failed",
+                  "gave up", "unasked", "square", "wall", "battery %", "servo °C"]
+        for i in range(0, max(len(rows), 1), 28):
+            if i:
+                fig = _page(pdf, "Lap by lap (continued)")
+            _table(fig.add_axes([0.04, 0.05, 0.92, 0.82]), header, rows[i:i + 28])
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # 3 — timeline, as drawn for the PNG
+        if (run / "timeline.png").exists():
+            fig = _page(pdf, "Timeline")
+            ax = fig.add_axes([0.03, 0.02, 0.94, 0.86])
+            ax.imshow(plt.imread(run / "timeline.png"))
+            ax.axis("off")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # 4 — incidents
+        ev = ev.sort_values("wall").copy()
+        ev["lap"] = (ev["kind"] == "lap_start").cumsum()
+        steps = ev["detail"].where(ev["kind"] == "activity").astype(str).str.split().str[-1]
+        ev["step"] = steps.ffill().fillna("")
+        inc = ev[ev["kind"].isin(INCIDENTS)]
+        rows = [[f"{(r.wall - ev['wall'].iloc[0]) / 60:.1f}", str(r.lap or ""), r.step, r.kind,
+                 str(r.detail)[:70] if not pd.isna(r.detail) else ""] for r in inc.itertuples()]
+        if not rows:
+            rows = [["", "", "", "nothing went wrong", ""]]
+        for i in range(0, len(rows), 30):
+            fig = _page(pdf, "Incidents" + (" (continued)" if i else ""),
+                        "" if i else "everything that was not the lap going to plan")
+            _table(fig.add_axes([0.04, 0.05, 0.92, 0.82]),
+                   ["min", "lap", "step", "event", "detail"], rows[i:i + 30],
+                   [0.06, 0.05, 0.12, 0.17, 0.6], left=5)
+            pdf.savefig(fig)
+            plt.close(fig)
+        d = pdf.infodict()
+        d["Title"] = f"Stress test — {run.name}"
+        d["Subject"] = subtitle
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("runs", nargs="+", type=Path, help="run directories written by robotctl endurance or stress")
@@ -549,7 +743,7 @@ def main() -> int:
             text += stress_summary(laps, lap_version(meta) or "?")
             (run / "summary.md").write_text(text)
             getup_chart(run, ev)
-            made.append(run / "getup.png")
+            made += [run / "getup.png", stress_report(run, df, ev, laps, meta)]
             lapped.append((run, laps))
         print(text)
         print("".join(f"→ {m}\n" for m in made + [run / "summary.md"]))
