@@ -538,8 +538,8 @@ case the sensor is in its 3280×2464 boot mode, whose field of view is the whole
 the 1920×1080 crop, and every intrinsic would be off by about 1.7×. `mediad::camera` has the
 arithmetic and the mode table, including the fact that reading 720p off the sensor would *narrow*
 the view to 27° rather than saving anything. It is also a robot whose sensor nobody has measured —
-the beta board's GC2093 has no field of view and no family solve in `mediad::sensor`, so it
-publishes geometry only once that robot carries its own `[media.intrinsics]`.
+which the beta board's GC2093 was until its family solve (`CameraIntrinsics::beta`, unit sky-gtc,
+~85°): each sensor in `mediad::sensor` publishes its own lens's geometry, never the other family's.
 
 ## 11. Everything on the wire should carry the time it happened — **wanted**
 

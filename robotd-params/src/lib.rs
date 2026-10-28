@@ -699,6 +699,34 @@ pub struct CameraIntrinsics {
 }
 
 impl CameraIntrinsics {
+    /// The beta family's camera calibration: the GC2093 on Seeed's main board and its lens, one part across
+    /// the family like the alpha's, so one solve is every unit's.
+    ///
+    /// Solved on unit *sky-gtc*, 2026-10-28 — a printed 11×8 ChArUco (`DICT_4X4_1000`, legacy pattern, 20.75 mm
+    /// squares), 80 views, 1.28 px RMS (per view: median 1.1, max 2.7 — spread evenly, not a few outliers, and
+    /// every-frame and every-third-frame solves agree within 3 px on the principal point; a slower recording on a
+    /// rigid board should bring it under 1), on the 1280×720 frame as `mediad` sends it: a scaled readout of the
+    /// sensor's only 1920×1080 mode, so the same field at any size `mediad` streams. Mounted upright
+    /// (`rotate` 0), ~85° horizontal and ~55° vertical field — wider than the alpha's 62°.
+    /// Re-solve with `duckslam calib intrinsics`; `duckslam calib export-toml` prints this shape.
+    pub fn beta() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            fx: 695.6216231288809,
+            fy: 696.0209167299262,
+            cx: 627.4740538073111,
+            cy: 363.60566030048255,
+            distortion: vec![
+                -0.368607360841971,
+                0.13550162561831905,
+                0.00012682873881955374,
+                0.0008719998338708391,
+                -0.022368269599378002,
+            ],
+        }
+    }
+
     /// The alpha family's camera calibration: the head camera module and M12 lens every alpha unit
     /// carries — one part across the family, so one solve is every unit's calibration.
     ///

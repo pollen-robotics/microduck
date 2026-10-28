@@ -128,8 +128,8 @@ pub const IMX219: Sensor = Sensor {
 /// Analogue gain is 64 for 1x — read off the driver, `min=64 max=8192`. The ceiling is kept at the
 /// IMX219's 11x rather than the driver's, so the loop spends noise the same way on both.
 ///
-/// No field of view and no family solve: nobody has measured this lens yet, so the geometry is
-/// unknown until a robot is calibrated.
+/// The geometry is the family solve, [`robotd_params::CameraIntrinsics::beta`] (unit *sky-gtc*): ~85°
+/// across the 16:9 frame.
 pub const GC2093: Sensor = Sensor {
     id: CameraSensor::Gc2093,
     mode: SensorMode {
@@ -148,8 +148,9 @@ pub const GC2093: Sensor = Sensor {
     // The beta image installs rkaiq with Seeed's IQ file, whose AE keeps converging — the one
     // thing the alpha's engine does not do.
     metering: Metering::Rkaiq,
-    hfov_deg: None,
-    family: None,
+    // 2·atan(640 / fx) on the 1280-wide solve.
+    hfov_deg: Some(85.2),
+    family: Some(robotd_params::CameraIntrinsics::beta),
 };
 
 // The GC2093's exposure control stops at 1121 lines. A hard cap above it would be refused by the
