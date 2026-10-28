@@ -477,7 +477,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// gallery, where anybody can browse, search and sort the ducks whose owners said yes. Additive:
 /// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
 /// works as before and the duck stays out of the gallery.
-pub const API_VERSION: u32 = 45;
+///
+/// # v46 — targeted gamepad connection
+///
+/// `pad.connect` reconnects an exact existing association; `pad.status` reports the adapter,
+/// service discovery, HID identity and both source services without claiming robot control.
+/// Install the daemon release containing v46 together with the matching robotctl.
+pub const API_VERSION: u32 = 46;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -933,8 +939,10 @@ pub mod method {
     // and the whole point of it having no privileged access is that it exercises the same API the
     // phone app will. Letting it configure BlueZ would have undone that.
 
-    /// Which pads this robot knows, and whether `padd` is driving from one.
+    /// Saved Bluetooth associations, link/HID evidence and source service diagnostics.
     pub const PAD_STATUS: &str = "pad.status";
+    /// Connect an exact existing association without discovery or pairing.
+    pub const PAD_CONNECT: &str = "pad.connect";
     /// Pair the gamepad that is in pairing mode now.
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
@@ -1204,6 +1212,7 @@ pub enum Call {
     // ── pad.* ────────────────────────────────────────────────────────────────
     PadStatus,
     PadPair(PadPairParams),
+    PadConnect(PadConnectParams),
     PadForget(PadForgetParams),
     PadBindings,
     PadBind(PadBindParams),
@@ -1342,6 +1351,7 @@ impl Call {
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
+            Call::PadConnect(_) => method::PAD_CONNECT,
             Call::PadForget(_) => method::PAD_FORGET,
             Call::PadBindings => method::PAD_BINDINGS,
             Call::PadBind(_) => method::PAD_BIND,
@@ -1379,6 +1389,7 @@ impl Call {
                 // consequential thing in this namespace — a paired pad can enable the policy.
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
+                | Call::PadConnect(_)
                 | Call::PadForget(_)
                 // Replacing the policy set changes what drives fifteen servos, which is at least
                 // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
@@ -1547,7 +1558,7 @@ impl Call {
             // and `pad.pair` waits on a gamepad for its whole timeout. Both hold the connection
             // for that long, which is what `Operation` is for — and why `net.status` must not be
             // queued behind them.
-            Call::NetConnect(_) | Call::PadPair(_) => (Config, Operation),
+            Call::NetConnect(_) | Call::PadPair(_) | Call::PadConnect(_) => (Config, Operation),
 
             // ── padd and tofd ───────────────────────────────────────────────
             //
@@ -1634,6 +1645,7 @@ impl Call {
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
             Call::PadPair(p) => encode(p),
+            Call::PadConnect(p) => encode(p),
             Call::PadForget(p) => encode(p),
             Call::PadBind(p) => encode(p),
             Call::RobotSetSkill(p) => encode(p),
@@ -1769,6 +1781,7 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
+            method::PAD_CONNECT => Call::PadConnect(decode(params)?),
             method::PAD_FORGET => Call::PadForget(decode(params)?),
             method::PAD_BINDINGS => Call::PadBindings,
             method::PAD_BIND => Call::PadBind(decode(params)?),
@@ -1960,6 +1973,9 @@ pub mod test_support {
                 pin: "000000".into(),
             }),
             Call::PadStatus,
+            Call::PadConnect(PadConnectParams {
+                mac: "78:86:2E:BB:13:28".into(),
+            }),
             Call::PadPair(PadPairParams {
                 mac: Some("78:86:2E:BB:13:28".into()),
                 timeout_seconds: Some(20),
@@ -3258,6 +3274,13 @@ pub struct PadPairParams {
     pub timeout_seconds: Option<u32>,
 }
 
+/// Connect one already paired pad, without discovery or replacing its bond.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PadConnectParams {
+    pub mac: String,
+}
+
 /// Forget one pad, by address.
 ///
 /// The address, not "the connected one": forgetting is what you do to a pad that is *not* in the
@@ -4444,8 +4467,15 @@ pub struct Pad {
     /// the pad work after a reboot with nobody logged in. A paired-but-untrusted pad looks paired
     /// and does not reconnect, which is why this is reported separately rather than folded in.
     pub trusted: bool,
-    /// Connected right now. This is the one that answers "why is the robot not moving".
+    /// Bluetooth link connected; this alone does not establish a usable HID device.
     pub connected: bool,
+    /// BlueZ service discovery, distinct from the link being connected.
+    #[serde(default)]
+    pub services_resolved: Option<bool>,
+    /// Exact Bluetooth MAC found on an input node in sysfs. None means not observable.
+    /// False means no matching node was found, not proof that the driver cannot support the pad.
+    #[serde(default)]
+    pub hid_recognized: Option<bool>,
 }
 
 /// Whether one of the robot's units is running, as systemd sees it.
@@ -4466,10 +4496,10 @@ pub struct Pad {
 ///
 /// `Failed` splits out for the smaller version of the same complaint: it read as `Inactive`, which
 /// is also what a deliberate `systemctl stop` reads as, and those are not the same news.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitState {
-    /// Running. With a connected pad, the robot is drivable.
+    /// Running; this does not establish device readiness or robot control.
     Active,
     /// Between processes: it exited and systemd is starting it again. Once for an ordinary restart,
     /// or every `RestartSec=` for a daemon that cannot start at all — this state cannot tell those
@@ -4484,6 +4514,7 @@ pub enum UnitState {
     Absent,
     /// Could not ask: no systemd, or the query failed. Distinct from `Absent`, because "I do not
     /// know" must not read as "it is not installed".
+    #[default]
     Unknown,
 }
 
@@ -4569,12 +4600,62 @@ pub struct LogsResult {
     pub truncated: bool,
 }
 
-/// Answer to [`Call::PadStatus`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// State of the selected Bluetooth adapter. Reading status never powers it on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadAdapterState {
+    #[default]
+    Unknown,
+    Unavailable,
+    Absent,
+    Off,
+    On,
+}
+
+/// Answer to pad.status, including independent partial diagnostics.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PadStatusResult {
     /// Every pad the robot is bonded to, connected first.
     pub pads: Vec<Pad>,
     pub driver: UnitState,
+    #[serde(default)]
+    pub network_driver: UnitState,
+    #[serde(default)]
+    pub adapter_state: PadAdapterState,
+    #[serde(default)]
+    pub adapter: Option<String>,
+    #[serde(default)]
+    pub bluetooth_error: Option<String>,
+    /// Selected source in robotd.toml; None if the configuration could not be read.
+    #[serde(default)]
+    pub udp_selected: Option<bool>,
+    #[serde(default)]
+    pub config_error: Option<String>,
+}
+
+/// Phase at which a targeted connection stopped. No phase scans, pairs or removes keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadConnectPhase {
+    Adapter,
+    Lookup,
+    Trust,
+    Connect,
+    Verify,
+}
+
+/// Answer to pad.connect. A link success does not claim HID readiness or robot control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PadConnectResult {
+    Connected {
+        pad: Pad,
+    },
+    Failed {
+        phase: PadConnectPhase,
+        detail: String,
+        pad: Option<Pad>,
+    },
 }
 
 /// Why pairing a pad failed.
@@ -4594,6 +4675,10 @@ pub enum PadPairFailure {
     /// BlueZ refused the bond. The classic cause on this board is the `Privacy` setting in
     /// `/etc/bluetooth/main.conf` — see `configd::bluez` for which value and why.
     Rejected,
+    /// The selected D-Bus device vanished; this is not an authentication failure.
+    Disappeared,
+    /// Pairing returned, but its final state could not be verified.
+    VerificationFailed,
     Other,
 }
 
@@ -5853,7 +5938,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            74,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6084,6 +6169,7 @@ mod tests {
                 // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
                 // list: reading which pads are paired is exactly the kind of inspection support
                 // needs on a robot it is not allowed to reconfigure.
+                method::PAD_CONNECT,
                 method::PAD_PAIR,
                 method::PAD_FORGET,
             ]

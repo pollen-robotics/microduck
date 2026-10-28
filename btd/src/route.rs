@@ -200,6 +200,8 @@ fn permits(call: &proto::Call) -> bool {
         // robot with a controller, and the PIN gate is what stands in front of it.
         PadStatus => true,
         PadPair(_) => true,
+        // Same authenticated configuration gate as pairing; never resets the radio.
+        PadConnect(_) => true,
         PadForget(_) => true,
 
         // ── refused ─────────────────────────────────────────────────────────
@@ -623,6 +625,7 @@ mod tests {
                 // the same reason as provisioning: it takes a pad held in pairing mode next to the
                 // robot, so BLE's physical-presence claim (§4.2) is not being stretched — and the
                 // alternative is an ssh session, which is not a thing an owner has.
+                proto::method::PAD_CONNECT,
                 proto::method::PAD_PAIR,
                 proto::method::PAD_FORGET,
             ]
@@ -635,6 +638,9 @@ mod tests {
     fn a_pad_can_be_paired_from_the_phone() {
         for call in [
             proto::Call::PadStatus,
+            proto::Call::PadConnect(proto::PadConnectParams {
+                mac: "98:B6:E9:A4:FC:67".into(),
+            }),
             proto::Call::PadPair(proto::PadPairParams::default()),
             proto::Call::PadForget(proto::PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),

@@ -918,7 +918,13 @@ fn bar(fraction: f64) -> String {
 
 #[derive(Subcommand, Debug)]
 enum PadCommand {
-    /// Which pads this robot is paired to, and whether `padd` is driving. Changes nothing.
+    /// Connect an already paired pad by its exact Bluetooth address. No scan or re-pairing.
+    Connect {
+        mac: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Saved associations, Bluetooth/HID connection evidence and source services. Changes nothing.
     Status {
         #[arg(long)]
         json: bool,
@@ -4870,12 +4876,16 @@ fn robot_skills(robot_socket: &Path) -> Option<Vec<String>> {
     Some(ack.skills)
 }
 
-fn run_pad(socket: &Path, config: &Path, command: PadCommand) -> Result<(), Failure> {
+fn run_pad(socket: &Path, _config: &Path, command: PadCommand) -> Result<(), Failure> {
     let mut client = Client::connect_to("configd", socket)?;
     client.hello()?;
 
     let (call, json) = match &command {
         PadCommand::Status { json } => (proto::Call::PadStatus, *json),
+        PadCommand::Connect { mac, json } => (
+            proto::Call::PadConnect(proto::PadConnectParams { mac: mac.clone() }),
+            *json,
+        ),
         PadCommand::Pair { mac, timeout, json } => (
             proto::Call::PadPair(proto::PadPairParams {
                 mac: mac.clone(),
@@ -4912,14 +4922,34 @@ fn run_pad(socket: &Path, config: &Path, command: PadCommand) -> Result<(), Fail
     let result = result_of(client.call(&call)?)?;
     if json {
         println!("{}", compact(&result));
-        return Ok(());
+        // Machine-readable failures still need a failing exit status, just like the text path.
+        let failed = match &command {
+            PadCommand::Connect { .. } => matches!(
+                decode::<proto::PadConnectResult>(&result)?,
+                proto::PadConnectResult::Failed { .. }
+            ),
+            PadCommand::Pair { .. } => matches!(
+                decode::<proto::PadPairResult>(&result)?,
+                proto::PadPairResult::Failed { .. }
+            ),
+            _ => false,
+        };
+        return if failed {
+            Err(Failure::new(
+                exit::REFUSED,
+                "pad operation failed; see JSON result".into(),
+            ))
+        } else {
+            Ok(())
+        };
     }
 
     match command {
         PadCommand::Status { .. } => {
-            println!("{}", render_pad_status(&result, udp_selected(config))?)
+            println!("{}", render_pad_status(&result)?)
         }
         PadCommand::Pair { .. } => return report_pair(&result),
+        PadCommand::Connect { .. } => return report_pad_connect(&result),
         PadCommand::Bindings { .. } | PadCommand::Bind { .. } | PadCommand::Reset { .. } => {
             unreachable!("bindings, bind and reset returned before this point")
         }
@@ -4943,62 +4973,143 @@ fn run_pad(socket: &Path, config: &Path, command: PadCommand) -> Result<(), Fail
     Ok(())
 }
 
-/// Whether `[netpad] enabled` gives the pad to netpadd — the question padd's own `ExecCondition=`
-/// asks, answered the same way: a file that cannot be read counts as not enabled, as it does for
-/// padd, so this never explains a stand-down that did not happen.
-fn udp_selected(config: &Path) -> bool {
-    robotd_params::Params::load(config, false).is_ok_and(|p| p.netpad.enabled)
-}
-
-/// `udp` is whether `[netpad] enabled` is set, which is what an inactive `padd` means then.
-fn render_pad_status(result: &serde_json::Value, udp: bool) -> Result<String, Failure> {
+/// Connection diagnostics only: source, radio and HID identity, never driving mode or buttons.
+fn render_pad_status(result: &serde_json::Value) -> Result<String, Failure> {
     use std::fmt::Write;
     let status: proto::PadStatusResult = decode(result)?;
-
     let mut out = String::new();
-    if status.pads.is_empty() {
-        let _ = writeln!(out, "pad     none paired — run:  sudo robotctl pad pair");
+    let source = match status.udp_selected {
+        Some(true) => "UDP (netpad.enabled)",
+        Some(false) => "local pad (Bluetooth / USB on robot)",
+        None => "unknown",
+    };
+    let _ = writeln!(out, "source  {source}");
+    if let Some(error) = &status.config_error {
+        let _ = writeln!(out, "config  unavailable: {error}");
+    }
+    let adapter = match status.adapter_state {
+        proto::PadAdapterState::Unknown => "unknown",
+        proto::PadAdapterState::Unavailable => "unavailable",
+        proto::PadAdapterState::Absent => "absent — the radio may still be starting",
+        proto::PadAdapterState::Off => "off",
+        proto::PadAdapterState::On => "on",
+    };
+    let _ = writeln!(
+        out,
+        "radio   {adapter}{}",
+        status
+            .adapter
+            .as_ref()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default()
+    );
+    if let Some(error) = &status.bluetooth_error {
+        let _ = writeln!(out, "BlueZ   {error}");
+    }
+    if status.pads.is_empty()
+        && matches!(
+            status.adapter_state,
+            proto::PadAdapterState::On | proto::PadAdapterState::Off
+        )
+    {
+        let _ = writeln!(out, "pad     no saved associations on this adapter");
     }
     for pad in &status.pads {
-        // Four states, because they fail differently — and *trusted* is reported even when the pad
-        // is connected, which is the case that most looks like everything is fine: it drives now and
-        // does not come back after a reboot, because approving a reconnection needs an agent and at
-        // boot there is none.
-        let state = match (pad.connected, pad.trusted) {
-            (true, true) => "connected".to_owned(),
-            (true, false) => "connected, but NOT trusted — it will not reconnect after a reboot; \
-                              re-run:  sudo robotctl pad pair"
-                .to_owned(),
-            (false, true) => "paired, not connected — switch the pad on".to_owned(),
-            (false, false) => "paired but NOT trusted — re-run:  sudo robotctl pad pair".to_owned(),
+        let yes = |v| if v { "yes" } else { "no" };
+        let services = pad.services_resolved.map(yes).unwrap_or("unknown");
+        let hid = match pad.hid_recognized {
+            Some(true) => "recognized by exact Bluetooth address",
+            Some(false) => "no input node matched this address",
+            None => "identity unavailable",
         };
-        let _ = writeln!(out, "pad     {} {}  {}", pad.name, pad.mac, state);
-    }
-
-    let driver = match status.driver {
-        proto::UnitState::Active => "active — driving whatever pad connects".to_owned(),
-        // The state that most looks like the pad's fault: the light on the controller is on, the
-        // robot ignores it, and `padd` is dying and being restarted a few seconds later. Named
-        // rather than folded into either neighbour, which is the whole point of the variant.
-        proto::UnitState::Restarting => "restarting — it keeps exiting; check:  \
-                                         sudo journalctl -u padd -b | tail -30"
-            .to_owned(),
-        proto::UnitState::Failed => "FAILED to start — check:  \
-                                     sudo journalctl -u padd -b | tail -30"
-            .to_owned(),
-        // Stood down, not stopped: padd's `ExecCondition=` skips it when the pad is over UDP.
-        // Advising a start here would be advising the one thing that selection exists to prevent.
-        proto::UnitState::Inactive if udp => "standing down — `[netpad] enabled` hands the pad \
-                                              to netpadd; see docs/robot/udp-pad.md"
-            .to_owned(),
-        proto::UnitState::Inactive => {
-            "NOT running — start it:  sudo systemctl start padd".to_owned()
+        let _ = writeln!(out, "pad     {} {}", pad.name, pad.mac);
+        let _ = writeln!(
+            out,
+            "        paired={} trusted={} connected={} services_resolved={services}",
+            yes(pad.paired),
+            yes(pad.trusted),
+            yes(pad.connected)
+        );
+        let _ = writeln!(out, "        HID: {hid}");
+        if status.adapter_state == proto::PadAdapterState::On && (!pad.connected || !pad.trusted) {
+            let _ = writeln!(
+                out,
+                "        wake the pad, then: sudo robotctl pad connect {}",
+                pad.mac
+            );
         }
-        proto::UnitState::Absent => "not installed — this release predates padd.service".to_owned(),
-        proto::UnitState::Unknown => "unknown — could not ask systemd".to_owned(),
-    };
-    let _ = write!(out, "padd    {driver}");
-    Ok(out)
+    }
+    let _ = writeln!(out, "padd    {}", pad_unit(status.driver));
+    let _ = writeln!(out, "netpadd {}", pad_unit(status.network_driver));
+    if status.driver == proto::UnitState::Active
+        && status.network_driver == proto::UnitState::Active
+    {
+        let _ = writeln!(
+            out,
+            "CONFLICT: both pad sources are active; reapply the selected source with robotctl configure"
+        );
+    } else if matches!(
+        (status.udp_selected, status.driver, status.network_driver),
+        (Some(true), proto::UnitState::Active, _) | (Some(false), _, proto::UnitState::Active)
+    ) {
+        let _ = writeln!(
+            out,
+            "source mismatch: services do not match the configured selection; use robotctl configure"
+        );
+    } else if matches!(
+        (status.udp_selected, status.driver, status.network_driver),
+        (
+            Some(false),
+            proto::UnitState::Inactive
+                | proto::UnitState::Failed
+                | proto::UnitState::Restarting
+                | proto::UnitState::Absent,
+            _
+        ) | (
+            Some(true),
+            _,
+            proto::UnitState::Inactive
+                | proto::UnitState::Failed
+                | proto::UnitState::Restarting
+                | proto::UnitState::Absent
+        )
+    ) {
+        let _ = writeln!(
+            out,
+            "selected source service is not active; check its journal and robotctl configure"
+        );
+    } else if status.udp_selected == Some(true) && status.driver == proto::UnitState::Inactive {
+        let _ = writeln!(
+            out,
+            "padd is standing down for netpadd; see docs/robot/udp-pad.md"
+        );
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn pad_unit(state: proto::UnitState) -> &'static str {
+    match state {
+        proto::UnitState::Active => "active",
+        proto::UnitState::Inactive => "inactive",
+        proto::UnitState::Restarting => "restarting — check its journal",
+        proto::UnitState::Failed => "FAILED — check its journal",
+        proto::UnitState::Absent => "not installed",
+        proto::UnitState::Unknown => "unknown",
+    }
+}
+
+fn report_pad_connect(result: &serde_json::Value) -> Result<(), Failure> {
+    match decode::<proto::PadConnectResult>(result)? {
+        proto::PadConnectResult::Connected { pad } => {
+            println!("Bluetooth connected  {} {}", pad.name, pad.mac);
+            println!("Run robotctl pad status to check service discovery and HID recognition.");
+            Ok(())
+        }
+        proto::PadConnectResult::Failed { phase, detail, .. } => Err(Failure::new(
+            exit::REFUSED,
+            format!("pad connection failed ({phase:?}): {detail}"),
+        )),
+    }
 }
 
 /// Pairing is a successful call that may report a failed outcome, like a wifi join: the exit status
@@ -5008,11 +5119,16 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
         proto::PadPairResult::Paired { pad } => {
             println!("paired  {} {}", pad.name, pad.mac);
             if pad.connected {
-                println!("padd is driving from it now.");
+                println!(
+                    "Bluetooth link connected; run robotctl pad status to check HID recognition."
+                );
             } else {
                 // Bonded but not connected yet, which is normal for a second or two. Saying so
                 // beats printing nothing where "it works" should be.
-                println!("bonded; it will connect on its own in a moment.");
+                println!(
+                    "associated and trusted; link not connected. Wake the pad, then run: sudo robotctl pad connect {}",
+                    pad.mac
+                );
             }
             Ok(())
         }
@@ -5035,12 +5151,13 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
                      hci0 appears about 73s in"
                 }
                 proto::PadPairFailure::Rejected => {
-                    "Bluetooth refused the pairing. If this fails every time, check \
-                     /etc/bluetooth/main.conf: the `Privacy` setting decides whether a pad can \
-                     bond at all, and it should read `Privacy = device`. Fix it with \
-                     scripts/setup-board.sh and reboot, since it does not apply until then. \
-                     Otherwise the pad had probably left pairing mode: press Sync again and \
-                     re-run this while its light is flashing quickly"
+                    "Bluetooth refused the pairing; read the error below. If the pad left pairing mode, press Sync before retrying. Repeated authentication failures need diagnosis; do not change Privacy or remove associations without evidence"
+                }
+                proto::PadPairFailure::Disappeared => {
+                    "the selected Bluetooth device disappeared before pairing completed; inspect robotctl pad status for existing associations. This is not proof of invalid keys"
+                }
+                proto::PadPairFailure::VerificationFailed => {
+                    "pairing returned but its final association/trust could not be verified; inspect robotctl pad status before retrying"
                 }
                 proto::PadPairFailure::Other => "pairing failed",
             };
@@ -5756,27 +5873,64 @@ mod tests {
     /// one where `[netpad] enabled` stood it down for netpadd. Telling the second to start padd
     /// would hand the pad back to Bluetooth by hand, until the next restart undid it.
     #[test]
-    fn an_inactive_padd_is_a_stand_down_when_the_pad_is_over_udp() {
-        let inactive = serde_json::to_value(proto::PadStatusResult {
-            pads: Vec::new(),
-            driver: proto::UnitState::Inactive,
+    fn pad_status_distinguishes_radio_hid_and_source_without_claiming_control() {
+        let mut status = proto::PadStatusResult {
+            driver: proto::UnitState::Active,
+            network_driver: proto::UnitState::Active,
+            udp_selected: Some(false),
+            ..Default::default()
+        };
+        let render = |status: &proto::PadStatusResult| {
+            render_pad_status(&serde_json::to_value(status).unwrap())
+                .unwrap_or_else(|e| panic!("{}", e.message))
+        };
+        let text = render(&status);
+        assert!(text.contains("CONFLICT"), "{text}");
+        assert!(
+            !text.contains("none paired"),
+            "unknown radio is not an empty bond database"
+        );
+        assert!(!text.contains("driving"));
+        status.adapter_state = proto::PadAdapterState::Absent;
+        status.bluetooth_error = Some("not ready".into());
+        let text = render(&status);
+        assert!(text.contains("radio   absent") && text.contains("padd    active"));
+        assert!(!text.contains("pad pair"));
+        status.driver = proto::UnitState::Inactive;
+        status.udp_selected = Some(true);
+        assert!(render(&status).contains("standing down"));
+        status.pads.push(proto::Pad {
+            mac: "98:B6:E9:A4:FC:67".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            services_resolved: Some(true),
+            hid_recognized: Some(false),
+        });
+        let text = render(&status);
+        assert!(text.contains("connected=yes") && text.contains("no input node matched"));
+        assert!(!text.contains("driving"));
+    }
+
+    #[test]
+    fn pad_connect_requires_a_positional_address_and_reports_link_only() {
+        assert!(Cli::try_parse_from(["robotctl", "pad", "connect"]).is_err());
+        assert!(Cli::try_parse_from(["robotctl", "pad", "connect", "98:B6:E9:A4:FC:67"]).is_ok());
+        let failure = serde_json::to_value(proto::PadConnectResult::Failed {
+            phase: proto::PadConnectPhase::Connect,
+            detail: "org.bluez.Error.NotReady".into(),
+            pad: None,
         })
         .unwrap();
-
-        let bluetooth =
-            render_pad_status(&inactive, false).unwrap_or_else(|e| panic!("{}", e.message));
-        assert!(
-            bluetooth.contains("sudo systemctl start padd"),
-            "{bluetooth}"
-        );
-
-        let udp = render_pad_status(&inactive, true).unwrap_or_else(|e| panic!("{}", e.message));
-        assert!(!udp.contains("systemctl start padd"), "{udp}");
-        assert!(
-            udp.contains("[netpad] enabled") && udp.contains("netpadd"),
-            "{udp}"
-        );
-        assert!(udp.contains("udp-pad.md"), "{udp}");
+        assert!(report_pad_connect(&failure).is_err());
+        let failure = serde_json::to_value(proto::PadPairResult::Failed {
+            reason: proto::PadPairFailure::Disappeared,
+            detail: Some("UnknownObject".into()),
+        })
+        .unwrap();
+        let error = report_pair(&failure).unwrap_err();
+        assert!(error.message.contains("disappeared") && !error.message.contains("reboot"));
     }
 
     // ── robotctl policy ──────────────────────────────────────────────────

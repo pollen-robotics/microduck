@@ -42,6 +42,10 @@ struct Args {
     #[arg(long, default_value = DEFAULT_STATE_DIR)]
     state_dir: PathBuf,
 
+    /// Robot configuration, read only to report the selected gamepad source.
+    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+    config: PathBuf,
+
     /// Users permitted to make changes, by name. Read-only calls are never gated.
     ///
     /// Names rather than numbers, because `systemd-sysusers` allocates uids dynamically: a
@@ -173,6 +177,7 @@ fn resolve_gid(name: &str) -> Option<u32> {
 struct Service {
     net: Arc<dyn Net>,
     pads: Arc<dyn Pads>,
+    config: PathBuf,
     store: Store,
     policy: PeerPolicy,
     /// Read once at startup rather than per call: it comes from the SoC's fuses by way of the
@@ -219,13 +224,13 @@ async fn main() -> ExitCode {
         }
     };
 
-    // A board whose Bluetooth has not appeared yet — which on this one takes about 73 seconds —
-    // degrades to "no pads" and says why.
+    // A missing system bus is unavailable, not an empty list of saved associations.
+    // An adapter arriving late is handled by the live backend on each request.
     let pads: Arc<dyn Pads> = match pad_backend(args.fake_pads).await {
         Ok(pads) => pads,
         Err(e) => {
-            tracing::warn!(error = %e, "no gamepad backend; pad.* will report no pads");
-            Arc::new(FakePads::with(Vec::new()))
+            tracing::warn!(error = %e, "no gamepad backend; pad.* will report unavailable");
+            Arc::new(pad::UnavailablePads(e))
         }
     };
 
@@ -255,6 +260,7 @@ async fn main() -> ExitCode {
     let service = Arc::new(Service {
         net,
         pads,
+        config: args.config,
         store: Store::new(args.state_dir.join("config.json"), default_name),
         serial,
         simulated,
@@ -541,19 +547,28 @@ async fn dispatch(
                 ),
             }
         }
-        proto::Call::PadStatus => match service.pads.status().await {
-            Ok(pads) => proto::Response::ok(
-                Some(id),
-                &proto::PadStatusResult {
-                    pads,
-                    driver: units::state(units::PADD).await,
-                },
-            ),
-            Err(e) => {
-                tracing::warn!(error = %e, "backend failed");
-                proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
+        proto::Call::PadStatus => {
+            let mut status =
+                service
+                    .pads
+                    .status()
+                    .await
+                    .unwrap_or_else(|error| proto::PadStatusResult {
+                        adapter_state: proto::PadAdapterState::Unavailable,
+                        bluetooth_error: Some(error),
+                        ..Default::default()
+                    });
+            let (driver, network_driver) =
+                tokio::join!(units::state(units::PADD), units::state("netpadd.service"));
+            status.driver = driver;
+            status.network_driver = network_driver;
+            match robotd_params::Params::load(&service.config, false) {
+                Ok(params) => status.udp_selected = Some(params.netpad.enabled),
+                Err(error) => status.config_error = Some(error.to_string()),
             }
-        },
+            proto::Response::ok(Some(id), &status)
+        }
+        proto::Call::PadConnect(params) => reply(id, service.pads.connect(&params.mac).await),
         proto::Call::PadPair(params) => {
             let timeout = pad::pair_timeout(params.timeout_seconds);
             tracing::info!(mac = ?params.mac, ?timeout, "pairing a gamepad");
@@ -631,5 +646,72 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(test)]
+mod pad_dispatch_tests {
+    use super::*;
+
+    fn service(dir: &std::path::Path, pads: Arc<dyn Pads>) -> Service {
+        let config = dir.join("robotd.toml");
+        std::fs::write(&config, "[netpad]\nenabled = false\n").unwrap();
+        Service {
+            net: Arc::new(FakeNet::new()),
+            pads,
+            config,
+            store: Store::new(dir.join("config.json"), "test-duck"),
+            policy: PeerPolicy {
+                owner_uid: unsafe { libc::getuid() },
+                allow_uids: vec![],
+                allow_gids: vec![],
+            },
+            serial: None,
+            simulated: true,
+        }
+    }
+
+    // An unavailable bus must leave independent service/configuration diagnostics accessible.
+    #[tokio::test]
+    async fn status_reports_partial_failure_without_advising_new_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(
+            dir.path(),
+            Arc::new(pad::UnavailablePads("system bus unavailable".into())),
+        );
+        let response = dispatch(
+            &service,
+            None,
+            proto::Id::Number(1),
+            &proto::Call::PadStatus,
+        )
+        .await;
+        let status = response.result_as::<proto::PadStatusResult>().unwrap();
+        assert_eq!(status.adapter_state, proto::PadAdapterState::Unavailable);
+        assert_eq!(status.udp_selected, Some(false));
+        assert!(status.bluetooth_error.unwrap().contains("system bus"));
+        std::fs::write(&service.config, "broken config").unwrap();
+        let response = dispatch(
+            &service,
+            None,
+            proto::Id::Number(2),
+            &proto::Call::PadStatus,
+        )
+        .await;
+        let status = response.result_as::<proto::PadStatusResult>().unwrap();
+        assert_eq!(status.udp_selected, None);
+        assert!(status.config_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn reconnect_requires_mutation_permission_before_touching_the_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path(), Arc::new(FakePads::new()));
+        let call = proto::Call::PadConnect(proto::PadConnectParams {
+            mac: "78:86:2E:BB:13:28".into(),
+        });
+        let response = dispatch(&service, None, proto::Id::Number(1), &call).await;
+        assert_eq!(response.error.unwrap().code, proto::code::PERMISSION_DENIED);
+        assert!(service.pads.status().await.unwrap().pads.is_empty());
     }
 }

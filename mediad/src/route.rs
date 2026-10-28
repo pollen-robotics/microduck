@@ -277,6 +277,9 @@ fn permits(call: &proto::Call) -> bool {
         // A remote peer cannot satisfy any of that, so permitting it would only offer a button
         // that times out.
         PadPair(_) => false,
+        // Targeted reconnect is exposed locally and over authenticated BLE first;
+        // adding a remote manual handover is a separate transport decision.
+        PadConnect(_) => false,
 
         // ── refused: never over a network transport ──────────────────────────
         //

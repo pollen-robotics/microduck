@@ -31,7 +31,7 @@ sudo robotctl pad pair
 looking for a gamepad in pairing mode — on an Xbox pad, press the small Sync button on the
 top edge (not the Xbox button, which switches it off)
 paired  Xbox Wireless Controller 78:86:2E:BB:13:28
-padd is driving from it now.
+Bluetooth link connected; run robotctl pad status to check HID recognition.
 ```
 
 No MAC address needed: the robot looks for a gamepad in pairing mode and takes the one it finds. The
@@ -73,13 +73,64 @@ What it did is in `journalctl -u nfcd -b`.
 robotctl pad status
 ```
 
-```
-pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
-padd    active — driving whatever pad connects
+```text
+source  local pad (Bluetooth / USB on robot)
+radio   on (/org/bluez/hci0)
+pad     Pro Controller 98:B6:E9:A4:FC:67
+        paired=yes trusted=yes connected=yes services_resolved=yes
+        HID: recognized by exact Bluetooth address
+padd    active
+netpadd inactive
 ```
 
-Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
-working robot ignoring you.
+These are separate facts: `paired` is the saved association, `trusted` allows unattended
+reconnection, `connected` is the Bluetooth link and `services_resolved` is BlueZ's service
+discovery. None alone proves the input device exists. HID recognition reads Bluetooth input
+nodes in sysfs and matches their `uniq` to the **whole** address, case-insensitively. No matching
+node means no match was observed; `identity unavailable` means sysfs or the driver did not expose
+enough information. USB input cannot confirm the Bluetooth link. This does not say whether
+padd has opened the device, what buttons are active or what driving mode is selected.
+
+Status is read-only, including when the adapter is off or still absent at boot. An unavailable
+BlueZ is reported separately from an empty association list; the service and source diagnostics
+remain available. The selected adapter is the first path in lexical order, as for pairing;
+its saved associations are listed even when their names are not recognized as gamepads.
+Both source services active is a conflict; the configured source and the actual service states
+are shown separately. [udp-pad.md](udp-pad.md) owns source selection and how to apply it.
+
+## Reconnect an associated pad
+
+Wake the pad (Home on the Pro Controller; behavior varies on clones), then:
+
+```bash
+sudo robotctl pad connect 98:B6:E9:A4:FC:67
+```
+
+The address is required. This connects exactly that saved association on the selected adapter;
+it does not scan, pair, forget keys, restart a service or power-cycle/enable the adapter.
+It repairs missing trust, is idempotent when already connected, and has a total 15-second
+budget including waiting for another pair/connect operation. An operation already in progress
+is observed rather than started twice. A failure reports its phase and BlueZ's error; it leaves
+the association intact. Run `pad status` afterwards for service discovery and HID recognition.
+
+For an already-associated Pro Controller, a brief press of Home is the normal reconnect
+path. Allow it to reconnect automatically, then inspect `pad status`. `pad connect` is a
+troubleshooting request to a reachable controller, not a remote wake command. A page timeout
+means the radio did not receive a response; it does not establish that the controller was awake.
+
+Use Sync and `pad pair` only for a new association. Re-running pair on an existing association
+only repairs trust; it does not request a connection. On boards with the radio workaround,
+`pad pair` power-cycles the adapter, disconnecting other Bluetooth users and potentially
+triggering padd's lost-pad reaction. Do not use it as a reconnect command.
+
+If a device vanishes before Pair, the error says so; that is not evidence of bad keys and does
+not call for a Privacy change or reboot. If pairing returns but its final state cannot be read,
+the result says verification failed rather than inventing an association. Inspect status before
+retrying; `pad forget` remains an explicit action, never automatic.
+
+`--json` returns the same connection facts. These additions and `pad.connect` are API v46:
+install the daemon release containing them with its matching robotctl. They are not installed
+on a robot merely by updating this checkout.
 
 A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
 beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel
@@ -97,8 +148,7 @@ attitude — the [cheat sheet](cheatsheet.md#gamepad-configd) has the whole mapp
 in the monitor and the head use one filter, so where the drawn pad points is where the head goes.
 
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
-reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`
-to fix it.
+reboot, because approving a reconnection needs an agent and at boot there is none. Use `pad connect <address>` to repair trust and request a connection.
 
 ## Forget one
 
@@ -185,7 +235,10 @@ sudo sh scripts/setup-board.sh && sudo reboot
 
 ## Pairing a Pro Controller by hand
 
-Only if `pad pair` is not available. The order matters and is the **reverse** of the Xbox one:
+Only if `pad pair` is not available. Check the installed `bluetoothctl --version` and its
+manual first: in newer versions `bluetoothctl pair` also trusts/connects and can replace an
+existing bond. It is not the standalone D-Bus Pair method used by configd. For an existing
+association use `pad connect`, not this fresh-pair recipe. The order matters and is the **reverse** of the Xbox one:
 
 ```bash
 bluetoothctl pair 98:B6:E9:28:06:09
@@ -208,23 +261,11 @@ the class BlueZ reports and pairs before it connects.
 
 ## When pairing fails every time
 
-Check `/etc/bluetooth/main.conf` for the `Privacy` setting. It should read `Privacy = device`.
-A board that carries `Privacy = off` may refuse to bond a pad at all — the connect gives up with
-`le-connection-abort-by-local` and the pad never reaches `Paired: yes`.
-
-If instead a capture shows the pairing reaching `DHKey check failed (0x0b)`, that is the opposite
-fault and `Privacy = off` is the value to try on that board. Take a `btmon` capture before changing
-the value, because both have been seen and they need different answers.
-
-```bash
-sudo sh scripts/setup-board.sh
-```
-
-```bash
-sudo reboot
-```
-
-`setup-board.sh` corrects the value, and it does not take effect until the reboot.
+Read the actual BlueZ error before changing the board. Privacy requirements differ between
+these radios: the [configurations above](#when-a-pad-will-not-bond-at-all) describe the measured
+cases. Do not change Privacy or reboot in response to an object disappearing from D-Bus.
+Repeated authentication failures need a capture before deciding whether keys or the radio
+configuration are responsible.
 
 Otherwise the usual cause is the pad having left pairing mode before the exchange began: press Sync
 again and re-run while the light is still flashing quickly. To see the exchange itself:
@@ -339,9 +380,9 @@ diff /tmp/a.fp /tmp/b.fp
 No output means the same stack. The fingerprint carries no timestamps and no addresses, so anything
 `diff` prints is a real difference.
 
-Two lines to read before the rest. `transport` is `LE` on every pad tried so far, and a board that
-says `BR/EDR` is putting the pad through the kernel's classic HID path instead of BlueZ's — a
-different driver, different button numbering. `input` is the `Bus`/`Vendor`/`Product`/`Version`
+Two lines to read before the rest. `transport` is `LE` for the Xbox tested here and `BR/EDR` for the Pro Controller clone.
+Compare the same controller across boards: a different transport can mean a different HID
+path, driver or mapping. `input` is the `Bus`/`Vendor`/`Product`/`Version`
 quadruple that SDL and `gilrs` hash into a mapping GUID: two boards differing there have different
 axis and button mappings, whatever else matches.
 

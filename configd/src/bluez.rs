@@ -72,16 +72,11 @@
 //!
 //! ## The board setting that decides whether any of this can work
 //!
-//! `Privacy` in `/etc/bluetooth/main.conf`, which `scripts/setup-board.sh` sets to `device`.
-//!
-//! BlueZ defaults to `off`, and `off` works on some Radxa Zero 3W units. On the others a pad will
-//! not bond under `off` at all, and only `device` does. Nothing measurable separates the two
-//! populations, so `device` is set on every board.
-//!
-//! Under `device`, a pad cannot form a **new** bond while `btd` advertises. An existing bond is
-//! unaffected, which is why `robotctl pad pair` stops `btd` for the pairing window rather than
-//! anything here changing — see `BtdPaused` in `robotctl/src/main.rs`, and
-//! `docs/project/pad-minimal-pairing.md` for the bisect.
+//! Privacy requirements and the optional aic8800 workaround are board-specific; the owning
+//! guide is `docs/robot/pair-a-gamepad.md`, with the measurements in
+//! `docs/project/pad-minimal-pairing.md`. Do not infer a Privacy fault from a vanished D-Bus
+//! object. Only marker boards pause btd and cycle the adapter during `pad pair` (BtdPaused
+//! in robotctl); targeted `pad connect` never uses that workaround.
 //!
 //! The failure that looks like this file is at fault, and is not:
 //!
@@ -194,7 +189,10 @@ use duck_ipc_proto as proto;
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::pad::{Evidence, PadResult, Pads, gamepad_evidence, same_pad};
+use crate::pad::{
+    CONNECT_TIMEOUT, Evidence, PadConnection, PadResult, Pads, connect_existing, connection_failed,
+    gamepad_evidence, same_pad,
+};
 
 /// Where our pairing agent lives on the bus. Any path we own will do; this one says whose it is.
 const AGENT_PATH: &str = "/com/pollenrobotics/configd/pad_agent";
@@ -409,6 +407,7 @@ struct Snapshot {
     paired: bool,
     trusted: bool,
     connected: bool,
+    services_resolved: Option<bool>,
 }
 
 impl Snapshot {
@@ -435,6 +434,7 @@ impl Snapshot {
             paired: flag("Paired"),
             trusted: flag("Trusted"),
             connected: flag("Connected"),
+            services_resolved: get("ServicesResolved").and_then(|v| bool::try_from(v).ok()),
         })
     }
 
@@ -474,6 +474,11 @@ impl Snapshot {
             paired: self.paired,
             trusted: self.trusted,
             connected: self.connected,
+            services_resolved: self.services_resolved,
+            hid_recognized: crate::pad_hid::recognized(
+                std::path::Path::new("/sys/class/input"),
+                &self.mac,
+            ),
         }
     }
 }
@@ -687,7 +692,7 @@ impl BlueZ {
                 outcome = tokio::time::timeout(BOND_TIMEOUT, proxy.pair()) => match outcome {
                     Ok(Ok(())) => { tracing::info!("bonded (classic)"); true }
                     Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
-                    Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                    Ok(Err(e)) => return Err((pair_failure(&e), e.to_string())),
                     Err(_) => false,
                 },
                 bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
@@ -763,7 +768,7 @@ impl BlueZ {
                         Ok(Ok(())) => { tracing::info!("bonded"); true }
                         // Something bonded it between the two calls — success, not a failure.
                         Ok(Err(e)) if is_already_paired(&e) => { tracing::info!("already bonded"); true }
-                        Ok(Err(e)) => return Err((proto::PadPairFailure::Rejected, e.to_string())),
+                        Ok(Err(e)) => return Err((pair_failure(&e), e.to_string())),
                         Err(_) => false,
                     },
                     bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
@@ -833,21 +838,181 @@ fn is_already_paired(error: &zbus::Error) -> bool {
         if name.as_str() == "org.bluez.Error.AlreadyExists")
 }
 
+/// A stable choice, shared by read-only status and targeted reconnect. Never powers the adapter.
+fn selected_adapter(
+    objects: &HashMap<OwnedObjectPath, Interfaces>,
+) -> Option<(&OwnedObjectPath, &HashMap<String, OwnedValue>)> {
+    objects
+        .iter()
+        .filter_map(|(path, interfaces)| Some((path, interface(interfaces, "org.bluez.Adapter1")?)))
+        .min_by(|a, b| a.0.as_str().cmp(b.0.as_str()))
+}
+
+fn pair_failure(error: &zbus::Error) -> proto::PadPairFailure {
+    match error {
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject" =>
+        {
+            proto::PadPairFailure::Disappeared
+        }
+        _ => proto::PadPairFailure::Rejected,
+    }
+}
+
+struct ExistingDevice<'a> {
+    bluez: &'a BlueZ,
+    path: OwnedObjectPath,
+    mac: String,
+}
+
 #[async_trait]
-impl Pads for BlueZ {
-    async fn status(&self) -> PadResult<Vec<proto::Pad>> {
-        let mut pads: Vec<proto::Pad> = self
+impl PadConnection for ExistingDevice<'_> {
+    async fn state(&self) -> PadResult<Option<proto::Pad>> {
+        Ok(self
+            .bluez
             .devices()
             .await?
             .into_iter()
-            // Bonded pads only. Everything else BlueZ has ever seen in a scan is noise here: the
-            // question this answers is "what can drive this robot", not "what is in range".
-            .filter(|device| device.paired && device.is_gamepad())
+            .find(|device| device.path == self.path && device.mac.eq_ignore_ascii_case(&self.mac))
+            .map(|d| d.as_pad()))
+    }
+    async fn trust(&self) -> PadResult<()> {
+        let proxy = DeviceProxy::builder(&self.bluez.bus)
+            .path(self.path.as_ref())
+            .map_err(|e| e.to_string())?
+            .build()
+            .await
+            .map_err(|e| e.to_string())?;
+        proxy.set_trusted(true).await.map_err(|e| e.to_string())
+    }
+    async fn connect(&self) -> PadResult<()> {
+        let proxy = DeviceProxy::builder(&self.bluez.bus)
+            .path(self.path.as_ref())
+            .map_err(|e| e.to_string())?
+            .build()
+            .await
+            .map_err(|e| e.to_string())?;
+        match proxy.connect().await {
+            Ok(()) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if matches!(
+                    name.as_str(),
+                    "org.bluez.Error.AlreadyConnected" | "org.bluez.Error.InProgress"
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl Pads for BlueZ {
+    async fn status(&self) -> PadResult<proto::PadStatusResult> {
+        let objects = self.objects().await?;
+        let Some((path, properties)) = selected_adapter(&objects) else {
+            return Ok(proto::PadStatusResult {
+                adapter_state: proto::PadAdapterState::Absent,
+                ..Default::default()
+            });
+        };
+        let powered = properties
+            .get("Powered")
+            .and_then(|v| bool::try_from(v.clone()).ok());
+        let mut pads: Vec<proto::Pad> = objects
+            .iter()
+            .filter(|(p, _)| p.as_str().starts_with(&format!("{path}/")))
+            .filter_map(|(p, interfaces)| {
+                Snapshot::read(p, interface(interfaces, "org.bluez.Device1")?)
+            })
+            // Explicit-address pairing can admit hardware outside the name heuristic.
+            .filter(|device| device.paired)
             .map(|device| device.as_pad())
             .collect();
-        // Connected first, then by name, so the pad someone is holding is the first line.
-        pads.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
-        Ok(pads)
+        pads.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.mac.cmp(&b.mac)));
+        Ok(proto::PadStatusResult {
+            pads,
+            adapter: Some(path.to_string()),
+            adapter_state: match powered {
+                Some(true) => proto::PadAdapterState::On,
+                Some(false) => proto::PadAdapterState::Off,
+                None => proto::PadAdapterState::Unknown,
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn connect(&self, mac: &str) -> PadResult<proto::PadConnectResult> {
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        let _one_at_a_time = match tokio::time::timeout_at(deadline, self.pairing.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Ok(connection_failed(
+                    proto::PadConnectPhase::Connect,
+                    "deadline exceeded waiting for another pair/connect operation",
+                    None,
+                ));
+            }
+        };
+        let objects = match tokio::time::timeout_at(deadline, self.objects()).await {
+            Ok(Ok(objects)) => objects,
+            Ok(Err(error)) => {
+                return Ok(connection_failed(
+                    proto::PadConnectPhase::Adapter,
+                    error,
+                    None,
+                ));
+            }
+            Err(_) => {
+                return Ok(connection_failed(
+                    proto::PadConnectPhase::Adapter,
+                    "deadline exceeded reading the Bluetooth adapter",
+                    None,
+                ));
+            }
+        };
+        let Some((adapter, properties)) = selected_adapter(&objects) else {
+            return Ok(connection_failed(
+                proto::PadConnectPhase::Adapter,
+                "no Bluetooth adapter available yet",
+                None,
+            ));
+        };
+        if properties
+            .get("Powered")
+            .and_then(|v| bool::try_from(v.clone()).ok())
+            != Some(true)
+        {
+            return Ok(connection_failed(
+                proto::PadConnectPhase::Adapter,
+                "Bluetooth adapter is off or its power state is unknown; connect does not power-cycle or enable it",
+                None,
+            ));
+        }
+        let Some(device) = objects
+            .iter()
+            .filter(|(p, _)| p.as_str().starts_with(&format!("{adapter}/")))
+            .filter_map(|(p, interfaces)| {
+                Snapshot::read(p, interface(interfaces, "org.bluez.Device1")?)
+            })
+            .find(|device| device.mac.eq_ignore_ascii_case(mac) && device.paired)
+        else {
+            return Ok(connection_failed(
+                proto::PadConnectPhase::Lookup,
+                "address is not paired on the selected adapter; inspect pad status",
+                None,
+            ));
+        };
+        Ok(connect_existing(
+            &ExistingDevice {
+                bluez: self,
+                path: device.path,
+                mac: device.mac,
+            },
+            deadline,
+        )
+        .await)
     }
 
     async fn pair(&self, mac: Option<&str>, timeout: Duration) -> PadResult<proto::PadPairResult> {
@@ -1036,17 +1201,26 @@ impl Pads for BlueZ {
 
         // Re-read rather than assume: what BlueZ ended up with is what the caller should be told,
         // including a pad that bonded but has not connected yet.
-        let pad = self
-            .devices()
-            .await?
-            .into_iter()
-            .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
-            .map(|d| d.as_pad())
-            .unwrap_or_else(|| proto::Pad {
-                paired: true,
-                trusted: true,
-                ..device.as_pad()
+        let pad = match self.devices().await {
+            Ok(devices) => devices
+                .into_iter()
+                .find(|d| d.mac.eq_ignore_ascii_case(&device.mac))
+                .map(|d| d.as_pad()),
+            Err(error) => {
+                return Ok(proto::PadPairResult::Failed {
+                    reason: proto::PadPairFailure::VerificationFailed,
+                    detail: Some(format!(
+                        "pairing returned, but its final state could not be read: {error}; inspect pad status before retrying"
+                    )),
+                });
+            }
+        };
+        let Some(pad) = pad.filter(|pad| pad.paired && pad.trusted) else {
+            return Ok(proto::PadPairResult::Failed {
+                reason: proto::PadPairFailure::VerificationFailed,
+                detail: Some("the selected device disappeared or its association/trust was not confirmed; inspect pad status before retrying".into()),
             });
+        };
         tracing::warn!(mac = %pad.mac, name = %pad.name, "gamepad paired and trusted");
         Ok(proto::PadPairResult::Paired { pad })
     }
@@ -1095,6 +1269,7 @@ mod tests {
             paired: false,
             trusted: false,
             connected: false,
+            services_resolved: None,
         }
     }
 

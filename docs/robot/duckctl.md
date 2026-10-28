@@ -704,6 +704,7 @@ written without the `duckctl --name <robot-name>` in front of them:
 | `call system.services` | Which daemons are up, and the release each runs. |
 | `call pad.status` | Is a gamepad bonded, and is it connected? |
 | `call pad.pair '{"timeout_seconds":30}'` | Bond a pad held in pairing mode. |
+| `call pad.connect '{"mac":"<address>"}'` | Reconnect an existing association without scanning or pairing. |
 | `call pad.forget '{"mac":"<address>"}'` | Drop a bond. |
 
 `call` waits 60 seconds for an answer. The update commands above wait on *silence* instead — three
