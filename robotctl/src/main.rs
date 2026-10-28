@@ -628,10 +628,16 @@ enum RobotCommand {
     #[command(allow_negative_numbers = true)]
     Goto {
         /// `X Y THETA`, or `tag ID`.
-        #[arg(num_args = 2..=3, required = true, allow_hyphen_values = true)]
+        // No `allow_hyphen_values`: it swallowed `--look-only` after `tag 0` as a third value. Negative
+        // numbers still parse, through the command's `allow_negative_numbers`.
+        #[arg(num_args = 2..=3, required = true)]
         target: Vec<String>,
         #[arg(long, value_enum)]
         foot: Option<GotoFoot>,
+        /// With `tag ID`: find the tag and print where it and its footprints are relative to the robot's
+        /// feet (x forward, y left, degrees), without walking — to check the camera against a tape measure.
+        #[arg(long)]
+        look_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -3471,7 +3477,12 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
     }
 
     // `goto tag ID` is a scan and a few calls, not one request.
-    if let RobotCommand::Goto { target, json, .. } = &command
+    if let RobotCommand::Goto {
+        target,
+        json,
+        look_only,
+        ..
+    } = &command
         && target[0] == "tag"
     {
         let id: u32 = target
@@ -3479,16 +3490,42 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             .and_then(|s| s.parse().ok())
             .filter(|_| target.len() == 2)
             .ok_or_else(|| Failure::new(exit::USAGE, "usage: goto tag ID (a number)".into()))?;
-        let (goal, distance) = tag::goto_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
+        if *look_only {
+            let (tag, stance) =
+                tag::look_for_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "tag": tag, "footprints": stance })
+                );
+            } else {
+                println!(
+                    "tag {id} centre:   {:+.3} m forward, {:+.3} m left of the feet, facing {:+.1}°",
+                    tag[0],
+                    tag[1],
+                    tag[2].to_degrees()
+                );
+                println!(
+                    "its footprints: {:+.3} m forward, {:+.3} m left, heading {:+.1}° (stance centre)",
+                    stance[0],
+                    stance[1],
+                    stance[2].to_degrees()
+                );
+            }
+            return Ok(());
+        }
+        let (distance, heading) =
+            tag::goto_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
         if *json {
             println!(
                 "{}",
-                serde_json::json!({ "tag": id, "goal": goal, "distance_m": distance })
+                serde_json::json!({ "tag": id, "miss_m": distance, "miss_rad": heading })
             );
         } else {
             println!(
-                "tag {id} found — walking {distance:.2} m onto its footprints; the miss is in \
-                 `journalctl -u robotd | grep footstep`"
+                "on tag {id}'s footprints: {:.0} mm, {:.1}° off (as the camera sees it)",
+                distance * 1000.0,
+                heading.to_degrees()
             );
         }
         return Ok(());
@@ -3521,7 +3558,9 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             proto::Call::RobotFootsteps(read_footstep_pattern(file)?),
             *json,
         ),
-        RobotCommand::Goto { target, foot, json } => (
+        RobotCommand::Goto {
+            target, foot, json, ..
+        } => (
             proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
                 x: goto_number(target, 0)?,
                 y: goto_number(target, 1)?,
@@ -3644,6 +3683,44 @@ fn goto_number(target: &[String], i: usize) -> Result<f64, Failure> {
                 "usage: goto X Y THETA (metres, metres, degrees) or goto tag ID".into(),
             )
         })
+}
+
+#[cfg(test)]
+mod goto_parse_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `goto` takes negative numbers and flags in any position — `--look-only` after `tag 0` was once read as a
+    /// third target value.
+    #[test]
+    fn goto_arguments_parse_in_any_order() {
+        let target = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.namespace) {
+            Ok(Namespace::Robot {
+                command:
+                    RobotCommand::Goto {
+                        target,
+                        look_only,
+                        foot,
+                        ..
+                    },
+            }) => (target, look_only, foot.is_some()),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(
+            target(&["robotctl", "robot", "goto", "tag", "0", "--look-only"]),
+            (vec!["tag".into(), "0".into()], true, false)
+        );
+        assert_eq!(
+            target(&["robotctl", "robot", "goto", "--look-only", "tag", "2"]).1,
+            true
+        );
+        assert_eq!(
+            target(&[
+                "robotctl", "robot", "goto", "-0.1", "0", "-90", "--foot", "left"
+            ]),
+            (vec!["-0.1".into(), "0".into(), "-90".into()], false, true)
+        );
+    }
 }
 
 /// Which foot `robot goto` places on the goal.

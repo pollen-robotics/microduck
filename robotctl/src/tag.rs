@@ -376,71 +376,119 @@ fn locate(config: &Path, robot_socket: &Path, id: u32) -> Result<Option<Pose>, F
     Ok(Some(trunk * pose(frames.camera) * in_camera))
 }
 
-fn look(
-    client: &mut Client,
-    azimuth_deg: f64,
-    distance: f64,
-    trunk_height: f64,
-) -> Result<(), Failure> {
-    let a = azimuth_deg.to_radians();
-    client.call(&proto::Call::RobotLook(proto::LookParams {
-        x: distance * a.cos(),
-        y: distance * a.sin(),
-        z: -trunk_height,
-        neck_pitch: 0.0,
-    }))?;
+/// Done when the footprints, re-seen, are this close to where the feet are.
+const ARRIVED_M: f64 = 0.02;
+const ARRIVED_RAD: f64 = 0.07;
+/// Longest leg walked on one sighting. Farther goals are approached in legs, re-seeing the tag after each: the
+/// estimate improves as the robot closes in, and FootstepNet was trained on goals within ±1 m.
+const LEG_M: f64 = 0.8;
+/// Sighting → walk → re-sighting rounds before reporting where it got to.
+const ROUNDS: usize = 5;
+
+/// Where the robot stands now: the midpoint of its sole centres (7 mm ahead of the foot sites) and their mean
+/// heading, in the odometry's world — forward kinematics on the measured joints, oriented by the IMU, placed by
+/// the odometry, as `robotd`'s own odometry does.
+fn stance_now(state: &proto::RobotState) -> Option<[f64; 3]> {
+    stance_from(&state.joints, state.odom.position, state.imu.as_ref()?.quat)
+}
+
+/// [`stance_now`] from its inputs: joints in `JOINT_NAMES` order, trunk position, IMU `[w, x, y, z]`.
+fn stance_from(joints: &[f64], position: [f64; 3], imu: [f64; 4]) -> Option<[f64; 3]> {
+    let model = kinematics::Model::alpha();
+    let mut angles = vec![0.0; model.num_joints()];
+    for (name, angle) in proto::JOINT_NAMES.iter().zip(joints) {
+        if let Some(i) = model.joint_index(name) {
+            angles[i] = *angle;
+        }
+    }
+    let [w, x, y, z] = imu;
+    let trunk = Pose::new(position, Quat::new(w, x, y, z).normalized());
+    let mut soles = Vec::new();
+    for site in ["left_foot", "right_foot"] {
+        let foot = trunk * model.site_pose(model.site(site)?, &angles);
+        let centre = foot.transform_point([0.007, 0.0, 0.0]);
+        soles.push([centre[0], centre[1], foot.quat.yaw()]);
+    }
+    let yaw = (soles[0][2].sin() + soles[1][2].sin()).atan2(soles[0][2].cos() + soles[1][2].cos());
+    Some([
+        (soles[0][0] + soles[1][0]) / 2.0,
+        (soles[0][1] + soles[1][1]) / 2.0,
+        yaw,
+    ])
+}
+
+fn wrap(a: f64) -> f64 {
+    (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+}
+
+/// Hold the gaze on a trunk-frame point while it settles, re-sent so the idle head never takes over.
+fn hold_look(client: &mut Client, target: [f64; 3]) -> Result<(), Failure> {
+    let start = Instant::now();
+    while start.elapsed() < SETTLE {
+        client.call(&proto::Call::RobotLook(proto::LookParams {
+            x: target[0],
+            y: target[1],
+            z: target[2],
+            neck_pitch: 0.0,
+        }))?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
     Ok(())
 }
 
-/// Scan for tag `id`, then send the goal. Returns the goal (odometry world) and how far it was.
-pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<([f64; 3], f64), Failure> {
-    let mut robot = Client::connect_to("robotd", robot_socket)?;
-    robot.hello()?;
-    let trunk_height = robot_state(robot_socket)?.odom.position[2].max(0.08);
-    let mut stances: Vec<[f64; 3]> = Vec::new();
-    for (azimuth, distance) in SCAN {
-        eprintln!("looking {azimuth:+.0}° at {distance:.2} m…");
-        let start = Instant::now();
-        // Re-sent while it settles, so the idle head never takes over mid-scan.
-        while start.elapsed() < SETTLE {
-            look(&mut robot, azimuth, distance, trunk_height)?;
-            std::thread::sleep(Duration::from_millis(150));
-        }
-        for _ in 0..SIGHTINGS + 2 {
-            if let Some(tag) = locate(config, robot_socket, id)? {
-                match stance_for(tag) {
-                    Some(stance) => stances.push(stance),
-                    None => eprintln!("  tag {id} seen, but not lying flat — ignored"),
-                }
+/// A sighting: the tag's world position and the stance its sheet implies.
+type Sighting = ([f64; 3], [f64; 3]);
+
+/// Up to [`SIGHTINGS`] sightings of the tag from the current gaze, averaged: the tag's world pose (position and
+/// the stance it implies). `None` if it is not in view.
+fn sight(config: &Path, robot_socket: &Path, id: u32) -> Result<Option<Sighting>, Failure> {
+    let mut found: Vec<Sighting> = Vec::new();
+    for _ in 0..SIGHTINGS + 2 {
+        if let Some(tag) = locate(config, robot_socket, id)? {
+            match stance_for(tag) {
+                Some(stance) => found.push((tag.pos, stance)),
+                None => eprintln!("  tag {id} seen, but not lying flat — ignored"),
             }
-            if stances.len() >= SIGHTINGS {
-                break;
-            }
-            look(&mut robot, azimuth, distance, trunk_height)?;
         }
-        if !stances.is_empty() {
+        if found.len() >= SIGHTINGS {
             break;
         }
     }
-    // Head back to rest either way.
-    robot.call(&proto::Call::RobotHead(proto::HeadParams::default()))?;
-    if stances.is_empty() {
-        return Err(Failure::new(
-            exit::FAILED,
-            format!("tag {id} not seen anywhere in front of the robot"),
-        ));
+    if found.is_empty() {
+        return Ok(None);
     }
-    let n = stances.len() as f64;
-    let (sx, sy) = stances
-        .iter()
-        .fold((0.0, 0.0), |(s, c), p| (s + p[2].sin(), c + p[2].cos()));
-    let goal = [
-        stances.iter().map(|p| p[0]).sum::<f64>() / n,
-        stances.iter().map(|p| p[1]).sum::<f64>() / n,
-        sx.atan2(sy),
-    ];
-    let here = robot_state(robot_socket)?.odom.position;
-    let distance = (goal[0] - here[0]).hypot(goal[1] - here[1]);
+    let n = found.len() as f64;
+    let mean = |f: fn(&Sighting) -> f64| found.iter().map(f).sum::<f64>() / n;
+    let (s, c) = found.iter().fold((0.0, 0.0), |(s, c), (_, p)| {
+        (s + p[2].sin(), c + p[2].cos())
+    });
+    Ok(Some((
+        [mean(|f| f.0[0]), mean(|f| f.0[1]), mean(|f| f.0[2])],
+        [mean(|f| f.1[0]), mean(|f| f.1[1]), s.atan2(c)],
+    )))
+}
+
+/// A world point in the trunk frame of `state`, for the gaze IK.
+fn in_trunk(state: &proto::RobotState, world: [f64; 3]) -> Option<[f64; 3]> {
+    Some(point_in_trunk(
+        state.odom.position,
+        state.imu.as_ref()?.quat,
+        world,
+    ))
+}
+
+fn point_in_trunk(position: [f64; 3], imu: [f64; 4], world: [f64; 3]) -> [f64; 3] {
+    let [w, x, y, z] = imu;
+    let q = Quat::new(w, -x, -y, -z).normalized();
+    q.rotate([
+        world[0] - position[0],
+        world[1] - position[1],
+        world[2] - position[2],
+    ])
+}
+
+/// Send one footstep goal (odometry world) and wait until the footstep policy has walked it and handed back.
+fn walk_to(robot: &mut Client, robot_socket: &Path, goal: [f64; 3]) -> Result<(), Failure> {
     let result = crate::result_of(robot.call(&proto::Call::RobotFootstepGoal(
         proto::FootstepGoalParams {
             x: goal[0],
@@ -457,7 +505,152 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<([f64; 3]
             outcome.reason.unwrap_or_else(|| "the robot refused".into()),
         ));
     }
-    Ok((goal, distance))
+    let start = Instant::now();
+    let mut walking = false;
+    let mut quiet = 0;
+    while start.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(250));
+        let state = robot_state(robot_socket)?;
+        if state.movement.requested.iter().any(|v| v.abs() > 0.05) {
+            return Err(Failure::new(
+                exit::FAILED,
+                "cancelled: the stick moved".into(),
+            ));
+        }
+        if state.policy == "footsteps" {
+            walking = true;
+            quiet = 0;
+        } else if walking || start.elapsed() > Duration::from_secs(3) {
+            quiet += 1;
+            if quiet >= 3 {
+                return Ok(());
+            }
+        }
+    }
+    Err(Failure::new(
+        exit::FAILED,
+        "still walking after 60 s".into(),
+    ))
+}
+
+/// Look for tag `id` without moving: where the vision chain puts the tag and its footprints, relative to the
+/// robot's current stance (x forward, y left, heading) — to compare with a tape measure, which separates a camera
+/// error from a walking one.
+pub fn look_for_tag(
+    config: &Path,
+    robot_socket: &Path,
+    id: u32,
+) -> Result<([f64; 3], [f64; 3]), Failure> {
+    let mut robot = Client::connect_to("robotd", robot_socket)?;
+    robot.hello()?;
+    let trunk_height = robot_state(robot_socket)?.odom.position[2].max(0.08);
+    let mut seen = None;
+    for (azimuth, distance) in SCAN {
+        eprintln!("looking {azimuth:+.0}° at {distance:.2} m…");
+        let a = azimuth.to_radians();
+        hold_look(
+            &mut robot,
+            [distance * a.cos(), distance * a.sin(), -trunk_height],
+        )?;
+        seen = sight(config, robot_socket, id)?;
+        if seen.is_some() {
+            break;
+        }
+    }
+    robot.call(&proto::Call::RobotHead(proto::HeadParams::default()))?;
+    let (tag, goal) =
+        seen.ok_or_else(|| Failure::new(exit::FAILED, format!("tag {id} not seen")))?;
+    let here = stance_now(&robot_state(robot_socket)?)
+        .ok_or_else(|| Failure::new(exit::FAILED, "robot.state has no IMU or joints".into()))?;
+    let rel = |p: [f64; 2], yaw: f64| {
+        let (s, c) = here[2].sin_cos();
+        let (dx, dy) = (p[0] - here[0], p[1] - here[1]);
+        [c * dx + s * dy, -s * dx + c * dy, wrap(yaw - here[2])]
+    };
+    let tag_up = goal[2]; // the stance faces the tag's printed "up"
+    Ok((
+        rel([tag[0], tag[1]], tag_up),
+        rel([goal[0], goal[1]], goal[2]),
+    ))
+}
+
+/// Find tag `id` and stand on its footprints, closing the loop on the camera: sight it, walk at most [`LEG_M`]
+/// toward its footprints, look straight at where it should be, sight it again, until the footprints re-seen are
+/// within [`ARRIVED_M`] / [`ARRIVED_RAD`] of the feet. One sighting from afar carried every error into the stance
+/// (seen on a beta: 10–15 cm short); re-seeing from close shrinks them. Returns the last miss (m, rad).
+pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64), Failure> {
+    let mut robot = Client::connect_to("robotd", robot_socket)?;
+    robot.hello()?;
+    let trunk_height = robot_state(robot_socket)?.odom.position[2].max(0.08);
+    let mut tag_world: Option<[f64; 3]> = None;
+    let mut miss = (f64::INFINITY, f64::INFINITY);
+    for round in 0..ROUNDS {
+        // Look where the tag was last seen; else (first round, or lost) sweep the floor in front.
+        let mut seen = None;
+        if let Some(world) = tag_world {
+            let state = robot_state(robot_socket)?;
+            if let Some(target) = in_trunk(&state, world) {
+                eprintln!("round {}: looking at the tag…", round + 1);
+                hold_look(&mut robot, target)?;
+                seen = sight(config, robot_socket, id)?;
+            }
+        }
+        if seen.is_none() {
+            for (azimuth, distance) in SCAN {
+                eprintln!(
+                    "round {}: looking {azimuth:+.0}° at {distance:.2} m…",
+                    round + 1
+                );
+                let a = azimuth.to_radians();
+                hold_look(
+                    &mut robot,
+                    [distance * a.cos(), distance * a.sin(), -trunk_height],
+                )?;
+                seen = sight(config, robot_socket, id)?;
+                if seen.is_some() {
+                    break;
+                }
+            }
+        }
+        robot.call(&proto::Call::RobotHead(proto::HeadParams::default()))?;
+        let Some((tag, goal)) = seen else {
+            return Err(Failure::new(
+                exit::FAILED,
+                format!("tag {id} not seen anywhere in front of the robot"),
+            ));
+        };
+        tag_world = Some(tag);
+        let here = stance_now(&robot_state(robot_socket)?)
+            .ok_or_else(|| Failure::new(exit::FAILED, "robot.state has no IMU or joints".into()))?;
+        let (dx, dy) = (goal[0] - here[0], goal[1] - here[1]);
+        let distance = dx.hypot(dy);
+        miss = (distance, wrap(goal[2] - here[2]).abs());
+        eprintln!(
+            "  footprints {:.0} mm, {:.1}° from the feet",
+            miss.0 * 1000.0,
+            miss.1.to_degrees()
+        );
+        if miss.0 < ARRIVED_M && miss.1 < ARRIVED_RAD {
+            return Ok(miss);
+        }
+        // Far: a leg toward the footprints, facing the tag so the next sighting has it ahead.
+        let target = if distance > LEG_M {
+            let k = LEG_M / distance;
+            [
+                here[0] + dx * k,
+                here[1] + dy * k,
+                (tag[1] - here[1]).atan2(tag[0] - here[0]),
+            ]
+        } else {
+            goal
+        };
+        eprintln!(
+            "  walking {:.2} m…",
+            (target[0] - here[0]).hypot(target[1] - here[1])
+        );
+        walk_to(&mut robot, robot_socket, target)?;
+    }
+    Ok(miss)
 }
 
 #[cfg(test)]
@@ -512,6 +705,38 @@ mod tests {
             "{stance:?}"
         );
         assert!(stance[2].abs() < 1e-6, "faces the tag: {stance:?}");
+    }
+
+    fn yaw_quat(yaw: f64) -> [f64; 4] {
+        [(yaw / 2.0).cos(), 0.0, 0.0, (yaw / 2.0).sin()]
+    }
+
+    /// The stance is under the trunk and heads where it heads: the convergence test compares it with the
+    /// footprints, so a frame slip here is a robot that "arrives" beside the sheet.
+    #[test]
+    fn stance_now_follows_the_trunk() {
+        for yaw in [0.0, 1.2, -2.5] {
+            let joints = vec![0.0; proto::JOINT_NAMES.len()];
+            let s = stance_from(&joints, [0.4, -0.3, 0.17], yaw_quat(yaw)).expect("stance");
+            assert!(wrap(s[2] - yaw).abs() < 1e-9, "{s:?} vs yaw {yaw}");
+            assert!(
+                (s[0] - 0.4).hypot(s[1] + 0.3) < 0.03,
+                "stance {s:?} not under the trunk"
+            );
+        }
+    }
+
+    /// The gaze target is the world point seen from the trunk: a point straight ahead of a yawed robot is
+    /// straight ahead in its trunk frame.
+    #[test]
+    fn in_trunk_undoes_the_trunk_pose() {
+        let yaw: f64 = 0.9;
+        let ahead = [1.0 + 0.5 * yaw.cos(), 2.0 + 0.5 * yaw.sin(), 0.0];
+        let t = point_in_trunk([1.0, 2.0, 0.17], yaw_quat(yaw), ahead);
+        assert!(
+            (t[0] - 0.5).abs() < 1e-9 && t[1].abs() < 1e-9 && (t[2] + 0.17).abs() < 1e-9,
+            "{t:?}"
+        );
     }
 
     /// A quarter-turn mount maps rays the way duckslam's `rotate_intrinsics` does, and undoing it with the

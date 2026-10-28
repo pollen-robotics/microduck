@@ -5269,7 +5269,9 @@ fn dispatch(
                 None if !(g.x.is_finite() && g.y.is_finite() && g.yaw.is_finite()) => {
                     proto::IntentResult::refused("the goal is not a number")
                 }
-                None if g.x.hypot(g.y) > 1.5 => proto::IntentResult::refused(format!(
+                // In the robot's frame the goal's norm is its distance; an odometry-world goal is anywhere in
+                // the world, and its client (`goto tag`) keeps each leg short itself.
+                None if !g.odom && g.x.hypot(g.y) > 1.5 => proto::IntentResult::refused(format!(
                     "the goal is {:.2} m away; FootstepNet plans up to 1.5 m",
                     g.x.hypot(g.y)
                 )),
@@ -6897,6 +6899,20 @@ mod tests {
             .unwrap();
         assert!(!refused.accepted);
         assert!(intents.take_footstep_goal().is_none());
+        // An odometry-world goal far from the world origin is not far from the robot: the norm is no distance
+        // there (a robot that walked and was carried away from where it booted had every tag refused).
+        let far_in_world = proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+            x: 3.0,
+            y: 1.0,
+            yaw: 0.0,
+            foot: None,
+            odom: true,
+        });
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &far_in_world)
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert!(intents.take_footstep_goal().is_some_and(|g| g.odom));
         let refused: proto::IntentResult = dispatch(&plain, &intents, id(), &goal(0.3))
             .result_as()
             .unwrap();
