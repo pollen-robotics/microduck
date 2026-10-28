@@ -376,9 +376,14 @@ fn locate(config: &Path, robot_socket: &Path, id: u32) -> Result<Option<Pose>, F
     Ok(Some(trunk * pose(frames.camera) * in_camera))
 }
 
-/// Done when the footprints, re-seen, are this close to where the feet are.
-const ARRIVED_M: f64 = 0.02;
-const ARRIVED_RAD: f64 = 0.07;
+/// The staging pose: this far behind the footprints, facing the tag — where the last sighting is taken. The
+/// tag is then ~35 cm away and straight ahead (on a beta that measured 6 mm in range, ~3 cm across), while on the
+/// footprints themselves it is under the head, out of the gaze the policy allows (seen: the loop lost it there).
+const STAGE_M: f64 = 0.22;
+/// At the staging pose when a fresh sighting puts it this close to the feet; then the last stretch is walked
+/// blind, straight ahead.
+const STAGED_M: f64 = 0.03;
+const STAGED_RAD: f64 = 0.09;
 /// Longest leg walked on one sighting. Farther goals are approached in legs, re-seeing the tag after each: the
 /// estimate improves as the robot closes in, and FootstepNet was trained on goals within ±1 m.
 const LEG_M: f64 = 0.8;
@@ -574,10 +579,12 @@ pub fn look_for_tag(
     ))
 }
 
-/// Find tag `id` and stand on its footprints, closing the loop on the camera: sight it, walk at most [`LEG_M`]
-/// toward its footprints, look straight at where it should be, sight it again, until the footprints re-seen are
-/// within [`ARRIVED_M`] / [`ARRIVED_RAD`] of the feet. One sighting from afar carried every error into the stance
-/// (seen on a beta: 10–15 cm short); re-seeing from close shrinks them. Returns the last miss (m, rad).
+/// Find tag `id` and stand on its footprints, closing the loop on the camera: sight it, walk (at most [`LEG_M`]) to
+/// the staging pose [`STAGE_M`] behind its footprints, look straight at where it should be, sight it again —
+/// until a sighting puts the staging pose within [`STAGED_M`] / [`STAGED_RAD`] of the feet — then walk the last
+/// stretch straight onto the footprints from that sighting. Seen on a beta: one far sighting carried every error
+/// into the stance (10–15 cm off), and aiming the loop at the footprints themselves lost the tag under the head.
+/// Returns the staging miss of the sighting the last stretch was walked on (m, rad).
 pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64), Failure> {
     let mut robot = Client::connect_to("robotd", robot_socket)?;
     robot.hello()?;
@@ -622,15 +629,22 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64
         tag_world = Some(tag);
         let here = stance_now(&robot_state(robot_socket)?)
             .ok_or_else(|| Failure::new(exit::FAILED, "robot.state has no IMU or joints".into()))?;
-        let (dx, dy) = (goal[0] - here[0], goal[1] - here[1]);
+        let stage = [
+            goal[0] - STAGE_M * goal[2].cos(),
+            goal[1] - STAGE_M * goal[2].sin(),
+            goal[2],
+        ];
+        let (dx, dy) = (stage[0] - here[0], stage[1] - here[1]);
         let distance = dx.hypot(dy);
-        miss = (distance, wrap(goal[2] - here[2]).abs());
+        miss = (distance, wrap(stage[2] - here[2]).abs());
         eprintln!(
-            "  footprints {:.0} mm, {:.1}° from the feet",
+            "  staging pose {:.0} mm, {:.1}° from the feet",
             miss.0 * 1000.0,
             miss.1.to_degrees()
         );
-        if miss.0 < ARRIVED_M && miss.1 < ARRIVED_RAD {
+        if miss.0 < STAGED_M && miss.1 < STAGED_RAD {
+            eprintln!("  last {:.2} m onto the footprints…", STAGE_M);
+            walk_to(&mut robot, robot_socket, goal)?;
             return Ok(miss);
         }
         // Far: a leg toward the footprints, facing the tag so the next sighting has it ahead.
@@ -642,7 +656,7 @@ pub fn goto_tag(config: &Path, robot_socket: &Path, id: u32) -> Result<(f64, f64
                 (tag[1] - here[1]).atan2(tag[0] - here[0]),
             ]
         } else {
-            goal
+            stage
         };
         eprintln!(
             "  walking {:.2} m…",
