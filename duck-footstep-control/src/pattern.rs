@@ -8,8 +8,10 @@
 use crate::follower::Follower;
 use crate::pose::{Foot, Pose2, compose, wrap};
 
-/// Touchdowns in place after the last step before the pattern hands back: the first squares the feet up, the
-/// second lands the last step's miss in the log.
+/// Touchdowns in place after the pattern ran out of marks for the swing foot before it hands back anyway. Only
+/// reached when the last mark never lands (cannot happen with alternating marks); normally the pattern ends on
+/// the touchdown that lands its last mark — the generator's last step squares the feet, so anything after it was
+/// stepping in place for nothing (seen on the robot: "too many steps after arriving").
 const TAIL_TOUCHDOWNS: u32 = 2;
 
 /// One landing that missed its mark: pattern index, distance (m), heading error (rad).
@@ -95,6 +97,9 @@ impl PatternRun {
         if follower.switched() {
             if let (Some(k), Some((distance, heading))) = (previous, follower.last_error()) {
                 self.misses.push((k, distance, heading));
+                if k + 1 == self.steps.len() {
+                    return None; // the last mark just landed: both feet down, hand back now
+                }
             }
             self.in_flight = chosen;
             match chosen {
@@ -120,7 +125,7 @@ mod tests {
     const SPACING: f64 = 0.095;
 
     /// A robot that lands every target exactly: the pattern must come out landing by landing, in the world the
-    /// start stance defines, with zero misses, and hand back after squaring up. Starting on the "wrong" support
+    /// start stance defines, with zero misses, and hand back on the touchdown of its last mark. Starting on the "wrong" support
     /// foot costs one step in place, not a skipped mark.
     #[test]
     fn a_perfect_walker_lands_the_pattern_in_order() {
@@ -164,8 +169,8 @@ mod tests {
                 run.misses()
             );
             let in_place = landed.len() - 3;
-            let expected =
-                if first_support == Foot::Left { 1 } else { 0 } + TAIL_TOUCHDOWNS as usize;
+            // No stepping after the last mark: the pattern ends on its touchdown.
+            let expected = usize::from(first_support == Foot::Left);
             assert_eq!(in_place, expected, "support {first_support:?}: {landed:?}");
         }
     }
