@@ -1035,6 +1035,14 @@ A released stick is the neutral step: the robot squares its feet and steps in pl
 0.4 s idle hands back to the gait at the next touchdown, never with a foot in the air. Body-pose
 mode and every skill outrank it, as they outrank walking.
 
+**Goals** (`robot.footstepGoal`, `robotctl robot goto X Y THETA [--foot left|right]`) are what
+FootstepNet is for: a pose in the robot's frame when asked (the stance frame below), for one foot's
+sole centre or for the stance centre, anchored in the odometry's world. At every touchdown the
+planner replans from the support sole where it actually landed, so tracking errors are corrected
+on the way; when the goal foot stands on the goal the other foot squares up beside it and the
+robot hands back, journaling the final miss. Goals beyond 1.5 m (FootstepNet trained on ±1 m) are
+refused, and a plan still walking after 70 touchdowns is given up.
+
 **Scripted patterns** (`robot.footsteps`, `robotctl robot footsteps pattern.json`) are for checking
 placement against marks on the floor: microduck_rl `scripts/footsteps_patterns.py` prints FootstepNet
 plans 1:1 on A4 with the JSON to walk. The landings are in the start stance frame and anchored where

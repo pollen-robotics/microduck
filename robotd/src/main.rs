@@ -3617,6 +3617,13 @@ async fn control_loop<T: RobotIo>(
             }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
+                if let Some(g) = intents.take_footstep_goal() {
+                    let foot = g.foot.map(|f| match f {
+                        proto::FootSide::Left => duck_footstep_control::Foot::Left,
+                        proto::FootSide::Right => duck_footstep_control::Foot::Right,
+                    });
+                    controller.start_goal([g.x, g.y, g.yaw], foot);
+                }
                 if let Some(steps) = intents.take_footsteps() {
                     controller.start_pattern(
                         steps
@@ -5119,6 +5126,26 @@ fn do_names(policies: &PolicyNames) -> Vec<String> {
     names
 }
 
+/// Why a footstep request (pattern or goal) cannot run now, if it cannot: the policy not driving, the robot still
+/// homing, or no footstep networks — what this side can know, like a skill.
+fn footstep_refusal(state: &RobotState, intents: &Intents) -> Option<proto::IntentResult> {
+    if !intents.enabled() {
+        Some(proto::IntentResult::refused(
+            "the policy is not driving — press Start on the pad",
+        ))
+    } else if !state.homed.load(Ordering::Relaxed) {
+        Some(proto::IntentResult::refused(
+            "the robot is still going to its home pose; try again in a moment",
+        ))
+    } else if state.policies.load().footsteps.is_none() {
+        Some(proto::IntentResult::refused(
+            "footsteps are off: switch [policy] footstep_control on in `sudo robotctl configure`",
+        ))
+    } else {
+        None
+    }
+}
+
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     let policies = state.policies.load();
     match skill {
@@ -5221,24 +5248,35 @@ fn dispatch(
         // A footstep pattern for the bench. Refused for what this side can know, like a skill: the policy not
         // driving, the robot still homing, no footstep networks, or a pattern too long to be a sheet of paper.
         proto::Call::RobotFootsteps(p) => {
-            let result = if !intents.enabled() {
-                proto::IntentResult::refused("the policy is not driving — press Start on the pad")
-            } else if !state.homed.load(Ordering::Relaxed) {
-                proto::IntentResult::refused(
-                    "the robot is still going to its home pose; try again in a moment",
-                )
-            } else if state.policies.load().footsteps.is_none() {
-                proto::IntentResult::refused(
-                    "no footstep policy: set [policy] footsteps and footstep_planner, then restart robotd",
-                )
-            } else if p.steps.is_empty() || p.steps.len() > 64 {
-                proto::IntentResult::refused(format!(
-                    "{} steps; a pattern has 1 to 64",
-                    p.steps.len()
-                ))
-            } else {
-                intents.request_footsteps(p.steps.clone());
-                proto::IntentResult::accepted()
+            let result = match footstep_refusal(state, intents) {
+                Some(refused) => refused,
+                None if p.steps.is_empty() || p.steps.len() > 64 => proto::IntentResult::refused(
+                    format!("{} steps; a pattern has 1 to 64", p.steps.len()),
+                ),
+                None => {
+                    intents.request_footsteps(p.steps.clone());
+                    proto::IntentResult::accepted()
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // A goal to walk to with planned footsteps. The same refusals; a goal out of FootstepNet's trained range
+        // (±1 m starts and goals) is refused rather than planned into the unknown.
+        proto::Call::RobotFootstepGoal(g) => {
+            let result = match footstep_refusal(state, intents) {
+                Some(refused) => refused,
+                None if !(g.x.is_finite() && g.y.is_finite() && g.yaw.is_finite()) => {
+                    proto::IntentResult::refused("the goal is not a number")
+                }
+                None if g.x.hypot(g.y) > 1.5 => proto::IntentResult::refused(format!(
+                    "the goal is {:.2} m away; FootstepNet plans up to 1.5 m",
+                    g.x.hypot(g.y)
+                )),
+                None => {
+                    intents.request_footstep_goal(*g);
+                    proto::IntentResult::accepted()
+                }
             };
             proto::Response::ok(Some(id), &result)
         }
@@ -6821,7 +6859,7 @@ mod tests {
             .result_as()
             .unwrap();
         assert!(!refused.accepted);
-        assert!(refused.reason.unwrap().contains("footstep_planner"));
+        assert!(refused.reason.unwrap().contains("footstep_control"));
         assert!(intents.take_footsteps().is_none());
 
         let mut params = Params::default();
@@ -6838,6 +6876,30 @@ mod tests {
             .unwrap();
         assert!(accepted.accepted, "{:?}", accepted.reason);
         assert_eq!(intents.take_footsteps().map(|s| s.len()), Some(1));
+
+        // A goal: queued as given, and refused past what FootstepNet was trained to plan.
+        let goal = |x: f64| {
+            proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+                x,
+                y: 0.1,
+                yaw: 0.5,
+                foot: Some(proto::FootSide::Left),
+            })
+        };
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &goal(0.3))
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert_eq!(intents.take_footstep_goal().map(|g| g.x), Some(0.3));
+        let refused: proto::IntentResult = dispatch(&equipped, &intents, id(), &goal(3.0))
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(intents.take_footstep_goal().is_none());
+        let refused: proto::IntentResult = dispatch(&plain, &intents, id(), &goal(0.3))
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
     }
 
     /// A skill whose network was never configured is refused at the door with a reason —

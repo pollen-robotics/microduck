@@ -39,7 +39,9 @@
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
-use duck_footstep_control::{Follower, Foot, PatternRun, Pose2, compose, stick_step};
+use duck_footstep_control::{
+    Follower, Foot, GoalOutcome, GoalRun, PatternRun, Pose2, compose, stick_step,
+};
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -265,6 +267,8 @@ pub struct Controller {
     /// A scripted pattern being walked (`robot.footsteps`), which outranks the stick until it ends or the stick
     /// moves.
     pattern: Option<PatternRun>,
+    /// A goal being walked to (`robot.footstepGoal`); like a pattern, ahead of the stick until it moves.
+    goal: Option<GoalRun>,
 }
 
 impl Controller {
@@ -286,7 +290,23 @@ impl Controller {
             footstep_idle: 0.0,
             follower: Follower::new(),
             pattern: None,
+            goal: None,
         }
+    }
+
+    /// Walk to `goal` (`[x, y, yaw]` in the robot's frame now — the stance frame) with FootstepNet replanning at
+    /// every touchdown; `foot` puts that sole centre on it, `None` the stance centre. Replaces any pattern or goal
+    /// in progress. Dropped without the footstep networks, which the IPC side refuses first.
+    pub fn start_goal(&mut self, goal: Pose2, foot: Option<Foot>) {
+        if !self.policy.has_footsteps() {
+            tracing::warn!("footstep goal dropped: no footstep policy loaded");
+            return;
+        }
+        tracing::info!(x = goal[0], y = goal[1], yaw_deg = goal[2].to_degrees(), foot = ?foot, "footstep goal");
+        self.pattern = None;
+        self.goal = Some(GoalRun::new(goal, foot));
+        self.footstepping = true;
+        self.footstep_idle = 0.0;
     }
 
     /// Walk a scripted footstep pattern from where the robot stands: landings in the start stance frame
@@ -298,6 +318,7 @@ impl Controller {
             return;
         }
         tracing::info!(steps = steps.len(), "footstep pattern started");
+        self.goal = None;
         self.pattern = Some(PatternRun::new(steps));
         self.footstepping = true;
         self.footstep_idle = 0.0;
@@ -342,6 +363,42 @@ impl Controller {
         }
         let held = twist.iter().map(|v| v * v).sum::<f64>().sqrt()
             > duck_control::policy::DEFAULT_STANDING_THRESHOLD;
+        if let Some(run) = self.goal.as_mut() {
+            if held {
+                tracing::info!("footstep goal cancelled by the stick");
+                self.goal = None;
+                self.follower.reset();
+            } else {
+                let planner = self.policy.planner_mut()?;
+                match run.tick(&mut self.follower, planner, support, soles) {
+                    Ok(Some(command)) => return Some(command),
+                    Ok(None) => {
+                        match run.outcome() {
+                            Some(GoalOutcome::Reached {
+                                distance,
+                                heading,
+                                touchdowns,
+                            }) => tracing::info!(
+                                miss_mm = distance * 1000.0,
+                                miss_deg = heading.to_degrees(),
+                                touchdowns,
+                                "footstep goal reached"
+                            ),
+                            other => tracing::warn!(outcome = ?other, "footstep goal given up"),
+                        }
+                        self.goal = None;
+                        self.footstepping = false;
+                        return None;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "footstep planner failed; goal dropped");
+                        self.goal = None;
+                        self.footstepping = false;
+                        return None;
+                    }
+                }
+            }
+        }
         if let Some(run) = self.pattern.as_mut() {
             if held {
                 Self::finish_pattern(run, "cancelled by the stick");
@@ -786,6 +843,7 @@ impl Controller {
                     if body_active {
                         self.footstepping = false;
                         self.pattern = None;
+                        self.goal = None;
                     }
                     if let Some(target) = footstep {
                         // Head and body slots stay live: the footstep policy tracks the head command as the

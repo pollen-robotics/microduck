@@ -614,6 +614,26 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Walk to a pose with planned footsteps: X forward and Y left in metres, THETA in degrees (left positive),
+    /// in the robot's frame right now — origin midway between its feet.
+    ///
+    /// `--foot left` puts the left sole's centre there (`right` likewise); without it the robot's centre goes
+    /// there. FootstepNet replans at every touchdown, the other foot squares up at the end, and the robot hands
+    /// back to the gait; the final miss is in `journalctl -u robotd | grep footstep`. Needs
+    /// `[policy] footstep_control`; the stick cancels it. `robotctl robot goto 0.3 0 0` walks 30 cm ahead,
+    /// `goto 0 0 90` turns left in place.
+    #[command(allow_negative_numbers = true)]
+    Goto {
+        x: f64,
+        y: f64,
+        /// Degrees, counter-clockwise (left) positive.
+        theta: f64,
+        #[arg(long, value_enum)]
+        foot: Option<GotoFoot>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Which drive mode this robotd runs: walk or roller. Changes nothing.
     Mode {
         #[arg(long)]
@@ -3475,6 +3495,24 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             proto::Call::RobotFootsteps(read_footstep_pattern(file)?),
             *json,
         ),
+        RobotCommand::Goto {
+            x,
+            y,
+            theta,
+            foot,
+            json,
+        } => (
+            proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+                x: *x,
+                y: *y,
+                yaw: theta.to_radians(),
+                foot: foot.map(|f| match f {
+                    GotoFoot::Left => proto::FootSide::Left,
+                    GotoFoot::Right => proto::FootSide::Right,
+                }),
+            }),
+            *json,
+        ),
         RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
         RobotCommand::Look {
             x,
@@ -3552,6 +3590,17 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Goto {
+            x, y, theta, foot, ..
+        } => println!(
+            "walking to ({x:+.2} m, {y:+.2} m, {theta:+.0}°){} — the miss is in \
+             `journalctl -u robotd | grep footstep`",
+            match foot {
+                Some(GotoFoot::Left) => " with the left foot",
+                Some(GotoFoot::Right) => " with the right foot",
+                None => "",
+            }
+        ),
         RobotCommand::Footsteps { file, .. } => println!(
             "{} walking — misses in `journalctl -u robotd | grep footstep`",
             file.display()
@@ -3559,6 +3608,13 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// Which foot `robot goto` places on the goal.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum GotoFoot {
+    Left,
+    Right,
 }
 
 /// A footstep pattern file: its `steps`, whatever else it carries (name, start soles, the sheet's notes).

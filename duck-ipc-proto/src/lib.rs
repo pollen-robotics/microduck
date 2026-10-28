@@ -478,10 +478,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
 /// works as before and the duck stays out of the gallery.
 ///
-/// # v46 — `robot.footsteps`
+/// # v46 — `robot.footsteps`, `robot.footstepGoal`
 ///
 /// [`method::ROBOT_FOOTSTEPS`]: walk a scripted footstep pattern with the footstep policy, for checking
-/// placement against marks on the floor. A new route: a `robotd` predating it answers METHOD_NOT_FOUND, by name.
+/// placement against marks on the floor. [`method::ROBOT_FOOTSTEP_GOAL`]: walk to a pose in the robot's frame,
+/// FootstepNet replanning at every touchdown. New routes: a `robotd` predating them answers METHOD_NOT_FOUND, by
+/// name.
 pub const API_VERSION: u32 = 46;
 
 /// The observation width every policy this robot family runs is built against.
@@ -745,6 +747,10 @@ pub mod method {
     /// stands. Refused, with a reason, unless the policy is driving and `[policy] footsteps` is installed; the
     /// stick cancels it. Each landing's miss goes to the journal.
     pub const ROBOT_FOOTSTEPS: &str = "robot.footsteps";
+    /// Walk to a pose ([`FootstepGoalParams`]) in the robot's frame at the time of asking, FootstepNet
+    /// replanning at every touchdown; the other foot squares up at the end. Same refusals as
+    /// [`ROBOT_FOOTSTEPS`]; the stick cancels it; the final miss goes to the journal.
+    pub const ROBOT_FOOTSTEP_GOAL: &str = "robot.footstepGoal";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
     /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
@@ -1120,6 +1126,8 @@ pub enum Call {
     RobotMouth(MouthParams),
     /// Walk a scripted footstep pattern. See [`method::ROBOT_FOOTSTEPS`].
     RobotFootsteps(FootstepsParams),
+    /// Walk to a pose with planned footsteps. See [`method::ROBOT_FOOTSTEP_GOAL`].
+    RobotFootstepGoal(FootstepGoalParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
     /// Switch the flashlight. See [`method::ROBOT_FLASHLIGHT`].
@@ -1312,6 +1320,7 @@ impl Call {
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
             Call::RobotFootsteps(_) => method::ROBOT_FOOTSTEPS,
+            Call::RobotFootstepGoal(_) => method::ROBOT_FOOTSTEP_GOAL,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
@@ -1513,6 +1522,7 @@ impl Call {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotFootsteps(_)
+            | Call::RobotFootstepGoal(_)
             | Call::RobotSound(_)
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
@@ -1624,6 +1634,7 @@ impl Call {
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotFootsteps(p) => encode(p),
+            Call::RobotFootstepGoal(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::PolicyInstall(p) => encode(p),
@@ -1729,6 +1740,7 @@ impl Call {
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
             method::ROBOT_FOOTSTEPS => Call::RobotFootsteps(decode(params)?),
+            method::ROBOT_FOOTSTEP_GOAL => Call::RobotFootstepGoal(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
@@ -1907,6 +1919,12 @@ pub mod test_support {
                     y: 0.0475,
                     yaw: 0.1,
                 }],
+            }),
+            Call::RobotFootstepGoal(FootstepGoalParams {
+                x: 0.3,
+                y: -0.1,
+                yaw: 0.5,
+                foot: Some(FootSide::Right),
             }),
             Call::RobotSound(SoundParams {
                 tag: SoundTag::Chirp,
@@ -2551,6 +2569,19 @@ pub struct Footstep {
     pub x: f64,
     pub y: f64,
     pub yaw: f64,
+}
+
+/// A goal for [`method::ROBOT_FOOTSTEP_GOAL`], in the robot's frame when asked — the [`FootstepsParams`] start
+/// stance frame: origin midway between the sole centres, x forward, y left (m, m, rad). With `foot`, that foot's
+/// sole centre ends on it; without, the stance centre does.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FootstepGoalParams {
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foot: Option<FootSide>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5904,7 +5935,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            74,
+            75,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
