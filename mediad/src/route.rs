@@ -64,6 +64,9 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // A bench tool for checking footstep placement against a printed sheet, driven from `robotctl` on the
+        // robot; not part of the remote surface until a client wants it.
+        RobotFootsteps(_) => false,
         // Somebody watching through the camera is who wants the room lit.
         RobotFlashlight(_) => true,
 

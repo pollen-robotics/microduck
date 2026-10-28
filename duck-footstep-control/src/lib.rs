@@ -13,9 +13,11 @@
 //! or the joystick's carrot ([`carrot_goal`]) — and produces the policy command each tick.
 
 mod follower;
+mod pattern;
 mod planner;
 mod pose;
 
 pub use follower::{CarrotParams, Follower, carrot_goal};
+pub use pattern::{Miss, PatternRun, stance_frame};
 pub use planner::{Obstacle, Plan, Planner, PlannerError, PlannerOptions, StepNet};
 pub use pose::{Foot, Pose2, compose, relative, wrap};

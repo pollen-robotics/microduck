@@ -477,7 +477,12 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// gallery, where anybody can browse, search and sort the ducks whose owners said yes. Additive:
 /// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
 /// works as before and the duck stays out of the gallery.
-pub const API_VERSION: u32 = 45;
+///
+/// # v46 — `robot.footsteps`
+///
+/// [`method::ROBOT_FOOTSTEPS`]: walk a scripted footstep pattern with the footstep policy, for checking
+/// placement against marks on the floor. A new route: a `robotd` predating it answers METHOD_NOT_FOUND, by name.
+pub const API_VERSION: u32 = 46;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -736,6 +741,10 @@ pub mod method {
     /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
     /// is not part of any policy — this is the only thing that moves it.
     pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Walk a scripted footstep pattern ([`FootstepsParams`]) with the footstep policy, anchored where the robot
+    /// stands. Refused, with a reason, unless the policy is driving and `[policy] footsteps` is installed; the
+    /// stick cancels it. Each landing's miss goes to the journal.
+    pub const ROBOT_FOOTSTEPS: &str = "robot.footsteps";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
     /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
@@ -1109,6 +1118,8 @@ pub enum Call {
     RobotPose(PoseParams),
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
+    /// Walk a scripted footstep pattern. See [`method::ROBOT_FOOTSTEPS`].
+    RobotFootsteps(FootstepsParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
     /// Switch the flashlight. See [`method::ROBOT_FLASHLIGHT`].
@@ -1300,6 +1311,7 @@ impl Call {
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotFootsteps(_) => method::ROBOT_FOOTSTEPS,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
@@ -1500,6 +1512,7 @@ impl Call {
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotFootsteps(_)
             | Call::RobotSound(_)
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
@@ -1610,6 +1623,7 @@ impl Call {
             Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotFootsteps(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::PolicyInstall(p) => encode(p),
@@ -1714,6 +1728,7 @@ impl Call {
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_FOOTSTEPS => Call::RobotFootsteps(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
@@ -1885,6 +1900,14 @@ pub mod test_support {
                 active: true,
             }),
             Call::RobotMouth(MouthParams { open: 0.5 }),
+            Call::RobotFootsteps(FootstepsParams {
+                steps: vec![Footstep {
+                    foot: FootSide::Left,
+                    x: 0.05,
+                    y: 0.0475,
+                    yaw: 0.1,
+                }],
+            }),
             Call::RobotSound(SoundParams {
                 tag: SoundTag::Chirp,
                 hold: None,
@@ -2507,6 +2530,34 @@ pub struct RebootMotorsParams {
 #[serde(deny_unknown_fields)]
 pub struct DoParams {
     pub skill: Skill,
+}
+
+/// A scripted footstep pattern — see [`method::ROBOT_FOOTSTEPS`].
+///
+/// Landings in the **start stance frame**: origin midway between the two sole centres (7 mm ahead of the foot
+/// sites), x along their mean heading, y left; the start soles themselves are at `(0, ±spacing/2, 0)` and are not
+/// listed. microduck_rl `scripts/footsteps_patterns.py` writes these with the 1:1 sheet to print.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FootstepsParams {
+    pub steps: Vec<Footstep>,
+}
+
+/// One landing of a [`FootstepsParams`] pattern: which foot, and its sole-centre pose (m, m, rad).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Footstep {
+    pub foot: FootSide,
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FootSide {
+    Left,
+    Right,
 }
 
 /// Standing body pose offsets. Continuous intent — see [`method::ROBOT_POSE`].
@@ -5853,7 +5904,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            74,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

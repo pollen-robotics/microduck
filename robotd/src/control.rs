@@ -39,7 +39,7 @@
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
-use duck_footstep_control::{CarrotParams, Follower, Foot, Pose2, carrot_goal};
+use duck_footstep_control::{CarrotParams, Follower, Foot, PatternRun, Pose2, carrot_goal};
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -260,6 +260,9 @@ pub struct Controller {
     footstepping: bool,
     footstep_idle: f64,
     follower: Follower,
+    /// A scripted pattern being walked (`robot.footsteps`), which outranks the stick until it ends or the stick
+    /// moves.
+    pattern: Option<PatternRun>,
 }
 
 impl Controller {
@@ -280,7 +283,43 @@ impl Controller {
             footstepping: false,
             footstep_idle: 0.0,
             follower: Follower::new(),
+            pattern: None,
         }
+    }
+
+    /// Walk a scripted footstep pattern from where the robot stands: landings in the start stance frame
+    /// (see [`duck_footstep_control::PatternRun`]). Replaces a pattern in progress. Without the footstep
+    /// networks it is dropped — the IPC side refuses before it gets here.
+    pub fn start_pattern(&mut self, steps: Vec<(Pose2, Foot)>) {
+        if !self.policy.has_footsteps() {
+            tracing::warn!("footstep pattern dropped: no footstep policy loaded");
+            return;
+        }
+        tracing::info!(steps = steps.len(), "footstep pattern started");
+        self.pattern = Some(PatternRun::new(steps));
+        self.footstepping = true;
+        self.footstep_idle = 0.0;
+    }
+
+    /// The pattern's misses, to the journal, once it ends.
+    fn finish_pattern(run: &PatternRun, outcome: &str) {
+        for &(k, distance, heading) in run.misses() {
+            tracing::info!(
+                step = k + 1,
+                miss_mm = distance * 1000.0,
+                miss_deg = heading.to_degrees(),
+                "footstep mark"
+            );
+        }
+        let n = run.misses().len().max(1) as f64;
+        let mean = |f: fn(&(usize, f64, f64)) -> f64| run.misses().iter().map(f).sum::<f64>() / n;
+        tracing::info!(
+            landed = run.misses().len(),
+            of = run.len(),
+            mean_miss_mm = mean(|m| m.1) * 1000.0,
+            mean_miss_deg = mean(|m| m.2).to_degrees(),
+            "footstep pattern {outcome}"
+        );
     }
 
     /// This tick's contact odometry: the support (anchor) foot, 0 = left, and the left and right sole-centre
@@ -301,6 +340,24 @@ impl Controller {
         }
         let held = twist.iter().map(|v| v * v).sum::<f64>().sqrt()
             > duck_control::policy::DEFAULT_STANDING_THRESHOLD;
+        if let Some(run) = self.pattern.as_mut() {
+            if held {
+                Self::finish_pattern(run, "cancelled by the stick");
+                self.pattern = None;
+                self.follower.reset();
+            } else {
+                let spacing = self.policy.planner_mut()?.options().feet_spacing;
+                match run.tick(&mut self.follower, support, soles, spacing) {
+                    Some(command) => return Some(command),
+                    None => {
+                        Self::finish_pattern(run, "done");
+                        self.pattern = None;
+                        self.footstepping = false;
+                        return None;
+                    }
+                }
+            }
+        }
         self.footstep_idle = if held { 0.0 } else { self.footstep_idle + dt };
         if !self.footstepping {
             if !held {
@@ -730,6 +787,7 @@ impl Controller {
                     };
                     if body_active {
                         self.footstepping = false;
+                        self.pattern = None;
                     }
                     if let Some(target) = footstep {
                         // Head and body slots stay live: the footstep policy tracks the head command as the

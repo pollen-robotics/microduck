@@ -85,6 +85,44 @@ impl Follower {
         obstacle: Option<Obstacle>,
         max_steps: usize,
     ) -> Result<[f64; 3], PlannerError> {
+        self.advance(support_foot, soles, |support| {
+            let (goal_pose, goal_foot) = goal(support, support_foot);
+            let plan = planner.plan(
+                support,
+                support_foot,
+                goal_pose,
+                goal_foot,
+                obstacle,
+                max_steps,
+            )?;
+            let target = match plan.steps.first() {
+                Some((pose, _)) => *pose,
+                None => planner.neutral(support, support_foot), // at the goal: step in place
+            };
+            Ok((target, plan))
+        })
+    }
+
+    /// [`Self::update`] with the target chosen by the caller instead of planned: `target` is asked, at a
+    /// touchdown, for the swing foot's next landing given the support sole and foot. A scripted pattern.
+    pub fn update_scripted(
+        &mut self,
+        support_foot: Foot,
+        soles: [Pose2; 2],
+        target: impl FnOnce(Pose2, Foot) -> Pose2,
+    ) -> [f64; 3] {
+        let result = self.advance(support_foot, soles, |support| {
+            Ok::<_, PlannerError>((target(support, support_foot), Plan::default()))
+        });
+        result.expect("a scripted target cannot fail")
+    }
+
+    fn advance(
+        &mut self,
+        support_foot: Foot,
+        soles: [Pose2; 2],
+        replan: impl FnOnce(Pose2) -> Result<(Pose2, Plan), PlannerError>,
+    ) -> Result<[f64; 3], PlannerError> {
         let support = soles[support_foot.index()];
         self.switched = self.support != Some(support_foot);
         if self.switched {
@@ -93,19 +131,7 @@ impl Follower {
                 self.last_error = Some((r[0].hypot(r[1]), r[2].abs()));
             }
             self.support = Some(support_foot);
-            let (goal_pose, goal_foot) = goal(support, support_foot);
-            self.plan = planner.plan(
-                support,
-                support_foot,
-                goal_pose,
-                goal_foot,
-                obstacle,
-                max_steps,
-            )?;
-            self.target = match self.plan.steps.first() {
-                Some((pose, _)) => *pose,
-                None => planner.neutral(support, support_foot), // at the goal: step in place
-            };
+            (self.target, self.plan) = replan(support)?;
         }
         Ok(relative(support, self.target))
     }

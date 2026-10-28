@@ -354,6 +354,8 @@ struct PolicyNames {
     stand: Option<String>,
     sitstand: Option<String>,
     ground_pick: Option<String>,
+    /// The footstep policy, when it and its planner are both configured.
+    footsteps: Option<String>,
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
     skills: Vec<String>,
@@ -371,6 +373,7 @@ impl PolicyNames {
             stand: name(&policy.stand),
             sitstand: name(&policy.sitstand),
             ground_pick: name(&policy.ground_pick),
+            footsteps: name(&policy.footsteps).filter(|_| policy.footstep_planner.is_some()),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
         }
     }
@@ -3593,6 +3596,20 @@ async fn control_loop<T: RobotIo>(
             }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
+                if let Some(steps) = intents.take_footsteps() {
+                    controller.start_pattern(
+                        steps
+                            .iter()
+                            .map(|s| {
+                                let foot = match s.foot {
+                                    proto::FootSide::Left => duck_footstep_control::Foot::Left,
+                                    proto::FootSide::Right => duck_footstep_control::Foot::Right,
+                                };
+                                ([s.x, s.y, s.yaw], foot)
+                            })
+                            .collect(),
+                    );
+                }
                 // The footstep follower reads the same estimate the state stream reports, from this tick.
                 controller.set_odometry(
                     safety
@@ -5180,6 +5197,31 @@ fn dispatch(
             proto::Response::ok(Some(id), &result)
         }
 
+        // A footstep pattern for the bench. Refused for what this side can know, like a skill: the policy not
+        // driving, the robot still homing, no footstep networks, or a pattern too long to be a sheet of paper.
+        proto::Call::RobotFootsteps(p) => {
+            let result = if !intents.enabled() {
+                proto::IntentResult::refused("the policy is not driving — press Start on the pad")
+            } else if !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused(
+                    "the robot is still going to its home pose; try again in a moment",
+                )
+            } else if state.policies.load().footsteps.is_none() {
+                proto::IntentResult::refused(
+                    "no footstep policy: set [policy] footsteps and footstep_planner, then restart robotd",
+                )
+            } else if p.steps.is_empty() || p.steps.len() > 64 {
+                proto::IntentResult::refused(format!(
+                    "{} steps; a pattern has 1 to 64",
+                    p.steps.len()
+                ))
+            } else {
+                intents.request_footsteps(p.steps.clone());
+                proto::IntentResult::accepted()
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         // Picking the theremin up, or putting it down. Refused here for what this side can
         // already know — no voice, no depth frames, the feature switched off — and *not* for
         // circumstance: the loop puts the instrument down by itself when the robot starts
@@ -6732,6 +6774,50 @@ mod tests {
         assert!(accepted.accepted);
         assert_eq!(intents.take_sounds(), vec![proto::SoundTag::Chirp]);
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// A footstep pattern is refused at the door on a robot without the footstep networks — the default — and
+    /// queued for the loop on one that has them. Accepted-then-dropped is the failure this guards.
+    #[test]
+    fn robot_footsteps_needs_the_footstep_networks() {
+        let pattern = || {
+            proto::Call::RobotFootsteps(proto::FootstepsParams {
+                steps: vec![proto::Footstep {
+                    foot: proto::FootSide::Left,
+                    x: 0.05,
+                    y: 0.0475,
+                    yaw: 0.0,
+                }],
+            })
+        };
+        let id = || proto::Id::Number(1);
+        let intents = Intents::new();
+        intents.set_enabled(true);
+
+        let plain = state();
+        plain.homed.store(true, Ordering::Relaxed);
+        let refused: proto::IntentResult = dispatch(&plain, &intents, id(), &pattern())
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(refused.reason.unwrap().contains("footstep_planner"));
+        assert!(intents.take_footsteps().is_none());
+
+        let mut params = Params::default();
+        params.policy.footsteps = Some(PathBuf::from("/opt/footsteps.onnx"));
+        params.policy.footstep_planner = Some(PathBuf::from("/opt/footstepnet.onnx"));
+        let equipped = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        equipped.homed.store(true, Ordering::Relaxed);
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &pattern())
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert_eq!(intents.take_footsteps().map(|s| s.len()), Some(1));
     }
 
     /// A skill whose network was never configured is refused at the door with a reason —

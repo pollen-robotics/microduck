@@ -601,6 +601,19 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Walk a printed footstep pattern, to check where the feet land.
+    ///
+    /// `pattern.json` comes with its A4 sheet from microduck_rl `scripts/footsteps_patterns.py`. Print the
+    /// sheet at 100 %, stand the robot on the two start soles, then run this: the robot walks the marks with the
+    /// footstep policy, squares up and hands back. Each landing's miss is in `journalctl -u robotd`
+    /// ("footstep mark"). Needs `[policy] footsteps` and `footstep_planner`; the stick cancels it.
+    Footsteps {
+        /// The pattern file (`{"steps": [{"foot": "left", "x": .., "y": .., "yaw": ..}, ..]}`, start-stance frame).
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Which drive mode this robotd runs: walk or roller. Changes nothing.
     Mode {
         #[arg(long)]
@@ -3458,6 +3471,10 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        RobotCommand::Footsteps { file, json } => (
+            proto::Call::RobotFootsteps(read_footstep_pattern(file)?),
+            *json,
+        ),
         RobotCommand::Mode { json } => (proto::Call::RobotMode, *json),
         RobotCommand::Look {
             x,
@@ -3535,9 +3552,31 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Footsteps { file, .. } => println!(
+            "{} walking — misses in `journalctl -u robotd | grep footstep`",
+            file.display()
+        ),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// A footstep pattern file: its `steps`, whatever else it carries (name, start soles, the sheet's notes).
+fn read_footstep_pattern(file: &Path) -> Result<proto::FootstepsParams, Failure> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", file.display())))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", file.display())))?;
+    let steps = value
+        .get("steps")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(serde_json::json!({ "steps": steps })).map_err(|e| {
+        Failure::new(
+            exit::USAGE,
+            format!("{}: not a footstep pattern ({e})", file.display()),
+        )
+    })
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].

@@ -236,6 +236,10 @@ fn permits(call: &proto::Call) -> bool {
         // about the stream, not about any one of them.
         RobotMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_) => false,
 
+        // A bench tool for checking footstep placement against a printed sheet, driven from `robotctl` on
+        // the robot. Nothing a phone does.
+        RobotFootsteps(_) => false,
+
         // **Not teleop either, and it sat in that group for the same reason a skill did**: it was
         // next to them in a match arm rather than because anybody argued it belonged. It is one
         // request — start driving, or stop — not fifty a second, so the notification budget and

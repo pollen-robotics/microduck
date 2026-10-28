@@ -812,6 +812,7 @@ impl Server {
             | Call::RobotFlashlight(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotFootsteps(_)
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe

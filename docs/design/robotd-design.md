@@ -1031,6 +1031,13 @@ place, and after 0.75 s idle hands back to the gait at the next touchdown, never
 the air. A planner error hands back at once. Body-pose mode and every skill outrank it, as they
 outrank walking.
 
+**Scripted patterns** (`robot.footsteps`, `robotctl robot footsteps pattern.json`) are for checking
+placement against marks on the floor: microduck_rl `scripts/footsteps_patterns.py` prints FootstepNet
+plans 1:1 on A4 with the JSON to walk. The landings are in the start stance frame and anchored where
+the robot stands when the pattern arrives; each touchdown takes the next mark for the swing foot (or
+steps in place to fall into phase), the pattern ends squared up, and every landing's miss goes to
+the journal (`footstep mark`). It outranks the stick until the stick moves, which cancels it.
+
 ### 4.5 What else the loop drives, and why none of it has a design page
 
 `robotd` grew five subsystems after slice 2 that are not control and not safety. They share a
