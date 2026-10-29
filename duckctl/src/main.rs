@@ -1088,6 +1088,13 @@ enum Command {
     /// Updates: what is available, installing it, and going back.
     #[command(subcommand)]
     Update(Update),
+    /// The operating system: which build each A/B slot holds, installing another, going back.
+    ///
+    /// Not `update`, which installs the daemon release. This is the whole root filesystem, from
+    /// the channel the robot follows, and every change ends in a reboot. Only a robot flashed with
+    /// a `microduck_yocto` image has slots; any other answers that it cannot.
+    #[command(subcommand)]
+    Os(Os),
     /// Name, serial and uptime.
     Info,
     /// Play this robot's quack — the loudest way to tell ducks apart.
@@ -1439,6 +1446,40 @@ enum Update {
     /// new subscriber — and then everything that follows. It never receives a reply, so it ends
     /// with Ctrl-C.
     Watch,
+}
+
+/// `os.*`: the robot's A/B root filesystem.
+#[derive(Subcommand)]
+enum Os {
+    /// Which build each slot holds, what the channel offers, and how an update is going.
+    ///
+    /// The command to repeat while an update runs, and the first one after the reboot it ends
+    /// in: `last_result` says whether the new OS came up or the robot went back to the old one.
+    Status,
+    /// Ask the channel what is newest. Changes nothing.
+    Check,
+    /// Download a build, install it to the other slot and reboot into it.
+    ///
+    /// Answers once the download has started; the robot then reboots by itself when the install
+    /// is done, and this tool's next connection finds it on the new slot. If the new slot does
+    /// not come up healthy, the robot boots the old one again.
+    Apply {
+        /// A build from `os status`'s `builds`, by id (`20261028093000`), older ones included.
+        /// Omit for the channel's newest.
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Go ahead even if someone is watching the robot remotely; their session drops.
+        #[arg(long)]
+        interrupt_sessions: bool,
+    },
+    /// Reboot into the other slot as it is, downloading nothing: the undo of an OS update.
+    ///
+    /// Only a slot that last booted healthy. `os status`'s `other` says which build that is.
+    Switch {
+        /// Go ahead even if someone is watching the robot remotely; their session drops.
+        #[arg(long)]
+        interrupt_sessions: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1972,6 +2013,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(note) = account_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
+                if let Some(note) = os_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
                 Ok(())
             };
         }
@@ -2303,6 +2347,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Update(update) => return update_request_line(update),
+        Command::Os(os) => return os_request_line(os),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Quack => (
             proto::method::ROBOT_SOUND,
@@ -2513,6 +2558,37 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
     Ok((serde_json::to_string(&request)?, timeout))
 }
 
+/// The `os` commands, from `duck_ipc_proto`'s types for `update_request_line`'s reason.
+fn os_request_line(os: &Os) -> Result<(String, Duration), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
+    let (call, timeout) = match os {
+        Os::Status => (proto::Call::OsStatus, REPLY_TIMEOUT),
+        // Two downloads from the channel.
+        Os::Check => (proto::Call::OsCheck, SLOW_REPLY_TIMEOUT),
+        // The robot answers once the download is under way, which takes the channel's two small
+        // fetches first — seconds, or half a minute on a slow mirror.
+        Os::Apply {
+            build,
+            interrupt_sessions,
+        } => (
+            proto::Call::OsApply(proto::OsApplyParams {
+                build: build.clone(),
+                interrupt_sessions: *interrupt_sessions,
+            }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Os::Switch { interrupt_sessions } => (
+            proto::Call::OsSwitch(proto::OsSwitchParams {
+                interrupt_sessions: *interrupt_sessions,
+            }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+    };
+    let request = proto::Request::call(proto::Id::Number(1), &call);
+    Ok((serde_json::to_string(&request)?, timeout))
+}
+
 /// The update commands, built from `duck_ipc_proto`'s own types rather than as hand-written JSON.
 ///
 /// `update.apply`'s target is an externally tagged enum — `"latest"`, `{"exact":"0.5.1"}`,
@@ -2704,8 +2780,23 @@ fn limp_note(command: &Command, reply: &serde_json::Value) -> Option<&'static st
     }
     // Only when `robotd` took it. A refusal prints as JSON above and leaves the robot as it was.
     reply["result"]["accepted"].as_bool()?.then_some(
-        "note: torque is off on every joint while the servos come back — hold the robot, or have          it down. It stays limp until something stands it up: press Start on the pad, or          `duckctl call robot.init`.",
+        "note: torque is off on every joint while the servos come back — hold the robot, or have \
+         it down. It stays limp until something stands it up: press Start on the pad, or \
+         `duckctl call robot.init`.",
     )
+}
+
+/// What happens after `os apply` or `os switch` answered: a reboot this tool will not see.
+fn os_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
+    if !matches!(command, Command::Os(Os::Apply { .. } | Os::Switch { .. })) {
+        return None;
+    }
+    let phase = reply["result"]["phase"].as_str()?;
+    Some(format!(
+        "note: the robot is {phase}. It reboots by itself once the new OS is installed, and is \
+         gone for a minute or so — that is the update working. `duckctl os status` follows it; \
+         after the reboot, `last_result` says whether the new slot came up or it went back."
+    ))
 }
 
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
@@ -3609,12 +3700,32 @@ mod tests {
         let note = limp_note(&cli.command, &accepted).expect("a note");
         assert!(note.contains("torque is off"), "{note}");
         assert!(note.contains("robot.init"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
 
         let refused = serde_json::json!({ "error": { "code": 14, "message": "no" } });
         assert_eq!(limp_note(&cli.command, &refused), None);
 
         let health = Cli::try_parse_from(["duckctl", "health"]).expect("parses");
         assert_eq!(limp_note(&health.command, &accepted), None);
+    }
+
+    /// `os apply` answers mid-download; the reboot that follows is the update, not a fault.
+    #[test]
+    fn an_os_apply_says_the_robot_will_reboot() {
+        let cli = Cli::try_parse_from(["duckctl", "os", "apply"]).expect("parses");
+        let reply = serde_json::json!({ "result": { "phase": "downloading" } });
+        let note = os_note(&cli.command, &reply).expect("a note");
+        assert!(note.contains("the robot is downloading"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
+
+        let status = Cli::try_parse_from(["duckctl", "os", "status"]).expect("parses");
+        assert_eq!(os_note(&status.command, &reply), None);
     }
 
     /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
@@ -3710,6 +3821,33 @@ mod tests {
             let cli = Cli::try_parse_from(argv).expect("parses");
             let (line, _) = request_line(&cli.command).expect("a request");
             assert!(line.contains(&format!(r#""method":"{method}""#)), "{line}");
+        }
+    }
+
+    /// Each `os` command reaches its own method, and `apply` sends only what was given.
+    #[test]
+    fn every_os_command_asks_for_its_own_method() {
+        for (args, method, params) in [
+            (vec!["status"], "os.status", "{}"),
+            (vec!["check"], "os.check", "{}"),
+            (vec!["apply"], "os.apply", r#"{"interrupt_sessions":false}"#),
+            (
+                vec!["apply", "--build", "20261028093000"],
+                "os.apply",
+                r#"{"build":"20261028093000","interrupt_sessions":false}"#,
+            ),
+            (
+                vec!["switch", "--interrupt-sessions"],
+                "os.switch",
+                r#"{"interrupt_sessions":true}"#,
+            ),
+        ] {
+            let mut argv = vec!["duckctl", "os"];
+            argv.extend_from_slice(&args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            let (line, _) = request_line(&cli.command).expect("a request");
+            assert!(line.contains(&format!(r#""method":"{method}""#)), "{line}");
+            assert!(line.contains(&format!(r#""params":{params}"#)), "{line}");
         }
     }
 

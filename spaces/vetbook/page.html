@@ -36,6 +36,8 @@
 body { margin: 0; background: var(--bg); color: var(--ink); font: 500 17px/1.6 var(--body);
   background-image: radial-gradient(color-mix(in srgb, var(--pink) 18%, transparent) 2px, transparent 2.5px); background-size: 28px 28px; }
 main { max-width: 1040px; margin: 0 auto; padding-inline: 16px; padding-block: 36px 64px; display: grid; gap: 26px; }
+.back { font: 400 15px var(--display); color: var(--pink); text-decoration: none; justify-self: start; }
+.back:hover { text-decoration: underline; }
 h1 { font: 400 clamp(28px, 5vw, 44px)/1.15 var(--display); margin: 0; text-wrap: balance; }
 h1 span { color: var(--pink); }
 .lede { margin: 6px 0 0; color: var(--soft); }
@@ -59,6 +61,7 @@ code { font-size: .95em; background: var(--card); padding: 1px 6px; border-radiu
 </head>
 <body>
 <main>
+  <a class="back" href="/">← all the ducks</a>
   {% if card %}
   <header>
     <h1><span>{{ robot }}</span>'s vet book ♡</h1>

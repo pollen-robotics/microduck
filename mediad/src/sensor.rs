@@ -33,6 +33,8 @@ pub struct Sensor {
     pub mode: SensorMode,
     pub bus_format: &'static str,
     pub exposure: Exposure,
+    /// Who steers the exposure while the camera streams.
+    pub metering: Metering,
     /// Horizontal field of view across a frame in [`Sensor::mode`], degrees — what the nominal
     /// geometry rests on. `None` when nobody has measured it, and then nominal intrinsics are not
     /// published at all.
@@ -47,6 +49,24 @@ impl Sensor {
     pub fn name(&self) -> &'static str {
         self.id.label()
     }
+}
+
+/// Who steers this sensor's exposure. One writer, never two.
+///
+/// **Two loops on one sensor do not average, they fight.** Measured on a beta (2026-10-20) with
+/// both running: rkaiq held the picture at mediad's own setpoint, so mediad, seeing every darker
+/// step it wrote overwritten a frame later, stepped its belief down to its floor — 4 lines at 1x —
+/// and then re-asserted that floor on its ten-second heartbeat. Each re-assert was a black frame,
+/// rkaiq's recovery overshot to 1688 lines at 16x, and under strong lights that is a picture that
+/// flashes to white and hunts back every ten seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metering {
+    /// `mediad::exposure`, because the board's 3A engine converges once at stream start and then
+    /// stops. `scripts/setup-rkaiq.sh` turns that engine's AE off to match.
+    Mediad,
+    /// The 3A engine, whose AE runs every frame on this board: Seeed's tuning file ships it on
+    /// (`ae_calib.CommCtrl.Enable = 1`, `AecRunInterval = 0`), and it tracks the scene.
+    Rkaiq,
 }
 
 /// What the auto-exposure loop may spend, in this sensor's own units.
@@ -96,6 +116,7 @@ pub const IMX219: Sensor = Sensor {
         start_lines: 600,
         start_analogue: 4.0,
     },
+    metering: Metering::Mediad,
     hfov_deg: Some(62.0),
     family: Some(robotd_params::CameraIntrinsics::alpha),
 };
@@ -107,8 +128,8 @@ pub const IMX219: Sensor = Sensor {
 /// Analogue gain is 64 for 1x — read off the driver, `min=64 max=8192`. The ceiling is kept at the
 /// IMX219's 11x rather than the driver's, so the loop spends noise the same way on both.
 ///
-/// No field of view and no family solve: nobody has measured this lens yet, so the geometry is
-/// unknown until a robot is calibrated.
+/// The geometry is the family solve, [`robotd_params::CameraIntrinsics::beta`] (unit *sky-gtc*): ~85°
+/// across the 16:9 frame.
 pub const GC2093: Sensor = Sensor {
     id: CameraSensor::Gc2093,
     mode: SensorMode {
@@ -124,8 +145,12 @@ pub const GC2093: Sensor = Sensor {
         start_lines: 385,
         start_analogue: 4.0,
     },
-    hfov_deg: None,
-    family: None,
+    // The beta image installs rkaiq with Seeed's IQ file, whose AE keeps converging — the one
+    // thing the alpha's engine does not do.
+    metering: Metering::Rkaiq,
+    // 2·atan(640 / fx) on the 1280-wide solve.
+    hfov_deg: Some(85.2),
+    family: Some(robotd_params::CameraIntrinsics::beta),
 };
 
 // The GC2093's exposure control stops at 1121 lines. A hard cap above it would be refused by the

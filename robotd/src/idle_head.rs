@@ -18,8 +18,10 @@
 //!   and smaller its glances get, as if dozing off, and now and then it **yawns** — the beak
 //!   opens slowly and the head tips back. Silent. Any motion wakes it.
 //!
-//! All of it is added on top of whatever the head and body were last asked to do, the way the
-//! chorale's sway is, and fades in and out over `fade_s`, so it never jumps. Every number is
+//! It looks around the straight head, not wherever the head was last left: a head the pad parked
+//! off to one side is eased back to the middle as the behaviour fades in ([`IdleOffset::takeover`])
+//! and handed back as it fades out. The breath is added on top of whatever the body was asked to
+//! do. Both fade in and out over `fade_s`, so nothing jumps. Every number is
 //! `[idle]` in `robotd.toml` ([`IdleParams`]).
 //!
 //! A piece of the autonomous behaviour stack's LookAround/Chill states
@@ -40,6 +42,10 @@ pub struct IdleOffset {
     pub body_z: f64,
     /// Mouth opening, 0..1 — the yawn. The caller decides who else has the mouth.
     pub mouth: f64,
+    /// How much of the commanded head pose this replaces, 0..1: the caller scales the commanded
+    /// head by `1 - takeover` before adding `head`, so the glances centre on the straight head
+    /// rather than on wherever the pad left it.
+    pub takeover: f64,
 }
 
 /// One move and the pause after it: from where, to where, when it started, how long the move
@@ -194,6 +200,7 @@ impl IdleHead {
             ],
             body_z: g * breath,
             mouth: g * (beak + p.yawn_open * yawn).min(1.0),
+            takeover: g,
         }
     }
 
@@ -375,6 +382,7 @@ mod tests {
         assert!(peak(1) <= p.glance_pitch + p.nudge_pitch + p.drift + 1e-9);
         assert!(peak(3) <= p.tilt_roll + p.drift + 1e-9);
         assert!(later.iter().any(|o| o.body_z != 0.0), "it breathes");
+        assert_eq!(later.last().unwrap().takeover, 1.0, "it has the whole head");
     }
 
     /// **No jumps**: from one tick to the next the head moves a little, whatever it is doing —
@@ -393,6 +401,8 @@ mod tests {
             }
             let step = (pair[1].mouth - pair[0].mouth).abs();
             assert!(step < 0.05, "a {step} mouth step");
+            let step = (pair[1].takeover - pair[0].takeover).abs();
+            assert!(step < 0.05, "a {step} takeover step");
         }
     }
 

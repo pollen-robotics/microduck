@@ -126,8 +126,9 @@ struct Args {
     /// `rkaiq_3A_server` owns white balance, gamma and noise reduction, and its AE converges the
     /// sensor at stream start and then stops responding — and skips even that on a boot where it
     /// missed the stream-start event, which is the "3A stopped working" shape. `mediad::exposure`
-    /// is the loop. Turn it off for a fixed exposure: a calibration capture, or a board whose
-    /// engine really does keep converging.
+    /// is the loop. Turn it off for a fixed exposure, such as a calibration capture. A sensor whose
+    /// engine really does keep converging — the beta's GC2093 — never starts it
+    /// (`mediad::sensor::Metering`).
     #[arg(long)]
     no_auto_exposure: bool,
 
@@ -495,15 +496,26 @@ fn main() -> ExitCode {
         let _exposure = match (&source, args.no_auto_exposure) {
             // The pipeline found the sensor to start at all, so this is always `Some` here.
             (mediad::pipeline::Source::Camera(camera), false) => {
-                mediad::pipeline::sensor().map(|found| {
-                    let (exposure, analogue_gain) = camera.starting(found.sensor);
-                    mediad::exposure::spawn(
-                        camera.device.clone(),
-                        frames.clone(),
-                        found.sensor.exposure,
-                        exposure,
-                        analogue_gain,
-                    )
+                mediad::pipeline::sensor().and_then(|found| match found.sensor.metering {
+                    mediad::sensor::Metering::Mediad => {
+                        let (exposure, analogue_gain) = camera.starting(found.sensor);
+                        Some(mediad::exposure::spawn(
+                            camera.device.clone(),
+                            frames.clone(),
+                            found.sensor.exposure,
+                            exposure,
+                            analogue_gain,
+                        ))
+                    }
+                    // A second loop on the same sensor fights the engine; `Metering` has the
+                    // measurement.
+                    mediad::sensor::Metering::Rkaiq => {
+                        tracing::info!(
+                            sensor = found.sensor.name(),
+                            "auto-exposure is the 3A engine's on this sensor; mediad does not meter"
+                        );
+                        None
+                    }
                 })
             }
             (mediad::pipeline::Source::Camera(_), true) => {

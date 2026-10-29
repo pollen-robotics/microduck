@@ -134,6 +134,9 @@ impl Board {
     /// For a reader that wants this key and nothing else — the updater, before every check, and
     /// `robotctl health`. A file that is invalid somewhere else still says which board it is. One
     /// that is missing, does not say, or names a board this build does not know is `None`.
+    ///
+    /// Both layers at the provisioned path ([`crate::layered_text`]): the image declares the board
+    /// in the base, and `robotctl` may declare one in the user layer, which wins.
     pub fn declared(path: &Path) -> Option<Board> {
         #[derive(Deserialize)]
         struct OnlyBoard {
@@ -143,7 +146,7 @@ impl Board {
         struct BoardOnly {
             version: Board,
         }
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = crate::layered_text(path).ok()?;
         let table = toml::from_str::<toml::Table>(&text).ok()?;
         toml::Value::Table(table)
             .try_into::<OnlyBoard>()

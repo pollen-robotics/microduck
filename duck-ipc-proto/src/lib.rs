@@ -470,7 +470,22 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// laser sweep, nearest object — merged into the vet book by `robotd`, which owns it. The book
 /// gains three maps for them ([`vetbook::Life::tallies`], `highs`, `lows`), additive: an older
 /// book loads with them empty. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
-pub const API_VERSION: u32 = 44;
+///
+/// # v45 — the vet book gallery
+///
+/// [`VetbookShareParams::listed`]: a share can ask to be listed in the `microduck-vetbook` Space's
+/// gallery, where anybody can browse, search and sort the ducks whose owners said yes. Additive:
+/// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
+/// works as before and the duck stays out of the gallery.
+///
+/// # v46 — updating the OS
+///
+/// [`method::OS_STATUS`], [`method::OS_CHECK`], [`method::OS_APPLY`] and [`method::OS_SWITCH`]:
+/// the A/B root filesystem, installed by RAUC, as distinct from the daemon release `update.*`
+/// installs. Served by `updaterd`, which hands the work to the image's `microduck-osupdate`
+/// ([`OsStatus`]). New routes: an `updaterd` predating them answers METHOD_NOT_FOUND, and a board
+/// whose image has no A/B slots answers [`code::NOT_SUPPORTED`].
+pub const API_VERSION: u32 = 46;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -870,6 +885,33 @@ pub mod method {
     /// account and the network stack; the book itself comes from `robotd`.
     pub const VETBOOK_SHARE: &str = "vetbook.share";
 
+    // ── os.* ─────────────────────────────────────────────────────────────────
+    //
+    // The operating system: the root filesystem, kernel and bootloader environment, written to
+    // the inactive A/B slot by RAUC and booted on the next restart. Not a component of `update.*`
+    // — that is the daemon release, swapped by a symlink with no reboot — because the two share
+    // nothing but the word: no store, no `golden`, no units restarted, and a rollback that is a
+    // reboot into the other slot.
+    //
+    // Served by `updaterd` for `policy.*`'s reason, and the work itself is the image's
+    // `microduck-osupdate`, which also serves the LAN page on port 8090. One implementation, so
+    // the phone, `duckctl`, the page and a shell on the robot cannot disagree about what an update
+    // did. A board without that script — anything not built from `microduck_yocto` — answers
+    // [`crate::code::NOT_SUPPORTED`].
+
+    /// Which build each slot holds, what the channel offers, and how an update is going.
+    pub const OS_STATUS: &str = "os.status";
+    /// Ask the channel what is newest. Answers with the same [`crate::OsStatus`].
+    pub const OS_CHECK: &str = "os.check";
+    /// Download a build, install it to the other slot and reboot into it.
+    ///
+    /// Answers once the update is under way, not when it is done: it ends in a reboot, which
+    /// takes the connection with it. Poll [`OS_STATUS`]; after the reboot, `last_result` says
+    /// whether the new slot came up or the board rolled back.
+    pub const OS_APPLY: &str = "os.apply";
+    /// Reboot into the other slot as it is, with no download: the way back from an OS update.
+    pub const OS_SWITCH: &str = "os.switch";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -1037,6 +1079,10 @@ pub mod code {
     /// The caller may connect but may not perform this operation — "ask an
     /// administrator", not "something broke".
     pub const PERMISSION_DENIED: i32 = 14;
+    /// This board cannot do what was asked at all, whatever the arguments — an `os.*` call on a
+    /// board whose image has no A/B slots. Not [`METHOD_NOT_FOUND`]: the daemon has the route,
+    /// and upgrading the app would not change the answer.
+    pub const NOT_SUPPORTED: i32 = 15;
 }
 
 /// Request identifier. `None` on a [`Request`] makes it a notification.
@@ -1163,7 +1209,17 @@ pub enum Call {
     /// Forget the account; see [`method::ACCOUNT_LOGOUT`].
     AccountLogout,
     /// Publish the vet book; see [`method::VETBOOK_SHARE`].
-    VetbookShare,
+    VetbookShare(VetbookShareParams),
+
+    // ── os.* ─────────────────────────────────────────────────────────────────
+    /// The slots and the channel; see [`method::OS_STATUS`].
+    OsStatus,
+    /// Ask the channel; see [`method::OS_CHECK`].
+    OsCheck,
+    /// Install a build and reboot into it; see [`method::OS_APPLY`].
+    OsApply(OsApplyParams),
+    /// Reboot into the other slot; see [`method::OS_SWITCH`].
+    OsSwitch(OsSwitchParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -1319,7 +1375,11 @@ impl Call {
             Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
             Call::AccountStatus => method::ACCOUNT_STATUS,
             Call::AccountLogout => method::ACCOUNT_LOGOUT,
-            Call::VetbookShare => method::VETBOOK_SHARE,
+            Call::VetbookShare(_) => method::VETBOOK_SHARE,
+            Call::OsStatus => method::OS_STATUS,
+            Call::OsCheck => method::OS_CHECK,
+            Call::OsApply(_) => method::OS_APPLY,
+            Call::OsSwitch(_) => method::OS_SWITCH,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1384,6 +1444,12 @@ impl Call {
                 // Replacing the detector writes to the eMMC and restarts `mediad`, which drops
                 // every video session. `detector.check` is a read and stays ungated.
                 | Call::DetectorInstall(_)
+                // Replacing the operating system, and booting the other one. The most
+                // consequential pair in this list by the measure this gate exists for: both end
+                // in a reboot, and what comes back is a different root filesystem. `os.status`
+                // and `os.check` are reads and stay ungated, like `update.check`.
+                | Call::OsApply(_)
+                | Call::OsSwitch(_)
                 // Signing the robot in binds it to a Hugging Face account, and signing it out
                 // takes it away again. That is the most consequential pair here by one measure
                 // nothing else in this list shares: it decides who can reach the robot *from
@@ -1462,7 +1528,16 @@ impl Call {
             Call::AccountStatus | Call::AccountLogout => (Updater, Prompt),
             // Three or four round trips to Hugging Face: a repo create and a commit, plus a read
             // of the book from `robotd` and of the name from `configd`.
-            Call::VetbookShare => (Updater, Slow),
+            Call::VetbookShare(_) => (Updater, Slow),
+            // `status` reads `rauc status` and two small files. It must answer while an OS update
+            // is downloading, which is when a client asks it every few seconds.
+            Call::OsStatus => (Updater, Prompt),
+            // Two small downloads from the channel.
+            Call::OsCheck => (Updater, Slow),
+            // Both start the work and answer once it is under way — up to the first download's
+            // worth of waiting, so a refusal the script makes at once comes back as an error
+            // rather than as a phase. Long enough to want its own lane, and they change the robot.
+            Call::OsApply(_) | Call::OsSwitch(_) => (Updater, Operation),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1610,6 +1685,9 @@ impl Call {
             Call::PolicyFetch(p) => encode(p),
             Call::PolicySearch(p) => encode(p),
             Call::AccountLogin(p) => encode(p),
+            Call::VetbookShare(p) => encode(p),
+            Call::OsApply(p) => encode(p),
+            Call::OsSwitch(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
@@ -1649,7 +1727,8 @@ impl Call {
             | Call::DetectorCheck
             | Call::AccountStatus
             | Call::AccountLogout
-            | Call::VetbookShare
+            | Call::OsStatus
+            | Call::OsCheck
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1733,7 +1812,24 @@ impl Call {
             method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
             method::ACCOUNT_STATUS => Call::AccountStatus,
             method::ACCOUNT_LOGOUT => Call::AccountLogout,
-            method::VETBOOK_SHARE => Call::VetbookShare,
+            // Took no parameters before v45, so `null` and an absent member still mean the
+            // default share — unlisted — rather than a refusal.
+            method::VETBOOK_SHARE => Call::VetbookShare(match params {
+                None | Some(Value::Null) => VetbookShareParams::default(),
+                params => decode(params)?,
+            }),
+            method::OS_STATUS => Call::OsStatus,
+            method::OS_CHECK => Call::OsCheck,
+            // Every parameter is optional — `{"method":"os.apply"}` is "the channel's newest" — so
+            // an absent `params` means the defaults, as for `pad.pair`.
+            method::OS_APPLY => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::OsApply(decode(params.or(Some(&empty)))?)
+            }
+            method::OS_SWITCH => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::OsSwitch(decode(params.or(Some(&empty)))?)
+            }
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1914,7 +2010,16 @@ pub mod test_support {
             Call::AccountLogin(AccountLoginParams { force: false }),
             Call::AccountStatus,
             Call::AccountLogout,
-            Call::VetbookShare,
+            Call::VetbookShare(VetbookShareParams { listed: true }),
+            Call::OsStatus,
+            Call::OsCheck,
+            Call::OsApply(OsApplyParams {
+                build: Some("20261028093000".into()),
+                interrupt_sessions: false,
+            }),
+            Call::OsSwitch(OsSwitchParams {
+                interrupt_sessions: true,
+            }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -2861,6 +2966,17 @@ pub struct Account {
     pub refreshable: bool,
 }
 
+/// What to pass [`Call::VetbookShare`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VetbookShareParams {
+    /// List the duck in the Space's gallery, where anybody can find it by name and sort it by its
+    /// stats. The book is public either way — the card's link needs it to be — but unlisted, only
+    /// somebody given the link finds it. Each share decides again: sharing unlisted takes a listed
+    /// duck back out.
+    pub listed: bool,
+}
+
 /// Answer to [`Call::VetbookShare`]: where the book went, and the link to show people.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -2875,6 +2991,101 @@ pub struct VetbookShareResult {
     /// Which of the cards this share drew, as the Space names it: `notebook`, `purikura`,
     /// `profile`, `receipt`, `passport`, `gameboy`, `polaroid` or `fifa`.
     pub card: String,
+    /// Whether the duck is in the gallery after this share. `false` from an `updaterd` predating
+    /// v45, which never lists.
+    pub listed: bool,
+}
+
+// ── os.* ─────────────────────────────────────────────────────────────────────
+
+/// Parameters of [`Call::OsApply`]. Both optional: `{}` installs the channel's newest build.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OsApplyParams {
+    /// A build from [`OsStatus::builds`], by its id — the 14-digit build time, e.g.
+    /// `20261028093000`. Omit it for the channel's newest. Naming one is an explicit choice, so an
+    /// older build is allowed: it is how a robot goes back to a given OS without a slot switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// Skip *only* the "no active remote session" preflight check, as for `update.apply`.
+    #[serde(default)]
+    pub interrupt_sessions: bool,
+}
+
+/// Parameters of [`Call::OsSwitch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OsSwitchParams {
+    /// Skip *only* the "no active remote session" preflight check, as for `update.apply`.
+    #[serde(default)]
+    pub interrupt_sessions: bool,
+}
+
+/// Answer to every `os.*` call: the board's two slots, what its channel offers, and where an
+/// update has got to.
+///
+/// What `microduck-osupdate status` prints, with its empty strings read as absent. Absent is
+/// always "not known", never zero: a slot that was flashed rather than installed has no build, and
+/// a board that has never checked has nothing `available`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsStatus {
+    /// What RAUC calls this board, e.g. `microduck-beta`. Bundles for anything else are refused.
+    pub machine: Option<String>,
+    /// The channel the board follows, e.g. `dev`. Set on the robot, in
+    /// `/etc/microduck-osupdate.conf`.
+    pub channel: Option<String>,
+    /// The slot booted now, `A` or `B`.
+    pub slot: Option<String>,
+    /// The build booted now. Absent on a slot written by flashing a card rather than by an update.
+    pub installed_build: Option<String>,
+    /// The channel's newest build, as of the last check.
+    pub available: Option<OsAvailable>,
+    /// The slot not booted — what [`Call::OsSwitch`] would boot.
+    pub other: Option<OsSlot>,
+    /// Every build published for this machine, oldest first, each one installable by id.
+    pub builds: Vec<OsBuild>,
+    /// `idle`, `checking`, `downloading`, `installing` or `rebooting`.
+    pub phase: String,
+    /// Percent downloaded, while `phase` is `downloading`.
+    pub progress: u8,
+    /// The last thing the updater said: what it is doing, or why it stopped.
+    pub message: Option<String>,
+    /// How the last update ended, written on the boot after it: `updated to …`, `switched to …`,
+    /// or `rolled back: … did not come up`.
+    pub last_result: Option<String>,
+}
+
+/// A build the channel offers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsAvailable {
+    pub version: String,
+    pub build: String,
+    /// The bundle's size in bytes, which is what is downloaded.
+    pub size: u64,
+}
+
+/// The slot that is not booted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsSlot {
+    pub slot: Option<String>,
+    /// Absent when the slot was flashed, or has never been written.
+    pub build: Option<String>,
+    /// Whether RAUC last saw it boot healthy. Only a good slot can be switched to.
+    pub good: bool,
+    /// When it was installed, as RAUC records it.
+    pub installed: Option<String>,
+}
+
+/// One published build.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OsBuild {
+    pub channel: String,
+    pub build: String,
+    pub version: String,
 }
 
 /// Answer to [`Call::AccountLogout`].
@@ -5827,7 +6038,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            77,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6050,6 +6261,11 @@ mod tests {
                 // which account a robot thinks it belongs to is the first thing support asks.
                 method::ACCOUNT_LOGIN,
                 method::ACCOUNT_LOGOUT,
+                // Replacing the operating system and booting the other slot both end in a reboot
+                // into a different root filesystem. `os.status` and `os.check` must stay off this
+                // list, like `update.check`.
+                method::OS_APPLY,
+                method::OS_SWITCH,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,

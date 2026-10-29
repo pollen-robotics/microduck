@@ -3,6 +3,7 @@
 import datetime as dt
 
 import cards
+import gallery
 import traits
 
 
@@ -52,6 +53,24 @@ def test_star_sign_and_season():
 def test_a_book_with_nothing_in_it_still_makes_a_card():
     c = cards.card_for({}, "u", "duck")
     assert c.status.key == "egg" and c.badges == [] and c.style in cards.CARDS
+
+
+def test_only_a_listed_book_is_in_the_gallery():
+    b = book(distance_m=1234, pickups=7)
+    assert gallery.entry(b, "u", "duck") is None
+    b["share"]["listed"] = "yes"  # only the robot's own `true` counts
+    assert gallery.entry(b, "u", "duck") is None
+    b["share"]["listed"] = True
+    b["share"]["owner"] = "somebody-else"
+    e = gallery.entry(b, "u", "duck")
+    assert e["owner"] == "u" and e["robot"] == "duck" and e["mood"] == "healthy"
+    assert e["stats"]["distance_m"] == 1234 and e["stats"]["cuddles"] == 7 and e["walked"] == "1.2 km"
+
+
+def test_gallery_repo_names():
+    assert gallery.split("apirrone/graphite-bang-vetbook") == ("apirrone", "graphite-bang")
+    assert gallery.split("apirrone/graphite-bang") is None
+    assert gallery.split("../x-vetbook") is None
 
 
 if __name__ == "__main__":

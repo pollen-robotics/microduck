@@ -131,6 +131,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         //   config and adopting the file's mode would undo a live switch as a side effect.
         // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
+        // `allow_community` is not `robotd`'s at all: `updaterd` reads it before every fetch
+        // (`PolicyParams::community_allowed`), the way it reads the board.
+        "policy" if name == "allow_community" => Apply::Live("updaterd"),
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
@@ -274,6 +277,14 @@ pub fn summary(model: &Model) -> Vec<String> {
 /// lines that matter under the ones that do not.
 pub fn list(path: &Path, json: bool) -> Result<(), String> {
     let model = Model::load(path)?;
+    if let Some(note) = ignored_note(&model) {
+        // Yellow on a terminal, as in the editor: ignored is not an error.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!("\x1b[33m{note}\x1b[0m");
+        } else {
+            eprintln!("{note}");
+        }
+    }
     let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
 
     if json {
@@ -368,6 +379,25 @@ enum Focus {
     /// actually read what changed, which is not always `robotd` and is not always a restart.
     /// Never reached for a [`Plan::is_quiet`] plan: there is nothing to ask.
     Apply { plan: Plan },
+}
+
+/// What to say about keys the files set and this build does not know — typically left by a
+/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does. The
+/// base's are named with the base, since that is the file to open to drop one.
+fn ignored_note(model: &Model) -> Option<String> {
+    let mut parts = Vec::new();
+    if !model.ignored().is_empty() {
+        parts.push(model.ignored().join(", "));
+    }
+    if let Some((base, keys)) = model.ignored_in_base() {
+        parts.push(format!("{} (in {})", keys.join(", "), base.display()));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "ignored, unknown to this build (kept in the file): {}",
+            parts.join("; ")
+        )
+    })
 }
 
 /// Run the editor. Returns once the user has left, with everything saved or discarded.
@@ -777,8 +807,13 @@ fn draw(
     focus: &Focus,
     status: Option<&str>,
 ) {
+    // Ignored keys stay on screen in a line of their own, in yellow: they are not an error to
+    // clear with a keypress, and not something this editor can fix.
+    let ignored = ignored_note(model);
+    let footer_height = if ignored.is_some() { 5 } else { 4 };
     let [list_area, footer_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(footer_height)])
+            .areas(frame.area());
 
     // The visible window of the list, kept around the cursor.
     let height = list_area.height.saturating_sub(2) as usize;
@@ -862,7 +897,7 @@ fn draw(
     );
 
     // Footer: what the selected key is, and what the keys do — or the active prompt.
-    let footer: Vec<Line> = match focus {
+    let mut footer: Vec<Line> = match focus {
         Focus::Editing { buffer, error } => vec![
             Line::from(format!("new value: {buffer}▏")),
             Line::from(match error {
@@ -925,6 +960,9 @@ fn draw(
             ]
         }
     };
+    if let Some(note) = ignored {
+        footer.insert(0, Line::from(Span::styled(note, Style::new().yellow())));
+    }
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         footer_area,
@@ -1259,6 +1297,16 @@ mod tests {
             unmapped.is_empty(),
             "nothing says how {unmapped:?} applies — add an arm to `apply_for`"
         );
+    }
+
+    /// `allow_community` sits in `[policy]` but belongs to `updaterd`, which reads it before every
+    /// fetch. Falling through to the section's arm would offer to reload a walking robot for a key
+    /// it never reads.
+    #[test]
+    fn allow_community_is_live_in_the_updater_and_disturbs_nothing() {
+        let plan = plan_for_written(&["policy.allow_community".to_string()]);
+        assert_eq!(plan.live, vec!["updaterd"]);
+        assert!(plan.is_quiet(), "{plan:?}");
     }
 
     /// Either half of the pad source restarted alone leaves the other on the old answer.

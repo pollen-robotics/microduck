@@ -705,10 +705,55 @@ impl Server {
             },
             // No engine lock, like the account: it reads two daemons and talks to the Hub, and
             // touches nothing an update owns.
-            Call::VetbookShare => match crate::vetbook::share(&self.account, &self.vetbook).await {
-                Ok(result) => Response::ok(Some(id), &result),
-                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            Call::VetbookShare(params) => {
+                match crate::vetbook::share(&self.account, &self.vetbook, &params).await {
+                    Ok(result) => Response::ok(Some(id), &result),
+                    Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+
+            // ── os.* ────────────────────────────────────────────────────────────
+            //
+            // The reads take no engine lock: the OS's state is the script's, not the engine's, and
+            // `os.status` is what a client polls while an OS update downloads.
+            Call::OsStatus => match crate::os::status(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
             },
+            Call::OsCheck => match crate::os::check(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
+            },
+            // `try_lock` and `BUSY`, like every other mutation: an OS update started under a
+            // daemon release being installed would reboot the board in the middle of its swap.
+            // Held until the answer, so neither can start while the other is getting going.
+            Call::OsApply(_) | Call::OsSwitch(_) => {
+                let (action, interrupt_sessions) = match call {
+                    Call::OsApply(p) => (crate::os::Action::Apply(p.build), p.interrupt_sessions),
+                    Call::OsSwitch(p) => (crate::os::Action::Switch, p.interrupt_sessions),
+                    _ => unreachable!("matched above"),
+                };
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                let network = matches!(action, crate::os::Action::Apply(_));
+                if let Err(e) = engine.os_preflight(interrupt_sessions, network).await {
+                    return Response::err(Some(id), e.to_rpc_error());
+                }
+                match crate::os::start(&crate::os::Tools::system(), &action).await {
+                    Ok(status) => Response::ok(Some(id), &status),
+                    Err(e) => Response::err(Some(id), e),
+                }
+            }
 
             // Read-only and no engine lock: asking the Hub what exists changes nothing here.
             Call::PolicySearch(params) => match crate::policy::search(&params.query).await {

@@ -434,6 +434,10 @@ exposure, which is indistinguishable from the bug it fixes.
 because what it does lands at stream start — exactly when mediad's loop is converging from its own
 starting values, which is two writers racing for one control.
 
+The beta board is the other way round: Seeed's GC2093 tuning ships rkaiq's AE on, and it keeps
+converging, so there `mediad` does not start its loop. `mediad::sensor::Metering` says which sensor
+is steered by whom, and has what the two loops did to each other when both ran.
+
 **One thing `v4l2-ctl` will do to you while measuring any of this:** a single unknown control name
 fails the whole `--set-ctrl` or `--get-ctrl`. `--get-ctrl=exposure,analogue_gain,digital_gain`
 returns `unknown control 'digital_gain'` and no exposure, which reads as a node that carries neither.

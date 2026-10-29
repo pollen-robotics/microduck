@@ -121,13 +121,15 @@ A robot nobody has touched prints nothing — that is the answer. Add `--json` f
 bundle. It needs no root and no terminal, which is the point: it is the first question to ask
 about a robot behaving oddly, and until now answering it meant a full-screen editor over ssh.
 
-An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
+An interactive editor over this robot's own settings, `/var/lib/robot/robotd.toml`, layered over the image's `/etc/robot/robotd.toml` ([architecture.md](../design/architecture.md), "Where the state lives"): every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
 value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
 screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
-this robot diverges from the defaults; everything else is the built-in default, and `unset`
-optionals show what they resolve to `(auto)`.
+this robot diverges from the defaults; everything else is the default, and `unset`
+optionals show what they resolve to `(auto)`. A key's default is the image's value where the
+image sets one and the built-in default otherwise, so reverting a key goes back to what the image
+says — and keeps following it through the next OS update.
 
 Three properties worth trusting:
 
@@ -262,6 +264,15 @@ Other people publish policies for this robot:
 robotctl policy search microduck
 ```
 
+A robot only fetches policies from `pollen-robotics` until you allow others. Run this, set
+`policy.allow_community` to `true`, and save:
+
+```
+sudo robotctl configure
+```
+
+Then:
+
 ```
 sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
 ```
@@ -383,7 +394,7 @@ oddly and you are not sure what was left set.
 #### The slots, and four things worth knowing
 
 The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
+`roulade`. `load` writes the choice into `/var/lib/robot/robotd.toml`, so it survives a reboot and
 survives updates — a release replaces the binaries and the policies it ships, not the line that
 points elsewhere.
 
@@ -518,7 +529,11 @@ charge. `mediad` and `tofd` report theirs to `robotd` once a minute (`robot.vetb
 `n` on the page writes a dated line in the diary — "reglued the beak", "new feet" — and Enter
 saves it on the robot.
 
-**`s` shares it.** On a robot signed in to Hugging Face (`robotctl account login`), `updaterd`
+**`s` shares it.** It first asks whether to list the duck in the **gallery**, the Space's front page
+(<https://pollen-robotics-microduck-vetbook.hf.space>), where anybody can search ducks by name, sort
+and filter them by their stats, and follow one to its owner's Hugging Face profile: `y` lists it,
+`n` shares without listing, Esc cancels. Each share asks again, and an unlisted share takes a listed
+duck back out. On a robot signed in to Hugging Face (`robotctl account login`), `updaterd`
 publishes the book to a **public** dataset on that account, `<user>/<robot name>-vetbook`, and the
 page shows a link to its card on the `microduck-vetbook` Space, with a QR code to open it on a
 phone. The card is one of eight designs, drawn at random each share, in a palette the duck's name
@@ -550,7 +565,7 @@ unless `robotd --vetbook <file>` names one.
 
 Run `sudo robotctl configure`, then search for `pad_axes` to select axes, directions and gains.
 Head, body and roller limits are under `pad_head`, `pad_body` and `pad_roller`; walking speed
-limits remain under `pad_drive`. These share `/etc/robot/robotd.toml` with the `[pad]` button
+limits remain under `pad_drive`. These share `robotd.toml` with the `[pad]` button
 bindings, and apply within a second without restarting — to the Bluetooth pad and the pad over
 UDP alike.
 
@@ -717,7 +732,8 @@ nobody steering the head, it glances about every second or few — mostly left a
 and down, the neck leaning and the beak opening a touch with each look, now and then with a curious tilt — and while it
 holds a look its gaze keeps shifting a little around it. It drifts slightly and breathes (a
 millimetre of height, standing only). The longer nothing happens the calmer it gets, and after a
-while it yawns now and then — beak open, head back, silently. It fades in and out, and any stick or
+while it yawns now and then — beak open, head back, silently. It looks around the straight head:
+a head you left turned eases back to the middle as it starts. It fades in and out, and any stick or
 head command takes the head back. In the D-pad's head modes the pad keeps the head, so this only
 happens in move mode. `journalctl -fu robotd` logs each spell starting and stopping. Every number is
 in `[idle]` — `sudo robotctl configure`, then restart `robotd`.

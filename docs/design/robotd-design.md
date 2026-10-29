@@ -588,6 +588,13 @@ the robot is already tilted (≈26°), still tipping over rather than recovering
 past the fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead
 would add the filter's lag to the one number whose whole value is being early.
 
+It is armed only from standing: the robot must have been inside the tilt gate for
+`limp_fall_arm_ms` (200 ms), and firing disarms it until the robot has stood again. A fall
+happens to a robot that was up. Without the arm, the limp pose after a fall forwards leaves the
+robot on its front at ~58° — a hair short of `fall_gravity_z`, so not `fallen` — and the slow
+sag as the policy takes over is tilted, tipping and predicted past the threshold: limp, pose,
+hand back, limp again, until the fall verdict happened to latch.
+
 What it buys is not the landing itself but the stand-up after it. The standing policy gets a
 still robot in a known posture up cleanly and a thrashing one up only after several attempts
 at walking gain against the floor, which is where the load on the motors comes from. So the

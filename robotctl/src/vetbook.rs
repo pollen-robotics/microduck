@@ -234,16 +234,23 @@ struct Page {
 enum Share {
     #[default]
     Closed,
-    /// Drawn once before the call is made, so the page says what it is waiting for.
-    Working,
+    /// Whether to list the duck in the Space's gallery: asked on every share, nothing is
+    /// published until it is answered.
+    Asking,
+    /// Drawn once before the call is made, so the page says what it is waiting for. `true` is a
+    /// listed share.
+    Working(bool),
     Done(Result<proto::VetbookShareResult, String>),
 }
 
 /// `vetbook.share`, served by `updaterd`: it holds the account and the network.
-fn share(socket: &Path) -> Result<proto::VetbookShareResult, Failure> {
+fn share(socket: &Path, listed: bool) -> Result<proto::VetbookShareResult, Failure> {
     let mut client = Client::connect_to("updaterd", socket)?;
     client.hello()?;
-    decode(&result_of(client.call(&proto::Call::VetbookShare)?)?)
+    let params = proto::VetbookShareParams { listed };
+    decode(&result_of(
+        client.call(&proto::Call::VetbookShare(params))?,
+    )?)
 }
 
 fn live(
@@ -273,8 +280,8 @@ fn live(
             .map_err(|e| Failure::new(exit::FAILED, format!("cannot draw: {e}")))?;
 
         // The "sharing…" frame is on screen; now the few seconds of talking to Hugging Face.
-        if matches!(page.share, Share::Working) {
-            page.share = Share::Done(share(updater_socket).map_err(|e| e.message));
+        if let Share::Working(listed) = page.share {
+            page.share = Share::Done(share(updater_socket, listed).map_err(|e| e.message));
             continue;
         }
 
@@ -287,6 +294,15 @@ fn live(
             // A share's outcome stays up until it has been read: any key closes it.
             if matches!(page.share, Share::Done(_)) {
                 page.share = Share::Closed;
+                continue;
+            }
+            if matches!(page.share, Share::Asking) {
+                page.share = match key.code {
+                    KeyCode::Char('y') => Share::Working(true),
+                    KeyCode::Char('n') => Share::Working(false),
+                    KeyCode::Esc | KeyCode::Char('q') => Share::Closed,
+                    _ => Share::Asking,
+                };
                 continue;
             }
             // While a line is being typed every key is text, `q` included.
@@ -348,7 +364,7 @@ fn live(
                     page.tab = Tab::Diary;
                     page.draft = Some(String::new());
                 }
-                KeyCode::Char('s') => page.share = Share::Working,
+                KeyCode::Char('s') => page.share = Share::Asking,
                 _ => {}
             }
         }
@@ -470,7 +486,7 @@ impl Page {
             .max(url_cols + 6)
             .max(64)
             .min(area.width.saturating_sub(2));
-        let height = (qr_rows + 8).min(area.height.saturating_sub(2));
+        let height = (qr_rows + 9).min(area.height.saturating_sub(2));
         let popup = Rect {
             x: area.x + area.width.saturating_sub(width) / 2,
             y: area.y + area.height.saturating_sub(height) / 2,
@@ -481,6 +497,7 @@ impl Page {
         let (title, colour) = match &self.share {
             Share::Done(Err(_)) => (" not shared ", ALERT),
             Share::Done(Ok(_)) => (" shared ♡ ", LEAF),
+            Share::Asking => (" share ", DUCK),
             _ => (" sharing… ", DUCK),
         };
         let block = Block::bordered()
@@ -499,8 +516,40 @@ impl Page {
                     Span::styled(" card · book at ", Style::new().fg(DIM)),
                     Span::raw(shared.dataset.clone()),
                 ]),
+                if shared.listed {
+                    Line::styled("listed in the vet book gallery", Style::new().fg(LEAF))
+                } else {
+                    Line::styled(
+                        "not in the gallery: only people with the link will find it",
+                        Style::new().fg(DIM),
+                    )
+                },
             ],
             Share::Done(Err(why)) => vec![Line::styled(why.clone(), Style::new().fg(ALERT))],
+            Share::Asking => vec![
+                Line::from(vec![
+                    Span::raw("Put "),
+                    Span::styled(self.name.clone(), Style::new().fg(DUCK).bold()),
+                    Span::raw(" in the public vet book gallery?"),
+                ]),
+                Line::styled(
+                    "Anybody can then find it by name and compare its stats with other ducks.",
+                    Style::new().fg(DIM),
+                ),
+                Line::styled(
+                    "Either way the book is uploaded to a public dataset, so the link works.",
+                    Style::new().fg(DIM),
+                ),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("y", Style::new().fg(LEAF).bold()),
+                    Span::raw(" list it   "),
+                    Span::styled("n", Style::new().fg(BLUSH).bold()),
+                    Span::raw(" share without listing   "),
+                    Span::styled("esc", Style::new().fg(DIM).bold()),
+                    Span::raw(" cancel"),
+                ]),
+            ],
             _ => vec![Line::styled(
                 "publishing the vet book to your Hugging Face account…",
                 Style::new().fg(DIM),
@@ -512,7 +561,7 @@ impl Page {
 
         if let Some(modules) = &qr {
             let left = inner.x + inner.width.saturating_sub(qr_cols) / 2;
-            render_qr(modules, Rect::new(left, inner.y + 3, qr_cols, qr_rows), buf);
+            render_qr(modules, Rect::new(left, inner.y + 4, qr_cols, qr_rows), buf);
         }
         if matches!(self.share, Share::Done(_)) {
             let hint = if qr.is_some() {
@@ -1148,6 +1197,7 @@ impl Page {
                     "swap" => ("⚙", BEAK),
                     "note" => ("✎", LILAC),
                     "charge" => ("↯", LEAF),
+                    "policy" => ("◆", BEAK),
                     _ => ("•", DIM),
                 };
                 Line::from(vec![
@@ -1713,6 +1763,7 @@ mod tests {
                     image: String::new(),
                     dataset: "apirrone/lavender-star-vetbook".into(),
                     card: "purikura".into(),
+                    listed: true,
                 }))
             } else {
                 Share::Closed
@@ -1763,9 +1814,11 @@ mod tests {
             image: String::new(),
             dataset: "apirrone/lavender-star-vetbook".into(),
             card: "purikura".into(),
+            listed: true,
         };
         let page = draw_page(Tab::Life, 120, None, Share::Done(Ok(shared)));
         assert!(page.contains("shared ♡"), "{page}");
+        assert!(page.contains("listed in the vet book gallery"), "{page}");
         assert!(page.contains("/d/apirrone/lavender-star"));
         assert!(page.contains("purikura"));
         assert!(page.contains("▀"), "no QR code drawn");
@@ -1778,8 +1831,15 @@ mod tests {
         let page = draw_page(Tab::Life, 100, None, Share::Done(Err(why)));
         assert!(page.contains("not shared"), "{page}");
         assert!(page.contains("not signed in"));
-        let waiting = draw_page(Tab::Life, 100, None, Share::Working);
+        let waiting = draw_page(Tab::Life, 100, None, Share::Working(false));
         assert!(waiting.contains("sharing…"));
+    }
+
+    #[test]
+    fn a_share_asks_about_the_gallery_first() {
+        let page = draw_page(Tab::Life, 100, None, Share::Asking);
+        assert!(page.contains("public vet book gallery?"), "{page}");
+        assert!(page.contains("share without listing"), "{page}");
     }
 
     #[test]
