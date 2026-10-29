@@ -827,6 +827,7 @@ impl Server {
             | Call::RobotVetbookTally(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
+            | Call::RobotDiagnostics(_)
             | Call::RobotSubscribe(_) => Response::err(
                 Some(id),
                 proto::Error::new(

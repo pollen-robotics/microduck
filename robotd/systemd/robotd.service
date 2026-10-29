@@ -23,7 +23,7 @@ After=local-fs.target
 
 [Service]
 Type=exec
-ExecStart=/opt/robot/daemon/current/bin/robotd --socket /run/robotd.sock
+ExecStart=/opt/robot/daemon/current/bin/robotd --socket /run/robotd.sock --maintenance-user microduck
 
 # Parameters come from /etc/robot/robotd.toml, which is robotd's default path and is not
 # named here on purpose: the file is optional, and a missing one means built-in defaults

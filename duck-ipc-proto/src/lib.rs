@@ -477,7 +477,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// gallery, where anybody can browse, search and sort the ducks whose owners said yes. Additive:
 /// absent, or sent to an `updaterd` predating it, the book is shared unlisted — the card's link
 /// works as before and the duck stays out of the gallery.
-pub const API_VERSION: u32 = 45;
+///
+/// # v47 — local raw maintenance for all fifteen motors
+///
+/// Typed robot.diagnostics methods, connection-bound ownership and the optional maintenance
+/// block on robot.state. Install the complete daemon release, including robotctl and route tables.
+/// Version 46 is allocated to the independently reviewed gamepad connection addition.
+pub const API_VERSION: u32 = 47;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -512,6 +518,7 @@ pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
+pub mod diagnostics;
 pub mod led;
 pub mod vetbook;
 
@@ -1081,6 +1088,7 @@ pub enum Call {
     Subscribe,
 
     // ── robot.* ──────────────────────────────────────────────────────────────
+    RobotDiagnostics(diagnostics::Call),
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
@@ -1272,6 +1280,7 @@ impl Call {
     /// The wire method name.
     pub fn method(&self) -> &'static str {
         match self {
+            Call::RobotDiagnostics(p) => p.method(),
             Call::Hello(_) => method::HELLO,
             Call::Check(_) => method::CHECK,
             Call::Apply(_) => method::APPLY,
@@ -1359,6 +1368,9 @@ impl Call {
     /// `updaterd` authorises exactly these against the caller's uid/gid; read-only calls
     /// are ungated, so support can inspect a robot it is not allowed to change.
     pub fn is_mutating(&self) -> bool {
+        if let Call::RobotDiagnostics(p) = self {
+            return p.mutating();
+        }
         matches!(
             self,
             Call::Apply(_)
@@ -1446,6 +1458,7 @@ impl Call {
             // Reads a file, like `log`. Bounded by the per-run caps `updater::transcript`
             // enforces at write time, so the answer cannot grow without limit however long
             // a hook talked for.
+            Call::RobotDiagnostics(_) => (Robot, Prompt),
             Call::Show(_) => (Updater, Prompt),
             // `check` is one HTTP round trip. `install` downloads a policy set and then asks
             // `robotd` to reload, which is the same order of magnitude as a small update — long,
@@ -1604,6 +1617,7 @@ impl Call {
             Call::Show(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
+            Call::RobotDiagnostics(p) => p.params().unwrap_or_else(|| serde_json::json!({})),
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
@@ -1685,6 +1699,9 @@ impl Call {
                 .map_err(|e| Error::new(code::INVALID_PARAMS, e.to_string()))
         }
 
+        if method_name.starts_with("robot.diagnostics.") {
+            return diagnostics::Call::parse(method_name, params).map(Call::RobotDiagnostics);
+        }
         Ok(match method_name {
             method::HELLO => Call::Hello(decode(params)?),
             method::CHECK => Call::Check(decode(params)?),
@@ -1802,7 +1819,7 @@ impl Call {
 pub mod test_support {
     use super::*;
 
-    /// One of every [`Call`] variant, so a test cannot silently skip one.
+    /// One of every public method, including each diagnostic sub-operation.
     ///
     /// The exhaustive matches over [`Call`] — `method`, `destination`, and each transport's
     /// permission table — are what force this list to stay complete: a new variant breaks those
@@ -1811,6 +1828,52 @@ pub mod test_support {
         let component = ComponentId::new("daemon");
         let version = semver::Version::new(1, 4, 2);
         vec![
+            Call::RobotDiagnostics(diagnostics::Call::Capabilities),
+            Call::RobotDiagnostics(diagnostics::Call::Inspect),
+            Call::RobotDiagnostics(diagnostics::Call::Status),
+            Call::RobotDiagnostics(diagnostics::Call::Refresh(diagnostics::Cancel {
+                request_id: 1,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Acquire(diagnostics::Acquire {
+                request_id: 1,
+                mode: "maintenance_raw".into(),
+                acknowledge_raw: true,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Torque(diagnostics::Torque {
+                session_id: 1,
+                request_id: 2,
+                joints: vec!["mouth".into()],
+                on: true,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Gains(diagnostics::Gains {
+                session_id: 1,
+                request_id: 3,
+                gains: std::collections::BTreeMap::from([(
+                    "mouth".into(),
+                    diagnostics::Pid { p: 100, i: 0, d: 0 },
+                )]),
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Command(diagnostics::Command {
+                session_id: 1,
+                request_id: 4,
+                positions_rad: std::collections::BTreeMap::from([("mouth".into(), 0.0)]),
+                valid_for_ms: 100,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Keepalive(diagnostics::Keepalive {
+                session_id: 1,
+                sequence: 1,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Stop(diagnostics::Session {
+                session_id: 1,
+                request_id: 5,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Release(diagnostics::Session {
+                session_id: 1,
+                request_id: 6,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Cancel(diagnostics::Cancel {
+                request_id: 1,
+            })),
             Call::Hello(HelloParams {
                 api_version: API_VERSION,
             }),
@@ -3984,6 +4047,8 @@ impl IntentResult {
 /// `requested` rather than the stream carrying only outcomes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RobotState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<diagnostics::Status>,
     /// Seconds since the daemon started. Monotonic: it is for correlating samples, not for
     /// telling the time.
     pub t: f64,
@@ -5853,7 +5918,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            85,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6050,6 +6115,14 @@ mod tests {
         assert_eq!(
             mutating,
             vec![
+                "robot.diagnostics.acquire",
+                "robot.diagnostics.torque",
+                "robot.diagnostics.gains",
+                "robot.diagnostics.command",
+                "robot.diagnostics.keepalive",
+                "robot.diagnostics.stop",
+                "robot.diagnostics.release",
+                "robot.diagnostics.cancel",
                 method::APPLY,
                 method::ROLLBACK,
                 method::RESET_TO_GOLDEN,
@@ -6470,6 +6543,7 @@ mod tests {
         // Only the fields this test is about; everything else is `a_state()`'s business, so
         // the next field added to `RobotState` does not have to be typed out again here.
         let state = RobotState {
+            maintenance: None,
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],
@@ -6555,6 +6629,7 @@ mod tests {
     /// — so an additive field is one line here rather than one line per test.
     fn a_state() -> RobotState {
         RobotState {
+            maintenance: None,
             t: 1.5,
             movement: MoveState {
                 requested: [0.0; 3],

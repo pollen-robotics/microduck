@@ -2553,7 +2553,7 @@ impl View {
     /// the frame is stale, because points hanging where the sensor no longer
     /// looks would be a lie.
     fn tof_markers(&self) -> Vec<duck::Marker> {
-        if !self.tof_arrived.is_some_and(|at| at.elapsed() <= TOF_STALE) {
+        if self.tof_arrived.is_none_or(|at| at.elapsed() > TOF_STALE) {
             return Vec::new();
         }
         let Some(zones) = self.classified_tof() else {
@@ -4929,6 +4929,7 @@ mod tests {
 
     fn a_state() -> proto::RobotState {
         proto::RobotState {
+            maintenance: None,
             t: 1.0,
             movement: proto::MoveState {
                 requested: [0.0; 3],

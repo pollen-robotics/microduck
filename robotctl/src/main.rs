@@ -44,6 +44,7 @@ use robotd_params::board::Board;
 mod camera;
 mod cells;
 mod configure;
+mod diagnostics;
 mod duck;
 mod endurance;
 mod frame;
@@ -126,6 +127,11 @@ struct Cli {
 /// `robotctl motors` later is additive rather than a restructure.
 #[derive(Subcommand, Debug)]
 enum Namespace {
+    /// Inspect motors or open a persistent raw-maintenance session.
+    Diagnose {
+        #[command(subcommand)]
+        command: diagnostics::Command,
+    },
     /// Save one fresh raw UYVY frame; geometry is printed to stderr.
     Frame {
         #[arg(long, default_value = "frame.uyvy")]
@@ -5301,6 +5307,7 @@ fn resolve_from_dir(dir: &std::path::Path) -> Result<String, Failure> {
 
 fn run(cli: Cli) -> Result<(), Failure> {
     let command = match cli.namespace {
+        Namespace::Diagnose { command } => return diagnostics::run(&cli.robot_socket, command),
         Namespace::Frame { output } => return frame::run(&cli.media_socket, &output),
         Namespace::Health { json, check } => {
             return run_health(

@@ -76,6 +76,7 @@ pub enum Route {
 fn permits(call: &proto::Call) -> bool {
     use proto::Call::*;
     match call {
+        RobotDiagnostics(_) => false,
         // The version handshake. Must be reachable or no client can establish anything.
         Hello(_) => true,
 

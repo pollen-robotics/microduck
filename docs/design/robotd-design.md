@@ -873,6 +873,9 @@ control mid-stride is how a robot falls over (`updater-design.md` §7.2).
 
 ### 3.5 Maintenance is a separate namespace
 
+Inspection and raw maintenance sessions are specified in
+[`diagnostics-design.md`](diagnostics-design.md).
+
 `init`, emergency torque-off, calibration and raw joint writes are not intents. They live in their
 own namespace so the relay's per-transport allow-list can keep them off remote transports.
 Signaling gating decides *who connects*; it does not say a teleoperator is also a mechanic — and

@@ -16,6 +16,7 @@ docs give the reasoning and point at it.
 | | |
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
+| [`diagnostics.md`](robot/diagnostics.md) | Inspect and directly test any motor in a local raw-maintenance session. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`udp-pad.md`](robot/udp-pad.md) | A pad on the LAN over UDP: turning it on, `duckctl udp-pad`, and the wire format for writing your own sender. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
@@ -42,6 +43,7 @@ own the mechanism is the bug.
 |---|---|
 | [`architecture.md`](design/architecture.md) | The service split, the IPC contract, state ownership, safety and authority. |
 | [`robotd-design.md`](design/robotd-design.md) | The control loop: the Dynamixel bus and who owns the port, the model, sensing, observations, policy, safety — and what else hangs off the tick. |
+| [`diagnostics-design.md`](design/diagnostics-design.md) | All-motor inspection, exclusive raw maintenance commands, persistent CLI sessions and existing telemetry. |
 | [`updater-design.md`](design/updater-design.md) | The update engine: verification, atomic swap, health gate, rollback, release format. |
 | [`policy-channel-design.md`](design/policy-channel-design.md) | Where the ONNX policies come from: the `policies` component, trying someone else's, and what `reset` puts back. |
 | [`restart-order.md`](design/restart-order.md) | Which unit restarts, at which step, on every path that moves `current` — and at boot. |

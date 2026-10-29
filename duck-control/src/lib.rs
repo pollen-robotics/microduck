@@ -8,6 +8,7 @@
 //! designed in `docs/design/robotd-design.md` §2.
 
 pub mod bus;
+pub mod diagnostics;
 pub mod fall;
 pub mod imu;
 pub mod io;

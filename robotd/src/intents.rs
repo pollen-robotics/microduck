@@ -467,6 +467,31 @@ impl Intents {
         self.rest.swap(false, Ordering::Relaxed)
     }
 
+    pub fn maintenance_idle(&self) -> bool {
+        !self.enabled()
+            && self.power.load(Ordering::Relaxed) == POWER_NONE
+            && self.skills.load(Ordering::Relaxed) == 0
+            && !self.shutdown.load(Ordering::Relaxed)
+            && !self.rest.load(Ordering::Relaxed)
+            && self.mode_switch.load(Ordering::Relaxed) == MODE_NONE
+            && self.policy_change.load().is_none()
+            && self.reboot_motors.try_lock().is_ok_and(|v| v.is_none())
+    }
+    pub fn clear_maintenance_intents(&self) {
+        self.set_enabled(false);
+        self.set_twist([0.0; 3]);
+        self.power.store(POWER_NONE, Ordering::Relaxed);
+        self.skills.store(0, Ordering::Relaxed);
+        self.shutdown.store(false, Ordering::Relaxed);
+        self.rest.store(false, Ordering::Relaxed);
+        self.mode_switch.store(MODE_NONE, Ordering::Relaxed);
+        self.policy_change.store(None);
+        if let Ok(mut r) = self.reboot_motors.try_lock() {
+            *r = None;
+        }
+        self.set_head([0.0; 4]);
+        self.set_mouth(0.0);
+    }
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
     }

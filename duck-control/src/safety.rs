@@ -185,6 +185,23 @@ impl<T: RobotIo> Safety<T> {
     /// except through here" a fact the borrow checker enforces rather than a convention. Slow
     /// sensors and IMU diagnostics read rather than write, so they are no threat to that, but
     /// handing out the handle to reach them would be.
+    /// Selective maintenance access; authority is enforced by robotd's control thread.
+    pub fn diagnostic_read(&mut self, id: u8) -> Result<crate::diagnostics::Motor, IoError> {
+        self.io.diagnostic_read(id)
+    }
+    pub fn diagnostic_goals(&mut self, g: &[(u8, f64)]) -> Result<(), IoError> {
+        self.io.diagnostic_goals(g)
+    }
+    pub fn diagnostic_torque(&mut self, id: u8, on: bool) -> Result<(), IoError> {
+        self.io.diagnostic_torque(id, on)
+    }
+    pub fn diagnostic_pid(&mut self, id: u8, p: crate::diagnostics::Pid) -> Result<(), IoError> {
+        self.gain = None;
+        self.io.diagnostic_pid(id, p)
+    }
+    pub fn invalidate_gain(&mut self) {
+        self.gain = None;
+    }
     pub fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors, IoError> {
         self.io.slow_sensors()
     }
