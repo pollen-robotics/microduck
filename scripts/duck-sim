@@ -55,8 +55,13 @@ DUCKS="${DUCK_SIM_DUCKS:-1}"
 #
 # `apartment` is six rooms in 7x6 m with 50 cm walls and doorways deliberately off centre — that
 # asymmetry is what lets a pose be disambiguated from a 45-degree forward field of view, which is
-# exactly what the duck has. The default is a bare floor, where there is nothing to see.
-SCENE="${DUCK_SIM_SCENE:-}"
+# exactly what the duck has. The default is the backlash floor: the gait the official set ships is
+# trained against the robot with joint backlash (the velstand task is *-Rough-Backlash-MicroDuck),
+# and on the rigid scene that gait stands but will not break into steps — issue #498. Pass a bare
+# name for another of the simulator's scenes, or a path for your own. `backlash` is the default
+# only when the variable is *unset*: an explicitly empty DUCK_SIM_SCENE still asks for the
+# simulator's own default scene (the rigid floor), so the plain scene stays reachable.
+SCENE="${DUCK_SIM_SCENE-backlash}"
 
 # Which ducks have an eye. `a`, `a,c`, or `all`; empty for none, which is the default because a
 # rendered frame costs 12 ms against 0.3 ms to step four ducks' physics — one camera is a third of a
@@ -206,16 +211,16 @@ build_daemons() {
 # A `policies/` beside the repo wins if it has one: that is somebody's own set, and fetching over
 # it would silently swap the gait they are working on.
 policies() {
-    if [ -f "$REPO/policies/alpha_stand.onnx" ]; then
+    if [ -f "$REPO/policies/velstand.onnx" ]; then
         POLICIES="$REPO/policies"
         return 0
     fi
     POLICIES="$STATE/policies/current"
-    [ -f "$POLICIES/alpha_stand.onnx" ] || {
+    [ -f "$POLICIES/velstand.onnx" ] || {
         say "no policy set here — fetching the official one"
         sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
     }
-    [ -f "$POLICIES/alpha_stand.onnx" ] ||
+    [ -f "$POLICIES/velstand.onnx" ] ||
         die "no policy set in $STATE/policies. It needs the network once, or your own .onnx files in $REPO/policies."
 }
 
@@ -236,11 +241,21 @@ up() {
 
     # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
     # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    #
+    # `walk` is `velstand.onnx`, the shipped gait since set v5 — it walks on a twist AND stands
+    # still at zero command, which is why no `stand` line is written: robotd then loads no standing
+    # network, exactly as a robot's defaults do (`PolicyParams::resolved`). Naming the pre-v5
+    # `alpha_walking.onnx` + `alpha_stand.onnx` pair here gave the simulated duck a gait that stands
+    # but cannot start walking from the standing pose the standing network holds it in — issue #498.
+    # Those two files stay in the set for a board that loads them back by hand.
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$POLICIES/alpha_walking.onnx"
-stand = "$POLICIES/alpha_stand.onnx"
+walk = "$POLICIES/velstand.onnx"
+# The gait's trained scale: infer_policy.py runs every policy at 1.0, and in the simulator the
+# gait will not break into steps from the standing pose at the daemon's 0.9 default. A robot
+# keeps its own default; this names it only for the simulated one.
+action_scale = 1.0
 sitstand = "$POLICIES/alpha_sitstand.onnx"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
