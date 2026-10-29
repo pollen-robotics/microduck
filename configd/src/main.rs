@@ -250,12 +250,28 @@ async fn main() -> ExitCode {
     };
     tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
+    // The label serial and the PIN a user reads off it. Absent on a Zero 3W and on an unprogrammed
+    // beta, which keep the factory PIN — said at `warn`, because that PIN is public.
+    let mut store = Store::new(args.state_dir.join("config.json"), default_name);
+    let label_serial = configd::identity::label_serial();
+    match label_serial
+        .as_deref()
+        .and_then(configd::identity::default_pin)
+    {
+        Some(pin) => store = store.with_default_pin(pin),
+        None => tracing::warn!(
+            path = configd::identity::LABEL_EEPROM_PATH,
+            "no label serial in the ID EEPROM; the default pairing PIN is the public factory one"
+        ),
+    }
+    tracing::info!(label_serial = ?label_serial, "label");
+
     tokio::spawn(configd::indicator::run(Arc::clone(&net)));
 
     let service = Arc::new(Service {
         net,
         pads,
-        store: Store::new(args.state_dir.join("config.json"), default_name),
+        store,
         serial,
         simulated,
         policy: PeerPolicy {
