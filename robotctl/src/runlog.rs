@@ -245,14 +245,25 @@ pub(crate) struct DurableCsv {
 }
 
 impl DurableCsv {
+    /// Appending to a file that has a header keeps that header's columns, so a run resumed by a
+    /// build that logs more (or fewer) columns stays one aligned table: what the old header has
+    /// no column for is dropped.
     pub(crate) fn open(path: &Path, fields: Vec<String>) -> std::io::Result<Self> {
-        let fresh = path.metadata().map_or(true, |m| m.len() == 0);
+        let existing = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.lines().next().map(str::to_owned))
+            .filter(|h| !h.is_empty());
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        if fresh {
-            let header: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
-            writeln!(file, "{}", header.join(","))?;
-            file.sync_all()?;
-        }
+        // Column names are never quoted, so a plain split reads the header back.
+        let fields = match existing {
+            Some(header) => header.split(',').map(str::to_owned).collect(),
+            None => {
+                let header: Vec<String> = fields.iter().map(|f| csv_field(f)).collect();
+                writeln!(file, "{}", header.join(","))?;
+                file.sync_all()?;
+                fields
+            }
+        };
         Ok(Self { file, fields })
     }
 
@@ -328,11 +339,40 @@ impl Run {
 #[derive(Default)]
 struct FeedInner {
     latest: Option<(Instant, proto::RobotState)>,
-    current_sum: f64,
-    current_n: u64,
+    current: CurrentWindow,
 }
 
-/// The latest `robot.state` frame, plus motor current averaged since the last sample.
+/// Motor current since the last sample: per joint and summed, the mean and the peak.
+#[derive(Default, Clone)]
+pub(crate) struct CurrentWindow {
+    pub(crate) n: u64,
+    /// Indexed as [`proto::JOINT_NAMES`].
+    pub(crate) sum_ma: [f64; proto::JOINT_NAMES.len()],
+    pub(crate) peak_ma: [f64; proto::JOINT_NAMES.len()],
+    pub(crate) total_sum_ma: f64,
+    pub(crate) total_peak_ma: f64,
+}
+
+impl CurrentWindow {
+    fn add(&mut self, currents_ma: &[f64]) {
+        let mut total = 0.0;
+        for (i, c) in currents_ma
+            .iter()
+            .take(proto::JOINT_NAMES.len())
+            .enumerate()
+        {
+            let c = c.abs();
+            self.sum_ma[i] += c;
+            self.peak_ma[i] = self.peak_ma[i].max(c);
+            total += c;
+        }
+        self.total_sum_ma += total;
+        self.total_peak_ma = self.total_peak_ma.max(total);
+        self.n += 1;
+    }
+}
+
+/// The latest `robot.state` frame, plus motor current since the last sample.
 #[derive(Clone)]
 pub(crate) struct StateFeed(Arc<Mutex<FeedInner>>);
 
@@ -353,9 +393,11 @@ impl StateFeed {
     fn stream(socket: &Path, inner: &Mutex<FeedInner>) -> Result<(), Failure> {
         let mut client = Client::connect_to("robotd", socket)?;
         let _ = client.writer.set_read_timeout(Some(Duration::from_secs(5)));
+        // Every tick, not decimated: a current peak is a few ticks long, and a 20 Hz stream
+        // misses most of them.
         client.send(&proto::Request::call(
             proto::Id::Number(1),
-            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(20) }),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: None }),
         ))?;
         let mut line = String::new();
         loop {
@@ -372,8 +414,7 @@ impl StateFeed {
             };
             let mut inner = inner.lock().expect("feed lock");
             if !state.currents_ma.is_empty() {
-                inner.current_sum += state.currents_ma.iter().map(|c| c.abs()).sum::<f64>();
-                inner.current_n += 1;
+                inner.current.add(&state.currents_ma);
             }
             inner.latest = Some((Instant::now(), state));
         }
@@ -385,12 +426,11 @@ impl StateFeed {
         (at.elapsed() <= FRAME_MAX_AGE).then(|| state.clone())
     }
 
-    fn take_mean_current_ma(&self) -> Option<f64> {
+    /// `None` when no frame since the last call carried current.
+    fn take_current(&self) -> Option<CurrentWindow> {
         let mut inner = self.0.lock().expect("feed lock");
-        let mean = (inner.current_n > 0).then(|| inner.current_sum / inner.current_n as f64);
-        inner.current_sum = 0.0;
-        inner.current_n = 0;
-        mean
+        let window = std::mem::take(&mut inner.current);
+        (window.n > 0).then_some(window)
     }
 }
 
@@ -506,6 +546,16 @@ impl Sampler {
                 "motor_mean_c",
                 "motor_hottest",
                 "motor_current_ma",
+                "motor_current_peak_ma",
+            ]
+            .map(String::from),
+        );
+        for joint in proto::JOINT_NAMES {
+            fields.push(format!("{joint}_current_ma"));
+            fields.push(format!("{joint}_current_peak_ma"));
+        }
+        fields.extend(
+            [
                 "loop_hz",
                 "activity",
                 "lap",
@@ -639,8 +689,20 @@ impl Sampler {
             put("reason", h.reason.clone().unwrap_or_default());
         }
 
-        if let Some(ma) = self.feed.take_mean_current_ma() {
-            put("motor_current_ma", format!("{ma:.0}"));
+        if let Some(w) = self.feed.take_current() {
+            let n = w.n as f64;
+            put("motor_current_ma", format!("{:.0}", w.total_sum_ma / n));
+            put("motor_current_peak_ma", format!("{:.0}", w.total_peak_ma));
+            for (i, joint) in proto::JOINT_NAMES.iter().enumerate() {
+                put(
+                    &format!("{joint}_current_ma"),
+                    format!("{:.0}", w.sum_ma[i] / n),
+                );
+                put(
+                    &format!("{joint}_current_peak_ma"),
+                    format!("{:.0}", w.peak_ma[i]),
+                );
+            }
         }
         let (activity, home, lap, step) = {
             let shared = self.run.shared.lock().expect("shared lock");
@@ -814,5 +876,40 @@ mod tests {
         let mut names = vec!["policy10", "policy2", "policy0"];
         names.sort_by_key(|n| by_index(n));
         assert_eq!(names, ["policy0", "policy2", "policy10"]);
+    }
+
+    #[test]
+    fn current_window_keeps_mean_and_peak_per_joint_and_summed() {
+        let mut w = CurrentWindow::default();
+        let mut a = [0.0; 15];
+        a[3] = 100.0;
+        a[4] = -50.0;
+        let mut b = [0.0; 15];
+        b[3] = 300.0;
+        w.add(&a);
+        w.add(&b);
+        assert_eq!(w.n, 2);
+        assert_eq!(w.sum_ma[3] / 2.0, 200.0);
+        assert_eq!(w.peak_ma[3], 300.0);
+        assert_eq!(w.peak_ma[4], 50.0, "magnitude, whatever the sign");
+        assert_eq!(w.total_sum_ma / 2.0, 225.0);
+        assert_eq!(
+            w.total_peak_ma, 300.0,
+            "the peak of the sum, not the sum of the peaks"
+        );
+    }
+
+    #[test]
+    fn appending_keeps_the_existing_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.csv");
+        let row = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        DurableCsv::open(&path, vec!["a".into(), "b".into()])
+            .unwrap()
+            .write(&[row("a", "1"), row("b", "2")]);
+        DurableCsv::open(&path, vec!["a".into(), "new".into(), "b".into()])
+            .unwrap()
+            .write(&[row("a", "3"), row("new", "x"), row("b", "4")]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n3,4\n");
     }
 }

@@ -14,12 +14,15 @@ Writes into each run directory:
     breakdown.png  the odometry track against the 0.5 m circle, time per activity, drain rate
                    and board temperature per activity
     summary.md     the numbers: runtime, peak temperatures, time throttled, drain per activity
+    currents.png   each servo's mean current over the run and its highest peak (when the run
+                   logged per-joint current)
 
 For a stress run it also writes:
 
     getup.png      every get-up's time against the lap it happened in
     report.pdf     the same, to read or pass on: an overview (headline numbers, how each fall
-                   ended, get-up times), the per-lap table, the timeline and every incident
+                   ended, get-up times), the per-lap table, the timeline, servo currents and every
+                   incident
     summary.md     … plus a table per lap: falls, get-ups, failures, guards, battery, hottest servo
 
 Given several runs it also writes `compare.png` beside the first, battery against time for each —
@@ -213,9 +216,14 @@ def timeline_figure(run: Path, df: pd.DataFrame, ev: pd.DataFrame):
 
     if "current" in ax_of:
         ax = ax_of["current"]
-        ax.plot(df["h"], df["motor_current_ma"] / 1000, color=SERIES[0], lw=1)
+        if df.get("motor_current_peak_ma", pd.Series(dtype=float)).notna().any():
+            ax.plot(df["h"], df["motor_current_peak_ma"] / 1000, color=SERIES[1], lw=0.8,
+                    alpha=0.7, label="peak")
+        ax.plot(df["h"], df["motor_current_ma"] / 1000, color=SERIES[0], lw=1, label="mean")
         ax.set_ylabel("A")
-        ax.set_title("Servo current, sum of |joint current|, mean over each sample")
+        ax.set_title("Servo current, sum of |joint current| over each sample")
+        if "motor_current_peak_ma" in df:
+            ax.legend(loc="upper left", ncol=2)
 
     for _, e in ev[ev["kind"].isin(["fence", "paused", "sit_refused", "rise_refused", "connection_lost"])].iterrows():
         axes[0].axvline(e["h"], color=INK_2, lw=0.6, ls=":")
@@ -238,6 +246,43 @@ def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
     fig = timeline_figure(run, df, ev)
     fig.savefig(run / "timeline.png", dpi=130)
     plt.close(fig)
+
+
+def motor_currents(df: pd.DataFrame) -> pd.DataFrame:
+    """Per joint: mean current over the run, the highest peak, and when and doing what it hit.
+
+    Empty for a run logged before per-joint current (only `motor_current_ma`, the sum)."""
+    joints = [c.removesuffix("_current_peak_ma") for c in df.columns
+              if c.endswith("_current_peak_ma") and c != "motor_current_peak_ma"
+              and df[c].notna().any()]
+    rows = []
+    for j in joints:
+        peak = df[f"{j}_current_peak_ma"]
+        i = peak.idxmax()
+        rows.append({"joint": j, "mean_a": df[f"{j}_current_ma"].mean() / 1000,
+                     "peak_a": peak.max() / 1000, "peak_h": df.loc[i, "h"],
+                     "peak_activity": str(df.loc[i, "step"] if "step" in df and
+                                          not pd.isna(df.loc[i, "step"]) else df.loc[i, "activity"])})
+    return pd.DataFrame(rows, columns=["joint", "mean_a", "peak_a", "peak_h", "peak_activity"]
+                        ).set_index("joint")
+
+
+def currents_figure(run: Path, cur: pd.DataFrame, figsize=(10, 6)):
+    fig, ax = plt.subplots(figsize=figsize)
+    y = np.arange(len(cur))[::-1]
+    ax.barh(y, cur["peak_a"], color=SERIES[1], alpha=0.35, height=0.7, label="highest peak")
+    ax.barh(y, cur["mean_a"], color=SERIES[0], height=0.7, label="mean over the run")
+    for yi, (_, r) in zip(y, cur.iterrows()):
+        ax.annotate(f"{r['mean_a']:.2f} / {r['peak_a']:.2f} A", (r["peak_a"], yi), xytext=(4, 0),
+                    textcoords="offset points", va="center", fontsize=8, color=INK_2)
+    ax.set_yticks(y, [j.replace("_", " ") for j in cur.index])
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("A")
+    ax.set_xlim(0, cur["peak_a"].max() * 1.25)
+    ax.set_title(f"Servo current per joint — {run.name}")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig
 
 
 def drain_by_activity(df: pd.DataFrame) -> pd.DataFrame:
@@ -366,6 +411,10 @@ def summary(run: Path, df: pd.DataFrame, ev: pd.DataFrame, drain: pd.DataFrame) 
         i = df["motor_max_c"].idxmax()
         lines.append(f"- Hottest servo: {df.loc[i, 'motor_max_c']:.0f} °C ({df.loc[i, 'motor_hottest']}) "
                      f"at {df.loc[i, 'h']:.2f} h")
+    if "motor_current_peak_ma" in df and df["motor_current_peak_ma"].notna().any():
+        i = df["motor_current_peak_ma"].idxmax()
+        lines.append(f"- Servo current, all joints: mean {df['motor_current_ma'].mean() / 1000:.2f} A, "
+                     f"peak {df.loc[i, 'motor_current_peak_ma'] / 1000:.2f} A at {df.loc[i, 'h']:.2f} h")
     if "odom_dist" in df and df["odom_dist"].notna().any():
         lines.append(f"- Odometry: max {df['odom_dist'].max():.2f} m from start, "
                      f"{(ev['kind'] == 'fence').sum()} fence trips")
@@ -379,6 +428,12 @@ def summary(run: Path, df: pd.DataFrame, ev: pd.DataFrame, drain: pd.DataFrame) 
         lines += ["", "Drain is read off robotd's percentage, which is linear in voltage between 6.6 V "
                       "and full — not in charge — so per-activity rates depend on where in the curve "
                       "each activity happened. Compare them within a run, not across chemistries."]
+    cur = motor_currents(df)
+    if len(cur):
+        lines += ["", "| joint | mean A | peak A | peak at | doing |", "|---|---:|---:|---:|---|"]
+        for j, r in cur.iterrows():
+            lines.append(f"| {j} | {r['mean_a']:.2f} | {r['peak_a']:.2f} | {r['peak_h']:.2f} h | {r['peak_activity']} |")
+        lines += ["", "Peaks are read off every control tick, means are of each sample's mean."]
     text = "\n".join(lines) + "\n"
     (run / "summary.md").write_text(text)
     return text
@@ -696,7 +751,14 @@ def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFr
         pdf.savefig(fig)
         plt.close(fig)
 
-        # 4 — incidents
+        # 4 — servo currents
+        cur = motor_currents(df)
+        if len(cur):
+            fig = currents_figure(run, cur, figsize=A4)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # 5 — incidents
         ev = ev.sort_values("wall").copy()
         ev["lap"] = (ev["kind"] == "lap_start").cumsum()
         steps = ev["detail"].where(ev["kind"] == "activity").astype(str).str.split().str[-1]
@@ -739,6 +801,12 @@ def main() -> int:
         drain = breakdown(run, df, ev, meta)
         text = summary(run, df, ev, drain)
         made = [run / "timeline.png", run / "breakdown.png"]
+        cur = motor_currents(df)
+        if len(cur):
+            fig = currents_figure(run, cur)
+            fig.savefig(run / "currents.png", dpi=130)
+            plt.close(fig)
+            made.append(run / "currents.png")
         laps = stress_laps(df, ev)
         if len(laps):
             text += stress_summary(laps, lap_version(meta) or "?")

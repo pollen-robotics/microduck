@@ -600,7 +600,8 @@ sudo robotctl endurance stop
 
 Walks, stands and sits at random, for random lengths, within half a metre of where it started, until
 the battery is empty — and logs the charge, every thermal zone, the CPU clock and throttle, servo
-temperature and current, and odometry every 10 s. It starts in the background as the
+temperature, each servo's current (its mean over the 10 s and its peak, read on every control tick),
+and odometry every 10 s. It starts in the background as the
 `robotctl-endurance` unit and returns, so you can close the ssh session; `journalctl -u
 robotctl-endurance -f` is the live view. Put the robot on clear floor first, with no pad connected:
 an idle pad sends zero velocities that cancel these.
@@ -650,7 +651,8 @@ Same background unit, battery hand-off and files as `endurance`, under `/var/lib
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
 `fallen_unprovoked`, `wall_guard` and `square_guard`. `scripts/endurance-plot.py` draws one run or
-overlays several, and writes each stress run a `report.pdf` to read or pass on.
+overlays several, and writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
+page of the report give each servo's mean current and highest peak.
 
 ### Gamepad (`configd`)
 
