@@ -126,6 +126,18 @@ fn permits(call: &proto::Call) -> bool {
         Rollback(_) => true,
         Select(_) => true,
 
+        // The operating system, which `update.*` does not reach: the A/B root filesystem. On the
+        // `Apply` argument above, and with more reason. An image that was flashed is otherwise
+        // only ever replaced by flashing it again, which an owner cannot do; and the slot switch
+        // is the `Rollback` of this half — the slot it boots already ran on this board, nothing
+        // is downloaded, and a slot that does not come up healthy is reverted by the bootloader.
+        // Each still passes `updaterd`'s preflight and its peer policy, which names `btd`.
+        //
+        // The replies are an [`proto::OsStatus`], under a kilobyte for a channel with a handful
+        // of builds; `apply` and `switch` end in a reboot, so the link drops after the answer.
+        OsStatus | OsCheck => true,
+        OsApply(_) | OsSwitch(_) => true,
+
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => true,
 
@@ -619,6 +631,10 @@ mod tests {
                 // person approving the code is holding the phone that is bonded to the robot.
                 proto::method::ACCOUNT_LOGIN,
                 proto::method::ACCOUNT_LOGOUT,
+                // Updating the OS, and booting the other slot. `update.apply`'s argument: an
+                // owner has no other way to replace an image, and the slot switch is the undo.
+                proto::method::OS_APPLY,
+                proto::method::OS_SWITCH,
                 proto::method::NET_CONNECT,
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,

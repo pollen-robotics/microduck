@@ -9,6 +9,11 @@
 //! It lives outside `releases/<ver>/` so it survives an update *and* a rollback: this is
 //! per-robot configuration, not shipped defaults (`architecture.md` §3).
 //!
+//! **Two layers.** [`DEFAULT_PATH`] is what the image or installer wrote; [`USER_PATH`] holds the
+//! keys someone changed on this robot, and wins key by key. Only the user layer is on the
+//! partition an OS update leaves alone, so the image can move its own values forward while the
+//! owner's stay put. [`Params::load`] merges them; [`edit`] only ever writes the user layer.
+//!
 //! A crate of its own rather than a module of `robotd`, for one consumer: `robotctl
 //! configure` edits the file interactively, and doing that against a copied schema is how a
 //! copied schema drifts. [`registry`] is the machine-readable index of every key — what it
@@ -77,7 +82,122 @@ pub fn footsteps_library_path(file: &str) -> PathBuf {
 }
 
 /// Where a provisioned robot keeps it, alongside the updater's own config.
+///
+/// The *base* layer: what the image or the installer put there. On a robot that updates its OS
+/// by A/B slots this file is on the root filesystem, so every OS update replaces it — which is
+/// right for what the image decides (the board, the bus port) and wrong for anything an owner
+/// changed. Those go to [`USER_PATH`] instead. See [`user_layer_for`].
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
+
+/// The owner's layer over [`DEFAULT_PATH`]: only the keys somebody changed on this robot.
+///
+/// Under `/var/lib/robot` because that is the one tree that survives an OS update and a slot
+/// switch — a setting changed with `robotctl configure` or from the phone must not quietly
+/// revert the next time the robot takes a new image. Every writer goes here ([`edit`]); nothing
+/// writes the base any more.
+pub const USER_PATH: &str = "/var/lib/robot/robotd.toml";
+
+/// The user layer that goes with the file at `path`, if it has one.
+///
+/// Only the provisioned location is layered. A file named on the command line — a simulated
+/// duck's, a test's, a bench override — is read on its own, exactly as before layering existed,
+/// so it means what it says and nothing under `/var/lib/robot` can change it.
+pub fn user_layer_for(path: &Path) -> Option<PathBuf> {
+    (path == Path::new(DEFAULT_PATH)).then(|| PathBuf::from(USER_PATH))
+}
+
+/// When the config at `path` last changed, across both layers — for a reader that polls.
+///
+/// `padd` and `netpadd` re-read the file when this moves. Watching the base alone would miss
+/// every edit, since edits land in the user layer. A pair rather than the later of the two
+/// mtimes, so that deleting the user layer — a reset — is a change too.
+pub fn config_stamp(path: &Path) -> ConfigStamp {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    ConfigStamp {
+        base: mtime(path),
+        user: user_layer_for(path).and_then(|user| mtime(&user)),
+    }
+}
+
+/// See [`config_stamp`]. Compare two; the value means nothing on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigStamp {
+    base: Option<std::time::SystemTime>,
+    user: Option<std::time::SystemTime>,
+}
+
+/// The config at `path` as one TOML document, both layers merged — for a reader that wants a
+/// few keys without the whole schema's validation (`Board::declared`, `edit::pad_bindings`).
+///
+/// A user layer that does not parse is left out, as [`Params::load`] leaves it out. `Ok("")`
+/// when neither file exists.
+pub fn layered_text(path: &Path) -> Result<String, String> {
+    let read = |p: &Path| read_optional(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
+    let base = read(path)?.unwrap_or_default();
+    let Some(user) = user_layer_for(path)
+        .map(|u| read(&u))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(base);
+    };
+    let base_table: toml::Table = base
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match user.parse::<toml::Table>() {
+        Ok(user_table) => Ok(merge_layers(base_table, user_table).to_string()),
+        Err(_) => Ok(base),
+    }
+}
+
+/// A file's text, or `None` when there is no file — a real state for either layer.
+fn read_optional(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `user` over `base`: tables merge key by key, recursively; anything else — a value, an array,
+/// an array of tables — replaces the base's whole.
+///
+/// Replacing arrays whole is the only reading that lets a user layer *remove* an entry: a
+/// `[[policy.skill]]` list merged element-wise could only ever grow. The editor copies the base's
+/// list into the user layer before it first changes one ([`edit`]), so nothing is lost by it.
+///
+/// Renamed sections are normalised first, in both layers, so a base under the old name and a
+/// user layer under the new one merge into one table instead of tripping the loader's duplicate
+/// check.
+pub fn merge_layers(mut base: toml::Table, mut user: toml::Table) -> toml::Table {
+    normalise_renamed(&mut base);
+    normalise_renamed(&mut user);
+    merge_into(&mut base, user);
+    base
+}
+
+fn normalise_renamed(table: &mut toml::Table) {
+    for (old, new) in registry::RENAMED_SECTIONS {
+        if !table.contains_key(*new)
+            && let Some(value) = table.remove(*old)
+        {
+            table.insert((*new).to_owned(), value);
+        }
+    }
+}
+
+fn merge_into(base: &mut toml::Table, user: toml::Table) {
+    for (key, value) in user {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(below)), toml::Value::Table(above)) => {
+                merge_into(below, above);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -125,6 +245,14 @@ pub struct Params {
     pub pad_roller: PadRollerParams,
     /// The pad over UDP: `netpadd` reads this, and so does `padd`, to know whether to stand down.
     pub netpad: NetpadParams,
+    /// Why the user layer ([`USER_PATH`]) was set aside, when it was — not a key in any file.
+    ///
+    /// A broken user layer does not stop the robot: it runs on the base alone, and `robotd`
+    /// reports *degraded* with this reason. Refusing to start would leave a robot that one bad
+    /// hand edit had taken off its own update path, since an update of either kind now keeps the
+    /// file.
+    #[serde(skip)]
+    pub user_layer_rejected: Option<String>,
 }
 
 /// The pad's walking speed limits: what full stick deflection asks for, per axis and per
@@ -1466,6 +1594,14 @@ pub struct PolicyParams {
     pub voltage_adapt: bool,
     /// Reference voltage for `voltage_adapt` — the supply the gains were identified at.
     pub nominal_voltage: f64,
+    /// Whether `policy.fetch` may download a policy from a Hub repo outside `pollen-robotics`.
+    ///
+    /// Off by default: a robot out of the box only fetches networks we published. It gates the
+    /// download and nothing else — a slot already pointing at a community policy keeps running
+    /// when this is turned off, so flipping it can never change what a robot does at its next
+    /// start. `robotd` does not read it; `updaterd` does, before every fetch
+    /// ([`Self::community_allowed`]). `docs/design/policy-channel-design.md` §9.2.
+    pub allow_community: bool,
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -2049,6 +2185,26 @@ impl ResolvedPolicy {
 }
 
 impl PolicyParams {
+    /// Whether `robotd.toml` at `path` allows community policies, read on its own.
+    ///
+    /// For `updaterd`, before every fetch, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
+    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
+    /// — the default, and the answer that downloads nothing.
+    pub fn community_allowed(path: &Path) -> bool {
+        let Some(text) = std::fs::read_to_string(path).ok() else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("policy")
+            .and_then(|policy| policy.get("allow_community"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The built-in skills with config merged over them, by name.
     ///
     /// Merge rather than replace, for the reason every other key in this file resolves the way it
@@ -2351,6 +2507,7 @@ impl Default for PolicyParams {
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
+            allow_community: false,
         }
     }
 }
@@ -2577,7 +2734,78 @@ impl Params {
     /// unprovisioned board should still come up on defaults rather than refuse to start,
     /// and a daemon that will not start is much harder to diagnose remotely than one
     /// running on known defaults. A file explicitly named on the command line must exist.
+    ///
+    /// At [`DEFAULT_PATH`] this is both layers, merged ([`user_layer_for`]). The base's errors
+    /// are fatal, as they always were; the user layer's are not — see
+    /// [`Params::user_layer_rejected`].
     pub fn load(path: &Path, explicit: bool) -> Result<Self, ParamsError> {
+        match user_layer_for(path) {
+            Some(user) => Self::load_layered(path, &user, explicit),
+            None => Self::load_one(path, explicit),
+        }
+    }
+
+    /// The base at `base` with the user layer at `user` over it.
+    ///
+    /// [`Params::load`] calls this for the provisioned path; it is public so a test can point it
+    /// at two temporary files.
+    pub fn load_layered(base: &Path, user: &Path, explicit: bool) -> Result<Self, ParamsError> {
+        let alone = Self::load_one(base, explicit)?;
+        match Self::with_user_layer(base, user) {
+            Ok(Some(merged)) => Ok(merged),
+            Ok(None) => Ok(alone),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "the user config is invalid; running on the base config alone until it is fixed"
+                );
+                Ok(Self {
+                    user_layer_rejected: Some(e.to_string()),
+                    ..alone
+                })
+            }
+        }
+    }
+
+    /// Both layers merged and validated, `Ok(None)` when there is no user layer, or the reason
+    /// the user layer cannot be used.
+    ///
+    /// The editor's gate as well as the loader's: [`edit`] validates a staged user layer through
+    /// this before renaming it into place, so nothing it writes is a layer the daemon would set
+    /// aside.
+    pub fn with_user_layer(base: &Path, user: &Path) -> Result<Option<Self>, ParamsError> {
+        let read = |path: &Path| {
+            read_optional(path).map_err(|source| ParamsError::Read {
+                path: path.display().to_string(),
+                source,
+            })
+        };
+        let Some(user_text) = read(user)? else {
+            return Ok(None);
+        };
+        // The user layer on its own first, so a syntax error or a wrong type is reported against
+        // the file somebody edited, with its own line and column — not against a merged document
+        // nobody has ever seen. Not validated alone: a partial file is not a robot, and the
+        // cross-key checks need the base's values.
+        Self::parse_file(&user_text, user, false)?;
+        let base_text = read(base)?.unwrap_or_default();
+        let table = |text: &str, path: &Path| {
+            text.parse::<toml::Table>()
+                .map_err(|source| ParamsError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
+        };
+        let merged = merge_layers(table(&base_text, base)?, table(&user_text, user)?).to_string();
+        // Errors from here on are named after the user layer: the base passed alone, so whatever
+        // fails now is something the user layer brought.
+        let params = Self::parse_file(&merged, user, true)?;
+        params.validate(user)?;
+        Ok(Some(params))
+    }
+
+    /// One file, as `load` read it before there were layers.
+    fn load_one(path: &Path, explicit: bool) -> Result<Self, ParamsError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
@@ -2591,41 +2819,58 @@ impl Params {
                 });
             }
         };
+        let params = Self::parse_file(&text, path, true)?;
+        params.validate(path)?;
+        Ok(params)
+    }
 
+    /// Text into `Params` for a file at `path`, as [`Params::parse`] does it, the error naming
+    /// `path`. `warn` is false for a pass whose unknown keys the next pass will report anyway.
+    fn parse_file(text: &str, path: &Path, warn: bool) -> Result<Self, ParamsError> {
+        let (params, ignored) = Self::parse(text).map_err(|source| ParamsError::Parse {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if warn && !ignored.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                ignored = %ignored.join(", "),
+                "this build has no such keys; they are ignored and their values do nothing"
+            );
+        }
+        Ok(params)
+    }
+
+    /// Parse the text of a `robotd.toml` the way the daemon does, unknown keys dropped (see
+    /// [`without_unknown_keys`]), and name the ones that were. No range checks — that is
+    /// [`Params::load`]'s second half.
+    ///
+    /// **Everything that reads this file goes through here**, not through `toml::from_str`. The
+    /// editor and the pad bindings once parsed strictly, so a key left behind by another branch
+    /// meant a robot that walked fine and a `robotctl configure` that would not open — and a
+    /// `pad.bind` that showed the phone the default bindings rather than the real ones.
+    pub fn parse(text: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
         // Strict first. A file this build fully understands parses exactly as it always has —
         // one pass, serde's own spans, no second guess — and that is the overwhelmingly common
         // case. The lenient path below only ever runs on a file that has already failed.
-        let params = match toml::from_str::<Params>(&text) {
-            Ok(params) => params,
+        match toml::from_str::<Params>(text) {
+            Ok(params) => Ok((params, Vec::new())),
             // Not an unknown-key problem: a syntax error, or a value of the wrong type. The
             // strict error is what gets reported, because it is the one carrying a line and a
             // column.
             Err(source) => {
-                let Some((reparsed, ignored)) = without_unknown_keys(&text) else {
-                    return Err(ParamsError::Parse {
-                        path: path.display().to_string(),
-                        source,
-                    });
+                let Some((reparsed, ignored)) = without_unknown_keys(text) else {
+                    return Err(source);
                 };
-                tracing::warn!(
-                    path = %path.display(),
-                    ignored = %ignored.join(", "),
-                    "this build has no such keys; they are ignored and their values do nothing"
-                );
                 // Pruned, and what is left still does not parse — a real error sharing a file
                 // with an inert one. This reports the real one, which costs the position: serde
                 // is now looking at a table rather than at the text. The alternative was worse.
                 // Returning the strict error here would name the key this release just declared
                 // harmless as the reason the daemon will not start, and send whoever reads it to
                 // delete a section that was never the problem.
-                reparsed.map_err(|source| ParamsError::Parse {
-                    path: path.display().to_string(),
-                    source,
-                })?
+                Ok((reparsed?, ignored))
             }
-        };
-        params.validate(path)?;
-        Ok(params)
+        }
     }
 
     /// Reject values that would produce a loop that cannot work, at startup rather than as
@@ -3776,6 +4021,134 @@ mod tests {
         assert!(Params::load(&dir.path().join("absent.toml"), true).is_err());
     }
 
+    /// Both layers in one directory, as `Params::load_layered` takes them.
+    fn layers(dir: &std::path::Path, base: &str, user: Option<&str>) -> (PathBuf, PathBuf) {
+        let base_path = dir.join("base.toml");
+        let user_path = dir.join("user.toml");
+        std::fs::write(&base_path, base).unwrap();
+        if let Some(user) = user {
+            std::fs::write(&user_path, user).unwrap();
+        }
+        (base_path, user_path)
+    }
+
+    /// The whole point of the user layer: what the owner set wins, key by key, and what the
+    /// image set and the owner did not touch is still the image's — so the next image can move
+    /// it.
+    #[test]
+    fn the_user_layer_wins_key_by_key_over_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[bus]\nport = \"/dev/ttyS2\"\n[control]\nhz = 50\n",
+            Some("[control]\nhz = 100\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 100, "the user's value");
+        assert_eq!(
+            p.bus.port, "/dev/ttyS2",
+            "the base's, untouched by the user"
+        );
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    #[test]
+    fn no_user_layer_is_the_base_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(dir.path(), "[control]\nhz = 75\n", None);
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 75);
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    /// A broken user layer must not take the robot down: it would take the update path down
+    /// with it, and no update replaces this file any more. The base runs, and the reason is
+    /// kept for `robotd`'s health to report — naming the file somebody has to fix.
+    #[test]
+    fn a_user_layer_that_does_not_parse_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[control]\nhz = 75\n",
+            Some("[control\nhz = 100\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).expect("the robot still starts");
+        assert_eq!(p.control.hz, 75, "the base alone");
+        let why = p.user_layer_rejected.expect("and says why");
+        assert!(why.contains("user.toml"), "names the file to fix: {why}");
+    }
+
+    /// Validation runs on the merged robot, not on either half: `hz = 0` parses fine and is
+    /// still a loop that cannot run.
+    #[test]
+    fn a_user_layer_that_fails_validation_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[control]\nhz = 75\n",
+            Some("[control]\nhz = 0\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert_eq!(p.control.hz, 75);
+        assert!(p.user_layer_rejected.is_some());
+    }
+
+    /// The base is the image's, and an image that ships a broken one is a broken image: that
+    /// stays fatal, exactly as a broken single file was.
+    #[test]
+    fn a_broken_base_is_still_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(dir.path(), "[control\n", Some("[control]\nhz = 100\n"));
+        assert!(Params::load_layered(&base, &user, true).is_err());
+    }
+
+    /// An image that still writes a section under its old name, under a user layer written by an
+    /// editor that uses the new one, is one section — not a duplicate the loader refuses.
+    #[test]
+    fn renamed_sections_merge_across_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, user) = layers(
+            dir.path(),
+            "[imu_head]\nenabled = true\n",
+            Some("[pad_imu_head_control]\ngain = 0.5\n"),
+        );
+        let p = Params::load_layered(&base, &user, true).unwrap();
+        assert!(
+            p.pad_imu_head_control.enabled,
+            "from the base, under its old name"
+        );
+        assert_eq!(p.pad_imu_head_control.gain, 0.5, "from the user layer");
+        assert!(p.user_layer_rejected.is_none());
+    }
+
+    /// A list replaces, it does not merge: otherwise a user layer could add a skill and never
+    /// remove one.
+    #[test]
+    fn a_user_list_replaces_the_base_list() {
+        let base: toml::Table = "[policy]\n[[policy.skill]]\nname = \"a\"\nduration = 1.0\n\
+                                 [[policy.skill]]\nname = \"b\"\nduration = 1.0\n"
+            .parse()
+            .unwrap();
+        let user: toml::Table = "[[policy.skill]]\nname = \"b\"\nduration = 2.0\n"
+            .parse()
+            .unwrap();
+        let merged = merge_layers(base, user);
+        let skills = merged["policy"]["skill"].as_array().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"].as_str(), Some("b"));
+    }
+
+    /// Only the provisioned path is layered. A file somebody named — a simulated duck's, a
+    /// bench override — means exactly what it says.
+    #[test]
+    fn only_the_provisioned_path_has_a_user_layer() {
+        assert_eq!(
+            user_layer_for(Path::new(DEFAULT_PATH)),
+            Some(PathBuf::from(USER_PATH))
+        );
+        assert_eq!(user_layer_for(Path::new("/tmp/duck-sim/robotd.toml")), None);
+    }
+
     /// Partial files are the normal case — a board overrides the port and nothing else.
     #[test]
     fn absent_sections_take_their_defaults() {
@@ -4268,6 +4641,10 @@ mod tests {
         assert!(!skill("kick_left").chain);
         assert!(p.voltage_adapt, "on by default since 2026-09-14");
         assert_eq!(p.nominal_voltage, 7.4);
+        assert!(
+            !PolicyParams::default().allow_community,
+            "only pollen-robotics policies out of the box"
+        );
 
         let name = |p: &Option<std::path::PathBuf>| {
             p.as_ref()
@@ -4481,5 +4858,29 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    /// `updaterd` asks this before every fetch, so it must answer from a file `robotd` would
+    /// reject, and must fall to "no" — the answer that downloads nothing — on anything else.
+    #[test]
+    fn community_allowed_reads_one_key_and_defaults_to_no() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            PolicyParams::community_allowed(&path)
+        };
+        assert!(read("[policy]\nallow_community = true\n"));
+        assert!(
+            read("[policy]\nallow_community = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[policy]\nallow_community = false\n"));
+        assert!(!read("[policy]\n# allow_community = true\n"));
+        assert!(!read("[policy]\nallow_community = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!PolicyParams::community_allowed(&path));
     }
 }

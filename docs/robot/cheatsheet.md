@@ -121,13 +121,15 @@ A robot nobody has touched prints nothing — that is the answer. Add `--json` f
 bundle. It needs no root and no terminal, which is the point: it is the first question to ask
 about a robot behaving oddly, and until now answering it meant a full-screen editor over ssh.
 
-An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
+An interactive editor over this robot's own settings, `/var/lib/robot/robotd.toml`, layered over the image's `/etc/robot/robotd.toml` ([architecture.md](../design/architecture.md), "Where the state lives"): every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
 value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
 screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
-this robot diverges from the defaults; everything else is the built-in default, and `unset`
-optionals show what they resolve to `(auto)`.
+this robot diverges from the defaults; everything else is the default, and `unset`
+optionals show what they resolve to `(auto)`. A key's default is the image's value where the
+image sets one and the built-in default otherwise, so reverting a key goes back to what the image
+says — and keeps following it through the next OS update.
 
 Three properties worth trusting:
 
@@ -262,6 +264,15 @@ Other people publish policies for this robot:
 robotctl policy search microduck
 ```
 
+A robot only fetches policies from `pollen-robotics` until you allow others. Run this, set
+`policy.allow_community` to `true`, and save:
+
+```
+sudo robotctl configure
+```
+
+Then:
+
 ```
 sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
 ```
@@ -383,7 +394,7 @@ oddly and you are not sure what was left set.
 #### The slots, and four things worth knowing
 
 The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
+`roulade`. `load` writes the choice into `/var/lib/robot/robotd.toml`, so it survives a reboot and
 survives updates — a release replaces the binaries and the policies it ships, not the line that
 points elsewhere.
 
@@ -554,7 +565,7 @@ unless `robotd --vetbook <file>` names one.
 
 Run `sudo robotctl configure`, then search for `pad_axes` to select axes, directions and gains.
 Head, body and roller limits are under `pad_head`, `pad_body` and `pad_roller`; walking speed
-limits remain under `pad_drive`. These share `/etc/robot/robotd.toml` with the `[pad]` button
+limits remain under `pad_drive`. These share `robotd.toml` with the `[pad]` button
 bindings, and apply within a second without restarting — to the Bluetooth pad and the pad over
 UDP alike.
 

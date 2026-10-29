@@ -94,7 +94,9 @@ Where the state lives, and what survives an update:
 
 | | |
 |---|---|
-| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration; the installer writes it once and never overwrites it. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
+| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration as the image or the installer wrote it. The installer writes it once and never overwrites it; an OS image replaces it with every OS update. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
+| `/var/lib/robot/robotd.toml` | the keys somebody changed on this robot, over the one above key by key — every writer (`robotctl configure`, `policy`, `pad`, and `robotd` serving the phone) writes here and only here (below) |
+| `/var/lib/robot/hf-token` | the Hugging Face sign-in, written by `updaterd` and read by `mediad` ([`remote-access-design.md`](remote-access-design.md) §2.5) |
 | `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
 | `/var/lib/robot/vetbook.json` | the vet book — the robot's lifetime record, owned by `robotd` (`robotd/src/vetbook.rs`) |
 | NetworkManager profiles | wifi credentials; we never store them (§3) |
@@ -104,6 +106,38 @@ Where the state lives, and what survives an update:
 
 Everything outside `releases/<ver>/` survives both an update and a rollback. That is the
 whole rule, and it is why per-board config is not shipped in the release.
+
+**An OS update is a second kind of update, and it moves the line.** A robot whose OS updates by
+A/B slots (`microduck_yocto`) has a fresh root filesystem in each slot, so `/etc` is the image's
+and is replaced with it; only `/var/lib/robot` — its own partition — survives. That is why
+anything an *owner* decides lives there, and anything the *image* decides stays in `/etc`:
+
+- **`robotd.toml` is two layers.** `/etc/robot/robotd.toml` is the base — the board, the bus
+  port, what the image ships — and `/var/lib/robot/robotd.toml` holds only the keys changed on
+  this robot. `robotd_params::Params::load` merges them for every reader at the default path:
+  tables key by key, anything else (lists included) replaced whole. The image can then move its
+  own values forward and the owner's still stand. A file named with `--params`/`--config` is read
+  alone, as before.
+- **A broken user layer does not stop the robot.** It is set aside, the robot runs on the base,
+  and `robotd` reports *degraded* naming the file — never *unhealthy*, which would roll back every
+  release over a file no release can fix. A broken base is still fatal: that is a broken image.
+  The editors validate a user layer against its base before writing it, so only a hand edit can
+  produce one.
+- **A robot that predates the layers has its edits in the base**, mixed in with the template it
+  was installed from. The first time `robotd` starts with no user layer — or an editor writes
+  one, whichever comes first — the keys somebody changed are *moved* into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
+  value no release's template ever shipped live, never `[board] version`. Moved rather than
+  copied, because a copy left in the base would still be the default the editor compares against,
+  hiding the edit and making "revert" a no-op; a rollback to a release without layers runs on the
+  template's values until it moves forward again. On an A/B robot whose OS update arrives first,
+  the bundle's install hook (`microduck_yocto`, `microduck-bundle-hook`) copies the running slot's
+  base to `/var/lib/robot/robotd.toml.from-slot` while there is no user layer, and the edits are
+  adopted from there; it does the same for `hf-token`.
+- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but two keys
+  are per-robot decisions — `allow_dev_keys` on a dev board, `auto_apply = "all"` on a canary —
+  and on an A/B robot an OS update currently puts both back to the image's values. Open.
+- On a robot installed by `install.sh`, which has no slots, `/etc` survives anyway; the layers
+  change nothing there but where an edit lands.
 
 How a change reaches a robot, end to end:
 
