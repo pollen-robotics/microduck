@@ -65,6 +65,18 @@ recipe, and the export to ONNX that this repo loads.
 
 It also sits, kicks a ball, rolls forward on command, and quacks in a voice that is its own.
 
+Everything above is remote-controlled: you drive, it moves. It does not yet act on its own.
+
+### What works today, and what's planned
+
+| | |
+|---|---|
+| **Today** | Walking, rolling, picking up, getting back up — all driven by you: a gamepad, the app, or your own script over the JSON-RPC contract. Signed, health-gated, reversible updates. |
+| **Planned** | The autonomous brain: behavior that decides on its own, without a human at the controls. This is roadmap milestone [M9](docs/project/roadmap.md#m9--the-autonomous-brain) — the largest piece of work left, deliberately sequenced last. The design thinking lives in [`docs/ideas/autonomous_behavior.md`](docs/ideas/autonomous_behavior.md), and [`docs/design/architecture.md` §5.3](docs/design/architecture.md#53-server-side-agents-dont-force-them-through-webrtc) sketches where server-side agents would plug in. None of it ships today. |
+
+If you are buying one, buy it for what it does in the table above. The autonomous part is a
+roadmap, not a feature.
+
 ## Where to find things
 
 ### You have a duck
