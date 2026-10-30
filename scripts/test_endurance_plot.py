@@ -308,6 +308,19 @@ class IntervalMetricTests(unittest.TestCase):
         self.assertAlmostEqual(intervals["dh"].sum() * 3600, 60)
         self.assertTrue(any("obvious sampling gap" in message for message in data.warnings))
 
+    def test_short_session_uses_configured_interval_to_exclude_long_gap(self):
+        # Two intervals are too few for an empirical median; without the metadata fallback
+        # this 990 s stall would be counted as walk time.
+        data = self.load_rows(session_rows([0, 10, 1000]), meta=meta_for([0], interval=10.0))
+        self.assertEqual(data.df["segment"].nunique(), 1)
+        self.assertAlmostEqual(data.df["sample_s"].iloc[0], 10.0)
+        intervals = plotter.valid_intervals(data.df)
+        self.assertEqual(intervals["left"].tolist(), [0])
+        self.assertAlmostEqual(intervals["dh"].sum() * 3600, 10)
+        durations = plotter.activity_intervals(data.df).groupby("activity")["dh"].sum() * 3600
+        self.assertAlmostEqual(durations["walk"], 10)
+        self.assertTrue(any("obvious sampling gap" in message for message in data.warnings))
+
     def test_unknown_activity_transition_interval_is_not_assigned(self):
         data = self.load_rows(session_rows([0, 10, 20, 30], activity=["walk", "walk", "stand", "stand"]))
         intervals = plotter.activity_intervals(data.df)
