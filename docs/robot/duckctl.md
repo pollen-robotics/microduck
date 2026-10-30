@@ -142,6 +142,12 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
+`ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
+(`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
+second, the scan is skipped. If nothing does — the robot moved, is off, or the laptop is on another
+network — it scans as before and remembers the new address. A lease handed to another machine shows
+up as ssh's host-key warning; `duckctl ip` always scans, and refreshes the file as it does.
+
 Files go the same way:
 
 ```bash
