@@ -67,6 +67,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+      # The training integrity helpers are standard-library-only so leakage and manifest
+      # regressions stay cheap to test; model training itself requires private recordings and
+      # PyTorch, and is deliberately not a CI job.
+      - name: Test pet-detect training integrity
+        run: python3 -m unittest discover -s pet-detect/training -p 'test_*.py'
+
       # These are the pieces of this repo that run without being compiled — four on a robot,
       # and `provision-board.sh` and `dev-push.sh` on a developer's machine — so nothing else
       # would catch a typo in one until someone tried to provision a board. shellcheck is on the

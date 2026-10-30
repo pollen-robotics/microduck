@@ -28,3 +28,9 @@ __pycache__/
 # holding `*` so it self-ignores; this is for the person who reaches for `python -m venv`, which
 # does not, and it is the same accident `__pycache__` above was added for.
 .venv/
+
+# Petting recordings contain room audio and are too large and privacy-sensitive for Git.
+# Keep the schema and collection guidance; publish reviewed datasets as versioned artifacts.
+/pet-detect/data/*
+!/pet-detect/data/README.md
+!/pet-detect/data/manifest.example.jsonl

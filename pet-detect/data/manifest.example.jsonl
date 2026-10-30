@@ -1,0 +1,4 @@
+{"path":"clips/duck-a-kitchen-normal-01.wav","label":"normal","session":"duck-a-kitchen-normal-01","robot":"duck-a","environment":"kitchen, walking motors and speech","license":"CC-BY-4.0"}
+{"path":"clips/duck-a-workshop-normal-02.wav","label":"normal","session":"duck-a-workshop-normal-02","robot":"duck-a","environment":"workshop, motors idle and fan","license":"CC-BY-4.0"}
+{"path":"clips/duck-a-kitchen-petting-01.wav","label":"petting","session":"duck-a-kitchen-petting-01","robot":"duck-a","environment":"kitchen, slow head scratches","license":"CC-BY-4.0"}
+{"path":"clips/duck-a-workshop-petting-02.wav","label":"petting","session":"duck-a-workshop-petting-02","robot":"duck-a","environment":"workshop, fast head scratches","license":"CC-BY-4.0"}
