@@ -1438,11 +1438,17 @@ impl AudioParams {
     /// in `robotd.toml` is the default and needs it, but the equally natural full spec
     /// `plughw:aic3104,0` would otherwise become `plughw:aic3104,0,0`, which no card
     /// answers to. That lands the worker in its restart loop for the life of the daemon.
+    ///
+    /// And only for `hw`/`plughw`, the two that take a card and a device positionally. Any
+    /// other name — `default`, which `duck-sim` configures, or a PCM from an asound.conf — is
+    /// already a whole PCM: `default,0` is `Unknown PCM default,0` to ALSA, the same restart
+    /// loop, on exactly the machines where nobody is reading the journal for it.
     pub fn capture_device(&self) -> String {
-        if self.device.contains(',') {
-            self.device.clone()
-        } else {
+        let positional = matches!(self.device.split_once(':'), Some(("hw" | "plughw", _)));
+        if positional && !self.device.contains(',') {
             format!("{},0", self.device)
+        } else {
+            self.device.clone()
         }
     }
 
@@ -3906,6 +3912,33 @@ mod tests {
             ..AudioParams::default()
         };
         assert_eq!(spelled_out.capture_device(), "plughw:aic3104,0");
+
+        let numeric = AudioParams {
+            device: "hw:1".to_owned(),
+            ..AudioParams::default()
+        };
+        assert_eq!(numeric.capture_device(), "hw:1,0");
+    }
+
+    /// A device that is a whole PCM is captured from as written. `duck-sim` sets
+    /// `device = "default"`, and `default,0` is not a PCM ALSA knows — so a simulated duck with
+    /// listening on had a mic worker that failed and restarted for as long as it ran.
+    #[test]
+    fn a_whole_pcm_is_captured_from_as_written() {
+        for device in [
+            "default",
+            "speaker",
+            "pulse",
+            "dmix:aic3104",
+            "default:CARD=facemic",
+        ] {
+            let params = AudioParams {
+                device: device.to_owned(),
+                ..AudioParams::default()
+            };
+            assert_eq!(params.capture_device(), device, "{device}");
+            assert_eq!(params.resolve_devices(&[]).capture, device, "{device}");
+        }
     }
 
     /// A board without the configured card plays and records on ALSA's `default`, which the
