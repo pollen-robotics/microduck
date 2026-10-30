@@ -179,6 +179,18 @@
 //! (classic)`, `connected`, `gamepad paired and trusted` — and `padd` drove from it. An Xbox pad
 //! paired a minute later through the unchanged LE path.
 //!
+//! **A classic pad does not reliably come back on its own, so the robot pages it.** Over LE the
+//! adapter's background scan is what reconnects a bonded pad; over BR/EDR nothing on the host
+//! side does — the pad is expected to page the robot, and it does so only when it is switched on.
+//! A fresh bond is where that bites: the clone (and an 8BitDo Pro 2 in NES mode) often drops the
+//! link a second or two after bonding, when its pairing-mode window closes, and is then bonded,
+//! trusted, still blinking, and not connected until it is power-cycled. On the beta board one
+//! pairing in three ended that way, and a plain `bluetoothctl connect` brought the pad straight up. So `bond` re-pages a classic pad whose link dropped before it answers,
+//! and `configd` sweeps for bonded classic pads that are down for the rest of the robot's life,
+//! backing off while the pages keep missing. LE pads are left out of both: they reconnect by
+//! themselves, and a host-initiated connect to one while `btd` holds a phone's link is the call
+//! `docs/project/pad-minimal-pairing.md` fault 3 shows failing.
+//!
 //! What has **not** been exercised on hardware: a DualSense, two pads in pairing mode at once, and
 //! pairing by explicit address.
 //!
@@ -221,6 +233,17 @@ const BOND_SETTLE: Duration = Duration::from_secs(5);
 
 /// How often to re-read `Paired` while waiting for a bond.
 const BOND_POLL: Duration = Duration::from_millis(200);
+
+/// Settle time before judging the link a fresh bond ended up with, and between re-pages of
+/// one that dropped.
+const LINK_SETTLE: Duration = Duration::from_secs(2);
+
+/// Re-pages after a fresh bond before the rest is left to the background reconnect sweep.
+const LINK_ATTEMPTS: u32 = 3;
+
+/// A page against a pad that is right there answers in well under a second; one that has
+/// gone dark burns its ~5 s page timeout inside this.
+const LINK_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long to keep sweeping after the first classified, unbonded pad turns up, for the rest of it.
 ///
@@ -658,6 +681,82 @@ impl BlueZ {
         }
     }
 
+    /// A freshly bonded classic pad may drop the link it paired over within seconds — the
+    /// Pro Controller clone does, when its pairing-mode page-scan window closes. Re-page a
+    /// pad that dropped, so a successful pairing leaves the pad *connected* rather than
+    /// bonded and dark until something else pages it.
+    async fn ensure_link(&self, mac: &str) {
+        for attempt in 1..=LINK_ATTEMPTS {
+            tokio::time::sleep(LINK_SETTLE).await;
+            let state = self
+                .devices()
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().find(|d| d.mac.eq_ignore_ascii_case(mac)));
+            let Some(device) = state else {
+                tracing::warn!(mac, "pad vanished from BlueZ right after bonding");
+                return;
+            };
+            if device.connected {
+                tracing::info!(mac, "link up");
+                return;
+            }
+            tracing::info!(mac, attempt, "link down after bonding; re-paging");
+            let builder = DeviceProxy::builder(&self.bus).path(device.path.as_ref());
+            let Ok(builder) = builder else { continue };
+            let Ok(proxy) = builder.build().await else {
+                continue;
+            };
+            match tokio::time::timeout(LINK_CONNECT_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!(mac, "re-paged; connected"),
+                Ok(Err(e)) => tracing::info!(mac, error = %e, "re-page refused"),
+                Err(_) => tracing::info!(mac, "re-page did not answer in time"),
+            }
+        }
+        tracing::warn!(
+            mac,
+            "bonded pad still not connected; the background sweep keeps trying"
+        );
+    }
+
+    /// Ask every bonded pad that lost its link to reconnect. One sweep; the caller repeats, and
+    /// backs off while this answers `true` — a pad still down after its page.
+    async fn sweep_reconnects(&self) -> PadResult<bool> {
+        // The pairing window owns the radio: a Connect here would fight its discovery.
+        let Ok(_not_pairing) = self.pairing.try_lock() else {
+            return Ok(false);
+        };
+        let devices = self.devices().await?;
+        let mut still_down = false;
+        for pad in needs_reconnect(&devices) {
+            // One object we cannot build a proxy for is no reason to skip the others.
+            let proxy = match DeviceProxy::builder(&self.bus).path(pad.path.as_ref()) {
+                Ok(builder) => builder.build().await,
+                Err(e) => Err(e),
+            };
+            let proxy = match proxy {
+                Ok(proxy) => proxy,
+                Err(e) => {
+                    tracing::debug!(mac = %pad.mac, error = %e, "no proxy for bonded pad");
+                    still_down = true;
+                    continue;
+                }
+            };
+            match tokio::time::timeout(LINK_CONNECT_TIMEOUT, proxy.connect()).await {
+                Ok(Ok(())) => tracing::info!(mac = %pad.mac, "reconnected bonded pad"),
+                Ok(Err(e)) => {
+                    tracing::debug!(mac = %pad.mac, error = %e, "reconnect refused");
+                    still_down = true;
+                }
+                Err(_) => {
+                    tracing::debug!(mac = %pad.mac, "reconnect did not answer in time");
+                    still_down = true;
+                }
+            }
+        }
+        Ok(still_down)
+    }
+
     /// Connect, pair, trust — in that order, for the reasons in this module's docs.
     async fn bond(&self, device: &Snapshot) -> Result<(), (proto::PadPairFailure, String)> {
         let proxy = DeviceProxy::builder(&self.bus)
@@ -700,11 +799,11 @@ impl BlueZ {
             }
 
             // Now connect, which is what brings up the HID channel and hands the pad to the kernel
-            // driver — `hid-nintendo`, for the clone above — so an input device appears. Soft: a
-            // bonded and trusted pad reconnects by itself, so a refusal here is not worth failing a
-            // pairing that succeeded. Logged at warn rather than info, though, because a classic
-            // pad that bonded and will not connect is the "connected light, no input" state from
-            // the other order, and worth a line in the journal.
+            // driver — `hid-nintendo`, for the clone above — so an input device appears. Soft: the
+            // link is checked and re-paged after trust is set, below, so a refusal here is not
+            // worth failing a pairing that succeeded. Logged at warn rather than info, though,
+            // because a classic pad that bonded and will not connect is the "connected light, no
+            // input" state from the other order, and worth a line in the journal.
             match tokio::time::timeout(BOND_TIMEOUT, proxy.connect()).await {
                 Ok(Ok(())) => tracing::info!("connected"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "bonded but not connected yet"),
@@ -791,8 +890,32 @@ impl BlueZ {
             .set_trusted(true)
             .await
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
+
+        // Classic only: an LE pad pages *us* when it wants back, and paging it from here only
+        // races its own reconnect.
+        if device.is_classic() {
+            self.ensure_link(&device.mac).await;
+        }
         Ok(())
     }
+}
+
+/// Bonded pads worth re-paging: trusted, a gamepad, on the classic transport, link down.
+///
+/// Empty while any pad is connected — the pad that is driving wins, and re-paging another one
+/// mid-drive is how a second bonded pad steals the robot from the hands holding the first.
+/// LE pads are excluded: they reconnect by themselves, and a host page only races that.
+fn needs_reconnect(devices: &[Snapshot]) -> Vec<&Snapshot> {
+    if devices
+        .iter()
+        .any(|d| d.paired && d.connected && d.is_gamepad())
+    {
+        return Vec::new();
+    }
+    devices
+        .iter()
+        .filter(|d| d.paired && d.trusted && !d.connected && d.is_classic() && d.is_gamepad())
+        .collect()
 }
 
 /// Collapse a pad that presents as two devices into the one worth bonding.
@@ -1074,6 +1197,10 @@ impl Pads for BlueZ {
         tracing::info!(mac, "pad forgotten");
         Ok(proto::PadForgetResult { removed: true })
     }
+
+    async fn reconnect_bonded(&self) -> PadResult<bool> {
+        self.sweep_reconnects().await
+    }
 }
 
 #[cfg(test)]
@@ -1118,5 +1245,44 @@ mod tests {
         let a = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
         let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
         assert_eq!(one_face_per_pad(vec![&a, &b]).len(), 2);
+    }
+
+    fn bonded(mac: &str, name: &str, class: Option<u32>, connected: bool) -> Snapshot {
+        Snapshot {
+            paired: true,
+            trusted: true,
+            connected,
+            ..face(mac, name, class)
+        }
+    }
+
+    /// A bonded classic pad with its link down is the one case the sweep pages.
+    #[test]
+    fn a_bonded_classic_pad_with_a_dropped_link_is_paged() {
+        let pad = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), false);
+        let devices = [pad];
+        let kept = needs_reconnect(&devices);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].mac, "98:B6:E9:28:06:09");
+    }
+
+    /// The pad someone is driving with stands down the sweep for everyone else.
+    #[test]
+    fn a_connected_pad_suppresses_the_sweep() {
+        let driving = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), true);
+        let idle = bonded("78:86:2E:BB:13:28", "Pro Controller", Some(0x2508), false);
+        assert!(needs_reconnect(&[driving, idle]).is_empty());
+    }
+
+    /// LE pads page us themselves; untrusted bonds and non-pads are not ours to page.
+    #[test]
+    fn le_untrusted_and_non_pads_are_never_paged() {
+        let le = bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller", None, false);
+        let untrusted = Snapshot {
+            trusted: false,
+            ..bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), false)
+        };
+        let speaker = bonded("00:11:22:33:44:55", "BT Speaker", Some(0x240414), false);
+        assert!(needs_reconnect(&[le, untrusted, speaker]).is_empty());
     }
 }
