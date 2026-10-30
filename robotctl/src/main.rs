@@ -50,6 +50,7 @@ mod frame;
 mod imu_view;
 mod led;
 mod monitor;
+mod motors;
 mod path_map;
 mod show;
 mod vetbook;
@@ -435,6 +436,35 @@ enum Namespace {
         args: endurance::EnduranceArgs,
     },
 
+    /// Cap every servo's PWM, as a percentage of the maximum (`50` is 50%). Bench tool.
+    ///
+    /// Writes the XL330's `pwm_limit` EEPROM register straight onto the bus, so **robotd must be
+    /// stopped** (`sudo systemctl stop robotd`) with the gamepad disconnected, or it is restarted
+    /// at once. Torque goes off on the servos first — EEPROM ignores writes otherwise, so **the
+    /// robot drops** — and they are rebooted afterwards for the value to take effect. The value
+    /// is kept across power cycles; robotd never rewrites it.
+    SetPwmLimit {
+        /// Percent of the maximum PWM, 0 to 100.
+        percent: f64,
+        /// Servo ids, space separated. None means all.
+        ids: Vec<u8>,
+        #[command(flatten)]
+        bus: MotorBusArgs,
+    },
+
+    /// Cap every servo's current, in mA. Bench tool, with the same rules as `set-pwm-limit`.
+    ///
+    /// Writes the XL330's `current_limit` EEPROM register (0 to 1750 mA). The robot's servo
+    /// firmware applies it in position control too, not only in the current-based modes.
+    SetCurrentLimit {
+        /// Milliamps, 0 to 1750.
+        milliamps: u16,
+        /// Servo ids, space separated. None means all.
+        ids: Vec<u8>,
+        #[command(flatten)]
+        bus: MotorBusArgs,
+    },
+
     /// Print a shell completion script on stdout.
     ///
     /// Generated from this binary's own command tree, so the completions a robot offers
@@ -519,6 +549,42 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Where `set-pwm-limit` and `set-current-limit` find the servos.
+#[derive(Args, Debug)]
+struct MotorBusArgs {
+    /// Serial port. Defaults to `bus.port` in robotd.toml.
+    #[arg(long)]
+    port: Option<String>,
+    /// Drop the robot without asking — torque goes off on every servo written.
+    #[arg(long)]
+    yes: bool,
+}
+
+impl MotorBusArgs {
+    /// The port robotd itself would open.
+    fn port(self) -> Result<String, Failure> {
+        if !self.yes {
+            return Err(Failure::new(
+                exit::USAGE,
+                "this turns torque off on the servos and the robot will collapse. Re-run with \
+                 --yes if that is what you want."
+                    .to_owned(),
+            ));
+        }
+        if let Some(port) = self.port {
+            return Ok(port);
+        }
+        robotd_params::Params::load(Path::new(robotd_params::DEFAULT_PATH), false)
+            .map(|p| p.bus.port)
+            .map_err(|e| {
+                Failure::new(
+                    exit::FAILED,
+                    format!("cannot read bus.port from robotd.toml ({e}); pass --port"),
+                )
+            })
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -5383,6 +5449,23 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Endurance { command, args } => {
             return endurance::run(&cli.robot_socket, command, args);
+        }
+        Namespace::SetPwmLimit { percent, ids, bus } => {
+            let port = bus.port()?;
+            return motors::run(&cli.robot_socket, &port, motors::Limit::Pwm(percent), ids);
+        }
+        Namespace::SetCurrentLimit {
+            milliamps,
+            ids,
+            bus,
+        } => {
+            let port = bus.port()?;
+            return motors::run(
+                &cli.robot_socket,
+                &port,
+                motors::Limit::Current(milliamps),
+                ids,
+            );
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
