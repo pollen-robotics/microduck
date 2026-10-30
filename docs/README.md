@@ -85,3 +85,4 @@ thinking is not lost and does not get mistaken for a decision.
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | Building, testing, repo layout, conventions, releasing. |
 | [`project/npu-bringup.md`](project/npu-bringup.md) | The duck detector on the RK3566's NPU: what runs, how to benchmark it, and the frame path that is still missing. |
 | [`../deploy/README.md`](../deploy/README.md) | What a robot image is configured with, and what provisioning actually does. |
+| [`../virtual-duck/README.md`](../virtual-duck/README.md) | The duck as an Android pet over other apps: microduck_rl's body, motions recorded from the official policies, voices made for a phone speaker. |
