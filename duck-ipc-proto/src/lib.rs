@@ -485,7 +485,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// installs. Served by `updaterd`, which hands the work to the image's `microduck-osupdate`
 /// ([`OsStatus`]). New routes: an `updaterd` predating them answers METHOD_NOT_FOUND, and a board
 /// whose image has no A/B slots answers [`code::NOT_SUPPORTED`].
-pub const API_VERSION: u32 = 46;
+///
+/// # v47 — anonymous usage data
+///
+/// [`method::TELEMETRY_STATUS`] and [`method::TELEMETRY_SET`]: whether the robot shares anonymous
+/// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
+/// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
+pub const API_VERSION: u32 = 47;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -912,6 +918,17 @@ pub mod method {
     /// Reboot into the other slot as it is, with no download: the way back from an OS update.
     pub const OS_SWITCH: &str = "os.switch";
 
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    //
+    // Anonymous usage data, sent to PostHog: on by default, and this is the owner's switch.
+    // Served by `updaterd`, which has the network stack and is up whenever the board is. What is
+    // sent and what never is: `docs/robot/telemetry.md`.
+
+    /// Whether this robot shares anonymous usage data.
+    pub const TELEMETRY_STATUS: &str = "telemetry.status";
+    /// Turn sharing on or off, at once and across reboots. Off also forgets the random robot id.
+    pub const TELEMETRY_SET: &str = "telemetry.set";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -1220,6 +1237,12 @@ pub enum Call {
     OsApply(OsApplyParams),
     /// Reboot into the other slot; see [`method::OS_SWITCH`].
     OsSwitch(OsSwitchParams),
+
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    /// Whether usage data is shared; see [`method::TELEMETRY_STATUS`].
+    TelemetryStatus,
+    /// Turn sharing on or off; see [`method::TELEMETRY_SET`].
+    TelemetrySet(TelemetrySetParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -1380,6 +1403,8 @@ impl Call {
             Call::OsCheck => method::OS_CHECK,
             Call::OsApply(_) => method::OS_APPLY,
             Call::OsSwitch(_) => method::OS_SWITCH,
+            Call::TelemetryStatus => method::TELEMETRY_STATUS,
+            Call::TelemetrySet(_) => method::TELEMETRY_SET,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1538,6 +1563,8 @@ impl Call {
             // worth of waiting, so a refusal the script makes at once comes back as an error
             // rather than as a phase. Long enough to want its own lane, and they change the robot.
             Call::OsApply(_) | Call::OsSwitch(_) => (Updater, Operation),
+            // A small file and a flag; the sending happens in a task `updaterd` owns.
+            Call::TelemetryStatus | Call::TelemetrySet(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1688,6 +1715,7 @@ impl Call {
             Call::VetbookShare(p) => encode(p),
             Call::OsApply(p) => encode(p),
             Call::OsSwitch(p) => encode(p),
+            Call::TelemetrySet(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
@@ -1729,6 +1757,7 @@ impl Call {
             | Call::AccountLogout
             | Call::OsStatus
             | Call::OsCheck
+            | Call::TelemetryStatus
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1830,6 +1859,8 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::OsSwitch(decode(params.or(Some(&empty)))?)
             }
+            method::TELEMETRY_STATUS => Call::TelemetryStatus,
+            method::TELEMETRY_SET => Call::TelemetrySet(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -2020,6 +2051,8 @@ pub mod test_support {
             Call::OsSwitch(OsSwitchParams {
                 interrupt_sessions: true,
             }),
+            Call::TelemetryStatus,
+            Call::TelemetrySet(TelemetrySetParams { enabled: false }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -3019,6 +3052,23 @@ pub struct OsSwitchParams {
     /// Skip *only* the "no active remote session" preflight check, as for `update.apply`.
     #[serde(default)]
     pub interrupt_sessions: bool,
+}
+
+/// Parameters of [`Call::TelemetrySet`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySetParams {
+    pub enabled: bool,
+}
+
+/// Answer to both `telemetry.*` calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryResult {
+    /// The owner's choice, as stored.
+    pub enabled: bool,
+    /// Whether anything is actually sent: `enabled`, and no `MICRODUCK_TELEMETRY=0` or
+    /// `DO_NOT_TRACK=1` in `updaterd`'s environment.
+    pub active: bool,
 }
 
 /// Answer to every `os.*` call: the board's two slots, what its channel offers, and where an
@@ -6038,7 +6088,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            77,
+            79,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

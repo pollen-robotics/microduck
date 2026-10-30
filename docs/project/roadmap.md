@@ -362,6 +362,7 @@ The numbers above are identifiers. This is the order.
 
 ## Not doing, on purpose
 
-Recorded so they stay decided: A/B image updates, OS/kernel OTA, fleet dashboards/telemetry,
-delta updates, staged rollouts, hardware capability matrix, competing model alternatives per
-slot (§17), peripheral firmware OTA (§11.1).
+Recorded so they stay decided: A/B image updates, OS/kernel OTA, fleet dashboards, delta updates,
+staged rollouts, hardware capability matrix, competing model alternatives per slot (§17),
+peripheral firmware OTA (§11.1). Anonymous usage telemetry was on this list and is now done
+([`telemetry.md`](../robot/telemetry.md)); per-device fleet telemetry still is not.

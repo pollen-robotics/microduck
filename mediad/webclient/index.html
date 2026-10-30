@@ -345,6 +345,10 @@
     <!-- The OS update page of a Yocto robot (microduck_yocto's microduck-osupdate, port 8090).
          Shown only once that port answers, so a robot without it shows nothing. -->
     <a id="os-update" class="pill" hidden target="_blank" rel="noopener">OS update</a>
+    <!-- The owner's switch for anonymous usage data (`telemetry.set`). Hidden until the robot
+         answers `telemetry.status`, so an older updaterd shows nothing. -->
+    <label id="telemetry-opt" class="pill" hidden>
+      <input type="checkbox" data-needs-channel> share anonymous usage data</label>
   </div>
 
   <div class="row">
@@ -1223,6 +1227,7 @@ function newPeerConnection() {
       // the most useful thing on the screen.
       setLive(true); clearAlert();
       startTelemetry();
+      showUsageData();
     };
     control.onclose = () => {
       setDc("control closed", "bad");
@@ -1233,6 +1238,19 @@ function newPeerConnection() {
     };
     control.onmessage = (e) => onControl(e.data);
   };
+}
+
+// ── anonymous usage data ───────────────────────────────────────────────────────
+//
+// Not the `telemetry` panel, which is robot state: this is whether the robot reports usage to
+// Pollen. `docs/robot/telemetry.md` says what is sent.
+function showUsageData() {
+  const label = document.getElementById("telemetry-opt");
+  const box = label.querySelector("input");
+  const show = (r) => { box.checked = r.enabled; label.hidden = false; };
+  call("telemetry.status", {}, true).then(show).catch(() => { label.hidden = true; });
+  box.onchange = () => call("telemetry.set", { enabled: box.checked }).then(show)
+    .catch(() => { box.checked = !box.checked; });
 }
 
 // ── JSON-RPC over the control channel ──────────────────────────────────────────

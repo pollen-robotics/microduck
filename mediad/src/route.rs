@@ -238,6 +238,11 @@ fn permits(call: &proto::Call) -> bool {
         // The OS's two reads, for the same reason: which build each slot holds is a question a
         // remote client may ask of a robot it cannot change.
         OsStatus | OsCheck => true,
+        // The dashboard's switch for anonymous usage data. With no authorisation here (§4) any
+        // LAN peer can flip it, which is acceptable for a choice that sends nothing personal,
+        // moves nothing, and is undone by flipping it back. Not mutating for the same reason, so
+        // `updaterd` does not gate it behind its peer policy either.
+        TelemetryStatus | TelemetrySet(_) => true,
 
         // ── identity and status ─────────────────────────────────────────────
         SystemInfo | SystemServices | SystemSetName(_) => true,

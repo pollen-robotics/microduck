@@ -52,6 +52,7 @@ pub mod robot;
 pub mod source;
 mod spawn;
 pub mod store;
+pub mod telemetry;
 pub mod transcript;
 /// Names to numbers, for the two lookups this crate makes against the user database.
 pub mod unix;

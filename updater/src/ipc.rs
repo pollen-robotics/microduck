@@ -130,6 +130,10 @@ pub struct Server {
 
     /// Where `vetbook.share` asks for the book and the robot's name.
     vetbook: crate::vetbook::Sources,
+
+    /// Anonymous usage data: the owner's switch, and the queue the task started by
+    /// [`Self::spawn_telemetry`] sends.
+    telemetry: Arc<crate::telemetry::Telemetry>,
 }
 
 impl Server {
@@ -169,7 +173,17 @@ impl Server {
             forced_owner_uid: None,
             account: Arc::new(crate::account::account_at(token_path)),
             vetbook: crate::vetbook::Sources::default(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(PathBuf::from(
+                crate::telemetry::DEFAULT_PATH,
+            ))),
         }
+    }
+
+    /// Keep the telemetry state somewhere other than a robot's: `updaterd` passes its
+    /// `state_dir`, and a test a temporary directory.
+    pub fn with_telemetry_at(mut self, path: PathBuf) -> Self {
+        self.telemetry = Arc::new(crate::telemetry::Telemetry::new(path));
+        self
     }
 
     /// Where `vetbook.share` finds `robotd` and `configd`, when not at their default sockets.
@@ -311,6 +325,12 @@ impl Server {
     /// still has an account that stops working after thirty days.
     pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
+    }
+
+    /// Report this start and send usage data until the process ends. Nothing leaves the robot
+    /// while the owner's switch is off; see [`crate::telemetry`].
+    pub fn spawn_telemetry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(Arc::clone(&self.telemetry).run(self.vetbook.robot_socket.clone()))
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for
@@ -702,6 +722,14 @@ impl Server {
             Call::AccountLogout => match self.account.logout().await {
                 Ok(was) => Response::ok(Some(id), &crate::account::logout_result(was)),
                 Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
+            },
+            // ── telemetry.* ─────────────────────────────────────────────────────
+            //
+            // No engine lock: a flag and a small file, outside every release directory.
+            Call::TelemetryStatus => Response::ok(Some(id), &self.telemetry.status()),
+            Call::TelemetrySet(params) => match self.telemetry.set(params.enabled) {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
             },
             // No engine lock, like the account: it reads two daemons and talks to the Hub, and
             // touches nothing an update owns.

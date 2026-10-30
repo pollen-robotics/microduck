@@ -109,6 +109,9 @@ pass "systemd is pid 1 (${state})"
 
 in_container() { docker exec "$NAME" sh -c "$1"; }
 
+# A test container is not a robot anybody uses: keep its updaterd out of the usage counts.
+in_container "mkdir -p /etc/systemd/system/updaterd.service.d && printf '[Service]\nEnvironment=MICRODUCK_TELEMETRY=0\n' > /etc/systemd/system/updaterd.service.d/telemetry.conf"
+
 # ── the first install, which is a board's bootstrap ──
 #
 # Run from the tree rather than from a release, because on a bare board nothing is installed yet.
