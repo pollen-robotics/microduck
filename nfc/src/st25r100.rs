@@ -20,9 +20,14 @@ use crate::{Error, Result};
 mod reg {
     pub const OPERATION: u8 = 0x00;
     pub const GENERAL: u8 = 0x01;
+    pub const TX_MOD: u8 = 0x04;
+    pub const RX_ANA2: u8 = 0x07;
+    pub const RX_DIG: u8 = 0x08;
     pub const CORR1: u8 = 0x09;
+    pub const CORR4: u8 = 0x0c;
     pub const CORR5: u8 = 0x0d;
     pub const DISPLAY1: u8 = 0x0f;
+    pub const PROTOCOL: u8 = 0x12;
     pub const PROTOCOL_TX1: u8 = 0x13;
     pub const PROTOCOL_RX1: u8 = 0x16;
     pub const NRT_GPT_CONFIG: u8 = 0x1e;
@@ -48,6 +53,9 @@ const FIFO: u8 = 0x5f;
 // Operation register (§5.13.1).
 const OP_TX_EN: u8 = 1 << 5;
 const OP_RX_EN: u8 = 1 << 4;
+/// The AM regulator, which modulates through TX_MOD `reg_am`. Set in every operation state:
+/// without it the ISO 15693 downlink does not reach the tag (measured 2026-10-27).
+const OP_AM_EN: u8 = 1 << 3;
 const OP_EN: u8 = 1 << 1;
 // General register (§5.13.2): single-ended driving on the RFO/RFI pair `rfo2` names.
 const GEN_SINGLE: u8 = 1 << 5;
@@ -61,6 +69,8 @@ const TX_CRC: u8 = 1 << 5;
 const RX_B_SOF_EOF: u8 = 0b0011_0000;
 const RX_PARITY: u8 = 1 << 3;
 const RX_CRC: u8 = 1 << 2;
+/// The anticollision bit, which the ISO 15693 receiver needs to see a subcarrier answer.
+const RX_ANTCL: u8 = 1 << 0;
 // IRQ status 1/2/3 (§5.13.61-63).
 const I_COL: u8 = 1 << 6;
 const I_RXE: u8 = 1 << 3;
@@ -79,6 +89,27 @@ const CORR1_NFCA_106: u8 = 0xc3;
 /// kbit/s, against 3 at power-on.
 const DEC_F_MASK: u8 = 0b0000_0111;
 const DEC_F_NFCA_106: u8 = 0b010;
+/// 4 for ISO 15693 at 26.48 kbit/s, and `en_subc_end` besides — both what ST's reader library
+/// sets for that mode.
+const DEC_F_NFCV_26: u8 = 0b100;
+const EN_SUBC_END: u8 = 1 << 4;
+/// The correlator-1 coefficients for ISO 15693 at 26.48 kbit/s.
+const CORR1_NFCV_26: u8 = 0xc0;
+
+/// Protocol register (§5.13.19): `om<3:0>` picks the framing. The rate fields stay 0 — 106 and
+/// 26.48 kbit/s are the same code on either side.
+const OM_MASK: u8 = 0x0f;
+const OM_ISO14443A: u8 = 0x01;
+const OM_ISO15693: u8 = 0x05;
+
+/// Rx path digital register (§5.13.9), the filter coefficients: 0x4C for ISO 14443A at 106,
+/// 0x08 for ISO 15693 at 26.48 (ST's reader library, both).
+const RX_DIG_FILT_MASK: u8 = 0b0111_1100;
+const RX_DIG_NFCA_106: u8 = 0x4c;
+const RX_DIG_NFCV_26: u8 = 0x08;
+/// Correlator 4 (§5.13.13): collision and data levels. Only written for ISO 15693, whose
+/// subcarrier reception wants the lower levels; the power-on value serves ISO 14443A.
+const CORR4_NFCV_26: u8 = 0xaa;
 
 /// `ic_type` in the identity register's top five bits (§5.13.64).
 const IC_TYPE_ST25R100: u8 = 0b10101;
@@ -98,6 +129,17 @@ pub enum Antenna {
     Two,
 }
 
+/// Which protocol the transceiver frames: the operation mode plus the receiver settings it
+/// needs. The per-frame registers [`St25r100::transceive`] programs (parity, CRC) need no
+/// change between them — the parity bit does nothing outside ISO 14443A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    /// ISO 14443A at 106 kbit/s: NFC Type 2 tags (NTAG).
+    A,
+    /// ISO 15693 at 26.48 kbit/s: NFC Type 5 tags (ST25TV, ICODE).
+    V,
+}
+
 impl Antenna {
     fn general(self) -> u8 {
         GEN_SINGLE
@@ -111,11 +153,16 @@ impl Antenna {
 pub struct St25r100<B> {
     bus: B,
     antenna: Antenna,
+    proto: Proto,
 }
 
 impl<B: Bus> St25r100<B> {
     pub fn new(bus: B, antenna: Antenna) -> Self {
-        Self { bus, antenna }
+        Self {
+            bus,
+            antenna,
+            proto: Proto::A,
+        }
     }
 
     pub fn antenna(&self) -> Antenna {
@@ -179,24 +226,64 @@ impl<B: Bus> St25r100<B> {
         if let Err(e) = adjusted {
             tracing::warn!(error = %e, "carrying on with the power-on regulator setting");
         }
+        // Modulation through the AM regulator at 12%, and the receiver gain ST's reader library
+        // initialises to. Its measured-working ISO 15693 configuration, which the power-on
+        // values are not: a tag answered nothing until these (2026-10-27).
+        let tx_mod = self.read(reg::TX_MOD)?;
+        self.write(reg::TX_MOD, &[(tx_mod & !0xf1) | 0x41])?;
+        let rx_ana2 = self.read(reg::RX_ANA2)?;
+        self.write(reg::RX_ANA2, &[(rx_ana2 & !0x0f) | 0x04])?;
         // The receiver's decoder, set for ISO 14443A at 106 kbit/s. The power-on correlator
         // settings do not decode it: on the board a tag's ATQA raised I_subc_start every time and
-        // never I_rxs. With these two it decoded every time (2026-10-06).
-        self.write(reg::CORR1, &[CORR1_NFCA_106])?;
+        // never I_rxs. With these it decoded every time (2026-10-06).
+        self.set_proto(Proto::A)?;
+        self.write(reg::OPERATION, &[OP_EN | OP_AM_EN])
+    }
+
+    /// Frame the transceiver for one protocol: the operation mode, the digital filters and the
+    /// correlator. The register values are ST's own reader library's for each mode; the two
+    /// were measured working on this board (2026-10-27, the beta's reader and an ST25TV).
+    pub fn set_proto(&mut self, proto: Proto) -> Result<()> {
+        self.proto = proto;
+        let (om, rx_dig, corr1, dec_f) = match proto {
+            Proto::A => (
+                OM_ISO14443A,
+                RX_DIG_NFCA_106,
+                CORR1_NFCA_106,
+                DEC_F_NFCA_106,
+            ),
+            Proto::V => (OM_ISO15693, RX_DIG_NFCV_26, CORR1_NFCV_26, DEC_F_NFCV_26),
+        };
+        let protocol = self.read(reg::PROTOCOL)?;
+        self.write(reg::PROTOCOL, &[(protocol & !OM_MASK) | om])?;
+        let dig = self.read(reg::RX_DIG)?;
+        self.write(reg::RX_DIG, &[(dig & !RX_DIG_FILT_MASK) | rx_dig])?;
+        self.write(reg::CORR1, &[corr1])?;
         let corr5 = self.read(reg::CORR5)?;
-        self.write(reg::CORR5, &[(corr5 & !DEC_F_MASK) | DEC_F_NFCA_106])?;
-        self.write(reg::OPERATION, &[OP_EN])
+        let subc = if matches!(proto, Proto::V) {
+            EN_SUBC_END
+        } else {
+            0
+        };
+        self.write(
+            reg::CORR5,
+            &[(corr5 & !(DEC_F_MASK | EN_SUBC_END)) | subc | dec_f],
+        )?;
+        if matches!(proto, Proto::V) {
+            self.write(reg::CORR4, &[CORR4_NFCV_26])?;
+        }
+        Ok(())
     }
 
     /// Field off, chip still ready.
     pub fn field_off(&mut self) -> Result<()> {
-        self.write(reg::OPERATION, &[OP_EN])
+        self.write(reg::OPERATION, &[OP_EN | OP_AM_EN])
     }
 
     /// Put the field on the other antenna. Takes effect at the next [`Reader::reset_field`].
     pub fn set_antenna(&mut self, antenna: Antenna) -> Result<()> {
         self.antenna = antenna;
-        self.write(reg::OPERATION, &[OP_EN])?;
+        self.write(reg::OPERATION, &[OP_EN | OP_AM_EN])?;
         self.write(reg::GENERAL, &[antenna.general()])
     }
 
@@ -266,9 +353,9 @@ fn outcome(irq: [u8; 3]) -> Option<Result<()>> {
 
 impl<B: Bus> Reader for St25r100<B> {
     fn reset_field(&mut self) -> Result<()> {
-        self.write(reg::OPERATION, &[OP_EN])?;
+        self.write(reg::OPERATION, &[OP_EN | OP_AM_EN])?;
         sleep(FIELD_RESET);
-        self.write(reg::OPERATION, &[OP_EN | OP_RX_EN | OP_TX_EN])?;
+        self.write(reg::OPERATION, &[OP_EN | OP_AM_EN | OP_RX_EN | OP_TX_EN])?;
         sleep(GUARD);
         Ok(())
     }
@@ -279,7 +366,13 @@ impl<B: Bus> Reader for St25r100<B> {
         self.command(cmd::STOP_ALL)?;
         self.command(cmd::CLEAR_RX_GAIN)?;
         let tx = TX_PARITY | if exchange.crc { TX_CRC } else { 0 };
-        let rx = RX_B_SOF_EOF | RX_PARITY | if exchange.rx_crc() { RX_CRC } else { 0 };
+        let mut rx = RX_B_SOF_EOF | RX_PARITY | if exchange.rx_crc() { RX_CRC } else { 0 };
+        // The 15693 receiver wants the anticollision bit as well — ST's reader library sets it
+        // for its inventory, without which a tag's answer does not register (measured
+        // 2026-10-27).
+        if matches!(self.proto, Proto::V) {
+            rx |= RX_ANTCL;
+        }
         self.write(reg::PROTOCOL_TX1, &[tx])?;
         self.write(reg::PROTOCOL_RX1, &[rx])?;
         let ticks = nrt_ticks(exchange.timeout_ms).to_be_bytes();

@@ -248,6 +248,18 @@ mod tests {
         assert_eq!(parse(&[TLV_NDEF, 0, TLV_TERMINATOR]).unwrap(), vec![]);
     }
 
+    /// Phone NFC apps write a Lock Control TLV ahead of the record; the walk has to skip
+    /// unknown TLVs by their length, which is what keeps such a tag readable.
+    #[test]
+    fn a_lock_tlv_ahead_of_the_message_is_walked_past() {
+        let mut tag = vec![0x01, 0x03, 0xA0, 0x0C, 0x34]; // a phone app's lock TLV
+        tag.extend(text_tag("98:B6:E9:28:06:09"));
+        assert_eq!(
+            mac_in(&parse(&tag).unwrap()),
+            Some("98:B6:E9:28:06:09".into())
+        );
+    }
+
     #[test]
     fn an_address_is_found_however_it_is_spelled() {
         let mac = |s: &str| mac_in(&[Record::Text(s.into())]);
