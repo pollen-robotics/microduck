@@ -165,7 +165,10 @@ pub(super) fn run(robot_socket: &Path, port: &str, limit: Limit, ids: Vec<u8>) -
         )));
     }
     if !failed.is_empty() {
-        return Err(bus_error(format!("{register} was not set on {}", names(&failed))));
+        return Err(bus_error(format!(
+            "{register} was not set on {}",
+            names(&failed)
+        )));
     }
     println!(
         "{register} set to {} on {} servo(s), rebooted. Torque is off; `robot init` or Start \
@@ -259,7 +262,9 @@ fn open(port: &str) -> Result<Xl330Controller> {
             };
             Failure::new(code, format!("opening {port}: {e}"))
         })?;
-    Ok(Xl330Controller::new().with_protocol_v2().with_serial_port(serial))
+    Ok(Xl330Controller::new()
+        .with_protocol_v2()
+        .with_serial_port(serial))
 }
 
 fn name(id: u8) -> &'static str {
@@ -297,7 +302,10 @@ mod tests {
     #[test]
     fn current_is_milliamps_up_to_the_xl330_maximum() {
         assert_eq!(Limit::Current(800).raw().unwrap(), 800);
-        assert_eq!(Limit::Current(CURRENT_MAX_MA).raw().unwrap(), CURRENT_MAX_MA);
+        assert_eq!(
+            Limit::Current(CURRENT_MAX_MA).raw().unwrap(),
+            CURRENT_MAX_MA
+        );
         assert!(Limit::Current(CURRENT_MAX_MA + 1).raw().is_err());
     }
 
