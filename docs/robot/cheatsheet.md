@@ -482,6 +482,20 @@ answers, flashes the new servo as that joint, sets its registers and reboots it.
 adopted`. One at a time: with two joints missing it cannot tell which the new servo is for, waits,
 and says so.
 
+**PWM and current limits** are EEPROM registers on the servos, written on the bench with `robotd`
+stopped — disconnect the gamepad first, or it starts `robotd` again:
+
+```
+sudo systemctl stop robotd
+sudo robotctl set-pwm-limit 50 --yes          # 50% of max PWM, every servo; or `50 20 21 --yes` for just those
+sudo robotctl set-current-limit 800 --yes     # mA, 0–1750
+sudo systemctl start robotd
+```
+
+Torque goes off on the servos first (EEPROM ignores writes otherwise), so **the robot drops**; each
+value is read back, and the servos are rebooted so it takes effect. `robotctl` refuses while
+`robotd` holds its lock.
+
 `init` works whether or not the robot has fallen — by default a fall is a *report* (visible in
 `robotctl monitor`), not a gate, matching the prototype. A board that sets `[safety] fall_limp`
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses

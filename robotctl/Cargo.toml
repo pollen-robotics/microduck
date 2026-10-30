@@ -57,5 +57,12 @@ ratatui = { version = "0.30.2", default-features = false, features = [
 # computation, no image backends.
 qrcode = { version = "0.14.1", default-features = false }
 
+# `set-pwm-limit` and `set-current-limit`, which write two EEPROM registers on the servos with
+# robotd stopped. The same pins as `duck-control`, for its reasons — including
+# `default-features = false` on serialport, whose libudev feature breaks the aarch64 build.
+# Neither brings in anything the recovery-path rule above is about.
+rustypot = "1.8.0"
+serialport = { version = "4.8", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.27.0"
