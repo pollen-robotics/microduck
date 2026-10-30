@@ -1431,6 +1431,57 @@ mod tests {
         );
     }
 
+    /// **The twin must walk on what a robot walks on.**
+    ///
+    /// `duck-sim` names every slot explicitly, because robotd's own default paths point into a
+    /// release directory a laptop does not have — so its `[policy]` block is a hand-kept copy of
+    /// robotd's walk-mode defaults. It drifted once: set v5 made the default `velstand` with no
+    /// standing network, and the twin stayed on `alpha_walking` + `alpha_stand` for weeks,
+    /// walking on a gait no robot ran and unable to turn on the spot. A slot robotd leaves
+    /// unloaded must be `"none"` here, not merely absent, since absent means robotd's default.
+    #[test]
+    fn duck_sim_names_robotds_walk_defaults() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = std::fs::read_to_string(root.join("scripts/duck-sim")).unwrap();
+        let block: Vec<&str> = script
+            .lines()
+            .skip_while(|l| !l.contains("cat > \"$STATE/robotd.toml\""))
+            .skip_while(|l| *l != "[policy]")
+            .skip(1)
+            .take_while(|l| !l.is_empty() && !l.starts_with('['))
+            .collect();
+        assert!(!block.is_empty(), "duck-sim must write a [policy] block");
+
+        let resolved = robotd_params::PolicyParams {
+            mode: robotd_params::Mode::Walk,
+            ..Default::default()
+        }
+        .resolved();
+        for slot in robotd_params::Slot::ALL {
+            let key = format!("{} = ", slot.as_str());
+            let named = block
+                .iter()
+                .find_map(|l| l.strip_prefix(&key))
+                .unwrap_or_else(|| panic!("duck-sim must name the {} slot", slot.as_str()))
+                .trim_matches('"');
+            let named = (named != "none").then(|| {
+                named
+                    .strip_prefix("$POLICIES/")
+                    .unwrap_or_else(|| panic!("{named:?} is not under $POLICIES"))
+                    .to_owned()
+            });
+            let default = resolved
+                .slot(slot)
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+            assert_eq!(
+                named,
+                default,
+                "duck-sim's {} slot has drifted from robotd's walk-mode default",
+                slot.as_str()
+            );
+        }
+    }
+
     /// **The seeder's `sed` must match what the manifest actually says.**
     ///
     /// There is no JSON parser where that script runs — a release on a board with curl and a

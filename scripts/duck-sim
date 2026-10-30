@@ -236,11 +236,16 @@ up() {
 
     # Every policy named explicitly: `RELEASE_DIR` is /opt/robot/daemon/current, which exists on a
     # robot and not here, and `PolicyParams::resolved` uses a named path verbatim when it has one.
+    #
+    # Named, so they are a copy of robotd's walk-mode defaults, and a copy drifts: these lines were
+    # written while `alpha_walking` + `alpha_stand` was the default, and kept them after set v5
+    # made it `velstand` with no standing network. The twin then walked on a gait no robot runs,
+    # one that cannot turn on the spot. `xtask` holds them to the defaults now.
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$POLICIES/alpha_walking.onnx"
-stand = "$POLICIES/alpha_stand.onnx"
+walk = "$POLICIES/velstand.onnx"
+stand = "none"
 sitstand = "$POLICIES/alpha_sitstand.onnx"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
