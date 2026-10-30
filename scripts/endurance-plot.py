@@ -52,7 +52,7 @@ CRITICAL = "#e34948"
 
 # A median is stable against a few stalls; five times it is a conservative "obvious gap" rule
 # that still admits ordinary scheduler jitter. Fewer than three positive intervals cannot
-# establish a cadence, so short segments are reported as having no gap estimate.
+# establish an empirical median, but a matched configured interval can still provide a fallback.
 GAP_FACTOR = 5.0
 MIN_CADENCE_INTERVALS = 3
 # started_wall is written just before the first sample; allow a small clock/rounding skew when
@@ -276,7 +276,19 @@ def assign_segments(df: pd.DataFrame, meta: list[dict[str, Any]], warnings: list
 
     df["segment"] = segment
     df["meta_segment"] = meta_segment
-    df["sample_s"] = estimate_cadence(df, segment)
+    sample_s = estimate_cadence(df, segment)
+    # A three-sample session has only two intervals, too few for a median. Its matched
+    # producer interval is still enough to reject an obvious stall as measured time.
+    for sid in np.unique(segment):
+        mask = segment == sid
+        if np.isfinite(sample_s[mask]).any():
+            continue
+        meta_index = int(meta_segment[mask][0])
+        if 0 <= meta_index < len(meta):
+            configured = finite_number(meta[meta_index]["args"].get("interval"))
+            if configured is not None and configured > 0:
+                sample_s[mask] = max(configured, 0.5)  # producer clamps its interval to 0.5 s
+    df["sample_s"] = sample_s
 
     t_complete = "t_s" in df and np.isfinite(df["t_s"].to_numpy(dtype=float)).all()
     u_complete = "uptime_s" in df and np.isfinite(df["uptime_s"].to_numpy(dtype=float)).all()
@@ -308,7 +320,7 @@ def assign_segments(df: pd.DataFrame, meta: list[dict[str, Any]], warnings: list
         cadence = df["sample_s"].to_numpy(dtype=float)[:-1]
         gaps = same_session & finite_dt & (dt > 0) & np.isfinite(cadence) & (dt > GAP_FACTOR * cadence)
         if np.any(gaps):
-            warn(warnings, f"{int(gaps.sum())} obvious sampling gap(s) exceed {GAP_FACTOR:g}× the segment median "
+            warn(warnings, f"{int(gaps.sum())} obvious sampling gap(s) exceed {GAP_FACTOR:g}× the segment sampling interval "
                            "and are excluded from measured durations and rates.")
     return df
 
@@ -894,7 +906,7 @@ def summary(data: RunData, drain: pd.DataFrame) -> str:
     for sid, group in df.groupby("segment", sort=True):
         value = group["sample_s"].iloc[0]
         cadences.append(f"session {sid}: {value:.1f} s" if math.isfinite(value) else f"session {sid}: insufficient samples")
-    lines.append("- Median sampling interval: " + "; ".join(cadences))
+    lines.append("- Sampling interval used for gap detection: " + "; ".join(cadences))
 
     battery = numeric_column(df, "battery_pct")
     finite_battery = np.isfinite(battery)
@@ -976,7 +988,7 @@ def summary(data: RunData, drain: pd.DataFrame) -> str:
         lines += ["", "## Data quality", ""]
         lines += [f"- {message}" for message in data.warnings]
     text = "\n".join(lines) + "\n"
-    (run / "summary.md").write_text(text)
+    (run / "summary.md").write_text(text, encoding="utf-8")
     return text
 
 
