@@ -5743,6 +5743,167 @@ pub fn publish_identity(service: &str, build: BuildInfo) -> Result<(), String> {
     std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What `btd` last observed about chorale discovery. This is diagnostic output only:
+/// owned radio tasks and the robot's requests remain the authority for operations.
+/// Times are Unix seconds on the robot clock; readers must check `observed_at` for freshness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlePresenceStatus {
+    pub observed_at: i64,
+    /// Unknown until a connected robotd has requested a listening state.
+    pub requested: Option<bool>,
+    pub scan: BlePresenceScan,
+    /// Attempts started since listening was enabled, including the initial attempt.
+    pub attempts: u64,
+    /// Last successfully decoded chorale beacon, not proof of an accepted musical peer.
+    pub last_sighting: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+/// A scan is listening only after its BlueZ registration succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BlePresenceScan {
+    Unavailable { reason: String },
+    Disconnected,
+    Off,
+    Starting,
+    Listening { mode: BleScanMode, followers: usize },
+    Retrying { delay_ms: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BleScanMode {
+    Monitor,
+    Discovery,
+}
+
+/// The existing btd runtime directory is writable by the service and removed when it stops.
+pub fn ble_presence_path() -> std::path::PathBuf {
+    runtime_root().join("btd/chorale.json")
+}
+
+/// Publish with one serialized writer. Readers see the previous complete snapshot or the new
+/// one, never an in-place partial write. Failures are diagnostic and must not stop the radio.
+pub fn publish_ble_presence(
+    path: &std::path::Path,
+    status: &BlePresenceStatus,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let mut json = serde_json::to_vec(status).map_err(|e| e.to_string())?;
+    json.push(b'\n');
+    let temporary = path.with_extension("json.tmp");
+    let result = std::fs::write(&temporary, json).and_then(|()| std::fs::rename(&temporary, path));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("{}: {error}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn read_ble_presence() -> Option<BlePresenceStatus> {
+    read_ble_presence_at(&ble_presence_path())
+}
+
+/// Missing or unreadable telemetry is unavailable, never implicitly listening or off.
+pub fn read_ble_presence_at(path: &std::path::Path) -> Option<BlePresenceStatus> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+#[cfg(test)]
+mod ble_presence_tests {
+    use super::*;
+
+    fn snapshot(scan: BlePresenceScan) -> BlePresenceStatus {
+        BlePresenceStatus {
+            observed_at: 100,
+            requested: Some(true),
+            scan,
+            attempts: 2,
+            last_sighting: Some(98),
+            last_error: Some("scan ended".into()),
+        }
+    }
+
+    /// The tagged file contract distinguishes a registered mode from an attempt in progress.
+    #[test]
+    fn presence_states_round_trip() {
+        for scan in [
+            BlePresenceScan::Unavailable {
+                reason: "no adapter".into(),
+            },
+            BlePresenceScan::Disconnected,
+            BlePresenceScan::Off,
+            BlePresenceScan::Starting,
+            BlePresenceScan::Listening {
+                mode: BleScanMode::Monitor,
+                followers: 3,
+            },
+            BlePresenceScan::Listening {
+                mode: BleScanMode::Discovery,
+                followers: 0,
+            },
+            BlePresenceScan::Retrying { delay_ms: 500 },
+        ] {
+            let status = snapshot(scan);
+            let json = serde_json::to_value(&status).unwrap();
+            assert!(json["scan"]["state"].is_string());
+            assert_eq!(json["observedAt"], 100);
+            assert_eq!(
+                serde_json::from_value::<BlePresenceStatus>(json).unwrap(),
+                status
+            );
+        }
+    }
+
+    /// Renaming leaves already-open readers on the previous complete inode.
+    #[test]
+    fn presence_publication_replaces_a_complete_snapshot() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("btd/chorale.json");
+        let first = snapshot(BlePresenceScan::Starting);
+        publish_ble_presence(&path, &first).unwrap();
+        let mut previous = std::fs::File::open(&path).unwrap();
+        let second = snapshot(BlePresenceScan::Retrying { delay_ms: 500 });
+        publish_ble_presence(&path, &second).unwrap();
+        let mut old_json = String::new();
+        previous.read_to_string(&mut old_json).unwrap();
+        assert_eq!(
+            serde_json::from_str::<BlePresenceStatus>(&old_json).unwrap(),
+            first
+        );
+        assert_eq!(read_ble_presence_at(&path), Some(second));
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    /// A failed temporary write must leave the last readable observation intact.
+    #[test]
+    fn failed_presence_publication_preserves_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chorale.json");
+        let first = snapshot(BlePresenceScan::Starting);
+        publish_ble_presence(&path, &first).unwrap();
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        assert!(publish_ble_presence(&path, &snapshot(BlePresenceScan::Off)).is_err());
+        assert_eq!(read_ble_presence_at(&path), Some(first));
+    }
+
+    #[test]
+    fn absent_or_malformed_presence_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chorale.json");
+        assert_eq!(read_ble_presence_at(&path), None);
+        for bytes in ["{", "{}", r#"{"scan":{"state":"unknown"}}"#] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(read_ble_presence_at(&path), None);
+        }
+    }
+}
+
 /// What `mediad`'s capture path is doing, published for `robotctl` to read.
 ///
 /// A file rather than a query, for the same reason [`Identity`] is one: it needs no socket, no

@@ -1832,6 +1832,9 @@ struct HealthReport {
     /// reasons, plus `--no-remote`.
     #[serde(skip_serializing_if = "Option::is_none")]
     remote: Option<proto::RemoteStatus>,
+    /// btd-owned observations; separate from robotd's hardware health verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ble_presence: Option<proto::BlePresenceStatus>,
     /// Who `updaterd` says this robot is signed in as — the account on disk, which is not always
     /// the one the service listed it under. `None` when `updaterd` could not be asked, which the
     /// software block already reports.
@@ -1977,6 +1980,7 @@ fn run_health(
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
         remote: proto::read_remote_status(),
+        ble_presence: proto::read_ble_presence(),
         account: Client::connect(socket)
             .ok()
             .and_then(|mut client| client.call(&proto::Call::AccountStatus).ok())
@@ -2217,6 +2221,10 @@ fn render_health(report: &HealthReport) -> String {
             "camera    {rate}, {}x{} {}{dropped} — {watching}",
             camera.width, camera.height, camera.format
         );
+    }
+
+    if let Some(line) = ble_presence_line(report) {
+        out.push_str(&line);
     }
 
     if let Some(line) = central_line(report) {
@@ -2503,6 +2511,64 @@ fn describe_age(age: i64) -> String {
     };
     let plural = if count == 1 { "" } else { "s" };
     format!("{count} {unit}{plural} ago")
+}
+
+/// This is the transport's observation, not evidence that a nearby duck exists or that
+/// robotd accepted its beacon. An old snapshot must never look like a current listening claim.
+fn ble_presence_line(report: &HealthReport) -> Option<String> {
+    let status = report.ble_presence.as_ref()?;
+    let requested = match status.requested {
+        Some(true) => "requested on",
+        Some(false) => "requested off",
+        None => "request unknown",
+    };
+    let state = match &status.scan {
+        proto::BlePresenceScan::Unavailable { reason } => {
+            format!(
+                "unavailable ({})",
+                reason.lines().next().unwrap_or("no reason")
+            )
+        }
+        proto::BlePresenceScan::Disconnected => "robotd disconnected".into(),
+        proto::BlePresenceScan::Off => "off".into(),
+        proto::BlePresenceScan::Starting => "starting".into(),
+        proto::BlePresenceScan::Listening { mode, followers } => {
+            let mode = match mode {
+                proto::BleScanMode::Monitor => "monitor",
+                proto::BleScanMode::Discovery => "discovery",
+            };
+            let plural = if *followers == 1 { "" } else { "s" };
+            format!("listening ({mode}), {followers} device follower{plural}")
+        }
+        proto::BlePresenceScan::Retrying { delay_ms } => format!("retrying after {delay_ms} ms"),
+    };
+    let retries = status.attempts.saturating_sub(1);
+    let mut line = format!("chorale   {state} · {requested} · {retries} retries");
+    if let Some(at) = status.last_sighting {
+        if at > report.read_at {
+            line.push_str(" · last decoded beacon time is in the future");
+        } else {
+            let age = report.read_at.saturating_sub(at);
+            line.push_str(&format!(" · last decoded beacon {age} s ago"));
+        }
+    } else {
+        line.push_str(" · no decoded beacon");
+    }
+    if let Some(error) = &status.last_error {
+        line.push_str(&format!(
+            " · last error: {}",
+            error.lines().next().unwrap_or("unknown")
+        ));
+    }
+    let age = report.read_at.saturating_sub(status.observed_at);
+    if status.observed_at > report.read_at {
+        line.push_str(" — stale snapshot (timestamp is in the future)");
+    // Adapter/socket retries refresh every five seconds; allow publication phase and rounding.
+    } else if age > 10 {
+        line.push_str(&format!(" — stale snapshot ({age} s old)"));
+    }
+    line.push('\n');
+    Some(line)
 }
 
 /// Past this, a registration whose heartbeat has not moved is called stale. The relay posts every
@@ -6653,6 +6719,7 @@ mod tests {
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
             camera: None,
             remote: None,
+            ble_presence: None,
             account: None,
             board: BoardReport {
                 declared: Some(Board::Zero3),
@@ -6660,6 +6727,93 @@ mod tests {
             },
             read_at: 1_000_000,
         }
+    }
+
+    fn presence(scan: proto::BlePresenceScan) -> proto::BlePresenceStatus {
+        proto::BlePresenceStatus {
+            observed_at: 1_000_000,
+            requested: Some(true),
+            scan,
+            attempts: 3,
+            last_sighting: Some(999_997),
+            last_error: None,
+        }
+    }
+
+    /// Absence means nothing was published, and must not silently become an off state.
+    #[test]
+    fn health_omits_absent_ble_telemetry() {
+        let report = health_report(None, None);
+        assert_eq!(ble_presence_line(&report), None);
+        assert!(
+            !serde_json::to_value(&report)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("ble_presence")
+        );
+    }
+
+    #[test]
+    fn health_distinguishes_ble_request_mode_and_device_followers() {
+        let mut report = health_report(None, None);
+        let mut status = presence(proto::BlePresenceScan::Off);
+        status.requested = Some(false);
+        status.attempts = 0;
+        status.last_sighting = None;
+        report.ble_presence = Some(status);
+        let off = render_health(&report);
+        assert!(
+            off.contains("chorale   off · requested off · 0 retries · no decoded beacon"),
+            "{off}"
+        );
+        report.ble_presence = Some(presence(proto::BlePresenceScan::Listening {
+            mode: proto::BleScanMode::Discovery,
+            followers: 2,
+        }));
+        let listening = render_health(&report);
+        assert!(
+            listening.contains("listening (discovery), 2 device followers"),
+            "{listening}"
+        );
+        assert!(
+            listening.contains("2 retries · last decoded beacon 3 s ago"),
+            "{listening}"
+        );
+        assert_eq!(report.healthy(), None);
+        report.read_at += 4;
+        assert!(
+            ble_presence_line(&report)
+                .unwrap()
+                .contains("last decoded beacon 7 s ago")
+        );
+        assert!(serde_json::to_value(&report).unwrap()["ble_presence"].is_object());
+    }
+
+    #[test]
+    fn health_reports_ble_retry_errors_and_stale_observations() {
+        let mut report = health_report(None, None);
+        let mut status = presence(proto::BlePresenceScan::Retrying { delay_ms: 500 });
+        status.last_error = Some("scan failed\nprivate detail".into());
+        status.observed_at -= 10;
+        report.ble_presence = Some(status);
+        let current = ble_presence_line(&report).unwrap();
+        assert!(current.contains("retrying after 500 ms"), "{current}");
+        assert!(current.contains("last error: scan failed"), "{current}");
+        assert!(!current.contains("private detail"));
+        assert!(!current.contains("stale"));
+        report.ble_presence.as_mut().unwrap().observed_at -= 1;
+        assert!(
+            ble_presence_line(&report)
+                .unwrap()
+                .contains("stale snapshot (11 s old)")
+        );
+        report.ble_presence.as_mut().unwrap().observed_at = report.read_at + 1;
+        assert!(
+            ble_presence_line(&report)
+                .unwrap()
+                .contains("stale snapshot (timestamp is in the future)")
+        );
     }
 
     #[test]

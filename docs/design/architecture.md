@@ -630,6 +630,28 @@ only thing separating them.
 
 ### 8.4 Health is one question, so it is one command
 
+`btd` publishes local chorale discovery telemetry in `/run/btd/chorale.json`, read
+by `robotctl health` in its text and JSON reports. This is an atomic, single-writer
+snapshot, not another API or an authority for radio decisions. It distinguishes
+the requested listening state from starting, registered listening, retrying,
+disconnected and unavailable states. Monitor/discovery mode is reported only
+after registration; the follower count is device tasks, **not nearby ducks**.
+Attempt counts include the first attempt after enable, so retries are attempts
+minus one. Last-sighting time means a decoded beacon, not an accepted musical peer.
+
+The radio/session owner timestamps observations; a separate publisher coalesces
+file writes to once per second without refreshing that timestamp. A stalled
+session therefore becomes stale even if the file writer remains alive. Health
+marks observations over ten seconds old (or in the future) stale, allowing for
+the five-second adapter/socket retry cadence. Beacon ages advance at read time.
+Missing or malformed telemetry is unavailable, never implicitly off. Per-scan
+observations are discarded on retry, retaining the last decoded sighting before
+normal completion, listening-off or socket teardown. Abrupt process/adapter
+cancellation may lose an observation not yet consumed; this snapshot is not a
+durable encounter log. This local diagnostic report does not affect the
+health command's robotd-based exit status; matching workspace binaries gain the
+feature together without a new RPC or wire-version requirement.
+
 `robotctl health` reports hardware from `robotd` and software from `updaterd` in a single
 answer. That is not a convenience: "what is wrong with this robot" does not divide into
 hardware and software until *after* it is answered, and a robot that reverted a release an
