@@ -39,7 +39,6 @@
 set -eu
 
 STATE="${DUCK_SIM_STATE:-$HOME/.cache/duck-sim}"
-RL="${DUCK_SIM_RL:-$HOME/Pollen/microduck_rl}"
 PORT="${DUCK_SIM_PORT:-7801}"
 
 # `setsid` is util-linux: Linux has it, a Mac does not. What it buys is a daemon in its own session,
@@ -66,6 +65,35 @@ CAMERAS="${DUCK_SIM_CAMERAS:-}"
 FRAME_PORT="${DUCK_SIM_FRAME_PORT:-7901}"
 SOCK="$STATE/duck.sock"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Where `microduck_rl` is: `DUCK_SIM_RL` if set, else a clone beside this one (what the docs say to
+# do), else the older `~/Pollen/microduck_rl`.
+if [ -n "${DUCK_SIM_RL:-}" ]; then
+    RL="$DUCK_SIM_RL"
+elif [ -d "$REPO/../microduck_rl" ]; then
+    RL="$(cd "$REPO/../microduck_rl" && pwd)"
+else
+    RL="$HOME/Pollen/microduck_rl"
+fi
+no_rl() {
+    die "no simulator at $RL. It is the microduck_rl repo: clone it beside this one ($(dirname "$REPO")/microduck_rl), or set DUCK_SIM_RL=/path/to/microduck_rl."
+}
+
+# Check the active toolchain, including rustup directory overrides, before cargo hides the
+# problem deep in its dependency graph. Keep rustup's stderr when the executable itself fails.
+check_rust() {
+    want="$(sed -n 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' "$REPO/Cargo.toml" | head -1)"
+    command -v rustc >/dev/null 2>&1 ||
+        die "no rustc on PATH. Install Rust $want or newer: https://rustup.rs"
+    version="$(cd "$REPO" && rustc --version)" ||
+        die "rustc --version failed. Check the toolchain with \`rustup show\` in $REPO, or install and select stable with \`rustup update stable\` and \`RUSTUP_TOOLCHAIN=stable scripts/duck-sim\`."
+    have="$(printf '%s\n' "$version" | awk '$1 == "rustc" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$/ {print $2; exit}')"
+    [ -n "$have" ] || die "cannot parse rustc version: $version. Check \`rustc --version\` and \`rustup show\`."
+    [ -z "$want" ] && return 0
+    oldest="$(printf '%s\n%s\n' "$want" "$have" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)"
+    [ "$oldest" = "$want" ] ||
+        die "this workspace needs Rust $want or newer and rustc is $have. Run \`rustup update stable\`, then \`RUSTUP_TOOLCHAIN=stable scripts/duck-sim\` (a directory override may still select the older toolchain)."
+}
 
 say()  { printf '\033[36m==\033[0m %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -194,6 +222,7 @@ down() {
 # simulated body was — its `--sim` was the older robot-made-of-nothing — and every duck "would not
 # enable". cargo returns in a moment when nothing changed, which is the only case the guard saved.
 build_daemons() {
+    check_rust
     say "building the daemons from $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
     (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds -p configd -p updater)
 }
@@ -220,7 +249,7 @@ policies() {
 }
 
 up() {
-    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -d "$RL" ] || no_rl
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     # `.so.<version>` on Linux, `.<version>.dylib` on macOS — the wheel names it after the platform
     # and `ort` dlopens whatever this points at, so both spellings are looked for rather than one.
@@ -228,6 +257,8 @@ up() {
             \( -name 'libonnxruntime.so*' -o -name 'libonnxruntime*.dylib' \) -type f 2>/dev/null | head -1)"
     [ -n "$ORT" ] || die "no onnxruntime in $RL/.venv — the policies cannot load without it."
 
+    # A setup error must not tear down an already running duck.
+    check_rust
     down
     mkdir -p "$STATE"
 
@@ -560,19 +591,39 @@ PY
 # gravity [0, 0, -1] as surely as a standing one does, so it reported a seated duck as standing
 # while the window showed it sitting. `STAND` is 0.12 and `SIT` is 0.07; halfway is the line.
 # Orientation still matters, for the duck that stood up and then fell over.
-upright() { upright_at "$PORT" "the duck"; }
+upright() {
+    body_up || { say "the sim is not running (nothing on port $PORT). Start it with \`scripts/duck-sim\`."; return 1; }
+    upright_at "$PORT" "the duck"
+}
+body_up() {
+    python3 -c "import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(0 if s.connect_ex(('127.0.0.1',int(sys.argv[1])))==0 else 1)" "$PORT" 2>/dev/null
+}
+
+status() {
+    body_up || { say "the sim is not running (nothing on port $PORT). Start it with \`scripts/duck-sim\`."; return 1; }
+    # A pipeline to head loses robotctl's failure (including a missing first build).
+    health_code=0
+    health="$(ctl health)" || health_code=$?
+    printf '%s\n' "$health" | head -4
+    [ "$health_code" -eq 0 ] || return "$health_code"
+    upright_at "$PORT" "the duck"
+}
 
 upright_at() {
     read_z="$(python3 - "$1" <<'PY'
 import json, socket, sys
-s = socket.socket(); s.settimeout(2); s.connect(("127.0.0.1", int(sys.argv[1])))
-f = s.makefile("rw")
-f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
-f.write('{"op":"read"}\n'); f.flush()
-r = json.loads(f.readline())
-print("%.3f %.3f" % (r.get("trunk_z", -1.0), r["imu"]["gravity"][2]))
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2) as s:
+        f = s.makefile("rw")
+        f.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); f.flush(); f.readline()
+        f.write('{"op":"read"}\n'); f.flush()
+        r = json.loads(f.readline())
+        print("%.3f %.3f" % (r.get("trunk_z", -1.0), r["imu"]["gravity"][2]))
+except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as error:
+    print("cannot read the simulated body on port %s: %s" % (sys.argv[1], error), file=sys.stderr)
+    sys.exit(1)
 PY
-)" || return 0
+)" || return 1
     trunk="${read_z% *}"
     z="${read_z#* }"
     standing="$(python3 -c "print(1 if $trunk > 0.095 else 0)" 2>/dev/null || echo 0)"
@@ -622,7 +673,7 @@ has_camera() {
 # The body, on the host in both modes: MuJoCo is not going in a container, and the container shares
 # the host's network namespace so localhost is the same localhost either way.
 start_body() {
-    [ -d "$RL" ] || die "no simulator at $RL. It is the microduck_rl repo — set DUCK_SIM_RL."
+    [ -d "$RL" ] || no_rl
     [ -x "$RL/.venv/bin/python" ] || die "$RL has no .venv. Run \`uv sync\` there first."
     mkdir -p "$STATE"
     say "starting the body from $RL — a MuJoCo window should open"
@@ -1111,10 +1162,18 @@ case "${1:-up}" in
     drive)   shift; drive "$@" ;;
     ctl)     shift; ctl "$@" ;;
     stand)   stand && sleep 6 && upright ;;
-    status)  ctl health | head -4; upright ;;
+    status)  status ;;
     monitor) shift; ctl monitor "$@" ;;
     log)     tail -f "$STATE/robotd.log" ;;
-    simlog)  tail -f "$STATE/body.log" ;;
+    simlog)
+        [ -f "$STATE/body.log" ] || die "the sim is not running (no $STATE/body.log). Start it with \`scripts/duck-sim\`."
+        if body_up; then
+            tail -f "$STATE/body.log"
+        else
+            say "the sim is not running; this is the last body's log"
+            tail -n 50 "$STATE/body.log"
+            exit 1
+        fi ;;
     realtime) realtime ;;
     *)       die "unknown command '$1'. Try: up, boot, shell, down, stand, drive, monitor, ctl, log, simlog, status, realtime" ;;
 esac
