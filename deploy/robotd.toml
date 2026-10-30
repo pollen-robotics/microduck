@@ -321,7 +321,8 @@ mode = "walk"
 # enabled = true
 
 # ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up. The mic
-# worker captures from "<device>,0".
+# worker captures from "<device>,0" for an hw/plughw card without a subdevice, and from
+# the device as written otherwise (`default`, an asound.conf PCM).
 # device = "plughw:aic3104"
 
 # Where the voice bank lives.
