@@ -1532,6 +1532,12 @@ pub struct SkillDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<PathBuf>,
 
+    /// A beak track the mouth follows while the skill runs, in place of whatever else holds it: a
+    /// CSV of `t,mouth` rows, seconds from the skill's first tick (φ·`duration` for a phase skill)
+    /// and the mouth joint target in radians. How a dance sings along with its `sound`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouth: Option<PathBuf>,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
@@ -1894,6 +1900,7 @@ fn fallback_skills() -> Vec<SkillDef> {
         unwind_s: 0.0,
         phase: false,
         sound: None,
+        mouth: None,
         params: SkillOverrides::default(),
     };
     vec![
@@ -1910,6 +1917,7 @@ fn fallback_skills() -> Vec<SkillDef> {
             unwind_s: 0.0,
             phase: false,
             sound: None,
+            mouth: None,
             params: SkillOverrides::default(),
         },
         kick("kick_left", "ball_kick_left.onnx"),

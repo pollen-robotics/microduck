@@ -118,6 +118,8 @@ pub struct SkillTuning {
     /// The one-shot skills, in priority order — name, duration, whether holding chains, and
     /// what each changes about the robot while it runs. Config, resolved over the built-ins.
     pub skills: Vec<robotd_params::SkillDef>,
+    /// Each skill's beak track, loaded from its `mouth` file, by the same index as `skills`.
+    pub mouth_tracks: Vec<Option<MouthTrack>>,
 }
 
 impl Default for SkillTuning {
@@ -134,6 +136,7 @@ impl Default for SkillTuning {
             sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
             sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
             skills: Vec::new(),
+            mouth_tracks: Vec::new(),
         }
     }
 }
@@ -147,6 +150,70 @@ fn grasp_mouth(mouth: f64, close: f64, phase: f64) -> f64 {
         .clamp(0.0, 1.0);
     let closing = ((phase - close) / GRASP_MOUTH_CLOSE_LEN).clamp(0.0, 1.0);
     mouth * opening * (1.0 - closing)
+}
+
+/// A skill's beak track: the mouth joint target, radians, against the skill's own time — the
+/// `mouth = "<csv>"` of its entry, how a dance sings along with its music.
+///
+/// The file is `t,mouth` rows, seconds and radians, rising in `t`; `#` lines and a header that
+/// does not parse as numbers are skipped. Read linearly between rows, held at either end, and
+/// clamped to the mouth's travel, so a track can never ask the servo for more than the trigger can.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MouthTrack {
+    t: Vec<f64>,
+    mouth: Vec<f64>,
+}
+
+impl MouthTrack {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let (mut t, mut mouth) = (Vec::new(), Vec::new());
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut cells = line.split(',').map(|c| c.trim().parse::<f64>());
+            match (cells.next(), cells.next()) {
+                (Some(Ok(at)), Some(Ok(value))) if at.is_finite() && value.is_finite() => {
+                    if t.last().is_some_and(|&last| at <= last) {
+                        return Err(format!("line {}: time {at} does not rise", n + 1));
+                    }
+                    t.push(at);
+                    mouth.push(value);
+                }
+                // The header row, before any data.
+                _ if t.is_empty() => {}
+                _ => return Err(format!("line {}: not `t,mouth` numbers", n + 1)),
+            }
+        }
+        if t.is_empty() {
+            return Err("no `t,mouth` rows".into());
+        }
+        Ok(Self { t, mouth })
+    }
+
+    /// The target at `t` seconds into the skill, radians, inside the mouth's travel.
+    pub fn at(&self, t: f64) -> f64 {
+        let i = self.t.partition_point(|&at| at <= t);
+        let value = match i {
+            0 => self.mouth[0],
+            i if i == self.t.len() => self.mouth[i - 1],
+            i => {
+                let (t0, t1) = (self.t[i - 1], self.t[i]);
+                let (m0, m1) = (self.mouth[i - 1], self.mouth[i]);
+                m0 + (m1 - m0) * (t - t0) / (t1 - t0)
+            }
+        };
+        value.clamp(
+            duck_control::model::MOUTH_CLOSED,
+            duck_control::model::MOUTH_OPEN,
+        )
+    }
 }
 
 /// Which grasp a running pick is: the pick's cycle on that grasp's network, with its beak.
@@ -513,6 +580,20 @@ impl Controller {
             ),
         };
         Some(grasp_mouth(mouth, close, phase))
+    }
+
+    /// The mouth target the running skill's beak track asks for now, radians, or `None` when no
+    /// skill with a track runs — whatever holds the mouth otherwise then has it back, a skill
+    /// stopped early included. Like the grasp's beak, read after [`Self::step`]: one tick ahead of
+    /// the clock the legs ran on. An unwind holds the track's end.
+    pub fn skill_mouth(&self) -> Option<f64> {
+        let active = self.active?;
+        let track = self.skills.mouth_tracks.get(active.index)?.as_ref()?;
+        let duration = self.skills.skills.get(active.index)?.duration;
+        Some(track.at(match active.phase {
+            SkillPhase::Holding => duration - active.remaining,
+            SkillPhase::Unwinding => duration,
+        }))
     }
 
     /// The sound a skill plays from its first tick, if its entry names one.
@@ -1010,6 +1091,64 @@ mod tests {
             skill_twist(&plain, SkillPhase::Holding, 2.0),
             [0.3, 0.0, 0.0]
         );
+    }
+
+    /// A beak track reads between its rows, holds at its ends, and never leaves the mouth's
+    /// travel; a file that is not `t,mouth` rows is refused rather than half-played.
+    #[test]
+    fn a_mouth_track_reads_between_its_rows() {
+        let track = MouthTrack::parse(
+            "# Tremendous beak, rad\nt,mouth\n0.0,0.0\n0.1,0.3\n0.2,0.1\n0.3,1.5\n0.4,-0.5\n",
+        )
+        .unwrap();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(track.at(-1.0), 0.0), "held before the start");
+        assert!(near(track.at(0.05), 0.15), "halfway up");
+        assert!(near(track.at(0.1), 0.3));
+        assert!(near(track.at(0.15), 0.2), "halfway down");
+        assert!(
+            near(track.at(0.3), duck_control::model::MOUTH_OPEN),
+            "clamped open"
+        );
+        assert!(
+            near(track.at(9.0), duck_control::model::MOUTH_CLOSED),
+            "held at the end, clamped closed"
+        );
+        assert!(MouthTrack::parse("t,mouth\n").is_err(), "no rows");
+        assert!(
+            MouthTrack::parse("0.0,0.1\n0.0,0.2\n").is_err(),
+            "time must rise"
+        );
+        assert!(
+            MouthTrack::parse("0.0,0.1\nopen,0.2\n").is_err(),
+            "a bad row"
+        );
+    }
+
+    /// A skill with a beak track owns the mouth on its own clock — φ·duration — and gives it back
+    /// when it ends or is stopped; a skill without one never touches it.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_skill_sings_its_beak_track_then_hands_the_mouth_back() {
+        let mut c = full_controller();
+        c.skills.mouth_tracks = vec![None, Some(MouthTrack::parse("0.0,0.0\n1.0,0.4\n").unwrap())];
+        assert_eq!(c.skill_mouth(), None, "nothing runs");
+        assert_eq!(c.start_skill(1), Ok(true));
+        tick(&mut c, 0.5);
+        let mid = c.skill_mouth().expect("the track drives the beak");
+        assert!((mid - 0.2).abs() < 1e-9, "t = 0.5 s of 1.0: {mid}");
+        tick(&mut c, 0.6);
+        assert_eq!(c.skill_mouth(), None, "the skill has ended");
+
+        assert_eq!(c.start_skill(1), Ok(true));
+        tick(&mut c, 0.2);
+        assert!(c.skill_mouth().is_some());
+        c.stop_moves();
+        assert_eq!(c.skill_mouth(), None, "stopped early");
+
+        assert_eq!(c.start_skill(0), Ok(true));
+        tick(&mut c, 0.2);
+        assert_eq!(c.skill_mouth(), None, "a kick has no track");
     }
 
     /// The grasp's beak plays the schedule it was trained with — closed as it starts, open on the

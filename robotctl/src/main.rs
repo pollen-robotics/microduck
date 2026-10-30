@@ -1116,6 +1116,10 @@ enum PolicyCommand {
         /// A `.wav` on this robot played from its first tick.
         #[arg(long)]
         sound: Option<PathBuf>,
+        /// A beak track on this robot the mouth follows while it runs: a CSV of `t,mouth` rows,
+        /// seconds from its first tick and the mouth target in radians.
+        #[arg(long, value_name = "CSV")]
+        mouth: Option<PathBuf>,
         /// Scale raw policy output into joint offsets with this, when it was trained with its own.
         #[arg(long)]
         action_scale: Option<f64>,
@@ -4130,6 +4134,7 @@ fn run_policy_skill(
         unwind_command,
         phase,
         sound,
+        mouth,
         action_scale,
         json,
     } = command
@@ -4226,6 +4231,9 @@ fn run_policy_skill(
         sound: sound
             .as_ref()
             .map(|s| s.canonicalize().unwrap_or_else(|_| s.clone())),
+        mouth: mouth
+            .as_ref()
+            .map(|m| m.canonicalize().unwrap_or_else(|_| m.clone())),
         params: robotd_params::SkillOverrides {
             action_scale: action_scale
                 .or_else(|| from_manifest.as_ref().and_then(|m| m.action_scale)),

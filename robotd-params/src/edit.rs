@@ -408,6 +408,9 @@ impl Model {
         if let Some(sound) = &skill.sound {
             entry["sound"] = toml_edit::value(sound.display().to_string());
         }
+        if let Some(mouth) = &skill.mouth {
+            entry["mouth"] = toml_edit::value(mouth.display().to_string());
+        }
         // Only what differs from a plain zero-command one-shot. A file full of explicit
         // defaults is the unreadable thing this whole editor exists to avoid.
         if skill.command != [0.0; 3] {
@@ -1342,6 +1345,46 @@ mod tests {
         assert_eq!(written.matches("[[policy.skill]]").count(), 1, "{written}");
         assert!(written.contains("duration = 6.0"), "{written}");
         assert!(written.contains("# kept"), "comments survive: {written}");
+    }
+
+    /// A dance's phase clock, music and beak track are written beside it and read back as they
+    /// were — the keys `robotctl policy add --phase --sound --mouth` sets.
+    #[test]
+    fn a_dance_keeps_its_phase_sound_and_beak_track() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "tremendous".into(),
+                path: Some(PathBuf::from("/srv/tremendous.onnx")),
+                duration: 18.25,
+                phase: true,
+                sound: Some(PathBuf::from("/srv/tremendous.wav")),
+                mouth: Some(PathBuf::from("/srv/tremendous_mouth.csv")),
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(
+            written.contains("mouth = \"/srv/tremendous_mouth.csv\""),
+            "{written}"
+        );
+        let params: crate::Params = toml::from_str(&written).expect("parses");
+        let skill = &params.policy.skills[0];
+        assert!(skill.phase);
+        assert_eq!(
+            skill.sound.as_deref(),
+            Some(Path::new("/srv/tremendous.wav"))
+        );
+        assert_eq!(
+            skill.mouth.as_deref(),
+            Some(Path::new("/srv/tremendous_mouth.csv"))
+        );
     }
 
     /// Only what differs from a plain zero-command one-shot is written — a file full of explicit

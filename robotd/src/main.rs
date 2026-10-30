@@ -1967,6 +1967,19 @@ fn try_controller(
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
+            // A track that will not load costs the skill its beak, not the skill: it still dances.
+            mouth_tracks: policy_cfg
+                .skills
+                .iter()
+                .map(|skill| {
+                    let path = skill.mouth.as_ref()?;
+                    control::MouthTrack::load(path)
+                        .inspect_err(|e| {
+                            tracing::warn!(skill = %skill.name, error = %e, "beak track not loaded")
+                        })
+                        .ok()
+                })
+                .collect(),
         };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
@@ -3885,6 +3898,14 @@ async fn control_loop<T: RobotIo>(
                 .unwrap_or(snapshot.mouth.max(idle.mouth));
             targets[duck_control::model::MOUTH_INDEX] = duck_control::model::mouth_target(mouth);
         }
+        // A skill with a beak track (`mouth = "<csv>"`) owns the mouth while it runs, over all of
+        // that — a dance singing along with its music, whatever the trigger, the yawn or an
+        // instrument was doing. Radians already, clamped to the travel; when the skill ends or is
+        // stopped, `skill_mouth` is `None` and the mouth is the block above's again.
+        let skill_mouth = controller.as_ref().and_then(Controller::skill_mouth);
+        if driving && let Some(radians) = skill_mouth {
+            targets[duck_control::model::MOUTH_INDEX] = radians;
+        }
 
         // The next feature row pairs its reading with this command.
         if let Some(watch) = pickup_watch.as_mut() {
@@ -3911,8 +3932,12 @@ async fn control_loop<T: RobotIo>(
             fresh: fresh.as_ref(),
             overran: tick_start.elapsed() > period,
             flashlight: state.flashlight.load(Ordering::Relaxed) != 0,
-            // What a client asked the beak to do, or the chorale singing through it.
-            mouth: snapshot.mouth.max(chorale_mouth),
+            // What a client asked the beak to do, the chorale singing through it, or a skill's
+            // beak track (radians, back in opening units) — every flap is wear.
+            mouth: skill_mouth.map_or(snapshot.mouth.max(chorale_mouth), |radians| {
+                (radians - duck_control::model::MOUTH_CLOSED)
+                    / (duck_control::model::MOUTH_OPEN - duck_control::model::MOUTH_CLOSED)
+            }),
             sounds_played: voice.as_ref().map(|v| v.played()),
         });
 
@@ -4843,6 +4868,7 @@ fn set_skill_request(
         // Not on the wire: kept from the entry a file edit put there.
         phase: existing.as_ref().is_some_and(|s| s.phase),
         sound: existing.as_ref().and_then(|s| s.sound.clone()),
+        mouth: existing.as_ref().and_then(|s| s.mouth.clone()),
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale
