@@ -80,7 +80,7 @@ is where somebody goes when it breaks, not when they want to see a duck bow.
 
 ## The parts
 
-`src/rendezvous.ts` is a port of `spaces/shared/wire.py`: `GET /events` for the stream, `POST /send`
+`src/rendezvous.ts` is a port of `sdk/duck/wire.py`: `GET /events` for the stream, `POST /send`
 for everything else, and a `peer` envelope carrying `rpc` is a control call. Four things that
 protocol punishes a reader for not knowing are in its header, all of them learned in the Python
 version and all still true.

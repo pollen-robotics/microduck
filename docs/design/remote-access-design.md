@@ -599,7 +599,7 @@ service the mini fleet also depends on:
 ```
 
 `mediad::relay` answers it with `session::run`: the same routing table, the same per-lane sockets,
-and what a bridged peer may call is §3.6's answer unchanged. `spaces/shared/wire.py` is the client
+and what a bridged peer may call is §3.6's answer unchanged. `sdk/duck/wire.py` is the client
 half. This is the path for a **program** that drives a duck: it works from a data centre, it is
 authenticated by the account at both ends (§7), and it needs nothing but HTTP.
 

@@ -46,7 +46,7 @@ from typing import Any
 
 import requests
 
-from rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
+from .rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ class WsConsumer:
     """
 
     def __init__(self, token: str, peer_id: str, rpc: Any, base: str = DEFAULT_CENTRAL_URL,
-                 label: str = "microduck-policy-playground"):
+                 label: str = "microduck-sdk"):
         self._token = token
         self._peer_id = peer_id
         self._rpc = rpc
@@ -343,7 +343,7 @@ def connect(token: str, peer_id: str, rpc: Any, label: str) -> WsConsumer:
 if __name__ == "__main__":
     # ── checking the lane against the real rendezvous and a real duck ─────────
     #
-    # `uv run wire.py` — no Gradio, no browser, and read-only calls: it asks the robot what it is
+    # `python -m duck.wire`: no Gradio, no browser, and read-only calls. It asks the robot what it is
     # running and what it can do, and asks for nothing to move. Which makes it the thing to run
     # first when a click does not work, because it isolates the transport from everything else on
     # the page.
@@ -355,9 +355,10 @@ if __name__ == "__main__":
     import os
     import sys
 
-    import rendezvous
-    from control import Rpc, RpcError
     from huggingface_hub import get_token
+
+    from duck import rendezvous
+    from duck.control import Rpc, RpcError
 
     _logging.basicConfig(level=_logging.INFO, format="%(name)-10s %(message)s")
 
@@ -383,7 +384,7 @@ if __name__ == "__main__":
     # Shorter than the page's, because a person is watching this one.
     rpc = Rpc(timeout=15)
     consumer = WsConsumer(
-        credential, duck.peer_id, rpc, label="microduck-policy-playground/wire-check"
+        credential, duck.peer_id, rpc, label="microduck-sdk/wire-check"
     )
     try:
         consumer.start()
