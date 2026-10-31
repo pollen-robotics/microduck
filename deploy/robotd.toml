@@ -161,7 +161,7 @@ mode = "walk"
 # stand       = "none"                   velstand stands on its own; "alpha_stand.onnx" is
 #                                        the old standing + body-pose network, still in the set
 # sitstand    = "alpha_sitstand.onnx"    sit <-> stand, posture flag
-# ground_pick = "alpha_ground_pick.onnx" A-button pick
+# ground_pick = "static_ground_pick.onnx" A-button pick, which plays its trained beak
 # kick_left   = "ball_kick_left.onnx"
 # kick_right  = "ball_kick_right.onnx"
 # roulade     = "roulade.onnx"           X-button forward roll

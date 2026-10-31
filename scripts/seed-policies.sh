@@ -48,7 +48,7 @@ POLICY_ROOT="${1:-/opt/robot/policies}"
 # Bumping this ships inside a release, so bump it when the daemon's defaults need the new set
 # (a slot defaulting to a file only the new set carries), and tag the set first.
 POLICY_REPO="${POLICY_REPO:-pollen-robotics/microduck-policies}"
-POLICY_VERSION="${POLICY_VERSION:-v8}"
+POLICY_VERSION="${POLICY_VERSION:-v9}"
 POLICY_BASE_URL="${POLICY_BASE_URL:-https://huggingface.co/${POLICY_REPO}/resolve/${POLICY_VERSION}}"
 
 # The set says what is in it. `manifest.json` lists every policy, and that list is what gets
@@ -61,7 +61,7 @@ POLICY_BASE_URL="${POLICY_BASE_URL:-https://huggingface.co/${POLICY_REPO}/resolv
 # The grep is over a file we generate, so its shape is ours: one `"file": "name.onnx"` per policy.
 # A JSON parser is not available here — this runs from a release on a board with curl and a
 # POSIX shell — and an xtask test asserts the pattern matches what the manifest actually says.
-FALLBACK_FILES="velstand.onnx alpha_sitstand.onnx alpha_ground_pick.onnx ball_kick_left.onnx ball_kick_right.onnx roller.onnx roller_crouch.onnx roulade.onnx"
+FALLBACK_FILES="velstand.onnx alpha_sitstand.onnx static_ground_pick.onnx ball_kick_left.onnx ball_kick_right.onnx roller.onnx roller_crouch.onnx roulade.onnx"
 
 # Per-file, because `hooks/postinstall` runs inside an update under a 120-second hook timeout and
 # a hook that times out fails the update and rolls it back. Ten files at eight seconds is 80,

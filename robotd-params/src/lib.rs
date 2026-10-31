@@ -2286,11 +2286,13 @@ impl PolicyParams {
             // so no standing network is loaded by default: with `stand` unset the walking
             // policy runs at every velocity. `alpha_walking.onnx` + `alpha_stand.onnx` stay
             // in the set for a board that loads them back by hand.
+            // The pick is the static low grasp (set v9); `alpha_ground_pick.onnx`, the one
+            // before it, stays in the set.
             Mode::Walk => (
                 "velstand.onnx",
                 None,
                 Some("alpha_sitstand.onnx"),
-                Some("alpha_ground_pick.onnx"),
+                Some("static_ground_pick.onnx"),
             ),
             // The prototype's roller preset, since rebased on the alpha defaults: roller
             // policy, crouch on the ground-pick trigger, and everything else — sit/stand,
@@ -4601,7 +4603,7 @@ mod tests {
         assert_eq!(name(&p.sitstand).as_deref(), Some("alpha_sitstand.onnx"));
         assert_eq!(
             name(&p.ground_pick).as_deref(),
-            Some("alpha_ground_pick.onnx")
+            Some("static_ground_pick.onnx")
         );
         assert_eq!(name(&p.kick_left).as_deref(), Some("ball_kick_left.onnx"));
         assert_eq!(name(&p.kick_right).as_deref(), Some("ball_kick_right.onnx"));
