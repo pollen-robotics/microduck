@@ -1483,9 +1483,9 @@ impl Call {
                 // able to ask which account a robot thinks it belongs to.
                 | Call::AccountLogin(_)
                 | Call::AccountLogout // Not `vetbook.share`. It changes nothing on the robot, and it publishes under an
-                                      // account root already signed in — with a token the `robot` group can read, so
-                                      // this gate would protect nothing and only put `sudo` in front of a share button.
-                                      // Which transports may carry it is the route tables' decision, not this one.
+                                      // account root already signed in, so gating it would put `sudo` in front of a
+                                      // share button. Which transports may carry it is the route tables' decision,
+                                      // not this one.
         )
     }
 

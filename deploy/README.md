@@ -361,7 +361,7 @@ bad time" than a clock.
 /opt/robot/daemon/releases/<version>/   the release tree
 /opt/robot/daemon/current -> releases/<version>
 /etc/systemd/system/*.service           every unit the release ships, copied out of it
-/usr/lib/sysusers.d/robot.conf          creates the `robot` group
+/usr/lib/sysusers.d/robot.conf          creates the `robot` and `robot-account` groups
 /var/lib/robot/updater/                 lock, update log, boot counter
 /usr/local/bin/robotctl -> current/bin/robotctl
 /usr/local/sbin/robot-provision         provisioning, resumed after its reboot
