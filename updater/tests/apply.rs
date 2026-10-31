@@ -1866,6 +1866,31 @@ async fn rollback_skips_known_bad_releases() {
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
 }
 
+/// The same history at `keep_previous = 1`. The prune after 1.2.0 kept the newest
+/// other release — 1.1.0, which had failed — and deleted 1.0.0, leaving `rollback`
+/// nothing it would land on.
+#[tokio::test]
+async fn pruning_keeps_the_good_release_a_rollback_needs() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::RolledBack { .. }),
+        "{result:?}"
+    );
+
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
 /// **#3** An unrecoverable trial was re-reported on every boot, appending a bogus
 /// rollback entry each time and never converging.
 #[tokio::test]
