@@ -123,6 +123,12 @@ only repairs trust; it does not request a connection. On boards with the radio w
 `pad pair` power-cycles the adapter, disconnecting other Bluetooth users and potentially
 triggering padd's lost-pad reaction. Do not use it as a reconnect command.
 
+After an adapter power transition, pairing waits up to five seconds for discovery to stop
+returning BlueZ `NotReady`. Other discovery errors are reported immediately. If the bond attempt
+times out, configd explicitly requests `CancelPairing` (bounded to two seconds); dropping the
+pending D-Bus call alone does not cancel BlueZ's operation. Cancellation failures are logged,
+not treated as proof that the radio recovered. Neither path removes saved associations.
+
 If a device vanishes before Pair, the error says so; that is not evidence of bad keys and does
 not call for a Privacy change or reboot. If pairing returns but its final state cannot be read,
 the result says verification failed rather than inventing an association. Inspect status before

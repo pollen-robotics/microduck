@@ -254,6 +254,7 @@ trait Adapter {
 trait Device {
     fn connect(&self) -> zbus::Result<()>;
     fn pair(&self) -> zbus::Result<()>;
+    fn cancel_pairing(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn set_trusted(&self, on: bool) -> zbus::Result<()>;
@@ -698,6 +699,7 @@ impl BlueZ {
                 bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
             };
             if !paired {
+                cancel_timed_out_pairing(&proxy).await;
                 return Err((
                     proto::PadPairFailure::Timeout,
                     "the pad did not finish pairing".to_owned(),
@@ -774,6 +776,7 @@ impl BlueZ {
                     bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
                 };
                 if !paired {
+                    cancel_timed_out_pairing(&proxy).await;
                     return Err((
                         proto::PadPairFailure::Timeout,
                         "the pad did not finish pairing".to_owned(),
@@ -797,6 +800,16 @@ impl BlueZ {
             .await
             .map_err(|e| (proto::PadPairFailure::Other, e.to_string()))?;
         Ok(())
+    }
+}
+
+/// Dropping the D-Bus request future does not cancel BlueZ's pairing operation.
+/// Explicitly end our timed-out attempt without removing any association.
+async fn cancel_timed_out_pairing(device: &DeviceProxy<'_>) {
+    match tokio::time::timeout(Duration::from_secs(2), device.cancel_pairing()).await {
+        Ok(Ok(())) => tracing::info!("cancelled timed-out pairing"),
+        Ok(Err(error)) => tracing::warn!(%error, "could not confirm pairing cancellation"),
+        Err(_) => tracing::warn!("pairing cancellation timed out"),
     }
 }
 
@@ -1040,10 +1053,16 @@ impl Pads for BlueZ {
         // Discovery has to be running for a first-time bond to resolve an address. A failure here
         // is worth reporting rather than working around: without it the search below can only ever
         // find devices already in BlueZ's cache.
-        adapter
-            .start_discovery()
-            .await
-            .map_err(|e| format!("cannot start Bluetooth discovery: {e}"))?;
+        crate::pad::discovery_when_ready(
+            || async {
+                adapter.start_discovery().await.map_err(|e| {
+                    let transient = matches!(&e, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.bluez.Error.NotReady");
+                    (transient, format!("cannot start Bluetooth discovery: {e}"))
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await?;
         tracing::info!(?timeout, "looking for a gamepad in pairing mode");
 
         let found = self.find(mac, timeout).await;
