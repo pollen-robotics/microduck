@@ -254,7 +254,9 @@ operator with a shell are in it, and a token in that group is readable by the ga
 `mediad` is the only reader, and `mediad.service` is the only unit that grants `robot-account`.
 The store sets the group on each save, and a signed-in robot saves only on a refresh, so a board
 that signed in under the old group gets the new one at `updaterd`'s next start
-(`account::settle_group`) rather than weeks later.
+(`account::settle_group`) rather than weeks later. Applying an older release (not `rollback`, which
+runs no hooks) puts back a `mediad.service` without the group, and the relay reads as signed out
+until that release's `updaterd` next refreshes the token under `robot`.
 
 **Under `/var/lib/robot`, not `/etc/robot`, where it began.** A robot that updates its OS by A/B
 slots replaces `/etc` with each image, so a token there signed the robot out at every OS update

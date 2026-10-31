@@ -539,9 +539,6 @@ async fn serve(args: Args) -> ExitCode {
     let Some(loaded) = load(&args) else {
         return ExitCode::FAILURE;
     };
-    // Before anything reads the account, so the first `account.status` already sees it.
-    updater::account::migrate_legacy();
-    updater::account::settle_group(&args.token);
     let (config, keys, robot, faults) = (loaded.config, loaded.keys, loaded.robot, loaded.faults);
     // `vetbook.share` reads the book from the same `robotd` the engine talks to.
     let vetbook_robot_socket = args
@@ -583,6 +580,12 @@ async fn serve(args: Args) -> ExitCode {
         tracing::info!("--self-test: config loaded and engine constructed; not serving");
         return ExitCode::SUCCESS;
     }
+
+    // Before anything reads the account, so the first `account.status` already sees it. After the
+    // self-test, which runs while the old `updaterd` is still serving and must not touch the
+    // credential under it.
+    updater::account::migrate_legacy();
+    updater::account::settle_group(&args.token);
 
     // BEFORE serving. A robot that booted into a bad release has already begun
     // reverting by the time anything can ask it to do something else.
