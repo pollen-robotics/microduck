@@ -1599,9 +1599,11 @@ pub fn is_none_sentinel(path: &std::path::Path) -> bool {
 /// community policy like `polite-bow` — zero command, four seconds, selecting it is the trigger —
 /// is a fifth set of the same four numbers, and could not be added without a daemon release.
 ///
-/// Deliberately *only* the zero-command family. `walk` and `stand` are the fallback pair chosen
-/// by command magnitude, `sitstand` is latched and driven internally by the shutdown sit, and `ground_pick` writes a scripted phase rather than a constant. Those stay
-/// where they are until something needs them not to; see `docs/ideas/policy-moves.md`.
+/// Constant-command one-shots, and phase-encoded ones the daemon clocks the same way it clocks
+/// the ground pick. `walk` and `stand` are the fallback pair chosen by command magnitude,
+/// `sitstand` is latched and driven internally by the shutdown sit, and `ground_pick` stays its
+/// own arm — a set's phase entry still fills that slot. A community phase policy is a skill
+/// instead, added with `policy add`; see `docs/policy-manifest.md`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillDef {
@@ -1654,6 +1656,21 @@ pub struct SkillDef {
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
+
+    /// How the daemon feeds this skill its command. Absent or `"constant"` is a fixed twist
+    /// (`command`) for the window. `"phase"` is `[cos 2πφ, sin 2πφ, 0]` with φ from 0 at
+    /// `1/period_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+
+    /// Seconds per phase cycle, when `encoding` is `"phase"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_s: Option<f64>,
+
+    /// Fraction of the cycle at which an episodic phase skill hands back. Absent on a
+    /// perpetual one, which wraps instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_phase: Option<f64>,
 }
 
 /// Parameters a skill changes for its duration, restored when it ends.
@@ -1700,6 +1717,13 @@ impl SkillDef {
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(POLICY_DIR).join(format!("{}.onnx", self.name))),
         }
+    }
+
+    /// The daemon writes this skill's command as a phase rather than as `command`.
+    pub fn is_phase(&self) -> bool {
+        self.encoding
+            .as_deref()
+            .is_some_and(|e| e.eq_ignore_ascii_case("phase"))
     }
 }
 
@@ -1775,8 +1799,9 @@ pub struct SetPolicy {
 ///
 /// - absent or `"constant"`: the skill family — a fixed twist for the window, `idle` on the way
 ///   back. Every kick, the roulade, and every community one-shot so far.
-/// - `"phase"`: `[cos 2πφ, sin 2πφ, 0]` with φ advancing from 0 over `period_s` seconds and the
-///   move handing back at `end_phase`. The ground pick, and the roller crouch.
+/// - `"phase"`: `[cos 2πφ, sin 2πφ, 0]` with φ advancing from 0 over `period_s` seconds. A set
+///   entry is the ground pick (hands back at `end_phase`). A community policy added as a skill
+///   uses the same encoding: episodic hands back at `end_phase`, perpetual wraps.
 /// - `"posture_flag"`: one slot carries `sit` or `stand`. The sit↔stand.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default)]
@@ -1854,11 +1879,11 @@ impl SetPolicy {
         self.mode.unwrap_or_default()
     }
 
-    /// **An episodic policy on a constant command**: what becomes a skill on its own.
+    /// **An episodic policy on a constant command**: what a set installs as a skill on its own.
     ///
-    /// A phase-encoded one does not — it is the ground pick, whose command the daemon generates,
-    /// and loading it as a generic one-shot would feed it all-zeros: a robot moving plausibly and
-    /// wrongly, which `duck_control::obs`'s header calls the hardest failure to see.
+    /// A phase-encoded set entry is the ground pick, not a skill — the set's phase numbers are
+    /// that arm's timing. A community phase policy becomes a skill the other way, through
+    /// `policy add`, which is how one network can be clocked without taking over `ground_pick`.
     pub fn is_zero_command_skill(&self) -> bool {
         self.is_episodic() && !self.is_phase() && !self.is_posture_flag()
     }
@@ -1963,8 +1988,8 @@ pub fn set_manifest() -> Option<SetManifest> {
 fn builtin_skills(manifest: Option<&SetManifest>) -> Vec<SkillDef> {
     // What the set itself declares. A policy is a skill only if it says it is episodic, drives on
     // a constant command, and how long it runs — a gait is not something to ask for by name, a
-    // perpetual one needs a hold length that only a person can choose, and a phase-encoded one
-    // is the ground pick.
+    // perpetual one needs a hold length that only a person can choose, and a phase-encoded set
+    // entry is the ground pick. A community phase policy is added with `policy add`, not here.
     if let Some(manifest) = manifest {
         let from_set: Vec<SkillDef> = manifest
             .skills()
@@ -2007,6 +2032,7 @@ fn fallback_skills() -> Vec<SkillDef> {
         unwind: [0.0; 3],
         unwind_s: 0.0,
         params: SkillOverrides::default(),
+        ..Default::default()
     };
     vec![
         // Order is priority, replacing the hardcoded `roulade > kick` precedence.
@@ -2021,6 +2047,7 @@ fn fallback_skills() -> Vec<SkillDef> {
             unwind: [0.0; 3],
             unwind_s: 0.0,
             params: SkillOverrides::default(),
+            ..Default::default()
         },
         kick("kick_left", "ball_kick_left.onnx"),
         kick("kick_right", "ball_kick_right.onnx"),
@@ -3740,6 +3767,41 @@ mod tests {
         assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
         assert_eq!(flamingo.unwind, [0.0, 1.0, 0.0]);
         assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// A phase skill carries the clock the daemon will write. Absent encoding is still a
+    /// constant-command one-shot, so a board that has never seen one keeps its kicks.
+    #[test]
+    fn a_skill_can_declare_a_phase_clock() {
+        let params = super::PolicyParams {
+            skills: vec![super::SkillDef {
+                name: "dance".into(),
+                path: Some(std::path::PathBuf::from("/srv/dance.onnx")),
+                duration: 2.8,
+                encoding: Some("phase".into()),
+                period_s: Some(4.0),
+                end_phase: Some(0.7),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dance = params
+            .resolved()
+            .skills
+            .into_iter()
+            .find(|s| s.name == "dance")
+            .unwrap();
+        assert!(dance.is_phase());
+        assert_eq!(dance.period_s, Some(4.0));
+        assert_eq!(dance.end_phase, Some(0.7));
+        assert!(
+            !super::PolicyParams::default()
+                .resolved()
+                .skills
+                .iter()
+                .any(|s| s.is_phase()),
+            "the built-ins stay constant-command"
+        );
     }
 
     /// And the common case declares none of it. A zero command with no unwind is what every

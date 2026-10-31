@@ -781,11 +781,10 @@ the peer connection, and a Gradio callback runs in whichever worker thread the r
 **Two refusals, and which side owns them is most of what writing this settled.** `policy.fetch`
 checks the claims that are about the robot — `obs_len`, `action_len`, `model_api`, `robot.model` —
 and it checks them *before* the download, so a client should not repeat them and should show what
-the robot said. `robot.setSkill` checks nothing about the command encoding: a phase policy
-installed as a one-shot is **accepted**, and the robot then feeds a constant to a network trained
-on a phase, which is plausible movement and wrong movement. That rule lives in `robotctl`, and
-`robotctl` is not in the path of a click — so `catalogue.refusal` is the same rule written a second
-time, and any client that grows this button needs it a third.
+the robot said. `robot.setSkill` now clocks a phase skill the same way `policy add` does; a
+posture-flag policy is still refused. A client that does not send `encoding` / `period_s` still
+gets a constant, which is why the playground's `catalogue.refusal` keeps its own copy of the rule
+for anything this daemon cannot drive, and any client that grows this button needs that too.
 
 **A `401` from the rendezvous is the token and nothing else, and proving that took reading their
 `app.py` after guessing wrong.** The first version of this page listed robots with `GET

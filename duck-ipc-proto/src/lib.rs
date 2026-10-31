@@ -491,7 +491,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::TELEMETRY_STATUS`] and [`method::TELEMETRY_SET`]: whether the robot shares anonymous
 /// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
 /// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
-pub const API_VERSION: u32 = 47;
+///
+/// # v48 — a phase-encoded skill
+///
+/// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
+/// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v47 `robotd`
+/// would accept the call only by ignoring those members, and then run a phase policy on a
+/// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
+/// what this bump makes an older daemon do; a board has to be on this release before
+/// `robotctl policy add` can install a phase skill.
+pub const API_VERSION: u32 = 48;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2897,10 +2907,14 @@ pub struct PolicyFetchResult {
     /// The manifest's `command.idle` — the twist that means "stop", and what a skill unwinds to.
     pub idle: Option<[f64; 3]>,
     /// The manifest's `command.encoding`: absent or `"constant"` for the skill family, `"phase"`
-    /// for a ground pick, `"posture_flag"` for a sit↔stand. What decides whether the policy can
-    /// be a generic one-shot at all — a phase policy fed a constant is a robot moving plausibly
-    /// and wrongly.
+    /// for a clocked skill (and for a ground pick in that slot), `"posture_flag"` for a
+    /// sit↔stand. A phase skill is one `policy add` can install; a posture-flag policy is not.
     pub encoding: Option<String>,
+    /// Phase encoding: seconds per cycle. Present when `encoding` is `"phase"`.
+    pub period_s: Option<f64>,
+    /// Phase encoding: the fraction of the cycle at which an episodic skill hands back.
+    /// Absent on a perpetual one, which wraps instead.
+    pub end_phase: Option<f64>,
     /// Whether holding the button chains another run, from the manifest.
     pub chain: bool,
     /// The manifest's `schema_version`, so a client can say which convention it read.
@@ -4884,6 +4898,17 @@ pub struct SkillParams {
     /// Servo gain relative to the gait's, when this skill wants its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_ratio: Option<f64>,
+    /// How the daemon feeds this skill its command: absent or `"constant"` is a fixed twist;
+    /// `"phase"` is `[cos 2πφ, sin 2πφ, 0]` with φ from 0 at `1/period_s`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Seconds per phase cycle, when `encoding` is `"phase"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_s: Option<f64>,
+    /// Fraction of the cycle at which an episodic phase skill hands back. Absent on a
+    /// perpetual one, which wraps instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_phase: Option<f64>,
     /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
     /// Ignored on the way in — a client cannot make a built-in an override by saying so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -6190,6 +6215,41 @@ mod tests {
 
         let back: Request = serde_json::from_str(&line).unwrap();
         assert_eq!(back.as_call().unwrap(), call);
+    }
+
+    /// A phase skill's new members survive the wire, and a payload from before them still
+    /// parses. The other direction — an older daemon refusing members it does not know — is
+    /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
+    /// which is why [`API_VERSION`] moved. Without that, a v47 `robotd` would run a phase
+    /// policy on a constant command.
+    #[test]
+    fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {
+        let params = SkillParams {
+            name: "dance".into(),
+            duration: Some(2.8),
+            encoding: Some("phase".into()),
+            period_s: Some(4.0),
+            end_phase: Some(0.7),
+            ..Default::default()
+        };
+        let call = Call::RobotSetSkill(params.clone());
+        let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
+        assert!(
+            line.contains(r#""encoding":"phase""#) && line.contains(r#""period_s":4.0"#),
+            "{line}"
+        );
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.as_call().unwrap(), call);
+
+        let old: SkillParams = serde_json::from_str(r#"{"name":"bow","duration":4.0}"#).unwrap();
+        assert_eq!(old.encoding, None);
+        assert_eq!(old.period_s, None);
+        assert_eq!(old.end_phase, None);
+        let written = serde_json::to_string(&old).unwrap();
+        assert!(
+            !written.contains("encoding") && !written.contains("period_s"),
+            "a constant skill must not mention a clock it does not use: {written}"
+        );
     }
 
     /// An unknown method and unparseable parameters are different failures, and a client

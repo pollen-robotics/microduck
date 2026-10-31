@@ -50,6 +50,64 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
 
+/// Twist encoding the ground pick and a phase skill share: `[cos 2πφ, sin 2πφ, 0]`.
+///
+/// Head and body stay zero, matching `zero_command_padding` at training. One function so a
+/// skill cannot drift off the pick's encoding — that drift is a robot moving plausibly on
+/// a command it was never trained on.
+fn phase_twist(phi: f64) -> [f64; 3] {
+    let angle = std::f64::consts::TAU * phi;
+    [angle.cos(), angle.sin(), 0.0]
+}
+
+/// φ from 0, advancing at `1/period_s`. The ground pick and a phase skill share this, so
+/// the two cannot disagree about when a cycle ends or how it wraps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PhaseClock {
+    phi: f64,
+    period_s: f64,
+    /// Some: episodic, hand back at this φ. None: perpetual, wrap at 1.
+    end_phase: Option<f64>,
+}
+
+impl PhaseClock {
+    fn start(period_s: f64, end_phase: Option<f64>) -> Self {
+        Self {
+            phi: 0.0,
+            period_s,
+            end_phase,
+        }
+    }
+
+    fn of_skill(def: &robotd_params::SkillDef) -> Option<Self> {
+        if !def.is_phase() {
+            return None;
+        }
+        let period_s = def.period_s.filter(|p| p.is_finite() && *p > 0.0)?;
+        Some(Self::start(
+            period_s,
+            def.end_phase.filter(|e| e.is_finite() && *e > 0.0),
+        ))
+    }
+
+    fn twist(self) -> [f64; 3] {
+        phase_twist(self.phi)
+    }
+
+    /// Advance after the tick that used the current φ, matching the prototype. `true` when
+    /// an episodic clock has reached its cutoff and the caller should end the window.
+    fn advance(&mut self, dt: f64) -> bool {
+        self.phi += dt / self.period_s;
+        match self.end_phase {
+            Some(end) => self.phi >= end,
+            None => {
+                self.phi %= 1.0;
+                false
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// Scales raw policy output before it becomes a joint offset. The prototype's current
@@ -162,6 +220,8 @@ struct ActiveSkill {
     /// that lands while the skill runs, and positive at the end of a window means start
     /// another.
     chain: f64,
+    /// Phase clock, when this skill is phase-encoded. `None` for a constant-command skill.
+    clock: Option<PhaseClock>,
 }
 
 /// Which half of a skill is running.
@@ -220,8 +280,8 @@ pub struct Controller {
     /// Previous filtered targets, kept only for the low-pass. `None` until the first tick,
     /// so the filter starts from reality rather than dragging up from zero.
     previous: Option<[f64; NUM_JOINTS]>,
-    /// Ground-pick phase, 0..`skills.ground_pick_end_phase`. `None` when inactive.
-    ground_pick: Option<f64>,
+    /// Ground-pick clock, φ from 0 to `end_phase`. `None` when inactive.
+    ground_pick: Option<PhaseClock>,
     /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
     /// limp-fall predictor and any active skill makes it true. That was uncontroversial when
     /// every one-shot was under a second; a skill configured to hold for ten is a robot with no
@@ -395,7 +455,10 @@ impl Controller {
         if let Some(reason) = self.move_blocked() {
             return Err(reason);
         }
-        self.ground_pick = Some(0.0);
+        self.ground_pick = Some(PhaseClock::start(
+            self.skills.ground_pick_period,
+            Some(self.skills.ground_pick_end_phase),
+        ));
         Ok(())
     }
 
@@ -439,6 +502,7 @@ impl Controller {
             phase: SkillPhase::Holding,
             remaining: duration,
             chain: 0.0,
+            clock: PhaseClock::of_skill(def),
         });
         Ok(true)
     }
@@ -572,6 +636,7 @@ impl Controller {
                         phase: SkillPhase::Holding,
                         remaining: def.map_or(0.0, |d| d.duration),
                         chain: 0.0,
+                        clock: def.and_then(PhaseClock::of_skill),
                         ..active
                     })
                 }
@@ -598,10 +663,7 @@ impl Controller {
             // exactly that. Only the twist differs, and for most skills it is zero too, which is
             // what made the kick and roulade arms the same arm.
             let def = self.skills.skills.get(active.index);
-            let twist = def.map_or([0.0; 3], |d| match active.phase {
-                SkillPhase::Holding => d.command,
-                SkillPhase::Unwinding => d.unwind,
-            });
+            let twist = skill_twist(def, &active);
             let label = def.map_or(std::borrow::Cow::Borrowed("skill"), |d| {
                 std::borrow::Cow::Owned(match active.phase {
                     SkillPhase::Holding => d.name.clone(),
@@ -613,12 +675,12 @@ impl Controller {
                 ..Command::default()
             };
             (Net::Skill(active.index), c, label)
-        } else if let Some(phase) = self.ground_pick {
+        } else if let Some(clock) = self.ground_pick {
             // The twist slots carry the phase encoding; head and body are zero-padded,
-            // mirroring the training env's `zero_command_padding`.
-            let angle = std::f64::consts::TAU * phase;
+            // mirroring the training env's `zero_command_padding`. Same function a phase
+            // skill uses, so the two cannot drift.
             let c = Command {
-                twist: [angle.cos(), angle.sin(), 0.0],
+                twist: clock.twist(),
                 ..Command::default()
             };
             (Net::GroundPick, c, "ground_pick".into())
@@ -740,15 +802,22 @@ impl Controller {
 
         // Advance the windows, after the tick that used them — the prototype advances its
         // phase after the motor write.
-        if let Some(phase) = self.ground_pick.as_mut() {
-            *phase += dt / self.skills.ground_pick_period;
-            if *phase >= self.skills.ground_pick_end_phase {
-                self.ground_pick = None;
-            }
+        if let Some(clock) = self.ground_pick.as_mut()
+            && clock.advance(dt)
+        {
+            self.ground_pick = None;
         }
         if let Some(active) = self.active.as_mut() {
             active.remaining -= dt;
             active.chain = (active.chain - dt).max(0.0);
+            if active.phase == SkillPhase::Holding
+                && let Some(clock) = active.clock.as_mut()
+                && clock.advance(dt)
+            {
+                // Episodic phase reached end_phase. Expire at the next tick the same way
+                // remaining hitting zero does, so unwind still has a chance to run.
+                active.remaining = 0.0;
+            }
         }
         if let Sit::Rising { remaining } = &mut self.sit {
             *remaining -= dt;
@@ -761,6 +830,18 @@ impl Controller {
             gain,
             busy: self.busy(),
         })
+    }
+}
+
+/// Twist a running skill is fed. The clock wins while it holds; unwind is always the
+/// idle command, never another lap of φ.
+fn skill_twist(def: Option<&robotd_params::SkillDef>, active: &ActiveSkill) -> [f64; 3] {
+    match active.phase {
+        SkillPhase::Unwinding => def.map_or([0.0; 3], |d| d.unwind),
+        SkillPhase::Holding => active
+            .clock
+            .map(PhaseClock::twist)
+            .unwrap_or_else(|| def.map_or([0.0; 3], |d| d.command)),
     }
 }
 
@@ -1020,5 +1101,165 @@ mod tests {
             !c.busy(),
             "a stop ends the pick rather than resuming it later"
         );
+    }
+
+    /// The obs twist slots must be exactly `[cos 2πφ, sin 2πφ, 0]`. Feeding a phase
+    /// policy a constant instead is a robot that looks plausible and is wrong — the
+    /// failure `duck_control::obs` exists to make loud.
+    fn obs_twist(phi: f64) -> [f32; 3] {
+        let command = Command {
+            twist: phase_twist(phi),
+            ..Command::default()
+        };
+        let obs = Observation::build(
+            &duck_control::imu::ImuData::default(),
+            &DEFAULT_POSITION,
+            &[0.0; NUM_JOINTS],
+            &DEFAULT_POSITION,
+            &[0.0; ACTION_LEN],
+            &command,
+        );
+        let d = obs.as_slice();
+        [d[48], d[49], d[50]]
+    }
+
+    fn assert_twist_close(got: [f64; 3], expected: [f64; 3]) {
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-9, "twist {got:?} != {expected:?}");
+        }
+    }
+
+    /// The ground pick's clock: period 4 s, cutoff 0.7, 50 Hz. Ending at 1.0 replays
+    /// the reach on the way out, which is the prototype bug the 0.7 cutoff fixed.
+    #[test]
+    fn the_ground_pick_clock_hands_back_at_end_phase() {
+        let dt = 0.02;
+        let mut clock = PhaseClock::start(4.0, Some(0.7));
+        let mut ticks = 0;
+        loop {
+            let expected = phase_twist(clock.phi);
+            let slots = obs_twist(clock.phi);
+            assert!((f64::from(slots[0]) - expected[0]).abs() < 1e-5);
+            assert!((f64::from(slots[1]) - expected[1]).abs() < 1e-5);
+            assert_eq!(slots[2], 0.0);
+            ticks += 1;
+            if clock.advance(dt) {
+                break;
+            }
+            assert!(ticks < 200, "the pick must end: φ={}", clock.phi);
+        }
+        assert_eq!(ticks, 140, "2.8 s at 50 Hz");
+        assert!(clock.phi >= 0.7);
+    }
+
+    /// A phase skill uses that same clock. Episodic hands back at end_phase; the twist
+    /// at each tick is the pick's encoding, not the skill's constant `command`.
+    #[test]
+    fn a_phase_skill_feeds_cos_sin_zero_over_time() {
+        let def = robotd_params::SkillDef {
+            name: "dance".into(),
+            duration: 2.8,
+            encoding: Some("phase".into()),
+            period_s: Some(4.0),
+            end_phase: Some(0.7),
+            command: [1.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let mut clock = PhaseClock::of_skill(&def).expect("phase skill");
+        let active = |clock: PhaseClock, phase: SkillPhase| ActiveSkill {
+            index: 0,
+            phase,
+            remaining: 1.0,
+            chain: 0.0,
+            clock: Some(clock),
+        };
+
+        assert_twist_close(
+            skill_twist(Some(&def), &active(clock, SkillPhase::Holding)),
+            phase_twist(0.0),
+        );
+        assert_eq!(phase_twist(0.0), [1.0, 0.0, 0.0]);
+
+        let dt = 0.02;
+        for _ in 0..50 {
+            clock.advance(dt);
+        }
+        let expected = phase_twist(1.0 / 4.0);
+        assert_twist_close(
+            skill_twist(Some(&def), &active(clock, SkillPhase::Holding)),
+            expected,
+        );
+        let slots = obs_twist(clock.phi);
+        assert!((f64::from(slots[0]) - expected[0]).abs() < 1e-5);
+        assert!((f64::from(slots[1]) - expected[1]).abs() < 1e-5);
+        assert_eq!(slots[2], 0.0);
+
+        // Unwind is the idle command, not the clock — a perpetual skill coming back.
+        let mut unwinding = def.clone();
+        unwinding.unwind = [0.0, 1.0, 0.0];
+        assert_twist_close(
+            skill_twist(Some(&unwinding), &active(clock, SkillPhase::Unwinding)),
+            [0.0, 1.0, 0.0],
+        );
+
+        // The cutoff is the pick's: 140 ticks of 20 ms on a 4 s cycle at 0.7.
+        let mut cut = PhaseClock::of_skill(&def).unwrap();
+        let mut ticks = 0;
+        while !cut.advance(dt) {
+            ticks += 1;
+            assert!(ticks < 200);
+        }
+        assert_eq!(ticks + 1, 140);
+    }
+
+    /// A perpetual phase skill wraps rather than stopping at 1, and coming back drives
+    /// `command.idle` (the unwind), not another lap of the clock.
+    #[test]
+    fn a_perpetual_phase_skill_wraps_and_unwinds_on_idle() {
+        let def = robotd_params::SkillDef {
+            name: "loop".into(),
+            duration: 5.0,
+            encoding: Some("phase".into()),
+            period_s: Some(1.0),
+            end_phase: None,
+            unwind: [0.0, 0.0, 0.0],
+            unwind_s: 1.0,
+            ..Default::default()
+        };
+        let mut clock = PhaseClock::of_skill(&def).expect("wraps");
+        assert!(clock.end_phase.is_none());
+        clock.advance(0.75);
+        assert!((clock.phi - 0.75).abs() < 1e-12);
+        assert!(!clock.advance(0.5), "wrap is not a cutoff");
+        assert!((clock.phi - 0.25).abs() < 1e-12);
+
+        let active = ActiveSkill {
+            index: 0,
+            phase: SkillPhase::Unwinding,
+            remaining: 1.0,
+            chain: 0.0,
+            clock: Some(clock),
+        };
+        assert_twist_close(skill_twist(Some(&def), &active), def.unwind);
+    }
+
+    /// A constant-command skill is unchanged: zeros in, zeros out, no clock.
+    #[test]
+    fn a_constant_skill_does_not_grow_a_clock() {
+        let def = robotd_params::SkillDef {
+            name: "bow".into(),
+            duration: 4.0,
+            command: [0.0; 3],
+            ..Default::default()
+        };
+        assert!(PhaseClock::of_skill(&def).is_none());
+        let active = ActiveSkill {
+            index: 0,
+            phase: SkillPhase::Holding,
+            remaining: 4.0,
+            chain: 0.0,
+            clock: None,
+        };
+        assert_twist_close(skill_twist(Some(&def), &active), [0.0; 3]);
     }
 }

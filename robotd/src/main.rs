@@ -4732,6 +4732,9 @@ fn skills_report(state: &RobotState) -> proto::SkillsResult {
                 chain: Some(skill.chain),
                 action_scale: skill.params.action_scale,
                 gain_ratio: skill.params.gain_ratio,
+                encoding: skill.encoding.clone(),
+                period_s: skill.period_s,
+                end_phase: skill.end_phase,
                 overridden: overridden.contains(&skill.name),
             })
             .collect(),
@@ -4790,7 +4793,35 @@ fn set_skill_request(
                 .find(|s| s.name == p.name)
         });
 
-    let duration = match p.duration.or(existing.as_ref().map(|s| s.duration)) {
+    let encoding = p
+        .encoding
+        .as_deref()
+        .or(existing.as_ref().and_then(|s| s.encoding.as_deref()));
+    let is_phase = encoding.is_some_and(|e| e.eq_ignore_ascii_case("phase"));
+    let period_s = p.period_s.or(is_phase
+        .then(|| existing.as_ref().and_then(|s| s.period_s))
+        .flatten());
+    let end_phase = p.end_phase.or(is_phase
+        .then(|| existing.as_ref().and_then(|s| s.end_phase))
+        .flatten());
+    let SkillEncoding {
+        encoding,
+        period_s,
+        end_phase,
+    } = match skill_phase_fields(encoding, period_s, end_phase) {
+        Ok(fields) => fields,
+        Err(why) => return proto::IntentResult::refused(why),
+    };
+    let from_phase = match (period_s, end_phase) {
+        (Some(period), Some(end)) => Some(period * end),
+        _ => None,
+    };
+
+    let duration = match p
+        .duration
+        .or(existing.as_ref().map(|s| s.duration))
+        .or(from_phase)
+    {
         Some(duration) if duration > 0.0 => duration,
         Some(_) => {
             return proto::IntentResult::refused("a skill's duration must be more than zero");
@@ -4858,6 +4889,9 @@ fn set_skill_request(
                 .gain_ratio
                 .or(existing.as_ref().and_then(|s| s.params.gain_ratio)),
         },
+        encoding,
+        period_s,
+        end_phase,
     };
 
     if let Err(e) = params::edit::set_skill(&state.config_path, &skill) {
@@ -4865,6 +4899,75 @@ fn set_skill_request(
     }
     intents.request_policy_change(intents::PolicyChange::Reload);
     proto::IntentResult::accepted()
+}
+
+/// How the daemon will feed a skill its command, after the call's encoding has been
+/// checked. Named so the three fields stay together without a 3-tuple of Options.
+struct SkillEncoding {
+    encoding: Option<String>,
+    period_s: Option<f64>,
+    end_phase: Option<f64>,
+}
+
+/// Normalise a skill's command encoding. A phase skill needs a usable `period_s`; a
+/// posture flag is not a skill; anything else this daemon does not drive is refused
+/// rather than run as a constant.
+fn skill_phase_fields(
+    encoding: Option<&str>,
+    period_s: Option<f64>,
+    end_phase: Option<f64>,
+) -> Result<SkillEncoding, String> {
+    match encoding.map(|e| e.to_ascii_lowercase()).as_deref() {
+        None | Some("constant") | Some("") => {
+            if period_s.is_some() || end_phase.is_some() {
+                return Err(
+                    "period_s and end_phase belong on a phase skill; set encoding to \"phase\""
+                        .into(),
+                );
+            }
+            Ok(SkillEncoding {
+                encoding: None,
+                period_s: None,
+                end_phase: None,
+            })
+        }
+        Some("phase") => {
+            let period_s = match period_s {
+                Some(p) if p.is_finite() && p > 0.0 => p,
+                Some(_) => {
+                    return Err(
+                        "a phase skill's period_s must be a positive number of seconds".into(),
+                    );
+                }
+                None => {
+                    return Err("a phase skill needs period_s — seconds per cycle".into());
+                }
+            };
+            let end_phase = match end_phase {
+                None => None,
+                Some(e) if e.is_finite() && e > 0.0 => Some(e),
+                Some(_) => {
+                    return Err(
+                        "a phase skill's end_phase must be a positive fraction of the cycle".into(),
+                    );
+                }
+            };
+            Ok(SkillEncoding {
+                encoding: Some("phase".into()),
+                period_s: Some(period_s),
+                end_phase,
+            })
+        }
+        Some("posture_flag") => Err(
+            "a posture-flag policy is a sit↔stand, not a skill — `robotctl policy load sitstand` \
+             puts it in that slot"
+                .into(),
+        ),
+        Some(other) => Err(format!(
+            "command encoding {other:?} is not one this daemon can drive — a skill needs a \
+             constant or a phase"
+        )),
+    }
 }
 
 /// Take a skill out of the table.
@@ -5956,6 +6059,93 @@ mod tests {
         );
         assert!(!result.accepted);
         assert!(result.reason.unwrap_or_default().contains("no such file"));
+    }
+
+    /// A phase skill is accepted with its clock, and duration can come from
+    /// `period_s × end_phase` when the call does not name one. A missing or non-positive
+    /// `period_s` is refused rather than run as a constant.
+    #[test]
+    fn a_phase_skill_is_stored_with_its_clock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let onnx = dir.path().join("dance.onnx");
+        std::fs::write(&onnx, b"not really an onnx").expect("write");
+        let (_cfg, state) = state_over("");
+        let intents = Intents::default();
+
+        let missing = set_skill_request(
+            &proto::SkillParams {
+                name: "dance".to_owned(),
+                path: Some(onnx.display().to_string()),
+                encoding: Some("phase".into()),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(!missing.accepted);
+        assert!(
+            missing.reason.unwrap_or_default().contains("period_s"),
+            "the missing clock is named"
+        );
+
+        let bad = set_skill_request(
+            &proto::SkillParams {
+                name: "dance".to_owned(),
+                path: Some(onnx.display().to_string()),
+                encoding: Some("phase".into()),
+                period_s: Some(0.0),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(!bad.accepted);
+        assert!(bad.reason.unwrap_or_default().contains("period_s"));
+
+        let added = set_skill_request(
+            &proto::SkillParams {
+                name: "dance".to_owned(),
+                path: Some(onnx.display().to_string()),
+                encoding: Some("phase".into()),
+                period_s: Some(4.0),
+                end_phase: Some(0.7),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(added.accepted, "{added:?}");
+
+        let written = params::Params::load(&state.config_path, false).expect("valid");
+        let skill = written
+            .policy
+            .resolved_skills()
+            .into_iter()
+            .find(|s| s.name == "dance")
+            .expect("still there");
+        assert!(skill.is_phase());
+        assert_eq!(skill.period_s, Some(4.0));
+        assert_eq!(skill.end_phase, Some(0.7));
+        assert!(
+            (skill.duration - 2.8).abs() < 1e-12,
+            "duration is period × end_phase: {}",
+            skill.duration
+        );
+
+        let sit = set_skill_request(
+            &proto::SkillParams {
+                name: "sit".to_owned(),
+                path: Some(onnx.display().to_string()),
+                duration: Some(2.0),
+                encoding: Some("posture_flag".into()),
+                ..Default::default()
+            },
+            &state,
+            &intents,
+        );
+        assert!(!sit.accepted);
+        let sit_reason = sit.reason.unwrap_or_default();
+        assert!(sit_reason.contains("sitstand"), "{sit_reason}");
     }
 
     /// The two the daemon drives itself may not become table entries: an entry answering to

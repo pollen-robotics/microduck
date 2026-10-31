@@ -313,6 +313,12 @@ an all-zero command and being selected *is* the trigger. A policy that reads its
 something else — flamingo's is `[flag, side, 0]` — needs it spelled out, and its README says
 what the slots mean.
 
+A policy whose command is a **phase** (`encoding: phase` in the manifest) is a skill too. The
+robot writes `[cos 2πφ, sin 2πφ, 0]` from 0 at `1/period_s`. An episodic one hands back at
+`end_phase` (`duration_s = period_s × end_phase`). A perpetual one still needs `--hold`, and φ
+wraps until then. `period_s` has to be a positive number of seconds. A posture-flag policy is
+still a sit↔stand, not a skill.
+
 `sudo robotctl policy remove <name>` takes one out. A skill this robot's release ships comes back
 when you do, since removing the entry only removes the override.
 
@@ -432,10 +438,11 @@ all-zero command it was trained against, becomes a skill the robot answers to by
 for `robot do` and a button, with nothing else edited. A **`perpetual`** one is a gait and needs
 a slot pointed at it instead.
 
-A policy the daemon has to *drive* — writing a phase over time, or flipping a posture flag —
-declares that under `command.encoding`, and its numbers become that arm's timing rather than a
-new skill. The ground pick and the sit↔stand are the two, and getting one of those entries wrong
-is the one mistake here worth being careful about.
+A policy the official set drives itself — the ground pick's phase, the sit↔stand's posture flag
+— declares that under `command.encoding`, and those entries' numbers become that arm's timing
+rather than a new skill. A community phase policy is the other path: `policy add` installs it as
+a skill and the daemon clocks it. A posture-flag policy is still only the sit↔stand. Getting a
+set's ground-pick or sit↔stand entry wrong is the one mistake here worth being careful about.
 
 The manifest in full, every field, and what each one changes on the robot:
 [`../policy-manifest.md`](../policy-manifest.md).

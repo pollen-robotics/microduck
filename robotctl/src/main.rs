@@ -1106,6 +1106,11 @@ enum PolicyCommand {
     /// `kind: perpetual`, like the published flamingo — has no length of its own, so `--hold`
     /// and `--unwind` say how long to hold it and how long to come back before the gait takes
     /// over. Without those the robot would be handed back mid-pose.
+    ///
+    /// A policy whose command is a phase (`encoding: phase`) is a skill too: the robot writes
+    /// `[cos 2πφ, sin 2πφ, 0]` from 0 at `1/period_s`. Episodic hands back at `end_phase`.
+    /// Perpetual still needs `--hold`, and φ wraps until then. `period_s` has to be a positive
+    /// number of seconds. A posture-flag policy is still a sit↔stand, not a skill.
     Add {
         /// What to call it. This is what `robotctl robot do <name>` and a pad button will use.
         name: String,
@@ -4160,76 +4165,20 @@ fn run_policy_skill(
         }
     };
 
-    // A skill feeds its network a constant. A policy whose manifest says the daemon must drive
-    // it — a phase for a ground pick, a flag for a sit↔stand — cannot be one, and would run on a
-    // command it was never trained on while looking plausible. Those go in the slot the daemon
-    // drives, which is a different command.
-    if let Some(why) = from_manifest
-        .as_ref()
-        .and_then(|m| skill_encoding_refusal(name, m.encoding.as_deref()))
-    {
-        return Err(Failure::new(exit::USAGE, why));
-    }
-    // The manifest supplies the length for a policy that ends itself. One that does not —
-    // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
-    // hold and an unwind are for, so it is a refusal rather than a guess.
-    let declared = from_manifest.as_ref().and_then(|m| m.duration_s);
+    let skill = skill_from_add(
+        name,
+        path,
+        from_manifest.as_ref(),
+        *hold,
+        *unwind,
+        command_spec.as_deref(),
+        unwind_command.as_deref(),
+    )?;
+    let duration = skill.duration;
     let perpetual = from_manifest
         .as_ref()
         .and_then(|m| m.kind.as_deref())
         .is_some_and(|kind| kind.eq_ignore_ascii_case("perpetual"));
-    let duration = match hold.or(declared) {
-        Some(duration) if duration > 0.0 => duration,
-        Some(_) => return Err(Failure::new(exit::USAGE, "--hold must be positive".into())),
-        None if perpetual => {
-            return Err(Failure::new(
-                exit::USAGE,
-                format!(
-                    "{name} holds until it is told otherwise, so it has no length of its own — \
-                     say how long with `--hold`. How to come back it does declare, if its \
-                     manifest carries `command.idle` and `unwind_s`"
-                ),
-            ));
-        }
-        None => {
-            return Err(Failure::new(
-                exit::USAGE,
-                "its manifest does not say how long it runs; give `--hold <seconds>`".into(),
-            ));
-        }
-    };
-
-    let skill = robotd_params::SkillDef {
-        name: name.clone(),
-        path,
-        duration,
-        // Whether a held button chains another run is the policy's to say — the roulade does,
-        // a kick does not — and the manifest is where it says it.
-        chain: from_manifest.as_ref().is_some_and(|m| m.chain),
-        command: command_spec
-            .as_deref()
-            .map(twist_of)
-            .transpose()?
-            .unwrap_or_default(),
-        // The manifest knows how to stop: `command.idle` is the twist that means "stop doing
-        // the thing", and `unwind_s` is how long the policy needs to get there. A flag on the
-        // command line wins, because a person watching the robot is a better judge than a
-        // number measured in simulation.
-        unwind: match unwind_command.as_deref() {
-            Some(spec) => twist_of(spec)?,
-            None => from_manifest
-                .as_ref()
-                .and_then(|m| m.idle)
-                .unwrap_or_default(),
-        },
-        unwind_s: unwind
-            .or_else(|| from_manifest.as_ref().and_then(|m| m.unwind_s))
-            .unwrap_or(0.0),
-        params: robotd_params::SkillOverrides {
-            action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
-            ..Default::default()
-        },
-    };
 
     robotd_params::edit::set_skill(config, &skill).map_err(|e| Failure::new(exit::FAILED, e))?;
 
@@ -4253,21 +4202,148 @@ fn run_policy_skill(
     Ok(())
 }
 
+/// Build the skill entry `policy add` would write, without fetching or touching the file.
+///
+/// The fetch and the write sit around this so a change that could never be written fails
+/// before anything is downloaded — and so the encoding, period and hold rules can be tested
+/// without a Hub.
+fn skill_from_add(
+    name: &str,
+    path: Option<PathBuf>,
+    from_manifest: Option<&proto::PolicyFetchResult>,
+    hold: Option<f64>,
+    unwind: Option<f64>,
+    command_spec: Option<&str>,
+    unwind_command: Option<&str>,
+) -> Result<robotd_params::SkillDef, Failure> {
+    if let Some(why) =
+        from_manifest.and_then(|m| skill_encoding_refusal(name, m.encoding.as_deref()))
+    {
+        return Err(Failure::new(exit::USAGE, why));
+    }
+
+    let phase = from_manifest
+        .and_then(|m| m.encoding.as_deref())
+        .is_some_and(|e| e.eq_ignore_ascii_case("phase"));
+    let (period_s, end_phase) = if phase {
+        let period_s = match from_manifest.and_then(|m| m.period_s) {
+            Some(p) if p.is_finite() && p > 0.0 => p,
+            Some(_) => {
+                return Err(Failure::new(
+                    exit::USAGE,
+                    format!(
+                        "{name}'s manifest has command.period_s that is not a positive number of \
+                         seconds — a phase skill needs one"
+                    ),
+                ));
+            }
+            None => {
+                return Err(Failure::new(
+                    exit::USAGE,
+                    format!(
+                        "{name} is a phase policy, so it needs command.period_s — seconds per \
+                         cycle — and this manifest does not have a positive one"
+                    ),
+                ));
+            }
+        };
+        let end_phase = match from_manifest.and_then(|m| m.end_phase) {
+            None => None,
+            Some(e) if e.is_finite() && e > 0.0 => Some(e),
+            Some(_) => {
+                return Err(Failure::new(
+                    exit::USAGE,
+                    format!(
+                        "{name}'s manifest has command.end_phase that is not a positive fraction \
+                         of the cycle"
+                    ),
+                ));
+            }
+        };
+        (Some(period_s), end_phase)
+    } else {
+        (None, None)
+    };
+
+    // The manifest supplies the length for a policy that ends itself. One that does not —
+    // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
+    // hold and an unwind are for, so it is a refusal rather than a guess. An episodic phase
+    // policy's length is `period_s × end_phase` when it does not declare `duration_s`.
+    let perpetual = from_manifest
+        .and_then(|m| m.kind.as_deref())
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("perpetual"));
+    let from_phase = match (phase, perpetual, period_s, end_phase) {
+        (true, false, Some(period), end) => Some(period * end.unwrap_or(1.0)),
+        _ => None,
+    };
+    let declared = from_manifest.and_then(|m| m.duration_s).or(from_phase);
+    let duration = match hold.or(declared) {
+        Some(duration) if duration > 0.0 => duration,
+        Some(_) => return Err(Failure::new(exit::USAGE, "--hold must be positive".into())),
+        None if perpetual => {
+            return Err(Failure::new(
+                exit::USAGE,
+                format!(
+                    "{name} holds until it is told otherwise, so it has no length of its own — \
+                     say how long with `--hold`. How to come back it does declare, if its \
+                     manifest carries `command.idle` and `unwind_s`"
+                ),
+            ));
+        }
+        None => {
+            return Err(Failure::new(
+                exit::USAGE,
+                "its manifest does not say how long it runs; give `--hold <seconds>`".into(),
+            ));
+        }
+    };
+
+    // A perpetual phase skill wraps; an episodic one hands back at end_phase. Default the
+    // cutoff to one cycle when the manifest does not say, so a dance that runs once around
+    // does not need to spell 1.0.
+    let stored_end_phase = if phase && !perpetual {
+        Some(end_phase.unwrap_or(1.0))
+    } else {
+        None
+    };
+
+    Ok(robotd_params::SkillDef {
+        name: name.to_owned(),
+        path,
+        duration,
+        // Whether a held button chains another run is the policy's to say — the roulade does,
+        // a kick does not — and the manifest is where it says it.
+        chain: from_manifest.is_some_and(|m| m.chain),
+        command: command_spec.map(twist_of).transpose()?.unwrap_or_default(),
+        // The manifest knows how to stop: `command.idle` is the twist that means "stop doing
+        // the thing", and `unwind_s` is how long the policy needs to get there. A flag on the
+        // command line wins, because a person watching the robot is a better judge than a
+        // number measured in simulation.
+        unwind: match unwind_command {
+            Some(spec) => twist_of(spec)?,
+            None => from_manifest.and_then(|m| m.idle).unwrap_or_default(),
+        },
+        unwind_s: unwind
+            .or_else(|| from_manifest.and_then(|m| m.unwind_s))
+            .unwrap_or(0.0),
+        params: robotd_params::SkillOverrides {
+            action_scale: from_manifest.and_then(|m| m.action_scale),
+            ..Default::default()
+        },
+        encoding: phase.then(|| "phase".into()),
+        period_s,
+        end_phase: stored_end_phase,
+    })
+}
+
 /// Why a policy with this `command.encoding` cannot be a one-shot skill, or `None` when it can.
 ///
-/// A skill's network is fed a constant twist for its window. The manifest's `encoding` says
-/// whether that is what the policy expects: absent or `constant` is; `phase` is a ground pick and
-/// `posture_flag` a sit↔stand, both driven by the daemon through commands it generates. Loading
-/// either as a skill would run it on a command it was never trained on — a robot moving plausibly
-/// and wrongly, which is the failure hardest to see — so it is a refusal naming the command that
-/// does load it.
+/// A skill's network is fed a constant twist, or a phase the daemon clocks. `posture_flag` is a
+/// sit↔stand, and an encoding this daemon does not know would run on a command it was never
+/// trained on — a robot moving plausibly and wrongly, which is the failure hardest to see.
 fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> {
     match encoding.map(|e| e.to_ascii_lowercase()).as_deref() {
-        None | Some("constant") => None,
-        Some("phase") => Some(format!(
-            "{name} is driven by a phase the daemon generates, so it cannot be a one-shot skill — \
-             it is a ground pick: `robotctl policy load ground_pick <source>` puts it in that slot"
-        )),
+        None | Some("constant") | Some("phase") => None,
         Some("posture_flag") => Some(format!(
             "{name} is driven by a posture flag the daemon flips, so it cannot be a one-shot \
              skill — it is a sit↔stand: `robotctl policy load sitstand <source>` puts it in that \
@@ -4275,7 +4351,7 @@ fn skill_encoding_refusal(name: &str, encoding: Option<&str>) -> Option<String> 
         )),
         Some(other) => Some(format!(
             "{name}'s manifest says its command encoding is {other:?}, which this daemon does not \
-             know how to drive — a skill needs a constant command"
+             know how to drive — a skill needs a constant or a phase"
         )),
     }
 }
@@ -6120,14 +6196,121 @@ mod tests {
     /// Only what differs from a plain zero-command one-shot is written — a file full of explicit
     /// defaults is the unreadable thing this editor exists to avoid.
     #[test]
-    fn a_skill_must_take_a_constant_command() {
+    fn a_skill_takes_a_constant_or_phase_command() {
         assert_eq!(skill_encoding_refusal("bow", None), None);
         assert_eq!(skill_encoding_refusal("bow", Some("constant")), None);
-        let pick = skill_encoding_refusal("pick", Some("phase")).expect("refused");
-        assert!(pick.contains("policy load ground_pick"), "{pick}");
+        assert_eq!(skill_encoding_refusal("dance", Some("phase")), None);
         let sit = skill_encoding_refusal("sit", Some("posture_flag")).expect("refused");
         assert!(sit.contains("policy load sitstand"), "{sit}");
         assert!(skill_encoding_refusal("x", Some("telepathy")).is_some());
+    }
+
+    fn phase_manifest(
+        kind: &str,
+        period_s: Option<f64>,
+        end_phase: Option<f64>,
+        duration_s: Option<f64>,
+    ) -> proto::PolicyFetchResult {
+        proto::PolicyFetchResult {
+            encoding: Some("phase".into()),
+            kind: Some(kind.into()),
+            period_s,
+            end_phase,
+            duration_s,
+            ..Default::default()
+        }
+    }
+
+    /// An episodic phase skill is accepted and lasts `period_s × end_phase`. A perpetual one
+    /// needs `--hold` so φ has a window to wrap in. A missing or non-positive period is
+    /// refused rather than run as a constant, which would look plausible and be wrong.
+    #[test]
+    fn policy_add_accepts_a_phase_skill_and_refuses_a_bad_clock() {
+        let episodic = must(skill_from_add(
+            "dance",
+            Some(PathBuf::from("/srv/dance.onnx")),
+            Some(&phase_manifest("episodic", Some(4.0), Some(0.7), None)),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert!(episodic.is_phase());
+        assert_eq!(episodic.period_s, Some(4.0));
+        assert_eq!(episodic.end_phase, Some(0.7));
+        assert!((episodic.duration - 2.8).abs() < 1e-12);
+
+        let looped = must(skill_from_add(
+            "loop",
+            Some(PathBuf::from("/srv/loop.onnx")),
+            Some(&phase_manifest("perpetual", Some(2.0), None, None)),
+            Some(5.0),
+            Some(1.0),
+            None,
+            None,
+        ));
+        assert!(looped.is_phase());
+        assert_eq!(looped.period_s, Some(2.0));
+        assert_eq!(
+            looped.end_phase, None,
+            "perpetual wraps, it does not cut off"
+        );
+        assert_eq!(looped.duration, 5.0);
+        assert_eq!(looped.unwind_s, 1.0);
+
+        let no_hold = skill_from_add(
+            "loop",
+            None,
+            Some(&phase_manifest("perpetual", Some(2.0), None, None)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("perpetual needs --hold");
+        assert_eq!(no_hold.code, exit::USAGE);
+        assert!(no_hold.message.contains("--hold"), "{}", no_hold.message);
+
+        let missing = skill_from_add(
+            "dance",
+            None,
+            Some(&phase_manifest("episodic", None, Some(1.0), None)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("needs period_s");
+        assert!(missing.message.contains("period_s"), "{}", missing.message);
+
+        let zero = skill_from_add(
+            "dance",
+            None,
+            Some(&phase_manifest("episodic", Some(0.0), Some(1.0), None)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("zero is not a period");
+        assert!(zero.message.contains("period_s"), "{}", zero.message);
+
+        let sit = skill_from_add(
+            "sit",
+            None,
+            Some(&proto::PolicyFetchResult {
+                encoding: Some("posture_flag".into()),
+                kind: Some("scripted".into()),
+                duration_s: Some(2.0),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("still a sit↔stand");
+        assert!(sit.message.contains("sitstand"), "{}", sit.message);
     }
 
     /// A twist is three numbers; anything else is a refusal rather than a partial parse, which

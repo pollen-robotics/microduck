@@ -531,6 +531,15 @@ impl Model {
             entry["unwind"] = toml_edit::value(array_of(skill.unwind));
             entry["unwind_s"] = toml_edit::value(skill.unwind_s);
         }
+        if skill.is_phase() {
+            entry["encoding"] = toml_edit::value("phase");
+            if let Some(period_s) = skill.period_s {
+                entry["period_s"] = toml_edit::value(period_s);
+            }
+            if let Some(end_phase) = skill.end_phase {
+                entry["end_phase"] = toml_edit::value(end_phase);
+            }
+        }
 
         let mut overrides = toml_edit::Table::new();
         for (key, value) in [
@@ -2178,6 +2187,51 @@ mod tests {
         assert_eq!(flamingo.name, "flamingo");
         assert_eq!(flamingo.command, [1.0, 1.0, 0.0]);
         assert_eq!(flamingo.unwind_s, 3.0);
+    }
+
+    /// A phase skill writes the clock, not a constant twist — so an older daemon that does
+    /// not know those keys drops them (and will not run the policy as a phase) rather than
+    /// refusing to start.
+    #[test]
+    fn a_phase_skill_writes_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").unwrap();
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "dance".into(),
+                path: Some(PathBuf::from("/srv/dance.onnx")),
+                duration: 2.8,
+                encoding: Some("phase".into()),
+                period_s: Some(4.0),
+                end_phase: Some(0.7),
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert!(written.contains("encoding = \"phase\""), "{written}");
+        assert!(written.contains("period_s = 4.0"), "{written}");
+        assert!(written.contains("end_phase = 0.7"), "{written}");
+        assert!(
+            !written.contains("command"),
+            "the clock is the command: {written}"
+        );
+
+        let parsed = Params::load(&config, true).expect("robotd would accept it");
+        let dance = parsed
+            .policy
+            .resolved()
+            .skills
+            .into_iter()
+            .find(|s| s.name == "dance")
+            .expect("the skill");
+        assert!(dance.is_phase());
+        assert_eq!(dance.period_s, Some(4.0));
+        assert_eq!(dance.end_phase, Some(0.7));
     }
 
     /// Removing says whether there was anything to remove, so a typo says so instead of looking

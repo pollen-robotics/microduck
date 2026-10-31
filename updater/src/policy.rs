@@ -1178,8 +1178,7 @@ pub struct PolicyManifest {
 #[serde(default)]
 pub struct ManifestCommand {
     /// How the daemon is meant to drive the twist: absent or `"constant"` (a skill), `"phase"`
-    /// (a ground pick), `"posture_flag"` (a sit↔stand). Read so a client can refuse to make a
-    /// one-shot of something the daemon has to drive itself.
+    /// (a clocked skill, or a ground pick in that slot), `"posture_flag"` (a sit↔stand).
     pub encoding: Option<String>,
     pub idle: Option<[f64; 3]>,
     /// Phase encoding: seconds per cycle, and where in it the move hands back.
@@ -1434,6 +1433,8 @@ pub async fn fetch(
         unwind_s: manifest.unwind_s,
         idle: manifest.command.as_ref().and_then(|c| c.idle),
         encoding: manifest.command.as_ref().and_then(|c| c.encoding.clone()),
+        period_s: manifest.command.as_ref().and_then(|c| c.period_s),
+        end_phase: manifest.command.as_ref().and_then(|c| c.end_phase),
         chain: manifest.chain,
         schema_version: manifest.schema_version,
     })
