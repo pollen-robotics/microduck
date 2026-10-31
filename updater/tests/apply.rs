@@ -1866,6 +1866,28 @@ async fn rollback_skips_known_bad_releases() {
     assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
 }
 
+/// A named version is let past the downgrade guard because somebody named it, so the
+/// source serving another version's signed manifest under that name must not install
+/// it. Here 1.0.0's manifest sits where 1.5.0's belongs, on a robot running 1.4.0.
+#[tokio::test]
+async fn an_exact_version_whose_manifest_names_another_is_refused() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.4.0"] {
+        fx.publish(v, None);
+    }
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), "");
+    apply_exact(&mut engine, "1.4.0").await.unwrap();
+
+    fx.point_ref_at("1.5.0", "1.0.0");
+    let result = apply_exact(&mut engine, "1.5.0").await;
+
+    assert!(
+        matches!(result, Err(updater::Error::Corrupt(_))),
+        "{result:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.4.0"));
+}
+
 /// **#3** An unrecoverable trial was re-reported on every boot, appending a bogus
 /// rollback entry each time and never converging.
 #[tokio::test]
