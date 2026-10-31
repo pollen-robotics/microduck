@@ -2550,8 +2550,14 @@ async fn control_loop<T: RobotIo>(
                     bringup = Bringup::Limp;
                     was_driving = false;
                     // And the skill state with it: a limp robot is not sitting, kicking or
-                    // picking anything, whatever it was doing when the torque went.
+                    // picking anything, whatever it was doing when the torque went — nor playing
+                    // the sound a skill started.
                     if let Some(controller) = controller.as_mut() {
+                        if controller.busy()
+                            && let Some(voice) = voice.as_mut()
+                        {
+                            voice.stop();
+                        }
                         controller.forget();
                     }
                 }
@@ -2594,8 +2600,14 @@ async fn control_loop<T: RobotIo>(
                 shutdown_rest = None;
                 shutdown_power_off = true;
             }
-            // As for a relax: the robot came back limp, and the seat or move it had is gone.
+            // As for a relax: the robot came back limp, and the seat or move it had is gone,
+            // with the sound a skill started.
             if let Some(controller) = controller.as_mut() {
+                if controller.busy()
+                    && let Some(voice) = voice.as_mut()
+                {
+                    voice.stop();
+                }
                 controller.forget();
             }
         }
