@@ -118,13 +118,14 @@ pub struct ConfigStamp {
 /// A user layer that does not parse is left out, as [`Params::load`] leaves it out. `Ok("")`
 /// when neither file exists.
 pub fn layered_text(path: &Path) -> Result<String, String> {
+    layered_text_in(path, user_layer_for(path).as_deref())
+}
+
+/// [`layered_text`] with the user layer named, so a test can point both layers at a directory.
+fn layered_text_in(path: &Path, user: Option<&Path>) -> Result<String, String> {
     let read = |p: &Path| read_optional(p).map_err(|e| format!("cannot read {}: {e}", p.display()));
     let base = read(path)?.unwrap_or_default();
-    let Some(user) = user_layer_for(path)
-        .map(|u| read(&u))
-        .transpose()?
-        .flatten()
-    else {
+    let Some(user) = user.map(read).transpose()?.flatten() else {
         return Ok(base);
     };
     let base_table: toml::Table = base
@@ -2161,14 +2162,21 @@ impl ResolvedPolicy {
 }
 
 impl PolicyParams {
-    /// Whether `robotd.toml` at `path` allows community policies, read on its own.
+    /// Whether `robotd.toml` at `path` allows community policies, without the rest of the schema.
     ///
-    /// For `updaterd`, before every fetch, the way it reads the board
+    /// For `updaterd`, before every fetch, both layers read the way it reads the board
     /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
     /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
     /// — the default, and the answer that downloads nothing.
+    ///
+    /// `robotctl configure` writes the owner's layer, and `robotd` moves a value hand-set in /etc
+    /// there at its first start with layers, so the base alone does not see it turned on.
     pub fn community_allowed(path: &Path) -> bool {
-        let Some(text) = std::fs::read_to_string(path).ok() else {
+        Self::community_allowed_in(path, user_layer_for(path).as_deref())
+    }
+
+    fn community_allowed_in(path: &Path, user: Option<&Path>) -> bool {
+        let Ok(text) = layered_text_in(path, user) else {
             return false;
         };
         let Ok(table) = toml::from_str::<toml::Table>(&text) else {
@@ -4824,5 +4832,38 @@ mod tests {
         assert!(!read("not toml ["));
         std::fs::remove_file(&path).expect("remove");
         assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// An owner turns it on with `robotctl configure`, which writes the owner's layer. `updaterd`
+    /// has to see that, and an owner turning it back off.
+    #[test]
+    fn community_allowed_reads_the_owners_layer_over_the_base() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("etc-robotd.toml");
+        let user = dir.path().join("var-robotd.toml");
+        let read = |base_text: &str, user_text: Option<&str>| {
+            std::fs::write(&base, base_text).expect("write base");
+            match user_text {
+                Some(text) => std::fs::write(&user, text).expect("write user"),
+                None => {
+                    let _ = std::fs::remove_file(&user);
+                }
+            }
+            PolicyParams::community_allowed_in(&base, Some(&user))
+        };
+
+        assert!(read(
+            "[policy]\n",
+            Some("[policy]\nallow_community = true\n")
+        ));
+        assert!(!read(
+            "[policy]\nallow_community = true\n",
+            Some("[policy]\nallow_community = false\n")
+        ));
+        assert!(read("[policy]\nallow_community = true\n", None));
+        assert!(
+            read("[policy]\nallow_community = true\n", Some("not toml [")),
+            "a user layer that does not parse is left out, as everywhere else"
+        );
     }
 }
