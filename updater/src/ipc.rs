@@ -134,6 +134,9 @@ pub struct Server {
     /// Anonymous usage data: the owner's switch, and the queue the task started by
     /// [`Self::spawn_telemetry`] sends.
     telemetry: Arc<crate::telemetry::Telemetry>,
+
+    /// What runs and watches an OS update. A test points it at stubs.
+    os: crate::os::Tools,
 }
 
 impl Server {
@@ -176,6 +179,7 @@ impl Server {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(PathBuf::from(
                 crate::telemetry::DEFAULT_PATH,
             ))),
+            os: crate::os::Tools::system(),
         }
     }
 
@@ -200,6 +204,13 @@ impl Server {
     #[doc(hidden)]
     pub fn with_account_for_test(mut self, token_path: PathBuf, endpoint: String) -> Self {
         self.account = Arc::new(crate::account::account_for_test(token_path, endpoint));
+        self
+    }
+
+    /// Run and watch OS updates with these programs instead of the robot's.
+    #[doc(hidden)]
+    pub fn with_os_tools_for_test(mut self, tools: crate::os::Tools) -> Self {
+        self.os = tools;
         self
     }
 
@@ -409,6 +420,14 @@ impl Server {
                         continue;
                     }
 
+                    if crate::os::running(&self.os).await {
+                        tracing::info!(
+                            %component,
+                            %candidate,
+                            "an OS update is running; holding this one until the next check"
+                        );
+                        continue;
+                    }
                     if mandatory {
                         tracing::warn!(
                             %component,
@@ -447,6 +466,9 @@ impl Server {
     /// unattended update in progress rather than an unexplained restart.
     async fn apply_unattended(&self, component: &str) -> Result<proto::ApplyResult, crate::Error> {
         let mut engine = self.engine.try_lock().map_err(|_| crate::Error::Busy)?;
+        if crate::os::running(&self.os).await {
+            return Err(crate::Error::Busy);
+        }
 
         let (tx, rx) = mpsc::unbounded_channel::<Progress>();
         let pump = self.spawn_progress_pump(rx);
@@ -744,11 +766,11 @@ impl Server {
             //
             // The reads take no engine lock: the OS's state is the script's, not the engine's, and
             // `os.status` is what a client polls while an OS update downloads.
-            Call::OsStatus => match crate::os::status(&crate::os::Tools::system()).await {
+            Call::OsStatus => match crate::os::status(&self.os).await {
                 Ok(status) => Response::ok(Some(id), &status),
                 Err(e) => Response::err(Some(id), e),
             },
-            Call::OsCheck => match crate::os::check(&crate::os::Tools::system()).await {
+            Call::OsCheck => match crate::os::check(&self.os).await {
                 Ok(status) => Response::ok(Some(id), &status),
                 Err(e) => Response::err(Some(id), e),
             },
@@ -777,7 +799,7 @@ impl Server {
                 if let Err(e) = engine.os_preflight(interrupt_sessions, network).await {
                     return Response::err(Some(id), e.to_rpc_error());
                 }
-                match crate::os::start(&crate::os::Tools::system(), &action).await {
+                match crate::os::start(&self.os, &action).await {
                     Ok(status) => Response::ok(Some(id), &status),
                     Err(e) => Response::err(Some(id), e),
                 }
@@ -1048,6 +1070,18 @@ impl Server {
                 );
             }
         };
+        // `os.apply` gives the engine back once its update is under way, and that update ends
+        // in a reboot that must not land in the middle of a swap. Asked under the lock, so no
+        // `os.apply` can start between this and the swap; the 8090 page does not take it.
+        if crate::os::running(&self.os).await {
+            return Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::BUSY,
+                    "an OS update is running; retry once it has finished",
+                ),
+            );
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Progress>();
 

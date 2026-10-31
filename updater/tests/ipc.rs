@@ -740,6 +740,95 @@ async fn a_mandatory_update_is_applied_without_a_client() {
     );
 }
 
+/// Stubs for the OS update tools whose `systemctl` reports the update unit active while
+/// `running` exists, so a test can start and finish an OS update by touching a file.
+fn os_update_stubs(fx: &Harness) -> (updater::os::Tools, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let running = fx.root.join("os-update-running");
+    let systemctl = fx.root.join("systemctl");
+    std::fs::write(
+        &systemctl,
+        format!(
+            "#!/bin/sh\nif [ -e '{}' ]; then echo active; else echo inactive; fi\n",
+            running.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tools = updater::os::Tools {
+        systemctl,
+        ..updater::os::Tools::system()
+    };
+    (tools, running)
+}
+
+/// **A daemon update waits for an OS update to finish.** `os.apply` gives the engine back once
+/// its update is under way, and the reboot it ends in must not land in the middle of a swap.
+#[tokio::test]
+async fn a_daemon_update_is_refused_while_an_os_update_runs() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let (tools, running) = os_update_stubs(&fx);
+    let server = Server::new(fx.engine(true, Faults::none())).with_os_tools_for_test(tools);
+    let _server = fx.serve_with(Arc::new(server)).await;
+
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+    let apply = serde_json::json!({ "component": "daemon", "target": "latest" });
+
+    std::fs::write(&running, "").unwrap();
+    let response = client.call(method::APPLY, apply.clone()).await;
+    let error = response.error.expect("refused while the OS update runs");
+    assert_eq!(error.code, proto::code::BUSY);
+    assert!(error.message.contains("OS update"), "{}", error.message);
+    assert_eq!(fx.live_version(), None, "nothing was installed");
+
+    std::fs::remove_file(&running).unwrap();
+    let response = client.call(method::APPLY, apply).await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// The scheduler too: a mandatory release waits for the OS update and goes in after it.
+#[tokio::test]
+async fn a_mandatory_update_waits_for_an_os_update_to_finish() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let (tools, running) = os_update_stubs(&fx);
+    let server =
+        Arc::new(Server::new(fx.engine(true, Faults::none())).with_os_tools_for_test(tools));
+    let _server = fx.serve_with(Arc::clone(&server)).await;
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+    let response = client
+        .call(
+            method::APPLY,
+            serde_json::json!({ "component": "daemon", "target": "latest" }),
+        )
+        .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+
+    fx.publish_with("1.1.0", false, |m| {
+        m["min_supported"] = serde_json::json!("1.1.0");
+    });
+    std::fs::write(&running, "").unwrap();
+    server.check_all_for_test(AutoApply::Mandatory).await;
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "held while the OS update runs"
+    );
+
+    std::fs::remove_file(&running).unwrap();
+    server.check_all_for_test(AutoApply::Mandatory).await;
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "and applied once it has finished"
+    );
+}
+
 /// **A bad mandatory release must not put the robot in an apply/rollback loop.**
 ///
 /// The failure this prevents is a fleet-wide one. `min_supported` exists to force robots

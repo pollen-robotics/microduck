@@ -1229,7 +1229,10 @@ same preflight as an apply: the robot is not moving and nobody is watching it
 remotely, `interrupt_sessions` lifting only the second. The clock check applies
 to `os.apply` alone, since a switch makes no HTTPS request. The work runs as the
 transient unit `microduck-osupdate-apply`, the one the 8090 page starts too, so
-each path sees the other's update as running.
+each path sees the other's update as running. `os.apply` gives the lock back once
+the update is under way, so while that unit runs an apply, rollback, select or
+reset answers `BUSY` and the scheduler holds its update: the reboot must not land
+in the middle of a swap either.
 
 `os.apply` answers once the phase is past the script's checks, so a refusal the
 script makes at once — the build is already running, the channel has no
