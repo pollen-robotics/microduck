@@ -959,7 +959,7 @@ mod discovery_tests {
             .is_err()
         );
         assert!(
-            discovery_when_ready(|| std::future::pending(), Duration::from_millis(20))
+            discovery_when_ready(std::future::pending, Duration::from_millis(20))
                 .await
                 .is_err()
         );
