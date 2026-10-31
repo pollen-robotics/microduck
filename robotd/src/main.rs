@@ -1814,8 +1814,11 @@ impl RestRamp {
 /// can produce one — JSON parses `1e400` as infinity — and the safety layer below refuses
 /// non-finite joint targets rather than clamping them, so a single bad `robot.move` would
 /// otherwise freeze the robot on its hold pose until reboot.
+///
+/// So is one past `f32`'s range: finite here, it is infinite in the observation the policy is
+/// handed, and the policy refuses that on every tick just the same.
 fn slew(ema: &mut f64, target: f64, alpha: f64) {
-    if target.is_finite() {
+    if (target as f32).is_finite() {
         *ema += alpha * (target - *ema);
     }
 }
@@ -10186,5 +10189,20 @@ mod tests {
         // And the filter still works afterwards: the next real command slews as always.
         slew(&mut ema, 1.0, 0.3);
         assert!((ema - 0.65).abs() < 1e-12, "{}", ema);
+    }
+
+    /// `1e300` is finite, so it passed the check above — and the policy is fed `f32`, where it
+    /// is infinity. One `robot.head` carrying it made every inference fail until a sane head
+    /// command replaced it, the robot held rather than balanced all the while.
+    #[test]
+    fn a_command_past_f32_does_not_poison_the_filter() {
+        let mut ema = 0.5;
+        slew(&mut ema, 1e300, 0.3);
+        slew(&mut ema, -1e300, 0.3);
+        assert!((ema as f32).is_finite(), "{ema}");
+        assert_eq!(
+            ema, 0.5,
+            "targets the policy cannot take are dropped, not folded in"
+        );
     }
 }
