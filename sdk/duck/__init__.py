@@ -3,11 +3,12 @@
     from duck import Duck
 
     with Duck() as duck:
+        duck.enable(True)
         for view in duck.watch(fps=2):
-            if view.nearest and view.nearest < 0.3:
+            if view.position and view.position[0] > 1.0:
                 duck.stop()
-            else:
-                duck.move(vx=0.15)
+                break
+            duck.move(vx=0.12)
 
 The Spaces under `spaces/` use these same modules rather than a copy.
 """

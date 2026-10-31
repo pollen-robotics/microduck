@@ -36,23 +36,25 @@ rather than a copy of them.
 
 ## A behaviour is a loop
 
-`watch` merges state and depth and hands over the latest of each, once per tick:
+`watch` hands over the latest state once per tick, at the rate the caller decides:
 
 ```python
 with Duck() as duck:
-    for view in duck.watch(fps=4):
-        if view.nearest and view.nearest < 0.4:
-            duck.move(vyaw=0.8)
-        else:
-            duck.move(vx=0.12)
+    duck.enable(True)
+    for view in duck.watch(fps=2):
+        if view.position and view.position[0] > 1.0:
+            duck.stop()
+            break
+        duck.move(vx=0.12)
 ```
 
-It asks the robot for each stream at the tick rate, held under what the lane carries, so at
-`fps=4` a tick may repeat the reading before it. `view.nearest` is the closest thing the depth
-sensor sees in metres, or `None`, read the way `tof::Frame::zone` reads it: a negative distance is
-a failed convergence, not the nearest thing in the room.
+`move` and `head` are notifications, as `duck-ipc-proto` says continuous intents are, so they
+wait for nothing. The robot is asked for state at the tick rate, held under what the lane carries.
 
-`examples/wander_without_bumping_into_things.py` is a duck walking around a room.
+`watch(depth=True)` adds the ToF, and `view.nearest` is the closest thing it sees in metres, read
+the way `tof::Frame::zone` reads it. It is off by default because `tofd` sends 15 frames a second
+and the robot posts lane messages one at a time, so today depth holds every answer and every state
+behind it. `examples/wander_without_bumping_into_things.py` uses it.
 
 ## Frames
 

@@ -113,6 +113,14 @@ class Rpc:
                 method, {"message": f"no answer in {budget:.0f}s"}
             ) from None
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> bool:
+        """One notification: no id, so nothing comes back and nothing waits. For continuous
+        intents, which `duck-ipc-proto` says to send this way."""
+        send = self._send
+        if send is None:
+            raise RpcError(method, {"message": "no control channel, connect first"})
+        return send({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
     def on_message(self, raw: Any) -> None:
         """One line off the channel. Runs on the consumer's event loop, so it does not block."""
         if isinstance(raw, bytes):

@@ -3,7 +3,8 @@
     python examples/wander_without_bumping_into_things.py [duck-name]
 
 The whole behaviour is the loop below. Depth and state arrive on two streams at two rates, and
-`watch` is what makes them one object per tick.
+`watch` is what makes them one object per tick. Depth over the rendezvous waits on the robot
+posting lane messages faster than `tofd` sends frames; see the README.
 """
 
 import sys
@@ -22,7 +23,7 @@ def main(name: str | None) -> None:
     with Duck(name) as duck:
         duck.enable(True)
 
-        for view in duck.watch(fps=4):
+        for view in duck.watch(fps=2, depth=True):
             if view.fallen:
                 print("down, stopping and letting somebody pick it up")
                 duck.stop()

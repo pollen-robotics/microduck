@@ -73,9 +73,10 @@ class Duck:
     def video(self) -> dict[str, Any]:
         return self._rpc.call("media.video")
 
-    def move(self, vx: float = 0.0, vy: float = 0.0, vyaw: float = 0.0) -> Any:
-        """Walk, m/s and rad/s. The deadman stops the robot when intents stop arriving."""
-        return self._rpc.call("robot.move", {"vx": vx, "vy": vy, "vyaw": vyaw})
+    def move(self, vx: float = 0.0, vy: float = 0.0, vyaw: float = 0.0) -> bool:
+        """Walk, m/s and rad/s. A notification, so it waits for nothing; the deadman stops the
+        robot when they stop arriving."""
+        return self._rpc.notify("robot.move", {"vx": vx, "vy": vy, "vyaw": vyaw})
 
     def stop(self) -> Any:
         return self._rpc.call("robot.stop")
@@ -90,9 +91,9 @@ class Duck:
         head_pitch: float = 0.0,
         head_roll: float = 0.0,
         neck_pitch: float = 0.0,
-    ) -> Any:
-        """Pose the head by joint angle, radians."""
-        return self._rpc.call(
+    ) -> bool:
+        """Pose the head by joint angle, radians. A notification, like `move`."""
+        return self._rpc.notify(
             "robot.head",
             {
                 "head_yaw": head_yaw,
@@ -131,11 +132,13 @@ class Duck:
     def stop_frames(self) -> Any:
         return self._rpc.call("media.stream", {"url": None})
 
-    def watch(self, fps: float = 2.0, depth: bool = True) -> Iterator[View]:
-        """One `View` per tick with the latest state and depth, `fps` ticks a second.
+    def watch(self, fps: float = 2.0, depth: bool = False) -> Iterator[View]:
+        """One `View` per tick with the latest state, and depth if asked, `fps` ticks a second.
 
         Each stream is asked for at the tick rate held under the lane's budget, so a tick may
-        repeat the reading before it.
+        repeat the reading before it. Depth is off by default: `tofd` sends every frame, 15 a
+        second, and the robot posts lane messages one at a time, so today it holds every answer
+        behind it.
         """
         hz = _lane_rate(fps, 2 if depth else 1)
         self.subscribe(hz)

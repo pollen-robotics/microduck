@@ -63,6 +63,8 @@ class FakeRendezvous:
                 if body["type"] == "peer" and "rpc" in body:
                     call = body["rpc"]
                     fake.calls.append(call)
+                    if "id" not in call:
+                        return
                     answer = {"method": call["method"], "params": call.get("params")}
                     fake.events.put(
                         {
@@ -153,14 +155,22 @@ def test_intents_carry_the_fields_robotd_accepts(rendezvous):
         duck.look(0.5, 0.0, 0.1)
 
     sent = {c["method"]: set(c["params"]) for c in rendezvous.calls}
+    notified = {c["method"] for c in rendezvous.calls if "id" not in c}
+    assert notified == {"robot.head", "robot.move"}, "continuous intents are notifications"
     assert sent["robot.head"] == fields("HeadParams")
     assert sent["robot.move"] == fields("MoveParams")
     assert sent["robot.look"] <= fields("LookParams")
 
 
+def test_watch_leaves_depth_off_unless_asked(rendezvous):
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.watch(fps=2)
+    assert "tof.stream" not in {c["method"] for c in rendezvous.calls}
+
+
 def test_watch_asks_for_rates_the_lane_can_carry(rendezvous):
     with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
-        ticks = duck.watch(fps=20)
+        ticks = duck.watch(fps=20, depth=True)
         asked = {c["method"]: c["params"] for c in rendezvous.calls}
         per_minute = (asked["robot.subscribe"]["hz"] + asked["tof.stream"]["hz"]) * 60
         assert per_minute <= LANE_NOTIFICATIONS_PER_MINUTE
