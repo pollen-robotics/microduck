@@ -1,13 +1,18 @@
 //! The mapping itself: one frame of pad in, the intents it means out. `padd`'s crate doc
 //! describes what each control does; this is where it is done.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Select held this long powers the robot off; let go sooner and the motors go limp at once.
+/// Rémi's own setting (2026-10-31), kept off main, where a tap does nothing, a release between
+/// [`crate::hold::REST_HOLD`] and [`crate::hold::SHUTDOWN_HOLD`] rests and the latter powers off.
+const SELECT_POWER_OFF: Duration = Duration::from_secs(3);
 
 use duck_ipc_proto as proto;
 use robotd_params::pad_axes::{AxisBinding, Sticks};
 
 use crate::buttons::Buttons;
-use crate::hold::{HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
+use crate::hold::{HOME_HOLD, HoldAction, HoldButton};
 
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
@@ -449,38 +454,33 @@ impl Mapper {
             })));
         }
 
-        // Select: nothing on a tap. Let go between two and four seconds, a rest; held to four, a
-        // power-off. Both sit and ease into the rest pose before torque goes, which is why the
-        // rest waits for the release: until then the same hold may still become a power-off.
+        // Select: let go before three seconds and the motors go limp now — torque off and every
+        // servo rebooted where the robot is, no sit first. Held to three, the gentle power-off:
+        // sit, rest pose, then power off. The limp waits for the release because until then the
+        // same press may still become the power-off, which needs a robot still up to sit with.
         match self.select.tick(
             pad.held.contains(Buttons::SELECT),
             pad.released.contains(Buttons::SELECT),
             now,
-            &[REST_HOLD, SHUTDOWN_HOLD],
+            &[SELECT_POWER_OFF],
         ) {
-            HoldAction::ReleasedAfter(0) => {
-                tracing::warn!(
-                    "Select released — robot.rest: sit, rest pose, then torque off and servo reboot"
-                );
-                // A reboot at the end rather than a bare relax: a servo that tripped its overload
-                // comes back with it, so this is also the way out of a tripped servo without
-                // pulling the battery. The robot ends limp, so the next Start stands it up again
-                // rather than toggling the policy on a robot that is lying on the floor.
-                self.up = false;
-                out.push(Out::Request(proto::Call::RobotRest));
-            }
-            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
             HoldAction::Tap => {
-                tracing::info!("Select tapped — hold it 2 s to rest, 4 s to power off")
-            }
-            HoldAction::Reached(0) => {
-                tracing::warn!("Select held 2 s — let go to rest, keep holding to power off")
+                tracing::warn!(
+                    "Select — robot.rebootMotors: limp now, torque off and servo reboot"
+                );
+                // The robot ends limp, so the next Start stands it up again rather than toggling
+                // the policy on a robot that is lying on the floor.
+                self.up = false;
+                out.push(Out::Request(proto::Call::RobotRebootMotors(
+                    proto::RebootMotorsParams::default(),
+                )));
             }
             HoldAction::Reached(_) => {
                 self.up = false;
-                tracing::warn!("Select held on — asking the robot to power off");
+                tracing::warn!("Select held 3 s — asking the robot to power off");
                 out.push(Out::Request(proto::Call::RobotShutdown));
             }
+            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
         }
 
         // Either trigger opens the mouth; the max wins, as in the prototype — where RT
@@ -806,6 +806,62 @@ mod tests {
             held: button,
             ..Default::default()
         }
+    }
+
+    /// Select let go before three seconds reboots every servo, limp at once; held to three it
+    /// powers off instead, and that release adds nothing.
+    #[test]
+    fn select_goes_limp_on_a_short_press_and_powers_off_held_three_seconds() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let limp = |out: &Vec<Out>| {
+            out.iter()
+                .any(|o| matches!(o, Out::Request(proto::Call::RobotRebootMotors(p)) if p.ids.is_empty()))
+        };
+        let off = |out: &Vec<Out>| {
+            out.iter()
+                .any(|o| matches!(o, Out::Request(proto::Call::RobotShutdown)))
+        };
+        let up = PadFrame {
+            released: Buttons::SELECT,
+            ..Default::default()
+        };
+        let held = PadFrame {
+            held: Buttons::SELECT,
+            ..Default::default()
+        };
+
+        m.tick(&press(Buttons::SELECT), &cfg, t, &mut out, &mut frame);
+        assert!(
+            !limp(&out) && !off(&out),
+            "nothing while it is down: {out:?}"
+        );
+        m.tick(
+            &up,
+            &cfg,
+            t + Duration::from_millis(150),
+            &mut out,
+            &mut frame,
+        );
+        assert!(limp(&out) && !off(&out), "{out:?}");
+
+        let t = t + Duration::from_secs(10);
+        m.tick(&press(Buttons::SELECT), &cfg, t, &mut out, &mut frame);
+        m.tick(
+            &held,
+            &cfg,
+            t + Duration::from_millis(2900),
+            &mut out,
+            &mut frame,
+        );
+        assert!(!limp(&out) && !off(&out), "{out:?}");
+        m.tick(&held, &cfg, t + SELECT_POWER_OFF, &mut out, &mut frame);
+        assert!(off(&out) && !limp(&out), "{out:?}");
+        m.tick(&up, &cfg, t + Duration::from_secs(4), &mut out, &mut frame);
+        assert!(
+            !limp(&out) && !off(&out),
+            "the release after a power-off: {out:?}"
+        );
     }
 
     /// D-pad left pressed again while driving enters precision mode, with a chirp; pressed again

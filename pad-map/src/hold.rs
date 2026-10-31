@@ -11,10 +11,12 @@ pub const HOME_HOLD: Duration = Duration::from_millis(1500);
 /// `robot.rest` — it sits if it is driving, eases into the rest pose, then torque goes off and
 /// every servo reboots. Decided on the release, because until then the hold may still become a
 /// power-off, and both start the same way.
+#[allow(dead_code)] // main's Select; this branch's own is mapper.rs's SELECT_POWER_OFF
 pub const REST_HOLD: Duration = Duration::from_secs(2);
 
 /// Select held this long powers the robot off: `robot.shutdown`, the same sit and rest pose ending
 /// in a power-off. Sent the moment the hold gets here; the release after it does nothing.
+#[allow(dead_code)] // main's Select; this branch's own is mapper.rs's SELECT_POWER_OFF
 pub const SHUTDOWN_HOLD: Duration = Duration::from_secs(4);
 
 /// A button that does different things depending on how long it is held.
