@@ -28,6 +28,10 @@ tokio = { workspace = true, features = [
     "signal",
     "sync",
 ] }
+# A line cap that holds while the line is arriving, which `lines()` does not. Both already in the
+# graph via the updater, which frames its socket the same way.
+tokio-util = { workspace = true, features = ["codec"] }
+futures-util = "0.3.33"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 libc = "0.2"
