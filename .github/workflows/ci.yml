@@ -60,7 +60,9 @@ jobs:
       # before it checks anything.
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
-      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs, and
+      # plugins-base carries `gstreamer-rtp-1.0.pc` for the capture-time extension in
+      # `wire_payloader_setup`.
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
       - run: cargo fmt --all --check
@@ -259,7 +261,9 @@ jobs:
       # Same reason as the check job: the workspace does not build without it.
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
-      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs, and
+      # plugins-base carries `gstreamer-rtp-1.0.pc` for the capture-time extension in
+      # `wire_payloader_setup`.
       - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
 
       # `xtask` is excluded because it is build tooling that never ships. It is exercised

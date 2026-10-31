@@ -95,6 +95,12 @@ pub fn video_notification(video: &Video) -> String {
 /// One function for both, because a peer that asks and a peer that listens must be told the same
 /// thing — and the console does both, a push when the channel opens and a call when it is ready.
 fn video_params(video: &Video) -> serde_json::Value {
+    // The two clocks, read as one pair so the offset between them is the pair's own and not
+    // whatever the next statement interrupts it with. `mono_ns` is the axis `robot.state` and
+    // `tof.frame` stamp on, and the one this daemon states its own sender reports and frame
+    // extensions in — so a client comparing a picture with a sample does not need this pair at
+    // all. It is published for a client that has a reason of its own to name a wall-clock moment,
+    // and `real_ns` is that clock.
     let mut params = serde_json::json!({
         "width": video.width,
         "height": video.height,

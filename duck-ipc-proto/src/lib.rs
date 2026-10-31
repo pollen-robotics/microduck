@@ -288,10 +288,11 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///   published so no client has to carry a copy of the kinematics.
 /// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
 ///
-/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
-/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
-/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
-/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read back to
+/// back, so a peer can put a sample stamped with `t_ns` onto the wall-clock axis if it needs one.
+/// Media itself does not: `mediad` states its sender reports and its frames on `CLOCK_MONOTONIC`
+/// directly. Additive everywhere: an older client ignores fields it does not know, and an older
+/// daemon leaves them at their defaults (zero, or absent).
 ///
 /// # v25 — the whole skeleton's pose, for a viewer
 ///
@@ -5914,7 +5915,9 @@ macro_rules! log_startup_identity {
 
 /// The clocks every daemon stamps with, so no two of them disagree about which clock
 /// "monotonic" means. Nanoseconds. `monotonic` is `CLOCK_MONOTONIC` — what
-/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry; `realtime` is `CLOCK_REALTIME`, the
+/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry, and what `mediad` states both its RTCP
+/// sender reports and the RFC 6051 `ntp-64` frame extension in (`remote-webrtc.md` §11), so a
+/// frame and a sample need no conversion to be compared. `realtime` is `CLOCK_REALTIME`, the
 /// clock RTCP sender reports are stated in, read together in `media.video` so a peer can
 /// relate the two. Unix only: no daemon runs anywhere else.
 #[cfg(unix)]
@@ -5950,6 +5953,7 @@ pub mod clock {
             assert!(b >= a);
             assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
         }
+
     }
 }
 

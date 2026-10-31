@@ -100,6 +100,8 @@ use duck_ipc_proto as proto;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_rtp as gst_rtp;
+use gstreamer_rtp::prelude::RTPHeaderExtensionExt;
 use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
@@ -629,6 +631,7 @@ pub fn start(
     // regression rather than an improvement: `profile` defaults to High and `header-mode` to
     // first-frame, and both matter — see `wire_encoder_setup`.
     wire_encoder_setup(&sink)?;
+    wire_payloader_setup(&sink)?;
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
@@ -1894,6 +1897,105 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
     Ok(())
 }
 
+/// Add RFC 6051's `ntp-64` extension to every payloader, so each frame carries the time it was
+/// captured instead of a peer interpolating from one sender report a second. `remote-webrtc.md`
+/// §11 has the reasoning and the measurements.
+///
+/// The id matters: `webrtcsink` gives TWCC the smallest unused id *after* this runs, so the
+/// extension registered here keeps its own.
+///
+/// Returning `false` leaves the rest of the handler chain in place; `webrtcsink` owns the payload
+/// type, the SSRC and TWCC and still has to get its turn.
+///
+/// Missing plugins are a warning rather than an error: a session with no frame dates is worse than
+/// one with them and better than no session.
+fn wire_payloader_setup(sink: &gst::Element) -> Result<()> {
+    if glib::subclass::signal::SignalId::lookup("payloader-setup", sink.type_()).is_none() {
+        return Err(anyhow!(
+            "webrtcsink has no payloader-setup signal; without it no frame can state the time it \
+             was captured, so a peer can only interpolate from sender reports"
+        ));
+    }
+
+    sink.connect("payloader-setup", false, move |values| {
+        // (webrtcsink, consumer_id, stream_name, payloader).
+        let Some(payloader) = values.get(3).and_then(|v| v.get::<gst::Element>().ok()) else {
+            tracing::warn!(
+                arity = values.len(),
+                "payloader-setup did not carry a payloader; its frames will carry no capture time"
+            );
+            return Some(false.to_value());
+        };
+
+        let Some(extension) = gst_rtp::RTPHeaderExtension::create_from_uri(NTP64_URI) else {
+            tracing::warn!(
+                "no RTP header extension for {NTP64_URI} on these plugins, so frames carry no \
+                 capture time and a peer can only interpolate from sender reports"
+            );
+            return Some(false.to_value());
+        };
+
+        // Written before it is registered, because an id is what makes the extension usable on the
+        // wire and an extension without one is silently inert.
+        extension.set_id(NTP64_EXT_ID);
+
+        if let Some(taken) = extension_at_id(&payloader, NTP64_EXT_ID) {
+            tracing::warn!(
+                id = NTP64_EXT_ID,
+                existing = %taken,
+                "the payloader already has an extension at this id, so the capture-time extension \
+                 was left out rather than replacing it"
+            );
+            return Some(false.to_value());
+        }
+
+        payloader.emit_by_name::<()>("add-extension", &[&extension]);
+        tracing::debug!(
+            id = NTP64_EXT_ID,
+            "frames now carry their capture time, on the robot's monotonic clock"
+        );
+        Some(false.to_value())
+    });
+
+    Ok(())
+}
+
+/// The URI RFC 6051 gives the 64-bit NTP timestamp extension, and what to say when it is asked for.
+const NTP64_URI: &str = "urn:ietf:params:rtp-hdrext:ntp-64";
+
+/// Which id this robot claims for [`NTP64_URI`], and why it is this one.
+///
+/// Low ids are where TWCC lives: `webrtcsink` asks the payloader what is already registered and
+/// takes the smallest free id for it, and a peer that offers an id of its own is echoed back with
+/// that same one. So the smallest free id would be *ours* to take, and then TWCC would have to move
+/// around it — which it does, correctly, on this plugin series. Taking a higher id leaves the low
+/// range to the extension whose id the peer has a say in, and measured on 0.15.3 the two land side
+/// by side: `extmap:1` for TWCC beside `extmap:4` for this.
+const NTP64_EXT_ID: u32 = 4;
+
+/// The URI of the extension already registered at `id`, if one is.
+///
+/// **Read rather than assumed, because `add-extension` on a taken id replaces rather than refuses.**
+/// `GstRTPBasePayload` keeps one extension per id, so registering this one over something else's
+/// would drop that something else — the congestion-control extension in the case that matters, and
+/// a peer that stopped receiving feedback is a stream that degrades for reasons nothing in the log
+/// explains. The `extensions` property is the payloader's own list and exists from GStreamer 1.24;
+/// on a build without it the answer is `None` and the extension is registered, which is the same
+/// position upstream's example takes.
+fn extension_at_id(payloader: &gst::Element, id: u32) -> Option<glib::GString> {
+    let extensions = payloader.find_property("extensions")?;
+    if extensions.value_type() != gst::Array::static_type() {
+        return None;
+    }
+
+    payloader
+        .property::<gst::Array>("extensions")
+        .iter()
+        .filter_map(|value| value.get::<gst_rtp::RTPHeaderExtension>().ok())
+        .find(|extension| extension.id() == id)
+        .and_then(|extension| extension.uri())
+}
+
 /// Live count of what the consumers see, so [`meter_capture_rate`] can report it and the camera
 /// LED can follow it.
 ///
@@ -2068,6 +2170,13 @@ fn wire_consumers(
 
         // Before the datachannel, because this is what the *offer* needs and the offer is
         // generated as soon as this handler returns. §6 of `remote-access-design.md`.
+        //
+        // And before it for the same reason, because this is half of what a receiver needs to
+        // date a frame: `webrtcsink` sends RTCP sender reports for the whole session, and a report
+        // is only usable if its NTP time is on the axis the reader expected. Left alone, that
+        // clock is `CLOCK_REALTIME` — which on this board means NTP, when NTP has been set, and
+        // never the axis `robot.state` is on. `remote-webrtc.md` §11.
+        configure_sender_reports(&webrtcbin, &peer);
         let turn_servers = offer_relay_candidates(&webrtcbin, &peer, &relays);
         // And before the offer too, for the same reason: gathering starts when the offer is
         // built, so a listener attached after this handler returns can miss the early candidates.
@@ -2088,6 +2197,90 @@ fn wire_consumers(
         None
     });
     Ok(())
+}
+
+/// Put one consumer's RTCP sender reports on the robot's own clock, and on the capture time.
+///
+/// **What a sender report is for.** A frame arrives when it arrives, and a peer that wants to
+/// know when the robot *saw* it has only the report to go on: an SR carries the NTP time of the
+/// moment it was written beside the RTP timestamp of that moment, and the two together are what
+/// turns a frame's RTP timestamp — a counter from a random offset — into a time. `remote-webrtc.md`
+/// §11 calls this the media half, and this is where the robot decides what the report says.
+///
+/// **Two properties, and neither is the default.**
+///
+/// - **`ntp-time-source=clock-time`** states the report's NTP field in *pipeline clock* time.
+///   The pipeline runs on `GstSystemClock`, which is `CLOCK_MONOTONIC` — the same clock
+///   `robot.state`/`tof.frame` carry in `t_ns`, and the same one `media.video`'s `mono_ns` is
+///   read from. That is what makes a frame and a sample comparable at all: the default (`ntp`)
+///   is `CLOCK_REALTIME` converted to the NTP epoch, so a peer would need the offset between the
+///   two clocks *and* a clock that has been set, and this board has no battery-backed RTC and
+///   boots at 1970.
+/// - **`rtcp-sync-send-time=false`** makes the report state the time the frame was *captured*
+///   rather than the time it was *sent*. With `=true`, `rtpbin` shifts the report by the
+///   pipeline's *configured* latency — a constant that comes from the caps, not a measurement of
+///   what the encoder and the queue actually took — so every frame would carry that constant
+///   instead of the moment the camera saw it.
+///
+/// Both are set on the internal `rtpbin`, which is where the reports are built and where
+/// `webrtcbin` itself offers no property for either — the same route upstream's own
+/// `webrtc-precise-sync-send` example takes.
+///
+/// **Nothing here is fatal.** A `webrtcbin` without an `rtpbin`, or a property this plugin series
+/// has renamed, costs the peer a *usable* timestamp and nothing else: the session still
+/// negotiates, the video still plays and the control channel still works. Every value is checked
+/// before it is written, because `set_property_from_str` panics on a property or a nickname this
+/// build does not have, and a panic inside a GStreamer signal handler aborts the daemon.
+fn configure_sender_reports(webrtcbin: &gst::Element, peer: &str) {
+    let Some(rtpbin) = webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+    else {
+        tracing::warn!(
+            peer,
+            "webrtcbin has no rtpbin on these plugins, so this session's sender reports stay on \
+             the wall clock and a frame cannot be put on the robot's monotonic axis"
+        );
+        return;
+    };
+
+    // Checked through the enum's own class rather than written as a string: `clock-time` is the
+    // nickname this plugin series uses, and a build that spelled it differently should keep its
+    // own default and say so rather than panic the daemon.
+    match rtpbin.find_property("ntp-time-source") {
+        Some(pspec)
+            if glib::EnumClass::with_type(pspec.value_type())
+                .and_then(|class| class.to_value_by_nick("clock-time"))
+                .is_some() =>
+        {
+            rtpbin.set_property_from_str("ntp-time-source", "clock-time");
+        }
+        Some(_) => tracing::warn!(
+            peer,
+            "rtpbin's ntp-time-source has no `clock-time` value on these plugins; this session's \
+             sender reports stay on the wall clock"
+        ),
+        None => tracing::warn!(
+            peer,
+            "rtpbin has no ntp-time-source property on these plugins; this session's sender \
+             reports stay on the wall clock"
+        ),
+    }
+
+    if rtpbin.find_property("rtcp-sync-send-time").is_some() {
+        rtpbin.set_property("rtcp-sync-send-time", false);
+    } else {
+        tracing::warn!(
+            peer,
+            "rtpbin has no rtcp-sync-send-time property on these plugins; this session's sender \
+             reports will state the send time rather than the capture time"
+        );
+    }
+
+    tracing::debug!(
+        peer,
+        "sender reports will state robot CLOCK_MONOTONIC at capture time"
+    );
 }
 
 /// Add this robot's TURN servers to one consumer's `webrtcbin`, and answer how many it took.
