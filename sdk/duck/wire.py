@@ -86,9 +86,12 @@ class WsConsumer:
         # `startSession` the far end never sees.
         self._streaming = requests.Session()
         self._posting = requests.Session()
-        # Both sessions, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
+        # Continuous intents on a connection of their own, so a call in flight never holds one up
+        # past the robot's deadman.
+        self._intents = requests.Session()
+        # Every session, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
         # for what an unnamed one gets — an `awselb/2.0` 429 that the rendezvous never sees.
-        for session in (self._streaming, self._posting):
+        for session in (self._streaming, self._posting, self._intents):
             session.headers["User-Agent"] = USER_AGENT
         self._stream: requests.Response | None = None
         self._thread: threading.Thread | None = None
@@ -167,6 +170,7 @@ class WsConsumer:
             self._stream = None
         self._streaming.close()
         self._posting.close()
+        self._intents.close()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -196,6 +200,14 @@ class WsConsumer:
             return False
         return True
 
+    def send_intent(self, envelope: dict[str, Any]) -> None:
+        """A continuous intent, on its own connection. Raises `WireError` when it was not taken."""
+        if not self._session_id:
+            raise WireError("the session is not open")
+        self._post(
+            {"type": "peer", "sessionId": self._session_id, "rpc": envelope}, self._intents
+        )
+
     # ── the wire ────────────────────────────────────────────────────────────
 
     def _open_stream(self) -> None:
@@ -219,7 +231,9 @@ class WsConsumer:
             raise WireError(f"the event stream answered HTTP {stream.status_code}")
         self._stream = stream
 
-    def _post(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def _post(
+        self, message: dict[str, Any], session: requests.Session | None = None
+    ) -> dict[str, Any] | None:
         """`POST /send`, returning the body when the service answers in it.
 
         `startSession` and `list` are answered in the response body; everything else comes back on
@@ -230,7 +244,7 @@ class WsConsumer:
         redacted = {k: v for k, v in message.items() if k != "rpc"}
         logger.info("→ %s %s", message.get("type"), json.dumps(redacted.get("rpc") or redacted)[:180])
         try:
-            answer = self._posting.post(
+            answer = (session or self._posting).post(
                 f"{self._base}/send",
                 headers={"authorization": f"Bearer {self._token}"},
                 json=message,

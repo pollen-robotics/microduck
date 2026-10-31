@@ -49,12 +49,15 @@ with Duck() as duck:
 ```
 
 `move` and `head` are notifications, as `duck-ipc-proto` says continuous intents are, so they
-wait for nothing. The robot is asked for state at the tick rate, held under what the lane carries.
+wait for nothing. The robot zeroes the twist 500 ms after the last one, which is less than a round
+trip through the rendezvous, so `move` hands the twist to a thread that resends it until `stop()`,
+or until a second after the last `move`: a script that hangs stops the robot about a second and a
+half later. State is asked for at the tick rate, held under what the lane carries.
 
 `watch(depth=True)` adds the ToF, and `view.nearest` is the closest thing it sees in metres, read
 the way `tof::Frame::zone` reads it. It is off by default because `tofd` sends 15 frames a second
 and the robot posts lane messages one at a time, so today depth holds every answer and every state
-behind it. `examples/wander_without_bumping_into_things.py` uses it.
+behind it.
 
 ## Frames
 
@@ -62,7 +65,8 @@ The lane carries no pixels. To watch a duck, use WebRTC, which the console alrea
 
 For a program taking frames on a long-running stream, `media.stream` is the fallback
 ([`faq.md`](../docs/faq.md)): the robot dials a WebSocket you serve and pushes frames to it. It only
-works where the robot can reach you, a Space or a server with an address of its own.
+works where the robot can reach you, a Space or a server with an address of its own, and the robot
+sends its owner's Hugging Face token to that address so the receiver can tell whose camera it is.
 `stream_frames` starts it and `receive` serves the far end, decoding JPEG or H.264 by what the
 robot's hello says (`pip install -e "sdk[frames]"`):
 

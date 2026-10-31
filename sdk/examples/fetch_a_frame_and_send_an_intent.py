@@ -1,15 +1,17 @@
 """M5's sentence as a program: a server-side script fetches a frame and sends an intent.
 
-    pip install "microduck[frames]" pillow
+    pip install -e "sdk[frames]" pillow
     python examples/fetch_a_frame_and_send_an_intent.py wss://this-server.example/frames
 
 Control goes over the rendezvous, so the duck can be anywhere its owner's account reaches. The
 frame comes over `media.stream`, which means the robot dials the url given here: run this where
-that url reaches port 8099 on this machine, a server with an address of its own or a tunnel.
+that url reaches port 8099 on this machine, a server with an address of its own. The robot
+sends its owner's Hugging Face token to that url, so it has to be a server you trust with it.
 """
 
 import sys
 import threading
+import time
 
 from PIL import Image
 
@@ -36,9 +38,11 @@ def main(url: str, name: str | None) -> None:
         seen.wait(timeout=15)
         duck.stop_frames()
 
-        # The deadman stops it about a second later.
+        duck.enable(True)
         duck.move(vx=0.1)
-        print("told it to walk")
+        time.sleep(2)
+        duck.stop()
+        print("walked for two seconds")
 
 
 if __name__ == "__main__":

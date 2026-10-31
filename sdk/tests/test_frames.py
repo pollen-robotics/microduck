@@ -69,7 +69,7 @@ def test_an_encoding_nobody_decodes_is_refused_by_name():
         decoder_for(hello("vp9"))
 
 
-def test_receive_branches_on_the_hello_before_the_first_frame():
+def test_receive_branches_on_the_hello_and_skips_a_bad_frame():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -90,8 +90,10 @@ def test_receive_branches_on_the_hello_before_the_first_frame():
 
     with robot:
         robot.send(json.dumps(hello("jpeg")))
-        for unit in encoded("mjpeg", "yuvj420p", 2):
-            robot.send(unit)
+        good = encoded("mjpeg", "yuvj420p", 2)
+        robot.send(good[0])
+        robot.send(b"not a jpeg")
+        robot.send(good[1])
         deadline = time.monotonic() + 5
         while len(seen) < 2 and time.monotonic() < deadline:
             time.sleep(0.05)

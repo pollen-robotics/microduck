@@ -37,6 +37,9 @@ import numpy as np
 import requests
 from fastapi import WebSocket, WebSocketDisconnect
 
+# The SDK's decoder, from `sdk/duck`, which `scripts/publish-space.sh` copies beside this file.
+from duck.frames import decoder_for
+
 logger = logging.getLogger(__name__)
 
 WHOAMI = "https://huggingface.co/api/whoami-v2"
@@ -166,65 +169,6 @@ def whoami(token: str) -> str | None:
         return answer.json().get("name")
     except ValueError:
         return None
-
-
-def decoder_for(hello: dict[str, Any]) -> Any:
-    """A callable turning one unit into zero or more RGB pictures.
-
-    Chosen from `frames.encoding` in the hello rather than sniffed from the bytes, which is why
-    `mediad` sends that field: a JPEG's magic and an Annex-B start code are both recognisable, but
-    a receiver that guessed would be a receiver that guesses wrong on the day a third encoding
-    appears.
-    """
-    encoding = ((hello.get("frames") or {}).get("encoding") or "h264").lower()
-    if encoding in ("jpeg", "jpg", "mjpeg"):
-        return jpeg_decoder()
-    if encoding in ("h264", "avc"):
-        return h264_decoder()
-    raise ValueError(f"a robot offered frames as {encoding!r}, which this Space cannot decode")
-
-
-def jpeg_decoder() -> Any:
-    """One JPEG in, one picture out. Stateless, which is the point of it.
-
-    OpenCV rather than PIL because the filters are OpenCV anyway. `imdecode` gives BGR, flipped
-    once here so everything downstream — the filters, Gradio — deals in RGB like the rest of this
-    project.
-    """
-    import cv2
-
-    def decode(unit: bytes) -> list[np.ndarray]:
-        picture = cv2.imdecode(np.frombuffer(unit, dtype=np.uint8), cv2.IMREAD_COLOR)
-        return [] if picture is None else [picture[:, :, ::-1]]
-
-    return decode
-
-
-def h264_decoder() -> Any:
-    """Annex-B access units in, pictures out — with the first few producing nothing.
-
-    **Stateful, and the state is the whole difference from JPEG.** A predicted frame means nothing
-    without the frames it refers to, so this holds one decoder for the life of a connection and
-    feeds it in arrival order. It produces nothing until a keyframe and its parameter sets have
-    both arrived, which `mediad` makes certain of by asking its encoder for a keyframe when the
-    valve opens and by carrying SPS/PPS in front of every one (`h264parse config-interval=-1`).
-
-    `parse` before `decode` even though `mediad` sends whole access units: the parser is what
-    strips start codes and splits a unit that arrived with its parameter sets glued in front,
-    which is exactly what a keyframe looks like here.
-    """
-    import av
-
-    codec = av.CodecContext.create("h264", "r")
-
-    def decode(unit: bytes) -> list[np.ndarray]:
-        pictures: list[np.ndarray] = []
-        for packet in codec.parse(unit):
-            for frame in codec.decode(packet):
-                pictures.append(frame.to_ndarray(format="rgb24"))
-        return pictures
-
-    return decode
 
 
 def mount(app: Any) -> None:

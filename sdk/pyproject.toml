@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +9,7 @@ description = "Drive a Microduck from a script, over the rendezvous control lane
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = ["requests>=2.28"]
+dependencies = ["requests>=2.28", "urllib3>=2.3"]
 
 [project.optional-dependencies]
 frames = ["av>=12", "numpy", "websockets>=13"]

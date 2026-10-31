@@ -6,12 +6,13 @@ import json
 import queue
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from duck import Duck, RendezvousError, RpcError
+from duck import Duck, RendezvousError, RpcError, WireError
 from duck.client import LANE_NOTIFICATIONS_PER_MINUTE, _choose, _lane_rate
 from duck.control import Rpc
 from duck.rendezvous import Robot
@@ -26,6 +27,9 @@ class FakeRendezvous:
         self.posts: list[dict] = []
         self.bearers: list[str] = []
         self.calls: list[dict] = []
+        self.answers: dict[str, dict] = {}
+        self.silent: set[str] = set()
+        self.reject = False
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,15 +61,20 @@ class FakeRendezvous:
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])))
                 fake.posts.append(body)
                 if body["type"] == "startSession":
-                    self._json({"type": "sessionStarted", "sessionId": "s-1"})
+                    if fake.reject:
+                        self._json({"type": "sessionRejected", "activeApp": "the console"})
+                    else:
+                        self._json({"type": "sessionStarted", "sessionId": "s-1"})
                     return
                 self._json({"status": "ok"})
                 if body["type"] == "peer" and "rpc" in body:
                     call = body["rpc"]
                     fake.calls.append(call)
-                    if "id" not in call:
+                    if "id" not in call or call["method"] in fake.silent:
                         return
-                    answer = {"method": call["method"], "params": call.get("params")}
+                    answer = fake.answers.get(
+                        call["method"], {"method": call["method"], "params": call.get("params")}
+                    )
                     fake.events.put(
                         {
                             "type": "peer",
@@ -153,6 +162,7 @@ def test_intents_carry_the_fields_robotd_accepts(rendezvous):
         duck.head(head_yaw=0.2)
         duck.move(vx=0.1)
         duck.look(0.5, 0.0, 0.1)
+        duck.stop()
 
     sent = {c["method"]: set(c["params"]) for c in rendezvous.calls}
     notified = {c["method"] for c in rendezvous.calls if "id" not in c}
@@ -160,6 +170,87 @@ def test_intents_carry_the_fields_robotd_accepts(rendezvous):
     assert sent["robot.head"] == fields("HeadParams")
     assert sent["robot.move"] == fields("MoveParams")
     assert sent["robot.look"] <= fields("LookParams")
+
+
+def moves(fake) -> int:
+    return sum(c["method"] == "robot.move" for c in list(fake.calls))
+
+
+def test_a_move_is_resent_until_stop_so_the_deadman_stays_fed(rendezvous):
+    """`robotd` zeroes the twist 500 ms after the last intent, less than a round trip through the
+    rendezvous, so one `move()` has to keep arriving."""
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.move(vx=0.1)
+        time.sleep(0.6)
+        assert moves(rendezvous) >= 3
+        duck.stop()
+        after = moves(rendezvous)
+        time.sleep(0.5)
+        assert moves(rendezvous) == after, "nothing is resent once stopped"
+
+
+def test_a_script_that_stops_calling_move_stops_the_robot(rendezvous, monkeypatch):
+    monkeypatch.setattr("duck.client.HOLD", 0.3)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.move(vx=0.1)
+        time.sleep(0.6)
+        held = moves(rendezvous)
+        time.sleep(0.5)
+        assert moves(rendezvous) == held
+
+
+def test_a_refusal_raises_with_the_robots_reason(rendezvous):
+    """`robot.enable` answers `accepted: false` rather than an error, and a script that only
+    checks for exceptions would carry on as if the robot were driving."""
+    rendezvous.answers["robot.enable"] = {"accepted": False, "reason": "the robot is limp"}
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        with pytest.raises(RpcError, match="the robot is limp"):
+            duck.enable(True)
+
+
+def test_closing_fails_a_call_still_waiting(rendezvous):
+    rendezvous.silent.add("robot.health")
+    duck = Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=30)
+    failed: list = []
+
+    def ask():
+        try:
+            duck.health()
+        except RpcError as e:
+            failed.append(e)
+
+    caller = threading.Thread(target=ask, daemon=True)
+    caller.start()
+    time.sleep(0.3)
+    duck.close()
+    caller.join(timeout=3)
+    assert failed, "the call was left to wait out its 30 s"
+
+
+def test_a_duck_that_cannot_start_leaves_nothing_running(rendezvous):
+    rendezvous.reject = True
+    before = sum(t.name == "duck-wire" for t in threading.enumerate())
+    with pytest.raises(WireError, match="busy"):
+        Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5)
+    time.sleep(0.5)
+    assert sum(t.name == "duck-wire" for t in threading.enumerate()) == before
+
+
+def test_watch_needs_a_rate_the_lane_can_take(rendezvous):
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        for fps in (0, -1, 50):
+            with pytest.raises(ValueError):
+                duck.watch(fps=fps)
+
+
+def test_a_stream_is_asked_for_once(rendezvous):
+    """`tofd` and `robotd` never answer a second request on a streaming connection."""
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.watch(fps=2, depth=True)
+        duck.watch(fps=2, depth=True)
+    asked = [c["method"] for c in rendezvous.calls]
+    assert asked.count("robot.subscribe") == 1
+    assert asked.count("tof.stream") == 1
 
 
 def test_watch_leaves_depth_off_unless_asked(rendezvous):
@@ -170,10 +261,10 @@ def test_watch_leaves_depth_off_unless_asked(rendezvous):
 
 def test_watch_asks_for_rates_the_lane_can_carry(rendezvous):
     with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
-        ticks = duck.watch(fps=20, depth=True)
+        ticks = duck.watch(fps=10, depth=True)
         asked = {c["method"]: c["params"] for c in rendezvous.calls}
-        per_minute = (asked["robot.subscribe"]["hz"] + asked["tof.stream"]["hz"]) * 60
-        assert per_minute <= LANE_NOTIFICATIONS_PER_MINUTE
+        assert asked["robot.subscribe"]["hz"] * 2 * 60 <= LANE_NOTIFICATIONS_PER_MINUTE
+        assert asked["tof.stream"] == {}, "tof.stream takes no parameters"
 
         rendezvous.notify("robot.state", {"safety": {"fallen": False}, "odom": {"yaw": 0.3}})
         rendezvous.notify("tof.frame", {"distance_mm": [500, 250], "status": [5, 5]})
