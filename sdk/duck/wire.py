@@ -160,6 +160,9 @@ class WsConsumer:
                 pass
         self._session_id = None
         if self._stream is not None:
+            # `close` waits for the read the pump is blocked in, up to the next ping 30 s away.
+            with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):
+                self._stream.raw.shutdown()
             self._stream.close()
             self._stream = None
         self._streaming.close()
