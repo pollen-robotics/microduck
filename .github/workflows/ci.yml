@@ -66,6 +66,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      - run: node --test mediad/webclient/*.test.cjs
 
       # These are the pieces of this repo that run without being compiled — four on a robot,
       # and `provision-board.sh` and `dev-push.sh` on a developer's machine — so nothing else

@@ -1604,6 +1604,7 @@ addEventListener("blur", () => { keys.clear(); refreshTwist(); });
 // with the knob drawn where the finger is so a stick that is not centred is visible rather than
 // inferred from the robot moving.
 function wirePad(pad, knob, onMove) {
+  let pointerId = null;
   const clamp = (v) => Math.max(-1, Math.min(1, v));
   const read = (event) => {
     const box = pad.getBoundingClientRect();
@@ -1620,18 +1621,29 @@ function wirePad(pad, knob, onMove) {
     // A knob that slides under your thumb and moves nothing is worse than one that will not
     // move: it says the robot is being driven. The section is dimmed for the same reason.
     if (!open()) { log("bad", "!! no control channel — connect to a robot first"); return; }
+    if (pointerId !== null) return;
+    pointerId = event.pointerId;
     pad.setPointerCapture(event.pointerId);
     const at = read(event);
     draw(at.x, at.y); onMove(at);
   });
   pad.addEventListener("pointermove", (event) => {
-    if (!pad.hasPointerCapture(event.pointerId)) return;
+    if (event.pointerId !== pointerId || !pad.hasPointerCapture(event.pointerId)) return;
     const at = read(event);
     draw(at.x, at.y); onMove(at);
   });
-  const release = () => { draw(0, 0); onMove({ x: 0, y: 0 }); };
+  const release = (event) => {
+    if (pointerId === null || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
+    const held = pointerId;
+    pointerId = null;
+    if (pad.hasPointerCapture(held)) pad.releasePointerCapture(held);
+    draw(0, 0); onMove({ x: 0, y: 0 });
+  };
   pad.addEventListener("pointerup", release);
   pad.addEventListener("pointercancel", release);
+  // A stale drag keeps refreshing the robot's deadman even after this window loses focus.
+  pad.addEventListener("lostpointercapture", release);
+  addEventListener("blur", release);
 }
 
 wirePad($("pad-move"), $("knob-move"), (at) => {
