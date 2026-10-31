@@ -59,7 +59,7 @@ What you give up by leaving WebRTC, which is why it is not the default:
 - **No return path at all.** Nothing reaches the robot on this transport — no audio, no second
   track, no teleop loop.
 - **No control channel.** Driving the robot means a JSON-RPC call over the rendezvous
-  (`spaces/shared/wire.py`), separately.
+  (`sdk/`), separately.
 - **Encryption is your TLS, not DTLS-SRTP**, and it terminates at your server rather than at the
   peer.
 
@@ -74,7 +74,7 @@ Space signs the visitor in with `hf_oauth`, and the service only ever shows an a
 it owns. Nothing is configured on the robot and no robot-side gate is involved —
 `remote-access-design.md` §7 is the argument for why that is enough.
 
-`spaces/shared/rendezvous.py` is the listing call: `ducks(token)` gives you what that account can
+`sdk/duck/rendezvous.py` is the listing call: `ducks(token)` gives you what that account can
 reach.
 
 ## Can I test without a robot?

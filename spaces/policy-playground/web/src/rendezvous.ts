@@ -1,7 +1,7 @@
 /**
  * JSON-RPC to a duck through the rendezvous, from the browser.
  *
- * A direct port of `spaces/shared/wire.py`, which is the transport that works from anywhere: no
+ * A direct port of `sdk/duck/wire.py`, which is the transport that works from anywhere: no
  * WebRTC, no ICE, no relay candidate. The service forwards every key of a `peer` envelope except
  * `type` and `sessionId` verbatim to the session partner, so an envelope carrying `rpc` is a
  * control call and `mediad::relay`'s control lane answers it out of the routing table the

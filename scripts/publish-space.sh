@@ -59,13 +59,14 @@ git clone --depth 1 "https://huggingface.co/spaces/$SPACE" "$CLONE"
 # a directory instead of skipping it — which under `set -e` aborts the publish after the clone,
 # for a reason that has nothing to do with the Space.
 #
-# **Symlinks are followed and flattened, which is how two Spaces share a client.** `spaces/shared`
-# holds the modules that speak this project's protocols — the control lane, the rendezvous
-# listing — and each Space links to the ones it uses. A Space repo cannot have a parent directory,
-# so `-type l` and `cp -L` turn the link into the file at publish time. Duplicating those modules
-# per Space instead is the drift `remote-access-design.md` §5 keeps their source in this
+# **Symlinks are followed and flattened, which is how a Space shares the SDK's client.** `sdk/duck`
+# holds the modules that speak this project's protocols (the control lane, the rendezvous
+# listing), and a Space links the package beside its own source. A Space repo cannot have a parent
+# directory, so `-type l` and `cp -RL` turn the link into a copy at publish time. Duplicating those
+# modules per Space instead is the drift `remote-access-design.md` §5 keeps their source in this
 # repository to avoid, and two copies in one repository would drift just as happily.
-find "$SOURCE" -maxdepth 1 \( -type f -o -type l \) -exec cp -L {} "$CLONE/" \;
+find "$SOURCE" -maxdepth 1 \( -type f -o -type l \) -exec cp -RL {} "$CLONE/" \;
+find "$CLONE" -path "$CLONE/.git" -prune -o -name __pycache__ -type d -prune -exec rm -rf {} +
 
 cd "$CLONE"
 

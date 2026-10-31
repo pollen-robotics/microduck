@@ -60,13 +60,10 @@ TIMEOUT = 20
 # library's signature instead. The difference between the two calls was the client, and nothing
 # else: same URL, same `Authorization`, same everything.
 #
-# So this names the page honestly rather than imitating a browser. A caller that says who it is
+# So this names the client honestly rather than imitating a browser. A caller that says who it is
 # and carries a link is what a rate limiter is meant to let through, and it is the half of this
 # that stays true if the rule ever changes.
-USER_AGENT = (
-    "microduck-policy-playground/1.0 "
-    "(+https://huggingface.co/spaces/pollen-robotics/microduck-policy-playground)"
-)
+USER_AGENT = "microduck-sdk/0.1 (+https://github.com/pollen-robotics/microduck/tree/main/sdk)"
 
 # Headers that say *who* answered. Asked only when the answer is one the application could not
 # have written: an edge or a proxy names itself and carries an id worth quoting, where FastAPI

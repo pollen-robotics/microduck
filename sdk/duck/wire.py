@@ -1,5 +1,8 @@
 """JSON-RPC to a duck over the rendezvous, with no WebRTC in the path at all.
 
+The calls never touch WebRTC. When a caller wants the camera, the same session also carries the
+robot's video offer and its answer (`on_media`, `send_media`), and the video itself is WebRTC.
+
 The other two transports negotiate: they exchange SDP and ICE so the two ends can find a route
 between them, and then speak WebRTC over it. That works on one network, and across NATs it works
 *when a relay candidate exists* — which now it does (`remote-access-design.md` §6), but the
@@ -42,11 +45,11 @@ import json
 import logging
 import queue
 import threading
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
-from rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
+from .rendezvous import DEFAULT_CENTRAL_URL, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ class WireError(Exception):
 
 
 class WsConsumer:
-    """One control-only session with one duck.
+    """One session with one duck: control over the lane, and the video offer when asked for.
 
     The surface is the other two consumers' — `start`, `stop`, `status`, `latest_frame`,
     `send_command` — so `app.py` holds any of the three without knowing which. `latest_frame`
@@ -72,12 +75,15 @@ class WsConsumer:
     """
 
     def __init__(self, token: str, peer_id: str, rpc: Any, base: str = DEFAULT_CENTRAL_URL,
-                 label: str = "microduck-policy-playground"):
+                 label: str = "microduck-sdk",
+                 on_media: Callable[[dict[str, Any]], None] | None = None):
         self._token = token
         self._peer_id = peer_id
         self._rpc = rpc
         self._base = base.rstrip("/")
         self._label = label
+        # Who takes the robot's offer and its ICE candidates, when somebody wants the video.
+        self._on_media = on_media
 
         # **Two sessions, because `requests.Session` is not thread-safe.** The pump thread holds
         # a streaming `GET /events` open for the life of the connection while every call POSTs
@@ -86,9 +92,14 @@ class WsConsumer:
         # `startSession` the far end never sees.
         self._streaming = requests.Session()
         self._posting = requests.Session()
-        # Both sessions, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
+        # Continuous intents on a connection of their own, so a call in flight never holds one up
+        # past the robot's deadman.
+        self._intents = requests.Session()
+        # The video's answer comes from aiortc's own thread, so it gets a connection too.
+        self._media = requests.Session()
+        # Every session, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
         # for what an unnamed one gets — an `awselb/2.0` 429 that the rendezvous never sees.
-        for session in (self._streaming, self._posting):
+        for session in (self._streaming, self._posting, self._intents, self._media):
             session.headers["User-Agent"] = USER_AGENT
         self._stream: requests.Response | None = None
         self._thread: threading.Thread | None = None
@@ -160,10 +171,15 @@ class WsConsumer:
                 pass
         self._session_id = None
         if self._stream is not None:
+            # `close` waits for the read the pump is blocked in, up to the next ping 30 s away.
+            with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):
+                self._stream.raw.shutdown()
             self._stream.close()
             self._stream = None
         self._streaming.close()
         self._posting.close()
+        self._intents.close()
+        self._media.close()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -193,6 +209,20 @@ class WsConsumer:
             return False
         return True
 
+    def send_media(self, payload: dict[str, Any]) -> None:
+        """An `sdp` or `ice` for the robot's media path, on this session."""
+        if not self._session_id:
+            raise WireError("the session is not open")
+        self._post({"type": "peer", "sessionId": self._session_id, **payload}, self._media)
+
+    def send_intent(self, envelope: dict[str, Any]) -> None:
+        """A continuous intent, on its own connection. Raises `WireError` when it was not taken."""
+        if not self._session_id:
+            raise WireError("the session is not open")
+        self._post(
+            {"type": "peer", "sessionId": self._session_id, "rpc": envelope}, self._intents
+        )
+
     # ── the wire ────────────────────────────────────────────────────────────
 
     def _open_stream(self) -> None:
@@ -216,7 +246,9 @@ class WsConsumer:
             raise WireError(f"the event stream answered HTTP {stream.status_code}")
         self._stream = stream
 
-    def _post(self, message: dict[str, Any]) -> dict[str, Any] | None:
+    def _post(
+        self, message: dict[str, Any], session: requests.Session | None = None
+    ) -> dict[str, Any] | None:
         """`POST /send`, returning the body when the service answers in it.
 
         `startSession` and `list` are answered in the response body; everything else comes back on
@@ -227,7 +259,7 @@ class WsConsumer:
         redacted = {k: v for k, v in message.items() if k != "rpc"}
         logger.info("→ %s %s", message.get("type"), json.dumps(redacted.get("rpc") or redacted)[:180])
         try:
-            answer = self._posting.post(
+            answer = (session or self._posting).post(
                 f"{self._base}/send",
                 headers={"authorization": f"Bearer {self._token}"},
                 json=message,
@@ -315,9 +347,11 @@ class WsConsumer:
         if kind == "peer":
             payload = message.get("rpc")
             if payload is None:
-                # An `sdp` or an `ice`: the robot's media path answering a negotiation this
-                # transport never started. Nothing here can use it, and it is not an error.
-                logger.debug("← a peer envelope with no rpc; ignoring it")
+                # An `sdp` or an `ice`: the robot's media path, offering video on this session.
+                if self._on_media is not None:
+                    self._on_media(message)
+                else:
+                    logger.debug("← a peer envelope with no rpc; ignoring it")
                 return
             self._rpc.on_message(json.dumps(payload))
             return
@@ -343,7 +377,7 @@ def connect(token: str, peer_id: str, rpc: Any, label: str) -> WsConsumer:
 if __name__ == "__main__":
     # ── checking the lane against the real rendezvous and a real duck ─────────
     #
-    # `uv run wire.py` — no Gradio, no browser, and read-only calls: it asks the robot what it is
+    # `python -m duck.wire`: no Gradio, no browser, and read-only calls. It asks the robot what it is
     # running and what it can do, and asks for nothing to move. Which makes it the thing to run
     # first when a click does not work, because it isolates the transport from everything else on
     # the page.
@@ -355,9 +389,10 @@ if __name__ == "__main__":
     import os
     import sys
 
-    import rendezvous
-    from control import Rpc, RpcError
     from huggingface_hub import get_token
+
+    from duck import rendezvous
+    from duck.control import Rpc, RpcError
 
     _logging.basicConfig(level=_logging.INFO, format="%(name)-10s %(message)s")
 
@@ -383,7 +418,7 @@ if __name__ == "__main__":
     # Shorter than the page's, because a person is watching this one.
     rpc = Rpc(timeout=15)
     consumer = WsConsumer(
-        credential, duck.peer_id, rpc, label="microduck-policy-playground/wire-check"
+        credential, duck.peer_id, rpc, label="microduck-sdk/wire-check"
     )
     try:
         consumer.start()

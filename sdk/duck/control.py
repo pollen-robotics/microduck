@@ -113,6 +113,15 @@ class Rpc:
                 method, {"message": f"no answer in {budget:.0f}s"}
             ) from None
 
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """One notification: no id, so nothing comes back and nothing waits. For continuous
+        intents, which `duck-ipc-proto` says to send this way."""
+        send = self._send
+        if send is None:
+            raise RpcError(method, {"message": "no control channel, connect first"})
+        if not send({"jsonrpc": "2.0", "method": method, "params": params or {}}):
+            raise RpcError(method, {"message": "the control channel would not take it"})
+
     def on_message(self, raw: Any) -> None:
         """One line off the channel. Runs on the consumer's event loop, so it does not block."""
         if isinstance(raw, bytes):
@@ -124,6 +133,11 @@ class Rpc:
             return
 
         call_id = message.get("id")
+        if call_id is None and "error" in message:
+            # A refused notification, answered with a null id since there was none to echo.
+            why = (message["error"] or {}).get("message")
+            logger.warning("← a notification was refused: %s", why)
+            return
         if call_id is None:
             # A notification. `robot.state` streams, `media.video` arrives once when the channel
             # opens, and `media.detections` a couple of times a second — none of them answer

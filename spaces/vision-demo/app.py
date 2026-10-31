@@ -39,15 +39,16 @@ import gradio as gr
 import numpy as np
 from fastapi import FastAPI
 
-# `spaces/shared`, flattened beside this file at publish time by `scripts/publish-space.sh`.
+# The `duck` package from `sdk/`, copied beside this file at publish time by
+# `scripts/publish-space.sh`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import receiver
-import rendezvous
-from control import Rpc, RpcError
+from duck import rendezvous
+from duck.control import Rpc, RpcError
+from duck.rendezvous import RendezvousError
+from duck.wire import WireError, WsConsumer
 from filters import FILTERS
-from rendezvous import RendezvousError
-from wire import WireError, WsConsumer
 
 ON_A_SPACE = bool(os.environ.get("SPACE_ID"))
 
