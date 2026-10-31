@@ -11,6 +11,16 @@ It is also where a **publisher** starts: [`policy-manifest.md`](policy-manifest.
 contract for a `manifest.json` beside a microduck `.onnx`, and it owns every field. The design
 docs give the reasoning and point at it.
 
+If you are here to **change the code**, [`CONTRIBUTING.md`](../CONTRIBUTING.md) is the start —
+the path, in order: clone and `cargo test --workspace` (with the Linux C libraries or the macOS
+note) · then see it move in [`robot/simulation.md`](robot/simulation.md) before touching a board
+· read [`design/architecture.md`](design/architecture.md) for why it is its own processes ·
+push it to a real duck with [`robot/dev-push.md`](robot/dev-push.md) · conventions and PR
+expectations live at the bottom of [`CONTRIBUTING.md`](../CONTRIBUTING.md). When something
+fights back, [`faq.md`](faq.md) and [`robot/cheatsheet-dev.md`](robot/cheatsheet-dev.md) are
+where the failure modes are written down. Each page below owns its mechanism; this is only the
+order to read them in.
+
 ## `robot/` — you have a robot
 
 | | |
