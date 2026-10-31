@@ -181,7 +181,11 @@ board with `--pause-btd-on-pair`:
 ```
 
 That leaves a marker at `/var/lib/robot/weird-ble` and changes nothing else. On a board with that
-marker, `sudo robotctl pad pair` handles the rest by itself — it stops `btd`, power-cycles the
+marker, the workaround is applied only when the device tree identifies a Zero 3. A beta or
+unknown board ignores an inherited marker: pairing leaves `btd` and adapter power unchanged.
+The editable `board.version` setting cannot opt a different radio into this hardware workaround.
+
+On a Zero 3 with that marker, `sudo robotctl pad pair` handles the rest by itself — it stops `btd`, power-cycles the
 adapter, pairs, and starts `btd` again. It says so as it goes. An existing bond is unaffected by any
 of this, so a paired pad connects and drives with everything running.
 

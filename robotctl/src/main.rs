@@ -3549,21 +3549,35 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
 /// The unit paused while a pad bonds. See [`BtdPaused`].
 const BTD_UNIT: &str = "btd.service";
 
-/// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
+/// Legacy pairing workaround requested by `--weird-ble` or `--pause-btd-on-pair`.
+/// Written by `scripts/setup-board.sh`; only applicable to detected Zero 3 boards.
 ///
 /// Under /var/lib rather than in a release directory: it is a fact about the board, and it has to
 /// survive an update and a rollback.
 const WEIRD_BLE_MARKER: &str = "/var/lib/robot/weird-ble";
 
-/// Was this board provisioned with `--weird-ble`?
+/// Is the legacy AIC8800 workaround requested on hardware it was measured on?
 ///
 /// A marker rather than re-deriving the answer from `Privacy = device` in `main.conf`: an explicit
 /// record of the decision someone made cannot be confused with a setting that arrived some other
 /// way, and there is no parsing to get subtly wrong.
 ///
-/// Absent answers `false`, which is the right default — most boards need nothing.
+/// A copied marker must not power-cycle a beta's WuQi radio. The device tree, not the
+/// editable board declaration, decides; unknown hardware also gets no radio mutations.
 fn needs_the_ble_workaround() -> bool {
-    std::path::Path::new(WEIRD_BLE_MARKER).exists()
+    let marker = std::path::Path::new(WEIRD_BLE_MARKER).exists();
+    let detected = Board::detected();
+    let needed = legacy_ble_workaround(marker, detected);
+    if marker && !needed {
+        eprintln!(
+            "ignoring legacy AIC8800 pairing marker on non-Zero3 hardware; leaving btd and adapter power unchanged"
+        );
+    }
+    needed
+}
+
+fn legacy_ble_workaround(marker: bool, detected: Option<Board>) -> bool {
+    marker && detected == Some(Board::Zero3)
 }
 
 /// Run `systemctl` and say whether it succeeded, with its output discarded.
@@ -3594,11 +3608,11 @@ fn systemctl(args: &[&str]) -> bool {
 /// future, and having `configd` drive `btd.service` would put a dependency between them that
 /// `docs/design/architecture.md` §1.1 keeps out on purpose — `btd` is in the recovery path.
 ///
-/// So it lives at the edge, in one place, in the command a human runs. **Delete this whole type when
-/// the radio changes**; nothing else has to be unpicked.
+/// Kept at the CLI edge for supported Zero 3 boards. Beta and unknown hardware never
+/// enter this workaround, even if provisioning left the legacy marker behind.
 ///
-/// Applied only on a board provisioned with `--weird-ble`, which is what sets `Privacy = device` and
-/// leaves the marker this looks for.
+/// Applied only on a detected Zero 3 with the marker left by `--weird-ble` or
+/// `--pause-btd-on-pair`. The marker alone says nothing about the Privacy setting.
 ///
 /// Stopping `btd` is only half of it: what it already pushed to the controller outlives the process,
 /// so the adapter is power-cycled too. See [`reset_the_adapter`].
@@ -5816,6 +5830,16 @@ mod head_imu_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_pairing_workaround_requires_marker_and_detected_zero3() {
+        use super::{Board, legacy_ble_workaround};
+        assert!(legacy_ble_workaround(true, Some(Board::Zero3)));
+        assert!(!legacy_ble_workaround(false, Some(Board::Zero3)));
+        for detected in [Some(Board::Beta), None] {
+            assert!(!legacy_ble_workaround(true, detected));
+            assert!(!legacy_ble_workaround(false, detected));
+        }
+    }
 
     // ── robotctl logs ────────────────────────────────────────────────────
 
