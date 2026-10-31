@@ -22,7 +22,9 @@ use ort::tensor::TensorElementType;
 use ort::value::{Tensor, Value, ValueType};
 use sha2::{Digest, Sha256};
 
+use crate::footsteps::{OnnxStepNet, load_planner};
 use crate::obs::{ACTION_LEN, OBS_LEN, Observation};
+use duck_footstep_control::Planner;
 
 /// Below this velocity magnitude the standing policy takes over. The prototype's value.
 pub const DEFAULT_STANDING_THRESHOLD: f64 = 0.05;
@@ -215,6 +217,9 @@ pub enum Net {
     GroundGrasp,
     /// The third pick, a second grasp: likewise.
     GroundGrasp2,
+    /// Footstep tracking: the twist slots carry the swing foot's target `(dx, dy, dyaw)` in the support sole frame,
+    /// from the planner (see [`crate::footsteps`]).
+    Footsteps,
     /// A one-shot skill, by its index in [`PolicyPaths::skills`].
     ///
     /// Kicks and roulade used to be variants here. They were the same thing three times over —
@@ -234,6 +239,10 @@ pub struct PolicyPaths {
     pub ground_pick: Option<PathBuf>,
     pub ground_grasp: Option<PathBuf>,
     pub ground_grasp_2: Option<PathBuf>,
+    /// Footstep-tracking policy and the FootstepNet planner that feeds it. Both or neither: one without the other
+    /// is a half-installed capability, refused at load like any broken bundle.
+    pub footsteps: Option<PathBuf>,
+    pub footstep_planner: Option<PathBuf>,
     /// One-shot skills, in the priority order the caller wants them considered. Each is
     /// selected only by an explicit request, so an empty list is a robot with no tricks rather
     /// than a robot missing something.
@@ -252,6 +261,8 @@ pub struct Policy {
     ground_pick: Option<Network>,
     ground_grasp: Option<Network>,
     ground_grasp_2: Option<Network>,
+    footsteps: Option<Network>,
+    planner: Option<Planner<OnnxStepNet>>,
     skills: Vec<Network>,
     standing_threshold: f64,
     active: Option<Net>,
@@ -290,6 +301,21 @@ impl Policy {
                 path.as_deref().map(|p| open_warm(p, zero)).transpose()
             }
 
+            if paths.footsteps.is_some() != paths.footstep_planner.is_some() {
+                let (have, missing) = if paths.footsteps.is_some() {
+                    (&paths.footsteps, "footstep_planner")
+                } else {
+                    (&paths.footstep_planner, "footsteps")
+                };
+                return Err(PolicyError::Shape {
+                    path: have.clone().unwrap_or_default(),
+                    what: "footstep slots",
+                    expected: format!(
+                        "`footsteps` and `footstep_planner` together; `{missing}` is not set"
+                    ),
+                    got: "one of the two".into(),
+                });
+            }
             Ok(Self {
                 walk: open_warm(&paths.walk, &zero)?,
                 stand: open_opt(&paths.stand, &zero)?,
@@ -297,6 +323,12 @@ impl Policy {
                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
                 ground_grasp: open_opt(&paths.ground_grasp, &zero)?,
                 ground_grasp_2: open_opt(&paths.ground_grasp_2, &zero)?,
+                footsteps: open_opt(&paths.footsteps, &zero)?,
+                planner: paths
+                    .footstep_planner
+                    .as_deref()
+                    .map(load_planner)
+                    .transpose()?,
                 skills: paths
                     .skills
                     .iter()
@@ -345,6 +377,16 @@ impl Policy {
         self.ground_grasp_2.is_some()
     }
 
+    /// The footstep policy and its planner, both loaded ([`PolicyPaths::footsteps`]).
+    pub fn has_footsteps(&self) -> bool {
+        self.footsteps.is_some() && self.planner.is_some()
+    }
+
+    /// The footstep planner, when [`Self::has_footsteps`].
+    pub fn planner_mut(&mut self) -> Option<&mut Planner<OnnxStepNet>> {
+        self.planner.as_mut()
+    }
+
     /// How many one-shot skills are loaded. A caller's index is valid below this.
     pub fn skill_count(&self) -> usize {
         self.skills.len()
@@ -366,6 +408,7 @@ impl Policy {
             Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
             Net::GroundGrasp if self.ground_grasp.is_none() => Net::Walk,
             Net::GroundGrasp2 if self.ground_grasp_2.is_none() => Net::Walk,
+            Net::Footsteps if self.footsteps.is_none() => Net::Walk,
             Net::Skill(i) if i >= self.skills.len() => Net::Walk,
             net => net,
         };
@@ -377,6 +420,7 @@ impl Policy {
             Net::GroundPick => self.ground_pick.as_mut().unwrap(),
             Net::GroundGrasp => self.ground_grasp.as_mut().unwrap(),
             Net::GroundGrasp2 => self.ground_grasp_2.as_mut().unwrap(),
+            Net::Footsteps => self.footsteps.as_mut().unwrap(),
             Net::Skill(i) => &mut self.skills[i],
         };
         if changed {
@@ -408,6 +452,7 @@ impl Policy {
             Net::GroundPick => self.ground_pick.as_mut(),
             Net::GroundGrasp => self.ground_grasp.as_mut(),
             Net::GroundGrasp2 => self.ground_grasp_2.as_mut(),
+            Net::Footsteps => self.footsteps.as_mut(),
             Net::Skill(i) => self.skills.get_mut(i),
         };
         let source = match net {
@@ -417,6 +462,7 @@ impl Policy {
             Net::GroundPick => from.ground_pick.as_ref(),
             Net::GroundGrasp => from.ground_grasp.as_ref(),
             Net::GroundGrasp2 => from.ground_grasp_2.as_ref(),
+            Net::Footsteps => from.footsteps.as_ref(),
             Net::Skill(i) => from.skills.get(i),
         };
         if let (Some(target), Some(source)) = (target, source)
@@ -450,6 +496,7 @@ impl Policy {
             .chain(self.ground_pick.iter_mut())
             .chain(self.ground_grasp.iter_mut())
             .chain(self.ground_grasp_2.iter_mut())
+            .chain(self.footsteps.iter_mut())
             .chain(self.skills.iter_mut())
         {
             network.reset();
@@ -585,7 +632,7 @@ pub(crate) fn tensor_shape(
     }
 }
 
-fn outlet<'a>(
+pub(crate) fn outlet<'a>(
     path: &Path,
     outlets: &'a [ort::value::Outlet],
     name: &str,
@@ -600,7 +647,11 @@ fn outlet<'a>(
     })
 }
 
-fn check_matrix(path: &Path, outlet: &ort::value::Outlet, width: usize) -> Result<(), PolicyError> {
+pub(crate) fn check_matrix(
+    path: &Path,
+    outlet: &ort::value::Outlet,
+    width: usize,
+) -> Result<(), PolicyError> {
     let shape = tensor_shape(path, outlet)?;
     if shape.len() != 2 || (shape[0] != 1 && shape[0] != -1) || shape[1] != width as i64 {
         return Err(shape_error(

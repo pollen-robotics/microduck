@@ -16,6 +16,12 @@ servo it has been through. On the robot, `robotctl vetbook` shows it, and `s` sh
 `updaterd` publishes it to a public dataset on the owner's Hugging Face account,
 `<user>/<duck>-vetbook`, and this Space turns it into a card.
 
+- `/`: the gallery — every duck whose owner said yes to listing it when sharing. Search by name or
+  owner, sort by any stat, filter by mood and badge; a tile opens the duck's card, its owner's name
+  their Hugging Face profile. A listed book carries the `microduck-vetbook-gallery` tag (how the
+  gallery finds it) *and* `share.listed: true` (what the gallery believes — anybody can tag a
+  dataset). `gallery.py` turns a book into a row; the list refreshes from the Hub every 5 minutes.
+- `/api/ducks`: the gallery's rows as JSON.
 - `/d/<user>/<duck>`: the page to share, with buttons to post it. Its preview image is the card,
   so a pasted link unfurls as the card.
 - `/d/<user>/<duck>/card.png`: the card, 1200 × 630. Each share draws one of eight at random;

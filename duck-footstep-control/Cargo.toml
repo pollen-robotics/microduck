@@ -1,0 +1,18 @@
+# Footstep-driven walking: FootstepNet's planning loop around a step network, and the follower that turns a
+# plan into the footstep policy's command.
+#
+# Pure logic — no ONNX Runtime here. The network sits behind `StepNet`; `duck-control` implements it on an
+# `ort` session with the same runtime probe and panic guard as the policies, so `ort` stays in one crate. Kept
+# out of `duck-control` because it is a planner, not the control core, and it is checked step-for-step against
+# the Python reference (microduck_rl `footstep_planner.py`) with a replaying stub network.
+[package]
+name = "duck-footstep-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror.workspace = true

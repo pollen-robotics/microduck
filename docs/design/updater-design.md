@@ -43,7 +43,7 @@ document is the update system only.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Update granularity | Application-level (not A/B image) | Only daemon + model change; OS is static. A/B (RAUC/Mender) would be over-engineering. |
+| Update granularity | Application-level (not A/B image) | Only daemon + model change; OS is static. A/B (RAUC/Mender) would be over-engineering. Since revisited for the Yocto image, which has A/B slots and its own updater — §11. |
 | Transport | Robot **pulls** from CDN over its own wifi | Robot has internet; phone is trigger + progress only. Big payloads never touch BLE. |
 | Hosting | **GitHub Releases** (daemon) + **HF Hub** (model) | Zero backend; each is a natural home for its artifact. Engine treats "source" as pluggable. |
 | Signing | **minisign** (CI signs, robot verifies) | Battle-tested format, tiny verify crate, simple key management. |
@@ -1191,16 +1191,61 @@ Shared across robots: engine, minisign pipeline, phone/BLE trigger protocol,
 rollback logic. Per-robot: the config file, the signing key, health probes,
 hooks. It's a small binary + a schema, not a framework.
 
-## 11. OS updates (deliberately out of scope for OTA)
+## 11. OS updates: `os.*`, on the boards that have slots
 
-Skipping A/B has one real constraint: we do not OTA the kernel/system libs.
-Mitigations:
-- Enable `unattended-upgrades` scoped to the Debian **security** pocket only,
-  for CVE patches. Set-and-forget.
-- Anything bigger (kernel bump, new system lib the daemon needs) = **re-flash at
-  service time**.
-- Minimize runtime deps on the base OS: static-ish linking, bundle what we can
-  inside the tarball, so a stock OS never blocks a daemon update.
+This section was "deliberately out of scope", and on an Armbian board it still
+is: one root filesystem, so nothing to switch to, and the mitigations stand —
+`unattended-upgrades` for the Debian security pocket, a re-flash for anything
+bigger, and a tarball that asks as little of the base OS as it can.
+
+A board flashed with a `microduck_yocto` image is different. It has two root
+filesystem slots, A and B, written by RAUC; and the image ships
+`microduck-osupdate`, which fetches a signed bundle from the channel the board
+follows, installs it to the slot not booted, reboots into it, and on the next
+boot records whether it came up. The bootloader boots the old slot again if the
+new one does not pass the health check. All of that is the image's —
+`microduck_yocto`'s `docs/agents/rauc.md` owns it.
+
+What lives here is the trigger. `updaterd` serves four methods for it
+(`API_VERSION` 46), and each one runs the script rather than re-implementing it,
+so the phone, `duckctl`, the image's LAN page on port 8090 and a shell on the
+robot all drive one updater:
+
+| Method | Gated | Does |
+|---|---|---|
+| `os.status` | no | the script's `status`: each slot's build, the channel's newest, phase, progress, `last_result` |
+| `os.check` | no | asks the channel; `BUSY` while an update runs |
+| `os.apply {build?}` | yes | the channel's newest, or a named build (older ones allowed); answers once the download is under way |
+| `os.switch` | yes | reboots into the other slot, downloading nothing — the undo; only a slot RAUC last saw good |
+
+Why not a component of `update.*`: a component is a store of releases swapped
+by a symlink, with `golden`, units restarted on apply and a health gate run by
+this engine. A slot has none of those, and its rollback is a reboot. Forcing it
+in would bend the engine for both.
+
+The two mutating calls take the engine lock (`BUSY` beside a daemon update —
+an OS update must not reboot the board halfway through a swap) and pass the
+same preflight as an apply: the robot is not moving and nobody is watching it
+remotely, `interrupt_sessions` lifting only the second. The clock check applies
+to `os.apply` alone, since a switch makes no HTTPS request. The work runs as the
+transient unit `microduck-osupdate-apply`, the one the 8090 page starts too, so
+each path sees the other's update as running.
+
+`os.apply` answers once the phase is past the script's checks, so a refusal the
+script makes at once — the build is already running, the channel has no
+manifest — is an error rather than a phase that turns `idle` a second later.
+The rest is the client's to follow: poll `os.status`, expect the link to drop
+at `rebooting`, and read `last_result` after the reboot.
+
+Routing: `btd` permits all four (§4.1's argument for `update.apply`, and the
+switch is the rollback); `mediad` permits only the reads, because `mediad` is in
+`allow_users` and its transport has no authorisation of its own. A board with
+no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
+the periodic check does not look at the channel.
+
+Known gap, carried from the script: the channel's manifest is unsigned, so
+whoever can write the bucket can point a robot at an older, validly signed
+bundle. RAUC still refuses any bundle we did not sign.
 
 ### 11.1 Peripheral / MCU firmware — out of scope
 

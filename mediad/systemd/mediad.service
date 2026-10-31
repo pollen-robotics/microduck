@@ -28,8 +28,8 @@ After=robotd.service configd.service updaterd.service local-fs.target
 [Service]
 Type=exec
 # **No video flags here, on purpose.** What this daemon streams — camera or test pattern, frame
-# size, rate, bitrate — is `[media]` in /etc/robot/robotd.toml, edited with `robotctl configure`
-# and applied by `systemctl restart mediad`.
+# size, rate, bitrate — is `[media]` in robotd.toml (/var/lib/robot/robotd.toml over
+# /etc/robot/robotd.toml), edited with `robotctl configure` and applied by `systemctl restart mediad`.
 #
 # They were flags on this line. The release installer rewrites this file, so changing one meant a
 # systemd drop-in — `systemctl edit --full` puts the edit exactly where it will be overwritten —

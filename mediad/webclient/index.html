@@ -342,6 +342,9 @@
     <span id="release" class="pill dim">release unknown</span>
     <span id="api" class="pill dim">api unknown</span>
     <span id="signalling" class="pill dim"></span>
+    <!-- The OS update page of a Yocto robot (microduck_yocto's microduck-osupdate, port 8090).
+         Shown only once that port answers, so a robot without it shows nothing. -->
+    <a id="os-update" class="pill" hidden target="_blank" rel="noopener">OS update</a>
   </div>
 
   <div class="row">
@@ -401,6 +404,18 @@ const PARAMS = new URLSearchParams(location.search);
 const REMOTE = PARAMS.get("mode")
   ? PARAMS.get("mode") === "remote"
   : !SERVED_BY_ROBOT && location.protocol === "https:";
+
+// The OS update page lives on the robot itself (port 8090, microduck_yocto's
+// microduck-osupdate), so it is only reachable from a page on the robot's LAN. A
+// no-cors fetch resolves when something answers there and rejects when the port is
+// closed -- a robot without it, or not a Yocto one -- and the link stays hidden.
+// Remote, through the rendezvous, there is no path to that port yet.
+if (SERVED_BY_ROBOT && !REMOTE) {
+  const osUrl = `http://${location.hostname}:8090/`;
+  fetch(osUrl, { mode: "no-cors", cache: "no-store" })
+    .then(() => { const a = document.getElementById("os-update"); a.href = osUrl; a.hidden = false; })
+    .catch(() => {});
+}
 
 // Where this page mints its own relay credentials, addressed as the Space it is rather than
 // through `turn.fastrtc.org` — that alias is a dangling delegation and answers nothing
@@ -876,6 +891,10 @@ function teardown() {
   wanted = false; starting = false;
   stopTelemetry();
   if (pc) { pc.close(); pc = null; }
+  if (reconnecting) {
+    reconnecting = false;
+    setTimeout(() => $("connect").onclick(), RECONNECT_DELAY_MS);
+  }
 }
 
 $("connect").onclick = async () => {
@@ -1155,6 +1174,8 @@ function newPeerConnection() {
   pc = new RTCPeerConnection(REMOTE
     ? { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, ...relays] }
     : undefined);
+
+  frozen = { frames: 0, at: performance.now(), armed: false };
 
   pc.ontrack = (event) => {
     log("dim", "track:", event.track.kind);
@@ -1470,6 +1491,41 @@ async function readStats() {
     $("rtt").textContent = `${Math.round(pair.currentRoundTripTime * 1000)} ms`;
   }
 }
+
+// ── a frozen picture is a new session ──────────────────────────────────────────
+//
+// A picture can stop for good while the session around it stays up, and a disconnect and connect
+// by hand brings it straight back — each session gets its own encoder and its own congestion
+// control on the robot, so a fresh one starts from a keyframe and a fresh rate. Until the robot
+// stops needing it, this does that by hand's work for it: no frame decoded for `FREEZE_MS`, and
+// the session is torn down and opened again.
+//
+// **Decoded frames, not bitrate.** A stream that is still arriving but waits on a keyframe that
+// never comes has bytes and no picture; counting frames catches that and the empty link both.
+// **Armed by the first frame**, so a robot with no picture to send gets one retry, not a loop.
+
+const FREEZE_MS = 1000;
+const RECONNECT_DELAY_MS = 300;
+let frozen = null, reconnecting = false, reconnects = 0;
+
+setInterval(async () => {
+  if (!pc || pc.connectionState !== "connected" || reconnecting) return;
+  let frames = null;
+  (await pc.getStats()).forEach((s) => {
+    if (s.type === "inbound-rtp" && s.kind === "video") frames = s.framesDecoded ?? 0;
+  });
+  if (frames === null || !frozen) return;
+  const now = performance.now();
+  if (frames !== frozen.frames) { frozen = { frames, at: now, armed: true }; return; }
+  if (!frozen.armed || now - frozen.at < FREEZE_MS) return;
+
+  reconnects += 1;
+  log("warn", `!! no frame decoded for ${FREEZE_MS} ms — reconnecting (${reconnects} so far)`);
+  frozen = null;
+  reconnecting = true;
+  // The same path as the button: disconnecting ends in `teardown`, which connects again.
+  $("connect").onclick();
+}, 250);
 
 // ── driving ────────────────────────────────────────────────────────────────────
 //

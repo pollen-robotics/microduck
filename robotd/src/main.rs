@@ -372,6 +372,8 @@ struct PolicyNames {
     ground_pick: Option<String>,
     ground_grasp: Option<String>,
     ground_grasp_2: Option<String>,
+    /// The footstep policy, when it and its planner are both configured.
+    footsteps: Option<String>,
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
     skills: Vec<String>,
@@ -391,6 +393,7 @@ impl PolicyNames {
             ground_pick: name(&policy.ground_pick),
             ground_grasp: name(&policy.ground_grasp),
             ground_grasp_2: name(&policy.ground_grasp_2),
+            footsteps: name(&policy.footsteps).filter(|_| policy.footstep_planner.is_some()),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
         }
     }
@@ -453,6 +456,75 @@ fn origin_of(path: &std::path::Path) -> &'static str {
 /// The org whose policies are official. One constant, matching `updater::policy::OFFICIAL_ORG`:
 /// a robot that can be *told* which org to trust has a badge that means nothing.
 const OFFICIAL_ORG: &str = "pollen-robotics";
+
+/// The vet book's `policy` events for a change the loop has just made live: one per slot or skill
+/// that starts or stops running a community policy, oldest-first in slot then skill order.
+///
+/// Only community, because that is the question the book answers — "did this duck run somebody
+/// else's network, and which" — and the events list is capped: logging every official reset
+/// would push out the updates and notes it exists to keep. Stopping is logged too, so the book
+/// says how long one ran and not only that it started.
+fn community_policy_events(
+    old: &params::ResolvedPolicy,
+    new: &params::ResolvedPolicy,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut compare = |what: String, before: Option<PathBuf>, after: Option<PathBuf>| {
+        if before == after {
+            return;
+        }
+        let community =
+            |p: &Option<PathBuf>| p.as_deref().is_some_and(|p| origin_of(p) == "community");
+        if community(&after) {
+            let source = library_source(after.as_deref().expect("community is a path"));
+            events.push(format!("{what} now runs {source} (community)"));
+        } else if community(&before) {
+            let source = library_source(before.as_deref().expect("community is a path"));
+            events.push(format!("{what} no longer runs {source} (community)"));
+        }
+    };
+    for slot in Slot::ALL {
+        compare(
+            slot.as_str().to_owned(),
+            old.slot(slot).map(PathBuf::from),
+            new.slot(slot).map(PathBuf::from),
+        );
+    }
+    let path_of = |cfg: &params::ResolvedPolicy, name: &str| {
+        cfg.skills
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(params::SkillDef::resolved_path)
+    };
+    let mut names: Vec<&str> = old.skills.iter().map(|s| s.name.as_str()).collect();
+    for skill in &new.skills {
+        if !names.contains(&skill.name.as_str()) {
+            names.push(&skill.name);
+        }
+    }
+    for name in names {
+        compare(
+            format!("skill {name}"),
+            path_of(old, name),
+            path_of(new, name),
+        );
+    }
+    events
+}
+
+/// `org/name@revision` for a file in the library, which is where every community policy lives
+/// (`<library>/<org>/<name>/<revision>/<file>`); the path itself for anything else.
+fn library_source(path: &std::path::Path) -> String {
+    let parts: Option<Vec<String>> = path.strip_prefix(params::POLICY_LIBRARY).ok().map(|rest| {
+        rest.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect()
+    });
+    match parts.as_deref() {
+        Some([org, name, revision, ..]) => format!("{org}/{name}@{revision}"),
+        _ => path.display().to_string(),
+    }
+}
 
 /// The per-slot answer to `robot.policies`: what is loaded, from where, and why not.
 ///
@@ -644,6 +716,10 @@ struct RobotState {
     ///
     /// A change to one slot is reported on that slot instead, which says more.
     policy_change_error: ArcSwapOption<String>,
+    /// Why the user config layer was set aside at startup, if it was
+    /// ([`Params::user_layer_rejected`]). Degraded, never unhealthy: it is a file on this board,
+    /// so no release the update gate could revert to would read it any differently.
+    config_error: Option<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
     ///
@@ -778,6 +854,7 @@ impl RobotState {
             board: params.board.version,
             policy_error: ArcSwapOption::empty(),
             policy_change_error: ArcSwapOption::empty(),
+            config_error: params.user_layer_rejected.clone(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             policy_slots: ArcSwap::from_pointee(slot_report(
                 &params.policy,
@@ -949,6 +1026,14 @@ impl RobotState {
             ));
         }
 
+        // Last, so it never hides an unhealthy verdict above: the robot is running, on the
+        // image's settings instead of its owner's, and the owner needs to know which file to fix.
+        if let Some(reason) = &self.config_error {
+            return degraded(format!(
+                "running without this robot's own settings, which are invalid — {reason}"
+            ));
+        }
+
         describe(true, false, None)
     }
 
@@ -1042,6 +1127,26 @@ async fn main() -> ExitCode {
         .params
         .clone()
         .unwrap_or_else(|| PathBuf::from(params::DEFAULT_PATH));
+    // At startup as well as on the first edit, so the old edits move to the layer an OS update
+    // keeps even on a robot nobody edits. Only where there is a `/var/lib/robot` — on a laptop
+    // running the default path there is nothing to adopt into.
+    if let Some(user) = params::user_layer_for(&params_path)
+        && user.parent().is_some_and(std::path::Path::is_dir)
+    {
+        match params::edit::adopt_base_edits(&params_path, &user) {
+            Ok(keys) if keys.is_empty() => {}
+            Ok(keys) => tracing::warn!(
+                ?keys,
+                to = %user.display(),
+                "moved this robot's own settings out of the base config, once"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                "could not move this robot's settings into its user config; they still apply \
+                 from the base, and the next start tries again"
+            ),
+        }
+    }
     let mut params = match Params::load(&params_path, explicit) {
         Ok(params) => params,
         Err(e) => {
@@ -1900,6 +2005,9 @@ fn change_disturbs(
         Driving::GroundPick => before.ground_pick != after.ground_pick,
         Driving::GroundGrasp => before.ground_grasp != after.ground_grasp,
         Driving::GroundGrasp2 => before.ground_grasp_2 != after.ground_grasp_2,
+        Driving::Footsteps => {
+            before.footsteps != after.footsteps || before.footstep_planner != after.footstep_planner
+        }
         Driving::Skill(_) => before.skills != after.skills,
     }
 }
@@ -1969,6 +2077,11 @@ fn try_controller(
             gain: policy_cfg.gain,
             head_lowpass: policy_cfg.head_lowpass,
             legs_lowpass: policy_cfg.legs_lowpass,
+            footstep_full_twist: {
+                // `[pad_drive]` is not in the policy config; its defaults are what a stock pad sends at full stick.
+                let pad = params::PadDriveParams::default();
+                [pad.vx_max, pad.vy_max, pad.vyaw_max]
+            },
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,
@@ -1996,6 +2109,23 @@ fn try_controller(
                 })
                 .collect(),
         };
+        // `footstep_control` on before the files were fetched is a robot that walks as before and says why,
+        // not one that holds a pose: the switch is a try-out, and the fetch is `robotctl configure`'s.
+        let (footsteps, footstep_planner) = match (
+            &policy_cfg.footsteps,
+            &policy_cfg.footstep_planner,
+        ) {
+            (Some(policy), Some(planner)) if !policy.exists() || !planner.exists() => {
+                tracing::warn!(
+                    policy = %policy.display(),
+                    planner = %planner.display(),
+                    "footstep_control is on but its networks are not on this robot; walking without it — \
+                     switch it off and on in `sudo robotctl configure` to fetch them"
+                );
+                (None, None)
+            }
+            (policy, planner) => (policy.clone(), planner.clone()),
+        };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
             stand: policy_cfg.stand.clone(),
@@ -2003,6 +2133,8 @@ fn try_controller(
             ground_pick: policy_cfg.ground_pick.clone(),
             ground_grasp: policy_cfg.ground_grasp.clone(),
             ground_grasp_2: policy_cfg.ground_grasp_2.clone(),
+            footsteps: footsteps.clone(),
+            footstep_planner: footstep_planner.clone(),
             // Only the skills whose file resolves — a slot switched off with `"none"` is
             // already filtered out by `resolved_skills`.
             skills: policy_cfg
@@ -2029,6 +2161,8 @@ fn try_controller(
                     ground_grasp_2 = ?policy_cfg.ground_grasp_2.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
+                    footsteps = ?policy_cfg.footsteps.as_ref().map(|p| p.display().to_string()),
+                    footstep_planner = ?policy_cfg.footstep_planner.as_ref().map(|p| p.display().to_string()),
                     limp_fall,
                     "policy loaded"
                 );
@@ -2277,6 +2411,7 @@ async fn control_loop<T: RobotIo>(
         predicted_z: params.safety.limp_fall_predict_z,
         lookahead: Duration::from_millis(params.safety.limp_fall_lookahead_ms),
         debounce: Duration::from_millis(params.safety.limp_fall_debounce_ms),
+        arm: Duration::from_millis(params.safety.limp_fall_arm_ms),
     });
     let limp_fall_still = Duration::from_millis(params.safety.limp_fall_still_ms);
     let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
@@ -3302,14 +3437,11 @@ async fn control_loop<T: RobotIo>(
             twist: twist_ema,
             // The chorale's sway rides on top of whatever the head was asked to do, computed
             // last tick (20 ms stale, invisible at sway speed) and slewed to zero when the
-            // singing stops so the head settles rather than snaps. The idle sweep rides the
-            // same way, and the two never overlap: singing is not still.
-            head: [
-                head_ema[0] + chorale_head[0] + idle_offset[0],
-                head_ema[1] + chorale_head[1] + idle_offset[1],
-                head_ema[2] + chorale_head[2] + idle_offset[2],
-                head_ema[3] + chorale_head[3] + idle_offset[3],
-            ],
+            // singing stops so the head settles rather than snaps. The idle look-around takes
+            // the head over instead, so it centres on the straight head and not on a pose the
+            // pad left parked; the two never overlap: singing is not still.
+            head: [0, 1, 2, 3]
+                .map(|i| head_ema[i] * (1.0 - idle.takeover) + chorale_head[i] + idle_offset[i]),
             body: BodyPose {
                 z: body_ema[0] + breath,
                 roll: body_ema[1],
@@ -3459,6 +3591,11 @@ async fn control_loop<T: RobotIo>(
                         &cfg,
                         &slot_errors,
                     )));
+                    // Here and not where the request was accepted: a load that fails to build
+                    // never ran, and the book is a record of what did.
+                    for text in community_policy_events(&policy_cfg, &cfg) {
+                        state.vetbook.policy(&text);
+                    }
                     policy_cfg = cfg;
                     tracing::warn!(
                         change = describe_change(&change),
@@ -3728,6 +3865,33 @@ async fn control_loop<T: RobotIo>(
             }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
+                if let Some(g) = intents.take_footstep_goal() {
+                    let foot = g.foot.map(|f| match f {
+                        proto::FootSide::Left => duck_footstep_control::Foot::Left,
+                        proto::FootSide::Right => duck_footstep_control::Foot::Right,
+                    });
+                    controller.start_goal([g.x, g.y, g.yaw], foot, g.odom);
+                }
+                if let Some(steps) = intents.take_footsteps() {
+                    controller.start_pattern(
+                        steps
+                            .iter()
+                            .map(|s| {
+                                let foot = match s.foot {
+                                    proto::FootSide::Left => duck_footstep_control::Foot::Left,
+                                    proto::FootSide::Right => duck_footstep_control::Foot::Right,
+                                };
+                                ([s.x, s.y, s.yaw], foot)
+                            })
+                            .collect(),
+                    );
+                }
+                // The footstep follower reads the same estimate the state stream reports, from this tick.
+                controller.set_odometry(
+                    safety
+                        .imu_ready()
+                        .then(|| (odometry.anchor_foot(), odometry.sole_poses())),
+                );
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
                     Ok(step) => (
                         step.targets,
@@ -5248,6 +5412,26 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     names
 }
 
+/// Why a footstep request (pattern or goal) cannot run now, if it cannot: the policy not driving, the robot still
+/// homing, or no footstep networks — what this side can know, like a skill.
+fn footstep_refusal(state: &RobotState, intents: &Intents) -> Option<proto::IntentResult> {
+    if !intents.enabled() {
+        Some(proto::IntentResult::refused(
+            "the policy is not driving — press Start on the pad",
+        ))
+    } else if !state.homed.load(Ordering::Relaxed) {
+        Some(proto::IntentResult::refused(
+            "the robot is still going to its home pose; try again in a moment",
+        ))
+    } else if state.policies.load().footsteps.is_none() {
+        Some(proto::IntentResult::refused(
+            "footsteps are off: switch [policy] footstep_control on in `sudo robotctl configure`",
+        ))
+    } else {
+        None
+    }
+}
+
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     let policies = state.policies.load();
     match skill {
@@ -5357,6 +5541,44 @@ fn dispatch(
                         known.join(", ")
                     )
                 })
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // A footstep pattern for the bench. Refused for what this side can know, like a skill: the policy not
+        // driving, the robot still homing, no footstep networks, or a pattern too long to be a sheet of paper.
+        proto::Call::RobotFootsteps(p) => {
+            let result = match footstep_refusal(state, intents) {
+                Some(refused) => refused,
+                None if p.steps.is_empty() || p.steps.len() > 64 => proto::IntentResult::refused(
+                    format!("{} steps; a pattern has 1 to 64", p.steps.len()),
+                ),
+                None => {
+                    intents.request_footsteps(p.steps.clone());
+                    proto::IntentResult::accepted()
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
+        // A goal to walk to with planned footsteps. The same refusals; a goal out of FootstepNet's trained range
+        // (±1 m starts and goals) is refused rather than planned into the unknown.
+        proto::Call::RobotFootstepGoal(g) => {
+            let result = match footstep_refusal(state, intents) {
+                Some(refused) => refused,
+                None if !(g.x.is_finite() && g.y.is_finite() && g.yaw.is_finite()) => {
+                    proto::IntentResult::refused("the goal is not a number")
+                }
+                // In the robot's frame the goal's norm is its distance; an odometry-world goal is anywhere in
+                // the world, and its client (`goto tag`) keeps each leg short itself.
+                None if !g.odom && g.x.hypot(g.y) > 1.5 => proto::IntentResult::refused(format!(
+                    "the goal is {:.2} m away; FootstepNet plans up to 1.5 m",
+                    g.x.hypot(g.y)
+                )),
+                None => {
+                    intents.request_footstep_goal(*g);
+                    proto::IntentResult::accepted()
+                }
             };
             proto::Response::ok(Some(id), &result)
         }
@@ -6951,6 +7173,88 @@ mod tests {
         assert!(accepted.accepted);
         assert_eq!(intents.take_sounds(), vec![proto::SoundTag::Chirp]);
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// A footstep pattern is refused at the door on a robot without the footstep networks — the default — and
+    /// queued for the loop on one that has them. Accepted-then-dropped is the failure this guards.
+    #[test]
+    fn robot_footsteps_needs_the_footstep_networks() {
+        let pattern = || {
+            proto::Call::RobotFootsteps(proto::FootstepsParams {
+                steps: vec![proto::Footstep {
+                    foot: proto::FootSide::Left,
+                    x: 0.05,
+                    y: 0.0475,
+                    yaw: 0.0,
+                }],
+            })
+        };
+        let id = || proto::Id::Number(1);
+        let intents = Intents::new();
+        intents.set_enabled(true);
+
+        let plain = state();
+        plain.homed.store(true, Ordering::Relaxed);
+        let refused: proto::IntentResult = dispatch(&plain, &intents, id(), &pattern())
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(refused.reason.unwrap().contains("footstep_control"));
+        assert!(intents.take_footsteps().is_none());
+
+        let mut params = Params::default();
+        params.policy.footstep_control = true;
+        let equipped = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        equipped.homed.store(true, Ordering::Relaxed);
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &pattern())
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert_eq!(intents.take_footsteps().map(|s| s.len()), Some(1));
+
+        // A goal: queued as given, and refused past what FootstepNet was trained to plan.
+        let goal = |x: f64| {
+            proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+                x,
+                y: 0.1,
+                yaw: 0.5,
+                foot: Some(proto::FootSide::Left),
+                odom: false,
+            })
+        };
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &goal(0.3))
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert_eq!(intents.take_footstep_goal().map(|g| g.x), Some(0.3));
+        let refused: proto::IntentResult = dispatch(&equipped, &intents, id(), &goal(3.0))
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
+        assert!(intents.take_footstep_goal().is_none());
+        // An odometry-world goal far from the world origin is not far from the robot: the norm is no distance
+        // there (a robot that walked and was carried away from where it booted had every tag refused).
+        let far_in_world = proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+            x: 3.0,
+            y: 1.0,
+            yaw: 0.0,
+            foot: None,
+            odom: true,
+        });
+        let accepted: proto::IntentResult = dispatch(&equipped, &intents, id(), &far_in_world)
+            .result_as()
+            .unwrap();
+        assert!(accepted.accepted, "{:?}", accepted.reason);
+        assert!(intents.take_footstep_goal().is_some_and(|g| g.odom));
+        let refused: proto::IntentResult = dispatch(&plain, &intents, id(), &goal(0.3))
+            .result_as()
+            .unwrap();
+        assert!(!refused.accepted);
     }
 
     /// A skill whose network was never configured is refused at the door with a reason —
@@ -9334,6 +9638,56 @@ mod tests {
         }
     }
 
+    /// The book hears when a slot or a skill starts or stops running a community policy, and
+    /// about nothing official.
+    #[test]
+    fn community_policies_coming_and_going_are_vet_book_events() {
+        let library = std::path::Path::new(params::POLICY_LIBRARY);
+        let flamingo = library.join("RemiFabre/microduck-flamingo-cycle/main/policy.onnx");
+        let ours = library.join("pollen-robotics/microduck-flamingo/main/policy.onnx");
+        let bow = library.join("fffiloni/microduck-polite-bow/v2/policy.onnx");
+
+        let base = params::PolicyParams::default();
+        let with = |edit: &dyn Fn(&mut params::PolicyParams)| {
+            let mut p = base.clone();
+            edit(&mut p);
+            p.resolved()
+        };
+        let plain = base.resolved();
+        let community_walk = with(&|p| p.walk = Some(flamingo.clone()));
+        let official_walk = with(&|p| p.walk = Some(ours.clone()));
+        let community_skill = with(&|p| {
+            p.skills.push(params::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(bow.clone()),
+                duration: 4.0,
+                ..Default::default()
+            })
+        });
+
+        assert_eq!(
+            community_policy_events(&plain, &community_walk),
+            vec!["walk now runs RemiFabre/microduck-flamingo-cycle@main (community)"]
+        );
+        assert_eq!(
+            community_policy_events(&community_walk, &plain),
+            vec!["walk no longer runs RemiFabre/microduck-flamingo-cycle@main (community)"]
+        );
+        assert!(
+            community_policy_events(&plain, &official_walk).is_empty(),
+            "an official policy is not what the book is asking about"
+        );
+        assert!(community_policy_events(&community_walk, &community_walk).is_empty());
+        assert_eq!(
+            community_policy_events(&plain, &community_skill),
+            vec!["skill polite-bow now runs fffiloni/microduck-polite-bow@v2 (community)"]
+        );
+        assert_eq!(
+            community_policy_events(&community_skill, &plain),
+            vec!["skill polite-bow no longer runs fffiloni/microduck-polite-bow@v2 (community)"]
+        );
+    }
+
     /// The three origins, told apart by the path — because the path is made of the answer.
     #[test]
     fn origin_comes_from_where_the_file_lives() {
@@ -9410,6 +9764,34 @@ mod tests {
         assert_eq!(walk.origin.as_deref(), Some("local"));
         assert!(walk.overridden);
         assert_eq!(walk.path.as_deref(), Some("/srv/mine.onnx"));
+    }
+
+    /// A user config layer that was set aside is degraded, for the same reason as a slot that
+    /// fell back: it is this board's file, and an update that rolled back over it would roll back
+    /// every release after it too. It still names the file somebody has to fix.
+    #[test]
+    fn a_set_aside_user_config_is_degraded_and_names_the_file() {
+        let params = Params {
+            user_layer_rejected: Some(
+                "parsing /var/lib/robot/robotd.toml: expected `]` at line 1".into(),
+            ),
+            ..Params::default()
+        };
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        s.ticks.store(1, Ordering::Relaxed);
+        s.last_tick_us
+            .store(s.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(health.degraded, "this must not roll a release back");
+        let reason = health.reason.unwrap();
+        assert!(reason.contains("/var/lib/robot/robotd.toml"), "{reason}");
     }
 
     /// The other unhealthy states *are* evidence about the release, so they must not be

@@ -211,6 +211,11 @@ pub struct Intents {
     /// lives in the shared params crate that owns the config keys it names, and encoding one as
     /// a number here would only move the parse somewhere with less to check it against.
     policy_change: ArcSwapOption<PolicyChange>,
+    /// A footstep pattern to walk (`robot.footsteps`), or `None`. Last writer wins, like `policy_change`: a
+    /// second pattern in the same tick is the one somebody is waiting for.
+    footsteps: ArcSwapOption<Vec<duck_ipc_proto::Footstep>>,
+    /// A goal to walk to (`robot.footstepGoal`), or `None`. Last writer wins.
+    footstep_goal: ArcSwapOption<duck_ipc_proto::FootstepGoalParams>,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
@@ -307,6 +312,8 @@ impl Intents {
             rest: AtomicBool::new(false),
             mode_switch: AtomicU8::new(MODE_NONE),
             policy_change: ArcSwapOption::empty(),
+            footsteps: ArcSwapOption::empty(),
+            footstep_goal: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             reboot_motors: Mutex::new(None),
             wheee: ArcSwap::from_pointee(Stamped {
@@ -493,6 +500,26 @@ impl Intents {
         self.policy_change
             .swap(None)
             .map(|change| PolicyChange::clone(&change))
+    }
+
+    /// Queue a footstep pattern for the loop.
+    pub fn request_footsteps(&self, steps: Vec<duck_ipc_proto::Footstep>) {
+        self.footsteps.store(Some(Arc::new(steps)));
+    }
+
+    /// Take the pending footstep pattern, once.
+    pub fn take_footsteps(&self) -> Option<Arc<Vec<duck_ipc_proto::Footstep>>> {
+        self.footsteps.swap(None)
+    }
+
+    /// Queue a footstep goal for the loop.
+    pub fn request_footstep_goal(&self, goal: duck_ipc_proto::FootstepGoalParams) {
+        self.footstep_goal.store(Some(Arc::new(goal)));
+    }
+
+    /// Take the pending footstep goal, once.
+    pub fn take_footstep_goal(&self) -> Option<duck_ipc_proto::FootstepGoalParams> {
+        self.footstep_goal.swap(None).map(|g| *g)
     }
 
     /// Ask for the sit-then-power-off sequence.

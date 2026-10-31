@@ -64,6 +64,9 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // A bench tool for checking footstep placement against a printed sheet, driven from `robotctl` on the
+        // robot; not part of the remote surface until a client wants it.
+        RobotFootsteps(_) | RobotFootstepGoal(_) => false,
         // Somebody watching through the camera is who wants the room lit.
         RobotFlashlight(_) => true,
 
@@ -210,7 +213,7 @@ fn permits(call: &proto::Call) -> bool {
         // Not sharing, though. A share publishes under the owner's name, in public, and §4 — no
         // authorisation on this transport — would let any LAN peer do that. The phone over BLE
         // and `robotctl` on the robot are where a share comes from.
-        VetbookShare => false,
+        VetbookShare(_) => false,
         // Daemon-to-daemon plumbing, like the chorale's: not a client surface.
         RobotVetbookTally(_) => false,
 
@@ -235,6 +238,9 @@ fn permits(call: &proto::Call) -> bool {
         // `Show` is the largest reply in this list — a run's whole transcript — and a
         // datachannel is the one transport here with the room for it.
         Check(_) | Status | Subscribe | Log(_) | Show(_) | ListInstalled(_) => true,
+        // The OS's two reads, for the same reason: which build each slot holds is a question a
+        // remote client may ask of a robot it cannot change.
+        OsStatus | OsCheck => true,
 
         // ── identity and status ─────────────────────────────────────────────
         SystemInfo | SystemServices | SystemSetName(_) => true,
@@ -266,6 +272,13 @@ fn permits(call: &proto::Call) -> bool {
         // client that reconnects and re-subscribes, and `RobotRemoteSessionActive` learning to
         // tell a bystander session from the one that requested the update.
         Apply(_) | Rollback(_) | Select(_) => false,
+        // An OS update ends in a reboot, which drops every session, this one included — and,
+        // unlike a daemon release, there is no `mediad` restart for a reconnecting client to ride
+        // out quickly: the robot is gone for a minute and may come back on the other slot. And
+        // `mediad` is in `updaterd`'s `allow_users`, so this arm is the only thing between a LAN
+        // peer and a new root filesystem (§4: no authorisation on this transport). The phone over
+        // BLE and a shell on the robot are where an OS update comes from.
+        OsApply(_) | OsSwitch(_) => false,
 
         // Reconfiguring wifi moves the robot to another network and takes this session with it.
         // And unlike the update case there is nothing to defer *to*: provisioning is what BLE

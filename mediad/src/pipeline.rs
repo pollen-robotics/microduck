@@ -617,6 +617,12 @@ pub fn start(
 
     set_congestion_control(&sink, congestion_control);
 
+    // A weak link drops the frame rate, never the resolution. Lowering the resolution puts a
+    // software `videoscale` in front of `mpph264enc`, and a system-memory frame into
+    // `mpph264enc` is what oopsed the board kernel twice; `videorate` only drops frames, so the
+    // camera's buffers still reach the encoder untouched.
+    sink.set_property_from_str("enable-mitigation-modes", "downsampled");
+
     // The encoder settings, applied through the hook that exists for it.
     //
     // Handing `webrtcsink` the encoder would otherwise *lose* them, which would make this change a

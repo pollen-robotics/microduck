@@ -596,6 +596,13 @@ the robot is already tilted (≈26°), still tipping over rather than recovering
 past the fall threshold — debounced three ticks. Differentiating the SFLP quaternion instead
 would add the filter's lag to the one number whose whole value is being early.
 
+It is armed only from standing: the robot must have been inside the tilt gate for
+`limp_fall_arm_ms` (200 ms), and firing disarms it until the robot has stood again. A fall
+happens to a robot that was up. Without the arm, the limp pose after a fall forwards leaves the
+robot on its front at ~58° — a hair short of `fall_gravity_z`, so not `fallen` — and the slow
+sag as the policy takes over is tilted, tipping and predicted past the threshold: limp, pose,
+hand back, limp again, until the fall verdict happened to latch.
+
 What it buys is not the landing itself but the stand-up after it. The standing policy gets a
 still robot in a known posture up cleanly and a thrashing one up only after several attempts
 at walking gain against the floor, which is where the load on the motors comes from. So the
@@ -1010,6 +1017,56 @@ It costs the loop two chain evaluations per tick and no extra bus traffic, which
 the loop's own rate rather than the prototype's separate 100 Hz. That cost is the reason the
 "no odometry" decision in §7 was reversed rather than re-argued: the objection was never the
 arithmetic, it was that nothing read the answer.
+
+#### 4.4.1 Footsteps: the stick places the feet
+
+Opt-in, walk mode only: `[policy] footstep_control = true` (off by default). Switching it on in
+`robotctl configure` fetches the footstep policy and its FootstepNet planner from the Hub repo
+`apirrone/microduck-footsteps` into the policy library (`policy.fetch`, the same path as `policy
+load`), and the reload that follows loads them; `footsteps` / `footstep_planner` override either
+file. On but not fetched is a robot that walks as before and says so in the journal — a try-out
+switch must not leave a robot holding a pose.
+
+With it on, a held stick no longer feeds the gait a velocity: the controller runs the footstep
+net, whose twist slots carry the swing foot's **target pose** `(dx, dy, dyaw)` in the support sole
+frame. The odometry is what makes it work, which is why it lives here: the support foot is the
+odometry's anchor foot, and a change of anchor is a touchdown — the same rule the policy was
+trained against. At every touchdown the swing foot's target is fixed for the whole swing: the
+neutral place beside the support (`feet_spacing` from the planner's metadata) moved by the stick,
+each axis's deflection times that axis's step limit, clipped like FootstepNet clips
+(`duck_footstep_control::stick_step`). Proportional on purpose — the first version planned with
+FootstepNet toward a goal the stick pushed ahead, and every deflection came out a full step,
+because the planner reaches a goal in the fewest steps and only aims within its 2 cm / 5° reached
+tolerance below that. FootstepNet stays loaded (its limits and geometry are the contract) for goal
+walking.
+
+A released stick is the neutral step: the robot squares its feet and steps in place, and after
+0.4 s idle hands back to the gait at the next touchdown, never with a foot in the air. Body-pose
+mode and every skill outrank it, as they outrank walking.
+
+**Goals** (`robot.footstepGoal`, `robotctl robot goto X Y THETA [--foot left|right]`) are what
+FootstepNet is for: a pose in the robot's frame when asked (the stance frame below), for one foot's
+sole centre or for the stance centre, anchored in the odometry's world. At every touchdown the
+planner replans from the support sole where it actually landed, so tracking errors are corrected
+on the way; when the goal foot stands on the goal the other foot squares up beside it and the
+robot hands back, journaling the final miss. Goals beyond 1.5 m (FootstepNet trained on ±1 m) are
+refused, and a plan still walking after 70 touchdowns is given up. A goal may also be given in
+the odometry's world (`odom: true`), which is what `robotctl robot goto tag ID` sends: it sweeps
+the head over the floor (`robot.look`), takes raw frames from `mediad` (`media.frame`), finds the
+AprilTag (tag36h11, the C reference detector), undistorts its corners with the robot's
+calibration, turns them by the frame's `rotate` into the upright camera that `frames.camera`
+describes, solves the tag's pose and chains it through `robot.state` (camera in trunk, IMU,
+odometry) into the world; the goal is the stance printed on the tag's sheet
+(`scripts/footstep_tag_sheet.py`, constants shared with `robotctl/src/tag.rs`). All of it is a
+client of what the daemons already publish; the placement is only as good as the camera
+calibration, so a robot without its own `[media.intrinsics]` uses the family's lens model.
+
+**Scripted patterns** (`robot.footsteps`, `robotctl robot footsteps pattern.json`) are for checking
+placement against marks on the floor: microduck_rl `scripts/footsteps_patterns.py` prints FootstepNet
+plans 1:1 on A4 with the JSON to walk. The landings are in the start stance frame and anchored where
+the robot stands when the pattern arrives; each touchdown takes the next mark for the swing foot (or
+steps in place to fall into phase), the pattern ends squared up, and every landing's miss goes to
+the journal (`footstep mark`). It outranks the stick until the stick moves, which cancels it.
 
 ### 4.5 What else the loop drives, and why none of it has a design page
 

@@ -4,6 +4,8 @@ A duck shares with `robotctl vetbook` and `s`: `updaterd` publishes the book to 
 on its owner's account, `<user>/<duck>-vetbook` (`updater/src/vetbook.rs` in the microduck
 repository), and hands back a link here. This draws the card from that dataset.
 
+- `/` is the gallery: every duck whose owner said yes to listing it when sharing, to search by
+  name, sort and filter by its stats, and follow to its card or its owner's profile.
 - `/d/<user>/<duck>` is the page to share: the card, buttons to post it, and the Open Graph tags
   that make a pasted link unfurl as the card.
 - `/d/<user>/<duck>/card.png` is the card, 1200 × 630. `?card=notebook|purikura|profile`
@@ -21,8 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import re
+import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,6 +38,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from playwright.async_api import async_playwright
 
 import cards
+import gallery
 
 HERE = Path(__file__).parent
 HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
@@ -41,6 +46,9 @@ PUBLIC_URL = os.environ.get("VETBOOK_PUBLIC_URL", "https://pollen-robotics-micro
 LOCAL = os.environ.get("VETBOOK_LOCAL")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 CACHE_SIZE = 256
+# How old the gallery may get before a visit refreshes it. A refresh is one Hub listing plus a
+# download for each book whose commit changed, so the stale list is served while it runs.
+GALLERY_TTL = 300
 
 env = Environment(loader=FileSystemLoader(HERE), autoescape=select_autoescape(["html"]))
 STICKER = "data:image/webp;base64," + base64.b64encode((HERE / "sticker.webp").read_bytes()).decode()
@@ -51,6 +59,10 @@ PIXEL_GB = "data:image/png;base64," + base64.b64encode((HERE / "pixel-head-gb.pn
 state: dict = {}
 pngs: OrderedDict[tuple, bytes] = OrderedDict()
 render_lock = asyncio.Semaphore(2)
+# The gallery: rows by repo, each with the commit it was read at, so a refresh downloads only the
+# books shared again since. `avatars` is the owners' Hugging Face pictures, by user.
+directory: dict = {"rows": {}, "at": 0.0, "task": None, "warm": None}
+avatars: dict[str, str | None] = {}
 
 
 @asynccontextmanager
@@ -82,8 +94,6 @@ async def fetch(user: str, duck: str) -> tuple[dict, str] | None:
         path = Path(LOCAL) / repo / "vetbook.json"
         if not path.exists():
             return None
-        import json
-
         return json.loads(path.read_text()), str(path.stat().st_mtime_ns)
     http: httpx.AsyncClient = state["http"]
     info = await http.get(f"{HUB}/api/datasets/{repo}")
@@ -196,6 +206,113 @@ async def share_page(user: str, duck: str, request: Request):
     )
 
 
+async def listed_repos() -> list[tuple[str, str]]:
+    """`(repo, commit)` for every dataset carrying the gallery tag."""
+    if LOCAL:
+        return [
+            (f"{p.parent.parent.name}/{p.parent.name}", str(p.stat().st_mtime_ns))
+            for p in Path(LOCAL).glob("*/*-vetbook/vetbook.json")
+        ]
+    http: httpx.AsyncClient = state["http"]
+    found: list[tuple[str, str]] = []
+    url: str | None = f"{HUB}/api/datasets?filter={gallery.TAG}&full=true&limit=1000"
+    # Paged by the `Link` header; ten pages is ten thousand ducks.
+    for _ in range(10):
+        if url is None:
+            break
+        response = await http.get(url)
+        response.raise_for_status()
+        found += [(d["id"], d.get("sha") or "main") for d in response.json() if d.get("id")]
+        url = response.links.get("next", {}).get("url")
+    return found
+
+
+async def avatar(user: str) -> str | None:
+    if LOCAL:
+        return None
+    if user not in avatars:
+        try:
+            r = await state["http"].get(f"{HUB}/api/users/{user}/overview")
+            avatars[user] = r.json().get("avatarUrl") if r.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            avatars[user] = None
+    return avatars[user]
+
+
+async def refresh_directory() -> None:
+    try:
+        repos = await listed_repos()
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        print(f"gallery: listing failed, keeping the last one: {e}")
+        directory["at"] = time.monotonic()
+        return
+    old = directory["rows"]
+    rows: dict = {}
+    sem = asyncio.Semaphore(8)
+
+    async def one(repo: str, sha: str) -> None:
+        names = gallery.split(repo)
+        if names is None:
+            return
+        if repo in old and old[repo][0] == sha:
+            rows[repo] = old[repo]
+            return
+        user, duck = names
+        async with sem:
+            try:
+                found = await fetch(user, duck)
+            except (httpx.HTTPError, ValueError) as e:
+                print(f"gallery: {repo}: {e}")
+                if repo in old:
+                    rows[repo] = old[repo]
+                return
+        if found is None:
+            return
+        try:
+            row = gallery.entry(found[0], user, duck)
+        except Exception as e:  # noqa: BLE001 — one odd book must not empty the gallery
+            print(f"gallery: {repo}: unreadable book: {e}")
+            return
+        if row is not None:
+            row["avatar"] = await avatar(user)
+            rows[repo] = (sha, row)
+
+    await asyncio.gather(*(one(repo, sha) for repo, sha in repos))
+    fresh = [row for repo, (sha, row) in rows.items() if old.get(repo, (None,))[0] != sha]
+    directory["rows"] = rows
+    directory["at"] = time.monotonic()
+    # The gallery shows every card at once, and a card is a second of Chromium, so draw the new
+    # ones now, behind the list rather than in front of it, instead of when a visitor's page asks
+    # for all of them together.
+    directory["warm"] = asyncio.create_task(warm(fresh))
+
+
+async def warm(rows: list[dict]) -> None:
+    for row in rows:
+        try:
+            await cached_png(row["user"], row["duck"], None, None, story=False, versioned=True)
+        except Exception as e:  # noqa: BLE001 — the visitor's request will try again
+            print(f"gallery: {row['user']}/{row['duck']}: card not drawn: {e}")
+
+
+async def ducks() -> list[dict]:
+    """The gallery's rows, newest share first. The first visit waits for them; later ones get the
+    last list while a stale one refreshes behind them."""
+    stale = time.monotonic() - directory["at"] > GALLERY_TTL
+    task = directory["task"]
+    if stale and (task is None or task.done()):
+        task = directory["task"] = asyncio.create_task(refresh_directory())
+    if directory["at"] == 0.0 and task is not None:
+        await asyncio.shield(task)
+    rows = [row for _, row in directory["rows"].values()]
+    return sorted(rows, key=lambda r: -r["shared_at"])
+
+
+@app.get("/api/ducks")
+async def api_ducks():
+    return {"ducks": await ducks()}
+
+
 @app.get("/sticker.webp")
 async def sticker():
     return FileResponse(HERE / "sticker.webp", media_type="image/webp")
@@ -203,14 +320,12 @@ async def sticker():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return env.get_template("page.html").render(
-        card=None,
-        heading=("Microduck", "vet book"),
+    return env.get_template("gallery.html").render(
         title="Microduck vet book",
-        description="Cards for microducks: hours awake, distance walked, cuddles and falls, shared from the robot.",
+        description="Every microduck keeps a vet book: hours awake, distance walked, cuddles and falls. "
+        "Browse the ducks whose owners shared theirs.",
         url=PUBLIC_URL,
-        image=None,
-        message="Every microduck keeps a vet book: its whole life in numbers. Shared, it becomes a card.",
+        ducks=await ducks(),
     )
 
 

@@ -20,6 +20,13 @@
 //! else is counters, dates and servo wear. A `share` block is added: the robot's name, the owner,
 //! when, from which release, and which card this share drew.
 //!
+//! **Listing is the owner's choice, made on every share.** The dataset is public either way —
+//! the card's link reads it — but only a share that says `listed` puts the duck in the Space's
+//! gallery, where strangers browse, search and sort ducks. Two marks say so, and the Space wants
+//! both: the dataset card's [`GALLERY_TAG`], which is how it finds the books without reading every
+//! one, and `share.listed` in the book, which is what it believes. Anybody can tag a dataset; only
+//! this share writes `listed`. Sharing unlisted rewrites both, which takes the duck back out.
+//!
 //! **The card is drawn at random**, one of three, when the book is shared — so a link keeps its
 //! card for as long as it stands, and sharing again re-rolls it.
 //!
@@ -50,6 +57,9 @@ pub const CARDS: [&str; 8] = [
     "notebook", "purikura", "profile", "receipt", "passport", "gameboy", "polaroid", "fifa",
 ];
 
+/// The dataset tag a listed book carries: the gallery asks the Hub for datasets with it.
+pub const GALLERY_TAG: &str = "microduck-vetbook-gallery";
+
 /// How long `robotd` and `configd` each get to answer. Both answer from memory.
 const ASK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -76,7 +86,9 @@ impl Default for Sources {
 pub async fn share(
     account: &crate::account::Account,
     sources: &Sources,
+    params: &proto::VetbookShareParams,
 ) -> Result<proto::VetbookShareResult> {
+    let listed = params.listed;
     // A token near its end is renewed first, so a share is not the thing that finds out.
     if let Err(e) = account.refresh_if_due().await {
         tracing::warn!(error = %e, "vet book share: token refresh failed; trying the one we have");
@@ -130,12 +142,12 @@ pub async fn share(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let shared = shared_copy(book, &name, &user, card, now);
+    let shared = shared_copy(book, &name, &user, card, now, listed);
     // This share's own image address: the Space draws the latest book whatever `v` says, but a new
     // address is what makes Hugging Face's image proxy (the README) and a social network's preview
     // fetch it again rather than show the last share's card.
     let image = format!("{url}/card.png?v={now}");
-    let readme = dataset_card(&name, &user, &url, &image);
+    let readme = dataset_card(&name, &user, &url, &image, listed);
 
     let endpoint = account.config().endpoint.trim_end_matches('/').to_owned();
     let client = crate::source::http::client()?;
@@ -162,12 +174,13 @@ pub async fn share(
     )
     .await?;
 
-    tracing::info!(%repo, card, "vet book shared");
+    tracing::info!(%repo, card, listed, "vet book shared");
     Ok(proto::VetbookShareResult {
         image,
         url,
         dataset: repo,
         card: card.to_owned(),
+        listed,
     })
 }
 
@@ -224,13 +237,14 @@ pub fn slug(name: &str) -> String {
 }
 
 /// The book as it is published: without diary notes and `robotd`'s bookkeeping, with a `share`
-/// block saying whose, when and which card.
+/// block saying whose, when, which card, and whether the gallery may show it.
 pub fn shared_copy(
     mut book: serde_json::Value,
     name: &str,
     user: &str,
     card: &str,
     now: i64,
+    listed: bool,
 ) -> serde_json::Value {
     if let Some(obj) = book.as_object_mut() {
         obj.remove("last_boot_id");
@@ -246,17 +260,24 @@ pub fn shared_copy(
                 "card": card,
                 "shared_at": now,
                 "daemon": env!("CARGO_PKG_VERSION"),
+                "listed": listed,
             }),
         );
     }
     book
 }
 
-/// The dataset's `README.md`: what this is, the card, and where it came from.
-fn dataset_card(name: &str, user: &str, url: &str, image: &str) -> String {
+/// The dataset's `README.md`: what this is, the card, and where it came from. A listed book's
+/// carries [`GALLERY_TAG`].
+pub fn dataset_card(name: &str, user: &str, url: &str, image: &str, listed: bool) -> String {
+    let gallery = if listed {
+        format!("- {GALLERY_TAG}\n")
+    } else {
+        String::new()
+    };
     format!(
         "---\npretty_name: \"{name}'s vet book\"\ntags:\n- microduck\n- robotics\n- pollen-robotics\n\
-         - vetbook\n---\n\n# {name}'s vet book\n\n[![{name}'s vet book card]({image})]({url})\n\n\
+         - vetbook\n{gallery}---\n\n# {name}'s vet book\n\n[![{name}'s vet book card]({image})]({url})\n\n\
          The lifetime record of **{name}**, a [microduck](https://pollen-robotics.com) belonging to \
          [@{user}](https://huggingface.co/{user}): hours awake, distance walked, falls, cuddles, \
          tricks, and every servo it has been through. Shared from the robot with \
@@ -374,7 +395,7 @@ mod tests {
                 { "kind": "swap", "text": "left_knee (id 23): new servo" },
             ],
         });
-        let shared = shared_copy(book, "graphite-bang", "apirrone", "purikura", 42);
+        let shared = shared_copy(book, "graphite-bang", "apirrone", "purikura", 42, false);
         let text = shared.to_string();
         assert!(!text.contains("hunter2"));
         assert!(!text.contains("last_boot_id"));
@@ -384,6 +405,25 @@ mod tests {
         assert_eq!(shared["share"]["card"], "purikura");
         assert_eq!(shared["share"]["owner"], "apirrone");
         assert_eq!(shared["share"]["robot"], "graphite-bang");
+        assert_eq!(shared["share"]["listed"], false);
+    }
+
+    #[test]
+    fn only_a_listed_book_carries_the_gallery_tag() {
+        let args = (
+            "graphite-bang",
+            "apirrone",
+            "https://x/d/a/g",
+            "https://x/d/a/g/card.png",
+        );
+        let listed = dataset_card(args.0, args.1, args.2, args.3, true);
+        let unlisted = dataset_card(args.0, args.1, args.2, args.3, false);
+        assert!(
+            listed.contains(&format!("\n- {GALLERY_TAG}\n---\n")),
+            "{listed}"
+        );
+        assert!(!unlisted.contains(GALLERY_TAG), "{unlisted}");
+        assert!(unlisted.contains("\n- vetbook\n---\n"), "{unlisted}");
     }
 
     #[test]

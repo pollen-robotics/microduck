@@ -45,12 +45,14 @@ mod camera;
 mod cells;
 mod configure;
 mod duck;
+mod endurance;
 mod frame;
 mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
 mod show;
+mod tag;
 mod vetbook;
 
 /// Exit codes. Stable — CI asserts on these.
@@ -419,6 +421,21 @@ enum Namespace {
         json: bool,
     },
 
+    /// Battery and heat test: walk, stand and sit at random near the start until the battery is
+    /// empty, logging charge, board temperatures and throttling to disk.
+    ///
+    /// Starts in the background (a transient systemd unit) and returns, so you can disconnect.
+    /// `robotd` sits the robot down and powers off at 0%; the log in /var/lib/endurance survives
+    /// that, and `scripts/endurance-plot.py` draws it. Needs root; no pad connected, since an
+    /// idle pad sends zero velocities that fight this one.
+    #[command(args_conflicts_with_subcommands = true)]
+    Endurance {
+        #[command(subcommand)]
+        command: Option<endurance::EnduranceCommand>,
+        #[command(flatten)]
+        args: endurance::EnduranceArgs,
+    },
+
     /// Print a shell completion script on stdout.
     ///
     /// Generated from this binary's own command tree, so the completions a robot offers
@@ -581,6 +598,46 @@ enum RobotCommand {
     /// be enabled and driving.
     Do {
         skill: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Walk a printed footstep pattern, to check where the feet land.
+    ///
+    /// `pattern.json` comes with its A4 sheet from microduck_rl `scripts/footsteps_patterns.py`. Print the
+    /// sheet at 100 %, stand the robot on the two start soles, then run this: the robot walks the marks with the
+    /// footstep policy, squares up and hands back. Each landing's miss is in `journalctl -u robotd`
+    /// ("footstep mark"). Needs `[policy] footsteps` and `footstep_planner`; the stick cancels it.
+    Footsteps {
+        /// The pattern file (`{"steps": [{"foot": "left", "x": .., "y": .., "yaw": ..}, ..]}`, start-stance frame).
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Walk to a pose with planned footsteps: `goto X Y THETA`, X forward and Y left in metres, THETA in
+    /// degrees (left positive), in the robot's frame right now — origin midway between its feet. Or
+    /// `goto tag ID`: scan the floor with the head for printed AprilTag ID (tag36h11, the sheets from
+    /// `scripts/footstep_tag_sheet.py`) and stand on its footprints.
+    ///
+    /// `--foot left` puts the left sole's centre there (`right` likewise); without it the robot's centre goes
+    /// there. FootstepNet replans at every touchdown, the other foot squares up at the end, and the robot hands
+    /// back to the gait; the final miss is in `journalctl -u robotd | grep footstep`. Needs
+    /// `[policy] footstep_control`; the stick cancels it. `robotctl robot goto 0.3 0 0` walks 30 cm ahead,
+    /// `goto 0 0 90` turns left in place, `goto tag 3` walks onto tag 3's sheet.
+    #[command(allow_negative_numbers = true)]
+    Goto {
+        /// `X Y THETA`, or `tag ID`.
+        // No `allow_hyphen_values`: it swallowed `--look-only` after `tag 0` as a third value. Negative
+        // numbers still parse, through the command's `allow_negative_numbers`.
+        #[arg(num_args = 2..=3, required = true)]
+        target: Vec<String>,
+        #[arg(long, value_enum)]
+        foot: Option<GotoFoot>,
+        /// With `tag ID`: find the tag and print where it and its footprints are relative to the robot's
+        /// feet (x forward, y left, degrees), without walking — to check the camera against a tape measure.
+        #[arg(long)]
+        look_only: bool,
         #[arg(long)]
         json: bool,
     },
@@ -3433,6 +3490,61 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         ));
     }
 
+    // `goto tag ID` is a scan and a few calls, not one request.
+    if let RobotCommand::Goto {
+        target,
+        json,
+        look_only,
+        ..
+    } = &command
+        && target[0] == "tag"
+    {
+        let id: u32 = target
+            .get(1)
+            .and_then(|s| s.parse().ok())
+            .filter(|_| target.len() == 2)
+            .ok_or_else(|| Failure::new(exit::USAGE, "usage: goto tag ID (a number)".into()))?;
+        if *look_only {
+            let (tag, stance) =
+                tag::look_for_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "tag": tag, "footprints": stance })
+                );
+            } else {
+                println!(
+                    "tag {id} centre:   {:+.3} m forward, {:+.3} m left of the feet, facing {:+.1}°",
+                    tag[0],
+                    tag[1],
+                    tag[2].to_degrees()
+                );
+                println!(
+                    "its footprints: {:+.3} m forward, {:+.3} m left, heading {:+.1}° (stance centre)",
+                    stance[0],
+                    stance[1],
+                    stance[2].to_degrees()
+                );
+            }
+            return Ok(());
+        }
+        let (distance, heading) =
+            tag::goto_tag(Path::new(robotd_params::DEFAULT_PATH), socket, id)?;
+        if *json {
+            println!(
+                "{}",
+                serde_json::json!({ "tag": id, "miss_m": distance, "miss_rad": heading })
+            );
+        } else {
+            println!(
+                "on tag {id}'s footprints — walked the last stretch from a sighting {:.0} mm, {:.1}° off the staging pose",
+                distance * 1000.0,
+                heading.to_degrees()
+            );
+        }
+        return Ok(());
+    }
+
     let mut client = Client::connect_to("robotd", socket)?;
     client.hello()?;
 
@@ -3453,6 +3565,25 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
         RobotCommand::Do { skill, json } => (
             proto::Call::RobotDo(proto::DoParams {
                 skill: skill.clone(),
+            }),
+            *json,
+        ),
+        RobotCommand::Footsteps { file, json } => (
+            proto::Call::RobotFootsteps(read_footstep_pattern(file)?),
+            *json,
+        ),
+        RobotCommand::Goto {
+            target, foot, json, ..
+        } => (
+            proto::Call::RobotFootstepGoal(proto::FootstepGoalParams {
+                x: goto_number(target, 0)?,
+                y: goto_number(target, 1)?,
+                yaw: goto_number(target, 2)?.to_radians(),
+                foot: foot.map(|f| match f {
+                    GotoFoot::Left => proto::FootSide::Left,
+                    GotoFoot::Right => proto::FootSide::Right,
+                }),
+                odom: false,
             }),
             *json,
         ),
@@ -3533,9 +3664,99 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Goto { target, foot, .. } => println!(
+            "walking to ({} m, {} m, {}°){} — the miss is in \
+             `journalctl -u robotd | grep footstep`",
+            target[0],
+            target[1],
+            target[2],
+            match foot {
+                Some(GotoFoot::Left) => " with the left foot",
+                Some(GotoFoot::Right) => " with the right foot",
+                None => "",
+            }
+        ),
+        RobotCommand::Footsteps { file, .. } => println!(
+            "{} walking — misses in `journalctl -u robotd | grep footstep`",
+            file.display()
+        ),
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// `goto X Y THETA`'s `i`th number.
+fn goto_number(target: &[String], i: usize) -> Result<f64, Failure> {
+    target
+        .get(i)
+        .filter(|_| target.len() == 3)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            Failure::new(
+                exit::USAGE,
+                "usage: goto X Y THETA (metres, metres, degrees) or goto tag ID".into(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod goto_parse_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `goto` takes negative numbers and flags in any position — `--look-only` after `tag 0` was once read as a
+    /// third target value.
+    #[test]
+    fn goto_arguments_parse_in_any_order() {
+        let target = |args: &[&str]| match Cli::try_parse_from(args).map(|c| c.namespace) {
+            Ok(Namespace::Robot {
+                command:
+                    RobotCommand::Goto {
+                        target,
+                        look_only,
+                        foot,
+                        ..
+                    },
+            }) => (target, look_only, foot.is_some()),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(
+            target(&["robotctl", "robot", "goto", "tag", "0", "--look-only"]),
+            (vec!["tag".into(), "0".into()], true, false)
+        );
+        assert!(target(&["robotctl", "robot", "goto", "--look-only", "tag", "2"]).1);
+        assert_eq!(
+            target(&[
+                "robotctl", "robot", "goto", "-0.1", "0", "-90", "--foot", "left"
+            ]),
+            (vec!["-0.1".into(), "0".into(), "-90".into()], false, true)
+        );
+    }
+}
+
+/// Which foot `robot goto` places on the goal.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum GotoFoot {
+    Left,
+    Right,
+}
+
+/// A footstep pattern file: its `steps`, whatever else it carries (name, start soles, the sheet's notes).
+fn read_footstep_pattern(file: &Path) -> Result<proto::FootstepsParams, Failure> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", file.display())))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", file.display())))?;
+    let steps = value
+        .get("steps")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(serde_json::json!({ "steps": steps })).map_err(|e| {
+        Failure::new(
+            exit::USAGE,
+            format!("{}: not a footstep pattern ({e})", file.display()),
+        )
+    })
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].
@@ -4032,6 +4253,30 @@ fn run_policy(
             ),
         )),
     }
+}
+
+/// Fetch `[policy] footstep_control`'s two networks into the library, through `updaterd`. Returns where they
+/// landed — the paths `robotd` resolves the switch to.
+pub(crate) fn fetch_footsteps(updater_socket: &Path) -> Result<Vec<PathBuf>, String> {
+    fetch_footsteps_inner(updater_socket).map_err(|f| f.message)
+}
+
+fn fetch_footsteps_inner(updater_socket: &Path) -> Result<Vec<PathBuf>, Failure> {
+    let mut client = Client::connect_to("updaterd", updater_socket)?;
+    client.hello()?;
+    let mut paths = Vec::new();
+    for file in robotd_params::FOOTSTEPS_FILES {
+        let result = result_of(client.call(&proto::Call::PolicyFetch(
+            proto::PolicyFetchParams {
+                repo: robotd_params::FOOTSTEPS_REPO.to_owned(),
+                revision: None,
+                file: Some(file.to_owned()),
+            },
+        ))?)?;
+        let fetched: proto::PolicyFetchResult = decode(&result)?;
+        paths.push(PathBuf::from(fetched.path));
+    }
+    Ok(paths)
 }
 
 /// Fetch a policy named as `org/name[@revision][:file]`, and say what arrived.
@@ -5393,6 +5638,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
+        Namespace::Endurance { command, args } => {
+            return endurance::run(&cli.robot_socket, command, args);
+        }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
@@ -5415,7 +5663,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             let result = if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &cli.socket)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }

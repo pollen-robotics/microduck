@@ -31,6 +31,9 @@ kinematics = { path = "../kinematics" }
 # with `mediad` and `duck-detect`. Deliberately NOT `duck-detect` itself, for the reason above —
 # that crate carries the NPU and ONNX runtimes, and this one has no dependencies at all.
 uyvy = { path = "../uyvy" }
+# `robot goto tag`: the reference AprilTag detector (C, built from the vendored source by `cc` — no system
+# package, cross-compiles with the board toolchain). Pure detection; no network, no OpenCV.
+apriltag = "0.4"
 pad-imu = { path = "../pad-imu" }
 # `robotctl configure`'s schema, defaults and validation — the same crate `robotd` parses
 # its config with, which is what makes the editor unable to disagree with the daemon. Pure

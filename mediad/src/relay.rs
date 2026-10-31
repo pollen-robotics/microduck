@@ -99,7 +99,11 @@ pub const DEFAULT_RENDEZVOUS: &str = "https://pollen-robotics-reachy-mini-centra
 /// Read on every connect attempt rather than cached: a login that happens while this task is
 /// waiting has to take effect without a restart, and re-reading a small file on a path that
 /// already sleeps for thirty seconds costs nothing.
-pub const DEFAULT_TOKEN_PATH: &str = "/etc/robot/hf-token";
+///
+/// The same string as `updater::account::DEFAULT_PATH`, which says why it is under `/var/lib`.
+/// Being re-read is also what covers the move: when `updaterd` migrates the file from `/etc` after
+/// this daemon started, the next attempt finds it.
+pub const DEFAULT_TOKEN_PATH: &str = "/var/lib/robot/hf-token";
 
 /// How long to wait between looks at a token file that is not there yet.
 ///
