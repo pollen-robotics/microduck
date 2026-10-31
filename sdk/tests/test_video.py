@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 
@@ -11,7 +12,12 @@ import pytest
 pytest.importorskip("aiortc")
 np = pytest.importorskip("numpy")
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack  # noqa: E402
+from aiortc import (  # noqa: E402
+    RTCConfiguration,
+    RTCPeerConnection,
+    RTCSessionDescription,
+    VideoStreamTrack,
+)
 from av import VideoFrame  # noqa: E402
 
 from duck.video import Camera  # noqa: E402
@@ -29,42 +35,67 @@ class LeftEdgeWhite(VideoStreamTrack):
         return frame
 
 
-def test_the_offer_is_answered_and_pictures_come_back_upright():
+@pytest.fixture
+def robot():
     loop = asyncio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
 
-    def on_robot(coroutine):
+    def run(coroutine):
         return asyncio.run_coroutine_threadsafe(coroutine, loop).result(timeout=15)
 
-    robot = on_robot(_peer())
+    async def peer() -> RTCPeerConnection:
+        return RTCPeerConnection(RTCConfiguration(iceServers=[]))
+
+    pc = run(peer())
+    yield pc, run
+    run(pc.close())
+    loop.call_soon_threadsafe(loop.stop)
+
+
+def test_the_offer_is_answered_and_pictures_come_back_upright(robot, caplog):
+    pc, run = robot
     answers: list = []
-    camera = Camera(send=answers.append)
+    camera = Camera(send=answers.append, stun=None)
     camera.rotate = 90
-
-    async def offer() -> dict:
-        robot.addTrack(LeftEdgeWhite())
-        await robot.setLocalDescription(await robot.createOffer())
-        return {"type": "offer", "sdp": robot.localDescription.sdp}
-
-    camera.on_media({"type": "peer", "sdp": on_robot(offer())})
-    deadline = time.monotonic() + 15
-    while not answers and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert answers, "the offer was never answered"
-    assert answers[0]["sdp"]["type"] == "answer"
-    on_robot(robot.setRemoteDescription(RTCSessionDescription(**answers[0]["sdp"])))
-
-    picture = camera.picture(timeout=15)
     try:
+
+        async def offer() -> dict:
+            pc.addTrack(LeftEdgeWhite())
+            await pc.setLocalDescription(await pc.createOffer())
+            return {"type": "offer", "sdp": pc.localDescription.sdp}
+
+        sdp = run(offer())
+        camera.on_media({"type": "peer", "sdp": sdp})
+        # The robot trickles its candidates too, by line index and nothing else.
+        line = next(x for x in sdp["sdp"].splitlines() if x.startswith("a=candidate:"))
+        with caplog.at_level(logging.WARNING, logger="duck.video"):
+            camera.on_media({"type": "peer", "ice": {"candidate": line[2:], "sdpMLineIndex": 0}})
+
+            deadline = time.monotonic() + 10
+            while not answers and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert answers, "the offer was never answered"
+            assert answers[0]["sdp"]["type"] == "answer"
+            run(pc.setRemoteDescription(RTCSessionDescription(**answers[0]["sdp"])))
+
+            picture = camera.picture(timeout=10)
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
         assert picture is not None, "no picture arrived"
         assert picture.shape[:2] == (64, 48), "a quarter turn makes it portrait"
         assert picture[0].mean() > 200, "turned clockwise, the white left edge is the top row"
         assert picture[-1].mean() < 60
+        assert picture.flags["C_CONTIGUOUS"], "torch.from_numpy takes it as it is"
     finally:
         camera.close()
-        on_robot(robot.close())
-        loop.call_soon_threadsafe(loop.stop)
 
 
-async def _peer() -> RTCPeerConnection:
-    return RTCPeerConnection()
+def test_closing_wakes_a_caller_waiting_for_a_picture():
+    camera = Camera(send=lambda _: None, stun=None)
+    got: list = []
+    waiter = threading.Thread(target=lambda: got.append(camera.picture(timeout=10)), daemon=True)
+    waiter.start()
+    time.sleep(0.1)
+    camera.close()
+    waiter.join(timeout=2)
+    assert not waiter.is_alive(), "picture() waited out its timeout after close()"
+    assert got == [None]

@@ -24,8 +24,16 @@ class Camera:
     in the order they came, and callers read `latest` or wait on `picture` from any thread.
     """
 
-    def __init__(self, send: Callable[[dict[str, Any]], None]):
+    def __init__(self, send: Callable[[dict[str, Any]], None], stun: str | None = STUN):
+        try:
+            import aiortc  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "video needs the `video` extra: pip install -e \"sdk[video]\""
+            ) from None
         self._send = send
+        self._stun = stun
+        self._closed = False
         self.rotate = 0
         self.latest: Any = None
         self.frames = 0
@@ -38,15 +46,28 @@ class Camera:
         self._thread.start()
 
     def on_media(self, message: dict[str, Any]) -> None:
-        self._loop.call_soon_threadsafe(self._inbox.put_nowait, message)
+        try:
+            self._loop.call_soon_threadsafe(self._inbox.put_nowait, message)
+        except RuntimeError:
+            pass  # closed
 
     def picture(self, timeout: float | None = None) -> Any:
-        """The newest picture, waiting up to `timeout` seconds for the first one."""
+        """The newest picture, waiting up to `timeout` seconds for one. `None` once the video is
+        gone, rather than the last picture before it went."""
         with self._arrived:
-            self._arrived.wait_for(lambda: self.latest is not None, timeout=timeout)
+            self._arrived.wait_for(lambda: self.latest is not None or self._closed, timeout=timeout)
             return self.latest
 
+    def _drop(self) -> None:
+        with self._arrived:
+            self.latest = None
+            self._arrived.notify_all()
+
     def close(self) -> None:
+        with self._arrived:
+            self._closed = True
+            self.latest = None
+            self._arrived.notify_all()
         if self._loop.is_closed():
             return
         future = asyncio.run_coroutine_threadsafe(self._close(), self._loop)
@@ -80,7 +101,8 @@ class Camera:
 
         if self._pc is not None:
             await self._pc.close()
-        pc = RTCPeerConnection(RTCConfiguration(iceServers=[RTCIceServer(urls=STUN)]))
+        servers = [RTCIceServer(urls=self._stun)] if self._stun else []
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pc = pc
 
         @pc.on("track")
@@ -92,6 +114,8 @@ class Camera:
         def _on_state() -> None:
             self.state = pc.connectionState
             logger.info("video: %s", self.state)
+            if self.state in ("failed", "closed"):
+                self._drop()
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
         await pc.setLocalDescription(await pc.createAnswer())
@@ -118,10 +142,11 @@ class Camera:
             try:
                 frame = await track.recv()
             except Exception:  # noqa: BLE001 - the track ends with the session
+                self._drop()
                 return
             picture = frame.to_ndarray(format="rgb24")
             if self.rotate % 360:
-                picture = np.rot90(picture, k=-(self.rotate // 90) % 4)
+                picture = np.ascontiguousarray(np.rot90(picture, k=-(self.rotate // 90) % 4))
             with self._arrived:
                 self.latest = picture
                 self.frames += 1

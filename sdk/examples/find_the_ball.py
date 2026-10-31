@@ -4,7 +4,7 @@
     python examples/find_the_ball.py [duck-name]
 
 The duck looks left, ahead and right. At each, SmolVLM (256M parameters, it runs on a laptop) is
-asked what it sees and whether the ball is there, and the duck keeps looking where it said yes.
+asked what it sees and whether the ball is there, and the duck chirps when it says yes.
 """
 
 import sys
@@ -18,7 +18,7 @@ from duck import Duck
 
 MODEL = "HuggingFaceTB/SmolVLM-256M-Instruct"
 
-# Trunk-frame points a metre out, metres: left, ahead and right.
+# Trunk-frame points, metres: to the left, ahead and to the right.
 GAZES = {"left": (1.0, 0.8, 0.1), "ahead": (1.0, 0.0, 0.1), "right": (1.0, -0.8, 0.1)}
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -45,6 +45,9 @@ def main(name: str | None) -> None:
             # Long enough for the head to get there and a picture taken after it did.
             time.sleep(1.5)
             picture = duck.frame()
+            if picture is None:
+                print("the video went away")
+                return
             seen = ask(picture, "Describe what is in front of you in one short sentence.")
             ball = ask(picture, "Is there an orange ball in this picture? Answer yes or no.")
             print(f"{where}: {seen}")

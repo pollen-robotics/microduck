@@ -14,12 +14,12 @@ STATUS_NO_TARGET = 255
 class View:
     """One tick. Any field can be `None`: no ToF fitted, or nothing arrived yet."""
 
-    # The newest camera picture, upright RGB, with `Duck(video=True)`.
-    frame: Any = None
     state: dict[str, Any] | None = None
     depth: dict[str, Any] | None = None
     elapsed: float = 0.0
     tick: int = 0
+    # The newest camera picture, upright RGB, with `Duck(video=True)`.
+    frame: Any = None
 
     _ranges: list[float | None] = field(default_factory=list, repr=False)
 

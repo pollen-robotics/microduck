@@ -74,9 +74,9 @@ class Duck:
             if self._camera:
                 self._camera.rotate = int((self.video() or {}).get("rotate") or 0)
         except BaseException:
+            self._lane.stop()
             if self._camera:
                 self._camera.close()
-            self._lane.stop()
             raise
 
         self._streams: set[str] = set()
@@ -94,9 +94,9 @@ class Duck:
             self._closing = True
             self._wake.notify()
         self._sender.join(timeout=5)
+        self._lane.stop()
         if self._camera:
             self._camera.close()
-        self._lane.stop()
         self._rpc.abandon("the duck was closed")
 
     def __enter__(self) -> "Duck":
@@ -177,9 +177,11 @@ class Duck:
         return _accepted("robot.do", self._rpc.call("robot.do", {"skill": skill}))
 
     def frame(self, timeout: float | None = 15.0) -> Any:
-        """The newest picture from the camera, an upright RGB array, waiting for the first.
+        """The newest picture from the camera, an upright RGB array, waiting for one.
 
-        Needs `Duck(video=True)` and the `video` extra. `None` if nothing arrived in `timeout`.
+        Needs `Duck(video=True)` and the `video` extra; a duck with no camera refuses
+        `media.video`, so opening it with video raises. `None` if no picture arrived in `timeout`
+        or the video has gone.
         """
         if self._camera is None:
             raise RuntimeError("no video on this duck: open it with Duck(video=True)")

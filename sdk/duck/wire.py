@@ -1,5 +1,8 @@
 """JSON-RPC to a duck over the rendezvous, with no WebRTC in the path at all.
 
+The calls never touch WebRTC. When a caller wants the camera, the same session also carries the
+robot's video offer and its answer (`on_media`, `send_media`), and the video itself is WebRTC.
+
 The other two transports negotiate: they exchange SDP and ICE so the two ends can find a route
 between them, and then speak WebRTC over it. That works on one network, and across NATs it works
 *when a relay candidate exists* — which now it does (`remote-access-design.md` §6), but the
@@ -62,7 +65,7 @@ class WireError(Exception):
 
 
 class WsConsumer:
-    """One control-only session with one duck.
+    """One session with one duck: control over the lane, and the video offer when asked for.
 
     The surface is the other two consumers' — `start`, `stop`, `status`, `latest_frame`,
     `send_command` — so `app.py` holds any of the three without knowing which. `latest_frame`
@@ -92,9 +95,11 @@ class WsConsumer:
         # Continuous intents on a connection of their own, so a call in flight never holds one up
         # past the robot's deadman.
         self._intents = requests.Session()
+        # The video's answer comes from aiortc's own thread, so it gets a connection too.
+        self._media = requests.Session()
         # Every session, once: every call on this lane goes out named. See `rendezvous.USER_AGENT`
         # for what an unnamed one gets — an `awselb/2.0` 429 that the rendezvous never sees.
-        for session in (self._streaming, self._posting, self._intents):
+        for session in (self._streaming, self._posting, self._intents, self._media):
             session.headers["User-Agent"] = USER_AGENT
         self._stream: requests.Response | None = None
         self._thread: threading.Thread | None = None
@@ -174,6 +179,7 @@ class WsConsumer:
         self._streaming.close()
         self._posting.close()
         self._intents.close()
+        self._media.close()
 
     def status(self) -> dict[str, Any]:
         return {
@@ -207,7 +213,7 @@ class WsConsumer:
         """An `sdp` or `ice` for the robot's media path, on this session."""
         if not self._session_id:
             raise WireError("the session is not open")
-        self._post({"type": "peer", "sessionId": self._session_id, **payload})
+        self._post({"type": "peer", "sessionId": self._session_id, **payload}, self._media)
 
     def send_intent(self, envelope: dict[str, Any]) -> None:
         """A continuous intent, on its own connection. Raises `WireError` when it was not taken."""

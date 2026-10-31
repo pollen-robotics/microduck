@@ -70,7 +70,9 @@ with Duck(video=True) as duck:
 ```
 
 `watch` carries it too, as `view.frame`. The video is WebRTC, encrypted end to end, and the robot
-offers a relay candidate, so it reaches a script in a data centre as well as one on its own wifi.
+offers a relay candidate, which is what lets it reach a script off its own network
+([`faq.md`](../docs/faq.md)). A duck with no camera refuses `media.video`, so `Duck(video=True)`
+raises there.
 
 ## Frames
 
