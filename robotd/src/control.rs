@@ -515,6 +515,19 @@ impl Controller {
             || matches!(self.sit, Sit::Rising { .. })
     }
 
+    /// A skill is running whose entry keeps the fall and pick-up reflexes on
+    /// ([`robotd_params::SkillDef::guarded`]).
+    pub fn guarded_skill(&self) -> bool {
+        self.active
+            .is_some_and(|a| self.skills.skills.get(a.index).is_some_and(|d| d.guarded()))
+    }
+
+    /// Whether the limp-fall and the pick-up pause may act: nothing is in flight but a guarded
+    /// skill (one move at a time, so nothing else can be), and the robot is not in a seat.
+    pub fn reflexes_on(&self) -> bool {
+        (!self.busy() || self.guarded_skill()) && !self.is_sitting()
+    }
+
     /// Start a one-shot ground pick. Refused while any other move runs or the robot is
     /// sitting — see [`Self::move_blocked`]. The prototype let a pick preempt a kick's tail;
     /// that was a pick starting from a robot on one leg.
@@ -1149,6 +1162,23 @@ mod tests {
         assert_eq!(c.start_skill(0), Ok(true));
         tick(&mut c, 0.2);
         assert_eq!(c.skill_mouth(), None, "a kick has no track");
+    }
+
+    /// Only a guarded skill (`fall_safety`) leaves the fall and pick-up reflexes on; any other
+    /// move owns the robot outright, as before.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn only_a_guarded_skill_keeps_the_reflexes_on() {
+        let mut c = full_controller();
+        assert!(c.reflexes_on(), "standing");
+        assert_eq!(c.start_skill(0), Ok(true));
+        assert!(!c.reflexes_on(), "a kick");
+        c.stop_moves();
+        c.skills.skills[1].fall_safety = Some(true);
+        assert_eq!(c.start_skill(1), Ok(true));
+        assert!(c.guarded_skill() && c.reflexes_on(), "a guarded skill");
+        c.stop_moves();
+        assert!(!c.guarded_skill() && c.reflexes_on(), "stopped");
     }
 
     /// The grasp's beak plays the schedule it was trained with — closed as it starts, open on the

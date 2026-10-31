@@ -1538,6 +1538,13 @@ pub struct SkillDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouth: Option<PathBuf>,
 
+    /// Whether the limp-fall catch and the pick-up pause stay on while this skill runs. Either
+    /// one then ends the skill, sound included. Absent means on for a `phase` skill, a
+    /// choreography on planted feet that a fall or a lift is never part of, and off for the rest,
+    /// as before: the roulade tips over on purpose. See [`Self::guarded`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fall_safety: Option<bool>,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
@@ -1549,12 +1556,9 @@ pub struct SkillDef {
 /// `smoothing = "off"`: one set of names for a person to learn, and `robotctl configure` already
 /// documents every one of them.
 ///
-/// **No fall-gate override here either, and for a sharper reason: a running skill already has
-/// the fall reflex switched off.** The limp-fall predictor is only consulted while the
-/// controller is not `busy()`, and any active skill makes it busy — so a move that leans past
-/// the gate cannot trip it, and a field to raise the gate would have been decoration. What that
-/// *does* mean is that the reflex is off for the whole of a skill, which was uncontroversial for
-/// a half-second kick and is worth a second look for anything long.
+/// **No fall-gate override here either.** Whether the reflexes run at all during a skill is
+/// [`SkillDef::fall_safety`]. When they do, the predictor waits for a lean past anything a skill
+/// does on purpose (robotd's `SKILL_FALL_TILT_Z`), so there is no gate left to tune per skill.
 ///
 /// **No `cmd_alpha` here, and its absence is the point.** Smoothing is applied to the *client's*
 /// command on its way in, and a skill never reads that: the loop builds a fresh command block
@@ -1587,6 +1591,11 @@ impl SkillDef {
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(POLICY_DIR).join(format!("{}.onnx", self.name))),
         }
+    }
+
+    /// `fall_safety`, resolved: what it says, or on for a phase skill.
+    pub fn guarded(&self) -> bool {
+        self.fall_safety.unwrap_or(self.phase)
     }
 }
 
@@ -1901,6 +1910,7 @@ fn fallback_skills() -> Vec<SkillDef> {
         phase: false,
         sound: None,
         mouth: None,
+        fall_safety: None,
         params: SkillOverrides::default(),
     };
     vec![
@@ -1918,6 +1928,7 @@ fn fallback_skills() -> Vec<SkillDef> {
             phase: false,
             sound: None,
             mouth: None,
+            fall_safety: None,
             params: SkillOverrides::default(),
         },
         kick("kick_left", "ball_kick_left.onnx"),
@@ -3220,6 +3231,23 @@ mod tests {
             assert_eq!(roller.ground_pick_period, 3.0);
             assert_eq!(roller.ground_pick_action_scale, 0.8);
         }
+    }
+
+    /// A phase skill keeps the fall and pick-up reflexes unless it says otherwise; any other
+    /// skill keeps them off, as before, unless it asks.
+    #[test]
+    fn a_phase_skill_keeps_the_reflexes_unless_it_says_otherwise() {
+        let skill = |extra: &str| -> super::SkillDef {
+            toml::from_str(&format!("name = \"s\"\nduration = 1.0\n{extra}")).unwrap()
+        };
+        assert!(skill("phase = true").guarded());
+        assert!(!skill("phase = true\nfall_safety = false").guarded());
+        assert!(!skill("").guarded());
+        assert!(skill("fall_safety = true").guarded());
+        assert!(
+            super::fallback_skills().iter().all(|s| !s.guarded()),
+            "the kicks and the roulade as before"
+        );
     }
 
     /// A phase entry with a `period_s` but no `encoding` is still a phase entry — the field

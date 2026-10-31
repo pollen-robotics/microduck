@@ -4234,6 +4234,8 @@ fn run_policy_skill(
         mouth: mouth
             .as_ref()
             .map(|m| m.canonicalize().unwrap_or_else(|_| m.clone())),
+        // The default for its kind (on for a phase skill); a file edit says otherwise.
+        fall_safety: None,
         params: robotd_params::SkillOverrides {
             action_scale: action_scale
                 .or_else(|| from_manifest.as_ref().and_then(|m| m.action_scale)),

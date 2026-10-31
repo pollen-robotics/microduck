@@ -579,11 +579,12 @@ fed an all-zero command it never trained on. The guard is on the encoding as wel
 *does* get to say about these arms is their timing (§9.3) — the pick's cycle and cutoff, the
 rise and the seat's settle — since those are properties of the trained network, not of the build.
 
-**A running skill has the fall reflex off** for its whole duration: the limp-fall predictor is
-only consulted while the controller is not `busy()`, and any active skill makes it busy. That was
-uncontroversial when every one-shot was under a second. A skill that can be configured to hold
-for ten is a robot with no fall reflex for ten seconds, and that wants deciding rather than
-inheriting.
+**A skill decides whether a fall or a lift ends it** (`fall_safety` on its entry). On, the
+limp-fall catch and the pick-up pause keep watching while it runs, and either one ends the skill
+and its sound; the fall predictor waits for a lean past 50° (`SKILL_FALL_TILT_Z`), because the
+dances lean 40° on purpose. Absent means on for a `phase` skill, a choreography on planted feet
+that a fall or a lift is never part of, and off for the others, which own the robot outright as
+before: the roulade tips over on purpose, and a kick is over in half a second.
 
 ### 10.3 The button
 

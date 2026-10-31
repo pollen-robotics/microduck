@@ -182,6 +182,21 @@ enum LimpFall {
     },
 }
 
+/// How far a skill that keeps the reflexes (`fall_safety`) may lean before the limp-fall predictor
+/// is consulted: 50°, past the ≈40° the Tremendous dances reach in simulation and short of the 60°
+/// their training calls a fall. The gait's own ≈26° gate would fire on their fastest leans, which
+/// in simulation predict −0.50 to −0.56 against its −0.5.
+const SKILL_FALL_TILT_Z: f64 = -0.643;
+
+/// End a guarded skill that a fall or a lift interrupted: the move, and the sound it started.
+fn cut_skill(controller: &mut Controller, voice: Option<&mut sound::Sound>, why: &str) {
+    controller.stop_moves();
+    if let Some(voice) = voice {
+        voice.stop();
+    }
+    tracing::warn!(why, "skill stopped, sound included");
+}
+
 /// Watching a limping robot for the moment it stops moving.
 ///
 /// The end of the limp is read from the gyro rather than timed, because the falls are not
@@ -3093,12 +3108,16 @@ async fn control_loop<T: RobotIo>(
                         && !powered_off
                         // A roulade tips the robot over on purpose, a ground pick pitches it
                         // forward, and a sit is not a fall. Limping through any of them would
-                        // break a move that was working.
-                        && controller
-                            .as_ref()
-                            .is_some_and(|c| !c.busy() && !c.is_sitting());
+                        // break a move that was working. A skill that keeps the reflexes
+                        // (`fall_safety`) is watched, past the lean it may do on purpose.
+                        && controller.as_ref().is_some_and(|c| c.reflexes_on());
+                    let skill = controller.as_ref().is_some_and(|c| c.guarded_skill());
                     match fresh.as_ref() {
-                        Some(fresh) if eligible && safety.imu_ready() => {
+                        Some(fresh)
+                            if eligible
+                                && safety.imu_ready()
+                                && (!skill || fresh.imu.gravity[2] > SKILL_FALL_TILT_Z) =>
+                        {
                             if falling.observe(&fresh.imu, period) {
                                 tracing::warn!(
                                     gravity_z = format!("{:.2}", fresh.imu.gravity[2]),
@@ -3107,6 +3126,9 @@ async fn control_loop<T: RobotIo>(
                                     gain = params.safety.gain_limp,
                                     "falling — going limp to land soft"
                                 );
+                                if skill && let Some(c) = controller.as_mut() {
+                                    cut_skill(c, voice.as_mut(), "fell");
+                                }
                                 limp_fall = LimpFall::Limp {
                                     since: tick_start,
                                     landing: Landing::default(),
@@ -3173,9 +3195,10 @@ async fn control_loop<T: RobotIo>(
 
         // Pick-up detection (`[pickup]`): pause the walking/standing networks while somebody
         // holds the robot, hand it back when it is on the floor. Watches only while those two
-        // networks have the robot — everything that owns it outright (a skill, a sit, the
-        // limp-fall, a disable, the shutdown sit) ends a pause and resets the watch. Roller mode
-        // is not watched: the model has never seen wheels.
+        // networks have the robot, or a skill that keeps the reflexes (`fall_safety`), which a
+        // lift ends — everything that owns it outright (any other skill, a sit, the limp-fall, a
+        // disable, the shutdown sit) ends a pause and resets the watch. Roller mode is not
+        // watched: the model has never seen wheels.
         let pickup_paused = match pickup_watch.as_mut() {
             Some(watch) => {
                 let watching = policy_cfg.mode == Mode::Walk
@@ -3186,16 +3209,19 @@ async fn control_loop<T: RobotIo>(
                     && shutdown_sit.is_none()
                     && shutdown_rest.is_none()
                     && !powered_off
-                    && controller
-                        .as_ref()
-                        .is_some_and(|c| !c.busy() && !c.is_sitting());
+                    && controller.as_ref().is_some_and(|c| c.reflexes_on());
                 let p_held = watch.p_held().map(|p| format!("{p:.2}"));
                 match watch.tick(watching, fresh.as_ref(), period) {
                     Some(pickup::Edge::Pause) => {
                         tracing::warn!(
                             p_held = watch.p_held().map(|p| format!("{p:.2}")),
                             "picked up — pausing the policy"
-                        )
+                        );
+                        if let Some(c) = controller.as_mut()
+                            && c.guarded_skill()
+                        {
+                            cut_skill(c, voice.as_mut(), "picked up");
+                        }
                     }
                     Some(pickup::Edge::Resume) if watching => {
                         tracing::warn!(
@@ -4869,6 +4895,7 @@ fn set_skill_request(
         phase: existing.as_ref().is_some_and(|s| s.phase),
         sound: existing.as_ref().and_then(|s| s.sound.clone()),
         mouth: existing.as_ref().and_then(|s| s.mouth.clone()),
+        fall_safety: existing.as_ref().and_then(|s| s.fall_safety),
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale

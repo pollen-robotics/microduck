@@ -635,7 +635,8 @@ policy expects to wake up in. That is also why resuming is the fast side of the 
 down while paused is holding a fixed pose on the floor, and the sooner the policy has it back the
 less often it tips (in simulation, 3 % of set-downs at a 0.18 s median resume, 12 % at 0.30 s).
 
-It watches only the walking and standing networks in walk mode. A skill, a sit, the limp-fall, a
+It watches only the walking and standing networks in walk mode, and a skill with `fall_safety` on,
+which a lift ends (policy-channel-design §10.2). Any other skill, a sit, the limp-fall, a
 disable or the shutdown sit owns the robot outright; any of them ends a pause and empties the
 window, and the next verdict waits for a full second of fresh history — the model was only shown
 complete windows, and one padded at startup paused a simulated robot a tenth of a second after
