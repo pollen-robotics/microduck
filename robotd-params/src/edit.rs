@@ -632,7 +632,32 @@ impl Model {
     ///
     /// Takes the lock as proof rather than acquiring it, so the caller's read-modify-write is
     /// covered by one hold rather than by two that another writer can slip between.
-    fn write_through(&self, _lock: &Lock, text: &str) -> Result<(), String> {
+    fn write_through(&self, lock: &Lock, text: &str) -> Result<(), String> {
+        let staged = self.stage_validated(lock, text)?;
+        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
+        // The rename is only durable once the directory entry is. A robot switched off at the
+        // wall is the normal case here, not the exceptional one — same discipline as `configd`'s
+        // store and the update journal.
+        if let Some(dir) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// The same staging and loader check [`Self::write_through`] does, then delete the
+    /// staging file instead of renaming it into place.
+    fn preview_through(&self, lock: &Lock, text: &str) -> Result<(), String> {
+        let staged = self.stage_validated(lock, text)?;
+        let _ = std::fs::remove_file(&staged);
+        Ok(())
+    }
+
+    /// Write the candidate beside the target and run it through [`Params::load`].
+    ///
+    /// The staged file is the caller's to rename or remove; on a refusal it is already gone.
+    fn stage_validated(&self, _lock: &Lock, text: &str) -> Result<PathBuf, String> {
         let staged = self.path.with_extension("toml.new");
         let write = |path: &Path| -> std::io::Result<()> {
             let mut file = std::fs::File::create(path)?;
@@ -652,16 +677,7 @@ impl Model {
                 "refusing to write a config robotd would reject: {e}"
             ));
         }
-        std::fs::rename(&staged, &self.path).map_err(|e| writable_hint(&self.path, &e))?;
-        // The rename is only durable once the directory entry is. A robot switched off at the
-        // wall is the normal case here, not the exceptional one — same discipline as `configd`'s
-        // store and the update journal.
-        if let Some(dir) = self.path.parent()
-            && let Ok(dir) = std::fs::File::open(dir)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        Ok(staged)
     }
 }
 
@@ -720,11 +736,28 @@ fn lock(path: &Path) -> Result<Lock, String> {
 /// as a keyed edit and so cannot be rebased the way [`Model::save`] rebases one. `robotctl
 /// policy add` and `robot.setSkill` both come through here.
 pub fn set_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
+    apply_skill(path, skill, false)
+}
+
+/// Same checks as [`set_skill`], including that the would-be file is one `robotd` would start
+/// on, then leave the config as it was.
+///
+/// `robotctl policy add --dry-run` writes through here rather than through a daemon flag:
+/// the CLI path never calls `robot.setSkill`, so there is no IPC call to hang one on.
+pub fn preview_skill(path: &Path, skill: &crate::SkillDef) -> Result<(), String> {
+    apply_skill(path, skill, true)
+}
+
+fn apply_skill(path: &Path, skill: &crate::SkillDef, dry_run: bool) -> Result<(), String> {
     let lock = lock_for_edit(path)?;
     let mut model = Model::open(path)?;
     model.put_skill(skill)?;
     let text = model.doc.to_string();
-    model.write_through(&lock, &text)
+    if dry_run {
+        model.preview_through(&lock, &text)
+    } else {
+        model.write_through(&lock, &text)
+    }
 }
 
 /// Take a skill out of the table. `false` if there was none, which is not a failure — it is the
@@ -2200,6 +2233,49 @@ mod tests {
         )
         .expect("added");
         assert_eq!(remove_skill(&config, "polite-bow"), Ok(true));
+    }
+
+    /// A dry-run has to run the same checks as a write — including that the name is not one
+    /// the daemon drives itself — and then leave the file as it was. A preview that wrote
+    /// would be the opposite of the promise.
+    #[test]
+    fn previewing_a_skill_validates_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        let original = "[policy]\n";
+        std::fs::write(&config, original).expect("write");
+
+        preview_skill(
+            &config,
+            &crate::SkillDef {
+                name: "polite-bow".into(),
+                path: Some(PathBuf::from("/srv/bow.onnx")),
+                duration: 4.0,
+                ..Default::default()
+            },
+        )
+        .expect("valid");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), original);
+        assert!(
+            !config.with_extension("toml.new").exists(),
+            "the staging file must not remain"
+        );
+
+        let refusal = preview_skill(
+            &config,
+            &crate::SkillDef {
+                name: "ground_pick".into(),
+                duration: 1.0,
+                ..Default::default()
+            },
+        )
+        .expect_err("refused");
+        assert!(refusal.contains("ground_pick"), "{refusal}");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            original,
+            "a refused preview writes nothing either"
+        );
     }
 
     /// **A name the daemon drives itself is refused by the writer, not only by the wire.**

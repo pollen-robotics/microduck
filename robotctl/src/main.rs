@@ -1106,6 +1106,10 @@ enum PolicyCommand {
     /// `kind: perpetual`, like the published flamingo — has no length of its own, so `--hold`
     /// and `--unwind` say how long to hold it and how long to come back before the gait takes
     /// over. Without those the robot would be handed back mid-pose.
+    ///
+    /// `--dry-run` runs every check `add` runs, prints the entry it would write, and writes
+    /// nothing. A Hub fetch is cached the same way a real add caches it; the skill is not
+    /// registered and the robot is not asked to reload.
     Add {
         /// What to call it. This is what `robotctl robot do <name>` and a pad button will use.
         name: String,
@@ -1125,6 +1129,11 @@ enum PolicyCommand {
         /// The twist fed while it unwinds. Zeros unless given.
         #[arg(long, value_name = "X,Y,Z")]
         unwind_command: Option<String>,
+        /// Fetch, validate, and print the entry that would be written — then write nothing.
+        ///
+        /// A Hub source is cached the same way a real add caches it; it is not registered.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -4135,13 +4144,15 @@ fn run_policy_skill(
         command: command_spec,
         unwind_command,
         json,
+        dry_run,
     } = command
     else {
         unreachable!("only add and remove reach here");
     };
 
     // Before the fetch, so a change that could never be written fails before anything is
-    // downloaded — the same order `policy load` uses.
+    // downloaded — the same order `policy load` uses. A dry-run runs this too: refusals have
+    // to match a real add, including "the file could not be recorded".
     ensure_recordable(config)?;
 
     // `none` switches a built-in off, the same word that switches off a policy slot.
@@ -4155,27 +4166,145 @@ fn run_policy_skill(
                 .map_err(|e| Failure::new(exit::USAGE, format!("{}: {e}", local.display())))?;
             (Some(path), None)
         } else {
+            // A dry-run of a Hub source still fetches: the file is cached the same way a real
+            // add caches it. Nothing is registered.
             let fetched = fetch_skill(updater_socket, source, *json)?;
             (Some(PathBuf::from(fetched.path.clone())), Some(fetched))
         }
     };
 
+    let prepared = prepare_skill_add(SkillAddSpec {
+        name,
+        source,
+        path,
+        from_manifest: from_manifest.as_ref(),
+        hold: *hold,
+        unwind: *unwind,
+        command_spec: command_spec.as_deref(),
+        unwind_command: unwind_command.as_deref(),
+    })?;
+
+    commit_skill_add(config, &prepared, *dry_run)?;
+
+    if *dry_run {
+        if *json {
+            println!("{}", compact(&prepared.preview()));
+        } else {
+            print_skill_preview(&prepared, from_manifest.is_some());
+        }
+        return Ok(());
+    }
+
+    if *json {
+        println!("{}", compact(&serde_json::json!({ "added": name })));
+        return Ok(());
+    }
+    println!("{name} added, {}s", prepared.skill.duration);
+    if prepared.skill.unwind_s > 0.0 {
+        println!(
+            "  then {}s coming back before the gait takes over",
+            prepared.skill.unwind_s
+        );
+    } else if prepared.perpetual {
+        // It was allowed through with an explicit --hold, which is the caller's call, but the
+        // consequence is worth stating rather than discovering with the robot on one foot.
+        println!("  no unwind: the gait takes over the moment it ends");
+    }
+    report_reload(robot_socket);
+    println!("  `robotctl robot do {name}` runs it, once the policy is driving");
+    Ok(())
+}
+
+/// The knobs `policy add` takes after the source has been resolved to a path.
+struct SkillAddSpec<'a> {
+    name: &'a str,
+    source: &'a str,
+    path: Option<PathBuf>,
+    from_manifest: Option<&'a proto::PolicyFetchResult>,
+    hold: Option<f64>,
+    unwind: Option<f64>,
+    command_spec: Option<&'a str>,
+    unwind_command: Option<&'a str>,
+}
+
+/// The would-be `[[policy.skill]]` entry, plus the manifest facts that are not written.
+#[derive(Debug)]
+struct SkillAdd {
+    skill: robotd_params::SkillDef,
+    kind: Option<String>,
+    encoding: Option<String>,
+    perpetual: bool,
+    /// `org/name@rev:file` when it came from the Hub, else the path that would be written.
+    source: String,
+    sha: Option<String>,
+}
+
+/// What `--dry-run` (and `--json`) prints: the entry a real add would write, plus the
+/// manifest facts a person looking at a stranger's skill needs before they install it.
+#[derive(Debug, serde::Serialize)]
+struct SkillPreview {
+    dry_run: bool,
+    name: String,
+    source: String,
+    sha: Option<String>,
+    kind: Option<String>,
+    encoding: Option<String>,
+    duration: f64,
+    unwind_s: f64,
+    command: [f64; 3],
+    unwind: [f64; 3],
+    action_scale: Option<f64>,
+    chain: bool,
+    overrides_shipped: bool,
+}
+
+impl SkillAdd {
+    fn preview(&self) -> SkillPreview {
+        SkillPreview {
+            dry_run: true,
+            name: self.skill.name.clone(),
+            source: self.source.clone(),
+            sha: self.sha.clone(),
+            kind: self.kind.clone(),
+            encoding: self.encoding.clone(),
+            duration: self.skill.duration,
+            unwind_s: self.skill.unwind_s,
+            command: self.skill.command,
+            unwind: self.skill.unwind,
+            action_scale: self.skill.params.action_scale,
+            chain: self.skill.chain,
+            overrides_shipped: robotd_params::ships_skill(&self.skill.name),
+        }
+    }
+}
+
+/// Build the entry a real add would write. Shared so a dry-run refuses with the same
+/// messages and the same exit codes.
+fn prepare_skill_add(spec: SkillAddSpec<'_>) -> Result<SkillAdd, Failure> {
+    let SkillAddSpec {
+        name,
+        source,
+        path,
+        from_manifest,
+        hold,
+        unwind,
+        command_spec,
+        unwind_command,
+    } = spec;
     // A skill feeds its network a constant. A policy whose manifest says the daemon must drive
     // it — a phase for a ground pick, a flag for a sit↔stand — cannot be one, and would run on a
     // command it was never trained on while looking plausible. Those go in the slot the daemon
     // drives, which is a different command.
-    if let Some(why) = from_manifest
-        .as_ref()
-        .and_then(|m| skill_encoding_refusal(name, m.encoding.as_deref()))
+    if let Some(why) =
+        from_manifest.and_then(|m| skill_encoding_refusal(name, m.encoding.as_deref()))
     {
         return Err(Failure::new(exit::USAGE, why));
     }
     // The manifest supplies the length for a policy that ends itself. One that does not —
     // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
     // hold and an unwind are for, so it is a refusal rather than a guess.
-    let declared = from_manifest.as_ref().and_then(|m| m.duration_s);
+    let declared = from_manifest.and_then(|m| m.duration_s);
     let perpetual = from_manifest
-        .as_ref()
         .and_then(|m| m.kind.as_deref())
         .is_some_and(|kind| kind.eq_ignore_ascii_case("perpetual"));
     let duration = match hold.or(declared) {
@@ -4199,58 +4328,103 @@ fn run_policy_skill(
         }
     };
 
+    let (resolved_source, sha) = resolved_skill_source(source, &path, from_manifest);
     let skill = robotd_params::SkillDef {
-        name: name.clone(),
+        name: name.to_owned(),
         path,
         duration,
         // Whether a held button chains another run is the policy's to say — the roulade does,
         // a kick does not — and the manifest is where it says it.
-        chain: from_manifest.as_ref().is_some_and(|m| m.chain),
-        command: command_spec
-            .as_deref()
-            .map(twist_of)
-            .transpose()?
-            .unwrap_or_default(),
+        chain: from_manifest.is_some_and(|m| m.chain),
+        command: command_spec.map(twist_of).transpose()?.unwrap_or_default(),
         // The manifest knows how to stop: `command.idle` is the twist that means "stop doing
         // the thing", and `unwind_s` is how long the policy needs to get there. A flag on the
         // command line wins, because a person watching the robot is a better judge than a
         // number measured in simulation.
-        unwind: match unwind_command.as_deref() {
+        unwind: match unwind_command {
             Some(spec) => twist_of(spec)?,
-            None => from_manifest
-                .as_ref()
-                .and_then(|m| m.idle)
-                .unwrap_or_default(),
+            None => from_manifest.and_then(|m| m.idle).unwrap_or_default(),
         },
         unwind_s: unwind
-            .or_else(|| from_manifest.as_ref().and_then(|m| m.unwind_s))
+            .or_else(|| from_manifest.and_then(|m| m.unwind_s))
             .unwrap_or(0.0),
         params: robotd_params::SkillOverrides {
-            action_scale: from_manifest.as_ref().and_then(|m| m.action_scale),
+            action_scale: from_manifest.and_then(|m| m.action_scale),
             ..Default::default()
         },
     };
 
-    robotd_params::edit::set_skill(config, &skill).map_err(|e| Failure::new(exit::FAILED, e))?;
+    Ok(SkillAdd {
+        skill,
+        kind: from_manifest.and_then(|m| m.kind.clone()),
+        encoding: from_manifest.and_then(|m| m.encoding.clone()),
+        perpetual,
+        source: resolved_source,
+        sha,
+    })
+}
 
-    if *json {
-        println!("{}", compact(&serde_json::json!({ "added": name })));
-        return Ok(());
+fn resolved_skill_source(
+    source: &str,
+    path: &Option<PathBuf>,
+    fetched: Option<&proto::PolicyFetchResult>,
+) -> (String, Option<String>) {
+    if let Some(fetched) = fetched {
+        (
+            format!("{}@{}:{}", fetched.repo, fetched.revision, fetched.file),
+            fetched.commit.clone(),
+        )
+    } else if let Some(path) = path {
+        (path.display().to_string(), None)
+    } else {
+        (source.to_owned(), None)
     }
-    println!("{name} added, {duration}s");
-    if skill.unwind_s > 0.0 {
+}
+
+/// Write the entry, or run every check the write runs and leave the file alone.
+fn commit_skill_add(config: &Path, add: &SkillAdd, dry_run: bool) -> Result<(), Failure> {
+    let result = if dry_run {
+        robotd_params::edit::preview_skill(config, &add.skill)
+    } else {
+        robotd_params::edit::set_skill(config, &add.skill)
+    };
+    result.map_err(|e| Failure::new(exit::FAILED, e))
+}
+
+fn print_skill_preview(add: &SkillAdd, fetched: bool) {
+    let preview = add.preview();
+    println!("would add {} — nothing written", preview.name);
+    println!("  source    {}", preview.source);
+    if let Some(sha) = &preview.sha {
+        println!("  sha       {sha}");
+    }
+    if let Some(kind) = &preview.kind {
+        println!("  kind      {kind}");
+    }
+    if let Some(encoding) = &preview.encoding {
+        println!("  encoding  {encoding}");
+    }
+    println!("  duration  {}s", preview.duration);
+    if preview.unwind_s > 0.0 {
         println!(
-            "  then {}s coming back before the gait takes over",
-            skill.unwind_s
+            "  unwind    {}s at {}, {}, {}",
+            preview.unwind_s, preview.unwind[0], preview.unwind[1], preview.unwind[2]
         );
-    } else if perpetual {
-        // It was allowed through with an explicit --hold, which is the caller's call, but the
-        // consequence is worth stating rather than discovering with the robot on one foot.
-        println!("  no unwind: the gait takes over the moment it ends");
     }
-    report_reload(robot_socket);
-    println!("  `robotctl robot do {name}` runs it, once the policy is driving");
-    Ok(())
+    println!(
+        "  command   {}, {}, {}",
+        preview.command[0], preview.command[1], preview.command[2]
+    );
+    match preview.action_scale {
+        Some(scale) => println!("  action_scale  {scale}"),
+        None => println!("  action_scale  (unset)"),
+    }
+    if preview.overrides_shipped {
+        println!("  overrides a skill this robot already ships");
+    }
+    if fetched {
+        println!("  the file is cached the same way a real add caches it; it is not registered");
+    }
 }
 
 /// Why a policy with this `command.encoding` cannot be a one-shot skill, or `None` when it can.
@@ -6114,6 +6288,248 @@ mod tests {
 
         let changing = slots_the_request_changes(&policies_of(slots), &[Slot::Walk], Some(wanted));
         assert!(changing.is_empty());
+    }
+
+    /// `--dry-run` is a flag the parser must accept, including next to `--json`. A flag that
+    /// only existed in the help would be the thing somebody reaches for first and finds missing.
+    #[test]
+    fn policy_add_parses_dry_run() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "policy",
+            "add",
+            "polite-bow",
+            "fffiloni/microduck-polite-bow-b1d864",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("must parse");
+        let Namespace::Policy {
+            command:
+                PolicyCommand::Add {
+                    name,
+                    source,
+                    dry_run,
+                    json,
+                    ..
+                },
+            ..
+        } = cli.namespace
+        else {
+            panic!("expected policy add");
+        };
+        assert_eq!(name, "polite-bow");
+        assert_eq!(source, "fffiloni/microduck-polite-bow-b1d864");
+        assert!(dry_run);
+        assert!(json);
+    }
+
+    fn add_spec<'a>(
+        name: &'a str,
+        source: &'a str,
+        path: Option<PathBuf>,
+        from_manifest: Option<&'a proto::PolicyFetchResult>,
+        hold: Option<f64>,
+    ) -> SkillAddSpec<'a> {
+        SkillAddSpec {
+            name,
+            source,
+            path,
+            from_manifest,
+            hold,
+            unwind: None,
+            command_spec: None,
+            unwind_command: None,
+        }
+    }
+
+    fn fetched_bow() -> proto::PolicyFetchResult {
+        proto::PolicyFetchResult {
+            path: "/var/lib/robot/policies/fffiloni/microduck-polite-bow-b1d864/main/policy.onnx"
+                .into(),
+            repo: "fffiloni/microduck-polite-bow-b1d864".into(),
+            revision: "main".into(),
+            commit: Some("b1d864cafe".into()),
+            file: "policy.onnx".into(),
+            origin: "community".into(),
+            kind: Some("episodic".into()),
+            encoding: Some("constant".into()),
+            duration_s: Some(4.0),
+            action_scale: Some(0.8),
+            unwind_s: Some(3.0),
+            idle: Some([0.0, 1.0, 0.0]),
+            chain: false,
+            ..Default::default()
+        }
+    }
+
+    /// The JSON a dry-run prints is the entry, not `{ "added": name }`. A script that keyed
+    /// on `added` would think the skill was registered.
+    #[test]
+    fn a_dry_run_json_shape_is_the_would_be_entry() {
+        let fetched = fetched_bow();
+        let prepared = must(prepare_skill_add(add_spec(
+            "polite-bow",
+            "fffiloni/microduck-polite-bow-b1d864",
+            Some(PathBuf::from(&fetched.path)),
+            Some(&fetched),
+            None,
+        )));
+        let json = serde_json::to_value(prepared.preview()).expect("serializes");
+        let obj = json.as_object().expect("object");
+        for key in [
+            "dry_run",
+            "name",
+            "source",
+            "sha",
+            "kind",
+            "encoding",
+            "duration",
+            "unwind_s",
+            "command",
+            "unwind",
+            "action_scale",
+            "chain",
+            "overrides_shipped",
+        ] {
+            assert!(obj.contains_key(key), "missing {key} in {json}");
+        }
+        assert_eq!(json["dry_run"], true);
+        assert_eq!(json["name"], "polite-bow");
+        assert_eq!(
+            json["source"],
+            "fffiloni/microduck-polite-bow-b1d864@main:policy.onnx"
+        );
+        assert_eq!(json["sha"], "b1d864cafe");
+        assert_eq!(json["kind"], "episodic");
+        assert_eq!(json["encoding"], "constant");
+        assert_eq!(json["duration"], 4.0);
+        assert_eq!(json["unwind_s"], 3.0);
+        assert_eq!(json["command"], serde_json::json!([0.0, 0.0, 0.0]));
+        assert_eq!(json["unwind"], serde_json::json!([0.0, 1.0, 0.0]));
+        assert_eq!(json["action_scale"], 0.8);
+        assert_eq!(json["overrides_shipped"], false);
+    }
+
+    /// A dry-run that wrote would be the opposite of the promise. The same inputs on a real
+    /// add do write — that is the control that the preview path is the one skipping the write,
+    /// not that the inputs were inert.
+    #[test]
+    fn a_dry_run_returns_the_entry_and_leaves_config_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        let original = "# kept\n[policy]\nmode = \"walk\"\n";
+        std::fs::write(&config, original).unwrap();
+        let onnx = dir.path().join("bow.onnx");
+        std::fs::write(&onnx, b"").unwrap();
+
+        let prepared = must(prepare_skill_add(add_spec(
+            "polite-bow",
+            onnx.to_str().unwrap(),
+            Some(onnx.clone()),
+            None,
+            Some(4.0),
+        )));
+        must(commit_skill_add(&config, &prepared, true));
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        assert!(
+            !config.with_extension("toml.new").exists(),
+            "the staging file must not remain after a dry-run"
+        );
+        let preview = prepared.preview();
+        assert_eq!(preview.name, "polite-bow");
+        assert_eq!(preview.duration, 4.0);
+        assert!(!preview.overrides_shipped);
+
+        must(commit_skill_add(&config, &prepared, false));
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("polite-bow"), "{written}");
+        assert!(written.contains("# kept"), "comments survive: {written}");
+    }
+
+    /// Dry-run refusals have to match a real add — same message, same exit — or the preview
+    /// is not a faithful one. The cases that fail before the write (encoding, hold) and the
+    /// one that fails at the writer (a name the daemon drives itself) both have to agree.
+    #[test]
+    fn a_dry_run_refuses_the_same_way_a_real_add_does() {
+        let phase = proto::PolicyFetchResult {
+            encoding: Some("phase".into()),
+            duration_s: Some(2.8),
+            ..Default::default()
+        };
+        let dry = prepare_skill_add(add_spec(
+            "pick",
+            "org/pick",
+            Some(PathBuf::from("/srv/pick.onnx")),
+            Some(&phase),
+            None,
+        ))
+        .expect_err("refused");
+        let real = prepare_skill_add(add_spec(
+            "pick",
+            "org/pick",
+            Some(PathBuf::from("/srv/pick.onnx")),
+            Some(&phase),
+            None,
+        ))
+        .expect_err("refused");
+        assert_eq!(dry.code, real.code);
+        assert_eq!(dry.message, real.message);
+        assert_eq!(dry.code, exit::USAGE);
+
+        let perpetual = proto::PolicyFetchResult {
+            kind: Some("perpetual".into()),
+            ..Default::default()
+        };
+        let dry = prepare_skill_add(add_spec(
+            "flamingo",
+            "org/flamingo",
+            Some(PathBuf::from("/srv/f.onnx")),
+            Some(&perpetual),
+            None,
+        ))
+        .expect_err("refused");
+        let real = prepare_skill_add(add_spec(
+            "flamingo",
+            "org/flamingo",
+            Some(PathBuf::from("/srv/f.onnx")),
+            Some(&perpetual),
+            None,
+        ))
+        .expect_err("refused");
+        assert_eq!(dry.code, real.code);
+        assert_eq!(dry.message, real.message);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("robotd.toml");
+        let original = "[policy]\n";
+        std::fs::write(&config, original).unwrap();
+        let owned = must(prepare_skill_add(add_spec(
+            "ground_pick",
+            "/srv/x.onnx",
+            Some(PathBuf::from("/srv/x.onnx")),
+            None,
+            Some(1.0),
+        )));
+        let dry = commit_skill_add(&config, &owned, true).expect_err("refused");
+        let real = commit_skill_add(&config, &owned, false).expect_err("refused");
+        assert_eq!(dry.code, real.code);
+        assert_eq!(dry.message, real.message);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+    }
+
+    /// Adding a name this robot already ships is an override, and the preview has to say so
+    /// rather than looking like a new skill. `roulade` is one of the fallback three.
+    #[test]
+    fn a_dry_run_says_when_it_would_override_a_shipped_skill() {
+        let prepared = must(prepare_skill_add(add_spec(
+            "roulade",
+            "/srv/roll.onnx",
+            Some(PathBuf::from("/srv/roll.onnx")),
+            None,
+            Some(1.0),
+        )));
+        assert!(prepared.preview().overrides_shipped);
     }
 
     /// **Adding the same skill twice retunes it rather than giving the robot two.**

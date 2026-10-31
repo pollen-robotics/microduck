@@ -1937,6 +1937,19 @@ impl SetManifest {
 /// offered and never run.
 pub const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
 
+/// Whether the installed set — or the fallback three, when the set says nothing — already
+/// ships a skill of this name.
+///
+/// Adding that name is an override, which is what `policy remove` then undoes. Public so
+/// `robotctl policy add --dry-run` can say so before anything is written.
+pub fn ships_skill(name: &str) -> bool {
+    ships_skill_in(name, set_manifest().as_ref())
+}
+
+fn ships_skill_in(name: &str, manifest: Option<&SetManifest>) -> bool {
+    builtin_skills(manifest).iter().any(|s| s.name == name)
+}
+
 /// The ground pick hands back at this fraction of its cycle when the set does not say — the
 /// prototype's cutoff. Ending at 100% replays the reach on the way out.
 pub const DEFAULT_GROUND_PICK_END_PHASE: f64 = 0.7;
@@ -3269,6 +3282,32 @@ mod tests {
         .unwrap();
         let names: Vec<String> = manifest.policies.iter().map(|p| p.skill_name()).collect();
         assert_eq!(names, ["roulade", "kick_left"]);
+    }
+
+    /// A name the set (or the fallback three) already has is an override. `policy add --dry-run`
+    /// has to be able to say that before anything is written; a name the daemon drives itself
+    /// is not a shipped *skill*, it is a refusal.
+    #[test]
+    fn a_shipped_skill_is_one_the_set_or_the_fallback_already_has() {
+        assert!(super::ships_skill_in("roulade", None));
+        assert!(super::ships_skill_in("kick_left", None));
+        assert!(super::ships_skill_in("kick_right", None));
+        assert!(
+            !super::ships_skill_in("polite-bow", None),
+            "a community one-shot is not shipped"
+        );
+        assert!(
+            !super::ships_skill_in("ground_pick", None),
+            "the daemon drives it; it is not a table skill"
+        );
+
+        let set = published_set();
+        assert!(super::ships_skill_in("roulade", Some(&set)));
+        assert!(
+            !super::ships_skill_in("ground_pick", Some(&set)),
+            "phase-encoded and daemon-owned, so builtin_skills drops it"
+        );
+        assert!(!super::ships_skill_in("polite-bow", Some(&set)));
     }
 
     /// A manifest that says nothing this build understands must not empty the robot. An older

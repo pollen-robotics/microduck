@@ -553,6 +553,8 @@ duration = 4.0
 ```
 
 `robotctl policy add polite-bow <repo>` writes that, taking the length from the repo's manifest.
+`--dry-run` prints the same entry and writes nothing — a Hub fetch is still cached; see the
+[cheat sheet](../robot/cheatsheet.md).
 Absent means the built-in three, and an entry merges by name, so a board updates onto this with
 no config and no migration — and adding one cannot silently remove another by omission.
 `"none"` removes a built-in, the same word that switches off a policy slot.
