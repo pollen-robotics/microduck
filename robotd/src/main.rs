@@ -3615,7 +3615,13 @@ async fn control_loop<T: RobotIo>(
                 // grace period below is for dropped sensor reads, not a user's stop.
                 let seated = controller.as_mut().is_some_and(|controller| {
                     controller.reset();
-                    // A move cut short is dropped rather than resumed on the next Start.
+                    // A move cut short is dropped rather than resumed on the next Start, and
+                    // the sound a skill started goes with it.
+                    if controller.busy()
+                        && let Some(voice) = voice.as_mut()
+                    {
+                        voice.stop();
+                    }
                     controller.stop_moves();
                     controller.is_sitting()
                 });
