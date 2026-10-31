@@ -1078,6 +1078,71 @@ impl Budget {
     }
 }
 
+/// What a lane has yet to post, in the order it should go.
+///
+/// **Each post is a round trip to the service**, a few hundred ms from a home connection, so a
+/// stream faster than that is a queue that only grows. Posted strictly in arrival order, an answer
+/// waited behind all of it: with `tof.stream` on, every call on the lane timed out. So answers go
+/// ahead of notifications, and a snapshot stream ([`SNAPSHOTS`]) keeps one queued line, replaced
+/// by the newest in place, since a superseded `robot.state` is of no use to anyone. Every other
+/// notification is an event (`pad.report`, `update.progress`), and those keep their order.
+#[derive(Default)]
+struct Outbox {
+    answers: std::collections::VecDeque<serde_json::Value>,
+    notifications: std::collections::VecDeque<serde_json::Value>,
+}
+
+/// Notifications that each describe the whole of something, so the newest replaces the rest.
+const SNAPSHOTS: [&str; 3] = [
+    duck_ipc_proto::method::ROBOT_STATE,
+    duck_ipc_proto::method::TOF_FRAME,
+    duck_ipc_proto::method::HEAD_IMU_FRAME,
+];
+
+impl Outbox {
+    /// An answer has an id because the call it answers had one. Everything else, a refusal of a
+    /// notification included, is rationed by the budget.
+    fn answers(payload: &serde_json::Value) -> bool {
+        !payload["id"].is_null()
+    }
+
+    fn take(&mut self, line: &str) {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(line) else {
+            // `session::run` builds every line through `duck-ipc-proto`, and a service's own
+            // output is forwarded verbatim, so this is a daemon emitting something that is not
+            // JSON, which is worth a line rather than a silent drop.
+            tracing::warn!(line = %line.chars().take(120).collect::<String>(),
+                "a control lane answer that is not JSON; dropping it");
+            return;
+        };
+        if Self::answers(&payload) {
+            self.answers.push_back(payload);
+            return;
+        }
+        let method = payload["method"].as_str().unwrap_or_default();
+        if SNAPSHOTS.contains(&method)
+            && let Some(queued) = self
+                .notifications
+                .iter_mut()
+                .find(|queued| queued["method"] == method)
+        {
+            *queued = payload;
+            return;
+        }
+        self.notifications.push_back(payload);
+    }
+
+    fn next(&mut self) -> Option<serde_json::Value> {
+        self.answers
+            .pop_front()
+            .or_else(|| self.notifications.pop_front())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.answers.is_empty() && self.notifications.is_empty()
+    }
+}
+
 /// One consumer's control lane, and the task that owns both its halves.
 struct Control {
     /// The id the *service* knows this session by, which is what every envelope has to name.
@@ -1147,6 +1212,7 @@ impl Relay {
         let (to_session, from_consumer) = tokio::sync::mpsc::channel::<String>(64);
         // Deeper than the inbound half on purpose: one call can answer with a stream, and the
         // budget below would rather drop a notification than have a service block writing it.
+        // It is drained between posts, so a post that takes long enough can still fill it.
         let (to_consumer, mut from_session) = tokio::sync::mpsc::channel::<String>(256);
 
         let hub = Hub {
@@ -1174,19 +1240,24 @@ impl Relay {
             ));
 
             let mut budget = Budget::new(NOTIFICATIONS_PER_WINDOW, NOTIFICATION_WINDOW);
-            while let Some(line) = from_session.recv().await {
-                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    // `session::run` builds every line through `duck-ipc-proto`, and a service's
-                    // own output is forwarded verbatim — so this is a daemon emitting something
-                    // that is not JSON, which is worth a line rather than a silent drop.
-                    tracing::warn!(line = %line.chars().take(120).collect::<String>(),
-                        "a control lane answer that is not JSON; dropping it");
+            let mut outbox = Outbox::default();
+            loop {
+                // Wait only when there is nothing to post, then take everything already queued,
+                // so what goes next is chosen from all of it rather than by arrival.
+                if outbox.is_empty() {
+                    match from_session.recv().await {
+                        Some(line) => outbox.take(&line),
+                        None => break,
+                    }
+                }
+                while let Ok(line) = from_session.try_recv() {
+                    outbox.take(&line);
+                }
+                let Some(payload) = outbox.next() else {
                     continue;
                 };
-                // An answer has an id because the call it answers had one. Everything else is a
-                // notification, and only notifications are rationed.
-                let answers = !payload["id"].is_null();
-                if !answers && !budget.take() {
+                // Only notifications are rationed.
+                if !Outbox::answers(&payload) && !budget.take() {
                     continue;
                 }
                 let envelope = serde_json::json!({
@@ -1722,6 +1793,8 @@ mod tests {
         push: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
         /// A status to answer `POST /send` with instead of 200.
         refuse_posts: std::sync::Mutex<Option<u16>>,
+        /// How long each `POST /send` takes, which on the real service is a round trip.
+        post_delay: std::sync::Mutex<Option<Duration>>,
     }
 
     impl Fake {
@@ -1833,6 +1906,10 @@ mod tests {
                     |State(fake): State<std::sync::Arc<Fake>>, body: String| async move {
                         let message: serde_json::Value =
                             serde_json::from_str(&body).expect("the relay posts JSON");
+                        let delay = *fake.post_delay.lock().unwrap();
+                        if let Some(delay) = delay {
+                            tokio::time::sleep(delay).await;
+                        }
                         fake.posts.lock().unwrap().push(message);
                         match *fake.refuse_posts.lock().unwrap() {
                             None => axum::http::StatusCode::OK,
@@ -2336,6 +2413,163 @@ mod tests {
             posted["rpc"],
             serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
             "and the payload is the daemon's own line, unparsed and unwrapped"
+        );
+        task.abort();
+    }
+
+    /// Answers first; a snapshot keeps one queued line, at its newest and in its first place; an
+    /// event keeps every line in order; and a refused notification is a notification, rationed.
+    #[test]
+    fn the_outbox_puts_answers_first_and_merges_only_snapshots() {
+        let state = |seq: u64| serde_json::json!({ "jsonrpc": "2.0", "method": "robot.state", "params": { "seq": seq } });
+        let pad = |n: u64| serde_json::json!({ "jsonrpc": "2.0", "method": "pad.report", "params": { "n": n } });
+        let answer = serde_json::json!({ "jsonrpc": "2.0", "id": 7, "result": {} });
+        let refused = serde_json::json!({
+            "jsonrpc": "2.0", "id": null, "error": { "code": -32601, "message": "no" },
+        });
+
+        let mut outbox = Outbox::default();
+        for line in [
+            state(1),
+            pad(1),
+            state(2),
+            answer.clone(),
+            pad(2),
+            refused.clone(),
+            state(3),
+        ] {
+            outbox.take(&line.to_string());
+        }
+        let order: Vec<_> = std::iter::from_fn(|| outbox.next()).collect();
+        assert_eq!(
+            order,
+            vec![answer, state(3), pad(1), pad(2), refused.clone()]
+        );
+        assert!(
+            !Outbox::answers(&refused),
+            "a refused notification is rationed"
+        );
+    }
+
+    /// A `robotd` that answers every call and, once subscribed, streams `robot.state` every 2 ms
+    /// with a sequence number, for as long as the connection lasts.
+    fn streaming_robotd(path: &Path) {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, write) = stream.into_split();
+                    let write = std::sync::Arc::new(tokio::sync::Mutex::new(write));
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let call: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let reply = serde_json::json!({
+                            "jsonrpc": "2.0", "id": call["id"], "result": { "accepted": true },
+                        });
+                        let _ = write
+                            .lock()
+                            .await
+                            .write_all(format!("{reply}\n").as_bytes())
+                            .await;
+                        if call["method"] == "robot.subscribe" {
+                            let write = std::sync::Arc::clone(&write);
+                            tokio::spawn(async move {
+                                for seq in 0u64.. {
+                                    let state = serde_json::json!({
+                                        "jsonrpc": "2.0", "method": "robot.state",
+                                        "params": { "seq": seq },
+                                    });
+                                    let line = format!("{state}\n");
+                                    if write.lock().await.write_all(line.as_bytes()).await.is_err()
+                                    {
+                                        return;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(2)).await;
+                                }
+                            });
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// **An answer does not wait behind a stream that outruns the service.**
+    ///
+    /// Each post is a round trip to the rendezvous, so a subscription faster than that queued in
+    /// front of every answer: on a real lane with `tof.stream` on, every call timed out. Here a
+    /// post takes 50 ms and `robotd` streams every 2 ms, so in arrival order the answer would sit
+    /// behind the whole queue, seconds of posts.
+    #[tokio::test]
+    async fn an_answer_goes_ahead_of_a_stream_that_outruns_the_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = fake_service().await;
+        *service.state.post_delay.lock().unwrap() = Some(Duration::from_millis(50));
+        let sockets = sockets_in(dir.path());
+        streaming_robotd(&sockets.robot);
+
+        let relay = Relay::new(
+            &service.base,
+            signed_in(&dir),
+            meta(),
+            sockets,
+            remote_json(&dir),
+        )
+        .unwrap()
+        .with_timings(brisk());
+        let task = tokio::spawn(relay.run());
+        until("registration", || {
+            !service.state.of_type("setPeerStatus").is_empty()
+        })
+        .await;
+
+        let rpc = |id: u64, method: &str| {
+            serde_json::json!({
+                "type": "peer",
+                "sessionId": "remote-session-1",
+                "rpc": { "jsonrpc": "2.0", "id": id, "method": method, "params": {} },
+            })
+        };
+        let states = |fake: &Fake| -> Vec<u64> {
+            fake.of_type("peer")
+                .iter()
+                .filter(|posted| posted["rpc"]["method"] == "robot.state")
+                .map(|posted| posted["rpc"]["params"]["seq"].as_u64().unwrap())
+                .collect()
+        };
+
+        service.state.push(rpc(1, "robot.subscribe"));
+        until("the stream to back up", || {
+            states(&service.state).len() >= 3
+        })
+        .await;
+
+        service.state.push(rpc(2, "robot.health"));
+        let asked = tokio::time::Instant::now();
+        until("the answer", || {
+            service
+                .state
+                .of_type("peer")
+                .iter()
+                .any(|posted| posted["rpc"]["id"] == 2)
+        })
+        .await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the answer took {:?}",
+            asked.elapsed()
+        );
+
+        // The stream is posted at its newest each time, not frame by frame.
+        let seqs = states(&service.state);
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "in order: {seqs:?}");
+        assert!(
+            seqs.windows(2).any(|w| w[1] - w[0] > 1),
+            "superseded states were posted anyway: {seqs:?}"
         );
         task.abort();
     }
