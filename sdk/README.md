@@ -59,9 +59,22 @@ the way `tof::Frame::zone` reads it. It is off by default because `tofd` sends 1
 and the robot posts lane messages one at a time, so today depth holds every answer and every state
 behind it.
 
+## Seeing
+
+`Duck(video=True)` answers the robot's video offer on the same session, so a script sees what the
+duck sees from wherever it runs (`pip install -e "sdk[video]"`):
+
+```python
+with Duck(video=True) as duck:
+    picture = duck.frame()  # the newest picture, an upright RGB array
+```
+
+`watch` carries it too, as `view.frame`. The video is WebRTC, encrypted end to end, and the robot
+offers a relay candidate, so it reaches a script in a data centre as well as one on its own wifi.
+
 ## Frames
 
-The lane carries no pixels. To watch a duck, use WebRTC, which the console already speaks.
+The lane carries no pixels. To watch a duck, use WebRTC, as above or in the console.
 
 For a program taking frames on a long-running stream, `media.stream` is the fallback
 ([`faq.md`](../docs/faq.md)): the robot dials a WebSocket you serve and pushes frames to it. It only

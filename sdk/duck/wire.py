@@ -42,7 +42,7 @@ import json
 import logging
 import queue
 import threading
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -72,12 +72,15 @@ class WsConsumer:
     """
 
     def __init__(self, token: str, peer_id: str, rpc: Any, base: str = DEFAULT_CENTRAL_URL,
-                 label: str = "microduck-sdk"):
+                 label: str = "microduck-sdk",
+                 on_media: Callable[[dict[str, Any]], None] | None = None):
         self._token = token
         self._peer_id = peer_id
         self._rpc = rpc
         self._base = base.rstrip("/")
         self._label = label
+        # Who takes the robot's offer and its ICE candidates, when somebody wants the video.
+        self._on_media = on_media
 
         # **Two sessions, because `requests.Session` is not thread-safe.** The pump thread holds
         # a streaming `GET /events` open for the life of the connection while every call POSTs
@@ -199,6 +202,12 @@ class WsConsumer:
             logger.warning("a call could not be posted: %s", e)
             return False
         return True
+
+    def send_media(self, payload: dict[str, Any]) -> None:
+        """An `sdp` or `ice` for the robot's media path, on this session."""
+        if not self._session_id:
+            raise WireError("the session is not open")
+        self._post({"type": "peer", "sessionId": self._session_id, **payload})
 
     def send_intent(self, envelope: dict[str, Any]) -> None:
         """A continuous intent, on its own connection. Raises `WireError` when it was not taken."""
@@ -332,9 +341,11 @@ class WsConsumer:
         if kind == "peer":
             payload = message.get("rpc")
             if payload is None:
-                # An `sdp` or an `ice`: the robot's media path answering a negotiation this
-                # transport never started. Nothing here can use it, and it is not an error.
-                logger.debug("← a peer envelope with no rpc; ignoring it")
+                # An `sdp` or an `ice`: the robot's media path, offering video on this session.
+                if self._on_media is not None:
+                    self._on_media(message)
+                else:
+                    logger.debug("← a peer envelope with no rpc; ignoring it")
                 return
             self._rpc.on_message(json.dumps(payload))
             return

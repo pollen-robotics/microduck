@@ -1,4 +1,4 @@
-"""What the robot senses right now: the latest `robot.state` and depth frame, not a queue."""
+"""What the robot senses right now: the latest picture, `robot.state` and depth frame."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ STATUS_NO_TARGET = 255
 class View:
     """One tick. Any field can be `None`: no ToF fitted, or nothing arrived yet."""
 
+    # The newest camera picture, upright RGB, with `Duck(video=True)`.
+    frame: Any = None
     state: dict[str, Any] | None = None
     depth: dict[str, Any] | None = None
     elapsed: float = 0.0

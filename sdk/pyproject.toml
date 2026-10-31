@@ -13,6 +13,7 @@ dependencies = ["requests>=2.28", "urllib3>=2.3"]
 
 [project.optional-dependencies]
 frames = ["av>=12", "numpy", "websockets>=13"]
+video = ["aiortc>=1.9", "numpy"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]

@@ -46,6 +46,7 @@ class Duck:
         timeout: float = 30.0,
         label: str = "microduck-sdk",
         base: str = DEFAULT_CENTRAL_URL,
+        video: bool = False,
     ):
         token = token or _token()
         if not token:
@@ -55,10 +56,26 @@ class Duck:
         found, _ = rendezvous.ducks(token, base=base)
         self.robot: Robot = _choose(found, name)
         self._rpc = Rpc(timeout=timeout)
-        self._lane = WsConsumer(token, self.robot.peer_id, self._rpc, base=base, label=label)
+        self._camera: Any = None
+        if video:
+            from .video import Camera
+
+            self._camera = Camera(lambda payload: self._lane.send_media(payload))
+        self._lane = WsConsumer(
+            token,
+            self.robot.peer_id,
+            self._rpc,
+            base=base,
+            label=label,
+            on_media=self._camera.on_media if self._camera else None,
+        )
         try:
             self._lane.start()
+            if self._camera:
+                self._camera.rotate = int((self.video() or {}).get("rotate") or 0)
         except BaseException:
+            if self._camera:
+                self._camera.close()
             self._lane.stop()
             raise
 
@@ -77,6 +94,8 @@ class Duck:
             self._closing = True
             self._wake.notify()
         self._sender.join(timeout=5)
+        if self._camera:
+            self._camera.close()
         self._lane.stop()
         self._rpc.abandon("the duck was closed")
 
@@ -157,6 +176,15 @@ class Duck:
         """Run a one-shot skill by name. Raises `RpcError` when refused."""
         return _accepted("robot.do", self._rpc.call("robot.do", {"skill": skill}))
 
+    def frame(self, timeout: float | None = 15.0) -> Any:
+        """The newest picture from the camera, an upright RGB array, waiting for the first.
+
+        Needs `Duck(video=True)` and the `video` extra. `None` if nothing arrived in `timeout`.
+        """
+        if self._camera is None:
+            raise RuntimeError("no video on this duck: open it with Duck(video=True)")
+        return self._camera.picture(timeout)
+
     def stream_frames(
         self,
         url: str,
@@ -194,7 +222,7 @@ class Duck:
         self.subscribe(_lane_rate(fps, 2 if depth else 1))
         if depth:
             self._stream("tof.stream")
-        return _ticks(self._rpc, fps)
+        return _ticks(self._rpc, fps, self._camera)
 
     def _stream(self, method: str, params: dict[str, Any] | None = None) -> Any:
         """Start a stream once. A second request on its connection is never answered."""
@@ -279,13 +307,14 @@ def _lane_rate(fps: float, streams: int) -> int:
     return max(1, min(math.ceil(fps), ceiling))
 
 
-def _ticks(rpc: Rpc, fps: float) -> Iterator[View]:
+def _ticks(rpc: Rpc, fps: float, camera: Any = None) -> Iterator[View]:
     started = time.monotonic()
     period = 1.0 / fps
     tick = 0
     while True:
         tick += 1
         yield View(
+            frame=camera.latest if camera else None,
             state=rpc.notifications.get("robot.state"),
             depth=rpc.notifications.get("tof.frame"),
             elapsed=time.monotonic() - started,
