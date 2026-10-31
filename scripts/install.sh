@@ -521,6 +521,12 @@ create_group() {
     if ! getent group robot >/dev/null; then
         die "the robot group could not be created; updaterd.service will not start without it"
     fi
+    if ! getent group robot-account >/dev/null; then
+        groupadd --system robot-account
+    fi
+    if ! getent group robot-account >/dev/null; then
+        die "the robot-account group could not be created; mediad.service will not start without it"
+    fi
 
     add_operator_to_group
 }

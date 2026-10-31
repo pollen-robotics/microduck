@@ -541,6 +541,7 @@ async fn serve(args: Args) -> ExitCode {
     };
     // Before anything reads the account, so the first `account.status` already sees it.
     updater::account::migrate_legacy();
+    updater::account::settle_group(&args.token);
     let (config, keys, robot, faults) = (loaded.config, loaded.keys, loaded.robot, loaded.faults);
     // `vetbook.share` reads the book from the same `robotd` the engine talks to.
     let vetbook_robot_socket = args

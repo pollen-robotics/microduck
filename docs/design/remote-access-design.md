@@ -54,9 +54,9 @@ service too was made the other way for this reason, and §3.1 is where it costs 
 **The flow lives in [`hf-robot-account`](https://github.com/pollen-robotics/hf-robot-account)**,
 its own repository, because nothing in it is about a duck: any robot with no browser signs in the
 same way. What stays in `updater/src/account.rs` is what is a fact about *this* robot — the token
-path, the `robot` group, the mapping onto `proto`, and which JSON-RPC code each refusal deserves.
-Everything below about the flow itself describes that crate; everything about where the credential
-lands and who may read it describes this repository.
+path, the `robot-account` group, the mapping onto `proto`, and which JSON-RPC code each refusal
+deserves. Everything below about the flow itself describes that crate; everything about where the
+credential lands and who may read it describes this repository.
 
 ### 2.1 Why the device grant, which is also where `reachy_mini` ended up
 
@@ -244,10 +244,17 @@ Pollen-owned dataset instead of the owner's.
 
 ### 2.5 Where the token lives, and who writes it
 
-`/var/lib/robot/hf-token`, `root:robot`, `0640`. JSON: the access token, the refresh token, an
-absolute `expires_at` (the response gives a duration, and a duration means nothing after a reboot)
-and the username, so `account.status` answers with no network at all — a robot that is offline
-still knows who it belongs to.
+`/var/lib/robot/hf-token`, `root:robot-account`, `0640`. JSON: the access token, the refresh
+token, an absolute `expires_at` (the response gives a duration, and a duration means nothing after
+a reboot) and the username, so `account.status` answers with no network at all: a robot that is
+offline still knows who it belongs to.
+
+**`robot-account`, not `robot`.** `robot` is the socket group, so `btd`, `padd`, `tofd` and every
+operator with a shell are in it, and a token in that group is readable by the gamepad daemon.
+`mediad` is the only reader, and `mediad.service` is the only unit that grants `robot-account`.
+The store sets the group on each save, and a signed-in robot saves only on a refresh, so a board
+that signed in under the old group gets the new one at `updaterd`'s next start
+(`account::settle_group`) rather than weeks later.
 
 **Under `/var/lib/robot`, not `/etc/robot`, where it began.** A robot that updates its OS by A/B
 slots replaces `/etc` with each image, so a token there signed the robot out at every OS update
@@ -267,9 +274,9 @@ while rolled back deletes only the link, so the robot is signed in again once it
 and a token that lands `0644` and is chmodded a moment later is world-readable for that moment —
 the kind of window that is invisible in testing and permanent in a `ps`-and-`cat` afterwards.
 `account::write_private` is the same rename dance with the temp file opened `0600` from the start,
-and a test asserts the landed file gives "others" nothing. On a board with no `robot` group — a
-developer's laptop, a half-provisioned board — it stays root-only and says so once, rather than
-guessing.
+and a test asserts the landed file gives "others" nothing. On a board with no `robot-account`
+group, a developer's laptop or a half-provisioned board, it stays root-only and says so once,
+rather than guessing.
 
 **Not in `robotd.toml`.** Every mechanism that exists for that file is wrong for a secret:
 `robotctl configure --list` prints what a robot changes, `policy-channel-design.md`'s full-screen
@@ -334,10 +341,10 @@ Three things make that acceptable rather than merely permitted:
   **`logout` deletes the robot's copy and tells Hugging Face nothing.** The robot stops being a producer, which is the effect
   somebody signing out is after — but the access token it held stays valid at Hugging Face until
   it expires, up to thirty days, for anything that already read the file. The credential is
-  `0640 root:robot`, so "anything" means root or `mediad` on that board; a stolen board is the
-  case that matters, and for that the answer is the account's connected-apps page on hf.co, not a
-  call here. Sending a revocation from the robot is a candidate for §9 and deliberately not in
-  this slice: it needs the endpoint checked against the first-party client rather than assumed,
+  `0640 root:robot-account`, so "anything" means root or `mediad` on that board; a stolen board
+  is the case that matters, and for that the answer is the account's connected-apps page on hf.co,
+  not a call here. Sending a revocation from the robot is a candidate for §9 and deliberately not
+  in this slice: it needs the endpoint checked against the first-party client rather than assumed,
   and a `logout` that failed because the network was down must still forget the token locally.
 
 **One consequence that lives in another file, and it found a bug.** `account.login` and
