@@ -56,7 +56,13 @@ DUCKS="${DUCK_SIM_DUCKS:-1}"
 # `apartment` is six rooms in 7x6 m with 50 cm walls and doorways deliberately off centre — that
 # asymmetry is what lets a pose be disambiguated from a 45-degree forward field of view, which is
 # exactly what the duck has. The default is a bare floor, where there is nothing to see.
-SCENE="${DUCK_SIM_SCENE:-}"
+#
+# **The default is `backlash`, not the simulator's own default `scene.xml`.** velstand was trained
+# on a robot with backlash in its joints (`Mjlab-VelStand-Rough-Backlash-MicroDuck`), and on the
+# model without it, it does not take a step: 0.15 m/s asked, nothing moved. Same floor, same foot
+# contacts, the robot `robot_groundcontact_backlash.xml`. The other built-in scenes, the apartment
+# among them, carry the robot without backlash, so a duck walks in them only once they gain it.
+SCENE="${DUCK_SIM_SCENE:-backlash}"
 
 # Which ducks have an eye. `a`, `a,c`, or `all`; empty for none, which is the default because a
 # rendered frame costs 12 ms against 0.3 ms to step four ducks' physics — one camera is a third of a
@@ -205,18 +211,21 @@ build_daemons() {
 #
 # A `policies/` beside the repo wins if it has one: that is somebody's own set, and fetching over
 # it would silently swap the gait they are working on.
+#
+# `velstand.onnx` is what is looked for because it is what a robot walks with (set v5 on). A set
+# without it predates that, and a twin running it would not be a twin of any robot shipping now.
 policies() {
-    if [ -f "$REPO/policies/alpha_stand.onnx" ]; then
+    if [ -f "$REPO/policies/velstand.onnx" ]; then
         POLICIES="$REPO/policies"
         return 0
     fi
     POLICIES="$STATE/policies/current"
-    [ -f "$POLICIES/alpha_stand.onnx" ] || {
+    [ -f "$POLICIES/velstand.onnx" ] || {
         say "no policy set here — fetching the official one"
         sh "$REPO/scripts/seed-policies.sh" "$STATE/policies" || true
     }
-    [ -f "$POLICIES/alpha_stand.onnx" ] ||
-        die "no policy set in $STATE/policies. It needs the network once, or your own .onnx files in $REPO/policies."
+    [ -f "$POLICIES/velstand.onnx" ] ||
+        die "no velstand.onnx in $STATE/policies. It needs the network once, or your own set (v5 or later) in $REPO/policies."
 }
 
 up() {
@@ -239,8 +248,11 @@ up() {
     cat > "$STATE/robotd.toml" <<TOML
 [policy]
 enabled = true
-walk = "$POLICIES/alpha_walking.onnx"
-stand = "$POLICIES/alpha_stand.onnx"
+# A robot's own defaults (deploy/robotd.toml): velstand walks and stands, and there is no separate
+# standing network. alpha_walking with alpha_stand is the pre-v5 pair, and it does not walk in
+# MuJoCo at all — commanded 0.15 m/s, it stands, in this simulator's own inference script too.
+walk = "$POLICIES/velstand.onnx"
+stand = "none"
 sitstand = "$POLICIES/alpha_sitstand.onnx"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
@@ -718,19 +730,40 @@ wait_for_socket() {
 # smallest client that sends one. Resent at 10 Hz because `robotd` expires an intent 500 ms after
 # they stop arriving, which is what makes a dropped connection stop the robot rather than run it
 # into a wall.
+#
+# **And says how far it went**, from the simulator's own trunk position rather than odometry, which is
+# the daemon's estimate and the thing a twin is there to check. `drive` used to report only that it
+# had sent the intents, and "still upright after walking" was a duck that had never taken a step.
 drive() {
     [ -S "$SOCK" ] || die "no duck. \`scripts/duck-sim\` first."
-    say "walking forward for 8 s"
-    python3 - "$SOCK" "${1:-0.15}" "${2:-0.0}" <<'PY'
-import json, socket, sys, time
-sock, vx, vyaw = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
+    say "walking for 8 s at vx ${1:-0.15} m/s, vyaw ${2:-0.0} rad/s"
+    python3 - "$SOCK" "$PORT" "${1:-0.15}" "${2:-0.0}" <<'PY'
+import json, math, socket, sys, time
+sock, port, vx, vyaw = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+body = socket.create_connection(("127.0.0.1", port)).makefile("rw")
+body.write(json.dumps({"op": "hello", "protocol": 1, "joints": 15}) + "\n"); body.flush(); body.readline()
+def pose():
+    body.write('{"op":"read"}\n'); body.flush(); r = json.loads(body.readline())
+    w, x, y, z = r["imu"]["quat"]
+    return r["trunk"][:2], math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
 s = socket.socket(socket.AF_UNIX); s.connect(sock)
 f = s.makefile("w")
+(x0, yaw0), turned = pose(), 0.0
+prev = yaw0
 for _ in range(80):
     f.write(json.dumps({"jsonrpc": "2.0", "method": "robot.move",
                         "params": {"vx": vx, "vy": 0.0, "vyaw": vyaw}}) + "\n")
     f.flush()
     time.sleep(0.1)
+    _, yaw = pose()
+    turned += math.atan2(math.sin(yaw - prev), math.cos(yaw - prev)); prev = yaw
+x1, _ = pose()
+moved = math.dist(x0, x1)
+print(f"   moved {moved * 100:.0f} cm ({moved / 8:.3f} m/s of {vx:.2f} asked), "
+      f"turned {math.degrees(turned):+.0f} deg ({math.degrees(turned) / 8:+.1f} deg/s of {math.degrees(vyaw):+.0f} asked)")
+if abs(vx) >= 0.05 and moved < 0.25 * abs(vx) * 8:
+    print("   it did not walk: under a quarter of the distance asked. "
+          "docs/design/simulation.md, \"Ways to pick the wrong model\".")
 PY
     say "stopped — the intent expires on its own"
 }
