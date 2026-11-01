@@ -2082,6 +2082,7 @@ fn try_controller(
                 let pad = params::PadDriveParams::default();
                 [pad.vx_max, pad.vy_max, pad.vyaw_max]
             },
+            footstep_stick: policy_cfg.footstep_stick,
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,

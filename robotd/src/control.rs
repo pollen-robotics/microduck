@@ -85,6 +85,8 @@ pub struct Tuning {
     /// Footstepping: the twist of a fully deflected stick (vx, vy, ωz) — full deflection on an axis is that
     /// axis's full step. The pad's `[pad_drive]` defaults; a robot with other pad ranges saturates early or late.
     pub footstep_full_twist: [f64; 3],
+    /// Whether the stick walks on footsteps (`[policy] footstep_stick`); off, only goals and patterns do.
+    pub footstep_stick: bool,
 }
 
 impl Default for Tuning {
@@ -97,6 +99,7 @@ impl Default for Tuning {
             head_lowpass: Some(0.5),
             legs_lowpass: Some(0.7),
             footstep_full_twist: [0.4, 0.3, 1.0],
+            footstep_stick: true,
         }
     }
 }
@@ -547,6 +550,11 @@ impl Controller {
                     }
                 }
             }
+        }
+        if !self.tuning.footstep_stick {
+            // Goals and patterns only: the stick keeps the gait.
+            self.footstepping = false;
+            return None;
         }
         self.footstep_idle = if held { 0.0 } else { self.footstep_idle + dt };
         if !self.footstepping {
@@ -1281,6 +1289,24 @@ mod tests {
         // Forward stick, left support: the right foot's first target is ahead, beside the left one.
         let target = relative(SOLES[0], controller.follower.target());
         assert!(target[0] > 0.02 && target[1] < -0.07, "{target:?}");
+    }
+
+    /// `footstep_stick` off: the stick keeps the gait even with odometry; goals and patterns still use footsteps.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn stick_keeps_the_gait_without_footstep_stick() {
+        let mut controller = footstep_controller();
+        controller.tuning.footstep_stick = false;
+        let sensors = duck_control::Sensors::default();
+        let forward = Command {
+            twist: [0.2, 0.0, 0.0],
+            ..Command::default()
+        };
+        controller.set_odometry(Some((0, SOLES)));
+        let step = controller
+            .step(&sensors, &forward, false, 0.02, 1.0)
+            .unwrap();
+        assert_eq!(step.label, "walk");
     }
 
     /// Releasing the stick hands back to the gait — but only after the idle delay AND at a touchdown, never

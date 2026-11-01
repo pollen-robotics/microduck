@@ -205,6 +205,11 @@ pub const REGISTRY: &[Entry] = &[
         "Walk on placed footsteps (stick = step size); fetches apirrone/microduck-footsteps",
     ),
     entry(
+        "policy.footstep_stick",
+        Kind::Bool,
+        "With footstep_control on, the stick walks on footsteps too; off = the stick keeps the gait",
+    ),
+    entry(
         "policy.footsteps",
         Kind::OptionalPath,
         "Footstep policy file; unset = the fetched apirrone/microduck-footsteps one",
