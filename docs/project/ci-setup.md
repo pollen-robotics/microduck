@@ -210,6 +210,7 @@ promote.yml            workflow_dispatch → _promote-release.yml
 dev.yml                every push: an unsigned-for-customers dev build, `team.dev` key
 _build-duckctl.yml     duckctl wheels + archives per platform           (called by dev.yml, duckctl-pypi.yml)
 duckctl-pypi.yml       tag daemon-v*: duckctl wheels → PyPI, for `uvx duckctl`, then the Homebrew formula
+sdk-pypi.yml           tag sdk-v*: the Python SDK, sdist + wheel → PyPI, for `pip install microduck`
 ```
 
 The recipe lives in the two called workflows so the staging and stable paths cannot drift apart in
@@ -243,6 +244,24 @@ A **manual promotion** (`gh workflow run promote`) needs one more step:
 `gh workflow run duckctl-pypi --ref daemon-v<version>`. That path creates the stable tag with
 `GITHUB_TOKEN`, and GitHub does not start workflows on a push made with it, so the tag alone
 publishes nothing. Re-running is safe: files PyPI already has are skipped.
+
+## `microduck` on PyPI
+
+`pip install microduck` installs the Python SDK in `sdk/`. `sdk-pypi.yml` publishes it on an
+`sdk-vX.Y.Z` tag push: an sdist and a wheel, both pure Python. The SDK's version is the one in
+`sdk/pyproject.toml`, not the workspace version, which is why it has a tag of its own, and the
+workflow refuses a tag that disagrees with it.
+
+No token here either. The one-time setup, **not done yet**:
+
+1. On PyPI: *Your projects → Publishing → Add a new pending publisher*. Fill in project
+   `microduck`, owner `pollen-robotics`, repository `microduck`, workflow `sdk-pypi.yml`,
+   environment `pypi`. The name was free on 2026-11-02, and the first upload creates the project.
+2. The `pypi` environment exists already, for `duckctl`. If it is ever limited to some tags, it
+   needs `sdk-v*` as well.
+
+To release: bump `version` in `sdk/pyproject.toml`, merge, then tag `sdk-v<that version>` on
+`main` and push the tag. Re-running is safe: files PyPI already has are skipped.
 
 ## `duckctl` on Homebrew
 
