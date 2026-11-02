@@ -180,8 +180,8 @@ class Duck:
         """The newest picture from the camera, an upright RGB array, waiting for one.
 
         Needs `Duck(video=True)` and the `video` extra; a duck with no camera refuses
-        `media.video`, so opening it with video raises. `None` if no picture arrived in `timeout`
-        or the video has gone.
+        `media.video`, so opening it with video raises. Raises `VideoError` when there is no
+        picture, saying whether none arrived in `timeout` or the video stopped.
         """
         if self._camera is None:
             raise RuntimeError("no video on this duck: open it with Duck(video=True)")

@@ -20,7 +20,7 @@ from aiortc import (  # noqa: E402
 )
 from av import VideoFrame  # noqa: E402
 
-from microduck.video import Camera  # noqa: E402
+from microduck.video import Camera, VideoError  # noqa: E402
 
 
 class LeftEdgeWhite(VideoStreamTrack):
@@ -89,13 +89,72 @@ def test_the_offer_is_answered_and_pictures_come_back_upright(robot, caplog):
         camera.close()
 
 
-def test_closing_wakes_a_caller_waiting_for_a_picture():
-    camera = Camera(send=lambda _: None, stun=None)
+def waiting(camera: Camera, timeout: float = 10) -> tuple[threading.Thread, list]:
     got: list = []
-    waiter = threading.Thread(target=lambda: got.append(camera.picture(timeout=10)), daemon=True)
+
+    def wait() -> None:
+        try:
+            got.append(camera.picture(timeout=timeout))
+        except VideoError as e:
+            got.append(e)
+
+    waiter = threading.Thread(target=wait, daemon=True)
     waiter.start()
     time.sleep(0.1)
+    return waiter, got
+
+
+def test_closing_wakes_a_caller_waiting_for_a_picture():
+    camera = Camera(send=lambda _: None, stun=None)
+    waiter, got = waiting(camera)
     camera.close()
     waiter.join(timeout=2)
     assert not waiter.is_alive(), "picture() waited out its timeout after close()"
-    assert got == [None]
+    assert [str(e) for e in got] == ["the duck was closed"]
+
+
+def test_no_picture_yet_is_told_apart_from_a_video_that_stopped():
+    camera = Camera(send=lambda _: None, stun=None)
+    try:
+        with pytest.raises(VideoError, match="no picture arrived in 0.2 s"):
+            camera.picture(timeout=0.2)
+
+        with camera._arrived:
+            camera.latest = np.zeros((2, 2, 3), dtype=np.uint8)
+            camera.frames = 40
+        assert camera.picture(timeout=0.2) is not None
+
+        # What a failed connection or an ended track does.
+        camera.state = "failed"
+        camera._drop(camera._pc)
+        started = time.monotonic()
+        with pytest.raises(VideoError, match=r"the video stopped after 40 pictures \(failed\)"):
+            camera.picture(timeout=10)
+        assert time.monotonic() - started < 1, "said at once, not after the timeout"
+    finally:
+        camera.close()
+
+
+def test_a_replaced_connection_ending_late_is_not_the_video_stopping():
+    camera = Camera(send=lambda _: None, stun=None)
+    try:
+        with camera._arrived:
+            camera.latest = np.zeros((2, 2, 3), dtype=np.uint8)
+            camera.frames = 3
+        camera._drop(object())
+        assert camera.picture(timeout=0.2) is not None
+    finally:
+        camera.close()
+
+
+def test_a_video_that_ends_before_its_first_picture_wakes_the_caller_waiting_for_it():
+    camera = Camera(send=lambda _: None, stun=None)
+    try:
+        waiter, got = waiting(camera)
+        camera.state = "failed"
+        camera._drop(camera._pc)
+        waiter.join(timeout=2)
+        assert not waiter.is_alive(), "picture() waited out its timeout after the video ended"
+        assert [str(e) for e in got] == ["the video ended before any picture arrived (failed)"]
+    finally:
+        camera.close()

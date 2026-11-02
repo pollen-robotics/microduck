@@ -18,7 +18,8 @@ from __future__ import annotations
 from .client import Duck, receive
 from .control import RpcError
 from .rendezvous import RendezvousError
+from .video import VideoError
 from .view import View
 from .wire import WireError
 
-__all__ = ["Duck", "RendezvousError", "RpcError", "View", "WireError", "receive"]
+__all__ = ["Duck", "RendezvousError", "RpcError", "VideoError", "View", "WireError", "receive"]

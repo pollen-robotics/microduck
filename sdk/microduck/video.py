@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 STUN = "stun:stun.l.google.com:19302"
 
 
+class VideoError(RuntimeError):
+    """No picture to give, and the message says which way: none ever came, or the video stopped."""
+
+
 class Camera:
     """Answers the robot's offer and keeps the newest picture.
 
@@ -36,8 +40,12 @@ class Camera:
         self._closed = False
         self.rotate = 0
         self.latest: Any = None
+        # Pictures since the robot's latest offer.
         self.frames = 0
         self.state = "waiting for the robot's offer"
+        # Set when the picture is dropped, so a caller waiting for one wakes at once rather than
+        # at its timeout; cleared by the next picture, as a new offer can start the video again.
+        self._stopped = False
         self._arrived = threading.Condition()
         self._pc: Any = None
         self._loop = asyncio.new_event_loop()
@@ -52,15 +60,36 @@ class Camera:
             pass  # closed
 
     def picture(self, timeout: float | None = None) -> Any:
-        """The newest picture, waiting up to `timeout` seconds for one. `None` once the video is
-        gone, rather than the last picture before it went."""
-        with self._arrived:
-            self._arrived.wait_for(lambda: self.latest is not None or self._closed, timeout=timeout)
-            return self.latest
+        """The newest picture, waiting up to `timeout` seconds for one.
 
-    def _drop(self) -> None:
+        Raises `VideoError` when there is none to give, never the last picture from before the
+        video stopped, and the message says which it was: no picture ever came, or pictures came
+        and then stopped.
+        """
+        with self._arrived:
+            self._arrived.wait_for(
+                lambda: self.latest is not None or self._closed or self._stopped,
+                timeout=timeout,
+            )
+            if self.latest is not None:
+                return self.latest
+            if self._closed:
+                raise VideoError("the duck was closed")
+            if self.frames:
+                raise VideoError(f"the video stopped after {self.frames} pictures ({self.state})")
+            if self._stopped:
+                raise VideoError(f"the video ended before any picture arrived ({self.state})")
+            raise VideoError(f"no picture arrived in {timeout:g} s ({self.state})")
+
+    def _drop(self, pc: Any) -> None:
+        # Only the current connection's end is the video's. A replaced one can still report its
+        # own close or end its track after the new offer started, and that must not wipe a new
+        # picture or say the video stopped.
+        if pc is not self._pc:
+            return
         with self._arrived:
             self.latest = None
+            self._stopped = True
             self._arrived.notify_all()
 
     def close(self) -> None:
@@ -104,18 +133,26 @@ class Camera:
         servers = [RTCIceServer(urls=self._stun)] if self._stun else []
         pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pc = pc
+        # A new offer is the video starting again: the old picture goes with the old connection,
+        # a caller waits for the first new one, and a timeout says none arrived.
+        with self._arrived:
+            self.latest = None
+            self._stopped = False
+            self.frames = 0
 
         @pc.on("track")
         def _on_track(track: Any) -> None:
             if track.kind == "video":
-                asyncio.ensure_future(self._read(track))
+                asyncio.ensure_future(self._read(track, pc))
 
         @pc.on("connectionstatechange")
         def _on_state() -> None:
+            if pc is not self._pc:
+                return
             self.state = pc.connectionState
             logger.info("video: %s", self.state)
             if self.state in ("failed", "closed"):
-                self._drop()
+                self._drop(pc)
 
         await pc.setRemoteDescription(RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
         await pc.setLocalDescription(await pc.createAnswer())
@@ -135,14 +172,16 @@ class Camera:
         candidate.sdpMLineIndex = ice.get("sdpMLineIndex")
         await self._pc.addIceCandidate(candidate)
 
-    async def _read(self, track: Any) -> None:
+    async def _read(self, track: Any, pc: Any) -> None:
         import numpy as np
 
         while True:
             try:
                 frame = await track.recv()
             except Exception:  # noqa: BLE001 - the track ends with the session
-                self._drop()
+                self._drop(pc)
+                return
+            if pc is not self._pc:
                 return
             picture = frame.to_ndarray(format="rgb24")
             if self.rotate % 360:
@@ -150,6 +189,7 @@ class Camera:
             with self._arrived:
                 self.latest = picture
                 self.frames += 1
+                self._stopped = False
                 self._arrived.notify_all()
 
     async def _close(self) -> None:

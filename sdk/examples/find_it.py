@@ -16,7 +16,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from microduck import Duck
+from microduck import Duck, VideoError
 
 MODEL = "HuggingFaceTB/SmolVLM-256M-Instruct"
 WHAT = "What object is in this picture? Answer with its colour and shape, in a few words."
@@ -75,9 +75,10 @@ def find(duck, gaze: dict, target: str) -> None:
     for where, point in GAZES.items():
         turn(duck, gaze, point)
         gaze["point"] = point
-        picture = duck.frame()
-        if picture is None:
-            print("the video went away")
+        try:
+            picture = duck.frame()
+        except VideoError as e:
+            print(e)
             return
         what = ask(picture, WHAT)
         match = ask(picture, f"Is there a {target} in this picture? Answer yes or no.")
