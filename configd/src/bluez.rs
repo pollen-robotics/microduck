@@ -151,7 +151,8 @@
 //! first match did not help; the BR/EDR face was still not in the tree. So `find` now ends the
 //! search early only on a match the radio classified — the LE face's name-only match is kept as a
 //! fallback but never stops the sweep — and `one_face_per_pad` folds candidates that share their
-//! unit octets into the classic one before the ambiguity rule sees them.
+//! unit octets into the classic one before the ambiguity rule sees them. Not every unit's faces
+//! share them, so `classified_over_named` then takes a classified candidate over name-only ones.
 //!
 //! Discovery stays on `auto`, so BlueZ sweeps both transports and a Pro Controller and an Xbox pad
 //! are both found by the same search.
@@ -950,6 +951,39 @@ fn one_face_per_pad(fresh: Vec<&Snapshot>) -> Vec<&Snapshot> {
     kept
 }
 
+/// Among pads in pairing mode, the ones the radio classified, when there are any.
+///
+/// A name-only match beside a classified one is far more often the other face of the same pad than
+/// a second pad: the Pro Controller clone's LE face is `BLE Controller_xxxxxx` with nothing else set.
+/// [`one_face_per_pad`] folds the two when their unit octets agree, and this covers the units where
+/// they do not — seen on hardware, where the pad was refused as "more than one in pairing mode" and,
+/// from an NFC tag, which names no address, could not be paired at all.
+///
+/// The cost: a genuine second pad identified by its name alone, in pairing mode at the same moment,
+/// loses to the classified one instead of being refused as ambiguous. Two classified pads, or two
+/// named ones, are still refused.
+fn classified_over_named(fresh: Vec<&Snapshot>) -> Vec<&Snapshot> {
+    let classified: Vec<&Snapshot> = fresh
+        .iter()
+        .copied()
+        .filter(|d| d.evidence() == Some(Evidence::Classified))
+        .collect();
+    if classified.is_empty() || classified.len() == fresh.len() {
+        return fresh;
+    }
+    for dropped in fresh
+        .iter()
+        .filter(|d| d.evidence() != Some(Evidence::Classified))
+    {
+        tracing::info!(
+            dropped = %dropped.mac,
+            name = %dropped.name,
+            "a name-only match beside a classified pad: taking the classified one"
+        );
+    }
+    classified
+}
+
 /// Did BlueZ refuse this because the bond already exists?
 fn is_already_paired(error: &zbus::Error) -> bool {
     matches!(error, zbus::Error::MethodError(name, _, _)
@@ -1059,7 +1093,7 @@ impl Pads for BlueZ {
                 // Without this, adding a second pad in a room where the first is in range would be
                 // refused as ambiguous forever.
                 let fresh: Vec<&Snapshot> = several.iter().filter(|d| !d.paired).collect();
-                let fresh = one_face_per_pad(fresh);
+                let fresh = classified_over_named(one_face_per_pad(fresh));
                 match fresh.as_slice() {
                     [only] => (*only).clone(),
                     // Nothing new: report the bonded one, and let `bond` re-assert `Trusted`. This is
@@ -1245,6 +1279,32 @@ mod tests {
         let a = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
         let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
         assert_eq!(one_face_per_pad(vec![&a, &b]).len(), 2);
+    }
+
+    /// The clone on a unit whose two faces share no octets: folding cannot see it is one pad, and the
+    /// classified face is still the one taken.
+    #[test]
+    fn a_classified_pad_wins_over_a_name_only_match() {
+        let le = face("5C:0A:11:4F:22:B7", "BLE Controller_9A31C0", None);
+        let classic = face("98:B6:E9:9A:31:C0", "Pro Controller", Some(0x2508));
+
+        for order in [vec![&le, &classic], vec![&classic, &le]] {
+            let kept = classified_over_named(one_face_per_pad(order));
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].mac, classic.mac);
+        }
+    }
+
+    /// Two classified pads, or two named ones, are still two — and still refused downstream.
+    #[test]
+    fn evidence_of_the_same_strength_stays_ambiguous() {
+        let pro = face("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508));
+        let other = face("E4:17:D8:00:11:22", "8BitDo Pro 2", Some(0x2508));
+        assert_eq!(classified_over_named(vec![&pro, &other]).len(), 2);
+
+        let a = face("5C:0A:11:4F:22:B7", "BLE Controller_9A31C0", None);
+        let b = face("78:86:2E:BB:13:28", "Xbox Wireless Controller", None);
+        assert_eq!(classified_over_named(vec![&a, &b]).len(), 2);
     }
 
     fn bonded(mac: &str, name: &str, class: Option<u32>, connected: bool) -> Snapshot {
