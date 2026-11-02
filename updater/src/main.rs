@@ -550,6 +550,7 @@ async fn serve(args: Args) -> ExitCode {
 
     // Read before `config` is moved into the engine.
     let config_check_interval = config.check_interval;
+    let telemetry_path = config.state_dir.join("telemetry.json");
     let config_auto_apply = config.auto_apply;
     // Numeric ids from the config, plus whatever the names resolve to. Names are what a shipped
     // config should use; the numeric lists remain for a bench override.
@@ -627,7 +628,8 @@ async fn serve(args: Args) -> ExitCode {
             .with_vetbook_sources(updater::vetbook::Sources {
                 robot_socket: vetbook_robot_socket,
                 ..Default::default()
-            }),
+            })
+            .with_telemetry_at(telemetry_path),
     );
     let socket = args.socket.clone();
 
@@ -635,6 +637,7 @@ async fn serve(args: Args) -> ExitCode {
     // and its refresh token rotates, so a robot that is on for a month loses remote access
     // unless something renews it. `docs/design/remote-access-design.md` §2.7.
     server.spawn_account_maintenance();
+    server.spawn_telemetry();
 
     // The scheduler is what makes `min_supported` effective: without it the floor is
     // inert, because a robot only learns of it when someone opens the app.

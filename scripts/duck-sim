@@ -381,7 +381,7 @@ units = []
 probe = "socket"
 timeout = "30s"
 TOML
-        DUCK_RUNTIME_DIR="$STATE" $SETSID nohup "$REPO/target/debug/updaterd" \
+        DUCK_RUNTIME_DIR="$STATE" MICRODUCK_TELEMETRY=0 $SETSID nohup "$REPO/target/debug/updaterd" \
             --config "$STATE/updater-$name.toml" --socket "$STATE/$name-updater.sock" \
             --token "$STATE/$name/hf-token" \
             > "$STATE/$name-updater.log" 2>&1 &

@@ -138,6 +138,10 @@ fn permits(call: &proto::Call) -> bool {
         OsStatus | OsCheck => true,
         OsApply(_) | OsSwitch(_) => true,
 
+        // The owner's switch for anonymous usage data. The phone is where an owner looks for a
+        // privacy setting, and the reply is two booleans.
+        TelemetryStatus | TelemetrySet(_) => true,
+
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => true,
 
