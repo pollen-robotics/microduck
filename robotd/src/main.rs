@@ -2083,6 +2083,7 @@ fn try_controller(
                 [pad.vx_max, pad.vy_max, pad.vyaw_max]
             },
             footstep_stick: policy_cfg.footstep_stick,
+            footstep_stick_side: policy_cfg.footstep_stick_side,
         };
         let skills = SkillTuning {
             ground_pick_period: policy_cfg.ground_pick_period,

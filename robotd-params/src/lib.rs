@@ -1580,6 +1580,10 @@ pub struct PolicyParams {
     /// Whether the stick walks on footsteps too while `footstep_control` is on. Off: the stick keeps the
     /// gait, and only goals and patterns (`robot.footstepGoal`, `robot.footsteps`) are walked on footsteps.
     pub footstep_stick: bool,
+    /// With `footstep_stick` off: a stick pushed mostly SIDEWAYS (its sideways share at least its forward and
+    /// turn shares) still walks on footsteps, so the robot side-steps; forward and turns keep the gait. The
+    /// gait cannot side-step (no ankle roll: a flat landing fixes the feet gap), the footstep network can.
+    pub footstep_stick_side: bool,
     /// Override the footstep policy file (default: [`FOOTSTEPS_REPO`]'s, in the library).
     pub footsteps: Option<PathBuf>,
     /// Override the FootstepNet planner file (default: [`FOOTSTEPS_REPO`]'s, in the library).
@@ -2229,6 +2233,8 @@ pub struct ResolvedPolicy {
     pub footstep_planner: Option<PathBuf>,
     /// See [`Policy::footstep_stick`].
     pub footstep_stick: bool,
+    /// See [`Policy::footstep_stick_side`].
+    pub footstep_stick_side: bool,
     pub action_scale: f64,
     pub standing_action_scale: f64,
     pub standing_gain_ratio: f64,
@@ -2472,6 +2478,7 @@ impl PolicyParams {
             footsteps: footstep_path(&self.footsteps, FOOTSTEPS_FILES[0]),
             footstep_planner: footstep_path(&self.footstep_planner, FOOTSTEPS_FILES[1]),
             footstep_stick: self.footstep_stick,
+            footstep_stick_side: self.footstep_stick_side,
             action_scale: self.action_scale.unwrap_or(match self.mode {
                 Mode::Walk => 0.9,
                 Mode::Roller => 0.8,
@@ -2590,6 +2597,7 @@ impl Default for PolicyParams {
             roulade: None,
             footstep_control: false,
             footstep_stick: true,
+            footstep_stick_side: false,
             footsteps: None,
             footstep_planner: None,
             action_scale: None,

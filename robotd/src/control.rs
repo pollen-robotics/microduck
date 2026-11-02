@@ -87,6 +87,8 @@ pub struct Tuning {
     pub footstep_full_twist: [f64; 3],
     /// Whether the stick walks on footsteps (`[policy] footstep_stick`); off, only goals and patterns do.
     pub footstep_stick: bool,
+    /// With `footstep_stick` off, a mostly-sideways stick still walks on footsteps (`[policy] footstep_stick_side`).
+    pub footstep_stick_side: bool,
 }
 
 impl Default for Tuning {
@@ -100,6 +102,7 @@ impl Default for Tuning {
             legs_lowpass: Some(0.7),
             footstep_full_twist: [0.4, 0.3, 1.0],
             footstep_stick: true,
+            footstep_stick_side: false,
         }
     }
 }
@@ -302,6 +305,19 @@ enum SkillPhase {
 
 /// The twist a skill is fed this tick. A phase skill runs on the ground pick's clock encoding, φ
 /// from 0 at its first tick to 1 as its window closes; any other one gets its constant command.
+/// Whether a stick is pushed mostly sideways: its sideways share of full deflection at least its forward and
+/// turn shares (`full` = the twist of a fully deflected stick, see [`Tuning::footstep_full_twist`]).
+fn sideways(twist: [f64; 3], full: [f64; 3]) -> bool {
+    let share = |i: usize| {
+        if full[i] > 0.0 {
+            (twist[i] / full[i]).abs()
+        } else {
+            0.0
+        }
+    };
+    share(1) > 0.0 && share(1) >= share(0) && share(1) >= share(2)
+}
+
 fn skill_twist(d: &robotd_params::SkillDef, phase: SkillPhase, remaining: f64) -> [f64; 3] {
     match phase {
         SkillPhase::Holding if d.phase && d.duration > 0.0 => {
@@ -551,11 +567,16 @@ impl Controller {
                 }
             }
         }
-        if !self.tuning.footstep_stick {
+        let held = if self.tuning.footstep_stick {
+            held
+        } else if self.tuning.footstep_stick_side {
+            // Only a mostly-sideways stick steps; forward and turns hand back to the gait like a release.
+            held && sideways(twist, self.tuning.footstep_full_twist)
+        } else {
             // Goals and patterns only: the stick keeps the gait.
             self.footstepping = false;
             return None;
-        }
+        };
         self.footstep_idle = if held { 0.0 } else { self.footstep_idle + dt };
         if !self.footstepping {
             if !held {
@@ -1307,6 +1328,41 @@ mod tests {
             .step(&sensors, &forward, false, 0.02, 1.0)
             .unwrap();
         assert_eq!(step.label, "walk");
+    }
+
+    /// `footstep_stick_side`: a sideways stick steps on footsteps, a forward one keeps the gait.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn sideways_stick_steps_with_footstep_stick_side() {
+        let mut controller = footstep_controller();
+        controller.tuning.footstep_stick = false;
+        controller.tuning.footstep_stick_side = true;
+        let sensors = duck_control::Sensors::default();
+        controller.set_odometry(Some((0, SOLES)));
+        let forward = Command {
+            twist: [0.2, 0.05, 0.0],
+            ..Command::default()
+        };
+        let step = controller
+            .step(&sensors, &forward, false, 0.02, 1.0)
+            .unwrap();
+        assert_eq!(step.label, "walk");
+        let side = Command {
+            twist: [0.05, 0.2, 0.1],
+            ..Command::default()
+        };
+        let step = controller.step(&sensors, &side, false, 0.02, 1.0).unwrap();
+        assert_eq!(step.label, "footsteps");
+    }
+
+    #[test]
+    fn sideways_share_of_the_stick() {
+        let full = [0.4, 0.3, 1.0];
+        assert!(sideways([0.0, 0.1, 0.0], full));
+        assert!(sideways([0.1, -0.1, 0.2], full));
+        assert!(!sideways([0.2, 0.1, 0.0], full));
+        assert!(!sideways([0.0, 0.1, 0.5], full));
+        assert!(!sideways([0.0, 0.0, 0.0], full));
     }
 
     /// Releasing the stick hands back to the gait — but only after the idle delay AND at a touchdown, never
