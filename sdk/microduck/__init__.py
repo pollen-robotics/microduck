@@ -1,6 +1,6 @@
 """Drive a duck from a script, wherever its owner's account reaches it.
 
-    from duck import Duck
+    from microduck import Duck
 
     with Duck() as duck:
         duck.enable(True)

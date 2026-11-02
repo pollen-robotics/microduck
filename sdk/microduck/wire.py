@@ -377,10 +377,10 @@ def connect(token: str, peer_id: str, rpc: Any, label: str) -> WsConsumer:
 if __name__ == "__main__":
     # ── checking the lane against the real rendezvous and a real duck ─────────
     #
-    # `python -m duck.wire`: no Gradio, no browser, and read-only calls. It asks the robot what it is
-    # running and what it can do, and asks for nothing to move. Which makes it the thing to run
-    # first when a click does not work, because it isolates the transport from everything else on
-    # the page.
+    # `python -m microduck.wire`: no Gradio, no browser, and read-only calls. It asks the robot
+    # what it is running and what it can do, and asks for nothing to move. Which makes it the thing
+    # to run first when a click does not work, because it isolates the transport from everything
+    # else on the page.
     #
     # A timeout here has exactly one likely cause and the message says so: the envelope crossed
     # the rendezvous and the robot did not answer it, which is a `mediad` without the control
@@ -391,8 +391,8 @@ if __name__ == "__main__":
 
     from huggingface_hub import get_token
 
-    from duck import rendezvous
-    from duck.control import Rpc, RpcError
+    from microduck import rendezvous
+    from microduck.control import Rpc, RpcError
 
     _logging.basicConfig(level=_logging.INFO, format="%(name)-10s %(message)s")
 

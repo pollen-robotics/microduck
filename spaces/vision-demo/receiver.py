@@ -37,8 +37,8 @@ import numpy as np
 import requests
 from fastapi import WebSocket, WebSocketDisconnect
 
-# The SDK's decoder, from `sdk/duck`, which `scripts/publish-space.sh` copies beside this file.
-from duck.frames import decoder_for
+# The SDK's decoder, from `sdk/microduck`, which `scripts/publish-space.sh` copies beside this file.
+from microduck.frames import decoder_for
 
 logger = logging.getLogger(__name__)
 

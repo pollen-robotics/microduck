@@ -16,8 +16,8 @@ pytest.importorskip("websockets")
 
 from websockets.sync.client import connect  # noqa: E402
 
-from duck import receive  # noqa: E402
-from duck.frames import decoder_for  # noqa: E402
+from microduck import receive  # noqa: E402
+from microduck.frames import decoder_for  # noqa: E402
 
 WIDTH, HEIGHT = 64, 48
 

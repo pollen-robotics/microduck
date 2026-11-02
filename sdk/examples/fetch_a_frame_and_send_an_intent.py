@@ -15,7 +15,7 @@ import time
 
 from PIL import Image
 
-from duck import Duck, receive
+from microduck import Duck, receive
 
 PORT = 8099
 

@@ -5,7 +5,7 @@ consumer should use that interpretation rather than re-deriving the thresholds, 
 anything if somebody checks the copy.
 """
 
-from duck.view import STATUS_NO_TARGET, View
+from microduck.view import STATUS_NO_TARGET, View
 
 
 def depth(distances, statuses):

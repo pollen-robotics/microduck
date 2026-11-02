@@ -17,4 +17,4 @@ video = ["aiortc>=1.12", "numpy"]
 test = ["pytest"]
 
 [tool.setuptools.packages.find]
-include = ["duck*"]
+include = ["microduck*"]

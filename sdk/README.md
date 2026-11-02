@@ -1,7 +1,7 @@
 # Driving a duck from a script
 
 ```python
-from duck import Duck
+from microduck import Duck
 
 with Duck() as duck:
     print(duck.health()["healthy"])

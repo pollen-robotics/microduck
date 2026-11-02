@@ -12,10 +12,10 @@ from pathlib import Path
 
 import pytest
 
-from duck import Duck, RendezvousError, RpcError, WireError
-from duck.client import LANE_NOTIFICATIONS_PER_MINUTE, _choose, _lane_rate
-from duck.control import Rpc
-from duck.rendezvous import Robot
+from microduck import Duck, RendezvousError, RpcError, WireError
+from microduck.client import LANE_NOTIFICATIONS_PER_MINUTE, _choose, _lane_rate
+from microduck.control import Rpc
+from microduck.rendezvous import Robot
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -190,7 +190,7 @@ def test_a_move_is_resent_until_stop_so_the_deadman_stays_fed(rendezvous):
 
 
 def test_a_script_that_stops_calling_move_stops_the_robot(rendezvous, monkeypatch):
-    monkeypatch.setattr("duck.client.HOLD", 0.3)
+    monkeypatch.setattr("microduck.client.HOLD", 0.3)
     with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
         duck.move(vx=0.1)
         time.sleep(0.6)
@@ -301,7 +301,7 @@ def test_choosing_a_duck_says_why_it_could_not():
 
 def test_no_token_is_said_before_anything_is_asked(monkeypatch):
     monkeypatch.delenv("HF_TOKEN", raising=False)
-    monkeypatch.setattr("duck.client._token", lambda: None)
+    monkeypatch.setattr("microduck.client._token", lambda: None)
     with pytest.raises(RendezvousError, match="no Hugging Face token"):
         Duck()
 

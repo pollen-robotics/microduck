@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
-from duck import Duck
+from microduck import Duck
 
 MODEL = "HuggingFaceTB/SmolVLM-256M-Instruct"
 

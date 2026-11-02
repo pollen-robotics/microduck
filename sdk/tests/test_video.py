@@ -20,7 +20,7 @@ from aiortc import (  # noqa: E402
 )
 from av import VideoFrame  # noqa: E402
 
-from duck.video import Camera  # noqa: E402
+from microduck.video import Camera  # noqa: E402
 
 
 class LeftEdgeWhite(VideoStreamTrack):
@@ -68,7 +68,7 @@ def test_the_offer_is_answered_and_pictures_come_back_upright(robot, caplog):
         camera.on_media({"type": "peer", "sdp": sdp})
         # The robot trickles its candidates too, by line index and nothing else.
         line = next(x for x in sdp["sdp"].splitlines() if x.startswith("a=candidate:"))
-        with caplog.at_level(logging.WARNING, logger="duck.video"):
+        with caplog.at_level(logging.WARNING, logger="microduck.video"):
             camera.on_media({"type": "peer", "ice": {"candidate": line[2:], "sdpMLineIndex": 0}})
 
             deadline = time.monotonic() + 10

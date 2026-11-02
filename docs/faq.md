@@ -74,7 +74,7 @@ Space signs the visitor in with `hf_oauth`, and the service only ever shows an a
 it owns. Nothing is configured on the robot and no robot-side gate is involved —
 `remote-access-design.md` §7 is the argument for why that is enough.
 
-`sdk/duck/rendezvous.py` is the listing call: `ducks(token)` gives you what that account can
+`sdk/microduck/rendezvous.py` is the listing call: `ducks(token)` gives you what that account can
 reach.
 
 ## Can I test without a robot?
