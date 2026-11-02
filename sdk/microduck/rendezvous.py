@@ -211,22 +211,3 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
         else:
             theirs.append(f"{robot.name} ({robot.kind or 'no kind declared'})")
     return ours, theirs
-
-
-if __name__ == "__main__":
-    import os
-    import sys
-
-    from huggingface_hub import get_token
-
-    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
-    credential = os.environ.get("HF_TOKEN") or get_token()
-    if not credential:
-        sys.exit("no token: run `hf auth login`, or set HF_TOKEN")
-    try:
-        found, others = ducks(credential)
-    except RendezvousError as e:
-        sys.exit(str(e))
-    for duck in found:
-        print(f"  {duck.peer_id}  {duck.label()}")
-    print(f"\n{len(found)} duck(s)" + (f"; also listed: {', '.join(others)}" if others else ""))

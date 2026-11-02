@@ -11,6 +11,9 @@ with Duck() as duck:
 `pip install -e sdk`, and sign in once with `hf auth login` (or set `HF_TOKEN`). `Duck()` finds the
 one duck online on that account; `Duck("duck-c51b")` picks one by name when there are several.
 
+`python -m microduck [name]` is the first thing to run when a script gets no answer: it lists the
+account's ducks, opens the lane to one and asks it what it runs, and moves nothing.
+
 ## What it is
 
 The rendezvous control lane: the same JSON-RPC every other transport speaks, carried as HTTP to

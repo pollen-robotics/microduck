@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -206,6 +209,28 @@ def test_a_refusal_raises_with_the_robots_reason(rendezvous):
     with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
         with pytest.raises(RpcError, match="the robot is limp"):
             duck.enable(True)
+
+
+def test_python_m_microduck_runs_without_a_second_copy_of_a_module(rendezvous):
+    """`python -m microduck.wire` warned, because the package had imported `wire` already."""
+    rendezvous.answers["robot.policies"] = {"enabled": True, "slots": []}
+    env = {
+        **os.environ,
+        "HF_TOKEN": "hf_test",
+        "REACHY_CENTRAL_URL": rendezvous.url,
+        "PYTHONWARNINGS": "error::RuntimeWarning",
+    }
+    run = subprocess.run(
+        [sys.executable, "-m", "microduck", "duck-a"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    assert "RuntimeWarning" not in run.stderr
+    assert "duck-a" in run.stdout and "robot.policies:" in run.stdout
+    assert {c["method"] for c in rendezvous.calls} == {"robot.policies", "robot.skills"}
 
 
 def test_closing_fails_a_call_still_waiting(rendezvous):
