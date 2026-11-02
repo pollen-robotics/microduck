@@ -78,6 +78,8 @@ class FakeRendezvous:
                     answer = fake.answers.get(
                         call["method"], {"method": call["method"], "params": call.get("params")}
                     )
+                    if callable(answer):
+                        answer = answer(call)
                     fake.events.put(
                         {
                             "type": "peer",
@@ -209,6 +211,127 @@ def test_a_refusal_raises_with_the_robots_reason(rendezvous):
     with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
         with pytest.raises(RpcError, match="the robot is limp"):
             duck.enable(True)
+
+
+class Seat:
+    """`robot.policies` and `robot.do` for a duck in its seat, as `robotd` answers them: a toggle
+    is accepted whenever the policy drives, and one that lands mid-sit is dropped."""
+
+    def __init__(self, sitting: bool, still_settling: int = 0, rises_by_itself_after=None):
+        self.sitting = sitting
+        self.since = time.monotonic()
+        # How many toggles land while the sit is still settling, and so do nothing.
+        self.still_settling = still_settling
+        self.rises_by_itself_after = rises_by_itself_after
+        self.toggles = 0
+        self.homed = True
+        self.refuse: str | None = None
+
+    def enable(self, _call):
+        # Times run from here, where the robot's own would: connecting first takes a while.
+        self.since = time.monotonic()
+        return {"accepted": True, "reason": "enabled, driving"}
+
+    def policies(self, _call):
+        elapsed = time.monotonic() - self.since
+        if self.rises_by_itself_after is not None and elapsed >= self.rises_by_itself_after:
+            self.sitting = False
+        return {"enabled": True, "slots": [], "sitting": self.sitting, "homed": self.homed}
+
+    def do(self, call):
+        assert call["params"] == {"skill": "sit_toggle"}
+        self.toggles += 1
+        if self.refuse:
+            reason, self.refuse = self.refuse, None
+            return {"accepted": False, "reason": reason}
+        if self.toggles > self.still_settling:
+            self.sitting = False
+        return {"accepted": True}
+
+    def install(self, fake) -> None:
+        fake.answers["robot.policies"] = self.policies
+        fake.answers["robot.do"] = self.do
+        fake.answers["robot.enable"] = self.enable
+
+
+@pytest.fixture
+def quick_seat(monkeypatch):
+    monkeypatch.setattr("microduck.client.SEAT_SETTLE", 0.5)
+
+
+def test_stand_toggles_a_duck_that_is_on_and_sitting(rendezvous, quick_seat):
+    """`enable(True)` leaves a seated duck seated, so the toggle is what stands it."""
+    seat = Seat(sitting=True)
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    assert seat.toggles == 1 and not seat.sitting
+    assert [c["method"] for c in rendezvous.calls][0] == "robot.enable"
+
+
+def test_stand_sends_the_toggle_again_when_the_sit_was_still_settling(rendezvous, quick_seat):
+    """The robot accepts a toggle mid-sit and then ignores it, so an accepted toggle is not
+    proof the duck got up."""
+    seat = Seat(sitting=True, still_settling=1)
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    assert seat.toggles == 2 and not seat.sitting
+
+
+def test_stand_leaves_a_duck_standing_itself_up_alone(rendezvous, quick_seat):
+    """A duck turned on in its seat settles and rises by itself. A toggle on top would be a
+    second stand-up, or a sit once it is up."""
+    seat = Seat(sitting=True, rises_by_itself_after=0.2)
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    assert seat.toggles == 0
+
+
+def test_stand_never_toggles_a_standing_duck(rendezvous, quick_seat):
+    seat = Seat(sitting=False)
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    assert seat.toggles == 0
+
+
+def test_stand_gives_up_on_a_duck_that_stays_seated(rendezvous, quick_seat):
+    seat = Seat(sitting=True, still_settling=100)
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        with pytest.raises(RpcError, match="still sitting"):
+            duck.stand(timeout=1.2)
+
+
+def test_stand_waits_out_a_refusal_that_clears_by_itself(rendezvous, quick_seat):
+    seat = Seat(sitting=True)
+    seat.refuse = "the robot is still going to its home pose; try again in a moment"
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    assert seat.toggles == 2 and not seat.sitting
+
+
+def test_stand_does_not_toggle_before_the_duck_has_homed(rendezvous, quick_seat):
+    """`robot.do` refuses every skill until then, and `robot.policies` says when it is."""
+    seat = Seat(sitting=True)
+    seat.homed = False
+    seat.install(rendezvous)
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        with pytest.raises(RpcError, match="still sitting"):
+            duck.stand(timeout=1.2)
+    assert seat.toggles == 0
+
+
+def test_stand_on_a_robot_that_does_not_say_whether_it_sits_only_enables(rendezvous, caplog):
+    rendezvous.answers["robot.policies"] = {"enabled": True, "slots": []}
+    with Duck("duck-a", token="hf_test", base=rendezvous.url, timeout=5) as duck:
+        duck.stand()
+    methods = [c["method"] for c in rendezvous.calls]
+    assert "robot.enable" in methods and "robot.do" not in methods
+    assert "does not say whether it is sitting" in caplog.text
 
 
 def test_python_m_microduck_runs_without_a_second_copy_of_a_module(rendezvous):

@@ -51,6 +51,15 @@ with Duck() as duck:
         duck.move(vx=0.12)
 ```
 
+`stand()` gets the duck up with its policy driving, from off or from its seat. `enable(True)` alone
+stands a duck that was off, but one already on stays in its seat, which is where it goes when its
+pad goes away. `stand()` sends the `sit_toggle` that ends a sit, and only while `robot.policies`
+says it is sitting.
+
+**A connected pad wins.** `padd` writes the twist on every tick, zero when the stick is centred,
+and the robot keeps whichever twist came last, so with a pad on `move()` barely gets through. Turn
+the pad off to drive from a script, then `stand()`.
+
 `move` and `head` are notifications, as `duck-ipc-proto` says continuous intents are, so they
 wait for nothing. The robot zeroes the twist 500 ms after the last one, which is less than a round
 trip through the rendezvous, so `move` hands the twist to a thread that resends it until `stop()`,
