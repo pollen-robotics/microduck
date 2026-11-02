@@ -4,14 +4,6 @@
 is the short list of things that are easy to get backwards, and where the answer lives when they
 are not here.
 
-## No robot on the desk? Run it against MuJoCo
-
-There is usually no board. `scripts/duck-sim` runs the real daemons (`robotd`, `tofd --sim`,
-`mediad`, configd, updaterd) against a MuJoCo body — the same control loop, policies, `robotctl`,
-console and updater as a real duck; only the servo bus is faked. `status` and `monitor` are how you
-prove a daemon change works without hardware, rather than trusting `cargo test`, which cannot see
-the bus. The seam, what the twin is and is not, lives in [`docs/design/simulation.md`](docs/design/simulation.md).
-
 ## Docs own mechanisms; one page each
 
 `docs/README.md` assigns every mechanism to one design doc. When a fact belongs to a page listed
