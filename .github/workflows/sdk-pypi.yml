@@ -1,9 +1,10 @@
 # `microduck` on PyPI, so `pip install microduck` gets the Python SDK on any machine.
 #
-# On a tag `sdk-vX.Y.Z` only. The SDK's version is its own, in `sdk/pyproject.toml`, not the
-# workspace version, so it has its own tag rather than riding `daemon-v*` as `duckctl` does: a fix
-# to the SDK does not wait for a robot release, and a robot release does not publish an SDK that
-# did not change.
+# On a stable release tag only, `daemon-vX.Y.Z`, as `duckctl-pypi.yml` is, and with the same
+# version: the workspace version in `Cargo.toml`, stamped into `sdk/pyproject.toml` at build time,
+# so there is no second number to bump. The SDK speaks the proto, so one number says which SDK goes
+# with which robot, and a fix reaches PyPI the way it reaches a robot. Staging and dev tags are
+# not published; the stable tag that promotes them is.
 #
 # An sdist and a wheel. The SDK is pure Python, so the sdist builds anywhere and nothing compiles
 # on the user's machine either way.
@@ -12,14 +13,14 @@
 # PyPI naming this repository, this file and the `pypi` environment. `docs/project/ci-setup.md` has
 # the one-time setup.
 #
-# `workflow_dispatch` is for a run to repeat: start it from the tag (Use workflow from → Tags →
-# `sdk-vX.Y.Z`).
+# `workflow_dispatch` is for a tag a manual promotion created, which starts no workflow, or a run to
+# repeat: start it from the tag (Use workflow from → Tags → `daemon-vX.Y.Z`).
 name: microduck to PyPI
 
 on:
   push:
     tags:
-      - 'sdk-v*'
+      - 'daemon-v*'
   workflow_dispatch:
 
 permissions:
@@ -30,24 +31,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # A tag that disagrees with `sdk/pyproject.toml` would publish a version nobody released, and a
-  # PyPI version can never be taken back. Refused here, before anything is built.
+  # A tag that disagrees with `Cargo.toml` would publish a version nobody released, and a PyPI
+  # version can never be taken back. Refused here, before anything is built.
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: The tag is the SDK's version
+      - name: The tag is the workspace version
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -eu
           case "$TAG" in
-              sdk-v*) ;;
-              *) echo "::error::run this from an sdk-vX.Y.Z tag, not '$TAG'"; exit 1 ;;
+              daemon-v*) ;;
+              *) echo "::error::run this from a daemon-vX.Y.Z tag, not '$TAG'"; exit 1 ;;
           esac
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("sdk/pyproject.toml", "rb"))["project"]["version"])')"
-          if [ "${TAG#sdk-v}" != "$version" ]; then
-              echo "::error::$TAG but sdk/pyproject.toml says $version"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "${TAG#daemon-v}" != "$version" ]; then
+              echo "::error::$TAG but the workspace is $version in Cargo.toml"
               exit 1
           fi
           echo "publishing microduck $version" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -61,9 +62,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      # `sdk/pyproject.toml` says 0.0.0 and nothing else may: this is the one place its version is
+      # written, and a line it cannot find fails the build rather than publishing 0.0.0.
+      - name: Stamp the workspace version
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          import pathlib, re, tomllib
+          version = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          path = pathlib.Path("sdk/pyproject.toml")
+          text, n = re.subn(r'(?m)^version = "0\.0\.0"$', f'version = "{version}"', path.read_text())
+          if n != 1:
+              raise SystemExit('sdk/pyproject.toml has no `version = "0.0.0"` line to stamp')
+          path.write_text(text)
+          print(f"microduck {version}")
+          EOF
       - run: pip install build
       - run: python -m build sdk --outdir dist
-      - run: ls -l dist
+      - name: The files carry that version
+        run: |
+          set -eu
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          ls -l dist
+          test -f "dist/microduck-$version-py3-none-any.whl"
+          test -f "dist/microduck-$version.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: microduck-dist

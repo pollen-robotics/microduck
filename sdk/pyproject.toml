@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "microduck"
-version = "0.1.0"
+# The workspace version from `Cargo.toml`, stamped in by `sdk-pypi.yml` when a release is built, so
+# there is no number here to bump. A local install says 0.0.0.
+version = "0.0.0"
 description = "Drive a Microduck from a script, over the rendezvous control lane"
 readme = "README.md"
 license = "Apache-2.0"

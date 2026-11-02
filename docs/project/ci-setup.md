@@ -210,7 +210,7 @@ promote.yml            workflow_dispatch → _promote-release.yml
 dev.yml                every push: an unsigned-for-customers dev build, `team.dev` key
 _build-duckctl.yml     duckctl wheels + archives per platform           (called by dev.yml, duckctl-pypi.yml)
 duckctl-pypi.yml       tag daemon-v*: duckctl wheels → PyPI, for `uvx duckctl`, then the Homebrew formula
-sdk-pypi.yml           tag sdk-v*: the Python SDK, sdist + wheel → PyPI, for `pip install microduck`
+sdk-pypi.yml           tag daemon-v*: the Python SDK, sdist + wheel → PyPI, for `pip install microduck`
 ```
 
 The recipe lives in the two called workflows so the staging and stable paths cannot drift apart in
@@ -247,21 +247,21 @@ publishes nothing. Re-running is safe: files PyPI already has are skipped.
 
 ## `microduck` on PyPI
 
-`pip install microduck` installs the Python SDK in `sdk/`. `sdk-pypi.yml` publishes it on an
-`sdk-vX.Y.Z` tag push: an sdist and a wheel, both pure Python. The SDK's version is the one in
-`sdk/pyproject.toml`, not the workspace version, which is why it has a tag of its own, and the
-workflow refuses a tag that disagrees with it.
+`pip install microduck` installs the Python SDK in `sdk/`. `sdk-pypi.yml` publishes it on every
+`daemon-v*` tag push, beside `duckctl`: an sdist and a wheel, both pure Python. Its version is the
+workspace version, stamped into `sdk/pyproject.toml` (which says 0.0.0) at build time, so a release
+needs nothing bumped for it, and the workflow refuses a tag that disagrees with `Cargo.toml`.
 
 No token here either. The one-time setup, **not done yet**:
 
 1. On PyPI: *Your projects → Publishing → Add a new pending publisher*. Fill in project
    `microduck`, owner `pollen-robotics`, repository `microduck`, workflow `sdk-pypi.yml`,
    environment `pypi`. The name was free on 2026-11-02, and the first upload creates the project.
-2. The `pypi` environment exists already, for `duckctl`. If it is ever limited to some tags, it
-   needs `sdk-v*` as well.
+2. The `pypi` environment exists already, for `duckctl`.
 
-To release: bump `version` in `sdk/pyproject.toml`, merge, then tag `sdk-v<that version>` on
-`main` and push the tag. Re-running is safe: files PyPI already has are skipped.
+The first upload is the first `daemon-v*` tag cut after this workflow merged. A **manual
+promotion** needs `gh workflow run sdk-pypi --ref daemon-v<version>` as well, for the reason
+`duckctl` does. Re-running is safe: files PyPI already has are skipped.
 
 ## `duckctl` on Homebrew
 
