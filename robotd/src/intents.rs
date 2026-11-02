@@ -216,6 +216,9 @@ pub struct Intents {
     footsteps: ArcSwapOption<Vec<duck_ipc_proto::Footstep>>,
     /// A goal to walk to (`robot.footstepGoal`), or `None`. Last writer wins.
     footstep_goal: ArcSwapOption<duck_ipc_proto::FootstepGoalParams>,
+    /// The target the next `ground_grasp_2` sees in its head-command slots (`robot.do "ground_grasp_2:dx,dy,c,s"`):
+    /// the object's offset from the grasp spot and its axis, for a grasp trained with them (the ep5 rook grasp).
+    grasp_target: ArcSwapOption<[f64; 4]>,
     /// Pending one-shot sound tags, a bitmask taken once per tick like the skills.
     sounds: std::sync::atomic::AtomicU32,
     /// The wheee hold, as a stamped level: `padd` re-notifies while the trigger is down,
@@ -314,6 +317,7 @@ impl Intents {
             policy_change: ArcSwapOption::empty(),
             footsteps: ArcSwapOption::empty(),
             footstep_goal: ArcSwapOption::empty(),
+            grasp_target: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             reboot_motors: Mutex::new(None),
             wheee: ArcSwap::from_pointee(Stamped {
@@ -371,6 +375,16 @@ impl Intents {
     pub fn request_ground_grasp_2(&self) {
         self.skills
             .fetch_or(SKILL_GROUND_GRASP_2, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The target for the next `ground_grasp_2` (see the field).
+    pub fn set_grasp_target(&self, target: [f64; 4]) {
+        self.grasp_target.store(Some(Arc::new(target)));
+    }
+
+    /// Take the pending grasp target, if any.
+    pub fn take_grasp_target(&self) -> Option<[f64; 4]> {
+        self.grasp_target.swap(None).map(|t| *t)
     }
 
     /// Queue the sit toggle, likewise.

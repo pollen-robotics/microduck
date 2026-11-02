@@ -383,6 +383,8 @@ pub struct Controller {
     ground_pick: Option<f64>,
     /// Which grasp that pick is, if one: the same phase on the grasp's network, with its beak.
     grasp: Option<Grasp>,
+    /// The second grasp's head-command slots for this cycle (see [`Self::start_ground_grasp_2_at`]).
+    grasp_target: [f64; 4],
     /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
     /// limp-fall predictor and any active skill makes it true. That was uncontroversial when
     /// every one-shot was under a second; a skill configured to hold for ten is a robot with no
@@ -426,6 +428,7 @@ impl Controller {
             previous: None,
             ground_pick: None,
             grasp: None,
+            grasp_target: [0.0; 4],
             active: None,
             sit: Sit::Up,
             sit_settle: 0.0,
@@ -655,6 +658,7 @@ impl Controller {
         self.previous = from.previous;
         self.ground_pick = from.ground_pick;
         self.grasp = from.grasp;
+        self.grasp_target = from.grasp_target;
         self.active = from.active;
         self.sit = from.sit;
         self.sit_settle = from.sit_settle;
@@ -780,7 +784,15 @@ impl Controller {
 
     /// Start the second grasp, likewise.
     pub fn start_ground_grasp_2(&mut self) -> Result<(), &'static str> {
-        self.start_grasp(Grasp::Second)
+        self.start_ground_grasp_2_at([0.0; 4])
+    }
+
+    /// Start the second grasp with a target in its head-command slots (the ep5 rook grasp: the rook's offset from
+    /// the grasp spot and its axis). Zeros = what every other grasp is trained with.
+    pub fn start_ground_grasp_2_at(&mut self, target: [f64; 4]) -> Result<(), &'static str> {
+        self.start_grasp(Grasp::Second)?;
+        self.grasp_target = target;
+        Ok(())
     }
 
     fn start_grasp(&mut self, grasp: Grasp) -> Result<(), &'static str> {
@@ -1064,7 +1076,14 @@ impl Controller {
             };
             match self.grasp {
                 Some(Grasp::First) => (Net::GroundGrasp, c, "ground_grasp".into()),
-                Some(Grasp::Second) => (Net::GroundGrasp2, c, "ground_grasp_2".into()),
+                Some(Grasp::Second) => (
+                    Net::GroundGrasp2,
+                    Command {
+                        head: self.grasp_target,
+                        ..c
+                    },
+                    "ground_grasp_2".into(),
+                ),
                 None => (Net::GroundPick, c, "ground_pick".into()),
             }
         } else {

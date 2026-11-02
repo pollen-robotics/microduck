@@ -2768,7 +2768,11 @@ async fn control_loop<T: RobotIo>(
                         outcome("ground_grasp", controller.start_ground_grasp());
                     }
                     if requests.ground_grasp_2 {
-                        outcome("ground_grasp_2", controller.start_ground_grasp_2());
+                        let target = intents.take_grasp_target().unwrap_or([0.0; 4]);
+                        if target != [0.0; 4] {
+                            tracing::warn!(?target, "ground_grasp_2 target");
+                        }
+                        outcome("ground_grasp_2", controller.start_ground_grasp_2_at(target));
                     }
                     if requests.sit_toggle {
                         match controller.sit_toggle() {
@@ -5434,6 +5438,22 @@ fn footstep_refusal(state: &RobotState, intents: &Intents) -> Option<proto::Inte
     }
 }
 
+/// `dx,dy,c,s` -> the four finite numbers of a grasp target, each within what the rook grasp was trained on.
+fn parse_grasp_target(text: &str) -> Option<[f64; 4]> {
+    let v: Vec<f64> = text
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let t: [f64; 4] = v.try_into().ok()?;
+    let ok = t.iter().all(|x| x.is_finite())
+        && t[0].abs() <= 0.06
+        && t[1].abs() <= 0.06
+        && t[2].abs() <= 1.0
+        && t[3].abs() <= 1.0;
+    ok.then_some(t)
+}
+
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     let policies = state.policies.load();
     match skill {
@@ -5448,6 +5468,18 @@ fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
         "ground_grasp_2" if policies.ground_grasp_2.is_some() => {
             intents.request_ground_grasp_2();
             true
+        }
+        // The rook grasp (ep5): `ground_grasp_2:dx,dy,c,s` hands the grasp the object's pose in its head-command slots
+        // (offset from the grasp spot in metres, lying axis as cos 2b / sin 2b; 0, 0 = standing).
+        name if name.starts_with("ground_grasp_2:") && policies.ground_grasp_2.is_some() => {
+            match parse_grasp_target(&name["ground_grasp_2:".len()..]) {
+                Some(target) => {
+                    intents.set_grasp_target(target);
+                    intents.request_ground_grasp_2();
+                    true
+                }
+                None => false,
+            }
         }
         "sit_toggle" if policies.sitstand.is_some() => {
             intents.request_sit_toggle();
@@ -7262,6 +7294,25 @@ mod tests {
     /// A skill whose network was never configured is refused at the door with a reason —
     /// not queued for a loop that would silently drop it. And a configured one is queued:
     /// the request must reach the intents for the loop to take.
+    /// The rook grasp's target rides the skill name; anything else is not a target.
+    #[test]
+    fn grasp_targets_parse_inside_their_range() {
+        assert_eq!(
+            parse_grasp_target("0.012,-0.004,0.94,0.34"),
+            Some([0.012, -0.004, 0.94, 0.34])
+        );
+        assert_eq!(parse_grasp_target(" 0, 0, 0, 0 "), Some([0.0; 4]));
+        assert_eq!(
+            parse_grasp_target("0.1,0,0,0"),
+            None,
+            "10 cm off the spot is not a grasp"
+        );
+        assert_eq!(parse_grasp_target("0,0,1.5,0"), None);
+        assert_eq!(parse_grasp_target("0,0,0"), None);
+        assert_eq!(parse_grasp_target("0,0,0,nan"), None);
+        assert_eq!(parse_grasp_target("a,b,c,d"), None);
+    }
+
     #[test]
     fn robot_do_refuses_what_is_not_configured_and_queues_what_is() {
         let s = state(); // default params: every walk-mode skill configured
