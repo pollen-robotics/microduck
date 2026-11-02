@@ -279,6 +279,7 @@ trait Adapter {
 trait Device {
     fn connect(&self) -> zbus::Result<()>;
     fn pair(&self) -> zbus::Result<()>;
+    fn cancel_pairing(&self) -> zbus::Result<()>;
 
     #[zbus(property)]
     fn set_trusted(&self, on: bool) -> zbus::Result<()>;
@@ -792,6 +793,7 @@ impl BlueZ {
                 bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
             };
             if !paired {
+                cancel_timed_out_pairing(&proxy).await;
                 return Err((
                     proto::PadPairFailure::Timeout,
                     "the pad did not finish pairing".to_owned(),
@@ -868,6 +870,7 @@ impl BlueZ {
                     bonded = self.wait_until_paired(&device.mac, BOND_TIMEOUT) => bonded,
                 };
                 if !paired {
+                    cancel_timed_out_pairing(&proxy).await;
                     return Err((
                         proto::PadPairFailure::Timeout,
                         "the pad did not finish pairing".to_owned(),
@@ -916,6 +919,23 @@ fn needs_reconnect(devices: &[Snapshot]) -> Vec<&Snapshot> {
         .iter()
         .filter(|d| d.paired && d.trusted && !d.connected && d.is_classic() && d.is_gamepad())
         .collect()
+}
+
+/// End a bond attempt that timed out. Dropping the `Pair` call's future does not cancel it in
+/// BlueZ, which goes on pairing after the caller has given up and answers the next attempt `Busy`.
+/// Removes no association; a failure is logged and not treated as a recovered radio.
+async fn cancel_timed_out_pairing(device: &DeviceProxy<'_>) {
+    match tokio::time::timeout(Duration::from_secs(2), device.cancel_pairing()).await {
+        Ok(Ok(())) => tracing::info!("cancelled the timed-out pairing"),
+        Ok(Err(error)) => tracing::warn!(%error, "could not cancel the timed-out pairing"),
+        Err(_) => tracing::warn!("cancelling the timed-out pairing timed out"),
+    }
+}
+
+/// `StartDiscovery` right after the adapter powers up, before BlueZ is ready for it.
+fn is_not_ready(error: &zbus::Error) -> bool {
+    matches!(error, zbus::Error::MethodError(name, _, _)
+        if name.as_str() == "org.bluez.Error.NotReady")
 }
 
 /// Collapse a pad that presents as two devices into the one worth bonding.
@@ -997,11 +1017,20 @@ impl Pads for BlueZ {
 
         // Discovery has to be running for a first-time bond to resolve an address. A failure here
         // is worth reporting rather than working around: without it the search below can only ever
-        // find devices already in BlueZ's cache.
-        adapter
-            .start_discovery()
-            .await
-            .map_err(|e| format!("cannot start Bluetooth discovery: {e}"))?;
+        // find devices already in BlueZ's cache. The one exception is `NotReady` just after the
+        // adapter powers up (seen on the beta after a bond timeout), retried for a few seconds.
+        crate::pad::discovery_when_ready(
+            || async {
+                adapter.start_discovery().await.map_err(|e| {
+                    (
+                        is_not_ready(&e),
+                        format!("cannot start Bluetooth discovery: {e}"),
+                    )
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await?;
         tracing::info!(?timeout, "looking for a gamepad in pairing mode");
 
         let found = self.find(mac, timeout).await;

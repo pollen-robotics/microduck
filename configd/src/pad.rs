@@ -29,6 +29,33 @@ use std::time::Duration;
 use async_trait::async_trait;
 use duck_ipc_proto as proto;
 
+/// Start discovery, retrying while BlueZ answers `NotReady` — the adapter is still powering up —
+/// within `budget`. `start` returns whether its error is that transient one. Any other error comes
+/// back at once, and the budget also bounds a D-Bus call that never answers.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn discovery_when_ready<F, Fut>(
+    mut start: F,
+    budget: Duration,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), (bool, String)>>,
+{
+    tokio::time::timeout(budget, async {
+        loop {
+            match start().await {
+                Ok(()) => return Ok(()),
+                Err((false, detail)) => return Err(detail),
+                Err((true, _)) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err("Bluetooth discovery did not become ready in time; is the adapter powered?".into())
+    })
+}
+
 /// What went wrong, in terms a caller can act on.
 pub type PadResult<T> = Result<T, String>;
 
@@ -539,5 +566,58 @@ mod tests {
         assert_eq!(pair_timeout(Some(30)), Duration::from_secs(30));
         assert_eq!(pair_timeout(Some(0)), Duration::ZERO);
         assert_eq!(pair_timeout(Some(9_999)), MAX_PAIR_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn not_ready_is_retried_and_other_errors_are_not() {
+        let mut calls = 0;
+        discovery_when_ready(
+            || {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Err((true, "NotReady".into()))
+                } else {
+                    Ok(())
+                })
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+
+        let mut calls = 0;
+        let error = discovery_when_ready(
+            || {
+                calls += 1;
+                std::future::ready(Err((false, "NotAuthorized".into())))
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error, "NotAuthorized");
+    }
+
+    #[tokio::test]
+    async fn a_radio_that_stays_unready_or_never_answers_is_bounded() {
+        let unready = || std::future::ready(Err((true, "NotReady".into())));
+        assert!(
+            discovery_when_ready(unready, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
+        let hung = || std::future::pending();
+        assert!(
+            discovery_when_ready(hung, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
     }
 }
