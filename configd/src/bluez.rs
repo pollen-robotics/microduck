@@ -918,6 +918,16 @@ async fn cancel_timed_out_pairing(device: &DeviceProxy<'_>) {
     }
 }
 
+/// Whether `pad.status` lists this device: bonded, and a pad by its radio or name — or, for one
+/// paired by address that neither identifies, because the kernel made an input device of it.
+///
+/// Not every bonded device. A phone with the app open is bonded and connected too, and `nfcd`
+/// refuses a tag while any listed device is connected, so listing it would make every tag do
+/// nothing for as long as the app is open. A phone never becomes an input device.
+fn is_listed(device: &Snapshot, hid_recognized: Option<bool>) -> bool {
+    device.paired && (device.is_gamepad() || hid_recognized == Some(true))
+}
+
 /// Bonded pads worth re-paging: trusted, a gamepad, on the classic transport, link down.
 ///
 /// Empty while any pad is connected — the pad that is driving wins, and re-paging another one
@@ -1062,9 +1072,10 @@ impl Pads for BlueZ {
             .filter_map(|(p, interfaces)| {
                 Snapshot::read(p, interface(interfaces, "org.bluez.Device1")?)
             })
-            // Explicit-address pairing can admit hardware outside the name heuristic.
-            .filter(|device| device.paired)
-            .map(|device| device.as_pad())
+            .filter_map(|device| {
+                let pad = device.as_pad();
+                is_listed(&device, pad.hid_recognized).then_some(pad)
+            })
             .collect();
         pads.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.mac.cmp(&b.mac)));
         Ok(proto::PadStatusResult {
@@ -1466,6 +1477,29 @@ mod tests {
         let driving = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), true);
         let idle = bonded("78:86:2E:BB:13:28", "Pro Controller", Some(0x2508), false);
         assert!(needs_reconnect(&[driving, idle]).is_empty());
+    }
+
+    /// A bonded phone is not a pad, so a tag still pairs while the app is connected; a pad paired
+    /// by address that the name and class miss is listed once it is an input device.
+    #[test]
+    fn status_lists_pads_and_input_devices_but_not_a_connected_phone() {
+        let phone = bonded("4C:2E:5E:11:22:33", "Pierre's phone", Some(0x5a020c), true);
+        assert!(!is_listed(&phone, Some(false)));
+        assert!(!is_listed(&phone, None));
+
+        let pad = bonded("98:B6:E9:28:06:09", "Pro Controller", Some(0x2508), true);
+        assert!(is_listed(&pad, Some(false)));
+        assert!(is_listed(&pad, None));
+
+        let unnamed = bonded("E4:17:D8:00:00:01", "", None, true);
+        assert!(!is_listed(&unnamed, Some(false)));
+        assert!(is_listed(&unnamed, Some(true)));
+
+        let seen_only = Snapshot {
+            paired: false,
+            ..bonded("98:B6:E9:28:06:0A", "Pro Controller", Some(0x2508), false)
+        };
+        assert!(!is_listed(&seen_only, Some(true)));
     }
 
     /// LE pads page us themselves; untrusted bonds and non-pads are not ours to page.
