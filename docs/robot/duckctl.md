@@ -142,6 +142,12 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
+`ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
+(`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
+second, the scan is skipped. If nothing does — the robot moved, is off, or the laptop is on another
+network — it scans as before and remembers the new address. A lease handed to another machine shows
+up as ssh's host-key warning; `duckctl ip` always scans, and refreshes the file as it does.
+
 Files go the same way:
 
 ```bash
@@ -493,6 +499,51 @@ duckctl --name <robot-name> update watch
 It prints where the update in flight has got to and then everything that follows. It never receives
 a reply, so it ends with Ctrl-C.
 
+## The operating system
+
+`update` above installs the daemon release. `os` installs the whole root filesystem, into the A/B
+slot the robot is not running, and every change ends in a reboot. Only a robot flashed with a
+`microduck_yocto` image has slots; any other answers error 15, "cannot be updated over the air".
+
+Which build each slot holds, what the robot's channel offers, and how an update is going:
+
+```bash
+duckctl --name <robot-name> os status
+```
+
+Ask the channel what is newest, changing nothing:
+
+```bash
+duckctl --name <robot-name> os check
+```
+
+Install the channel's newest:
+
+```bash
+duckctl --name <robot-name> os apply
+```
+
+Or a given build from `os status`'s `builds` list, older ones included:
+
+```bash
+duckctl --name <robot-name> os apply --build 20261028093000
+```
+
+`apply` answers once the download has started, not when it is done. The robot then downloads,
+installs and reboots by itself, and is gone for a minute or so. Run `os status` to follow it, and
+again after the reboot: `last_result` says whether the new OS came up, or whether the robot went
+back to the old slot because the new one did not pass its health check.
+
+Going back to the other slot as it is, with no download:
+
+```bash
+duckctl --name <robot-name> os switch
+```
+
+Both refuse while the robot is moving, or while someone is watching it remotely —
+`--interrupt-sessions` lifts the second — and while another update of either kind is running.
+[`updater-design.md`](../design/updater-design.md) §11 has the mechanism.
+
 ## The Hugging Face account
 
 ```
@@ -594,7 +645,8 @@ Install the newest official set — or `--version v1` to go back:
 duckctl policy update
 ```
 
-Download somebody else's, without running it:
+Download somebody else's, without running it. The robot refuses until
+`policy.allow_community` is `true` in `sudo robotctl configure` on it:
 
 ```bash
 duckctl policy fetch RemiFabre/microduck-flamingo-cycle

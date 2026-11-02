@@ -423,6 +423,25 @@ who can edit `robotd.toml` can name a directory whatever they like, and anyone w
 can run whatever they like anyway. What stands between a bad policy and a broken robot is §2's
 sandbox.
 
+**Community policies are off until somebody turns them on.** `[policy] allow_community`, `false`
+by default, decides whether `policy.fetch` will download from a repo outside `pollen-robotics`;
+refused, it answers `PERMISSION_DENIED` naming the key, before any request is made. The check is
+in `updaterd`'s fetch, the one place every transport and client reaches, and it reads the key
+from `robotd.toml` before each fetch, so `robotctl configure` applies it with no restart. Where
+the path is only a label, the org is a real check here: only members of `pollen-robotics` can
+publish under it on the Hub.
+
+It gates the **download and nothing else**. A slot that already points at a community policy
+keeps running when the key is turned off, and `robot.loadPolicy` still takes a path into the
+library. Gating the run as well was considered and rejected: turning the key off, or a release
+shipping it off, would then change what a robot runs at its next start, and the sandbox, not the
+org, is still what keeps a robot safe from a policy.
+
+**The vet book records it.** When a load or skill change goes live and a slot or skill starts or
+stops running a community policy, `robotd` writes a dated `policy` event naming
+`org/name@revision`. Official changes are not logged, because the events list is capped. A shared
+book is public, so the repos a duck ran are visible to anyone holding the link.
+
 **A repo carries one `policy.onnx`.** That convention already existed on the Hub before this was
 built — every published microduck policy has exactly one `.onnx` beside a README and a manifest —
 so the fetch takes the sole `.onnx` and refuses a repo with several by naming them. Choosing wrong
@@ -738,6 +757,9 @@ its meaning for the things that genuinely are models and not control policies, s
 | …but never one the robot is using, and nothing at all if it did not answer | Silence is a `robotd` that is down, not one using none of them (§8) |
 | The seeder never replaces an installed set | Otherwise a daemon update silently reverts a gait chosen with `policy update` (§9) |
 | Origin is the org in the path | Honest without a lookup, and a label rather than a boundary (§9.2) |
+| Community fetches are opt-in, `[policy] allow_community` | A robot out of the box only downloads what we published (§9.2) |
+| The vet book dates community policies coming and going | Which stranger's network a duck ran is the question; official changes would crowd the capped list (§9.2) |
+| …and the key gates the download, not the run | Turning it off must not change what a robot runs at its next start (§9.2) |
 | The manifest can refuse but never bless | It is a stranger's claim; the shape gate is the check (§9.2) |
 | A repo with two policies is a refusal | Guessing means running the wrong network on a real robot (§9.2) |
 | Seeds are pruned to the current and previous | Unbounded 7 MB-per-release growth; the previous one is the hand-recovery after a rollback (§9) |

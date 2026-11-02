@@ -982,6 +982,51 @@ mod tests {
         assert_eq!(origin_of_repo("nonsense"), "community");
     }
 
+    /// With community policies off, a stranger's repo is refused before anything is requested —
+    /// the library is not even created — and the refusal says how to turn them on.
+    #[tokio::test]
+    async fn a_community_fetch_is_refused_unless_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let library = tmp.path().join("library");
+        let err = fetch(
+            &library,
+            false,
+            "RemiFabre/microduck-flamingo-cycle",
+            None,
+            None,
+            Expectations::here(None),
+            None,
+        )
+        .await
+        .expect_err("community is off");
+
+        assert!(matches!(err, Error::CommunityPoliciesOff(_)), "{err:?}");
+        assert_eq!(err.code(), crate::proto::code::PERMISSION_DENIED);
+        let message = err.to_string();
+        assert!(message.contains("allow_community = true"), "{message}");
+        assert!(message.contains("robotctl configure"), "{message}");
+        assert!(!library.exists(), "nothing was written");
+    }
+
+    /// The shape check still comes first: `nonsense` is not a repo at all, and saying it is a
+    /// community one would send the reader to the wrong setting.
+    #[tokio::test]
+    async fn a_malformed_repo_is_malformed_before_it_is_community() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = fetch(
+            tmp.path(),
+            false,
+            "nonsense",
+            None,
+            None,
+            Expectations::here(None),
+            None,
+        )
+        .await
+        .expect_err("not org/name");
+        assert!(err.to_string().contains("not an org/name repo"), "{err}");
+    }
+
     /// One `.onnx` is the answer, and it is the answer for every microduck policy published so
     /// far — they all carry a single `policy.onnx` beside a README and a manifest.
     #[test]
@@ -1270,8 +1315,12 @@ fn sole_policy(files: &[String], repo: &str) -> Result<String, Error> {
 }
 
 /// Fetch one policy into the library and say what it turned out to be.
+///
+/// `allow_community` is `[policy] allow_community` in `robotd.toml`: without it, a repo outside
+/// [`OFFICIAL_ORG`] is refused before anything is requested.
 pub async fn fetch(
     library: &Path,
+    allow_community: bool,
     repo: &str,
     revision: Option<&str>,
     file: Option<&str>,
@@ -1287,6 +1336,11 @@ pub async fn fetch(
         if part.is_empty() || part.contains(['.', '/', '\\']) {
             return Err(Error::Network(format!("{repo} is not an org/name repo")));
         }
+    }
+    // After the shape check, so a malformed repo gets the error that says so; before the first
+    // request, so a refusal costs nothing and is the same answer offline.
+    if !allow_community && origin_of_repo(repo) != "official" {
+        return Err(Error::CommunityPoliciesOff(repo.to_owned()));
     }
     let revision = revision.unwrap_or("main");
     if revision.contains(['/', '\\']) || revision.starts_with('.') {

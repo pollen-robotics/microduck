@@ -610,6 +610,96 @@ fn become_program(program: &str, argv: &[String]) -> Result<(), Box<dyn std::err
     }
 }
 
+/// How long a remembered address gets to answer on port 22 before the radio is turned on instead.
+///
+/// A robot on the same LAN answers a SYN in milliseconds; this is generous for wifi and still a
+/// tenth of [`SCAN_TIME`], which is what it is saving.
+const REMEMBERED_PROBE: Duration = Duration::from_millis(800);
+
+/// How many robots' addresses are remembered. A bench, not a fleet.
+const REMEMBERED_ROBOTS: usize = 16;
+
+/// Where the last address of each robot is kept: `$XDG_CACHE_HOME/duckctl/addresses`, else
+/// `~/.cache/duckctl/addresses`, else under `%LOCALAPPDATA%`.
+///
+/// A cache in the strict sense — deleting it costs one scan and nothing else — so it goes where
+/// caches go rather than beside configuration.
+fn remembered_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
+    Some(base.join("duckctl").join("addresses"))
+}
+
+/// The remembered address for `wanted`, or for whichever robot was reached last when nobody named
+/// one — the same "no name, first one wins" rule the scan follows, with the last run as "first".
+///
+/// One line per robot, most recent first: the address, a space, and the name it advertised under.
+/// Address first because a macOS name can have spaces in it (`radxa-zero3 [duck-c51b]`).
+fn recall(contents: &str, wanted: Option<&str>) -> Option<(Ipv4Addr, String)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (address, name) = line.split_once(' ')?;
+            Some((address.parse().ok()?, name.to_owned()))
+        })
+        .find(|(_, name)| wanted.is_none_or(|wanted| answers_to(name, wanted)))
+}
+
+/// `contents` with `name` at `address` moved to the top, and any older line for that robot gone.
+fn remembered(contents: &str, name: &str, address: &str) -> String {
+    let mut lines = vec![format!("{address} {name}")];
+    lines.extend(
+        contents
+            .lines()
+            .filter(|line| line.split_once(' ').is_some_and(|(_, other)| other != name))
+            .take(REMEMBERED_ROBOTS - 1)
+            .map(str::to_owned),
+    );
+    lines.join("\n") + "\n"
+}
+
+/// Note where a robot was found, for the next `ssh` or `scp` to try before scanning.
+///
+/// Best effort, and silent when it fails: a read-only home costs the next run a scan, which is what
+/// every run cost before this existed.
+fn remember(name: &str, address: &str) {
+    let Some(path) = remembered_path() else {
+        return;
+    };
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, remembered(&contents, name, address));
+}
+
+/// The remembered address for the target, if something there still answers on ssh's port.
+///
+/// **Only for `ssh` and `scp`**, because they are the commands that check what they reach: a robot
+/// whose lease went to another machine is a host-key warning from ssh, not a silent wrong answer.
+/// `ip` and `open` would print or browse to whatever holds the address now, so they always scan —
+/// and refresh this file as they do.
+///
+/// Nothing answering is the case this exists to fall through: the robot moved, is off, or this
+/// laptop is on another network. The scan then runs exactly as it would have, and records the new
+/// address.
+fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
+    let contents = std::fs::read_to_string(remembered_path()?).ok()?;
+    let (address, name) = recall(&contents, target.wanted())?;
+    let socket = std::net::SocketAddr::from((address, 22));
+    match std::net::TcpStream::connect_timeout(&socket, REMEMBERED_PROBE) {
+        Ok(_) => Some((address, name)),
+        Err(_) => {
+            eprintln!("{name} is no longer at {address}; scanning instead");
+            None
+        }
+    }
+}
+
 /// Where the console is, given where the robot is.
 ///
 /// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
@@ -1088,6 +1178,13 @@ enum Command {
     /// Updates: what is available, installing it, and going back.
     #[command(subcommand)]
     Update(Update),
+    /// The operating system: which build each A/B slot holds, installing another, going back.
+    ///
+    /// Not `update`, which installs the daemon release. This is the whole root filesystem, from
+    /// the channel the robot follows, and every change ends in a reboot. Only a robot flashed with
+    /// a `microduck_yocto` image has slots; any other answers that it cannot.
+    #[command(subcommand)]
+    Os(Os),
     /// Name, serial and uptime.
     Info,
     /// Play this robot's quack — the loudest way to tell ducks apart.
@@ -1441,6 +1538,40 @@ enum Update {
     Watch,
 }
 
+/// `os.*`: the robot's A/B root filesystem.
+#[derive(Subcommand)]
+enum Os {
+    /// Which build each slot holds, what the channel offers, and how an update is going.
+    ///
+    /// The command to repeat while an update runs, and the first one after the reboot it ends
+    /// in: `last_result` says whether the new OS came up or the robot went back to the old one.
+    Status,
+    /// Ask the channel what is newest. Changes nothing.
+    Check,
+    /// Download a build, install it to the other slot and reboot into it.
+    ///
+    /// Answers once the download has started; the robot then reboots by itself when the install
+    /// is done, and this tool's next connection finds it on the new slot. If the new slot does
+    /// not come up healthy, the robot boots the old one again.
+    Apply {
+        /// A build from `os status`'s `builds`, by id (`20261028093000`), older ones included.
+        /// Omit for the channel's newest.
+        #[arg(long, value_name = "BUILD")]
+        build: Option<String>,
+        /// Go ahead even if someone is watching the robot remotely; their session drops.
+        #[arg(long)]
+        interrupt_sessions: bool,
+    },
+    /// Reboot into the other slot as it is, downloading nothing: the undo of an OS update.
+    ///
+    /// Only a slot that last booted healthy. `os status`'s `other` says which build that is.
+    Switch {
+        /// Go ahead even if someone is watching the robot remotely; their session drops.
+        #[arg(long)]
+        interrupt_sessions: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum Wifi {
     /// What the wifi is doing — SSID, signal, addresses.
@@ -1514,6 +1645,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // own terms, and finding the robot first would charge eight seconds for the privilege.
     if let Command::Scp { paths, .. } = &cli.command {
         scp_refusal(paths)?;
+    }
+
+    // The last address this robot was found at, before the eight seconds: a laptop reaches the
+    // same robot at the same address nearly every time. `recall_reachable` says why only these two.
+    if matches!(cli.command, Command::Ssh { .. } | Command::Scp { .. })
+        && let Some((address, name)) = recall_reachable(&target)
+    {
+        eprintln!("{name} at {address}, remembered from the last run");
+        return deliver(&cli.command, &address.to_string());
     }
 
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
@@ -1688,7 +1828,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // which a new lease has already broken ssh.
     if resolving {
         match choose(std::mem::take(&mut addresses), &target) {
-            Ok((Address::At(address), _)) => return deliver(&cli.command, &address.to_string()),
+            Ok((Address::At(address), name)) => {
+                let address = address.to_string();
+                remember(&name, &address);
+                return deliver(&cli.command, &address);
+            }
             // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
             // that did not say. Asking `net.status` over a connection would return the same nothing
             // more slowly, so this answers now.
@@ -1922,7 +2066,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
-                    Some(address) => deliver(&cli.command, address),
+                    Some(address) => {
+                        remember(&name, address);
+                        deliver(&cli.command, address)
+                    }
                     None => Err(no_address(&name).into()),
                 };
             }
@@ -1970,6 +2117,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("{note}");
                 }
                 if let Some(note) = account_note(&cli.command, &value) {
+                    eprintln!("{note}");
+                }
+                if let Some(note) = os_note(&cli.command, &value) {
                     eprintln!("{note}");
                 }
                 Ok(())
@@ -2303,6 +2453,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Update(update) => return update_request_line(update),
+        Command::Os(os) => return os_request_line(os),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
         Command::Quack => (
             proto::method::ROBOT_SOUND,
@@ -2513,6 +2664,37 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
     Ok((serde_json::to_string(&request)?, timeout))
 }
 
+/// The `os` commands, from `duck_ipc_proto`'s types for `update_request_line`'s reason.
+fn os_request_line(os: &Os) -> Result<(String, Duration), Box<dyn std::error::Error>> {
+    use duck_ipc_proto as proto;
+
+    let (call, timeout) = match os {
+        Os::Status => (proto::Call::OsStatus, REPLY_TIMEOUT),
+        // Two downloads from the channel.
+        Os::Check => (proto::Call::OsCheck, SLOW_REPLY_TIMEOUT),
+        // The robot answers once the download is under way, which takes the channel's two small
+        // fetches first — seconds, or half a minute on a slow mirror.
+        Os::Apply {
+            build,
+            interrupt_sessions,
+        } => (
+            proto::Call::OsApply(proto::OsApplyParams {
+                build: build.clone(),
+                interrupt_sessions: *interrupt_sessions,
+            }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+        Os::Switch { interrupt_sessions } => (
+            proto::Call::OsSwitch(proto::OsSwitchParams {
+                interrupt_sessions: *interrupt_sessions,
+            }),
+            SLOW_REPLY_TIMEOUT,
+        ),
+    };
+    let request = proto::Request::call(proto::Id::Number(1), &call);
+    Ok((serde_json::to_string(&request)?, timeout))
+}
+
 /// The update commands, built from `duck_ipc_proto`'s own types rather than as hand-written JSON.
 ///
 /// `update.apply`'s target is an externally tagged enum — `"latest"`, `{"exact":"0.5.1"}`,
@@ -2704,8 +2886,23 @@ fn limp_note(command: &Command, reply: &serde_json::Value) -> Option<&'static st
     }
     // Only when `robotd` took it. A refusal prints as JSON above and leaves the robot as it was.
     reply["result"]["accepted"].as_bool()?.then_some(
-        "note: torque is off on every joint while the servos come back — hold the robot, or have          it down. It stays limp until something stands it up: press Start on the pad, or          `duckctl call robot.init`.",
+        "note: torque is off on every joint while the servos come back — hold the robot, or have \
+         it down. It stays limp until something stands it up: press Start on the pad, or \
+         `duckctl call robot.init`.",
     )
+}
+
+/// What happens after `os apply` or `os switch` answered: a reboot this tool will not see.
+fn os_note(command: &Command, reply: &serde_json::Value) -> Option<String> {
+    if !matches!(command, Command::Os(Os::Apply { .. } | Os::Switch { .. })) {
+        return None;
+    }
+    let phase = reply["result"]["phase"].as_str()?;
+    Some(format!(
+        "note: the robot is {phase}. It reboots by itself once the new OS is installed, and is \
+         gone for a minute or so — that is the update working. `duckctl os status` follows it; \
+         after the reboot, `last_result` says whether the new slot came up or it went back."
+    ))
 }
 
 fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static str> {
@@ -2738,6 +2935,43 @@ fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a name the last robot reached wins; with one, that robot's line, matched the way a
+    /// scan matches it — so `DUCK_ROBOT=duck-c51b` finds the line macOS wrote as a composite.
+    #[test]
+    fn recall_picks_the_last_robot_or_the_named_one() {
+        let contents = "192.168.1.42 radxa-zero3 [duck-c51b]\n10.0.0.7 duck-ffff\n";
+        let last = (
+            Ipv4Addr::new(192, 168, 1, 42),
+            "radxa-zero3 [duck-c51b]".to_owned(),
+        );
+        assert_eq!(recall(contents, None), Some(last.clone()));
+        assert_eq!(recall(contents, Some("duck-c51b")), Some(last));
+        assert_eq!(
+            recall(contents, Some("duck-ffff")),
+            Some((Ipv4Addr::new(10, 0, 0, 7), "duck-ffff".to_owned()))
+        );
+        assert_eq!(recall(contents, Some("duck-0000")), None);
+        assert_eq!(
+            recall("garbage\n", None),
+            None,
+            "an unreadable line is skipped"
+        );
+    }
+
+    /// A robot that moved has one line, at the top, with its new address.
+    #[test]
+    fn remembering_moves_the_robot_to_the_top() {
+        let before = "10.0.0.7 duck-ffff\n192.168.1.42 duck-c51b\n";
+        assert_eq!(
+            remembered(before, "duck-c51b", "192.168.1.50"),
+            "192.168.1.50 duck-c51b\n10.0.0.7 duck-ffff\n"
+        );
+        assert_eq!(
+            remembered("", "duck-c51b", "1.2.3.4"),
+            "1.2.3.4 duck-c51b\n"
+        );
+    }
 
     /// The ordinary case, and the only one on Linux: one name, reported as it was advertised.
     #[test]
@@ -3609,12 +3843,32 @@ mod tests {
         let note = limp_note(&cli.command, &accepted).expect("a note");
         assert!(note.contains("torque is off"), "{note}");
         assert!(note.contains("robot.init"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
 
         let refused = serde_json::json!({ "error": { "code": 14, "message": "no" } });
         assert_eq!(limp_note(&cli.command, &refused), None);
 
         let health = Cli::try_parse_from(["duckctl", "health"]).expect("parses");
         assert_eq!(limp_note(&health.command, &accepted), None);
+    }
+
+    /// `os apply` answers mid-download; the reboot that follows is the update, not a fault.
+    #[test]
+    fn an_os_apply_says_the_robot_will_reboot() {
+        let cli = Cli::try_parse_from(["duckctl", "os", "apply"]).expect("parses");
+        let reply = serde_json::json!({ "result": { "phase": "downloading" } });
+        let note = os_note(&cli.command, &reply).expect("a note");
+        assert!(note.contains("the robot is downloading"), "{note}");
+        assert!(
+            !note.contains("  "),
+            "a line break leaked its indent: {note}"
+        );
+
+        let status = Cli::try_parse_from(["duckctl", "os", "status"]).expect("parses");
+        assert_eq!(os_note(&status.command, &reply), None);
     }
 
     /// **A load homes the robot before it answers**, so it gets the budget a slow call gets.
@@ -3710,6 +3964,33 @@ mod tests {
             let cli = Cli::try_parse_from(argv).expect("parses");
             let (line, _) = request_line(&cli.command).expect("a request");
             assert!(line.contains(&format!(r#""method":"{method}""#)), "{line}");
+        }
+    }
+
+    /// Each `os` command reaches its own method, and `apply` sends only what was given.
+    #[test]
+    fn every_os_command_asks_for_its_own_method() {
+        for (args, method, params) in [
+            (vec!["status"], "os.status", "{}"),
+            (vec!["check"], "os.check", "{}"),
+            (vec!["apply"], "os.apply", r#"{"interrupt_sessions":false}"#),
+            (
+                vec!["apply", "--build", "20261028093000"],
+                "os.apply",
+                r#"{"build":"20261028093000","interrupt_sessions":false}"#,
+            ),
+            (
+                vec!["switch", "--interrupt-sessions"],
+                "os.switch",
+                r#"{"interrupt_sessions":true}"#,
+            ),
+        ] {
+            let mut argv = vec!["duckctl", "os"];
+            argv.extend_from_slice(&args);
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            let (line, _) = request_line(&cli.command).expect("a request");
+            assert!(line.contains(&format!(r#""method":"{method}""#)), "{line}");
+            assert!(line.contains(&format!(r#""params":{params}"#)), "{line}");
         }
     }
 

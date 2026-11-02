@@ -9,7 +9,7 @@
 //! stub `systemctl` on `PATH` supplies unit states and records whether a reboot was asked for.
 //!
 //! What that leaves uncovered is real and worth naming: **systemd itself**. Whether the timer fires
-//! at `OnBootSec=180`, whether the oneshot's `Conflicts=shutdown.target` keeps it off the way down,
+//! at `OnBootSec=1`, whether the oneshot's `Conflicts=shutdown.target` keeps it off the way down,
 //! and whether `NRestarts` reads the way this assumes on a crash-looping unit — none of that is here.
 //! It needs real systemd — `systemd-nspawn`, or a privileged container with it as pid 1 — which
 //! `docs/project/install-path-gap.md` makes the case for and `docs/design/boot-recovery-net.md` says
@@ -87,14 +87,35 @@ impl Board {
 
     /// Run `robot-boot-check` against stubbed unit states.
     ///
-    /// `units` is what the stub `systemctl show` answers: `(unit, ActiveState, NRestarts)`. Anything
-    /// not listed answers empty, which is what a real `systemctl` does for a unit that is not
-    /// loaded — a release that predates the unit, on a board that must not be rolled back for it.
+    /// `units` is what the stub `systemctl show` answers: `(unit, ActiveState, NRestarts)`, each
+    /// having entered that state at boot. Anything not listed answers empty, which is what a real
+    /// `systemctl` does for a unit that is not loaded — a release that predates the unit, on a
+    /// board that must not be rolled back for it.
     fn boot_check(&self, args: &[&str], units: &[(&str, &str, u32)]) -> Rescue {
+        let at_boot: Vec<_> = units.iter().map(|&(u, s, r)| (u, s, r, 0)).collect();
+        self.boot_check_since(args, &at_boot)
+    }
+
+    /// The same, with the second after boot each unit entered its state: `(unit, ActiveState,
+    /// NRestarts, since)`. What tells a daemon that has run steadily from one that just came back.
+    ///
+    /// Every case must reach a verdict on its first look — the uptime is a file that does not
+    /// move, so a board that is neither settled nor past its deadline would be watched forever.
+    fn boot_check_since(&self, args: &[&str], units: &[(&str, &str, u32, u32)]) -> Rescue {
         self.run("scripts/robot-boot-check", args, units)
     }
 
-    fn run(&self, script: &str, args: &[&str], units: &[(&str, &str, u32)]) -> Rescue {
+    /// Write `[update_gate] boot_deadline_s` into one of robotd.toml's two layers.
+    fn with_deadline(&self, layer: &str, value: &str) -> &Self {
+        std::fs::write(
+            self.dir.path().join(layer),
+            format!("[update_gate]\n# a comment\nboot_deadline_s = {value}  # seconds\n"),
+        )
+        .expect("params layer");
+        self
+    }
+
+    fn run(&self, script: &str, args: &[&str], units: &[(&str, &str, u32, u32)]) -> Rescue {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask/ has a parent");
@@ -107,9 +128,11 @@ impl Board {
         // `$5`. Anything that is not a `show` is recorded instead, which is how a test asserts on
         // `reboot` — and, more often, on the absence of one.
         let mut stub = String::from("#!/bin/sh\nif [ \"$1\" = show ]; then\n  case \"$5\" in\n");
-        for (unit, state, restarts) in units {
+        for (unit, state, restarts, since) in units {
+            let since_us = u64::from(*since) * 1_000_000;
             stub.push_str(&format!(
-                "    {unit}) case \"$3\" in ActiveState) echo {state} ;; NRestarts) echo {restarts} ;; esac ;;\n"
+                "    {unit}) case \"$3\" in ActiveState) echo {state} ;; NRestarts) echo {restarts} ;; \
+                 ActiveEnterTimestampMonotonic) echo {since_us} ;; LoadState) echo loaded ;; esac ;;\n"
             ));
         }
         // An empty `case` body is not portable, and a unit the table does not mention must answer
@@ -133,6 +156,9 @@ impl Board {
             // A boot check that read the host's real uptime would decline on any machine that has
             // been up for more than ten minutes, which is every CI runner and every laptop.
             .env("ROBOT_UPTIME_FILE", self.uptime_file())
+            // Never the host's robotd.toml. Absent unless a case writes one (`with_deadline`).
+            .env("ROBOT_PARAMS_BASE", self.dir.path().join("base.toml"))
+            .env("ROBOT_PARAMS_USER", self.dir.path().join("user.toml"))
             .env(
                 "PATH",
                 format!(
@@ -591,7 +617,8 @@ fn the_boot_check_dry_run_hands_over_nothing() {
 
     let run = board.boot_check(&["--dry-run"], &[("btd.service", "failed", 4)]);
 
-    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    // Not 0: the OS's own boot gate asks this question with `--dry-run`, and reads the answer here.
+    assert_eq!(run.code(), 3, "stderr: {}", run.stderr());
     assert!(run.stderr().contains("would hand over"), "{}", run.stderr());
     assert_eq!(
         board.link_target("current").as_deref(),
@@ -599,4 +626,179 @@ fn the_boot_check_dry_run_hands_over_nothing() {
     );
     assert!(board.breadcrumb().is_none());
     assert!(run.systemctl.is_empty());
+}
+
+/// The ordinary boot, decided as soon as it can be: every daemon `active` for 10 s, here the last
+/// one since 15 s in, so 25 s after boot — not at the deadline, and not three minutes in.
+#[test]
+fn the_boot_check_passes_once_every_daemon_has_settled() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.booted_secs_ago(25);
+
+    let run = board.boot_check_since(
+        &[],
+        &[
+            ("updaterd.service", "active", 0, 15),
+            ("robotd.service", "active", 0, 8),
+            ("configd.service", "active", 0, 9),
+            ("btd.service", "active", 0, 8),
+        ],
+    );
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("settled 25s after boot"),
+        "{}",
+        run.stderr()
+    );
+    assert!(run.systemctl.is_empty(), "{:?}", run.systemctl);
+}
+
+/// Counts only grow, so a member that has already restarted three times is decided on the spot —
+/// 20 s in, with the deadline 40 s away.
+#[test]
+fn the_boot_check_rescues_before_the_deadline() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.booted_secs_ago(20);
+
+    let run = board.boot_check_since(
+        &[],
+        &[
+            ("updaterd.service", "active", 0, 15),
+            ("robotd.service", "active", 3, 19),
+            ("configd.service", "active", 0, 9),
+            ("btd.service", "active", 0, 8),
+        ],
+    );
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert_eq!(
+        board.link_target("current").as_deref(),
+        Some("releases/1.0.0")
+    );
+    assert_eq!(run.systemctl.trim(), "reboot");
+}
+
+/// Back up for five seconds after two crashes is not settled, and not failed either. At the deadline
+/// it is judged by the same rule as before the check watched: two restarts is a transient, left alone.
+#[test]
+fn the_boot_check_leaves_a_daemon_that_just_came_back_alone_at_the_deadline() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.booted_secs_ago(60);
+
+    let run = board.boot_check_since(
+        &[],
+        &[
+            ("updaterd.service", "active", 0, 15),
+            ("robotd.service", "active", 0, 8),
+            ("configd.service", "active", 0, 9),
+            ("btd.service", "active", 2, 55),
+        ],
+    );
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert!(
+        run.stderr()
+            .contains("60s deadline passed with btd.service"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(
+        board.link_target("current").as_deref(),
+        Some("releases/1.2.0")
+    );
+}
+
+/// The owner's layer wins over the image's, key by key, as `Params::load` merges them. A deadline
+/// read wrongly would leave this case watching forever rather than deciding at 30 s.
+#[test]
+fn the_boot_check_reads_its_deadline_from_the_owners_layer() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board
+        .with_deadline("base.toml", "90")
+        .with_deadline("user.toml", "30");
+    board.booted_secs_ago(30);
+
+    let run = board.boot_check_since(&[], &[("btd.service", "active", 1, 28)]);
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("30s deadline passed"),
+        "{}",
+        run.stderr()
+    );
+}
+
+/// Clamped, not refused: a robotd that refused the file would not start, and a robotd that does not
+/// start is what this script rolls a release back for.
+#[test]
+fn the_boot_check_clamps_a_deadline_out_of_range() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.with_deadline("user.toml", "5");
+    board.booted_secs_ago(20);
+
+    let run = board.boot_check_since(&[], &[("btd.service", "active", 1, 18)]);
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert!(run.stderr().contains("using 20"), "{}", run.stderr());
+    assert!(
+        run.stderr().contains("20s deadline passed"),
+        "{}",
+        run.stderr()
+    );
+}
+
+/// A value the script cannot read is named and dropped, and the default stands.
+#[test]
+fn the_boot_check_ignores_a_deadline_it_cannot_read() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.with_deadline("user.toml", "\"soon\"");
+    board.booted_secs_ago(60);
+
+    let run = board.boot_check_since(&[], &[("btd.service", "active", 1, 58)]);
+
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert!(
+        run.stderr().contains("not a whole number"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr().contains("60s deadline passed"),
+        "{}",
+        run.stderr()
+    );
+}
+
+/// The script cannot link `robotd-params`, so it repeats the key's default and bounds. This is what
+/// keeps `robotctl configure` and the board agreeing on what the number means.
+#[test]
+fn the_boot_check_and_robotd_params_agree_on_the_deadline() {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts/robot-boot-check"),
+    )
+    .expect("the script");
+    let value = |name: &str| -> u32 {
+        script
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name}= in the script"))
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+
+    assert_eq!(
+        value("DEADLINE_DEFAULT"),
+        robotd_params::UpdateGate::default().boot_deadline_s
+    );
+    assert_eq!(value("DEADLINE_MIN"), robotd_params::BOOT_DEADLINE_MIN_S);
+    assert_eq!(value("DEADLINE_MAX"), robotd_params::BOOT_DEADLINE_MAX_S);
 }

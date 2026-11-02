@@ -95,7 +95,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -223,12 +223,6 @@ fn bit(button: Button) -> Buttons {
         .map_or(Buttons::NONE, |(_, bit)| *bit)
 }
 
-/// When the config was last written, for spotting a change. `None` for a file that is not there,
-/// which is a real state and compares equal to itself.
-fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
-}
-
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -316,7 +310,7 @@ fn main() -> std::process::ExitCode {
     // When the file was last written, so a change is picked up without a restart. `padd` holds
     // no motor control and no session state — the whole of it is this table — so re-reading is a
     // swap between two ticks rather than anything to sequence.
-    let mut bindings_at = config_mtime(&args.config);
+    let mut bindings_at = robotd_params::config_stamp(&args.config);
     let mut bindings_checked = Instant::now();
     // What the pad means: the mode, the holds, the trigger edges and whether the robot is up.
     // `pad_map`, so that `netpadd` maps a pad exactly as this does.
@@ -340,7 +334,7 @@ fn main() -> std::process::ExitCode {
         // next command.
         if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
             bindings_checked = tick;
-            let now = config_mtime(&args.config);
+            let now = robotd_params::config_stamp(&args.config);
             if now != bindings_at {
                 bindings_at = now;
                 if config.reload(&args.config, &overrides) {

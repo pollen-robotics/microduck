@@ -66,13 +66,18 @@ enum Apply {
     Reload(&'static str),
     /// The daemon re-reads the file by itself. Nothing to do but say so.
     Live(&'static str),
+    /// Read once per boot by something that is not running now. A restart would apply nothing,
+    /// so there is nothing to offer — only the reboot to name.
+    NextBoot(&'static str),
 }
 
 impl Apply {
     /// The daemon, whatever the answer was.
     fn unit(self) -> &'static str {
         match self {
-            Self::Restart(unit) | Self::Reload(unit) | Self::Live(unit) => unit,
+            Self::Restart(unit) | Self::Reload(unit) | Self::Live(unit) | Self::NextBoot(unit) => {
+                unit
+            }
         }
     }
 }
@@ -131,10 +136,16 @@ fn apply_for(key: &str) -> Option<Apply> {
         //   config and adopting the file's mode would undo a live switch as a side effect.
         // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
+        // `allow_community` is not `robotd`'s at all: `updaterd` reads it before every fetch
+        // (`PolicyParams::community_allowed`), the way it reads the board.
+        "policy" if name == "allow_community" => Apply::Live("updaterd"),
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
         "netpad" => Apply::Restart("netpadd"),
+        // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
+        // offering a robotd restart for it would be an edit that appears to do something.
+        "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
@@ -143,9 +154,9 @@ fn apply_for(key: &str) -> Option<Apply> {
 
 /// What a set of written keys needs, with each daemon named once.
 ///
-/// Three lists rather than one, because the three answers read differently on the way out: a
-/// restart is a question, a reload is a lighter question, and `live` is an answer — the operator
-/// is told it already applies and asked nothing.
+/// Separate lists rather than one, because the answers read differently on the way out: a
+/// restart is a question, a reload is a lighter question, and `live` and `next_boot` are answers
+/// — the operator is told when it applies and asked nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Units to restart, in start order.
@@ -154,13 +165,15 @@ pub struct Plan {
     pub reload: Vec<&'static str>,
     /// Units that have it already, or will within a second.
     pub live: Vec<&'static str>,
+    /// What reads it at the next boot, and not before.
+    pub next_boot: Vec<&'static str>,
 }
 
 impl Plan {
     /// Is there nothing to ask the operator?
     ///
-    /// True for no edits at all *and* for edits that are already live — the difference is
-    /// `live`, and the caller says the two things differently.
+    /// True for no edits at all *and* for edits that are already live or wait for a boot — the
+    /// difference is `live` and `next_boot`, and the caller says those things differently.
     pub fn is_quiet(&self) -> bool {
         self.restart.is_empty() && self.reload.is_empty()
     }
@@ -180,6 +193,7 @@ fn plan_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Plan {
             Apply::Restart(_) => &mut plan.restart,
             Apply::Reload(_) => &mut plan.reload,
             Apply::Live(_) => &mut plan.live,
+            Apply::NextBoot(_) => &mut plan.next_boot,
         };
         if !list.contains(&apply.unit()) {
             list.push(apply.unit());
@@ -274,6 +288,14 @@ pub fn summary(model: &Model) -> Vec<String> {
 /// lines that matter under the ones that do not.
 pub fn list(path: &Path, json: bool) -> Result<(), String> {
     let model = Model::load(path)?;
+    if let Some(note) = ignored_note(&model) {
+        // Yellow on a terminal, as in the editor: ignored is not an error.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!("\x1b[33m{note}\x1b[0m");
+        } else {
+            eprintln!("{note}");
+        }
+    }
     let changed: Vec<Row> = model.rows().into_iter().filter(Row::differs).collect();
 
     if json {
@@ -368,6 +390,25 @@ enum Focus {
     /// actually read what changed, which is not always `robotd` and is not always a restart.
     /// Never reached for a [`Plan::is_quiet`] plan: there is nothing to ask.
     Apply { plan: Plan },
+}
+
+/// What to say about keys the files set and this build does not know — typically left by a
+/// branch the robot ran before. Kept in the file and ignored, exactly as `robotd` does. The
+/// base's are named with the base, since that is the file to open to drop one.
+fn ignored_note(model: &Model) -> Option<String> {
+    let mut parts = Vec::new();
+    if !model.ignored().is_empty() {
+        parts.push(model.ignored().join(", "));
+    }
+    if let Some((base, keys)) = model.ignored_in_base() {
+        parts.push(format!("{} (in {})", keys.join(", "), base.display()));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "ignored, unknown to this build (kept in the file): {}",
+            parts.join("; ")
+        )
+    })
 }
 
 /// Run the editor. Returns once the user has left, with everything saved or discarded.
@@ -627,6 +668,12 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
             };
             println!("  {names} {reads} this up within a second — nothing to restart");
         }
+        if !plan.next_boot.is_empty() {
+            println!(
+                "  {} reads this at the next boot — nothing to restart",
+                plan.next_boot.join(" and ")
+            );
+        }
     }
     Ok(())
 }
@@ -777,8 +824,13 @@ fn draw(
     focus: &Focus,
     status: Option<&str>,
 ) {
+    // Ignored keys stay on screen in a line of their own, in yellow: they are not an error to
+    // clear with a keypress, and not something this editor can fix.
+    let ignored = ignored_note(model);
+    let footer_height = if ignored.is_some() { 5 } else { 4 };
     let [list_area, footer_area] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(4)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(footer_height)])
+            .areas(frame.area());
 
     // The visible window of the list, kept around the cursor.
     let height = list_area.height.saturating_sub(2) as usize;
@@ -862,7 +914,7 @@ fn draw(
     );
 
     // Footer: what the selected key is, and what the keys do — or the active prompt.
-    let footer: Vec<Line> = match focus {
+    let mut footer: Vec<Line> = match focus {
         Focus::Editing { buffer, error } => vec![
             Line::from(format!("new value: {buffer}▏")),
             Line::from(match error {
@@ -925,6 +977,9 @@ fn draw(
             ]
         }
     };
+    if let Some(note) = ignored {
+        footer.insert(0, Line::from(Span::styled(note, Style::new().yellow())));
+    }
     frame.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::ALL)),
         footer_area,
@@ -1259,6 +1314,27 @@ mod tests {
             unmapped.is_empty(),
             "nothing says how {unmapped:?} applies — add an arm to `apply_for`"
         );
+    }
+
+    /// `allow_community` sits in `[policy]` but belongs to `updaterd`, which reads it before every
+    /// fetch. Falling through to the section's arm would offer to reload a walking robot for a key
+    /// it never reads.
+    #[test]
+    fn allow_community_is_live_in_the_updater_and_disturbs_nothing() {
+        let plan = plan_for_written(&["policy.allow_community".to_string()]);
+        assert_eq!(plan.live, vec!["updaterd"]);
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// `boot_deadline_s` sits in `[update_gate]` but is the boot check's, read once per boot.
+    /// Falling through to the section's arm would offer to restart robotd — standing motors and
+    /// all — for a key it never reads, and the change would still wait for the reboot.
+    #[test]
+    fn the_boot_deadline_waits_for_a_boot_and_restarts_nothing() {
+        let plan = plan_for_written(&["update_gate.boot_deadline_s".to_string()]);
+        assert_eq!(plan.next_boot, vec!["robot-boot-check"]);
+        assert!(plan.restart.is_empty(), "{plan:?}");
+        assert!(plan.is_quiet(), "{plan:?}");
     }
 
     /// Either half of the pad source restarted alone leaves the other on the old answer.

@@ -149,6 +149,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Consecutive bus read failures before reporting unhealthy",
     ),
+    entry(
+        "update_gate.boot_deadline_s",
+        Kind::Integer,
+        "Seconds after boot by which the boot check decides (20–300)",
+    ),
     // ── [policy] ─────────────────────────────────────────────────────────────
     feature(
         "policy.enabled",
@@ -243,6 +248,11 @@ pub const REGISTRY: &[Entry] = &[
         "policy.nominal_voltage",
         Kind::Float,
         "Reference voltage the gains were identified at",
+    ),
+    feature(
+        "policy.allow_community",
+        Kind::Bool,
+        "Allow fetching policies from outside pollen-robotics on the Hub",
     ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
@@ -1297,6 +1307,7 @@ mod tests {
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",
+                "policy.allow_community",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
                 "duck_detector.enabled",

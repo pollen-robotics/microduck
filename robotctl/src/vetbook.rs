@@ -1197,6 +1197,7 @@ impl Page {
                     "swap" => ("⚙", BEAK),
                     "note" => ("✎", LILAC),
                     "charge" => ("↯", LEAF),
+                    "policy" => ("◆", BEAK),
                     _ => ("•", DIM),
                 };
                 Line::from(vec![

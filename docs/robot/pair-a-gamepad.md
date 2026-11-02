@@ -134,7 +134,7 @@ not call for a Privacy change or reboot. If pairing returns but its final state 
 the result says verification failed rather than inventing an association. Inspect status before
 retrying; `pad forget` remains an explicit action, never automatic.
 
-`--json` returns the same connection facts. These additions and `pad.connect` are API v46:
+`--json` returns the same connection facts. These additions and `pad.connect` are API v48:
 install the daemon release containing them with its matching robotctl. They are not installed
 on a robot merely by updating this checkout.
 

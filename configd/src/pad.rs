@@ -89,6 +89,10 @@ pub trait Pads: Send + Sync {
 
     /// Drop the bond, so this pad stops reconnecting.
     async fn forget(&self, mac: &str) -> PadResult<proto::PadForgetResult>;
+
+    /// Re-page bonded pads whose link dropped, once. `true` when one is still down afterwards,
+    /// which is what the caller backs off on.
+    async fn reconnect_bonded(&self) -> PadResult<bool>;
 }
 
 /// Clamp a caller's timeout into something the adapter should be asked to do.
@@ -381,6 +385,11 @@ impl Pads for FakePads {
             removed: state.visible.len() != before,
         })
     }
+
+    /// A fake pad is connected the moment it pairs and never drops, so there is nothing to page.
+    async fn reconnect_bonded(&self) -> PadResult<bool> {
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +619,9 @@ impl Pads for UnavailablePads {
         Err(self.0.clone())
     }
     async fn forget(&self, _mac: &str) -> PadResult<proto::PadForgetResult> {
+        Err(self.0.clone())
+    }
+    async fn reconnect_bonded(&self) -> PadResult<bool> {
         Err(self.0.clone())
     }
 }

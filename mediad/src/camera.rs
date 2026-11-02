@@ -363,18 +363,31 @@ mod tests {
         assert!(Intrinsics::published(None, None, 1280, 720).is_none());
     }
 
-    /// **A sensor nobody has measured publishes nothing either**, even in its pinned mode: the
-    /// IMX219's 62° and its family solve describe another lens, and borrowing them would be a
-    /// plausible geometry that is wrong.
+    /// **Each sensor publishes its own lens, never the other family's.** The GC2093 published
+    /// nothing until its family was solved (sky-gtc, 2026-10-28) — borrowing the IMX219's 62° and
+    /// its solve would have been a plausible geometry that is wrong — and now it serves that solve:
+    /// ~85°, fx ≈ 696 on 1280×720, nowhere near the alpha's 1062. Scaled with the frame, too.
     #[test]
-    fn an_uncalibrated_sensor_borrows_no_other_lens() {
-        assert!(Intrinsics::nominal(Some(&GC2093), 1280, 720).is_none());
-        assert!(Intrinsics::family(Some(&GC2093), 1280, 720).is_none());
-        assert!(Intrinsics::published(None, Some(&GC2093), 1280, 720).is_none());
+    fn each_sensor_borrows_no_other_lens() {
+        let family = Intrinsics::family(Some(&GC2093), 1280, 720).expect("beta family solve");
+        assert_eq!(family.source, Source::Family);
+        assert!((family.fx - 695.6).abs() < 0.1, "{}", family.fx);
+        let alpha = Intrinsics::family(Some(&IMX219), 1280, 720).expect("alpha family solve");
+        assert!((alpha.fx - family.fx).abs() > 300.0);
+        let published = Intrinsics::published(None, Some(&GC2093), 1920, 1080).expect("scaled");
+        assert!(
+            (published.fx - 1.5 * 695.6216).abs() < 0.01,
+            "{}",
+            published.fx
+        );
+        let nominal = Intrinsics::nominal(Some(&GC2093), 1280, 720).expect("85° field");
+        assert!(
+            (nominal.fx - family.fx).abs() < 2.0,
+            "the field of view agrees with the solve"
+        );
     }
 
-    /// And a robot that has calibrated its own GC2093 publishes that, which is how a beta board
-    /// gets geometry before there is a family solve.
+    /// And a robot that has calibrated its own GC2093 publishes that, over the family's solve.
     #[test]
     fn a_robot_calibration_serves_a_sensor_with_no_family() {
         let published = Intrinsics::published(Some(&measured(1280, 720)), Some(&GC2093), 1280, 720)

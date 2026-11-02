@@ -130,6 +130,10 @@ pub struct Server {
 
     /// Where `vetbook.share` asks for the book and the robot's name.
     vetbook: crate::vetbook::Sources,
+
+    /// Anonymous usage data: the owner's switch, and the queue the task started by
+    /// [`Self::spawn_telemetry`] sends.
+    telemetry: Arc<crate::telemetry::Telemetry>,
 }
 
 impl Server {
@@ -169,7 +173,17 @@ impl Server {
             forced_owner_uid: None,
             account: Arc::new(crate::account::account_at(token_path)),
             vetbook: crate::vetbook::Sources::default(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(PathBuf::from(
+                crate::telemetry::DEFAULT_PATH,
+            ))),
         }
+    }
+
+    /// Keep the telemetry state somewhere other than a robot's: `updaterd` passes its
+    /// `state_dir`, and a test a temporary directory.
+    pub fn with_telemetry_at(mut self, path: PathBuf) -> Self {
+        self.telemetry = Arc::new(crate::telemetry::Telemetry::new(path));
+        self
     }
 
     /// Where `vetbook.share` finds `robotd` and `configd`, when not at their default sockets.
@@ -311,6 +325,12 @@ impl Server {
     /// still has an account that stops working after thirty days.
     pub fn spawn_account_maintenance(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
+    }
+
+    /// Report this start and send usage data until the process ends. Nothing leaves the robot
+    /// while the owner's switch is off; see [`crate::telemetry`].
+    pub fn spawn_telemetry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(Arc::clone(&self.telemetry).run(self.vetbook.robot_socket.clone()))
     }
 
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for
@@ -703,12 +723,63 @@ impl Server {
                 Ok(was) => Response::ok(Some(id), &crate::account::logout_result(was)),
                 Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
             },
+            // ── telemetry.* ─────────────────────────────────────────────────────
+            //
+            // No engine lock: a flag and a small file, outside every release directory.
+            Call::TelemetryStatus => Response::ok(Some(id), &self.telemetry.status()),
+            Call::TelemetrySet(params) => match self.telemetry.set(params.enabled) {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
             // No engine lock, like the account: it reads two daemons and talks to the Hub, and
             // touches nothing an update owns.
             Call::VetbookShare(params) => {
                 match crate::vetbook::share(&self.account, &self.vetbook, &params).await {
                     Ok(result) => Response::ok(Some(id), &result),
                     Err(e) => Response::err(Some(id), e.to_rpc_error()),
+                }
+            }
+
+            // ── os.* ────────────────────────────────────────────────────────────
+            //
+            // The reads take no engine lock: the OS's state is the script's, not the engine's, and
+            // `os.status` is what a client polls while an OS update downloads.
+            Call::OsStatus => match crate::os::status(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
+            },
+            Call::OsCheck => match crate::os::check(&crate::os::Tools::system()).await {
+                Ok(status) => Response::ok(Some(id), &status),
+                Err(e) => Response::err(Some(id), e),
+            },
+            // `try_lock` and `BUSY`, like every other mutation: an OS update started under a
+            // daemon release being installed would reboot the board in the middle of its swap.
+            // Held until the answer, so neither can start while the other is getting going.
+            Call::OsApply(_) | Call::OsSwitch(_) => {
+                let (action, interrupt_sessions) = match call {
+                    Call::OsApply(p) => (crate::os::Action::Apply(p.build), p.interrupt_sessions),
+                    Call::OsSwitch(p) => (crate::os::Action::Switch, p.interrupt_sessions),
+                    _ => unreachable!("matched above"),
+                };
+                let engine = match self.engine.try_lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        return Response::err(
+                            Some(id),
+                            proto::Error::new(
+                                proto::code::BUSY,
+                                "an update is in progress; retry shortly",
+                            ),
+                        );
+                    }
+                };
+                let network = matches!(action, crate::os::Action::Apply(_));
+                if let Err(e) = engine.os_preflight(interrupt_sessions, network).await {
+                    return Response::err(Some(id), e.to_rpc_error());
+                }
+                match crate::os::start(&crate::os::Tools::system(), &action).await {
+                    Ok(status) => Response::ok(Some(id), &status),
+                    Err(e) => Response::err(Some(id), e),
                 }
             }
 
