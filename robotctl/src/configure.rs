@@ -146,6 +146,10 @@ fn apply_for(key: &str) -> Option<Apply> {
         // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
         // offering a robotd restart for it would be an edit that appears to do something.
         "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
+        // `robotctl stress boot` reads it once per boot, from its timer. Nothing running now
+        // reads it, so there is nothing to restart — and a running stress test is started and
+        // stopped by `robotctl stress`, not by this key.
+        "stress" => Apply::NextBoot("robotctl-stress-boot"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
@@ -1334,6 +1338,14 @@ mod tests {
         let plan = plan_for_written(&["update_gate.boot_deadline_s".to_string()]);
         assert_eq!(plan.next_boot, vec!["robot-boot-check"]);
         assert!(plan.restart.is_empty(), "{plan:?}");
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// Switching the boot run on starts nothing now, and restarts nothing: the timer reads it.
+    #[test]
+    fn the_stress_boot_switch_waits_for_a_boot() {
+        let plan = plan_for_written(&["stress.on_boot".to_string()]);
+        assert_eq!(plan.next_boot, vec!["robotctl-stress-boot"]);
         assert!(plan.is_quiet(), "{plan:?}");
     }
 

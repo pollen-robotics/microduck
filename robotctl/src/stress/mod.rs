@@ -67,6 +67,13 @@ pub enum StressCommand {
     Status,
     /// Stop the background run. The policy goes off, as with the pad's Start.
     Stop,
+    /// Start the default run if `[stress] on_boot` is set (`robotctl configure`), and do nothing
+    /// otherwise. What `robotctl-stress-boot.timer` runs once per boot.
+    Boot {
+        /// The config to read. The default is where a provisioned robot keeps it.
+        #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Args, Debug, Clone, Serialize)]
@@ -118,9 +125,68 @@ pub fn run(
     match command {
         Some(StressCommand::Status) => UNIT.status(),
         Some(StressCommand::Stop) => UNIT.stop(),
+        Some(StressCommand::Boot { config }) => boot(robot_socket, tof_socket, &config),
         None if args.foreground => foreground(robot_socket, tof_socket, args),
         None => UNIT.start(robot_socket, args.out.as_deref()),
     }
+}
+
+// ── at boot ─────────────────────────────────────────────────────────────────────────────────
+
+/// How long the boot run waits for `robotd`'s socket. The timer fires seconds into the boot and
+/// `robotd` is usually up by then; a board still without it after this has a problem a stress
+/// test should not start on top of.
+const BOOT_ROBOTD_WAIT: Duration = Duration::from_secs(120);
+
+/// `[stress] on_boot`: start the default run, as `sudo robotctl stress` with no flags would.
+///
+/// Off is the normal answer and exits 0 saying so, because the timer runs this on every boot of
+/// every robot that ships it. A config that does not load counts as off — the boot is the wrong
+/// moment to guess what a broken file meant, and `robotd` reports the file itself. A run already
+/// going is not a failure either: there is nothing to start, and the one going is the one wanted.
+fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Failure> {
+    let on = match robotd_params::Params::load(config, false) {
+        Ok(params) => params.stress.on_boot,
+        Err(e) => {
+            println!("{}: {e}; not starting a stress run", config.display());
+            return Ok(());
+        }
+    };
+    if !on {
+        println!("[stress] on_boot is off; nothing to start");
+        return Ok(());
+    }
+    if UNIT.active() {
+        println!("a stress run is already going ({}); leaving it", UNIT.name);
+        return Ok(());
+    }
+    let deadline = Instant::now() + BOOT_ROBOTD_WAIT;
+    while !robot_socket.exists() {
+        if Instant::now() >= deadline {
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                format!(
+                    "[stress] on_boot is on, but {} did not appear within {} s: is robotd running? Not starting",
+                    robot_socket.display(),
+                    BOOT_ROBOTD_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("[stress] on_boot is on: starting the default run");
+    // The run's own command line, not this one: `stress boot --config …` re-run with
+    // `--foreground` is not a run. The sockets are passed through so the run talks to the same
+    // daemons this checked.
+    let argv = [
+        "--robot-socket".into(),
+        robot_socket.as_os_str().to_owned(),
+        "--tof-socket".into(),
+        tof_socket.as_os_str().to_owned(),
+        "stress".into(),
+    ]
+    .to_vec();
+    UNIT.start_with(robot_socket, None, argv)
 }
 
 // ── the depth stream ────────────────────────────────────────────────────────────────────────

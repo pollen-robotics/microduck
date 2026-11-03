@@ -62,6 +62,17 @@ impl Unit {
     /// Re-run this invocation as the background unit, with `--out` fixed now (so it can be
     /// printed) and `--foreground`, which makes the unit's copy the worker.
     pub(crate) fn start(&self, robot_socket: &Path, out: Option<&Path>) -> Result<(), Failure> {
+        self.start_with(robot_socket, out, std::env::args_os().skip(1).collect())
+    }
+
+    /// [`Self::start`] with the invocation given rather than read from this process — for a
+    /// caller whose own command line is not the run's (`robotctl stress boot`).
+    pub(crate) fn start_with(
+        &self,
+        robot_socket: &Path,
+        out: Option<&Path>,
+        mut argv: Vec<std::ffi::OsString>,
+    ) -> Result<(), Failure> {
         let (name, command) = (self.name, self.command);
         self.need_root("starting a run")?;
         need_robotd(robot_socket)?;
@@ -78,7 +89,6 @@ impl Unit {
             .map_err(|e| Failure::new(exit::FAILED, format!("cannot find this binary: {e}")))?;
 
         let dir = out.map_or_else(|| self.default_out(), Path::to_path_buf);
-        let mut argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
         if out.is_none() {
             argv.push("--out".into());
             argv.push(dir.clone().into());

@@ -1,0 +1,18 @@
+# When to ask whether this boot should start a stress run (`robotctl-stress-boot.service`).
+#
+# A timer rather than an enabled service so that only a boot starts it: `hooks/postinstall`
+# enables timers without starting them, and an `OnBootSec=` timer does not fire again until the
+# next boot.
+
+[Unit]
+Description=Start robotctl stress at boot if [stress] on_boot is set
+
+[Timer]
+# Thirty seconds, not one: the person who switched the robot on is usually holding it, and needs
+# a moment to set it down in its square before the first walk.
+OnBootSec=30
+
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

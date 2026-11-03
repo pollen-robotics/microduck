@@ -166,6 +166,14 @@ Same run directory shape as `endurance` (`meta.json`, `samples.csv`, `events.csv
 `--foreground`) turns the policy off, as the pad's Start does: the robot holds its home pose rather
 than balancing on. Running out of battery ends it as `endurance` does. Documented in `docs/robot/cheatsheet.md`.
 
+**At boot**, with `[stress] on_boot = true` (`robotctl configure`; off by default): for a bench
+robot left to repeat the test, each charge-and-boot is the next run. `robotctl-stress-boot.timer`
+fires 30 s into every boot — time to set the robot down — and runs `robotctl stress boot`, which
+reads the key, waits up to 120 s for robotd's socket and starts the default run exactly as
+`sudo robotctl stress` would. The oneshot has no `[Install]` section, like `robot-boot-check`'s, so
+neither an install nor an update ever starts a run; changing the key starts or stops nothing until
+the next boot.
+
 ## Left to the builder
 
 - How much of `endurance.rs` is shared vs. copied; whether `endurance` itself comes along.

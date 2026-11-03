@@ -626,6 +626,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::MEDIA_SENSOR_LABELS),
         "Head camera sensor — board follows the declared board; naming one forces it",
     ),
+    // ── [stress] ─────────────────────────────────────────────────────────────
+    feature(
+        "stress.on_boot",
+        Kind::Bool,
+        "Start `robotctl stress` at every boot — falls on purpose until the battery is empty",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
@@ -1321,6 +1327,7 @@ mod tests {
                 "audio.pet_detect",
                 "media.source",
                 "media.quality",
+                "stress.on_boot",
                 // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
                 "pad.a",

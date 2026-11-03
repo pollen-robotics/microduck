@@ -202,6 +202,9 @@ pub struct Params {
     pub chorale: ChoraleParams,
     pub idle: IdleParams,
     pub media: MediaParams,
+    /// `robotctl stress` on boot. Read by `robotctl stress boot`, which its timer runs once per
+    /// boot; nothing else reads it.
+    pub stress: StressParams,
     ///
     /// `[detect]` until 2026-09: in `robotctl configure` that read as "detect what?", one line
     /// from `chorale.accept`. Named for what it detects. The alias keeps a file written under the
@@ -995,6 +998,24 @@ impl DuckDetectorParams {
 /// `updater::policy::DETECTOR_FILES` download exactly this list, and a test in each place holds
 /// them together.
 pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
+
+/// `[stress]` — whether this robot starts `robotctl stress` by itself at boot.
+///
+/// For a bench robot left to run the stress test over and over: charge it, switch it on, and the
+/// run starts with no ssh session; it ends with the battery empty and `robotd`'s own shutdown,
+/// so the next charge-and-boot is the next run. The run is the default one — the test is the same
+/// on every robot (`docs/superpowers/specs/2026-10-27-stress-test-design.md`), so there is
+/// nothing here to tune it with.
+///
+/// Read by `robotctl stress boot`, which `robotctl-stress-boot.timer` runs once per boot and
+/// nothing runs mid-update. **Off by default**: a robot that starts throwing itself on the floor
+/// because it was switched on is a robot nobody should own by accident.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StressParams {
+    /// Start a stress run at every boot.
+    pub on_boot: bool,
+}
 
 /// `[chorale]` — several ducks singing one piece.
 ///

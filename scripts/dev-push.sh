@@ -389,6 +389,8 @@ cargo run -p xtask -- package \
     --include "scripts/robot-boot-check=scripts/robot-boot-check" \
     --include "updater/systemd/robot-boot-check.service=systemd/robot-boot-check.service" \
     --include "updater/systemd/robot-boot-check.timer=systemd/robot-boot-check.timer" \
+    --include "robotctl/systemd/robotctl-stress-boot.service=systemd/robotctl-stress-boot.service" \
+    --include "robotctl/systemd/robotctl-stress-boot.timer=systemd/robotctl-stress-boot.timer" \
     --include "configd/systemd/configd.service=systemd/configd.service" \
     --include "btd/systemd/btd.service=systemd/btd.service" \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \

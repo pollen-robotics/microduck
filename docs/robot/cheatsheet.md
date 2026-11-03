@@ -647,6 +647,10 @@ the ToF logs `no_tof` once and runs on odometry alone. Run it in a pen, with no 
 Unlike `endurance`, `stop` (or ctrl-C in `--foreground`) turns the policy off, as the pad's Start
 does: the robot holds its home pose.
 
+`[stress] on_boot = true` (`sudo robotctl configure`) starts the default run 30 s into every boot,
+for a robot left to repeat the test charge after charge; it takes effect at the next boot, and an
+update never starts a run.
+
 Same background unit, battery hand-off and files as `endurance`, under `/var/lib/stress/` —
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
