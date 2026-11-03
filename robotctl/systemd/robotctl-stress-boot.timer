@@ -8,9 +8,10 @@
 Description=Start robotctl stress at boot if [stress] on_boot is set
 
 [Timer]
-# Thirty seconds, not one: the person who switched the robot on is usually holding it, and needs
-# a moment to set it down in its square before the first walk.
-OnBootSec=30
+# Ten seconds, not one: the person who switched the robot on is usually holding it, and needs
+# a moment to set it down in its square before the first walk. The oneshot then waits for robotd
+# to be publishing state, which on a cold boot is most of the wait anyway.
+OnBootSec=10
 
 AccuracySec=1s
 

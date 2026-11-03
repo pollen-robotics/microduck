@@ -202,8 +202,9 @@ than balancing on. Running out of battery ends it as `endurance` does. Documente
 
 **At boot**, with `[stress] on_boot = true` (`robotctl configure`; off by default): for a bench
 robot left to repeat the test, each charge-and-boot is the next run. `robotctl-stress-boot.timer`
-fires 30 s into every boot — time to set the robot down — and runs `robotctl stress boot`, which
-reads the key, waits up to 120 s for robotd's socket and starts the default run exactly as
+fires 10 s into every boot — time to set the robot down — and runs `robotctl stress boot`, which
+reads the key, waits up to 120 s for robotd to be publishing state (not just its socket: robotd
+answers before it publishes, and a run started then dies `fatal`) and starts the default run exactly as
 `sudo robotctl stress` would. The oneshot has no `[Install]` section, like `robot-boot-check`'s, so
 neither an install nor an update ever starts a run; changing the key starts or stops nothing until
 the next boot.

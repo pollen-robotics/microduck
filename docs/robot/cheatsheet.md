@@ -669,7 +669,7 @@ turns a full circle without finding a way logs `boxed_in` and stands. A duck wit
 Unlike `endurance`, `stop` (or ctrl-C in `--foreground`) turns the policy off, as the pad's Start
 does: the robot holds its home pose.
 
-`[stress] on_boot = true` (`sudo robotctl configure`) starts the default run 30 s into every boot,
+`[stress] on_boot = true` (`sudo robotctl configure`) starts the default run once robotd is publishing state, from 10 s into every boot,
 for a robot left to repeat the test charge after charge; it takes effect at the next boot, and an
 update never starts a run.
 

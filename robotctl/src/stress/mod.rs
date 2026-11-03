@@ -164,9 +164,9 @@ pub fn run(
 
 // ── at boot ─────────────────────────────────────────────────────────────────────────────────
 
-/// How long the boot run waits for `robotd`'s socket. The timer fires seconds into the boot and
-/// `robotd` is usually up by then; a board still without it after this has a problem a stress
-/// test should not start on top of.
+/// How long the boot run waits for `robotd` to be publishing state. The timer fires seconds into
+/// the boot and `robotd` is usually up by then; a board still without it after this has a problem
+/// a stress test should not start on top of.
 const BOOT_ROBOTD_WAIT: Duration = Duration::from_secs(120);
 
 /// `[stress] on_boot`: start the default run, as `sudo robotctl stress` with no flags would.
@@ -191,20 +191,36 @@ fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Fai
         println!("a stress run is already going ({}); leaving it", UNIT.name);
         return Ok(());
     }
+    // Not just the socket: robotd answers on it before it publishes any `robot.state`, and a run
+    // started in that window spends its first 35 s finding no state and stops `fatal`. That was
+    // three boots in seven on the first beta runs.
     let deadline = Instant::now() + BOOT_ROBOTD_WAIT;
+    let not_starting = |why: String| {
+        Failure::new(
+            exit::UNREACHABLE,
+            format!(
+                "[stress] on_boot is on, but {why} within {} s: is robotd running? Not starting",
+                BOOT_ROBOTD_WAIT.as_secs()
+            ),
+        )
+    };
     while !robot_socket.exists() {
         if Instant::now() >= deadline {
-            return Err(Failure::new(
-                exit::UNREACHABLE,
-                format!(
-                    "[stress] on_boot is on, but {} did not appear within {} s: is robotd running? Not starting",
-                    robot_socket.display(),
-                    BOOT_ROBOTD_WAIT.as_secs()
-                ),
-            ));
+            return Err(not_starting(format!(
+                "{} did not appear",
+                robot_socket.display()
+            )));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+    let feed = StateFeed::spawn(robot_socket.to_owned());
+    while feed.frame().is_none() {
+        if Instant::now() >= deadline {
+            return Err(not_starting("robotd published no robot.state".into()));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    println!("robotd is publishing state");
     println!("[stress] on_boot is on: starting the default run");
     // The run's own command line, not this one: `stress boot --config …` re-run with
     // `--foreground` is not a run. The sockets are passed through so the run talks to the same
