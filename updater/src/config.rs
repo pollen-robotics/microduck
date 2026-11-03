@@ -73,7 +73,11 @@ pub struct Config {
     pub robot_socket: PathBuf,
 
     /// Accept artifacts signed with a key marked dev-only. Off in production.
-    /// See `docs/design/updater-design.md` §15.
+    ///
+    /// Not the usual way to make a dev board any more: that is
+    /// [`duck_ipc_proto::DEV_BUILDS_MARKER`] in [`Self::state_dir`], which survives an A/B OS
+    /// update where this file does not. Either one turns dev keys on — [`Self::dev_keys_allowed`].
+    /// See `docs/design/updater-design.md` §5.4.
     #[serde(default)]
     pub allow_dev_keys: bool,
 
@@ -363,6 +367,17 @@ fn default_policy_library() -> PathBuf {
 }
 
 impl Config {
+    /// Whether dev-only keys count on this robot: `allow_dev_keys` in this file, or
+    /// [`duck_ipc_proto::DEV_BUILDS_MARKER`] in `state_dir` — which is what
+    /// `robotctl configure --allow-dev-daemon on` writes. Read at startup, like the rest.
+    pub fn dev_keys_allowed(&self) -> bool {
+        self.allow_dev_keys
+            || self
+                .state_dir
+                .join(duck_ipc_proto::DEV_BUILDS_MARKER)
+                .exists()
+    }
+
     /// Parse from TOML text. Always validated — an invalid config must not be
     /// constructible.
     pub fn from_toml(text: &str) -> Result<Self, crate::Error> {

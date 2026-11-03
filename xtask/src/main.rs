@@ -555,8 +555,10 @@ fn keygen(
         KeyKind::Dev => {
             println!("This is a DEV key, for signing branch builds.");
             println!();
-            println!("  public  → trusted_keys_dir of DEVELOPER boards only, alongside");
-            println!("            allow_dev_keys = true in updater.toml");
+            println!("  public  → deploy/dev-key/team.dev.pub, which updaterd compiles in and");
+            println!(
+                "            uses only on a dev board (robotctl configure --allow-dev-daemon on)"
+            );
             println!("  private → shared with the team (password manager / CI secret)");
             println!();
             println!("It must NOT reach a customer robot: a robot that trusts this key");

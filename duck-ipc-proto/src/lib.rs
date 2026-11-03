@@ -533,6 +533,16 @@ pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
+/// The file in `updaterd`'s `state_dir` whose presence makes this robot a dev board: it trusts
+/// the team dev key `updaterd` carries built in, so `robotctl update apply --ref <branch>`
+/// installs what CI built for that branch.
+///
+/// `robotctl configure --allow-dev-daemon on|off` writes and removes it; `updaterd` reads it at
+/// startup. A file in `state_dir` rather than a key in `updater.toml` because `/etc` is the
+/// image's on an A/B robot and an OS update replaces it, while `state_dir` is under
+/// `/var/lib/robot`, which survives. `docs/design/updater-design.md` §5.4 owns the mechanism.
+pub const DEV_BUILDS_MARKER: &str = "allow-dev-builds";
+
 pub mod led;
 pub mod vetbook;
 

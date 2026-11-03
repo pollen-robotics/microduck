@@ -4,6 +4,15 @@ The commands that only make sense on a board set up by
 [`install-dev.md`](install-dev.md). Everything a robot needs day to day is in
 [`cheatsheet.md`](cheatsheet.md).
 
+## Making a board a dev board
+
+```
+sudo robotctl configure --allow-dev-daemon on
+```
+
+`off` undoes it. [`install-dev.md`](install-dev.md#making-an-existing-board-take-dev-builds) has
+what it does.
+
 ## The dev channel
 
 Install what a branch last built on CI:
