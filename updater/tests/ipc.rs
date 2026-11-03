@@ -503,6 +503,34 @@ async fn malformed_json_gets_a_parse_error_and_the_connection_survives() {
     assert!(client.hello().await.error.is_none());
 }
 
+/// The line cap must bound what is buffered, not just what is parsed.
+///
+/// Measuring a line only once its newline arrives means a peer that never sends one grows the
+/// daemon's buffer without limit, and is never told anything. The refusal has to come while the
+/// line is still arriving.
+#[tokio::test]
+async fn an_unterminated_oversized_request_is_refused_while_it_arrives() {
+    let fx = Harness::new();
+    let _server = fx.serve(fx.engine(true, Faults::none())).await;
+    let mut client = Client::connect(&fx.socket).await;
+
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    client.writer.write_all(&oversized).await.unwrap();
+    client.writer.flush().await.unwrap();
+
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), client.reader.read_line(&mut line))
+        .await
+        .expect("an oversized line must be refused before its newline arrives")
+        .unwrap();
+    let response: proto::Response = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(response.error.unwrap().code, proto::code::INVALID_REQUEST);
+
+    // The rest of the oversized line is dropped, and the next request is served.
+    client.writer.write_all(b"xxxx\n").await.unwrap();
+    assert!(client.hello().await.error.is_none());
+}
+
 /// `status` must answer *during* an update. Blocking would make the app go blank for
 /// the whole duration — exactly when someone is most likely watching it.
 #[tokio::test]
