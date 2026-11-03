@@ -11,29 +11,38 @@
 use crate::reader::{Exchange, Reader};
 use crate::{Error, Result, ndef};
 
-/// Flags of every request here: high data rate, one subcarrier, addressed by UID. The inventory
-/// adds bit 5, which ST's reader library also sets — without it a tag does not answer this
-/// reader (measured 2026-10-27); on the wire it reads as AFI-present, and no AFI byte follows.
+/// Request flags (ISO 15693-3 §7.3.1). Bits 5-8 mean different things with and without the
+/// Inventory flag, which is why 0x20 has two names. Every request here is at the high data rate
+/// with one subcarrier (bit 1 clear).
 const FLAG_HIGH_RATE: u8 = 0x02;
-const FLAG_ONE_SUBCARRIER: u8 = 0x04;
-const FLAG_INVENTORY_EXTRA: u8 = 0x20;
+/// Bit 3: this is an inventory, and bits 5-8 are read as the inventory's.
+const FLAG_INVENTORY: u8 = 0x04;
+/// With [`FLAG_INVENTORY`]: one slot. Without it a tag answers only in the one of 16 slots its UID
+/// picks, which reads as silence to a reader asking once — the "0x06 is ignored" of the bring-up.
+const FLAG_ONE_SLOT: u8 = 0x20;
+/// Without [`FLAG_INVENTORY`]: the request carries a UID, and only that tag answers.
 const FLAG_ADDRESS: u8 = 0x20;
 const RES_ERROR: u8 = 0x01;
 
 const CMD_INVENTORY: u8 = 0x01;
 const CMD_READ_SINGLE_BLOCK: u8 = 0x20;
 
-/// Single-slot inventory: flags, command, no mask bits.
+/// Single-slot inventory: flags, command, a mask length of 0.
 const INVENTORY_REQ: [u8; 3] = [
-    FLAG_HIGH_RATE | FLAG_ONE_SUBCARRIER | FLAG_INVENTORY_EXTRA,
+    FLAG_HIGH_RATE | FLAG_INVENTORY | FLAG_ONE_SLOT,
     CMD_INVENTORY,
     0x00,
 ];
 /// A tag answers within t1 (≈320 µs) plus its own thinking; 20 ms covers an EEPROM read too.
 const TIMEOUT_MS: u64 = 20;
-/// Reading stops here even without a terminator: a pairing tag's message is a tenth of this, and
-/// what runs past a cap this size is not one.
+/// Reading never goes past this many blocks, whatever the tag's memory: a pairing tag's message is
+/// a few of them, and what runs past a cap this size is not one.
 const MAX_BLOCKS: u8 = 32;
+
+/// Capability container magic (NFC Forum Type 5 §4.3): `E1` for one-byte block addresses, `E2`
+/// for two. Either says the tag is NDEF-formatted.
+const CC_MAGIC_1: u8 = 0xE1;
+const CC_MAGIC_2: u8 = 0xE2;
 
 /// Find the tag in the field: a single-slot inventory. Returns its UID, most significant byte
 /// first — the order it is printed in, not the order it is sent in.
@@ -64,34 +73,60 @@ pub fn read_block<R: Reader>(chip: &mut R, uid: &[u8], block: u8) -> Result<Vec<
 }
 
 /// The TLV area of the inventoried tag: everything after the capability container, reading only
-/// as many blocks as the message needs — a pairing tag costs four or five exchanges, not the
+/// as many blocks as the message needs — a pairing tag costs a handful of exchanges, not the
 /// whole memory.
 ///
-/// The first block tells the block length; the container's magic tells whether four or eight
-/// bytes of it precede the TLVs. Without a magic (a blank or foreign-format tag) the four a
-/// written tag carries is assumed, which walks a bare TLV area just as well.
+/// The container says how long it is and how much memory follows (NFC Forum Type 5 §4.3): an
+/// `MLEN` in byte 2, in 8-byte units, or 0 there and the real one in bytes 6-7 of an 8-byte
+/// container — told apart from a 4-byte one by its RFU bytes 4-5, which are zero, where a TLV
+/// would already have started. That size bounds every read, so a TLV area that does not open with the NDEF TLV —
+/// a phone app's Lock Control TLV first — is read whole without asking past the end of a small
+/// tag, which the tag would refuse.
+///
+/// A tag with no container is not NDEF-formatted: nothing is read past it, and the empty area
+/// comes back for [`ndef::parse`] to call blank.
 pub fn read_ndef_area<R: Reader>(chip: &mut R, uid: &[u8]) -> Result<Vec<u8>> {
     let mut data = read_block(chip, uid, 0)?;
     let blk_len = data.len();
     if blk_len == 0 {
         return Err(Error::Tag("empty block".into()));
     }
-    let cc_len = match data[0] {
-        0xE1 => 4,
-        0xE2 => 8,
-        _ => 4,
+    let read_to = |data: &mut Vec<u8>, chip: &mut R, len: usize| -> Result<()> {
+        while data.len() < len {
+            let next = (data.len() / blk_len) as u8;
+            data.extend(read_block(chip, uid, next)?);
+        }
+        Ok(())
     };
-    // The first two blocks carry the container and the TLV head, which is what sizes the message.
-    while data.len() < cc_len + 8 {
-        let next = (data.len() / blk_len) as u8;
-        data.extend(read_block(chip, uid, next)?);
+    if !matches!(data[0], CC_MAGIC_1 | CC_MAGIC_2) {
+        return Ok(Vec::new());
     }
-    let needed = ndef::tlv_size(&data[cc_len..]).map(|tlv| cc_len + tlv);
-    while needed.is_some_and(|n| data.len() < n) && (data.len() / blk_len) < MAX_BLOCKS as usize {
-        let next = (data.len() / blk_len) as u8;
-        data.extend(read_block(chip, uid, next)?);
+    read_to(&mut data, chip, 8)?;
+    let (cc_len, mlen) = match data[..8] {
+        [_, _, mlen, ..] if mlen != 0 => (4, Some(mlen as usize * 8)),
+        // MLEN 0 and the RFU bytes clear: the 8-byte container, its size in bytes 6-7.
+        [_, _, 0, _, 0, 0, hi, lo] => (8, Some(u16::from_be_bytes([hi, lo]) as usize * 8)),
+        // MLEN 0 with the TLVs already in bytes 4-5: a 4-byte container that does not say how big
+        // the memory is. The bring-up's own writer left `E1 40 00 16`; the cap bounds those.
+        _ => (4, None),
+    };
+    let cap = MAX_BLOCKS as usize * blk_len;
+    let end = mlen.map_or(cap, |mlen| (cc_len + mlen).min(cap));
+    // The TLV head is at most four bytes, and it is what sizes the message.
+    read_to(&mut data, chip, (cc_len + 4).min(end))?;
+    let needed = ndef::tlv_size(&data[cc_len..])
+        .map(|tlv| cc_len + tlv)
+        .unwrap_or(end);
+    if needed > end {
+        return Err(Error::Tag(format!(
+            "the NDEF message needs {} bytes, past the {} read here",
+            needed - cc_len,
+            end - cc_len
+        )));
     }
-    Ok(data[cc_len..].to_vec())
+    read_to(&mut data, chip, needed)?;
+    data.truncate(needed.max(cc_len));
+    Ok(data.split_off(cc_len))
 }
 
 /// The body of an answer without its flags byte — or the error the flags byte announces.
@@ -118,38 +153,50 @@ mod tests {
         quiet_after: Option<usize>,
     }
 
+    /// The pairing text's TLV, as a phone writes it: one NDEF text record, then the terminator.
+    fn pairing_tlv() -> Vec<u8> {
+        let text = ndef::PAIRING.as_bytes();
+        let mut record = vec![0xD1, 0x01, (3 + text.len()) as u8, b'T', 0x02, b'e', b'n'];
+        record.extend_from_slice(text);
+        let mut tlv = vec![0x03, record.len() as u8];
+        tlv.extend(record);
+        tlv.push(0xFE);
+        tlv
+    }
+
     impl Fake {
-        /// The tag written on the bring-up board: `microduck_gamepad_pairing` behind a CC, in
-        /// 4-byte blocks, exactly as `nfc-test t5 ndef` wrote it.
+        /// A pairing tag behind a 4-byte container whose MLEN covers the memory after it: the
+        /// message, then two spare blocks the reading must not ask for.
         fn pairing() -> Self {
-            Self::pairing_cc(4)
+            let mut area = pairing_tlv();
+            area.extend([0; 8]);
+            Self::sized(&[0xE1, 0x40], &area)
         }
 
         /// The same TLV area behind an 8-byte container, as a tag over 2 KB lays it out.
         fn pairing8() -> Self {
-            Self::pairing_cc(8)
+            let mut tag = vec![0xE2, 0x40, 0x00, 0x01, 0x00, 0x00, 0x03, 0xFF];
+            tag.extend(pairing_tlv());
+            tag.extend([0; 8]);
+            Self::raw(tag)
         }
 
-        fn pairing_cc(cc_len: usize) -> Self {
-            let mut area = match cc_len {
-                8 => vec![0xE2, 0x40, 0x00, 0x01, 0x00, 0x00, 0x03, 0xFF],
-                _ => vec![0xE1, 0x40, 0x00, 0x16],
-            };
-            // The TLV a pairing tag carries: one NDEF text record holding the pairing text.
-            let text = ndef::PAIRING.as_bytes();
-            let mut record = vec![0xD1, 0x01, (3 + text.len()) as u8, b'T', 0x02, b'e', b'n'];
-            record.extend_from_slice(text);
-            let mut tlv = vec![0x03, record.len() as u8];
-            tlv.extend(record);
-            tlv.push(0xFE);
-            area.extend(tlv);
-            area.resize(area.len() + (4 - area.len() % 4) % 4, 0);
-            // Two spare blocks past the message, to see the reading stop before them.
-            area.extend_from_slice(&[0; 8]);
-            let blocks = area.chunks(4).map(|c| c.try_into().unwrap()).collect();
+        /// `magic, version` then an MLEN that says exactly how much of `area` there is: the whole
+        /// memory, so a block past it is one the tag refuses.
+        fn sized(head: &[u8], area: &[u8]) -> Self {
+            let mut area = area.to_vec();
+            area.resize(area.len().div_ceil(8) * 8, 0);
+            let mut tag = head.to_vec();
+            tag.extend([(area.len() / 8) as u8, 0x00]);
+            tag.extend(area);
+            Self::raw(tag)
+        }
+
+        fn raw(mut memory: Vec<u8>) -> Self {
+            memory.resize(memory.len().div_ceil(4) * 4, 0);
             Self {
                 uid: vec![0xE0, 0x48, 0x04, 0x00, 0x0A, 0x3D, 0x2C, 0x9D],
-                blocks,
+                blocks: memory.chunks(4).map(|c| c.try_into().unwrap()).collect(),
                 requests: Vec::new(),
                 quiet_after: None,
             }
@@ -173,10 +220,12 @@ mod tests {
                     Ok(answer)
                 }
                 CMD_READ_SINGLE_BLOCK => {
-                    let block = data[10] as usize;
-                    let mut answer = vec![0x00];
-                    answer.extend_from_slice(&self.blocks[block]);
-                    Ok(answer)
+                    // Past the end, a real tag answers with the error flag: 0x10, block not
+                    // available.
+                    Ok(match self.blocks.get(data[10] as usize) {
+                        Some(block) => [&[0x00][..], block].concat(),
+                        None => vec![RES_ERROR, 0x10],
+                    })
                 }
                 other => Err(Error::Tag(format!("unknown command {other:#04x}"))),
             }
@@ -236,5 +285,55 @@ mod tests {
             "the area starts at the TLV, past the 8-byte CC"
         );
         assert!(ndef::asks_to_pair(&ndef::parse(&area).unwrap()));
+    }
+
+    /// A phone app's Lock Control TLV ahead of the NDEF one leaves the message unsized: the whole
+    /// memory the container declares is read, and not a block past it — on a tag this small, a
+    /// read past the end would be refused and the tag never paired.
+    #[test]
+    fn a_lock_tlv_first_reads_the_declared_memory_and_no_further() {
+        let mut area = vec![0x01, 0x03, 0xA0, 0x0C, 0x34];
+        area.extend(pairing_tlv());
+        let mut tag = Fake::sized(&[0xE1, 0x40], &area);
+        let uid = inventory(&mut tag).unwrap();
+        let read = read_ndef_area(&mut tag, &uid).unwrap();
+        assert!(ndef::asks_to_pair(&ndef::parse(&read).unwrap()));
+        assert_eq!(
+            tag.requests.len() - 1,
+            tag.blocks.len(),
+            "every block, once"
+        );
+    }
+
+    /// What the bring-up's writer left: MLEN 0 in a 4-byte container. Still read, as before.
+    #[test]
+    fn a_container_without_its_size_is_still_read() {
+        let mut tag = vec![0xE1, 0x40, 0x00, 0x16];
+        tag.extend(pairing_tlv());
+        tag.extend([0; 8]);
+        let mut tag = Fake::raw(tag);
+        let uid = inventory(&mut tag).unwrap();
+        let area = read_ndef_area(&mut tag, &uid).unwrap();
+        assert!(ndef::asks_to_pair(&ndef::parse(&area).unwrap()));
+    }
+
+    /// No container, no NDEF: one block read, and an empty area for the parser to call blank.
+    #[test]
+    fn a_tag_without_a_container_is_blank() {
+        let mut tag = Fake::raw(vec![0x00; 32]);
+        let uid = inventory(&mut tag).unwrap();
+        let area = read_ndef_area(&mut tag, &uid).unwrap();
+        assert!(area.is_empty());
+        assert!(ndef::parse(&area).is_err());
+        assert_eq!(tag.requests.len() - 1, 1);
+    }
+
+    /// A message longer than what is read says so, rather than coming back cut short.
+    #[test]
+    fn a_message_past_the_end_is_an_error_not_a_truncation() {
+        // A TLV claiming 200 bytes, in a tag that declares 16.
+        let mut tag = Fake::sized(&[0xE1, 0x40], &[0x03, 200, 0xD1, 0x01]);
+        let uid = inventory(&mut tag).unwrap();
+        assert!(matches!(read_ndef_area(&mut tag, &uid), Err(Error::Tag(_))));
     }
 }

@@ -62,7 +62,9 @@ struct Args {
     #[arg(long)]
     device: Option<PathBuf>,
 
-    /// Polls a second. Detecting a tag alone costs ~35 ms, so 20 is the ceiling.
+    /// Polls a second. Detecting a tag alone costs ~35 ms on the USB reader, so 20 is the ceiling.
+    /// The beta board asks twice on each of two antennas, ~110 ms with nothing there: keep it at
+    /// 5 or below.
     #[arg(long, default_value_t = 5.0)]
     hz: f64,
 
@@ -178,8 +180,10 @@ impl Chip {
                 Err(e) if !e.is_tag() => return Err(e),
                 _ => {}
             }
-            // The 14443A error is superseded by whatever the 15693 ask says.
+            // The 14443A error is superseded by whatever the 15693 ask says. The field is cycled
+            // so it comes back with the AM regulator ISO 15693 is sent through.
             c.set_proto(Proto::V)?;
+            c.reset_field()?;
             match vtag::inventory(c) {
                 Ok(uid) => return Ok((uid, Tech::V)),
                 Err(e) if e.is_tag() => last = e,

@@ -7,10 +7,9 @@
 //! were made on that board and are kept next to the code they justify.
 //!
 //! Layered as the Python is: [`transport`] frames register accesses over the serial link,
-//! [`clrc663`] is the chip, [`tag`] is ISO-14443A selection and the Type 2 reads, [`vtag`] the
-//! ISO 15693 ones, [`ndef`] is
-//! pure parsing. [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a
-//! laptop.
+//! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
+//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
+//! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
 
 pub mod clrc663;
 pub mod ndef;

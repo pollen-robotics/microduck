@@ -66,7 +66,10 @@ always running and picks a reader up within thirty seconds of it being plugged i
   if it finds two, as `robotctl pad pair` does. From a laptop with the reader plugged in, winnie's
   tool writes one: `ntag write --text microduck_gamepad_pairing`. A tag with an address on it, as
   the first ones had, no longer pairs anything.
-- It is an NTAG (NFC Forum Type 2, ISO 14443A); other kinds of tag are not read.
+- It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
+  15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
+  *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
+  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only.
 
 What it did is in `journalctl -u nfcd -b`.
 
