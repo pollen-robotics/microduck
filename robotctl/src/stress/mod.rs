@@ -130,6 +130,10 @@ pub struct StressArgs {
     /// undisturbed.
     #[arg(long, default_value_t = 2.0, help_heading = "Guards")]
     hands_off_pct: f64,
+    /// After giving up, call for help this often, s: two quacks and a wheee, loud enough to hear
+    /// from the next room. 0 for silence.
+    #[arg(long, default_value_t = 15.0, help_heading = "Guards")]
+    call_every: f64,
 }
 
 pub fn run(
@@ -832,6 +836,54 @@ impl Driver {
         self.last_xy = Some((x, y));
     }
 
+    /// One call for help: two quacks and a wheee of about a second.
+    fn call_for_help(&mut self) -> Drive {
+        for _ in 0..2 {
+            self.call(&proto::Call::RobotSound(proto::SoundParams {
+                tag: proto::SoundTag::Chirp,
+                hold: None,
+            }))?;
+            self.wait(0.4)?;
+        }
+        // The wheee is a hold that decays unless renewed, as the pad's D-pad up renews it.
+        let end = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < end {
+            self.sound_hold(true)?;
+            self.wait(0.1)?;
+        }
+        self.sound_hold(false)
+    }
+
+    fn sound_hold(&mut self, hold: bool) -> Drive {
+        let request = proto::Request::notify(&proto::Call::RobotSound(proto::SoundParams {
+            tag: proto::SoundTag::Wheee,
+            hold: Some(hold),
+        }));
+        if let Err(f) = self.conn()?.send(&request) {
+            self.drop_conn(&brief(&f));
+        }
+        Ok(())
+    }
+
+    /// Given up: call for help every `--call-every` until the run is stopped. Nothing moves —
+    /// the robot is limp on the floor — so a robotd that is gone just means a silent call.
+    fn call_for_help_until_stopped(&mut self) {
+        let every = self.args.call_every;
+        if every <= 0.0 {
+            return wait_for_signal(&self.run);
+        }
+        self.run.event(
+            "calling_for_help",
+            &format!("two quacks and a wheee every {every:.0} s"),
+        );
+        loop {
+            if self.call_for_help().is_err() || self.wait(every).is_err() {
+                break;
+            }
+        }
+        self.run.event("signal", signal_name());
+    }
+
     /// The policy off for `seconds` and back. A stop in the middle leaves it off, which is
     /// where [`Self::park`] puts it anyway.
     fn cut_policy(&mut self, seconds: f64) -> Drive {
@@ -898,10 +950,12 @@ fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Resul
         Err(Halt::HandsOff(why)) => {
             // Keep logging, touch nothing: after a give-up the robot is limp on the floor, and
             // near empty the rows to the power-off are the end of the curve.
-            if why != GAVE_UP {
+            if why == GAVE_UP {
+                driver.call_for_help_until_stopped();
+            } else {
                 run.set_activity("hands_off", &why);
+                wait_for_signal(&run);
             }
-            wait_for_signal(&run);
             run.event("stop", "stopped while hands-off");
             Ok(())
         }

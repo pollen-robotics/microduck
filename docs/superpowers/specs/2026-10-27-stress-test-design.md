@@ -87,7 +87,8 @@ After the enable, the robot tries to get up continuously; there is no cut betwee
 - Still down after that: `gave_up`; the run sends `robot.relax` (torque off — *my call*: policy
   off with torque on would push the home pose into the floor for hours, heating the servos and
   skewing the battery data), stops driving for good, and keeps logging samples until stopped or
-  the battery dies. `status` says so plainly.
+  the battery dies. `status` says so plainly. It also calls for help — two quacks and a wheee every 15 s
+  (`--call-every`) — so somebody in the next room knows to come and look.
 
 **Got up** means `fallen` false and held for 1 s without a relapse (`fallen` clears on a single
 upright sample, and a rocking robot can flip back). Upright on its seat counts as up — on

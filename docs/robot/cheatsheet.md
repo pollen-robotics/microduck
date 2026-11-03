@@ -653,7 +653,9 @@ lap (`stress-v1`, written into `meta.json`):
 
 Every get-up is timed: up means not fallen for 1 s, seated upright counts (it is stood up after).
 Still down 7 s after the policy came back (`--getup-timeout`), the policy is cut for 2 s
-(`--reset`) and given one more 7 s; still down then, the run gives up, cuts torque and only logs.
+(`--reset`) and given one more 7 s; still down then, the run gives up, cuts torque and only logs —
+and calls for help, two quacks and a wheee every 15 s (`--call-every`, 0 for silence), so you hear
+it from the next room.
 It stays within ±0.5 m of where it started on odometry (`--square`; coarse, since falls drift it)
 and turns away from anything closer than 20 cm ahead on the head ToF (`--wall`); a duck without
 the ToF logs `no_tof` once and runs on odometry alone. Run it in a pen, with no pad connected.
