@@ -40,7 +40,6 @@ use crate::runlog::{
 };
 use crate::{Client, Failure, exit};
 use getup::{Getup, Timing, Verdict};
-use guard::{ObstacleMap, Travel};
 use lap::{Action, Schedule, Step};
 
 const UNIT: Unit = Unit {
@@ -129,14 +128,9 @@ pub struct StressArgs {
     /// Half the side of the square it stays in, around where it started, m.
     #[arg(long, default_value_t = 0.5, help_heading = "Guards")]
     square: f64,
-    /// Stop walking at an obstacle this close, m: ahead on the head ToF, behind from what the ToF
-    /// saw before the robot turned its back on it.
-    #[arg(long, default_value_t = 0.30, help_heading = "Guards")]
+    /// Stop walking forward at an obstacle this close, m (head ToF).
+    #[arg(long, default_value_t = 0.20, help_heading = "Guards")]
     wall: f64,
-    /// Extra room a fall needs, m, on top of --wall: a robot falling into a wall gets up against
-    /// it, or not at all. The walk before a fall stops this much sooner.
-    #[arg(long, default_value_t = 0.35, help_heading = "Guards")]
-    fall_room: f64,
     /// At or below this battery %, stop driving and let robotd's own empty-battery shutdown run
     /// undisturbed.
     #[arg(long, default_value_t = 2.0, help_heading = "Guards")]
@@ -333,13 +327,8 @@ const GAVE_UP: &str = "gave up";
 enum Guard {
     /// The step's own twist.
     Off,
-    /// Turning on the spot until the way it was walking is clear by `limit` (× WALL_CLEAR),
-    /// since `since`.
-    Wall {
-        travel: Travel,
-        limit: f64,
-        since: f64,
-    },
+    /// Turning on the spot until the way ahead is clear.
+    Wall,
     /// Walking back towards the centre of the square.
     Square,
     /// Recovered: standing still for the rest of the slot.
@@ -364,10 +353,6 @@ struct Driver {
     no_tof_logged: bool,
     /// The last odometry read, to see a `robotd` restart zero it.
     last_xy: Option<(f64, f64)>,
-    /// What the head ToF has seen lately, so a backward walk knows what is behind it.
-    map: ObstacleMap,
-    /// The last walk ended on a guard, so the robot is standing rather than walking.
-    walk_guarded: bool,
 }
 
 impl Driver {
@@ -462,7 +447,6 @@ impl Driver {
 
     /// One tick of the 20 Hz loop: this twist, then the rest of the period.
     fn tick(&mut self, vx: f64, vyaw: f64) -> Drive {
-        self.look();
         self.move_(vx, vyaw)?;
         self.wait(MOVE_PERIOD.as_secs_f64())
     }
@@ -492,33 +476,6 @@ impl Driver {
     /// `safety.fallen` from the latest frame, `None` when there is none.
     fn fallen(&self) -> Option<bool> {
         self.feed.frame().map(|f| f.safety.fallen)
-    }
-
-    /// Remember what the ToF sees now, where the robot is now.
-    fn look(&mut self) {
-        let (Some(frame), Some(state), Some(pose)) =
-            (self.tof.frame(), self.feed.frame(), self.pose())
-        else {
-            return;
-        };
-        if let Some(zones) = guard::classify(&frame, &state, &self.reprojector) {
-            self.map.record(pose, &zones, self.now());
-        }
-    }
-
-    /// The nearest obstacle the way the robot is walking: what the ToF sees now and remembers
-    /// ahead, or what it remembers behind.
-    fn obstacle(&mut self, travel: Travel) -> Option<f64> {
-        let now = self.now();
-        let remembered = self.pose().and_then(|pose| {
-            self.map
-                .nearest(pose, travel, guard::CORRIDOR_HALF_WIDTH, now)
-        });
-        let live = match travel {
-            Travel::Forward => self.nearest_ahead(),
-            Travel::Backward => None,
-        };
-        live.into_iter().chain(remembered).min_by(f64::total_cmp)
     }
 
     /// The nearest obstacle ahead, when there is depth to say so.
@@ -621,17 +578,11 @@ impl Driver {
             self.run.shared.lock().expect("shared lock").lap = Some(n);
             self.run
                 .event("lap_start", &format!("lap {n} ({})", lap::VERSION));
-            for (i, step) in steps.iter().enumerate() {
+            for step in &steps {
                 self.run.shared.lock().expect("shared lock").step = step.name.into();
                 self.run.set_activity(activity(step.action), step.name);
-                // A walk that leads into a fall needs room for the fall at its end too.
-                let into_fall = matches!(
-                    (step.action, steps.get(i + 1).map(|s| s.action)),
-                    (Action::Walk { vx, .. }, Some(Action::Fall { vx: fall }))
-                        if vx != 0.0 && vx.signum() == fall.signum()
-                );
                 match step.action {
-                    Action::Walk { vx, vyaw } => self.walk(step, vx, vyaw, into_fall)?,
+                    Action::Walk { vx, vyaw } => self.walk(step, vx, vyaw)?,
                     Action::Fall { vx } => self.fall(vx)?,
                     Action::Sit => self.sit(step)?,
                     Action::Stand => self.stand(step)?,
@@ -652,55 +603,29 @@ impl Driver {
         Ok(true)
     }
 
-    fn walk(&mut self, step: &Step, vx: f64, vyaw: f64, into_fall: bool) -> Drive {
+    fn walk(&mut self, step: &Step, vx: f64, vyaw: f64) -> Drive {
         if !self.driving() {
             self.ensure_driving()?;
         }
         let end = self.schedule.deadline(step.seconds, self.now());
         let half = self.args.square;
-        let limit = self.args.wall + if into_fall { self.args.fall_room } else { 0.0 };
         let mut guard = Guard::Off;
         while self.now() < end {
             self.check_battery()?;
             if self.caught_falling()? {
-                self.walk_guarded = true;
                 return self.hold_until(end);
             }
             let pose = self.pose();
             self.follow_odometry(pose);
-            let travel = match guard {
-                Guard::Off => Travel::of(vx),
-                // `toward` walks forward, turning on the way.
-                Guard::Square => Some(Travel::Forward),
-                Guard::Wall { .. } | Guard::Done => None,
+            let walking_forward = match guard {
+                Guard::Off => vx > 0.0,
+                Guard::Square => true,
+                Guard::Wall | Guard::Done => false,
             };
-            if let Some(travel) = travel
-                && let Some(d) = self.obstacle(travel).filter(|d| *d < limit)
+            if walking_forward && let Some(d) = self.nearest_ahead().filter(|d| *d < self.args.wall)
             {
-                let way = match travel {
-                    Travel::Forward => "ahead",
-                    Travel::Backward => "behind",
-                };
-                self.run.event("wall_guard", &format!("{d:.2} m {way}"));
-                // A wall on the way back to the start means the start is wrong: the robot never
-                // walked through a wall, so odometry has drifted the start behind one. Walking
-                // back to it again would pin the robot to that wall for every step to come.
-                if guard == Guard::Square
-                    && let Some((x, y, _)) = pose
-                {
-                    let (dx, dy) = (x - self.home.0, y - self.home.1);
-                    self.home = (x, y);
-                    self.run.shared.lock().expect("shared lock").home = Some(self.home);
-                    self.run.event(
-                        "home_moved",
-                        &format!("a wall on the way back; the start is here now, ({dx:.2}, {dy:.2}) m from the old one"),
-                    );
-                }
-                guard = Guard::Wall {
-                    travel,
-                    limit,
-                    since: self.now(),
-                };
+                self.run.event("wall_guard", &format!("{d:.2} m ahead"));
+                guard = Guard::Wall;
             }
             if guard == Guard::Off
                 && let Some((x, y, _)) = pose
@@ -715,17 +640,17 @@ impl Driver {
             }
             let (cmd_vx, cmd_vyaw) = match guard {
                 Guard::Off => (vx, vyaw),
-                Guard::Wall {
-                    travel,
-                    limit,
-                    since,
-                } => match self.turn_clear(travel, limit, since) {
-                    Some(twist) => twist,
-                    None => {
+                Guard::Wall => {
+                    let clear = self
+                        .nearest_ahead()
+                        .is_none_or(|d| d >= self.args.wall * WALL_CLEAR);
+                    if clear {
                         guard = Guard::Done;
                         (0.0, 0.0)
+                    } else {
+                        (0.0, self.args.vyaw)
                     }
-                },
+                }
                 Guard::Square => match pose {
                     Some((x, y, yaw))
                         if guard::outside_square((x, y), self.home, half * SQUARE_RETURN) =>
@@ -748,52 +673,7 @@ impl Driver {
             };
             self.tick(cmd_vx, cmd_vyaw)?;
         }
-        self.walk_guarded = guard != Guard::Off;
         Ok(())
-    }
-
-    /// The twist that turns the robot until the way it was walking is clear, or `None` once it
-    /// is — or once it has turned all the way round without finding a way, which is a robot
-    /// boxed in: it stands, and says so, rather than spinning for the rest of the step.
-    fn turn_clear(&mut self, travel: Travel, limit: f64, since: f64) -> Option<(f64, f64)> {
-        let clear = self
-            .obstacle(travel)
-            .is_none_or(|d| d >= limit * WALL_CLEAR);
-        if clear {
-            return None;
-        }
-        let full_turn = std::f64::consts::TAU / self.args.vyaw.abs().max(0.1);
-        if self.now() - since > full_turn + 0.5 {
-            self.run
-                .event("boxed_in", "turned all the way round and found no way out");
-            return None;
-        }
-        Some((0.0, self.args.vyaw))
-    }
-
-    /// Room to fall the way `vx` walks, and a walk to have something to fall from. Called when
-    /// the walk into the fall was cut short, or the way is not clear: turn until it is, then walk
-    /// up to a second towards the fall, stopping at the first obstacle. False when it found no
-    /// room, and the fall is skipped rather than made into a wall.
-    fn walk_in(&mut self, vx: f64, travel: Travel) -> Result<bool, Halt> {
-        let room = self.args.wall + self.args.fall_room;
-        let since = self.now();
-        while let Some((tvx, tvyaw)) = self.turn_clear(travel, room, since) {
-            self.check_battery()?;
-            self.tick(tvx, tvyaw)?;
-        }
-        if self.obstacle(travel).is_some_and(|d| d < room) {
-            return Ok(false);
-        }
-        let end = self.now() + 1.0;
-        while self.now() < end {
-            self.check_battery()?;
-            if self.obstacle(travel).is_some_and(|d| d < room) {
-                return Ok(false);
-            }
-            self.tick(vx, 0.0)?;
-        }
-        Ok(true)
     }
 
     /// Cut the policy mid-stride, give it back, and see the robot down and up again.
@@ -803,20 +683,6 @@ impl Driver {
         // the lap keeps its six cuts.
         self.caught_falling()?;
         let way = if vx >= 0.0 { "forward" } else { "backward" };
-        let travel = Travel::of(vx).unwrap_or(Travel::Forward);
-        let room = self.args.wall + self.args.fall_room;
-        if self.walk_guarded || self.obstacle(travel).is_some_and(|d| d < room) {
-            self.run.event(
-                "fall_guard",
-                &format!("no room to fall {way}; turning and walking in again"),
-            );
-            if !self.walk_in(vx, travel)? {
-                self.run
-                    .event("fall_skipped", &format!("no {room:.2} m to fall {way}"));
-                self.schedule.unanchor();
-                return Ok(());
-            }
-        }
         if self.args.fall == "cut" {
             self.run.event(
                 "fall_triggered",
@@ -1006,8 +872,6 @@ impl Driver {
             let (dx, dy) = (x - before.0, y - before.1);
             self.home = (self.home.0 + dx, self.home.1 + dy);
             self.run.shared.lock().expect("shared lock").home = Some(self.home);
-            // Every cell was placed against the old origin.
-            self.map.clear();
             self.run.event(
                 "odometry_jump",
                 &format!("moved ({dx:.2}, {dy:.2}) m between reads; start moved with it"),
@@ -1125,8 +989,6 @@ fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Resul
         our_sit: false,
         no_tof_logged: false,
         last_xy: None,
-        map: ObstacleMap::default(),
-        walk_guarded: false,
     };
     match driver.run_forever() {
         Err(Halt::HandsOff(why)) => {

@@ -149,25 +149,8 @@ happened in:
 - **Square**: ±0.5 m from the start on odometry. If a walking step would take the robot past
   it, the step is cut short and the robot walks back toward the centre before the next step.
 - **Wall**: from `tofd`'s frames, if the nearest return in the direction of travel is under
-  `--wall` (30 cm), the step is cut short and the robot turns in place away from it before
-  resuming the lap. The sensor is in the head and looks forward, and half the lap walks backward,
-  so every return is also remembered on a 5 cm grid in the odometry frame for 90 s; a backward
-  walk checks the cells behind it. The memory is what stops the guard's own turn — which leaves
-  the wall behind the robot — from setting up the next step to back into it, and the lap's
-  turns sweep the sensor round often enough to keep it filled. An odometry jump (a `robotd`
-  restart) clears it.
-- **Room to fall** (v2): a walk that leads into a fall stops `--fall-room` (35 cm) sooner, so the
-  fall does not land against the wall. A fall whose walk was cut short, or with no room, turns
-  until there is room and walks in again for up to a second (`fall_guard`) — a trip needs a
-  walking robot — or, finding none, is skipped (`fall_skipped`). A turn that goes all the way
-  round without finding a way out stops (`boxed_in`).
-- **A wall on the way back to the start moves the start** (v2, `home_moved`). The exception to
-  "never re-anchor" below, for the one case where the anchor is provably wrong: the robot never
-  walked through a wall, so a wall between it and the start is drift. Without it a drifted start
-  behind a wall pins the robot there — square guard, wall guard, on every step, the turns
-  included — which is how the first runs got stuck and gave up against walls.
-- Before v2 the guard was 20 cm, forward only; robots got stuck against walls they had backed or
-  fallen into.
+  ~20 cm (forward walking only — the sensor is in the head and looks forward), the step is cut
+  short and the robot turns in place away from it before resuming the lap.
 - No ToF (socket absent / no sensor): one line in the events, and the run continues on odometry
   only.
 
