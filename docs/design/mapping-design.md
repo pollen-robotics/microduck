@@ -5,7 +5,7 @@ reboots, and knows where the robot is in it — or says it does not. It is the g
 work stands on: going somewhere, coming back, finding a place again after a power cycle.
 
 This page owns the mechanism. The algorithm is the `maploc` crate; the service is `mapd`; the
-wire is `map.*` (`duck-ipc-proto`, API v49); the switch is `[map] enabled` in `robotd.toml`, **off by
+wire is `map.*` (`duck-ipc-proto`, API v49; `map.mode` v50); the switch is `[map] enabled` in `robotd.toml`, **off by
 default** until its standing cost — parsing the state stream — has been measured on a board. Off,
 `mapd` still runs and answers `map.status` with why it is not mapping.
 
@@ -202,6 +202,28 @@ is never recognised stays an island: it is kept, and it is not drawn.
 `map.status` says which state it is in, and why (`lost`: `boot`, `carried`, `bumped`, `sat`,
 `fell`, `contradiction`).
 
+### 4.1 Localizing only
+
+A map built carefully once can be **frozen**: `map.mode` with `localize_only`, which `robotctl
+stress` asks for at the start of every lap (it is not kept — `mapd` starts mapping) and hands back
+when it stops. Frozen, a stop is matched against the map exactly as for tracking and adds nothing:
+the pose is corrected by an information-weighted update of odometry's prediction (the window's σ)
+with the match (its information, zero in the directions it does not pin), not by a graph solve.
+Nothing is optimized, so the map's poses never move. Lost, stops still chain into an island — a
+relocalization needs the composite scan — and the island is dropped when the robot is found or
+when a new one starts. Islands present when it is turned on are dropped; what is saved is the
+frozen map, with the boot hint kept current.
+
+**After a relocalization the window stays wide for three believed stops** (`track_max_xy_m`,
+`track_max_yaw_rad`, the correction gate likewise). A mapping robot's graph goes on refining a
+relocalized pose; a frozen map cannot, and in the simulator the relocalization landed 5° off at
+the place it was found — which the first stop after, at the same place, agreed with — and 8° off
+what the rest of the room said, so every later match was refused by the 3° gate and the robot
+ended a lap 33 cm off. With the wide window it ends the lap 8 cm and 0.6° off, as close as mapping
+does (`cargo test -p maploc --test sim localizing_only`).
+
+With nothing mapped there is nothing to localize in: the switch answers that it is still mapping.
+
 ## 5. What is kept
 
 The map is the keyframes, the pose graph and the islands, in one JSON file at `[map] path`
@@ -229,9 +251,13 @@ on its own thread behind a bounded queue: a relocalization search delays the map
 | `map.stream` | the status, then `map.state` notifications at 4 Hz |
 | `map.grid` | the occupancy grid at `res_m`, one character per cell (`?` `.` `#`), the stops, the pose |
 | `map.wipe` | forgets the map and deletes the file; mutating |
+| `map.mode` | localize only in a frozen map, or map (§4.1); not kept across a restart; not routed over WebRTC |
 
 Routed over WebRTC by `mediad`; refused over BLE. `robotctl map` (status), `robotctl map show`
-(the grid in the terminal, `--pgm` for an image), `robotctl map wipe`.
+(the grid in the terminal, `--pgm` for an image), `robotctl map wipe`, `robotctl map mode localize|map`, and `robotctl map load
+FILE` — another robot's `map.json` in place of this one's (`mapd` stopped, the old map kept beside
+it, the builder's last pose cleared so the boot search covers the whole map). That is how
+`robotctl stress` puts one test room's map on every robot it tests.
 
 **`mapd` sends nothing to `robotd`.** It does not move the head or the robot; it maps whatever the
 robot does. That keeps authority where `architecture.md` §6 puts it.

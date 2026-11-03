@@ -27,6 +27,8 @@ pub enum Input {
     Grid(f64, SyncSender<Option<proto::MapGridResult>>),
     /// Forget the map; answered with how many stops were forgotten.
     Wipe(SyncSender<u32>),
+    /// Localize only, or map; answered with the mode now.
+    Mode(bool, SyncSender<proto::MapModeResult>),
     /// Save and stop.
     Shutdown(SyncSender<()>),
 }
@@ -162,6 +164,29 @@ impl Worker {
                     self.publish();
                     let _ = reply.send(n as u32);
                 }
+                Ok(Input::Mode(on, reply)) => {
+                    let was = self.mapper.localize_only();
+                    let now = self.mapper.set_localize_only(on);
+                    let (in_map, _) = self.mapper.counts();
+                    if was != now {
+                        tracing::info!(
+                            keyframes = in_map,
+                            "{}",
+                            if now {
+                                "localizing only: the map is frozen"
+                            } else {
+                                "mapping again"
+                            }
+                        );
+                    } else if on && !now {
+                        tracing::warn!("asked to localize only, with nothing mapped: mapping");
+                    }
+                    self.publish();
+                    let _ = reply.send(proto::MapModeResult {
+                        localize_only: now,
+                        keyframes: in_map as u32,
+                    });
+                }
                 Ok(Input::Shutdown(reply)) => {
                     self.save("shutdown");
                     let _ = reply.send(());
@@ -184,10 +209,12 @@ impl Worker {
         let changed = !events.is_empty();
         // What a stop costs, and how big the map has grown: the number to watch if the map ever
         // makes the robot slow to know where it is.
-        if events
-            .iter()
-            .any(|e| matches!(e, Event::Keyframe { .. } | Event::Covered { .. }))
-        {
+        if events.iter().any(|e| {
+            matches!(
+                e,
+                Event::Keyframe { .. } | Event::Covered { .. } | Event::Localized { .. }
+            )
+        }) {
             let (in_map, islands) = self.mapper.counts();
             tracing::info!(
                 ms = format!("{:.1}", took.as_secs_f64() * 1e3),
@@ -247,6 +274,7 @@ impl Worker {
             s.status.relocalizations = self.relocalizations;
             s.status.island_keyframes = islands as u32;
             s.status.path = path;
+            s.status.localize_only = self.mapper.localize_only();
         }
     }
 
@@ -361,6 +389,22 @@ fn log_event(e: &Event) {
             by,
             frames,
             "stop covered by keyframes already in the map, match not believed: dropped"
+        ),
+        Event::Localized {
+            frames,
+            matched: Some(m),
+        } if m.accepted => tracing::info!(
+            frames,
+            rank = m.rank,
+            dx = format!("{:.3}", m.correction.x),
+            dy = format!("{:.3}", m.correction.y),
+            dyaw_deg = format!("{:.1}", m.correction.yaw.to_degrees()),
+            hit = format!("{:.2}", m.hit_frac),
+            "stop localized in the frozen map"
+        ),
+        Event::Localized { frames, .. } => tracing::info!(
+            frames,
+            "stop not localized in the frozen map: odometry carries on"
         ),
         Event::MapRestarted { dropped, kept } => tracing::warn!(
             dropped,

@@ -38,6 +38,15 @@
 //! searched for in the map — with the last few stops of the island as one wider scan — and when
 //! two consecutive stops agree, the island is joined to the map and tracking resumes.
 //!
+//! # Localizing only
+//!
+//! [`Mapper::set_localize_only`] freezes the map: a stop is matched against it and corrects the
+//! pose, and adds nothing. Lost, stops still chain into an island — a relocalization needs them —
+//! but the island is dropped when the robot is found or a new one starts, and nothing is ever
+//! optimized, so the map's poses do not move either. What is saved is the map as it was frozen.
+//! For a robot that must find itself in a map built carefully once — the stress test's room —
+//! rather than one that should learn its home.
+//!
 //! Tracking can also be lost without any of those: two consecutive stops that land on seen-clear
 //! floor or nowhere near the walls the map predicts. Those stops are never added to the map; they
 //! start the island instead.
@@ -318,6 +327,12 @@ pub enum Event {
         frames: u32,
         matched: Option<MatchSummary>,
     },
+    /// A stop matched against a frozen map ([`Mapper::set_localize_only`]): the pose corrected
+    /// where the match was believed, nothing added.
+    Localized {
+        frames: u32,
+        matched: Option<MatchSummary>,
+    },
     LoopClosed {
         from: usize,
         to: usize,
@@ -400,6 +415,9 @@ pub struct Session {
 
 pub const SESSION_VERSION: u32 = 1;
 
+/// Localizing only: stops believed with a wide window after a relocalization (`Mapper::unsure`).
+const UNSURE_STOPS: u32 = 3;
+
 pub struct Mapper {
     cfg: MapperConfig,
     projector: Projector,
@@ -452,6 +470,16 @@ pub struct Mapper {
     broke_from: Option<Pose2>,
     /// After a bump: the next tracking match's window, wider than odometry alone would want.
     widen: Option<(f64, f64)>,
+    /// Localizing only: the map is its first this many nodes, and nothing is added to it.
+    frozen: Option<usize>,
+    /// Localizing only: believed stops still to come before the pose is trusted as tracking's.
+    /// After a relocalization the pose is the relocalization's, which a mapping robot's graph
+    /// would go on refining and a frozen map cannot — and it can be several degrees off what the
+    /// rest of the room says (measured in the simulator: 5° at the place it was found, 8° by the
+    /// next). Until [`UNSURE_STOPS`] stops are believed, matches are searched for, and believed,
+    /// as wide as the tracking window goes. One was not enough: the first stop after is usually
+    /// at the place it was found, and agrees with the mistake.
+    unsure: u32,
     events: Vec<Event>,
 }
 
@@ -495,6 +523,8 @@ impl Mapper {
             pickup_since: None,
             broke_from: None,
             widen: None,
+            frozen: None,
+            unsure: 0,
             events: Vec::new(),
         }
     }
@@ -529,14 +559,64 @@ impl Mapper {
         m
     }
 
+    /// What to save. Localizing only, the map as it was frozen: the island a relocalization is
+    /// using is not part of it.
     pub fn session(&self) -> Session {
+        let n = self.frozen.unwrap_or(self.keyframes.len());
+        let mut graph = Graph::default();
+        for i in 0..n {
+            graph.add_node(self.graph.nodes[i], self.graph.fixed[i]);
+        }
+        for e in &self.graph.edges {
+            if e.from < n && e.to < n {
+                graph.add_edge(e.clone());
+            }
+        }
         Session {
             version: SESSION_VERSION,
-            keyframes: self.keyframes.clone(),
-            graph: self.graph.clone(),
-            island: self.island.clone(),
+            keyframes: self.keyframes[..n].to_vec(),
+            graph,
+            island: self.island[..n].to_vec(),
             last_pose: self.pose().or(self.last_pose),
         }
+    }
+
+    /// Localize in the map without adding to it, or go back to mapping. Turning it on drops the
+    /// islands — stops not placed in the map — and freezes the rest; a robot that was lost stays
+    /// lost, and searches the frozen map at its next stops. Returns whether it is on: with nothing
+    /// mapped there is nothing to localize in, and the mapper goes on mapping.
+    pub fn set_localize_only(&mut self, on: bool) -> bool {
+        if !on {
+            self.frozen = None;
+            return false;
+        }
+        if self.frozen.is_some() {
+            return true;
+        }
+        let main = self.main_island();
+        let keep: Vec<usize> = (0..self.keyframes.len())
+            .filter(|&i| self.island[i] == main)
+            .collect();
+        if keep.is_empty() {
+            return false;
+        }
+        if keep.len() < self.keyframes.len() {
+            self.retain_nodes(&keep);
+        }
+        if let Loc::Lost { .. } = self.loc {
+            // Its island is gone: the next stop starts a new one.
+            self.chain = None;
+            self.lost_keyframes = 0;
+        }
+        self.pending_reloc.clear();
+        self.pending_loop = None;
+        self.since_full = 0;
+        self.frozen = Some(keep.len());
+        true
+    }
+
+    pub fn localize_only(&self) -> bool {
+        self.frozen.is_some()
     }
 
     pub fn take_events(&mut self) -> Vec<Event> {
@@ -907,7 +987,11 @@ impl Mapper {
                     });
                     return;
                 }
-                self.track(kf, map_from_odom);
+                if self.frozen.is_some() {
+                    self.localize(kf, map_from_odom);
+                } else {
+                    self.track(kf, map_from_odom);
+                }
             }
             Loc::Lost { cause, hint } => self.search(kf, cause, hint),
         }
@@ -1111,40 +1195,12 @@ impl Mapper {
     /// frame is the odometry frame.
     fn restart_with(&mut self, keep: &[usize]) {
         let dropped = self.keyframes.len() - keep.len();
-        let mut new_of = vec![usize::MAX; self.keyframes.len()];
-        for (k, &i) in keep.iter().enumerate() {
-            new_of[i] = k;
+        self.retain_nodes(keep);
+        for (k, fixed) in self.graph.fixed.iter_mut().enumerate() {
+            *fixed = k == 0;
         }
-        let keyframes: Vec<Keyframe> = keep
-            .iter()
-            .enumerate()
-            .map(|(k, &i)| {
-                let mut kf = self.keyframes[i].clone();
-                kf.id = k as u32;
-                kf
-            })
-            .collect();
-        let mut graph = Graph::default();
-        for (k, &i) in keep.iter().enumerate() {
-            graph.add_node(self.graph.nodes[i], k == 0);
-        }
-        for e in &self.graph.edges {
-            if new_of[e.from] != usize::MAX && new_of[e.to] != usize::MAX {
-                let mut e = e.clone();
-                e.from = new_of[e.from];
-                e.to = new_of[e.to];
-                graph.add_edge(e);
-            }
-        }
-        self.path_at = keep.iter().map(|&i| self.path_at[i]).collect();
-        self.turn_at = keep.iter().map(|&i| self.turn_at[i]).collect();
         self.island = vec![0; keep.len()];
         self.next_island = 1;
-        self.keyframes = keyframes;
-        self.graph = graph;
-        self.chain = self
-            .chain
-            .and_then(|c| (new_of[c] != usize::MAX).then_some(new_of[c]));
         self.suspect = None;
         self.pending_loop = None;
         self.pending_reloc.clear();
@@ -1326,6 +1382,179 @@ impl Mapper {
     }
 
     /// Re-solve the whole graph.
+    /// Keep only the nodes `keep` (in order), renumbered from 0, with the edges between them, their
+    /// islands and fixed flags as they were. The chain follows its node if it is kept.
+    fn retain_nodes(&mut self, keep: &[usize]) {
+        let mut new_of = vec![usize::MAX; self.keyframes.len()];
+        for (k, &i) in keep.iter().enumerate() {
+            new_of[i] = k;
+        }
+        let keyframes: Vec<Keyframe> = keep
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let mut kf = self.keyframes[i].clone();
+                kf.id = k as u32;
+                kf
+            })
+            .collect();
+        let mut graph = Graph::default();
+        for &i in keep {
+            graph.add_node(self.graph.nodes[i], self.graph.fixed[i]);
+        }
+        for e in &self.graph.edges {
+            if new_of[e.from] != usize::MAX && new_of[e.to] != usize::MAX {
+                let mut e = e.clone();
+                e.from = new_of[e.from];
+                e.to = new_of[e.to];
+                graph.add_edge(e);
+            }
+        }
+        self.path_at = keep.iter().map(|&i| self.path_at[i]).collect();
+        self.turn_at = keep.iter().map(|&i| self.turn_at[i]).collect();
+        self.island = keep.iter().map(|&i| self.island[i]).collect();
+        self.keyframes = keyframes;
+        self.graph = graph;
+        self.chain = self
+            .chain
+            .and_then(|c| (new_of[c] != usize::MAX).then_some(new_of[c]));
+        self.pending_reloc.clear();
+    }
+
+    /// Localizing only: drop every node after the frozen map — the island a relocalization was
+    /// using, once it is found or abandoned.
+    fn drop_transient(&mut self) {
+        if let Some(n) = self.frozen
+            && self.keyframes.len() > n
+        {
+            let keep: Vec<usize> = (0..n).collect();
+            self.retain_nodes(&keep);
+        }
+    }
+
+    /// A stop while tracking in a frozen map: matched against it as [`Self::track`] would, and
+    /// the pose corrected in the directions the match pins — fused with odometry's prediction,
+    /// each weighted by what it knows — without adding a node.
+    fn localize(&mut self, kf: Keyframe, map_from_odom: Pose2) {
+        let frames = kf.n_frames;
+        let predicted = map_from_odom.compose(kf.odom);
+        let main = self.main_island();
+        let local = self.nearby(
+            main,
+            predicted,
+            self.cfg.local_radius_m,
+            self.cfg.local_max_keyframes,
+            &|_| false,
+        );
+        let noise = &self.cfg.odometry;
+        let sxy =
+            noise.base_xy_m + noise.along_per_m.max(noise.across_per_m) * self.path_since_match;
+        let dt_yaw = if self.t_yaw_ns == 0 {
+            0.0
+        } else {
+            kf.t_start_ns.saturating_sub(self.t_yaw_ns) as f64 * 1e-9
+        };
+        let syaw =
+            noise.base_yaw_rad + noise.yaw_per_rad * self.turn_since_yaw + noise.yaw_per_s * dt_yaw;
+        let (wxy, wyaw) = match self.widen.take() {
+            Some(w) => w,
+            None if self.unsure > 0 => (self.cfg.track_max_xy_m, self.cfg.track_max_yaw_rad),
+            None => (0.0, 0.0),
+        };
+        let half_xy = (3.0 * sxy)
+            .clamp(self.cfg.track_min_xy_m, self.cfg.track_max_xy_m)
+            .max(wxy);
+        let half_yaw = (3.0 * syaw)
+            .clamp(self.cfg.track_min_yaw_rad, self.cfg.track_max_yaw_rad)
+            .max(wyaw);
+        let win = Window {
+            center: predicted,
+            half_xy,
+            half_yaw,
+            step_yaw: 1f64.to_radians(),
+        };
+        let m = self
+            .field_of(&local)
+            .and_then(|f| match_local(&f, &kf, win, &self.cfg.matcher));
+        let correction_ok = |m: &MatchResult| {
+            let c = predicted.between(m.pose);
+            // A bump widened the window: the correction may be as wide as it.
+            c.x.hypot(c.y) <= self.cfg.track_max_correction_m.max(wxy)
+                && c.yaw.abs() <= self.cfg.track_max_correction_rad.max(wyaw)
+        };
+        let good = m.as_ref().is_some_and(|m| {
+            m.n_points >= self.cfg.min_match_points
+                && m.known_frac >= self.cfg.min_known_frac
+                && m.hit_frac >= self.cfg.min_hit_frac
+                && m.conflict_frac <= self.cfg.max_conflict
+                && m.rank > 0
+                && correction_ok(m)
+        });
+        let contradicts = m.as_ref().is_some_and(|m| {
+            m.n_points >= self.cfg.min_match_points
+                && m.known_frac >= self.cfg.contradiction_known_frac
+                && (m.hit_frac < self.cfg.contradiction_hit_frac
+                    || m.conflict_frac > 2.0 * self.cfg.max_conflict)
+        });
+        if contradicts {
+            self.contradictions += 1;
+            if self.contradictions >= 2 {
+                self.contradictions = 0;
+                self.last_pose = Some(predicted);
+                self.loc = Loc::Lost {
+                    cause: LostCause::Contradiction,
+                    hint: Hint::Pose {
+                        map_from_odom,
+                        xy_tol: 1.0,
+                        yaw_tol: 0.3,
+                    },
+                };
+                self.lost_keyframes = 0;
+                self.chain = None;
+                self.events.push(Event::Lost {
+                    cause: LostCause::Contradiction,
+                });
+                if let Some(prev) = self.suspect.take() {
+                    self.search(prev, LostCause::Contradiction, self.hint());
+                }
+                self.search(kf, LostCause::Contradiction, self.hint());
+                return;
+            }
+            self.suspect = Some(kf);
+            return;
+        }
+        self.contradictions = 0;
+        self.suspect = None;
+        let matched = m.as_ref().map(|m| MatchSummary {
+            accepted: good,
+            rank: m.rank,
+            correction: predicted.between(m.pose),
+            hit_frac: m.hit_frac,
+            known_frac: m.known_frac,
+            conflict_frac: m.conflict_frac,
+            n_points: m.n_points,
+            sigma: [
+                m.cov[0][0].sqrt(),
+                m.cov[1][1].sqrt(),
+                m.cov[2][2].sqrt().to_degrees(),
+            ],
+        });
+        if let (true, Some(m)) = (good, m.as_ref()) {
+            let prior = [
+                1.0 / (half_xy / 3.0).powi(2),
+                1.0 / (half_xy / 3.0).powi(2),
+                1.0 / (half_yaw / 3.0).powi(2),
+            ];
+            let pose = fuse(predicted, prior, m.pose, &m.info);
+            self.loc = Loc::Tracking {
+                map_from_odom: pose.compose(kf.odom.inverse()),
+            };
+            self.note_pinned(&m.info, kf.t_end_ns);
+            self.unsure = self.unsure.saturating_sub(1);
+        }
+        self.events.push(Event::Localized { frames, matched });
+    }
+
     fn optimize(&mut self) {
         self.since_full = 0;
         self.optimize_from(0);
@@ -1345,6 +1574,10 @@ impl Mapper {
 
     /// Optimize the nodes from `first` on.
     fn optimize_from(&mut self, first: usize) {
+        // A frozen map's poses do not move, and nothing else is in the graph long enough to.
+        if self.frozen.is_some() {
+            return;
+        }
         let Some(r) = self.graph.optimize_only(&self.cfg.graph, |i| i >= first) else {
             return;
         };
@@ -1485,7 +1718,7 @@ impl Mapper {
 
     /// A stop while lost: add it to the island, then look for the island in the map.
     fn search(&mut self, kf: Keyframe, cause: LostCause, hint: Hint) {
-        if self.counts().0 < self.cfg.min_map_keyframes {
+        if self.frozen.is_none() && self.counts().0 < self.cfg.min_map_keyframes {
             // Too little mapped to be recognised: start over here, this stop first. Decided at
             // the first stop while lost, not when it went lost — a bump puts it back on track.
             self.restart_with(&[]);
@@ -1493,6 +1726,10 @@ impl Mapper {
             return;
         }
         let (frames, occ, free) = (kf.n_frames, kf.occ.len(), kf.free.len());
+        if self.chain.is_none() {
+            // Localizing only, one island at a time: a new one replaces the last.
+            self.drop_transient();
+        }
         let isl = match self.chain {
             Some(c) => self.island[c],
             None => {
@@ -1511,7 +1748,10 @@ impl Mapper {
         self.chain = Some(node);
         self.lost_keyframes += 1;
         let in_island = self.island.iter().filter(|&&i| i == isl).count();
-        if in_island >= self.cfg.island_takeover_keyframes && in_island >= 2 * self.counts().0 {
+        if self.frozen.is_none()
+            && in_island >= self.cfg.island_takeover_keyframes
+            && in_island >= 2 * self.counts().0
+        {
             // Somewhere the map does not know, for long enough: this is the map now.
             let keep: Vec<usize> = (0..self.keyframes.len())
                 .filter(|&i| self.island[i] == isl)
@@ -1779,6 +2019,28 @@ impl Mapper {
     /// Attach an island to the map: move its nodes into the map frame, link the matched stops,
     /// and resume tracking from its newest stop.
     fn join(&mut self, isl: u32, map_from_island: Pose2, matches: &[Pending]) {
+        if self.frozen.is_some() {
+            // Island poses are odometry's: the island's place in the map is where odometry is.
+            let node = matches.last().expect("two matches").node;
+            let pose = map_from_island.compose(self.graph.nodes[node]);
+            self.loc = Loc::Tracking {
+                map_from_odom: map_from_island,
+            };
+            self.path_since_match = 0.0;
+            self.turn_since_yaw = 0.0;
+            self.t_yaw_ns = self.keyframes[node].t_end_ns;
+            self.path_since_anchor = 0.0;
+            self.events.push(Event::Relocalized {
+                node,
+                pose,
+                after_keyframes: self.lost_keyframes,
+            });
+            self.lost_keyframes = 0;
+            self.chain = None;
+            self.unsure = UNSURE_STOPS;
+            self.drop_transient();
+            return;
+        }
         let main = self.main_island();
         for i in 0..self.keyframes.len() {
             if self.island[i] == isl {
@@ -1818,4 +2080,53 @@ impl Mapper {
         });
         self.lost_keyframes = 0;
     }
+}
+
+/// One information-weighted update: the prediction `prior_pose` with diagonal information
+/// `prior` (x, y, yaw), corrected by a match at `meas` with information `info`, both in the map
+/// frame. Directions the match does not pin carry zero information and keep the prediction.
+fn fuse(prior_pose: Pose2, prior: [f64; 3], meas: Pose2, info: &Mat3) -> Pose2 {
+    let d = [
+        meas.x - prior_pose.x,
+        meas.y - prior_pose.y,
+        wrap(meas.yaw - prior_pose.yaw),
+    ];
+    let mut a = *info;
+    for k in 0..3 {
+        a[k][k] += prior[k];
+    }
+    let b: Vec<f64> = (0..3)
+        .map(|r| (0..3).map(|c| info[r][c] * d[c]).sum())
+        .collect();
+    let Some(inv) = inverse3(&a) else {
+        return prior_pose;
+    };
+    let dx: Vec<f64> = (0..3)
+        .map(|r| (0..3).map(|c| inv[r][c] * b[c]).sum())
+        .collect();
+    Pose2::new(
+        prior_pose.x + dx[0],
+        prior_pose.y + dx[1],
+        wrap(prior_pose.yaw + dx[2]),
+    )
+}
+
+fn inverse3(a: &Mat3) -> Option<Mat3> {
+    let c = |r: usize, k: usize| {
+        let (r1, r2) = ((r + 1) % 3, (r + 2) % 3);
+        let (k1, k2) = ((k + 1) % 3, (k + 2) % 3);
+        a[r1][k1] * a[r2][k2] - a[r1][k2] * a[r2][k1]
+    };
+    let det = a[0][0] * c(0, 0) + a[0][1] * c(0, 1) + a[0][2] * c(0, 2);
+    if det.abs() < 1e-300 {
+        return None;
+    }
+    let mut out = [[0.0; 3]; 3];
+    for (r, row) in out.iter_mut().enumerate() {
+        for (k, v) in row.iter_mut().enumerate() {
+            // The inverse is the transposed cofactors over the determinant.
+            *v = c(k, r) / det;
+        }
+    }
+    Some(out)
 }

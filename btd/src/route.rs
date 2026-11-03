@@ -537,7 +537,7 @@ fn permits(call: &proto::Call) -> bool {
         // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
         // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
         // reason to forward `map.status` — not yet one anybody has.
-        MapStatus | MapStream | MapGrid(_) | MapWipe => false,
+        MapStatus | MapStream | MapGrid(_) | MapWipe | MapMode(_) => false,
     }
 }
 

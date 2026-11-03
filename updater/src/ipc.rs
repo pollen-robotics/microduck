@@ -955,7 +955,11 @@ impl Server {
             ),
 
             // And again for the map: `mapd` owns it.
-            Call::MapStatus | Call::MapStream | Call::MapGrid(_) | Call::MapWipe => Response::err(
+            Call::MapStatus
+            | Call::MapStream
+            | Call::MapGrid(_)
+            | Call::MapWipe
+            | Call::MapMode(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,

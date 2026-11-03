@@ -97,6 +97,17 @@ pub async fn connection(stream: UnixStream, ctx: Ctx) -> std::io::Result<()> {
                     proto::Response::err(id, proto::Error::new(proto::code::INTERNAL_ERROR, e))
                 }
             },
+            Ok(proto::Call::MapMode(p)) => {
+                match ctx
+                    .ask(move |reply| Input::Mode(p.localize_only, reply))
+                    .await
+                {
+                    Ok(mode) => proto::Response::ok(id, &mode),
+                    Err(e) => {
+                        proto::Response::err(id, proto::Error::new(proto::code::INTERNAL_ERROR, e))
+                    }
+                }
+            }
             Ok(proto::Call::MapStream) => {
                 write_line(&mut write, &proto::Response::ok(id, &ctx.status())).await?;
                 let mut sink = tokio::io::sink();
@@ -238,6 +249,24 @@ mod tests {
             .unwrap();
         assert!(status.state.pose.is_some() && status.state.lost.is_none());
         assert_eq!(status.state.keyframes as usize, grid.keyframes.len());
+
+        // Frozen, and back: the status says which.
+        for on in [true, false] {
+            let mode: proto::MapModeResult = call(
+                &mut c,
+                &proto::Call::MapMode(proto::MapModeParams { localize_only: on }),
+            )
+            .await
+            .result_as()
+            .unwrap();
+            assert_eq!(mode.localize_only, on);
+            assert_eq!(mode.keyframes as usize, grid.keyframes.len());
+            let status: proto::MapStatusResult = call(&mut c, &proto::Call::MapStatus)
+                .await
+                .result_as()
+                .unwrap();
+            assert_eq!(status.localize_only, on);
+        }
 
         let wiped: proto::MapWipeResult = call(&mut c, &proto::Call::MapWipe)
             .await

@@ -5466,7 +5466,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return endurance::run(&cli.robot_socket, command, args);
         }
         Namespace::Stress { command, args } => {
-            return stress::run(&cli.robot_socket, &cli.tof_socket, command, args);
+            return stress::run(
+                stress::Sockets {
+                    robot: &cli.robot_socket,
+                    tof: &cli.tof_socket,
+                    map: &cli.map_socket,
+                },
+                command,
+                args,
+            );
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);

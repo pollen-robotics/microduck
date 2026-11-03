@@ -505,7 +505,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::MAP_GRID`] and [`method::MAP_WIPE`] — where the robot is in its own map, and the map.
 /// New routes: a release predating `mapd` has no socket to answer them, and a transport that
 /// forwards them says so by name.
-pub const API_VERSION: u32 = 49;
+///
+/// # v50 — localizing only
+///
+/// [`method::MAP_MODE`]: freeze the map and only find the robot in it, or go back to mapping
+/// ([`MapModeParams`]); [`MapStatusResult::localize_only`] says which. For `robotctl stress`, whose
+/// robots all run in one room mapped once. A new route: a `mapd` predating it answers
+/// METHOD_NOT_FOUND, and its status has no `localize_only` — read as mapping.
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1104,6 +1111,8 @@ pub mod method {
     pub const MAP_GRID: &str = "map.grid";
     /// Forget the map and start a new one from where the robot stands.
     pub const MAP_WIPE: &str = "map.wipe";
+    /// Localize in the map without adding to it, or map again. Not kept: `mapd` starts mapping.
+    pub const MAP_MODE: &str = "map.mode";
 }
 
 /// JSON-RPC error codes.
@@ -1348,6 +1357,7 @@ pub enum Call {
     MapStream,
     MapGrid(MapGridParams),
     MapWipe,
+    MapMode(MapModeParams),
 }
 
 /// The service that owns the answer to a call.
@@ -1495,6 +1505,7 @@ impl Call {
             Call::MapStream => method::MAP_STREAM,
             Call::MapGrid(_) => method::MAP_GRID,
             Call::MapWipe => method::MAP_WIPE,
+            Call::MapMode(_) => method::MAP_MODE,
         }
     }
 
@@ -1726,7 +1737,7 @@ impl Call {
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
             // on demand, a few milliseconds for a house. A wipe deletes a file.
-            Call::MapStatus | Call::MapGrid(_) | Call::MapWipe => (Map, Prompt),
+            Call::MapStatus | Call::MapGrid(_) | Call::MapWipe | Call::MapMode(_) => (Map, Prompt),
             Call::MapStream => (Map, Stream),
 
             // ── answered by no service ──────────────────────────────────────
@@ -1854,6 +1865,7 @@ impl Call {
             | Call::MapWipe
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
             Call::MapGrid(p) => encode(p),
+            Call::MapMode(p) => encode(p),
         }
     }
 
@@ -1983,6 +1995,7 @@ impl Call {
                 Call::MapGrid(decode(params.or(Some(&empty)))?)
             }
             method::MAP_WIPE => Call::MapWipe,
+            method::MAP_MODE => Call::MapMode(decode(params)?),
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -2204,6 +2217,9 @@ pub mod test_support {
             Call::MapStream,
             Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
             Call::MapWipe,
+            Call::MapMode(MapModeParams {
+                localize_only: true,
+            }),
         ]
     }
 }
@@ -5464,6 +5480,8 @@ pub struct MapStatusResult {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<u64>,
+    /// The map is frozen: stops find the robot in it and add nothing ([`Call::MapMode`]). (v50)
+    pub localize_only: bool,
 }
 
 /// Parameters of [`Call::MapGrid`].
@@ -5492,6 +5510,23 @@ pub struct MapGridResult {
     pub keyframes: Vec<MapPose>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pose: Option<MapPose>,
+}
+
+/// Parameters of [`Call::MapMode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapModeParams {
+    /// Freeze the map and only localize in it; `false` maps again. With nothing mapped there is
+    /// nothing to localize in, and `mapd` goes on mapping — the answer says so.
+    pub localize_only: bool,
+}
+
+/// Answer to [`Call::MapMode`]: the mode now, and the stops in the map.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapModeResult {
+    pub localize_only: bool,
+    pub keyframes: u32,
 }
 
 /// Answer to [`Call::MapWipe`].
@@ -6341,7 +6376,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            84,
+            85,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

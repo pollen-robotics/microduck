@@ -235,6 +235,8 @@ fn permits(call: &proto::Call) -> bool {
         // The map and the pose in it: what a remote viewer draws the duck on. A wipe is the
         // owner's to ask for, from wherever they drive the robot.
         MapStatus | MapStream | MapGrid(_) | MapWipe => true,
+        // Freezing the map is a test bench's switch (`robotctl stress`), run on the robot.
+        MapMode(_) => false,
 
         // ── reading the robot's software ─────────────────────────────────────
         //

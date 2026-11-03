@@ -585,3 +585,97 @@ fn a_map_of_one_stop_and_a_sit_starts_over_instead_of_staying_lost() {
         "{in_map} in the map, {islands} apart"
     );
 }
+
+/// The map with its boot hint taken out: what localizing only must leave exactly as it found.
+fn frozen_part(m: &Mapper) -> maploc::mapper::Session {
+    let mut s = m.session();
+    s.last_pose = None;
+    s
+}
+
+/// Localizing only, the way `robotctl stress` uses it: a map built once, a robot rebooted
+/// somewhere else in the room, then laps, a carry and a sit. It must find itself and keep track as
+/// a mapping robot would — and leave the map byte for byte as it was.
+#[test]
+fn localizing_only_finds_and_tracks_the_robot_and_leaves_the_map_alone() {
+    let r = mapped_room();
+    let moved = Pose2::new(2.8, 1.2, -2.5);
+    let (mut mapper, robot) = reboot(&r, moved);
+    assert!(mapper.set_localize_only(true));
+    let before = frozen_part(&mapper);
+    let (in_map, _) = mapper.counts();
+
+    let mut r2 = run(mapper, robot, &wander([moved.x, moved.y]));
+    let n = relocalized_after(&r2.events).expect("never found itself in the frozen map");
+    let (e, a) = err(r2.mapper.pose().unwrap(), r2.robot.truth);
+    eprintln!("found after {n} stops, {e:.3} m {a:.1}° off");
+    assert!(e < RELOC_M && a < RELOC_DEG, "{e:.3} m {a:.1}°");
+
+    // A lap of tracking.
+    let from = continue_run(&mut r2, &lap());
+    let localized = r2.events[from..]
+        .iter()
+        .filter(|e| matches!(e, Event::Localized { matched: Some(m), .. } if m.accepted))
+        .count();
+    let (e, a) = err(
+        r2.mapper.pose().expect("tracking after a lap"),
+        r2.robot.truth,
+    );
+    eprintln!("after a lap: {localized} stops corrected the pose, {e:.3} m {a:.1}° off");
+    assert!(localized >= 5, "{localized}");
+    assert!(e < RELOC_M && a < RELOC_DEG, "{e:.3} m {a:.1}°");
+
+    // Carried, and found again.
+    let to = Pose2::new(2.6, 1.0, 2.2);
+    let mut steps = vec![Step::Carry { to }];
+    steps.extend(wander([to.x, to.y]));
+    let from = continue_run(&mut r2, &steps);
+    relocalized_after(&r2.events[from..]).expect("never found itself after the carry");
+    let (e, a) = err(r2.mapper.pose().unwrap(), r2.robot.truth);
+    assert!(e < RELOC_M && a < RELOC_DEG, "{e:.3} m {a:.1}°");
+
+    // Nothing was added, nothing moved, and the island the searches used is gone.
+    assert!(
+        !r2.events
+            .iter()
+            .any(|e| matches!(e, Event::Covered { .. } | Event::LoopClosed { .. })),
+        "a frozen map took a stop"
+    );
+    assert_eq!(r2.mapper.counts(), (in_map, 0));
+    assert!(frozen_part(&r2.mapper) == before, "the frozen map changed");
+}
+
+/// Turned on while lost, the islands go and the map is frozen as it stands; turned off, the
+/// mapper maps again.
+#[test]
+fn localizing_only_turned_on_while_lost_drops_the_island() {
+    let mut r = mapped_room();
+    let to = Pose2::new(2.6, 1.0, 2.2);
+    continue_run(
+        &mut r,
+        &[
+            Step::Carry { to },
+            Step::Stop {
+                secs: 4.0,
+                sweep: true,
+            },
+            // A stop is placed when the robot moves again.
+            Step::Turn { yaw: 1.0 },
+        ],
+    );
+    assert!(r.mapper.lost().is_some());
+    let (in_map, islands) = r.mapper.counts();
+    assert!(islands > 0, "the stop while lost made no island");
+    assert!(r.mapper.set_localize_only(true));
+    assert_eq!(r.mapper.counts(), (in_map, 0));
+    assert!(r.mapper.localize_only());
+    assert!(!r.mapper.set_localize_only(false));
+    assert!(!r.mapper.localize_only());
+}
+
+#[test]
+fn with_nothing_mapped_there_is_nothing_to_localize_in() {
+    let mut m = Mapper::new(MapperConfig::default());
+    assert!(!m.set_localize_only(true));
+    assert!(!m.localize_only());
+}

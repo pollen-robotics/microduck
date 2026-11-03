@@ -659,13 +659,27 @@ Still down 7 s after the policy came back (`--getup-timeout`), the policy is cut
 (`--reset`) and given one more 7 s; still down then, the run gives up, cuts torque and only logs —
 and calls for help, two quacks and a wheee every 15 s (`--call-every`, 0 for silence), so you hear
 it from the next room.
-It stays within ±0.5 m of where it started on odometry (`--square`; coarse, since falls drift it)
-and turns away from anything closer than 30 cm ahead on the head ToF (`--wall`); a wall between it
-and its start means odometry drifted the start behind it, and the start moves (`home_moved`).
-Before backing up it looks behind — body and head a quarter turn left, so the forward-only ToF faces
-the way it will back — and with a wall nearer than the backing up plus `--wall`, turns round to
-back away from it instead (`look_back`). A duck without
-the ToF logs `no_tof` once and runs on odometry alone. Run it in a pen, with no pad connected.
+It keeps 30 cm (`--wall`) off the walls by `mapd`'s map of the room: before each walk it faces a
+way the whole walk has room for, steered back to the room's most open place when it strays 0.5 m
+(`--square`) from it, and stands if a walk would come closer. A fall or a sit leaves `mapd` lost;
+before its next walk the robot stands and turns a quarter at a time until it is found, for up to
+15 s (`--relocalize`). The map is frozen for the run — found in, never added to; `--map-learns`
+to let it grow — and handed back to mapping when the run stops (`robotctl map mode localize|map`
+does it by hand). Build the room's map once, on one robot, and put it on every robot tested
+there — `[map] enabled` on, and:
+
+```
+scp robot-a:/var/lib/mapd/map.json .        # from the robot that mapped the room
+scp map.json robot-b: && ssh robot-b sudo robotctl map load map.json
+```
+
+No map, or still lost after `--relocalize` (and always with `--no-map`), a walk runs on the first
+guards: within ±0.5 m of its start on odometry (coarse, since falls drift it), turning away from
+anything closer than 30 cm ahead on the head ToF, a wall between it and its start moving the start
+(`home_moved`), and a look behind before backing up — body and head a quarter turn left, turning
+round to back away from a wall nearer than the backing up plus `--wall` (`look_back`). A duck
+without the ToF logs `no_tof` once and runs on odometry alone. The stress spec
+(`docs/superpowers/specs/2026-10-27-stress-test-design.md`) owns the guards. Run it in a pen, with no pad connected.
 Unlike `endurance`, `stop` (or ctrl-C in `--foreground`) turns the policy off, as the pad's Start
 does: the robot holds its home pose.
 
@@ -676,7 +690,8 @@ update never starts a run.
 Same background unit, battery hand-off and files as `endurance`, under `/var/lib/stress/` —
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
-`fallen_unprovoked`, `wall_guard`, `square_guard`, `home_moved`, `look_back`, `trip_refused` and `limp` (the
+`fallen_unprovoked`, `map`, `no_map`, `map_mode`, `map_turn`, `map_short`, `map_guard`, `map_lost`,
+`relocalized`, `still_lost`, `wall_guard`, `square_guard`, `home_moved`, `look_back`, `trip_refused` and `limp` (the
 limp-fall caught it; seconds after the trip). `scripts/endurance-plot.py` draws one run or compares
 several side by side, lap for lap; `--concatenate DIR` charts every run folder inside DIR as one
 run — back to back, the time between cut out, laps numbered on — into `DIR/concatenated/`. It writes each stress run a `report.pdf` to read or pass on; `currents.png` and a

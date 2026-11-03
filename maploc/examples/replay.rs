@@ -133,6 +133,7 @@ fn kind(e: &Event) -> &'static str {
         Event::Keyframe { .. } => "keyframe",
         Event::Discarded { .. } => "discarded",
         Event::Covered { .. } => "covered",
+        Event::Localized { .. } => "localized",
         Event::MapRestarted { .. } => "map_restarted",
         Event::LoopClosed { .. } => "loop_closed",
         Event::Lost { .. } => "lost",
@@ -308,7 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Lost { .. } => lost += 1,
                 Event::Relocalized { .. } => reloc += 1,
                 Event::Discarded { .. } => discarded += 1,
-                Event::Covered { .. } => covered += 1,
+                Event::Covered { .. } | Event::Localized { .. } => covered += 1,
                 Event::MapRestarted { .. } => {}
                 Event::Searched { .. } | Event::Bumped { .. } => {}
             }

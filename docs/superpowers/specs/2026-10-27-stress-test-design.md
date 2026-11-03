@@ -19,14 +19,16 @@ robots, not to the test.
 - Falls are provoked, forward and backward, at fixed points of a scripted lap.
 - The get-up is the robot's own (the policy picks it up); the test only measures it and gives up
   cleanly when it cannot.
-- It stays inside a 1 m² square and does not walk into walls (head ToF as a guard).
+- It does not walk into walls: it keeps `--wall` off them by `mapd`'s map of the test room, the
+  same map on every robot (head ToF and an odometry square when there is no map).
 - Deterministic: the same commands in the same order on every robot; anything that differs is
   measured and logged, never compensated.
 - Logs good enough to compare robots lap by lap.
 
 ## Non-goals
 
-- Mapping, navigation, or using the ToF for anything but "don't hit the wall".
+- Navigation beyond "face a way the walk has room for". Building the map is `mapd`'s
+  (`mapping-design.md`); the test reads it.
 - Exploring the whole square: the lap is roughly self-cancelling and stays near its start.
 - Changing `robotd`'s fall or get-up behaviour. The test drives `robotd` as a client.
 
@@ -141,10 +143,44 @@ Speeds are fixed (full stick: 0.3 m/s, 1.5 rad/s, `endurance`'s defaults). The s
 the code with a version string; the version goes in `meta.json` and each sample row carries the
 lap number and step index, so runs compare lap for lap.
 
-## Guards: the square and the wall
+## Guards: the map
 
-These are safety overrides, not navigation, and each is logged as an event with the lap/step it
-happened in:
+**The map of the test room** is built once, carefully, on one robot — walked round with stops
+until `robotctl map show` has the whole room — and copied to every robot under test:
+`scp` its `/var/lib/mapd/map.json` off, then `sudo robotctl map load map.json` on each. `[map]
+enabled` must be on. Every robot then keeps off the same walls in the same frame, and none of
+them drifts: a fall costs the map's pose nothing once `mapd` has found the robot again.
+
+At each lap start the driver fetches `map.grid` (5 cm) and computes each cell's distance to the
+nearest wall *or unknown cell* — the robot walks only on floor the map saw — and, once per run,
+**home**: the most open place in the room. The pose is `map.stream`'s, carried forward by
+odometry between its 4 Hz updates. Each event names the step it happened in:
+
+- **Facing** (`map_turn`): before each walk the robot turns on the spot, outside the step's slot,
+  to a heading along which the whole walk (forward or back) keeps `--wall` off every wall — the
+  least turn that does, or, when it is further than `--square` from home, the one that walks it
+  back towards home. A robot already inside the margin may walk away from or along a wall, never
+  closer. No heading with room for all of it (`map_short`): the one with the longest free run.
+- **The live guard** (`map_guard`): while walking, if the next 5 cm would come within `--wall`,
+  the step stands for the rest of its slot.
+- **Lost** (`relocalized`, `still_lost`): every fall and sit leaves `mapd` lost
+  (`mapping-design.md` §4). Before a walk, a lost robot stands for 3 s and turns a quarter, until
+  `mapd` has it again or `--relocalize` (15 s) runs out — stops are what `mapd` relocalizes from,
+  and two that agree are what it needs. Still lost: that walk runs on the first guards below.
+  Lost mid-walk (`map_lost`): the step stands.
+
+**The map is frozen for the run** (`map.mode`, `mapping-design.md` §4.1), asked again at every lap
+start in case `mapd` restarted, and handed back when the run stops (`map_mode` events): `mapd`
+finds the robot in the room's map and adds nothing, so every robot runs against the same map from
+first lap to last, and a fall it misreads cannot move a wall. `--map-learns` lets it grow.
+
+Turns on the spot are not guarded with a map. `--no-map` runs the first guards throughout.
+
+## The first guards: the square and the wall
+
+What a walk runs on with no map, or with the robot still lost after `--relocalize`. These are
+safety overrides, not navigation, and each is logged as an event with the lap/step it happened
+in:
 
 - **Square**: ±0.5 m from the start on odometry. If a walking step would take the robot past
   it, the step is cut short and the robot walks back toward the centre before the next step.
@@ -172,14 +208,15 @@ stretches a lap; it is measured, and the lap's own steps keep their fixed length
 is down and flailing, so after a few falls the square is approximate. That is accepted: the
 origin is not re-anchored (re-anchoring would let real drift accumulate unseen), the square guard
 is a coarse backstop, and the ToF is the guard that actually keeps it off the walls. Run it in an
-open area or a pen.
+open area or a pen. With the map, odometry only carries the pose between `mapd`'s updates.
 
 ## Output
 
 Same run directory shape as `endurance` (`meta.json`, `samples.csv`, `events.csv`), plus:
 
 - events: `lap_start`, `step`, `fall_triggered`, `fallen`, `no_fall`, `got_up` (duration),
-  `getup_failed`, `long_reset`, `gave_up`, `square_guard`, `wall_guard`, `no_tof`, `hands_off`;
+  `getup_failed`, `long_reset`, `gave_up`, `map`, `no_map`, `map_mode`, `map_turn`, `map_short`, `map_guard`,
+  `map_lost`, `relocalized`, `still_lost`, `square_guard`, `wall_guard`, `no_tof`, `hands_off`;
 - a per-lap summary (laps file or derived by the plot script): falls, got-up count, get-up times,
   failures, guards, battery % and hottest servo at lap end;
 - the plot script can overlay several run directories (several robots) lap by lap: get-up time

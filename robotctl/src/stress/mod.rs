@@ -16,8 +16,21 @@
 //! a `limp` event when the limp-fall caught it. The get-up is the policy's own; [`getup`] times
 //! it and decides when to give up.
 //!
-//! **It stays in its square and off the walls** ([`guard`]): odometry for the square, the head
-//! ToF for the wall. A duck without the ToF runs on odometry alone and says so once.
+//! **It stays off the walls by the map** ([`room`]): `mapd`'s map of the test room, built once
+//! and copied to every robot under test (`robotctl map load`). Before each walk it faces a way the
+//! whole walk keeps `--wall` off every wall, back towards the room's most open place when it has
+//! strayed `--square` from it, and stops a walk that would come closer. Every fall and sit leaves
+//! `mapd` lost; the robot then stands and turns on the spot, which is what lets `mapd` find it
+//! again, for up to `--relocalize` seconds.
+//!
+//! **The map is frozen for the run** (`map.mode`, re-asked every lap in case `mapd` restarted):
+//! `mapd` finds the robot in it and adds nothing, so every robot keeps off the walls of the same
+//! map from first lap to last, and a fall it misreads cannot move a wall. `--map-learns` lets
+//! the map grow as usual. The run hands mapping back when it stops.
+//!
+//! **Without the map it falls back to the first guards** ([`guard`]) for that walk: an odometry
+//! square around the start, the head ToF ahead, and a look behind before backing up. A duck with
+//! no map, or one still lost after `--relocalize`, runs on those and says so.
 //!
 //! The background unit, the run directory and the sampler are `endurance`'s ([`runlog`]); the
 //! columns are a superset of what `scripts/endurance-plot.py` reads, plus `lap` and `step`.
@@ -25,7 +38,9 @@
 mod getup;
 pub(crate) mod guard;
 mod lap;
+mod room;
 
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -41,6 +56,7 @@ use crate::runlog::{
 use crate::{Client, Failure, exit};
 use getup::{Getup, Timing, Verdict};
 use lap::{Action, Schedule, Step};
+use room::{Pose, Room};
 
 const UNIT: Unit = Unit {
     name: "robotctl-stress",
@@ -68,6 +84,19 @@ const TURN_TOLERANCE: f64 = 0.08;
 const TURN_TIMEOUT: f64 = 4.0;
 /// A wall guard turns until the nearest return ahead is this much further than `--wall`.
 const WALL_CLEAR: f64 = 1.5;
+/// A map pose older than this is no pose: `mapd` publishes at 4 Hz.
+const MAP_MAX_AGE: Duration = Duration::from_secs(1);
+/// The map's cell for the room, m. `mapd`'s keyframes are 2.5 cm; this is plenty for 30 cm.
+const ROOM_RES: f64 = 0.05;
+/// How far ahead of the robot the live map guard looks, m: a tick at full stick, and some.
+const MAP_LOOKAHEAD: f64 = 0.05;
+/// Relocalizing: how long each stop stands, s. `mapd` opens a keyframe after 0.4 s of stillness
+/// and wants ten frames; `robotd`'s idle glance, which widens what the stop sees, starts at 2 s.
+const RELOC_STOP: f64 = 3.0;
+/// Odometry kept to line a map pose up with, s at 20 Hz.
+const ODOM_HISTORY: usize = 60;
+/// A map pose is lined up with the odometry sample nearest its stamp, if one is this close, ns.
+const ODOM_MATCH_NS: u64 = 60_000_000;
 
 const DRIVING: [&str; 2] = ["walk", "stand"];
 
@@ -139,6 +168,19 @@ pub struct StressArgs {
     /// fall from 20 cm lands against the wall.
     #[arg(long, default_value_t = 0.30, help_heading = "Guards")]
     wall: f64,
+    /// Ignore `mapd`'s map and keep off the walls with the odometry square and the head ToF,
+    /// as the first stress runs did.
+    #[arg(long, help_heading = "Guards")]
+    no_map: bool,
+    /// Lost in the map before a walk (every fall and sit does it): stand and turn on the spot for
+    /// up to this long, s, so `mapd` can find the robot again. Still lost after it, that walk
+    /// falls back to the odometry square and the ToF.
+    #[arg(long, default_value_t = 15.0, help_heading = "Guards")]
+    relocalize: f64,
+    /// Let `mapd` add to the map during the run. By default the map is frozen for it: the robot
+    /// is found in it and nothing is added.
+    #[arg(long, help_heading = "Guards")]
+    map_learns: bool,
     /// At or below this battery %, stop driving and let robotd's own empty-battery shutdown run
     /// undisturbed.
     #[arg(long, default_value_t = 2.0, help_heading = "Guards")]
@@ -149,17 +191,24 @@ pub struct StressArgs {
     call_every: f64,
 }
 
+/// The daemons a run talks to.
+pub struct Sockets<'a> {
+    pub robot: &'a Path,
+    pub tof: &'a Path,
+    pub map: &'a Path,
+}
+
 pub fn run(
-    robot_socket: &Path,
-    tof_socket: &Path,
+    sockets: Sockets,
     command: Option<StressCommand>,
     args: StressArgs,
 ) -> Result<(), Failure> {
+    let robot_socket = sockets.robot;
     match command {
         Some(StressCommand::Status) => UNIT.status(),
         Some(StressCommand::Stop) => UNIT.stop(),
-        Some(StressCommand::Boot { config }) => boot(robot_socket, tof_socket, &config),
-        None if args.foreground => foreground(robot_socket, tof_socket, args),
+        Some(StressCommand::Boot { config }) => boot(&sockets, &config),
+        None if args.foreground => foreground(&sockets, args),
         None => UNIT.start(robot_socket, args.out.as_deref()),
     }
 }
@@ -177,7 +226,8 @@ const BOOT_ROBOTD_WAIT: Duration = Duration::from_secs(120);
 /// every robot that ships it. A config that does not load counts as off — the boot is the wrong
 /// moment to guess what a broken file meant, and `robotd` reports the file itself. A run already
 /// going is not a failure either: there is nothing to start, and the one going is the one wanted.
-fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Failure> {
+fn boot(sockets: &Sockets, config: &Path) -> Result<(), Failure> {
+    let robot_socket = sockets.robot;
     let on = match robotd_params::Params::load(config, false) {
         Ok(params) => params.stress.on_boot,
         Err(e) => {
@@ -231,7 +281,9 @@ fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Fai
         "--robot-socket".into(),
         robot_socket.as_os_str().to_owned(),
         "--tof-socket".into(),
-        tof_socket.as_os_str().to_owned(),
+        sockets.tof.as_os_str().to_owned(),
+        "--map-socket".into(),
+        sockets.map.as_os_str().to_owned(),
         "stress".into(),
         "--config".into(),
         config.as_os_str().to_owned(),
@@ -323,6 +375,118 @@ impl TofFeed {
     }
 }
 
+// ── the map ─────────────────────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct MapInner {
+    latest: Option<(Instant, proto::MapState)>,
+    /// Why there is no pose at all — `mapd` unreachable, or not mapping. Cleared by the next state.
+    unavailable: Option<String>,
+}
+
+/// The latest `map.state` from `mapd`, reconnecting forever.
+#[derive(Clone)]
+struct MapFeed(Arc<Mutex<MapInner>>);
+
+impl MapFeed {
+    fn spawn(socket: PathBuf) -> Self {
+        let feed = Self(Arc::default());
+        let inner = feed.0.clone();
+        std::thread::spawn(move || {
+            loop {
+                let why = Self::stream(&socket, &inner);
+                let mut inner = inner.lock().expect("map lock");
+                inner.unavailable = Some(why);
+                inner.latest = None;
+                drop(inner);
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+        feed
+    }
+
+    fn stream(socket: &Path, inner: &Mutex<MapInner>) -> String {
+        let mut client = match Client::connect_to("mapd", socket) {
+            Ok(c) => c,
+            Err(f) => return brief(&f),
+        };
+        let _ = client.writer.set_read_timeout(Some(Duration::from_secs(5)));
+        if let Err(f) = client.send(&proto::Request::call(
+            proto::Id::Number(1),
+            &proto::Call::MapStream,
+        )) {
+            return brief(&f);
+        }
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match client.reader.read_line(&mut line) {
+                Ok(0) => return "mapd closed the map stream".into(),
+                Err(e) => return format!("the map stream stopped: {e}"),
+                Ok(_) => {}
+            }
+            if let Ok(response) = serde_json::from_str::<proto::Response>(&line)
+                && let Ok(status) = response.result_as::<proto::MapStatusResult>()
+            {
+                let mut inner = inner.lock().expect("map lock");
+                inner.unavailable = status.unavailable;
+                inner.latest = Some((Instant::now(), status.state));
+                continue;
+            }
+            if let Some(state) = serde_json::from_str::<proto::Request>(&line)
+                .ok()
+                .and_then(|r| r.as_map_state())
+            {
+                let mut inner = inner.lock().expect("map lock");
+                inner.latest = Some((Instant::now(), state));
+            }
+        }
+    }
+
+    /// The latest state, if it is recent and `mapd` is mapping.
+    fn state(&self) -> Option<proto::MapState> {
+        let inner = self.0.lock().expect("map lock");
+        if inner.unavailable.is_some() {
+            return None;
+        }
+        let (at, state) = inner.latest.as_ref()?;
+        (at.elapsed() <= MAP_MAX_AGE).then(|| state.clone())
+    }
+
+    fn unavailable(&self) -> Option<String> {
+        let inner = self.0.lock().expect("map lock");
+        if let Some(why) = &inner.unavailable {
+            return Some(why.clone());
+        }
+        match &inner.latest {
+            None => Some("no map state from mapd yet".into()),
+            Some((at, _)) if at.elapsed() > MAP_MAX_AGE => Some(format!(
+                "no map state for {:.0} s",
+                at.elapsed().as_secs_f64()
+            )),
+            Some(_) => None,
+        }
+    }
+}
+
+/// The room, fetched from `mapd` at the start of every lap: the map moves a little as `mapd`
+/// re-solves it, and a lap is short enough for one grid to hold.
+fn fetch_room(socket: &Path) -> Result<Room, String> {
+    let mut client = Client::connect_to("mapd", socket).map_err(|f| brief(&f))?;
+    let _ = client
+        .writer
+        .set_read_timeout(Some(Duration::from_secs(10)));
+    let response = client
+        .call(&proto::Call::MapGrid(proto::MapGridParams {
+            res_m: Some(ROOM_RES),
+        }))
+        .map_err(|f| brief(&f))?;
+    let grid: proto::MapGridResult =
+        crate::decode(&crate::result_of(response).map_err(|f| brief(&f))?)
+            .map_err(|f| brief(&f))?;
+    Room::from_grid(&grid).ok_or_else(|| "the map has no floor in it yet".into())
+}
+
 // ── the driver ──────────────────────────────────────────────────────────────────────────────
 
 type Drive = Result<(), Halt>;
@@ -361,6 +525,18 @@ struct Driver {
     no_tof_logged: bool,
     /// The last odometry read, to see a `robotd` restart zero it.
     last_xy: Option<(f64, f64)>,
+    map: MapFeed,
+    map_socket: PathBuf,
+    /// The room this lap keeps off the walls of, when there is a map.
+    room: Option<Room>,
+    /// The room's most open place, from the first map seen: where the walks are steered back to.
+    map_home: Option<(f64, f64)>,
+    /// Why the last lap had no room, said once per change.
+    no_room: Option<String>,
+    /// Odometry at each tick, stamped with `robotd`'s clock, to line `mapd`'s pose up with now.
+    odom: VecDeque<(u64, Pose)>,
+    /// Whether `mapd` last said the map was frozen; `None` before asking.
+    map_frozen: Option<bool>,
 }
 
 impl Driver {
@@ -455,6 +631,15 @@ impl Driver {
 
     /// One tick of the 20 Hz loop: this twist, then the rest of the period.
     fn tick(&mut self, vx: f64, vyaw: f64) -> Drive {
+        if let Some(f) = self.feed.frame()
+            && self.odom.back().is_none_or(|(t, _)| *t != f.t_ns)
+        {
+            if self.odom.len() == ODOM_HISTORY {
+                self.odom.pop_front();
+            }
+            self.odom
+                .push_back((f.t_ns, (f.odom.position[0], f.odom.position[1], f.odom.yaw)));
+        }
         self.move_(vx, vyaw)?;
         self.wait(MOVE_PERIOD.as_secs_f64())
     }
@@ -501,6 +686,218 @@ impl Driver {
         let state = self.feed.frame()?;
         let zones = guard::classify(&frame, &state, &self.reprojector)?;
         guard::nearest_ahead(&zones, guard::CORRIDOR_HALF_WIDTH)
+    }
+
+    /// Where the robot is in the map now: `mapd`'s pose carried forward by the odometry since
+    /// it was computed. `None` while lost, or with no map.
+    fn map_pose(&self) -> Option<Pose> {
+        let state = self.map.state()?;
+        let p = state.pose?;
+        let at_stamp = (p.x, p.y, p.yaw);
+        let then = self
+            .odom
+            .iter()
+            .min_by_key(|(t, _)| t.abs_diff(state.t_ns))
+            .filter(|(t, _)| t.abs_diff(state.t_ns) <= ODOM_MATCH_NS);
+        match (then, self.pose()) {
+            (Some((_, then)), Some(now)) => Some(room::compose(
+                room::compose(at_stamp, room::inverse(*then)),
+                now,
+            )),
+            _ => Some(at_stamp),
+        }
+    }
+
+    /// The room for this lap, or the first guards, said when it changes.
+    fn refresh_room(&mut self) {
+        if self.args.no_map {
+            if self.no_room.is_none() {
+                self.no_room = Some("--no-map".into());
+                self.run
+                    .event("no_map", "--no-map: odometry square and ToF");
+            }
+            return;
+        }
+        if !self.args.map_learns {
+            self.freeze_map(true);
+        }
+        match fetch_room(&self.map_socket) {
+            Ok(room) => {
+                if self.no_room.take().is_some() || self.map_home.is_none() {
+                    let home = *self.map_home.get_or_insert(room.centre());
+                    let state = self.map.state();
+                    self.run.event(
+                        "map",
+                        &format!(
+                            "keeping off the walls by the map: {} stops, home at ({:.2}, {:.2}), {:.2} m from the nearest wall",
+                            state.map_or(0, |s| s.keyframes),
+                            home.0,
+                            home.1,
+                            room.clearance(home.0, home.1)
+                        ),
+                    );
+                }
+                self.room = Some(room);
+            }
+            Err(why) => {
+                self.room = None;
+                if self.no_room.as_deref() != Some(why.as_str()) {
+                    self.run
+                        .event("no_map", &format!("{why}; odometry square and ToF"));
+                    self.no_room = Some(why);
+                }
+            }
+        }
+    }
+
+    /// Freeze the map for the run, or hand mapping back. Said when the answer changes; a `mapd`
+    /// that cannot is the run's to note, not to stop over.
+    fn freeze_map(&mut self, on: bool) {
+        let result = Client::connect_to("mapd", &self.map_socket).and_then(|mut c| {
+            let _ = c.writer.set_read_timeout(Some(Duration::from_secs(5)));
+            let response = c.call(&proto::Call::MapMode(proto::MapModeParams {
+                localize_only: on,
+            }))?;
+            crate::decode::<proto::MapModeResult>(&crate::result_of(response)?)
+        });
+        let now = match result {
+            Ok(r) => r.localize_only,
+            Err(f) => {
+                if self.map_frozen != Some(false) {
+                    self.run
+                        .event("map_mode", &format!("{}; the map may grow", brief(&f)));
+                }
+                self.map_frozen = Some(false);
+                return;
+            }
+        };
+        if self.map_frozen != Some(now) {
+            let what = match (on, now) {
+                (true, true) => "frozen: localizing only",
+                (true, false) => "nothing mapped to freeze: mapd is mapping",
+                (false, _) => "mapping again",
+            };
+            self.run.event("map_mode", what);
+        }
+        self.map_frozen = Some(now);
+    }
+
+    /// Found in the map before a walk, standing and turning on the spot to let `mapd` find the
+    /// robot if it has to. Outside the step's slot, like a look behind.
+    fn localize(&mut self) -> Result<bool, Halt> {
+        if self.room.is_none() {
+            return Ok(false);
+        }
+        if self.map_pose().is_some() {
+            return Ok(true);
+        }
+        // mapd gone, or not mapping: standing still would find nothing.
+        if let Some(why) = self.map.unavailable() {
+            self.run.event(
+                "still_lost",
+                &format!("{why}: this walk on the odometry square and ToF"),
+            );
+            return Ok(false);
+        }
+        let why = self
+            .map
+            .state()
+            .and_then(|s| s.lost)
+            .unwrap_or_else(|| "lost".into());
+        let t0 = self.now();
+        let end = t0 + self.args.relocalize;
+        let mut stops = 0;
+        while self.now() < end {
+            self.check_battery()?;
+            if self.caught_falling()? {
+                continue;
+            }
+            // A stop: still long enough for mapd to open a keyframe and the head to glance round.
+            let stop_end = (self.now() + RELOC_STOP).min(end);
+            while self.now() < stop_end && self.map_pose().is_none() {
+                self.tick(0.0, 0.0)?;
+            }
+            stops += 1;
+            if self.map_pose().is_some() {
+                self.run.event(
+                    "relocalized",
+                    &format!("{why}; found after {:.1} s, {stops} stops", self.now() - t0),
+                );
+                self.schedule.unanchor();
+                return Ok(true);
+            }
+            // A new view, and the move that closes the stop: a keyframe is placed when the robot
+            // moves again, and two that agree are what a relocalization needs.
+            if let Some((_, _, yaw)) = self.pose() {
+                self.turn_to(yaw + std::f64::consts::FRAC_PI_2)?;
+            }
+        }
+        self.run.event(
+            "still_lost",
+            &format!(
+                "{why}; not found after {:.0} s, {stops} stops: this walk on the odometry square and ToF",
+                self.now() - t0
+            ),
+        );
+        self.schedule.unanchor();
+        Ok(false)
+    }
+
+    /// Face the way the map says this walk can go. Outside the step's slot, like a look behind.
+    fn face_for(&mut self, step: &Step, vx: f64) -> Drive {
+        let (Some(room), Some(pose), Some(home)) = (&self.room, self.map_pose(), self.map_home)
+        else {
+            return Ok(());
+        };
+        let travel = vx * step.seconds;
+        let heading = room.heading_for(pose, travel, self.args.wall, home, self.args.square);
+        let turn = guard::wrap(heading.yaw - pose.2);
+        if heading.run < travel.abs() {
+            self.run.event(
+                "map_short",
+                &format!(
+                    "no way has {:.2} m free; the longest has {:.2} m, {:.0}°",
+                    travel.abs(),
+                    heading.run,
+                    turn.to_degrees()
+                ),
+            );
+        }
+        if turn.abs() > TURN_TOLERANCE
+            && let Some((_, _, yaw)) = self.pose()
+        {
+            let why = if heading.homeward {
+                "towards home"
+            } else {
+                "off the wall"
+            };
+            self.run.event(
+                "map_turn",
+                &format!(
+                    "{:.0}° {why}, at ({:.2}, {:.2}), {:.2} m from the nearest wall",
+                    turn.to_degrees(),
+                    pose.0,
+                    pose.1,
+                    room.clearance(pose.0, pose.1)
+                ),
+            );
+            self.turn_to(yaw + turn)?;
+            self.schedule.unanchor();
+        }
+        Ok(())
+    }
+
+    /// Whether the next tick of a walk at `vx` would bring the robot within `--wall` of a wall,
+    /// by the map. `None` when the map has no pose to say.
+    fn map_blocked(&self, vx: f64) -> Option<bool> {
+        let room = self.room.as_ref()?;
+        let pose = self.map_pose()?;
+        let direction = if vx < 0.0 {
+            pose.2 + std::f64::consts::PI
+        } else {
+            pose.2
+        };
+        Some(room.free_run(pose, direction, MAP_LOOKAHEAD, self.args.wall) < MAP_LOOKAHEAD)
     }
 
     fn check_battery(&self) -> Drive {
@@ -586,6 +983,7 @@ impl Driver {
             self.run.shared.lock().expect("shared lock").lap = Some(n);
             self.run
                 .event("lap_start", &format!("lap {n} ({})", lap::VERSION));
+            self.refresh_room();
             for step in &steps {
                 self.run.shared.lock().expect("shared lock").step = step.name.into();
                 self.run.set_activity(activity(step.action), step.name);
@@ -614,6 +1012,15 @@ impl Driver {
     fn walk(&mut self, step: &Step, vx: f64, vyaw: f64) -> Drive {
         if !self.driving() {
             self.ensure_driving()?;
+        }
+        // A turn on the spot goes nowhere: with the map, no guard has anything to say about it.
+        // Without, the odometry square still watches it, as it always did.
+        if vx == 0.0 && self.room.is_some() {
+            return self.turn_step(step, vyaw);
+        }
+        if self.localize()? {
+            self.face_for(step, vx)?;
+            return self.walk_by_map(step, vx, vyaw);
         }
         if vx < 0.0 {
             self.look_back(vx * step.seconds)?;
@@ -697,6 +1104,66 @@ impl Driver {
                 Guard::Done => (0.0, 0.0),
             };
             self.tick(cmd_vx, cmd_vyaw)?;
+        }
+        Ok(())
+    }
+
+    /// A walk with the map: the step's own twist until the map says the next tick would come
+    /// within `--wall` of a wall, then standing for the rest of the slot. Lost on the way — a
+    /// bump, a contradiction — it stands too: the walk was chosen for a pose it no longer has.
+    fn walk_by_map(&mut self, step: &Step, vx: f64, vyaw: f64) -> Drive {
+        let end = self.schedule.deadline(step.seconds, self.now());
+        while self.now() < end {
+            self.check_battery()?;
+            if self.caught_falling()? {
+                return self.hold_until(end);
+            }
+            let pose = self.pose();
+            self.follow_odometry(pose);
+            match self.map_blocked(vx) {
+                Some(false) => {}
+                Some(true) => {
+                    let at = self.map_pose().unwrap_or_default();
+                    let near = self.room.as_ref().map_or(0.0, |r| r.clearance(at.0, at.1));
+                    self.run.event(
+                        "map_guard",
+                        &format!(
+                            "{} at ({:.2}, {:.2}), {near:.2} m from the nearest wall; standing",
+                            step.name, at.0, at.1
+                        ),
+                    );
+                    return self.hold_until(end);
+                }
+                None => {
+                    let why = self
+                        .map
+                        .state()
+                        .and_then(|s| s.lost)
+                        .or_else(|| self.map.unavailable())
+                        .unwrap_or_else(|| "no pose".into());
+                    self.run.event(
+                        "map_lost",
+                        &format!("{} mid-walk: {why}; standing", step.name),
+                    );
+                    return self.hold_until(end);
+                }
+            }
+            self.tick(vx, vyaw)?;
+        }
+        Ok(())
+    }
+
+    /// A turn on the spot for the step's slot.
+    fn turn_step(&mut self, step: &Step, vyaw: f64) -> Drive {
+        let end = self.schedule.deadline(step.seconds, self.now());
+        while self.now() < end {
+            self.check_battery()?;
+            if self.caught_falling()? {
+                return self.hold_until(end);
+            }
+            let pose = self.pose();
+            self.follow_odometry(pose);
+            self.tick(0.0, vyaw)?;
         }
         Ok(())
     }
@@ -1056,6 +1523,14 @@ impl Driver {
     fn park(&mut self) {
         let _ = self.call(&proto::Call::RobotStop);
         let _ = self.enable(false);
+        self.release_map();
+    }
+
+    /// Mapping handed back, if this run froze the map.
+    fn release_map(&mut self) {
+        if self.map_frozen == Some(true) {
+            self.freeze_map(false);
+        }
     }
 }
 
@@ -1069,7 +1544,8 @@ fn activity(action: Action) -> &'static str {
     }
 }
 
-fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Result<(), Failure> {
+fn foreground(sockets: &Sockets, args: StressArgs) -> Result<(), Failure> {
+    let (robot_socket, tof_socket) = (sockets.robot, sockets.tof);
     runlog::need_robotd(robot_socket)?;
     let out = args.out.clone().unwrap_or_else(|| UNIT.default_out());
     let run = runlog::open_run(
@@ -1104,6 +1580,13 @@ fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Resul
         our_sit: false,
         no_tof_logged: false,
         last_xy: None,
+        map: MapFeed::spawn(sockets.map.to_owned()),
+        map_socket: sockets.map.to_owned(),
+        room: None,
+        map_home: None,
+        no_room: None,
+        odom: VecDeque::with_capacity(ODOM_HISTORY),
+        map_frozen: None,
     };
     match driver.run_forever() {
         Err(Halt::HandsOff(why)) => {
@@ -1115,6 +1598,7 @@ fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Resul
                 run.set_activity("hands_off", &why);
                 wait_for_signal(&run);
             }
+            driver.release_map();
             run.event("stop", "stopped while hands-off");
             Ok(())
         }
