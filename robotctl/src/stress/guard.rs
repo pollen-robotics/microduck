@@ -4,6 +4,13 @@
 //! goes on at its next step. Odometry drifts with every fall (contact odometry keeps integrating
 //! a robot flailing on the floor), so the square is coarse; the ToF is the one that actually sees
 //! the wall.
+//!
+//! **The ToF only looks forward, and half the lap walks backward.** So what it sees is also
+//! remembered ([`ObstacleMap`]): each return becomes a cell on a coarse grid in the odometry frame,
+//! and a backward walk checks the cells behind it. The memory is short ([`MEMORY_S`]) because
+//! odometry drifts, and the lap's turns sweep the sensor round often enough to keep it filled.
+
+use std::collections::HashMap;
 
 use duck_ipc_proto as proto;
 use kinematics::tof::{Reprojector, Zone};
@@ -33,6 +40,98 @@ pub fn classify(
     r: &Reprojector,
 ) -> Option<Vec<Zone>> {
     crate::monitor::classify_tof(frame, state, r).map(|zones| zones.to_vec())
+}
+
+/// Grid cell side, m. Coarser than the corridor's margin is pointless; finer only costs cells.
+const CELL: f64 = 0.05;
+/// Returns further than this are not remembered: the guard never needs them, and far returns are
+/// the least trustworthy under a drifting pose.
+const MEMORY_RANGE: f64 = 1.0;
+/// How long a cell is believed, s. Long enough to outlast a lap's walk away and back, short
+/// enough that a few falls' worth of odometry drift do not leave phantom walls.
+pub const MEMORY_S: f64 = 90.0;
+
+/// Which way the robot is walking, for asking what is in its way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Travel {
+    Forward,
+    Backward,
+}
+
+impl Travel {
+    /// The way a forward speed walks, or `None` for standing or turning on the spot.
+    pub fn of(vx: f64) -> Option<Self> {
+        if vx > 0.0 {
+            Some(Self::Forward)
+        } else if vx < 0.0 {
+            Some(Self::Backward)
+        } else {
+            None
+        }
+    }
+}
+
+/// What the head ToF has seen recently, in the odometry frame: cell → when last seen.
+#[derive(Debug, Default, Clone)]
+pub struct ObstacleMap {
+    cells: HashMap<(i32, i32), f64>,
+}
+
+impl ObstacleMap {
+    /// Remember a frame's returns, seen from `pose` (x, y, yaw) at time `now` (s).
+    pub fn record(&mut self, pose: (f64, f64, f64), zones: &[Zone], now: f64) {
+        let (x, y, yaw) = pose;
+        let (s, c) = yaw.sin_cos();
+        for zone in zones {
+            if let Zone::Hit { point, range } = zone
+                && *range <= MEMORY_RANGE
+            {
+                let wx = x + c * point[0] - s * point[1];
+                let wy = y + s * point[0] + c * point[1];
+                self.cells.insert(
+                    ((wx / CELL).floor() as i32, (wy / CELL).floor() as i32),
+                    now,
+                );
+            }
+        }
+        // Forget as we go, so the map stays the size of what the robot has seen lately.
+        self.cells.retain(|_, seen| now - *seen <= MEMORY_S);
+    }
+
+    /// The nearest remembered obstacle in the strip the robot would walk through, `half_width`
+    /// either side of its centre line, as a distance along that line from the trunk.
+    pub fn nearest(
+        &self,
+        pose: (f64, f64, f64),
+        travel: Travel,
+        half_width: f64,
+        now: f64,
+    ) -> Option<f64> {
+        let (x, y, yaw) = pose;
+        let (s, c) = yaw.sin_cos();
+        self.cells
+            .iter()
+            .filter(|(_, seen)| now - **seen <= MEMORY_S)
+            .filter_map(|((i, j), _)| {
+                // The cell's centre, in the robot's frame.
+                let (dx, dy) = (
+                    (f64::from(*i) + 0.5) * CELL - x,
+                    (f64::from(*j) + 0.5) * CELL - y,
+                );
+                let (rx, ry) = (c * dx + s * dy, -s * dx + c * dy);
+                let along = match travel {
+                    Travel::Forward => rx,
+                    Travel::Backward => -rx,
+                };
+                (along > 0.0 && ry.abs() <= half_width).then_some(along)
+            })
+            .min_by(f64::total_cmp)
+    }
+
+    /// Forget everything: the pose it was all recorded against is gone.
+    pub fn clear(&mut self) {
+        self.cells.clear();
+    }
 }
 
 /// Whether `pose` is outside the square of half-side `half` around `home`.
@@ -108,6 +207,53 @@ mod tests {
         ];
         assert_eq!(nearest_ahead(&zones, 0.15), None);
         assert_eq!(nearest_ahead(&[], 0.15), None);
+    }
+
+    /// A wall seen ahead, then turned away from, is behind the robot — and still known.
+    #[test]
+    fn a_wall_seen_ahead_is_remembered_behind_after_a_turn() {
+        let mut map = ObstacleMap::default();
+        map.record((0.0, 0.0, 0.0), &[hit(0.30, 0.0)], 0.0);
+        let ahead = map
+            .nearest((0.0, 0.0, 0.0), Travel::Forward, 0.15, 1.0)
+            .unwrap();
+        assert!((ahead - 0.30).abs() < CELL, "{ahead}");
+        assert_eq!(
+            map.nearest((0.0, 0.0, 0.0), Travel::Backward, 0.15, 1.0),
+            None
+        );
+        // Turned round on the spot: the same wall, 0.30 m behind.
+        let turned = (0.0, 0.0, std::f64::consts::PI);
+        let behind = map.nearest(turned, Travel::Backward, 0.15, 2.0).unwrap();
+        assert!((behind - 0.30).abs() < CELL, "{behind}");
+        assert_eq!(map.nearest(turned, Travel::Forward, 0.15, 2.0), None);
+        // Facing sideways it is in neither strip.
+        let side = (0.0, 0.0, std::f64::consts::FRAC_PI_2);
+        assert_eq!(map.nearest(side, Travel::Backward, 0.15, 2.0), None);
+    }
+
+    #[test]
+    fn the_map_forgets_and_ignores_far_returns_and_the_floor() {
+        let mut map = ObstacleMap::default();
+        map.record(
+            (0.0, 0.0, 0.0),
+            &[
+                hit(1.5, 0.0),
+                Zone::Floor {
+                    point: [0.2, 0.0, -0.2],
+                },
+                hit(0.4, 0.0),
+            ],
+            0.0,
+        );
+        let pose = (0.0, 0.0, 0.0);
+        assert!(map.nearest(pose, Travel::Forward, 0.15, 1.0).unwrap() < 0.5);
+        assert_eq!(
+            map.nearest(pose, Travel::Forward, 0.15, MEMORY_S + 1.0),
+            None
+        );
+        map.clear();
+        assert_eq!(map.nearest(pose, Travel::Forward, 0.15, 1.0), None);
     }
 
     #[test]
