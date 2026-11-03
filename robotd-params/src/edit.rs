@@ -1974,6 +1974,7 @@ mod tests {
                 "pickup",
                 "theremin",
                 "head_imu",
+                "map",
                 "audio",
                 "media",
                 "stress",

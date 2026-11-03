@@ -39,7 +39,7 @@ pub const PADD: &str = "padd.service";
 /// It has already cost once: `mediad` and `tofd` shipped units two releases before they were named
 /// here, so the block a person reads after an update — the one that exists to say which daemon is
 /// still on the old release — could not report either of them at all.
-pub const MANAGED: [&str; 9] = [
+pub const MANAGED: [&str; 10] = [
     "updaterd.service",
     "robotd.service",
     "configd.service",
@@ -49,6 +49,7 @@ pub const MANAGED: [&str; 9] = [
     "mediad.service",
     "tofd.service",
     "nfcd.service",
+    "mapd.service",
 ];
 
 /// What systemd says about one unit. The narrow question, kept for `pad.status`.
