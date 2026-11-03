@@ -65,15 +65,35 @@ impl Record {
     }
 }
 
-/// The NDEF TLV's total size, terminator included, from its first bytes — or `None` when they
-/// are not an NDEF TLV, in which case where the message ends is unknown and everything is read.
+/// The NDEF TLV's total size, terminator included, from the start of the tag's user memory —
+/// or `None` when the NDEF TLV cannot be located from the bytes already read.
 pub fn tlv_size(head: &[u8]) -> Option<usize> {
-    match *head {
-        [TLV_NDEF, 0xFF, hi, lo, ..] => Some(4 + u16::from_be_bytes([hi, lo]) as usize + 1),
-        [TLV_NDEF, 0xFF, ..] => None,
-        [TLV_NDEF, len, ..] => Some(2 + len as usize + 1),
-        _ => None,
+    let mut i = 0;
+    while i < head.len() {
+        let tlv = head[i];
+        if tlv == TLV_TERMINATOR {
+            return None;
+        }
+        if tlv == TLV_NULL {
+            i += 1;
+            continue;
+        }
+
+        let (len, start) = match head.get(i + 1..) {
+            Some([0xFF, hi, lo, ..]) => (u16::from_be_bytes([*hi, *lo]) as usize, i + 4),
+            Some([len, ..]) if *len != 0xFF => (*len as usize, i + 2),
+            _ => return None,
+        };
+        let end = start.checked_add(len)?;
+        if tlv == TLV_NDEF {
+            return end.checked_add(1);
+        }
+        if end > head.len() {
+            return None;
+        }
+        i = end;
     }
+    None
 }
 
 /// The records of the NDEF message in a tag's user memory. Empty for a blank tag.
@@ -238,7 +258,17 @@ mod tests {
     #[test]
     fn the_tlv_size_is_known_from_the_first_bytes() {
         let tag = text_tag("98:B6:E9:28:06:09");
-        assert_eq!(tlv_size(&tag), Some(2 + tag[1] as usize + 1));
+        let size = 2 + tag[1] as usize + 1;
+        assert_eq!(tlv_size(&tag), Some(size));
+
+        let mut after_null = vec![TLV_NULL];
+        after_null.extend_from_slice(&tag);
+        assert_eq!(tlv_size(&after_null), Some(1 + size));
+
+        let mut after_lock_control = vec![0x01, 3, 0xA0, 0x10, 0x44];
+        after_lock_control.extend_from_slice(&tag);
+        assert_eq!(tlv_size(&after_lock_control), Some(5 + size));
+
         assert_eq!(tlv_size(&[0x00, 0x00]), None);
     }
 
