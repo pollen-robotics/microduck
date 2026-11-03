@@ -119,3 +119,66 @@ def test_a_stress_run_gets_a_pdf_report(tmp_path):
     assert out == run / "report.pdf"
     assert out.read_bytes()[:5] == b"%PDF-"
     assert out.read_bytes().count(b"/Type /Page\n") + out.read_bytes().count(b"/Type /Page ") >= 4
+
+
+def test_concatenate_runs_them_back_to_back_with_laps_numbered_on(tmp_path):
+    parent = tmp_path / "series"
+    # Three laps of samples each (see write_run); the second run starts an hour later, on the
+    # same wall clock, and must follow the first with the gap cut out.
+    a = write_run(parent / "duck-a", "stress-v1",
+                  lap_events(0, ["1.00 s"] * 6) + lap_events(40, ["2.00 s"] * 6))
+    b = write_run(parent / "duck-b", "stress-v1", lap_events(0, ["3.00 s"] * 6))
+    for f in ("samples.csv", "events.csv"):
+        text = (b / f).read_text().splitlines()
+        rows = [text[0]] + [str(float(r.split(",", 1)[0]) + 3600) + "," + r.split(",", 1)[1] for r in text[1:]]
+        (b / f).write_text("\n".join(rows) + "\n")
+
+    out = plot.concatenate(parent)
+    df, ev = plot.load(out)
+    assert out == parent / "concatenated"
+    # 12 samples each, 10 s apart: the second run starts 10 s after the first's last sample.
+    assert df["wall"].is_monotonic_increasing
+    assert df["wall"].iloc[12] - df["wall"].iloc[11] == 10
+    assert list(ev.loc[ev["kind"] == "session", "detail"]) == ["duck-a", "duck-b"]
+
+    laps = plot.stress_laps(df, ev)
+    assert list(laps.index) == [1, 2, 3]
+    assert laps.loc[3, "getup_median_s"] == 3.0
+    # Run b's samples were laps 1-3 of its own; lap 3 of the series is its lap 1.
+    assert set(df.loc[12:, "lap"]) == {3, 4, 5}
+    # Each run drains 97 → 86 % walking; the jump back to 97 at the join is a charge, not a drain.
+    drain = plot.drain_by_activity(df)
+    assert drain.loc["walk", "pct"] == 22
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["concatenated"] == ["duck-a", "duck-b"]
+    assert len(meta["segments"]) == 2
+
+
+def test_concatenate_refuses_different_laps(tmp_path):
+    parent = tmp_path / "series"
+    write_run(parent / "duck-a", "stress-v1", lap_events(0, ["1.00 s"]))
+    write_run(parent / "duck-b", "stress-v2", lap_events(0, ["1.00 s"]))
+    with pytest.raises(SystemExit):
+        plot.concatenate(parent)
+
+
+def test_the_timeline_runs_on_the_runs_own_timer(tmp_path):
+    run = write_run(tmp_path / "duck-a", "stress-v1", lap_events(0, ["1.00 s"]))
+    # The board syncs its clock six samples in: the wall clock leaps an hour, t_s does not.
+    lines = (run / "samples.csv").read_text().splitlines()
+    out = [lines[0]]
+    for i, row in enumerate(lines[1:]):
+        wall, rest = row.split(",", 1)
+        out.append(f"{float(wall) + (3600 if i >= 6 else 0)},{rest}")
+    (run / "samples.csv").write_text("\n".join(out) + "\n")
+    df, _ = plot.load(run)
+    assert df["h"].diff().max() * 3600 == pytest.approx(10)
+
+
+def test_a_resumed_run_follows_the_piece_before_it():
+    samples = plot.pd.Series([0.0, 10.0, 20.0, 0.0, 10.0])
+    events = plot.pd.Series([0.0, 25.0, 0.0, 12.0])
+    s, e = plot.run_hours(samples, events)
+    # The first piece ends at 25 s (its last event), so the second starts there.
+    assert list(s * 3600) == pytest.approx([0, 10, 20, 25, 35])
+    assert list(e * 3600) == pytest.approx([0, 25, 25, 37])

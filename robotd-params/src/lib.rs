@@ -3953,7 +3953,10 @@ mod tests {
             let path = write(dir.path(), &format!("[stress]\ntrip_ms = {bad}\n"));
             assert!(Params::load(&path, true).is_err(), "accepted {bad}");
         }
-        let path = write(dir.path(), "[stress]\ntrip_ms = 1000\ntrip_legs = \"left\"\n");
+        let path = write(
+            dir.path(),
+            "[stress]\ntrip_ms = 1000\ntrip_legs = \"left\"\n",
+        );
         let p = Params::load(&path, true).unwrap();
         assert_eq!(p.stress.trip_ms, 1000);
         assert_eq!(p.stress.trip_legs, duck_ipc_proto::TripLegs::Left);

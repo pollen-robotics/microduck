@@ -25,6 +25,12 @@ For a stress run it also writes:
                    incident
     summary.md     … plus a table per lap: falls, get-ups, failures, guards, battery, hottest servo
 
+`--concatenate DIR` treats every run directory inside DIR as one run, back to back in start
+order: the time between them (a charge, a reboot) is cut out, and laps are numbered on from the
+previous run's. The merged `samples.csv`, `events.csv` and `meta.json` are written to
+`DIR/concatenated/`, which is then charted like any run directory — and can be compared with
+others. Give it more than once to compare several concatenated series.
+
 Given several runs it also writes `compare.png` beside the first, battery against time for each —
 or, for stress runs, median get-up time and battery against lap number, one line per robot. Stress
 runs of different laps (`meta.json` `lap`) are not the same test and are refused together.
@@ -85,13 +91,36 @@ plt.rcParams.update({
 
 def load(run: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(run / "samples.csv")
-    # Wall clock, not `t_s`: a run resumed after a crash restarts `t_s` at zero.
-    df["h"] = (df["wall"] - df["wall"].iloc[0]) / 3600.0
     ev_path = run / "events.csv"
-    ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "kind", "detail"])
-    if len(ev):
+    ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+    if "t_s" in df and df["t_s"].notna().all() and (not len(ev) or ev["t_s"].notna().all()):
+        df["h"], ev["h"] = run_hours(df["t_s"], ev["t_s"])
+    else:
+        # A file from before `t_s` was logged: the wall clock is all there is.
+        df["h"] = (df["wall"] - df["wall"].iloc[0]) / 3600.0
         ev["h"] = (ev["wall"] - df["wall"].iloc[0]) / 3600.0
     return df, ev
+
+
+def run_hours(samples_t: pd.Series, events_t: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Hours of running, from the run's own timer (`t_s`), for samples and events alike.
+
+    Not the wall clock: a board with no battery-backed clock boots on the last time it saved and
+    jumps forward when it syncs, minutes to an hour into a run, and every jump was a stretch of
+    nothing on the timeline. `t_s` is monotonic, but restarts at zero for each piece of a run —
+    `--out` appending a resumed run, or each join of `--concatenate` — so the pieces, found where
+    `t_s` drops, are laid end to end. Rows are in the order they were written.
+    """
+    def piece(t: pd.Series) -> pd.Series:
+        return (t.diff() < -1.0).cumsum()
+
+    sp, ep = piece(samples_t), piece(events_t)
+    pieces = int(max(sp.max() if len(sp) else 0, ep.max() if len(ep) else 0)) + 1
+    ends = [max(samples_t[sp == k].max() if (sp == k).any() else 0.0,
+                events_t[ep == k].max() if (ep == k).any() else 0.0) for k in range(pieces)]
+    offsets = np.concatenate([[0.0], np.cumsum(ends)[:-1]])
+    return ((samples_t + offsets[sp.to_numpy()]) / 3600.0,
+            (events_t + offsets[ep.to_numpy()]) / 3600.0 if len(ep) else events_t.astype(float))
 
 
 def temp_columns(df: pd.DataFrame) -> list[str]:
@@ -296,6 +325,10 @@ def drain_by_activity(df: pd.DataFrame) -> pd.DataFrame:
     d["dh"] = d["h"].diff().shift(-1)
     d["dp"] = -d["battery_pct"].diff().shift(-1)
     d["same"] = d["activity"] == d["activity"].shift(-1)
+    # A concatenated run's joins are a charge, not a drain: never pair samples across one.
+    if "session" in df:
+        session = df.loc[d.index, "session"]
+        d["same"] &= session == session.shift(-1)
     d = d[d["same"] & (d["dh"] > 0)]
     g = d.groupby("activity").agg(hours=("dh", "sum"), pct=("dp", "sum"))
     g["pct_per_h"] = g["pct"] / g["hours"]
@@ -465,7 +498,15 @@ LAP_COUNTS = ["fall_triggered", "no_fall", "got_up", "getup_failed", "long_reset
 
 def read_meta(run: Path) -> dict:
     path = run / "meta.json"
-    return json.loads(path.read_text()) if path.exists() else {}
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        # A run cut off before its meta.json reached the disk — a freeze or a power cut in its
+        # first seconds. Its samples are still data; it just has no settings or lap version.
+        print(f"{run}: meta.json is unreadable (cut off?); charting it without", file=sys.stderr)
+        return {}
 
 
 def lap_version(meta: dict) -> str | None:
@@ -594,7 +635,8 @@ OUTCOMES = {  # how a fall ended, in the order the bars stack; gray is not an ou
     "gave_up": ("gave up", CRITICAL),
     "no_fall": ("policy caught it", OTHER_COLOR),
 }
-INCIDENTS = ["getup_failed", "long_reset", "gave_up", "fallen_unprovoked", "odometry_jump",
+# `session` is a join made by --concatenate: where one run ended and the next began.
+INCIDENTS = ["session", "getup_failed", "long_reset", "gave_up", "fallen_unprovoked", "odometry_jump",
              "robotd_unreachable", "connection_lost", "no_tof", "enable_timeout", "rise_timeout",
              "sit_timeout", "fatal", "signal", "stop"]
 A4 = (11.69, 8.27)
@@ -666,7 +708,7 @@ def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFr
     falls = fall_outcomes(ev)
     provoked = falls[falls["provoked"]]
     seg = (meta.get("segments") or [{}])[0]
-    minutes = (df["wall"].iloc[-1] - df["wall"].iloc[0]) / 60 if len(df) else 0
+    minutes = (df["h"].iloc[-1] - df["h"].iloc[0]) * 60 if len(df) else 0
     batt = df["battery_pct"].dropna() if "battery_pct" in df else pd.Series(dtype=float)
     subtitle = "  ·  ".join(x for x in [
         str(seg.get("host") or run.name), str(seg.get("started_utc") or ""),
@@ -762,7 +804,9 @@ def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFr
         # 5 — incidents
         ev = ev.sort_values("wall").copy()
         ev["lap"] = (ev["kind"] == "lap_start").cumsum()
-        steps = ev["detail"].where(ev["kind"] == "activity").astype(str).str.split().str[-1]
+        # `fillna` first: under pandas 3 `astype(str)` keeps NaN, and a run with no `activity`
+        # event at all would then have no strings for `.str` to work on.
+        steps = ev["detail"].where(ev["kind"] == "activity").fillna("").astype(str).str.split().str[-1]
         ev["step"] = steps.ffill().fillna("")
         inc = ev[ev["kind"].isin(INCIDENTS)]
         rows = [[f"{(r.wall - ev['wall'].iloc[0]) / 60:.1f}", str(r.lap or ""), r.step, r.kind,
@@ -783,10 +827,68 @@ def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFr
     return out
 
 
+def concatenate(parent: Path) -> Path:
+    """Every run directory in `parent` as one run, written to `parent/concatenated/`.
+
+    Runs go in the order they started. Each one's clock is shifted to begin one sample interval
+    after the previous one's last sample, so the charts show time spent running, not the hours
+    on the charger between; a `session` event marks each join. A stress run's `lap` column is
+    renumbered on from the laps before it, so lap 1 of the second run is the lap after the first
+    run's last. `meta.json` carries every run's segments in order.
+    """
+    out = parent / "concatenated"
+    runs = sorted((d for d in parent.iterdir() if d.is_dir() and d != out and (d / "samples.csv").exists()),
+                  key=lambda d: pd.read_csv(d / "samples.csv", usecols=["wall"])["wall"].min())
+    if not runs:
+        raise SystemExit(f"{parent}: no run directories (none holds a samples.csv)")
+    if why := mixed_laps(runs):
+        raise SystemExit(f"{parent}: {why}")
+    falls = {str(((read_meta(r).get("segments") or [{}])[-1].get("args") or {}).get("fall")) for r in runs}
+    if len(falls) > 1:
+        print(f"{parent}: warning: these runs made their falls differently ({', '.join(sorted(falls))}); "
+              "their get-ups are not one measurement", file=sys.stderr)
+
+    samples, events, segments = [], [], []
+    shift, laps_before = None, 0
+    end = None
+    for i, run in enumerate(runs):
+        df = pd.read_csv(run / "samples.csv")
+        df["session"] = i
+        ev_path = run / "events.csv"
+        ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+        start = df["wall"].min()
+        step = df["wall"].diff().median() if len(df) > 1 else 10.0
+        shift = 0.0 if end is None else (end + (0 if pd.isna(step) else step)) - start
+        df["wall"] += shift
+        ev["wall"] = ev["wall"] + shift
+        if "lap" in df:
+            df["lap"] = df["lap"].where(df["lap"].isna() | (df["lap"] <= 0), df["lap"] + laps_before)
+        laps_before += int((ev["kind"] == "lap_start").sum())
+        # At t_s 0, which is also what tells `run_hours` a new piece of the run starts here.
+        join = pd.DataFrame([{"wall": df["wall"].min(), "t_s": 0, "kind": "session", "detail": run.name}])
+        events += [join, ev]
+        samples.append(df)
+        segments += (read_meta(run).get("segments") or [{}])
+        end = df["wall"].max()
+
+    out.mkdir(exist_ok=True)
+    pd.concat(samples, ignore_index=True).to_csv(out / "samples.csv", index=False)
+    # In written order, not sorted: `run_hours` finds each piece where `t_s` drops.
+    pd.concat(events, ignore_index=True).to_csv(out / "events.csv", index=False)
+    (out / "meta.json").write_text(json.dumps({"segments": segments, "concatenated": [r.name for r in runs]}, indent=2))
+    print(f"{parent}: {len(runs)} runs as one → {out}")
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("runs", nargs="+", type=Path, help="run directories written by robotctl endurance or stress")
+    p.add_argument("runs", nargs="*", type=Path, help="run directories written by robotctl endurance or stress")
+    p.add_argument("--concatenate", action="append", type=Path, default=[], metavar="DIR",
+                   help="a directory of run directories, charted as one run (repeatable)")
     args = p.parse_args()
+    args.runs += [concatenate(d) for d in args.concatenate]
+    if not args.runs:
+        p.error("give run directories, --concatenate DIR, or both")
     for run in args.runs:
         if not (run / "samples.csv").exists():
             print(f"{run}: no samples.csv", file=sys.stderr)
