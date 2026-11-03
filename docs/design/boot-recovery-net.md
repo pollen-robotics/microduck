@@ -36,8 +36,8 @@ healthy. This one handles a release whose daemons do not come up at all.
 
 | | |
 |---|---|
-| `robot-boot-check.timer` | fires 180 s into every boot |
-| `robot-boot-check.service` | the oneshot: asks whether the release came up, hands over if not |
+| `robot-boot-check.timer` | fires a second into every boot |
+| `robot-boot-check.service` | the oneshot: watches until the release came up or did not, hands over if not |
 | `scripts/robot-boot-check` | the predicate. Installed at `/usr/local/sbin/robot-boot-check` |
 | `scripts/robot-rescue` | swaps `current` to golden, records it, reboots. `/usr/local/sbin/robot-rescue` |
 | `<install_dir>/golden` | symlink to the release with a standing guarantee, published by `updaterd` |
@@ -50,7 +50,7 @@ broken by exactly the releases it exists to survive: the wrong architecture, a m
 library, a panic on startup. A rescue read through `current` would route the recovery through the
 thing being recovered.
 
-## The trigger: a deadline, not `OnFailure=`
+## The trigger: a watch, not `OnFailure=`
 
 `OnFailure=` looks like the natural fit — systemd fires it exactly when a unit exhausts its restarts
 and enters `failed`, with no polling and no resident watchdog. It does not fit *these* units, which
@@ -62,7 +62,7 @@ are configured not to reach that state:
 | `padd` | `Restart=always` | 5 s |
 | `configd` | `Restart=always` | 2 s |
 | `robotd` | `Restart=always` | 2 s |
-| `updaterd` | `Restart=on-failure` | — |
+| `updaterd` | `Restart=on-failure` | 10 s |
 
 `Restart=always` is deliberate in each case and argued in the unit file. No unit overrides
 `StartLimitIntervalSec`/`StartLimitBurst`, so systemd's default of five starts in ten seconds applies
@@ -70,10 +70,27 @@ are configured not to reach that state:
 entering `failed`, which is the state `OnFailure=` waits for. Making `OnFailure=` fire would mean
 retuning those units so the daemons *give up*: degrading the normal case to enable the rescue case.
 
-A deadline inverts the question, needs no unit changes, and catches the forever-restarter.
-`OnBootSec=180` because the board is slower than it looks — `hci0` does not exist until roughly 73
-seconds after power-on, of which `bluetooth.service` spends 26 blocked behind `dbus` — and the daemons
-wait for their hardware rather than exiting, so a slow boot is not a failed one.
+Watching inverts the question, needs no unit changes, and catches the forever-restarter. The timer
+starts the script a second into the boot, and it looks at the members every 2 s until the first of:
+
+- **a member did not come up** (the predicate below): hand over at once. Restart counts only grow, so
+  waiting cannot change the answer;
+- **every member has been `active` for 10 s straight**: the release came up. A crash-looper re-enters
+  `active` on each restart (`ActiveEnterTimestampMonotonic` moves), so it never stays long enough to
+  count;
+- **the deadline**, `[update_gate] boot_deadline_s` in `robotd.toml`, 60 s by default: the predicate
+  decides on what is there, and a member that never settled — stopped by hand, never started — is left
+  alone, as below.
+
+On a Yocto board every member is up by 16 s, so an ordinary boot is decided at about 25 s. The
+deadline is not a wait; it is when a boot that never settles is judged, and it is 60 because that
+judgement is by restart count: `updaterd` restarts every 10 s and passes three about 45 s into a boot,
+so a deadline below that passes a release whose `updaterd` cannot start. The script clamps the value to
+20–300 rather than anything refusing it, because every daemon reading `robotd.toml` exits on a value
+`Params::load` refuses, and a robotd that does not start is what this rolls a release back for.
+
+A daemon waiting for its hardware is `active`, so it settles like any other: a slow peripheral does
+not hold the verdict back, and a slow boot is not a failed one.
 
 ### The predicate
 
@@ -90,8 +107,12 @@ and answers nothing, which reads the same way. A daemon still waiting for hardwa
 one crash that recovered leaves one or two restarts, not three. **A false negative costs an operator a
 diagnosis; a false positive costs a good release.**
 
-Three restarts rather than one because `Restart=always` with a 2–5 s `RestartSec` means a genuine loop
-passes three well inside the deadline, while a daemon that died once on a transient does not.
+Three restarts rather than one because a genuine loop passes three inside the deadline, while a daemon
+that died once on a transient does not.
+
+`--dry-run` exits 3 where it would have handed over, so a caller can ask the question without the
+rescue: the OS's own boot gate on a Yocto image, `microduck-slot-health`, which decides whether RAUC
+marks the slot good.
 
 ### Three ways it refuses to fire
 
@@ -217,9 +238,10 @@ The decisions are: `xtask/tests/rescue.rs` asks both scripts every question agai
 with a stub `systemctl` supplying unit states and recording whether a reboot was asked for, and
 `scripts/board-test.sh` covers the installer half on real ARM64 Linux.
 
-**systemd is not.** Whether the timer fires at `OnBootSec=180`, whether `Conflicts=shutdown.target`
-keeps the oneshot off the way down, and whether `NRestarts` reads the way the predicate assumes on a
-crash-looping unit are all unverified. Nothing short of real systemd — `systemd-nspawn`, or a
+**systemd is not.** Whether the timer fires at `OnBootSec=1`, whether `Conflicts=shutdown.target`
+keeps the oneshot off the way down, and whether `NRestarts` and `ActiveEnterTimestampMonotonic` read
+the way the script assumes on a crash-looping unit are all unverified. Nor is the watch itself: each
+test is decided on its first look, because the stubbed uptime does not move. Nothing short of real systemd — `systemd-nspawn`, or a
 privileged container with it as pid 1 — can answer any of them, and
 [`install-path-gap.md`](../project/install-path-gap.md) is where the case for that lives. This is a
 second argument for it: the recovery net is the code that must work when everything else does not, and

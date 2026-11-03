@@ -2580,7 +2580,25 @@ pub struct UpdateGate {
     /// Consecutive bus read failures tolerated before reporting unhealthy. One dropped
     /// transaction is ordinary; a run of them means the bus is gone.
     pub max_consecutive_errors: u32,
+    /// Seconds after boot by which `robot-boot-check` stops waiting and decides whether the
+    /// release came up. Not robotd's: the script reads it, once per boot.
+    ///
+    /// Not a wait. A healthy boot is decided as soon as every daemon has run steadily for 10 s,
+    /// well before this. It is what a boot that never settles is judged at, by restart counts —
+    /// and `updaterd`, restarting every 10 s, needs about 45 s to show a crash loop, which is why
+    /// the default is 60. Below that, a release whose `updaterd` cannot start passes.
+    ///
+    /// Clamped to [`BOOT_DEADLINE_MIN_S`]–[`BOOT_DEADLINE_MAX_S`] by the script rather than
+    /// refused here: every daemon reading this file exits on a value [`Params::load`] refuses,
+    /// and a robotd that will not start is exactly what the check rolls a release back for.
+    pub boot_deadline_s: u32,
 }
+
+/// The bounds `robot-boot-check` clamps `[update_gate] boot_deadline_s` to. The script repeats
+/// them; `xtask/tests/rescue.rs` keeps the two equal.
+pub const BOOT_DEADLINE_MIN_S: u32 = 20;
+/// Below the script's 600 s uptime guard, past which it declines to act at all.
+pub const BOOT_DEADLINE_MAX_S: u32 = 300;
 
 impl Default for Bus {
     fn default() -> Self {
@@ -2613,6 +2631,7 @@ impl Default for UpdateGate {
             // health check that trips on jitter rolls back good releases.
             stall_periods: 25,
             max_consecutive_errors: 10,
+            boot_deadline_s: 60,
         }
     }
 }

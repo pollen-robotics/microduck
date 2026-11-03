@@ -1,9 +1,18 @@
 #!/bin/sh
 # Did the release that just booted actually come up? If not, hand over to `robot-rescue`.
 #
-# Run once per boot by `robot-boot-check.timer`, three minutes in. See
-# `docs/design/boot-recovery-net.md` for why this exists at all and why it is a deadline rather
-# than `OnFailure=` on each daemon.
+# Started once per boot by `robot-boot-check.timer`, a second in, and it watches from there. See
+# `docs/design/boot-recovery-net.md` for why this exists at all and why it watches rather than
+# relying on `OnFailure=` on each daemon.
+#
+# WHEN IT DECIDES. Every couple of seconds it looks at the members, and stops at the first of:
+#
+#   - a member did not come up (below): hand over at once — counts only grow, so waiting longer
+#     cannot change the answer;
+#   - every member has been `active` for 10 s straight: the release came up. A crash-looper re-enters
+#     `active` on every restart, so it never stays there long enough to count;
+#   - the deadline, `[update_gate] boot_deadline_s` in robotd.toml (60 s): judge what is there. A
+#     member still not settled by then — stopped by hand, or never started — is left alone, as below.
 #
 # WHAT COUNTS AS "DID NOT COME UP". Two conditions, both positive evidence that systemd tried to run
 # a daemon and could not keep it running:
@@ -26,15 +35,30 @@
 #
 # Usage:  robot-boot-check [--dry-run]
 #
-# Exit: 0 nothing to do, or the rescue was handed the decision; 2 declined; 1 something went wrong.
+# Exit: 0 nothing to do, or the rescue was handed the decision; 2 declined; 3 with --dry-run, would
+# have handed over; 1 something went wrong.
 set -eu
 
 MEMBERS="updaterd.service robotd.service configd.service btd.service"
 
-# Three, not one. `Restart=always` plus a 2-5s `RestartSec` means a genuine loop passes three within
-# the deadline several times over, while a daemon that died once on a transient and came back does
-# not. One would fire on the latter.
+# Three, not one. `Restart=always` plus a 2-5s `RestartSec` means a genuine loop passes three well
+# inside the deadline, while a daemon that died once on a transient and came back does not. One would
+# fire on the latter. `updaterd` is the slow one, `RestartSec=10s`: a loop there passes three about
+# 45 s into a boot, which is what holds the deadline's default at 60.
 MAX_RESTARTS=3
+
+# How long every member must have been `active`, unbroken, to call the release up. Past the gap
+# between two starts of every member's restart loop, so a crash-looper is never caught looking well.
+SETTLE=10
+POLL=2
+
+# `[update_gate] boot_deadline_s`, and its bounds. `robotd-params` owns the key and repeats these as
+# `BOOT_DEADLINE_*`; `xtask/tests/rescue.rs` keeps the two equal. Clamped rather than refused, here and
+# there: every daemon reading robotd.toml exits on a value it refuses, and a robotd that will not start
+# is exactly what this script rolls a release back for.
+DEADLINE_DEFAULT=60
+DEADLINE_MIN=20
+DEADLINE_MAX=300
 
 # This is a *boot* check. Being invoked well after boot means something other than the timer started
 # it — a hand-typed `systemctl start`, or an installer enabling units — and the honest answer then is
@@ -45,6 +69,9 @@ MAX_UPTIME=600
 
 RESCUE="${ROBOT_RESCUE:-/usr/local/sbin/robot-rescue}"
 UPTIME_FILE="${ROBOT_UPTIME_FILE:-/proc/uptime}"
+# robotd.toml's two layers, the owner's winning key by key (`robotd_params::USER_PATH`).
+PARAMS_BASE="${ROBOT_PARAMS_BASE:-/etc/robot/robotd.toml}"
+PARAMS_USER="${ROBOT_PARAMS_USER:-/var/lib/robot/robotd.toml}"
 
 DRY_RUN=
 while [ $# -gt 0 ]; do
@@ -55,11 +82,12 @@ while [ $# -gt 0 ]; do
 usage: robot-boot-check [--dry-run]
 
 Decide whether the booted release brought its daemons up, and hand over to robot-rescue if not.
-Run once per boot by robot-boot-check.timer. See docs/design/boot-recovery-net.md.
+Started once per boot by robot-boot-check.timer. See docs/design/boot-recovery-net.md.
 
   --dry-run   report the verdict, and do not invoke robot-rescue
 
-Exit: 0 nothing to do or handed over, 2 declined, 1 something went wrong.
+Exit: 0 nothing to do or handed over, 2 declined, 3 would have handed over (--dry-run),
+1 something went wrong.
 USAGE
             exit 0
             ;;
@@ -91,40 +119,101 @@ if [ -n "$up" ] && [ "$up" -gt "$MAX_UPTIME" ]; then
     exit 2
 fi
 
+# `boot_deadline_s` from one layer of robotd.toml, or nothing. A line-level read of one key in one
+# section rather than a TOML parser, because this runs when the release cannot: whatever it fails to
+# read falls back to the default, which is the safe direction.
+deadline_in() {
+    [ -r "$1" ] || return 0
+    awk '
+        /^[ \t]*\[/ { section = $0; sub(/#.*/, "", section); gsub(/[ \t]/, "", section); next }
+        section == "[update_gate]" && /^[ \t]*boot_deadline_s[ \t]*=/ {
+            value = $0; sub(/^[^=]*=[ \t]*/, "", value); sub(/[ \t]*(#.*)?$/, "", value)
+            print value; exit
+        }
+    ' "$1"
+}
+
+deadline="$DEADLINE_DEFAULT"
+for layer in "$PARAMS_BASE" "$PARAMS_USER"; do
+    value="$(deadline_in "$layer")"
+    [ -n "$value" ] || continue
+    case "$value" in
+        *[!0-9]*)
+            say "${layer}: boot_deadline_s = ${value} is not a whole number of seconds; ignoring it"
+            continue
+            ;;
+    esac
+    deadline="$value"
+done
+if [ "$deadline" -lt "$DEADLINE_MIN" ]; then
+    say "boot_deadline_s = ${deadline} is below ${DEADLINE_MIN}; using ${DEADLINE_MIN}"
+    deadline="$DEADLINE_MIN"
+elif [ "$deadline" -gt "$DEADLINE_MAX" ]; then
+    say "boot_deadline_s = ${deadline} is above ${DEADLINE_MAX}; using ${DEADLINE_MAX}"
+    deadline="$DEADLINE_MAX"
+fi
+
 # One property per call. `systemctl show -p A -p B` prints them in systemd's own order rather than
-# the order asked for, which makes a two-line parse quietly wrong the day that order changes.
+# the order asked for, which makes a multi-line parse quietly wrong the day that order changes.
 property() {
     # $1 property, $2 unit
     systemctl show -p "$1" --value "$2" 2>/dev/null || true
 }
 
-failed=""
-for unit in $MEMBERS; do
-    state="$(property ActiveState "$unit")"
-    restarts="$(property NRestarts "$unit")"
+while :; do
+    # No uptime source means no clock to wait on: judge once, as it stands.
+    now="$(uptime_secs)"
+    [ -n "$now" ] || now="$deadline"
 
-    # An unloaded unit answers with an empty string for both. Treated as zero rather than special
-    # cased: it then fails both conditions below, which is the answer we want anyway.
-    case "$restarts" in
-        ''|*[!0-9]*) restarts=0 ;;
-    esac
+    failed=""
+    unsettled=""
+    for unit in $MEMBERS; do
+        state="$(property ActiveState "$unit")"
+        restarts="$(property NRestarts "$unit")"
 
-    if [ "$state" = failed ] || [ "$restarts" -ge "$MAX_RESTARTS" ]; then
-        say "${unit} did not come up (state=${state:-unknown} restarts=${restarts})"
-        failed="${failed}${failed:+, }${unit} (${state:-unknown}, ${restarts} restarts)"
-    else
-        say "${unit} ok (state=${state:-unloaded} restarts=${restarts})"
-    fi
+        # An unloaded unit answers with an empty string for both. Treated as zero rather than special
+        # cased: it then fails both conditions below, which is the answer we want anyway.
+        case "$restarts" in
+            ''|*[!0-9]*) restarts=0 ;;
+        esac
+
+        if [ "$state" = failed ] || [ "$restarts" -ge "$MAX_RESTARTS" ]; then
+            failed="${failed}${failed:+, }${unit} (${state:-unknown}, ${restarts} restarts)"
+            continue
+        fi
+
+        # Not loaded: the release predates it, and there is nothing to wait for.
+        [ -n "$state" ] && [ "$(property LoadState "$unit")" != not-found ] || continue
+
+        # Microseconds of CLOCK_MONOTONIC, against /proc/uptime's CLOCK_BOOTTIME seconds. The two
+        # differ only by time spent suspended, which a robot booting does not do.
+        since="$(property ActiveEnterTimestampMonotonic "$unit")"
+        case "$since" in
+            ''|*[!0-9]*) since=0 ;;
+        esac
+        if [ "$state" != active ] || [ $((now - since / 1000000)) -lt "$SETTLE" ]; then
+            unsettled="${unsettled}${unsettled:+, }${unit} (${state}, ${restarts} restarts)"
+        fi
+    done
+
+    [ -z "$failed" ] && [ -n "$unsettled" ] && [ "$now" -lt "$deadline" ] || break
+    sleep "$POLL"
 done
 
 if [ -z "$failed" ]; then
-    say "every daemon came up; nothing to do"
+    if [ -z "$unsettled" ]; then
+        say "every daemon came up, settled ${now}s after boot; nothing to do"
+    else
+        say "the ${deadline}s deadline passed with ${unsettled} not settled; none failed, and that
+  is left alone; nothing to do"
+    fi
     exit 0
 fi
+say "did not come up: ${failed}"
 
 if [ -n "$DRY_RUN" ]; then
     say "would hand over to robot-rescue because: ${failed}"
-    exit 0
+    exit 3
 fi
 
 [ -x "$RESCUE" ] || {

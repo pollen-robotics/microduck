@@ -1298,7 +1298,7 @@ journalctl -b -u robotd -u updaterd -u btd -u configd
 
 ### The robot may have done this already
 
-Three minutes into every boot, a timer asks whether the release brought its daemons up, and falls back
+Every boot, a check watches whether the release brought its daemons up, and falls back
 to golden if it did not. So a robot that rebooted on its own and is running an older release than you
 installed has probably rescued itself. What it did:
 

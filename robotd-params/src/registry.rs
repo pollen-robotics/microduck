@@ -149,6 +149,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Consecutive bus read failures before reporting unhealthy",
     ),
+    entry(
+        "update_gate.boot_deadline_s",
+        Kind::Integer,
+        "Seconds after boot by which the boot check decides (20–300)",
+    ),
     // ── [policy] ─────────────────────────────────────────────────────────────
     feature(
         "policy.enabled",

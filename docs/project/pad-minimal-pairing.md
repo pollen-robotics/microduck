@@ -282,7 +282,9 @@ be an initiator while it is a peripheral rather than at anything either daemon c
 ### What is not worth building
 
 The obvious fix — `configd` or `padd` polling for a trusted-but-disconnected pad and connecting it
-— **does not work**, because that is exactly the call that returns the error above.
+— **does not work** for an LE pad, because that is exactly the call that returns the error above.
+A classic pad is a different case — the link is BR/EDR and the robot pages it — and `configd` does
+sweep for those; `configd/src/bluez.rs` has why.
 
 The two that would work are both bad trades on this radio. `btd` could drop its link whenever a pad
 wants one, which makes the phone the thing that disconnects at random and needs `btd` to know a pad

@@ -164,8 +164,8 @@ its own PR.
    engines in the same process, which surfaced as unrelated operations failing with `Busy` in the
    test suite.
 
-2. **A boot-time net outside `updaterd`**, for what slips through: a timer three minutes into each
-   boot asks whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
+2. **A boot-time net outside `updaterd`**, for what slips through: a check that watches each
+   boot for whether the release brought its daemons up, and a `/bin/sh` rescue in the installed base
    swaps `current` to golden if it did not. It has to live outside this process and outside the
    release, because the failure it exists for is an `updaterd` that does not start — at which point
    `recover_on_start` and the boot counter below are both unreachable. It cannot fix hardware: a

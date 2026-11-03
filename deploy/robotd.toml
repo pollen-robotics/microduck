@@ -111,6 +111,13 @@ hz = 50
 # not healthy whatever rate the loop is spinning at.
 # max_consecutive_errors = 10
 
+# Seconds after boot by which `robot-boot-check` decides whether the release came up — read by
+# that script, once per boot, not by robotd. A healthy boot is decided sooner, once every
+# daemon has run steadily for 10 s; this is when a boot that never settles is judged, by
+# restart counts. updaterd restarts every 10 s and needs about 45 s to show a crash loop, so
+# below that a release whose updaterd cannot start passes. Clamped to 20–300.
+# boot_deadline_s = 60
+
 [policy]
 # Whether to load a policy at all.
 #

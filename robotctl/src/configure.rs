@@ -66,13 +66,18 @@ enum Apply {
     Reload(&'static str),
     /// The daemon re-reads the file by itself. Nothing to do but say so.
     Live(&'static str),
+    /// Read once per boot by something that is not running now. A restart would apply nothing,
+    /// so there is nothing to offer — only the reboot to name.
+    NextBoot(&'static str),
 }
 
 impl Apply {
     /// The daemon, whatever the answer was.
     fn unit(self) -> &'static str {
         match self {
-            Self::Restart(unit) | Self::Reload(unit) | Self::Live(unit) => unit,
+            Self::Restart(unit) | Self::Reload(unit) | Self::Live(unit) | Self::NextBoot(unit) => {
+                unit
+            }
         }
     }
 }
@@ -138,6 +143,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         // Read once at startup by both `padd` and `netpadd`, each to decide whether it is the one
         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
         "netpad" => Apply::Restart("netpadd"),
+        // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
+        // offering a robotd restart for it would be an edit that appears to do something.
+        "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
@@ -146,9 +154,9 @@ fn apply_for(key: &str) -> Option<Apply> {
 
 /// What a set of written keys needs, with each daemon named once.
 ///
-/// Three lists rather than one, because the three answers read differently on the way out: a
-/// restart is a question, a reload is a lighter question, and `live` is an answer — the operator
-/// is told it already applies and asked nothing.
+/// Separate lists rather than one, because the answers read differently on the way out: a
+/// restart is a question, a reload is a lighter question, and `live` and `next_boot` are answers
+/// — the operator is told when it applies and asked nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     /// Units to restart, in start order.
@@ -157,13 +165,15 @@ pub struct Plan {
     pub reload: Vec<&'static str>,
     /// Units that have it already, or will within a second.
     pub live: Vec<&'static str>,
+    /// What reads it at the next boot, and not before.
+    pub next_boot: Vec<&'static str>,
 }
 
 impl Plan {
     /// Is there nothing to ask the operator?
     ///
-    /// True for no edits at all *and* for edits that are already live — the difference is
-    /// `live`, and the caller says the two things differently.
+    /// True for no edits at all *and* for edits that are already live or wait for a boot — the
+    /// difference is `live` and `next_boot`, and the caller says those things differently.
     pub fn is_quiet(&self) -> bool {
         self.restart.is_empty() && self.reload.is_empty()
     }
@@ -183,6 +193,7 @@ fn plan_for_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Plan {
             Apply::Restart(_) => &mut plan.restart,
             Apply::Reload(_) => &mut plan.reload,
             Apply::Live(_) => &mut plan.live,
+            Apply::NextBoot(_) => &mut plan.next_boot,
         };
         if !list.contains(&apply.unit()) {
             list.push(apply.unit());
@@ -656,6 +667,12 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                 "pick"
             };
             println!("  {names} {reads} this up within a second — nothing to restart");
+        }
+        if !plan.next_boot.is_empty() {
+            println!(
+                "  {} reads this at the next boot — nothing to restart",
+                plan.next_boot.join(" and ")
+            );
         }
     }
     Ok(())
@@ -1306,6 +1323,17 @@ mod tests {
     fn allow_community_is_live_in_the_updater_and_disturbs_nothing() {
         let plan = plan_for_written(&["policy.allow_community".to_string()]);
         assert_eq!(plan.live, vec!["updaterd"]);
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// `boot_deadline_s` sits in `[update_gate]` but is the boot check's, read once per boot.
+    /// Falling through to the section's arm would offer to restart robotd — standing motors and
+    /// all — for a key it never reads, and the change would still wait for the reboot.
+    #[test]
+    fn the_boot_deadline_waits_for_a_boot_and_restarts_nothing() {
+        let plan = plan_for_written(&["update_gate.boot_deadline_s".to_string()]);
+        assert_eq!(plan.next_boot, vec!["robot-boot-check"]);
+        assert!(plan.restart.is_empty(), "{plan:?}");
         assert!(plan.is_quiet(), "{plan:?}");
     }
 
