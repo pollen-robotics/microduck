@@ -1485,8 +1485,8 @@ enum Update {
         version: Option<duck_ipc_proto::semver::Version>,
         /// Install what a branch last built, e.g. `--ref my-branch`.
         ///
-        /// A dev build, so a robot only accepts one if the team key is in its trusted set and
-        /// `allow_dev_keys` is on: a customer robot refuses it.
+        /// A dev build, so a robot only accepts one once it is a dev board
+        /// (`sudo robotctl configure --allow-dev-daemon on` on it): a customer robot refuses it.
         #[arg(long = "ref", value_name = "REF", conflicts_with = "version")]
         git_ref: Option<String>,
         /// Install the release candidate from the staging channel.
