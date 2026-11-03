@@ -103,13 +103,18 @@ pub struct StressArgs {
     /// `cut` switches the policy off for --cut, the pad's Start, which takes both away.
     #[arg(long, default_value = "trip", value_parser = ["trip", "cut"], help_heading = "Lap")]
     fall: String,
-    /// How long a trip holds the legs, ms. Tune it by hand first: `robotctl robot trip MS`
-    /// while walking with the pad.
-    #[arg(long, default_value_t = 250, help_heading = "Lap")]
-    trip_ms: u32,
-    /// Which legs a trip holds: both, or one foot caught.
-    #[arg(long, default_value = "both", value_parser = ["both", "left", "right"], help_heading = "Lap")]
-    trip_legs: String,
+    /// How long a trip holds the legs, ms. Default: `[stress] trip_ms` (`robotctl configure`,
+    /// 500), re-read at every fall so it can be tuned mid-run; this flag pins it for the run.
+    /// Find it by hand with `robotctl robot trip MS` while walking with the pad.
+    #[arg(long, help_heading = "Lap")]
+    trip_ms: Option<u32>,
+    /// Which legs a trip holds: both, or one foot caught. Default: `[stress] trip_legs`, re-read
+    /// at every fall like `trip_ms`.
+    #[arg(long, value_parser = ["both", "left", "right"], help_heading = "Lap")]
+    trip_legs: Option<String>,
+    /// The config the trip is read from.
+    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+    config: PathBuf,
     /// With --fall cut: how long the policy is cut, s. Longer lets the robot settle and fall
     /// softly.
     #[arg(long, default_value_t = 0.5, help_heading = "Lap")]
@@ -204,6 +209,8 @@ fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Fai
         "--tof-socket".into(),
         tof_socket.as_os_str().to_owned(),
         "stress".into(),
+        "--config".into(),
+        config.as_os_str().to_owned(),
     ]
     .to_vec();
     UNIT.start_with(robot_socket, None, argv)
@@ -677,7 +684,7 @@ impl Driver {
     /// Hold the legs mid-stride and keep asking for the walk through it: the policy is still
     /// driving, and a foot caught while walking is caught while the walk goes on.
     fn trip(&mut self, vx: f64, way: &str) -> Drive {
-        let (ms, legs) = (self.args.trip_ms, crate::trip_legs(&self.args.trip_legs));
+        let (ms, legs) = self.trip_setting();
         self.run.event(
             "fall_triggered",
             &format!("{way}, trip {ms} ms {}", legs.as_str()),
@@ -691,6 +698,27 @@ impl Driver {
             self.tick(vx, 0.0)?;
         }
         Ok(())
+    }
+
+    /// The trip for this fall: a flag wins, else `[stress]` as the file says now — read per fall
+    /// so `robotctl configure` tunes a running test. A file that does not load keeps the
+    /// built-in values and says so, rather than stopping a run over an edit.
+    fn trip_setting(&self) -> (u32, proto::TripLegs) {
+        let file = match robotd_params::Params::load(&self.args.config, false) {
+            Ok(params) => params.stress,
+            Err(e) => {
+                self.run
+                    .event("config_unreadable", &format!("{e}; built-in trip"));
+                robotd_params::StressParams::default()
+            }
+        };
+        (
+            self.args.trip_ms.unwrap_or(file.trip_ms),
+            self.args
+                .trip_legs
+                .as_deref()
+                .map_or(file.trip_legs, crate::trip_legs),
+        )
     }
 
     /// Watch a get-up from the policy coming back, at 20 Hz, until a verdict ends it.

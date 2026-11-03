@@ -69,7 +69,9 @@ the fall predictor needs, and when the policy returns the robot is already past 
 Every provoked fall landed stiff — the case limp-fall exists to prevent, so not a real fall.
 
 The default fall is now `robot.trip` (robotd API v48): the leg targets held where they were for
-`--trip-ms` (250 ms; `--trip-legs both|left|right`) while the policy keeps stepping and the walk
+`[stress] trip_ms` (500 ms — 250 was caught too often) with `trip_legs` both, left or right,
+both in `robotctl configure` and re-read at every fall so a running test can be tuned;
+`--trip-ms` / `--trip-legs` pin them for one run. The legs are held while the policy keeps stepping and the walk
 command keeps arriving. The policy tries to recover; if it cannot, the robot falls with the
 limp-fall live, as a caught foot would. Each fall logs `limp` when the limp-fall took it. The
 trip length is tuned by hand first, `robotctl robot trip MS` while walking on the pad. The cut

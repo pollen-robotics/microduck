@@ -612,6 +612,14 @@ mode = "walk"
 # the default one, logging to /var/lib/stress. Off by default, and it should be: this makes the
 # robot throw itself on the floor because it was switched on.
 # on_boot = false
+#
+# How each provoked fall is made: the legs held mid-stride for `trip_ms` while the policy keeps
+# running (`robot.trip`), so it tries to recover and robotd's limp-fall catches the fall. 250 ms
+# was too often caught; 500 goes over. `trip_legs` is both, left or right — one foot caught. A
+# running test re-reads these at every fall, so they can be tuned without restarting it;
+# `robotctl stress --trip-ms` / `--trip-legs` override them for one run.
+# trip_ms = 500
+# trip_legs = "both"
 
 # ── Controller-IMU head control ─────────────────────────────────────────────────────────────
 #

@@ -632,6 +632,16 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Start `robotctl stress` at every boot — falls on purpose until the battery is empty",
     ),
+    entry(
+        "stress.trip_ms",
+        Kind::Integer,
+        "How long a stress fall holds the legs mid-stride, ms (1–1000) — longer falls more surely",
+    ),
+    entry(
+        "stress.trip_legs",
+        Kind::Choice(crate::TRIP_LEGS_LABELS),
+        "Which legs a stress fall holds — both, or one foot caught",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same

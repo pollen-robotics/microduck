@@ -475,12 +475,14 @@ sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && 
 **Tripping it on purpose**, to tune `robotctl stress`'s falls: drive with the pad and, from ssh,
 
 ```
-sudo robotctl robot trip 250                # hold both legs 250 ms mid-stride; --legs left|right for one foot
+sudo robotctl robot trip 500                # hold both legs 500 ms mid-stride; --legs left|right for one foot
 ```
 
 The policy keeps running through the trip, so it tries to recover, and a robot that goes over
 does it with the limp-fall live (`robotctl monitor` shows `limp`). Too short and it is caught;
-raise it until the fall is the one you want, then `robotctl stress --trip-ms N`. Refused while the
+raise it until the fall is the one you want, then set `[stress] trip_ms` (and `trip_legs`) in
+`sudo robotctl configure` — a running stress test takes it at its next fall — or pin it for one run
+with `robotctl stress --trip-ms N`. Refused while the
 policy is off; never reachable over Bluetooth or WebRTC.
 
 `reboot-motors` is also reachable over Bluetooth, as `duckctl reboot-motors`
@@ -640,7 +642,8 @@ sudo robotctl stress stop
 
 A violent test, the same on every robot so runs compare lap for lap: it walks, is made to fall,
 gets itself up, and does it again until the battery is empty. A fall is a trip: the legs held
-mid-stride for 250 ms (`--trip-ms`, `--trip-legs`; tune it with `robotctl robot trip`) while the
+mid-stride for 500 ms (`[stress] trip_ms` / `trip_legs` in `robotctl configure`, re-read at every
+fall; `--trip-ms` / `--trip-legs` pin them for a run; tune with `robotctl robot trip`) while the
 policy keeps running, so it tries to recover and robotd's limp-fall catches it as it would a real
 stumble. `--fall cut` is the old fall, the policy off for `--cut` 0.5 s, which lands stiff. One
 lap (`stress-v1`, written into `meta.json`):
