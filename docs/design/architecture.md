@@ -133,9 +133,11 @@ anything an *owner* decides lives there, and anything the *image* decides stays 
   the bundle's install hook (`microduck_yocto`, `microduck-bundle-hook`) copies the running slot's
   base to `/var/lib/robot/robotd.toml.from-slot` while there is no user layer, and the edits are
   adopted from there; it does the same for `hf-token`.
-- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but two keys
-  are per-robot decisions — `allow_dev_keys` on a dev board, `auto_apply = "all"` on a canary —
-  and on an A/B robot an OS update currently puts both back to the image's values. Open.
+- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but one key
+  is a per-robot decision — `auto_apply = "all"` on a canary — and on an A/B robot an OS update
+  currently puts it back to the image's value. Open. Being a dev board was the other one, and
+  is no longer a key here: it is a marker under `/var/lib/robot`
+  ([`updater-design.md`](updater-design.md) §5.4).
 - On a robot installed by `install.sh`, which has no slots, `/etc` survives anyway; the layers
   change nothing there but where an edit lands.
 
