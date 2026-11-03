@@ -27,6 +27,31 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+
+/// Retry only BlueZ's transient NotReady response while an adapter powers up.
+/// Other failures are returned immediately; the budget also bounds a hung D-Bus call.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn discovery_when_ready<F, Fut>(
+    mut start: F,
+    budget: Duration,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), (bool, String)>>,
+{
+    tokio::time::timeout(budget, async {
+        loop {
+            match start().await {
+                Ok(()) => return Ok(()),
+                Err((false, detail)) => return Err(detail),
+                Err((true, _)) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("Bluetooth discovery did not become ready within its startup budget; inspect the adapter power state before retrying".into()))
+}
+
 use duck_ipc_proto as proto;
 
 /// What went wrong, in terms a caller can act on.
@@ -49,7 +74,10 @@ pub const MAX_PAIR_TIMEOUT: Duration = Duration::from_secs(120);
 #[async_trait]
 pub trait Pads: Send + Sync {
     /// Every pad this robot is bonded to, connected first.
-    async fn status(&self) -> PadResult<Vec<proto::Pad>>;
+    async fn status(&self) -> PadResult<proto::PadStatusResult>;
+
+    /// Connect an exact, already paired address. Never discovers or changes a bond.
+    async fn connect(&self, mac: &str) -> PadResult<proto::PadConnectResult>;
 
     /// Pair whatever pad is in pairing mode, or the one at `mac`.
     ///
@@ -241,6 +269,8 @@ pub fn unpaired(mac: &str, name: &str) -> proto::Pad {
         paired: false,
         trusted: false,
         connected: false,
+        services_resolved: None,
+        hid_recognized: None,
     }
 }
 
@@ -252,6 +282,8 @@ pub fn bonded(mac: &str, name: &str) -> proto::Pad {
         paired: true,
         trusted: true,
         connected: true,
+        services_resolved: None,
+        hid_recognized: None,
     }
 }
 
@@ -263,14 +295,36 @@ impl Default for FakePads {
 
 #[async_trait]
 impl Pads for FakePads {
-    async fn status(&self) -> PadResult<Vec<proto::Pad>> {
+    async fn status(&self) -> PadResult<proto::PadStatusResult> {
         let state = self.inner.lock().await;
-        Ok(state
+        Ok(proto::PadStatusResult {
+            pads: state
+                .visible
+                .iter()
+                .filter(|pad| pad.paired)
+                .cloned()
+                .collect(),
+            adapter_state: proto::PadAdapterState::On,
+            ..Default::default()
+        })
+    }
+
+    async fn connect(&self, mac: &str) -> PadResult<proto::PadConnectResult> {
+        let mut state = self.inner.lock().await;
+        let Some(pad) = state
             .visible
-            .iter()
-            .filter(|pad| pad.paired)
-            .cloned()
-            .collect())
+            .iter_mut()
+            .find(|p| p.mac.eq_ignore_ascii_case(mac) && p.paired)
+        else {
+            return Ok(connection_failed(
+                proto::PadConnectPhase::Lookup,
+                "address is not paired on this adapter",
+                None,
+            ));
+        };
+        pad.trusted = true;
+        pad.connected = true;
+        Ok(proto::PadConnectResult::Connected { pad: pad.clone() })
     }
 
     async fn pair(&self, mac: Option<&str>, _timeout: Duration) -> PadResult<proto::PadPairResult> {
@@ -422,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_bonds_the_pad_and_forgetting_removes_it() {
         let pads = FakePads::new();
-        assert!(pads.status().await.unwrap().is_empty());
+        assert!(pads.status().await.unwrap().pads.is_empty());
 
         let result = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
         let proto::PadPairResult::Paired { pad } = result else {
@@ -432,11 +486,11 @@ mod tests {
         // reconnect after a reboot, which is the failure this contract exists to prevent.
         assert!(pad.paired && pad.trusted, "{pad:?}");
 
-        assert_eq!(pads.status().await.unwrap().len(), 1);
+        assert_eq!(pads.status().await.unwrap().pads.len(), 1);
         assert!(pads.forget(&pad.mac).await.unwrap().removed);
         // Forgetting again is not an error, and a client must not present it as one.
         assert!(!pads.forget(&pad.mac).await.unwrap().removed);
-        assert!(pads.status().await.unwrap().is_empty());
+        assert!(pads.status().await.unwrap().pads.is_empty());
     }
 
     /// No pad in pairing mode is the most common failure by far, and it has to be distinguishable
@@ -473,7 +527,7 @@ mod tests {
         assert_eq!(pad.mac, "A4:AE:11:00:22:33", "the new pad must win");
 
         // And the robot now has both. `padd` drives whichever connects.
-        let bonded_now = pads.status().await.unwrap();
+        let bonded_now = pads.status().await.unwrap().pads;
         assert_eq!(bonded_now.len(), 2, "{bonded_now:?}");
     }
 
@@ -539,5 +593,387 @@ mod tests {
         assert_eq!(pair_timeout(Some(30)), Duration::from_secs(30));
         assert_eq!(pair_timeout(Some(0)), Duration::ZERO);
         assert_eq!(pair_timeout(Some(9_999)), MAX_PAIR_TIMEOUT);
+    }
+}
+
+/// An unavailable backend must not masquerade as a robot with no saved associations.
+pub struct UnavailablePads(pub String);
+
+#[async_trait]
+impl Pads for UnavailablePads {
+    async fn status(&self) -> PadResult<proto::PadStatusResult> {
+        Ok(proto::PadStatusResult {
+            adapter_state: proto::PadAdapterState::Unavailable,
+            bluetooth_error: Some(self.0.clone()),
+            ..Default::default()
+        })
+    }
+    async fn connect(&self, _mac: &str) -> PadResult<proto::PadConnectResult> {
+        Err(self.0.clone())
+    }
+    async fn pair(
+        &self,
+        _mac: Option<&str>,
+        _timeout: Duration,
+    ) -> PadResult<proto::PadPairResult> {
+        Err(self.0.clone())
+    }
+    async fn forget(&self, _mac: &str) -> PadResult<proto::PadForgetResult> {
+        Err(self.0.clone())
+    }
+    async fn reconnect_bonded(&self) -> PadResult<bool> {
+        Err(self.0.clone())
+    }
+}
+
+/// The whole targeted operation, including discovery-free lookup and waiting for the mutex.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Only the device operations needed for reconnecting; the BlueZ adapter and test replays share it.
+#[async_trait]
+pub trait PadConnection: Send + Sync {
+    /// Re-read this exact device, returning None when it disappeared.
+    async fn state(&self) -> PadResult<Option<proto::Pad>>;
+    /// Set trust without pairing or replacing keys.
+    async fn trust(&self) -> PadResult<()>;
+    /// InProgress and AlreadyConnected are observations, not reasons to launch another Connect.
+    async fn connect(&self) -> PadResult<()>;
+}
+
+/// A failed connection with its phase and last observed state, never an invented pad.
+pub fn connection_failed(
+    phase: proto::PadConnectPhase,
+    detail: impl Into<String>,
+    pad: Option<proto::Pad>,
+) -> proto::PadConnectResult {
+    proto::PadConnectResult::Failed {
+        phase,
+        detail: detail.into(),
+        pad,
+    }
+}
+
+/// Connect a paired device, then verify its link. The caller supplies the one shared deadline.
+pub async fn connect_existing(
+    device: &impl PadConnection,
+    deadline: tokio::time::Instant,
+) -> proto::PadConnectResult {
+    use proto::PadConnectPhase as Phase;
+    let mut latest = None;
+    // Every D-Bus wait consumes the same budget; InProgress never starts a second operation.
+    macro_rules! step {
+        ($phase:expr, $future:expr) => {
+            match tokio::time::timeout_at(deadline, $future).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => return connection_failed($phase, error, latest),
+                Err(_) => return connection_failed($phase, "connection deadline exceeded", latest),
+            }
+        };
+    }
+    latest = step!(Phase::Lookup, device.state());
+    let Some(pad) = latest.as_ref().filter(|pad| pad.paired) else {
+        return connection_failed(
+            Phase::Lookup,
+            "address is not paired on this adapter; use pad pair only for a new association",
+            latest,
+        );
+    };
+    if !pad.trusted {
+        step!(Phase::Trust, device.trust());
+    }
+    if !pad.connected {
+        step!(Phase::Connect, device.connect());
+    }
+    loop {
+        latest = step!(Phase::Verify, device.state());
+        match latest.as_ref() {
+            Some(pad) if pad.paired && pad.trusted && pad.connected => {
+                return proto::PadConnectResult::Connected { pad: pad.clone() };
+            }
+            None => {
+                return connection_failed(
+                    Phase::Verify,
+                    "the device disappeared; association state could not be verified",
+                    None,
+                );
+            }
+            Some(pad) if !pad.paired => {
+                return connection_failed(
+                    Phase::Verify,
+                    "the association is no longer present",
+                    latest,
+                );
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return connection_failed(
+                Phase::Verify,
+                "connection deadline exceeded; wake the pad and retry connect",
+                latest,
+            );
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + Duration::from_millis(200)).min(deadline),
+        )
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Replay {
+        pad: Mutex<Option<proto::Pad>>,
+        calls: Mutex<Vec<&'static str>>,
+        delayed: bool,
+        failure: Option<&'static str>,
+        disappear: bool,
+        hang: bool,
+    }
+    impl Replay {
+        fn new() -> Self {
+            let mut pad = bonded("98:B6:E9:A4:FC:67", "Pro Controller");
+            pad.connected = false;
+            pad.trusted = false;
+            Self {
+                pad: Mutex::new(Some(pad)),
+                calls: Mutex::new(Vec::new()),
+                delayed: false,
+                failure: None,
+                disappear: false,
+                hang: false,
+            }
+        }
+    }
+    #[async_trait]
+    impl PadConnection for Replay {
+        async fn state(&self) -> PadResult<Option<proto::Pad>> {
+            self.calls.lock().unwrap().push("state");
+            Ok(self.pad.lock().unwrap().clone())
+        }
+        async fn trust(&self) -> PadResult<()> {
+            self.calls.lock().unwrap().push("trust");
+            self.pad.lock().unwrap().as_mut().unwrap().trusted = true;
+            Ok(())
+        }
+        async fn connect(&self) -> PadResult<()> {
+            self.calls.lock().unwrap().push("connect");
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+            if let Some(error) = self.failure {
+                return Err(error.into());
+            }
+            if self.disappear {
+                *self.pad.lock().unwrap() = None;
+                return Ok(());
+            }
+            if !self.delayed {
+                self.pad.lock().unwrap().as_mut().unwrap().connected = true;
+            }
+            Ok(())
+        }
+    }
+
+    // Reconnection must preserve the bond, repair trust first and verify rather than invent success.
+    #[tokio::test]
+    async fn reconnect_trusts_connects_and_is_idempotent() {
+        let device = Replay::new();
+        assert!(matches!(
+            connect_existing(
+                &device,
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+            proto::PadConnectResult::Connected { .. }
+        ));
+        assert_eq!(
+            *device.calls.lock().unwrap(),
+            ["state", "trust", "connect", "state"]
+        );
+        device.calls.lock().unwrap().clear();
+        assert!(matches!(
+            connect_existing(
+                &device,
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+            proto::PadConnectResult::Connected { .. }
+        ));
+        assert_eq!(*device.calls.lock().unwrap(), ["state", "state"]);
+    }
+
+    #[tokio::test]
+    async fn missing_or_unpaired_devices_never_connect() {
+        for missing in [false, true] {
+            let device = Replay::new();
+            if missing {
+                *device.pad.lock().unwrap() = None;
+            } else {
+                device.pad.lock().unwrap().as_mut().unwrap().paired = false;
+            }
+            assert!(matches!(
+                connect_existing(
+                    &device,
+                    tokio::time::Instant::now() + Duration::from_secs(1)
+                )
+                .await,
+                proto::PadConnectResult::Failed {
+                    phase: proto::PadConnectPhase::Lookup,
+                    ..
+                }
+            ));
+            assert_eq!(*device.calls.lock().unwrap(), ["state"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn in_progress_is_observed_once_until_the_shared_deadline() {
+        let mut device = Replay::new();
+        device.delayed = true;
+        let result = connect_existing(
+            &device,
+            tokio::time::Instant::now() + Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            proto::PadConnectResult::Failed {
+                phase: proto::PadConnectPhase::Verify,
+                ..
+            }
+        ));
+        assert_eq!(
+            device
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|&&c| c == "connect")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_failure_preserves_the_observed_bond_and_phase() {
+        let mut device = Replay::new();
+        device.failure = Some("org.bluez.Error.NotReady");
+        let result = connect_existing(
+            &device,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(
+            matches!(result, proto::PadConnectResult::Failed { phase: proto::PadConnectPhase::Connect, detail, pad: Some(pad) } if detail.contains("NotReady") && pad.paired)
+        );
+    }
+
+    #[tokio::test]
+    async fn disappearance_after_connect_is_not_a_success() {
+        let mut device = Replay::new();
+        device.disappear = true;
+        assert!(matches!(
+            connect_existing(
+                &device,
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+            proto::PadConnectResult::Failed {
+                phase: proto::PadConnectPhase::Verify,
+                pad: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_connect_consumes_only_the_remaining_budget() {
+        let mut device = Replay::new();
+        device.hang = true;
+        assert!(matches!(
+            connect_existing(
+                &device,
+                tokio::time::Instant::now() + Duration::from_millis(5)
+            )
+            .await,
+            proto::PadConnectResult::Failed {
+                phase: proto::PadConnectPhase::Connect,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_backend_connects_only_the_named_existing_association() {
+        let mut asleep = bonded("98:B6:E9:A4:FC:67", "Pro Controller");
+        asleep.connected = false;
+        let other = bonded("98:B6:E9:64:FD:06", "Other");
+        let pads = FakePads::with(vec![asleep, other.clone()]);
+        assert!(matches!(
+            pads.connect("98:b6:e9:a4:fc:67").await.unwrap(),
+            proto::PadConnectResult::Connected { .. }
+        ));
+        assert!(matches!(
+            pads.connect("98:B6:ED:A4:FC:67").await.unwrap(),
+            proto::PadConnectResult::Failed { .. }
+        ));
+        assert!(pads.status().await.unwrap().pads.contains(&other));
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transient_not_ready_retries_but_other_errors_do_not() {
+        let mut calls = 0;
+        discovery_when_ready(
+            || {
+                calls += 1;
+                std::future::ready(if calls == 1 {
+                    Err((true, "NotReady".into()))
+                } else {
+                    Ok(())
+                })
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let error = discovery_when_ready(
+            || {
+                calls += 1;
+                std::future::ready(Err((false, "NotAuthorized".into())))
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error, "NotAuthorized");
+    }
+
+    #[tokio::test]
+    async fn permanently_unready_and_hung_calls_are_bounded() {
+        assert!(
+            discovery_when_ready(
+                || std::future::ready(Err((true, "NotReady".into()))),
+                Duration::from_millis(20)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            discovery_when_ready(std::future::pending, Duration::from_millis(20))
+                .await
+                .is_err()
+        );
     }
 }

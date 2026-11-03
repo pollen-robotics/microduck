@@ -418,7 +418,7 @@ echo "    [ok] a pairing PIN keeps its leading zero"
 # `--fake-pads` serves an in-memory set: there is no bluetoothd in a container, and what is under
 # test here is the socket, the gating and the answers rather than BlueZ.
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status" \
-    | grep -q "none paired"
+    | grep -q "no saved associations on this adapter"
 echo "    [ok] pad status reports no pad on a fresh robot"
 
 code=0
@@ -436,6 +436,17 @@ echo "    [ok] a named user pairs the pad that is in pairing mode"
 su member -s /bin/sh -c "/bin/robot/robotctl --config-socket /run/c.sock pad status --json" \
     | grep -q "\"trusted\":true"
 echo "    [ok] the paired pad is trusted, so it reconnects by itself"
+
+# Reconnecting must use an existing exact association and the same mutation gate as pairing.
+code=0
+su bystander -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad connect 78:86:2E:BB:13:28" \
+    >/dev/null 2>&1 || code=$?
+test "$code" -eq 6 || { echo "    [FAIL] reconnect should be denied (6), got $code"; exit 1; }
+su member -s /bin/sh -c \
+    "/bin/robot/robotctl --config-socket /run/c.sock pad connect 78:86:2E:BB:13:28" \
+    | grep -q "Bluetooth connected"
+echo "    [ok] an authorized user reconnects an existing association"
 
 su member -s /bin/sh -c \
     "/bin/robot/robotctl --config-socket /run/c.sock pad forget 78:86:2E:BB:13:28" \

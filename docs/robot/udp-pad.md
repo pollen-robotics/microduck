@@ -41,7 +41,8 @@ Both, because each decides at start whether it is the one to run: `padd` stands 
 `[netpad] enabled` is true, and `netpadd` stands down when it is not. Restarting only one leaves the
 other on the old answer, and for a moment two sources — or none.
 
-To check which one has the robot:
+To see the selected source, both service states and Bluetooth connection evidence, use
+`robotctl pad status`. To check only which services are running:
 
 ```bash
 systemctl is-active padd netpadd

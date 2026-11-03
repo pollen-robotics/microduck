@@ -118,6 +118,8 @@ mod tests {
             paired: true,
             trusted: true,
             connected,
+            services_resolved: None,
+            hid_recognized: None,
         }
     }
 
