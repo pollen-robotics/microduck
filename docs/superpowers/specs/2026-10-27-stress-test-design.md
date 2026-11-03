@@ -62,6 +62,20 @@ If the robot did not fall (`safety.fallen` never set within ~2 s of the enable â
 event is logged as `no_fall` and the lap continues. That is data, not an error: with only 0.5 s
 off, some cuts will be caught by the policy, and the rate is worth comparing too.
 
+### v2: a trip, not a cut (2026-11-03)
+
+The cut above never exercises `robotd`'s limp-fall: it makes `driving` false, the one condition
+the fall predictor needs, and when the policy returns the robot is already past the arming gate.
+Every provoked fall landed stiff â€” the case limp-fall exists to prevent, so not a real fall.
+
+The default fall is now `robot.trip` (robotd API v48): the leg targets held where they were for
+`--trip-ms` (250 ms; `--trip-legs both|left|right`) while the policy keeps stepping and the walk
+command keeps arriving. The policy tries to recover; if it cannot, the robot falls with the
+limp-fall live, as a caught foot would. Each fall logs `limp` when the limp-fall took it. The
+trip length is tuned by hand first, `robotctl robot trip MS` while walking on the pad. The cut
+stays as `--fall cut`, and the get-up's 2 s reset is still a cut. `no_fall` now counts from the
+end of the trip.
+
 ## The get-up and giving up
 
 After the enable, the robot tries to get up continuously; there is no cut between its tries.

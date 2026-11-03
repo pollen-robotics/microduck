@@ -203,6 +203,8 @@ pub struct Intents {
     /// `robot.rebootMotors`, pending: the ids to reboot (empty = all). A mutex rather than an
     /// atomic because it carries a list; the loop takes it with `try_lock`, so it can never wait.
     reboot_motors: Mutex<Option<Vec<u8>>>,
+    /// `robot.trip`, pending. An edge like the reboot: the loop takes it once and runs it out.
+    trip: Mutex<Option<duck_ipc_proto::TripParams>>,
 }
 
 /// A pending policy change, as [`Intents::request_policy_change`] took it.
@@ -292,6 +294,7 @@ impl Intents {
             policy_change: ArcSwapOption::empty(),
             sounds: std::sync::atomic::AtomicU32::new(0),
             reboot_motors: Mutex::new(None),
+            trip: Mutex::new(None),
             wheee: ArcSwap::from_pointee(Stamped {
                 value: false,
                 at_us: 0,
@@ -492,6 +495,19 @@ impl Intents {
         if let Ok(mut slot) = self.reboot_motors.lock() {
             *slot = Some(ids);
         }
+    }
+
+    /// Ask the loop to trip the robot. A second request before the loop took the first replaces
+    /// it: the latest numbers are the ones somebody tuning wants.
+    pub fn request_trip(&self, trip: duck_ipc_proto::TripParams) {
+        if let Ok(mut slot) = self.trip.lock() {
+            *slot = Some(trip);
+        }
+    }
+
+    /// Take the pending trip, if any. Never blocks, as [`Self::take_reboot_motors`].
+    pub fn take_trip(&self) -> Option<duck_ipc_proto::TripParams> {
+        self.trip.try_lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Take the pending reboot request, if any. Never blocks: a contended lock reads as "nothing

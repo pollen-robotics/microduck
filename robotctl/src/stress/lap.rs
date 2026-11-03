@@ -14,7 +14,7 @@ pub const VERSION: &str = "stress-v1";
 pub enum Action {
     /// `robot.move` at this twist for the step's length.
     Walk { vx: f64, vyaw: f64 },
-    /// Cut the policy while walking at `vx`, give it back, and wait for the get-up. The walk
+    /// Trip (or cut) the robot while walking at `vx`, and wait for the get-up. The walk
     /// leading into it is the step before; this one lasts as long as the get-up does.
     Fall { vx: f64 },
     /// `sit_toggle` into the seat, and stay there.

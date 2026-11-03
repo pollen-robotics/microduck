@@ -591,6 +591,23 @@ enum RobotCommand {
         json: bool,
     },
 
+    /// Trip the robot mid-stride: hold its legs where they are for MS milliseconds while the
+    /// policy keeps running, as a caught foot would. **It is meant to make the robot fall.**
+    ///
+    /// Drive it with the pad and fire this from ssh to tune a fall by hand: too short and the
+    /// policy catches it, long enough and it goes over with robotd's own fall handling — the
+    /// limp-fall — live, which a cut policy (Start) switches off. `robotctl stress --trip-ms`
+    /// is what the stress test then uses. Refused while the policy is off.
+    Trip {
+        /// How long the legs are held, ms (1–1000).
+        ms: u32,
+        /// Which legs: both, or one foot caught.
+        #[arg(long, default_value = "both", value_parser = ["both", "left", "right"])]
+        legs: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Reboot servos: every one of them, or only the ids given.
     ///
     /// The way back from a servo in hardware error (overload, overheating) without pulling the
@@ -3466,6 +3483,13 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        RobotCommand::Trip { ms, legs, json } => (
+            proto::Call::RobotTrip(proto::TripParams {
+                ms: *ms,
+                legs: trip_legs(legs),
+            }),
+            *json,
+        ),
         RobotCommand::RebootMotors { ids, json } => (
             proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: ids.clone() }),
             *json,
@@ -3553,9 +3577,21 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Trip { .. } => {
+            println!("{}", outcome.reason.as_deref().unwrap_or("tripping"))
+        }
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// `--legs`, as clap has already checked it.
+pub(crate) fn trip_legs(legs: &str) -> proto::TripLegs {
+    match legs {
+        "left" => proto::TripLegs::Left,
+        "right" => proto::TripLegs::Right,
+        _ => proto::TripLegs::Both,
+    }
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].

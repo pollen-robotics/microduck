@@ -8,10 +8,13 @@
 //! schedule that only a get-up moves, and anything a robot does differently — a guard, a fall
 //! nobody asked for, a slow get-up — is logged rather than compensated.
 //!
-//! **A fall is the pad's Start tapped mid-stride**: `robot.enable { on: false }` while walking,
-//! and the policy back 0.5 s later, while the robot is still going down. A longer cut lets the
-//! ramp to the home pose settle it, which is a softer fall and an easier get-up than a real one.
-//! The get-up is the policy's own; [`getup`] times it and decides when to give up.
+//! **A fall is a trip** (`robot.trip`): the legs held mid-stride for `--trip-ms` while the policy
+//! keeps running, so it tries to recover and, failing, goes over with robotd's limp-fall live —
+//! the way a real stumble ends. `--fall cut` is the first version's fall, the pad's Start tapped
+//! mid-stride: the policy off for 0.5 s and back while the robot is still going down, which also
+//! switches the limp-fall off for exactly that moment, so the robot lands stiff. Each fall logs
+//! a `limp` event when the limp-fall caught it. The get-up is the policy's own; [`getup`] times
+//! it and decides when to give up.
 //!
 //! **It stays in its square and off the walls** ([`guard`]): odometry for the square, the head
 //! ToF for the wall. A duck without the ToF runs on odometry alone and says so once.
@@ -95,7 +98,20 @@ pub struct StressArgs {
     /// Turn rate, rad/s.
     #[arg(long, default_value_t = 1.5, help_heading = "Lap")]
     vyaw: f64,
-    /// How long the policy is cut to make a fall, s. Longer lets the robot settle and fall softly.
+    /// How a fall is made: `trip` holds the legs mid-stride while the policy keeps running, so
+    /// it tries to recover and robotd's limp-fall catches the fall as it would a real one;
+    /// `cut` switches the policy off for --cut, the pad's Start, which takes both away.
+    #[arg(long, default_value = "trip", value_parser = ["trip", "cut"], help_heading = "Lap")]
+    fall: String,
+    /// How long a trip holds the legs, ms. Tune it by hand first: `robotctl robot trip MS`
+    /// while walking with the pad.
+    #[arg(long, default_value_t = 250, help_heading = "Lap")]
+    trip_ms: u32,
+    /// Which legs a trip holds: both, or one foot caught.
+    #[arg(long, default_value = "both", value_parser = ["both", "left", "right"], help_heading = "Lap")]
+    trip_legs: String,
+    /// With --fall cut: how long the policy is cut, s. Longer lets the robot settle and fall
+    /// softly.
     #[arg(long, default_value_t = 0.5, help_heading = "Lap")]
     cut: f64,
     /// Down this long after the policy came back: cut it for --reset and try once more, s.
@@ -425,6 +441,11 @@ impl Driver {
         Some((f.odom.position[0], f.odom.position[1], f.odom.yaw))
     }
 
+    /// `safety.limp` from the latest frame: robotd's limp-fall has the robot.
+    fn limp(&self) -> bool {
+        self.feed.frame().is_some_and(|f| f.safety.limp)
+    }
+
     /// `safety.fallen` from the latest frame, `None` when there is none.
     fn fallen(&self) -> Option<bool> {
         self.feed.frame().map(|f| f.safety.fallen)
@@ -635,10 +656,36 @@ impl Driver {
         // the lap keeps its six cuts.
         self.caught_falling()?;
         let way = if vx >= 0.0 { "forward" } else { "backward" };
-        self.run.event("fall_triggered", way);
-        self.cut_policy(self.args.cut)?;
+        if self.args.fall == "cut" {
+            self.run.event(
+                "fall_triggered",
+                &format!("{way}, cut {:.2} s", self.args.cut),
+            );
+            self.cut_policy(self.args.cut)?;
+        } else {
+            self.trip(vx, way)?;
+        }
         self.get_up(Getup::provoked(self.timing))?;
         self.schedule.unanchor();
+        Ok(())
+    }
+
+    /// Hold the legs mid-stride and keep asking for the walk through it: the policy is still
+    /// driving, and a foot caught while walking is caught while the walk goes on.
+    fn trip(&mut self, vx: f64, way: &str) -> Drive {
+        let (ms, legs) = (self.args.trip_ms, crate::trip_legs(&self.args.trip_legs));
+        self.run.event(
+            "fall_triggered",
+            &format!("{way}, trip {ms} ms {}", legs.as_str()),
+        );
+        let result = self.call(&proto::Call::RobotTrip(proto::TripParams { ms, legs }))?;
+        if !result.as_ref().is_some_and(|r| r.accepted) {
+            self.run.event("trip_refused", &json(&result));
+        }
+        let end = self.now() + f64::from(ms) / 1000.0;
+        while self.now() < end {
+            self.tick(vx, 0.0)?;
+        }
         Ok(())
     }
 
@@ -646,7 +693,15 @@ impl Driver {
     fn get_up(&mut self, mut g: Getup) -> Drive {
         let t0 = self.now();
         let mut seen_down = false;
+        let mut was_limp = false;
         loop {
+            // robotd's limp-fall: whether this fall went through it, and when. A fall that never
+            // did landed stiff, and its get-up is not the same measurement.
+            let limp = self.limp();
+            if limp && !was_limp {
+                self.run.event("limp", &format!("{:.2} s", self.now() - t0));
+            }
+            was_limp = limp;
             let fallen = self.fallen();
             if fallen == Some(true) && !seen_down {
                 seen_down = true;

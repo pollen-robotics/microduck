@@ -458,8 +458,9 @@ def compare(runs: list[tuple[Path, pd.DataFrame]], out: Path) -> None:
 
 # ── stress runs ─────────────────────────────────────────────────────────────────────────────
 
+# `limp` is robotd's limp-fall catching a fall (from `--fall trip`); a run made by cuts has none.
 LAP_COUNTS = ["fall_triggered", "no_fall", "got_up", "getup_failed", "long_reset", "gave_up",
-              "fallen_unprovoked", "square_guard", "wall_guard"]
+              "fallen_unprovoked", "square_guard", "wall_guard", "limp"]
 
 
 def read_meta(run: Path) -> dict:
@@ -526,7 +527,7 @@ def stress_summary(laps: pd.DataFrame, version: str) -> str:
         "",
         f"- Falls provoked: **{int(tot['falls'])}**; no fall {int(tot['no_fall'])}, "
         f"got up {int(tot['got_up'])}, after a reset {int(tot['long_reset'])}, "
-        f"gave up {int(tot['gave_up'])}",
+        f"gave up {int(tot['gave_up'])}; caught by the limp-fall {int(tot['limp'])}",
         f"- Falls nobody asked for: {int(tot['fallen_unprovoked'])}; guards: square "
         f"{int(tot['square_guard'])}, wall {int(tot['wall_guard'])}",
     ]

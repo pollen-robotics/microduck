@@ -472,6 +472,17 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+**Tripping it on purpose**, to tune `robotctl stress`'s falls: drive with the pad and, from ssh,
+
+```
+sudo robotctl robot trip 250                # hold both legs 250 ms mid-stride; --legs left|right for one foot
+```
+
+The policy keeps running through the trip, so it tries to recover, and a robot that goes over
+does it with the limp-fall live (`robotctl monitor` shows `limp`). Too short and it is caught;
+raise it until the fall is the one you want, then `robotctl stress --trip-ms N`. Refused while the
+policy is off; never reachable over Bluetooth or WebRTC.
+
 `reboot-motors` is also reachable over Bluetooth, as `duckctl reboot-motors`
 ([`duckctl.md`](duckctl.md)) — `relax` is not.
 
@@ -628,8 +639,10 @@ sudo robotctl stress stop
 ```
 
 A violent test, the same on every robot so runs compare lap for lap: it walks, is made to fall,
-gets itself up, and does it again until the battery is empty. A fall is the pad's Start tapped
-mid-stride — the policy off for 0.5 s (`--cut`) and back while the robot is still going down. One
+gets itself up, and does it again until the battery is empty. A fall is a trip: the legs held
+mid-stride for 250 ms (`--trip-ms`, `--trip-legs`; tune it with `robotctl robot trip`) while the
+policy keeps running, so it tries to recover and robotd's limp-fall catches it as it would a real
+stumble. `--fall cut` is the old fall, the policy off for `--cut` 0.5 s, which lands stiff. One
 lap (`stress-v1`, written into `meta.json`):
 
 | block | steps |
@@ -654,7 +667,8 @@ update never starts a run.
 Same background unit, battery hand-off and files as `endurance`, under `/var/lib/stress/` —
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
-`fallen_unprovoked`, `wall_guard` and `square_guard`. `scripts/endurance-plot.py` draws one run or
+`fallen_unprovoked`, `wall_guard`, `square_guard`, `trip_refused` and `limp` (the limp-fall caught
+it; seconds after the trip). `scripts/endurance-plot.py` draws one run or
 overlays several, and writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
 page of the report give each servo's mean current and highest peak.
 

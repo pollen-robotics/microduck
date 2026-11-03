@@ -86,6 +86,10 @@ fn permits(call: &proto::Call) -> bool {
         // control-only session without video ever becomes a normal thing.
         RobotEnable(_) | RobotInit | RobotRelax | RobotRebootMotors(_) | RobotRest => true,
 
+        // A trip is a test instrument: it exists to knock the robot over. `robotctl` on the robot
+        // is where a test runs; a browser session has no reason to reach it.
+        RobotTrip(_) => false,
+
         // `robot.stop` is permitted here and refused over BLE, and the difference is honesty
         // rather than authority. BLE's objection was that a stop button over "an unbonded,
         // high-latency, sometimes-absent radio" is worse than no button because it *looks* like an
