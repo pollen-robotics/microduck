@@ -149,8 +149,17 @@ happened in:
 - **Square**: ±0.5 m from the start on odometry. If a walking step would take the robot past
   it, the step is cut short and the robot walks back toward the centre before the next step.
 - **Wall**: from `tofd`'s frames, if the nearest return in the direction of travel is under
-  ~20 cm (forward walking only — the sensor is in the head and looks forward), the step is cut
-  short and the robot turns in place away from it before resuming the lap.
+  30 cm (forward walking only — the sensor is in the head and looks forward), the step is cut
+  short and the robot turns in place away from it before resuming the lap. 20 cm until the first
+  runs, whose forward falls started that close and landed against the wall.
+- **Looking behind** (`look_back`): the sensor looks forward and the lap backs up, so before each
+  backward walk the robot turns its body a quarter left and its head a quarter left, which points
+  the ToF where it is about to back into. Clear for the backing up plus `--wall`: it turns back
+  and goes. A wall nearer: it carries on to a half turn, faces the wall and backs away from it.
+  The look sits outside the step's slot, like a get-up, so the step keeps its length.
+- **A wall on the way back to the start moves the start** (`home_moved`): the one exception to
+  "never re-anchor" below. The robot never walked through a wall, so a wall between it and the
+  start is drift; walking back to that start pinned the first runs to the wall until they gave up.
 - No ToF (socket absent / no sensor): one line in the events, and the run continues on odometry
   only.
 

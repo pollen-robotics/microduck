@@ -660,7 +660,11 @@ Still down 7 s after the policy came back (`--getup-timeout`), the policy is cut
 and calls for help, two quacks and a wheee every 15 s (`--call-every`, 0 for silence), so you hear
 it from the next room.
 It stays within ±0.5 m of where it started on odometry (`--square`; coarse, since falls drift it)
-and turns away from anything closer than 20 cm ahead on the head ToF (`--wall`); a duck without
+and turns away from anything closer than 30 cm ahead on the head ToF (`--wall`); a wall between it
+and its start means odometry drifted the start behind it, and the start moves (`home_moved`).
+Before backing up it looks behind — body and head a quarter turn left, so the forward-only ToF faces
+the way it will back — and with a wall nearer than the backing up plus `--wall`, turns round to
+back away from it instead (`look_back`). A duck without
 the ToF logs `no_tof` once and runs on odometry alone. Run it in a pen, with no pad connected.
 Unlike `endurance`, `stop` (or ctrl-C in `--foreground`) turns the policy off, as the pad's Start
 does: the robot holds its home pose.
@@ -672,9 +676,10 @@ update never starts a run.
 Same background unit, battery hand-off and files as `endurance`, under `/var/lib/stress/` —
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
-`fallen_unprovoked`, `wall_guard`, `square_guard`, `trip_refused` and `limp` (the limp-fall caught
-it; seconds after the trip). `scripts/endurance-plot.py` draws one run or
-overlays several, and writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
+`fallen_unprovoked`, `wall_guard`, `square_guard`, `home_moved`, `look_back`, `trip_refused` and `limp` (the
+limp-fall caught it; seconds after the trip). `scripts/endurance-plot.py` draws one run or compares
+several side by side, lap for lap; `--concatenate DIR` charts every run folder inside DIR as one
+run — back to back, the time between cut out, laps numbered on — into `DIR/concatenated/`. It writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
 page of the report give each servo's mean current and highest peak.
 
 ### Gamepad (`configd`)

@@ -26,6 +26,23 @@ pub fn nearest_ahead(zones: &[Zone], half_width: f64) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
+/// The nearest obstacle on the robot's left: [`nearest_ahead`] along the trunk's +y. What the
+/// ToF sees with the head turned to look that way.
+pub fn nearest_left(zones: &[Zone], half_width: f64) -> Option<f64> {
+    let turned: Vec<Zone> = zones
+        .iter()
+        .map(|zone| match zone {
+            // A quarter turn clockwise: left becomes ahead.
+            Zone::Hit { point, range } => Zone::Hit {
+                point: [point[1], -point[0], point[2]],
+                range: *range,
+            },
+            other => *other,
+        })
+        .collect();
+    nearest_ahead(&turned, half_width)
+}
+
 /// A frame's zones in the trunk frame, through the head FK — `robotctl monitor`'s reduction.
 pub fn classify(
     frame: &proto::TofFrame,
@@ -49,7 +66,8 @@ pub fn odometry_jumped(before: (f64, f64), after: (f64, f64)) -> bool {
     (after.0 - before.0).hypot(after.1 - before.1) > ODOMETRY_JUMP
 }
 
-fn wrap(angle: f64) -> f64 {
+/// An angle into (−π, π].
+pub fn wrap(angle: f64) -> f64 {
     angle.sin().atan2(angle.cos())
 }
 
@@ -94,6 +112,20 @@ mod tests {
         assert_eq!(
             nearest_ahead(&[hit(0.10, 0.30), hit(-0.10, 0.0)], 0.15),
             None
+        );
+    }
+
+    #[test]
+    fn nearest_left_looks_along_the_left() {
+        let zones = [
+            hit(0.0, 0.50),
+            hit(0.05, 0.30),
+            hit(0.40, 0.0),
+            hit(0.0, -0.20),
+        ];
+        assert_eq!(
+            nearest_left(&zones, 0.15).map(|d| (d * 100.0).round()),
+            Some(30.0)
         );
     }
 

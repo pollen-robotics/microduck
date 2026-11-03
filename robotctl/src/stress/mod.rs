@@ -59,6 +59,13 @@ const TURN_THRESHOLD: f64 = 0.6;
 /// The walk back to the centre ends this far inside the square, as a share of its half-side, so
 /// the robot is not on the edge again at the next step.
 const SQUARE_RETURN: f64 = 0.8;
+/// Looking behind (`look_back`): how long the head gets to arrive after the body's quarter turn,
+/// and how long the frames are then read for, s.
+const LOOK_SETTLE: f64 = 0.4;
+const LOOK_READ: f64 = 0.3;
+/// A turn on the spot is done within this of its heading, rad, or after this long, s.
+const TURN_TOLERANCE: f64 = 0.08;
+const TURN_TIMEOUT: f64 = 4.0;
 /// A wall guard turns until the nearest return ahead is this much further than `--wall`.
 const WALL_CLEAR: f64 = 1.5;
 
@@ -128,8 +135,9 @@ pub struct StressArgs {
     /// Half the side of the square it stays in, around where it started, m.
     #[arg(long, default_value_t = 0.5, help_heading = "Guards")]
     square: f64,
-    /// Stop walking forward at an obstacle this close, m (head ToF).
-    #[arg(long, default_value_t = 0.20, help_heading = "Guards")]
+    /// Stop walking forward at an obstacle this close, m (head ToF). 30 cm, not 20: a forward
+    /// fall from 20 cm lands against the wall.
+    #[arg(long, default_value_t = 0.30, help_heading = "Guards")]
     wall: f64,
     /// At or below this battery %, stop driving and let robotd's own empty-battery shutdown run
     /// undisturbed.
@@ -607,6 +615,9 @@ impl Driver {
         if !self.driving() {
             self.ensure_driving()?;
         }
+        if vx < 0.0 {
+            self.look_back(vx * step.seconds)?;
+        }
         let end = self.schedule.deadline(step.seconds, self.now());
         let half = self.args.square;
         let mut guard = Guard::Off;
@@ -625,6 +636,20 @@ impl Driver {
             if walking_forward && let Some(d) = self.nearest_ahead().filter(|d| *d < self.args.wall)
             {
                 self.run.event("wall_guard", &format!("{d:.2} m ahead"));
+                // A wall on the way back to the start means the start is wrong: the robot never
+                // walked through a wall, so odometry drifted it behind one. Walking back to it
+                // again would pin the robot to that wall for every step to come.
+                if guard == Guard::Square
+                    && let Some((x, y, _)) = pose
+                {
+                    let (dx, dy) = (x - self.home.0, y - self.home.1);
+                    self.home = (x, y);
+                    self.run.shared.lock().expect("shared lock").home = Some(self.home);
+                    self.run.event(
+                        "home_moved",
+                        &format!("a wall on the way back; the start is here now, ({dx:.2}, {dy:.2}) m from the old one"),
+                    );
+                }
                 guard = Guard::Wall;
             }
             if guard == Guard::Off
@@ -674,6 +699,96 @@ impl Driver {
             self.tick(cmd_vx, cmd_vyaw)?;
         }
         Ok(())
+    }
+
+    /// Before backing up `travel` m (negative), see what is behind: the ToF only looks forward,
+    /// so turn the body a quarter left and the head a quarter left — the sensor then faces where
+    /// the robot is about to back into. Clear for the whole backing up plus `--wall`: turn back
+    /// and go. A wall nearer than that: carry on to a half turn, so the robot faces the wall and
+    /// backs away from it, and the forward walks after have the live guard.
+    ///
+    /// Outside the step's slot, like a get-up: the look takes a couple of seconds, and the step
+    /// keeps its full length after it.
+    fn look_back(&mut self, travel: f64) -> Drive {
+        let Some((_, _, yaw0)) = self.pose() else {
+            return Ok(());
+        };
+        let need = travel.abs() + self.args.wall;
+        self.call(&proto::Call::RobotLook(proto::LookParams {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+            neck_pitch: 0.0,
+        }))?;
+        self.turn_to(yaw0 + std::f64::consts::FRAC_PI_2)?;
+        // The head has to have arrived, and the frames to be from where it arrived.
+        self.hold(LOOK_SETTLE)?;
+        let mut behind: Option<f64> = None;
+        let end = self.now() + LOOK_READ;
+        while self.now() < end {
+            if let Some(d) = self.nearest_left() {
+                behind = Some(behind.map_or(d, |b| b.min(d)));
+            }
+            self.tick(0.0, 0.0)?;
+        }
+        self.call(&proto::Call::RobotLook(proto::LookParams {
+            x: 1.0,
+            y: 0.0,
+            z: 0.0,
+            neck_pitch: 0.0,
+        }))?;
+        match behind.filter(|d| *d < need) {
+            Some(d) => {
+                self.run.event(
+                    "look_back",
+                    &format!("wall {d:.2} m behind, {need:.2} m needed; turned round"),
+                );
+                self.turn_to(yaw0 + std::f64::consts::PI)?;
+            }
+            None => {
+                let seen = behind.map_or("nothing".into(), |d| format!("{d:.2} m"));
+                self.run
+                    .event("look_back", &format!("clear: {seen} behind"));
+                self.turn_to(yaw0)?;
+            }
+        }
+        self.schedule.unanchor();
+        Ok(())
+    }
+
+    /// Turn on the spot to `target` yaw (odometry), the short way round. Gives up after
+    /// [`TURN_TIMEOUT`]: a robot that cannot find its heading should still get on with the lap.
+    fn turn_to(&mut self, target: f64) -> Drive {
+        let end = self.now() + TURN_TIMEOUT;
+        while self.now() < end {
+            self.check_battery()?;
+            let Some((_, _, yaw)) = self.pose() else {
+                break;
+            };
+            let err = guard::wrap(target - yaw);
+            if err.abs() < TURN_TOLERANCE {
+                break;
+            }
+            self.tick(0.0, self.args.vyaw.abs().copysign(err))?;
+        }
+        Ok(())
+    }
+
+    /// Stand still for `seconds`, keeping the twist alive.
+    fn hold(&mut self, seconds: f64) -> Drive {
+        let end = self.now() + seconds;
+        while self.now() < end {
+            self.tick(0.0, 0.0)?;
+        }
+        Ok(())
+    }
+
+    /// The nearest obstacle on the robot's left, with the head turned to look there.
+    fn nearest_left(&mut self) -> Option<f64> {
+        let frame = self.tof.frame()?;
+        let state = self.feed.frame()?;
+        let zones = guard::classify(&frame, &state, &self.reprojector)?;
+        guard::nearest_left(&zones, guard::CORRIDOR_HALF_WIDTH)
     }
 
     /// Cut the policy mid-stride, give it back, and see the robot down and up again.
