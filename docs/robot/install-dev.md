@@ -210,6 +210,8 @@ Swap `main` for any branch to get what CI last built for it. From here on, don't
 release, which on a dev board is usually a downgrade.
 
 `sudo robotctl configure --allow-dev-daemon off` makes it a robot that only takes releases again.
+The same switch is the first row of the `sudo robotctl configure` editor, `allow_dev_daemon` under
+`[dev board]`: SPACE toggles it, and saving offers the `updaterd` restart.
 
 The switch needs an `updaterd` that knows about it — a release from after it was added. On a board
 running an older one, `sudo robotctl update apply daemon` first, then the switch.

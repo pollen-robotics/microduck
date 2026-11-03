@@ -339,7 +339,8 @@ into `updater::verify::BUILTIN_DEV_KEY`), always marked dev-only. A dev-only key
 when dev keys are allowed, and they are allowed when either of these holds:
 
 - the file `allow-dev-builds` (`duck_ipc_proto::DEV_BUILDS_MARKER`) exists in `state_dir` —
-  written by `sudo robotctl configure --allow-dev-daemon on`, removed by `off`; or
+  written by `sudo robotctl configure --allow-dev-daemon on`, removed by `off`, and toggled by
+  the `allow_dev_daemon` row of the `robotctl configure` editor; or
 - `allow_dev_keys = true` in `updater.toml` — what boards provisioned by `install.sh` with
   `DUCK_DEV_KEY` carry, alongside a `team.dev.pub` copied into `trusted_keys_dir`.
 
