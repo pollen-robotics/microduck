@@ -10,7 +10,8 @@ The commands that only make sense on a board set up by
 sudo robotctl configure --allow-dev-daemon on
 ```
 
-`off` undoes it. [`install-dev.md`](install-dev.md#making-an-existing-board-take-dev-builds) has
+`off` undoes it. In the `sudo robotctl configure` editor it is the first row,
+`allow_dev_daemon`. [`install-dev.md`](install-dev.md#making-an-existing-board-take-dev-builds) has
 what it does.
 
 ## The dev channel

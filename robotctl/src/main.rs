@@ -249,6 +249,9 @@ enum Namespace {
     /// this build does not know survive untouched, and nothing is written that robotd's own
     /// validation would reject. The config is read once at robotd's startup, so saving offers
     /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    ///
+    /// One row is not robotd's: `allow_dev_daemon`, at the top, makes this robot a dev board
+    /// (the same as `--allow-dev-daemon`).
     Configure {
         /// The file to edit. The default is where a provisioned robot keeps it.
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
@@ -274,7 +277,8 @@ enum Namespace {
         #[arg(long, value_name = "on|off", value_parser = parse_on_off, conflicts_with = "list")]
         allow_dev_daemon: Option<bool>,
 
-        /// `updaterd`'s config, for where it keeps its state. Only read by `--allow-dev-daemon`.
+        /// `updaterd`'s config, for where it keeps its state: read by `--allow-dev-daemon` and by
+        /// the editor's dev-board row, which is absent when this file is.
         #[arg(long, default_value = dev_daemon::UPDATER_CONFIG)]
         updater_config: PathBuf,
     },
@@ -5428,7 +5432,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             } else if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &updater_config)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
