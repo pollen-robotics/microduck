@@ -27,8 +27,8 @@ use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
     BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID,
-    IMPACT_GUARD_FIRMWARE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS, homing_offset,
-    impact_guard_blocks,
+    IMPACT_GUARD_FIRMWARE, IMU_DXL_ID, ImpactGuard, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    homing_offset,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -127,8 +127,8 @@ pub struct DynamixelIo {
     /// built without this would silently drop back to a plain sync read for the rest of the
     /// process — a motor swap quietly halving the tick's bus budget.
     fast_sync_read: bool,
-    /// `bus.impact_guard`: which of [`impact_guard_blocks`] the register check asserts.
-    impact_guard: bool,
+    /// `bus.impact_guard*`: the settings the register check asserts on V3 servos.
+    impact_guard: ImpactGuard,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
@@ -151,16 +151,16 @@ impl DynamixelIo {
             port: port.to_owned(),
             ids,
             fast_sync_read,
-            impact_guard: true,
+            impact_guard: ImpactGuard::FACTORY,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
     }
 
-    /// `bus.impact_guard` from `robotd.toml`: the guard as ROBOTIS ships it, or off — the factory
-    /// firmware with only Current Limit. Applied by [`Self::check_registers`], so call it before.
-    pub fn set_impact_guard(&mut self, on: bool) {
-        self.impact_guard = on;
+    /// The impact guard settings `robotd.toml` asks for: ROBOTIS's factory values unless told
+    /// otherwise, or [`ImpactGuard::OFF`]. Applied by [`Self::check_registers`], so call it before.
+    pub fn set_impact_guard(&mut self, guard: ImpactGuard) {
+        self.impact_guard = guard;
     }
 
     /// The body IMU's sensor→trunk mount, which is the robot's ([`SflpDecoder::DEFAULT_MOUNT`]
@@ -302,7 +302,7 @@ impl DynamixelIo {
                 got: 0,
             })?;
         if firmware == IMPACT_GUARD_FIRMWARE {
-            for (addr, want) in impact_guard_blocks(self.impact_guard) {
+            for (addr, want) in self.impact_guard.blocks() {
                 let got = self
                     .controller
                     .read_raw_data(id, addr, want.len() as u8)

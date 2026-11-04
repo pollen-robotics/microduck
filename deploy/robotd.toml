@@ -55,6 +55,20 @@ port = "/dev/ttyS2"
 # restart.
 # impact_guard = true
 
+# What ON writes, in the registers' units — ROBOTIS's factory values below, the ones the gear
+# bench validated. An impact is a deceleration past impact_guard_decel rad/s² while the servo
+# moves toward its goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for
+# impact_guard_brake_ms and the servo holds at impact_guard_i_hold_ma until its goal comes back
+# past it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at
+# impact_guard_v_fast rad/s (never 0). A start that writes anything else says so in the journal,
+# so a recording can be matched to the settings it ran on.
+# impact_guard_v_min = 1
+# impact_guard_brake_ms = 50
+# impact_guard_decel = 400
+# impact_guard_i_hold_ma = 500
+# impact_guard_v_fast = 9
+# impact_guard_pwm_fast = 50
+
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
 # /etc/robot/robotd.toml once and never overwrites it, so an uncommented value is frozen on

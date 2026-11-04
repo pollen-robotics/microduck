@@ -121,6 +121,36 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Impact guard on V3 servos; off = factory firmware with Current Limit only",
     ),
+    entry(
+        "bus.impact_guard_v_min",
+        Kind::Integer,
+        "Impact guard: an impact counts only above this speed toward the goal, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_brake_ms",
+        Kind::Integer,
+        "Impact guard: brake time after an impact, ms",
+    ),
+    entry(
+        "bus.impact_guard_decel",
+        Kind::Integer,
+        "Impact guard: deceleration that counts as an impact, rad/s²",
+    ),
+    entry(
+        "bus.impact_guard_i_hold_ma",
+        Kind::Integer,
+        "Impact guard: current allowed after the brake until the goal comes back, mA",
+    ),
+    entry(
+        "bus.impact_guard_v_fast",
+        Kind::Integer,
+        "Impact guard: speed where the PWM limit reaches impact_guard_pwm_fast, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_pwm_fast",
+        Kind::Integer,
+        "Impact guard: PWM limit at speed, % of PWM Limit",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

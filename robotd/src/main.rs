@@ -1593,6 +1593,22 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
+/// What `[bus]` asks the V3 servos' impact guard to be: its six settings, or off.
+fn impact_guard(bus: &params::Bus) -> duck_control::model::ImpactGuard {
+    use duck_control::model::ImpactGuard;
+    if !bus.impact_guard {
+        return ImpactGuard::OFF;
+    }
+    ImpactGuard {
+        v_min: bus.impact_guard_v_min,
+        brake_ms: bus.impact_guard_brake_ms,
+        decel: bus.impact_guard_decel,
+        i_hold_ma: bus.impact_guard_i_hold_ma,
+        v_fast: bus.impact_guard_v_fast,
+        pwm_fast: bus.impact_guard_pwm_fast,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_bus(
     bus: &params::Bus,
@@ -1621,9 +1637,16 @@ fn open_bus(
     if !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
     }
-    io.set_impact_guard(bus.impact_guard);
+    let guard = impact_guard(bus);
+    io.set_impact_guard(guard);
     if !bus.impact_guard && loud {
         tracing::warn!("bus.impact_guard is off; V3 servos run as the factory firmware");
+    } else if guard != duck_control::model::ImpactGuard::FACTORY && loud {
+        // Said once a start so a recording can be matched to the settings it ran on.
+        tracing::warn!(
+            ?guard,
+            "bus.impact_guard_* differ from ROBOTIS's factory values"
+        );
     }
     if !adopt_missing_servo(&mut io, loud, missing, adopted) {
         return None;
@@ -7946,6 +7969,27 @@ mod tests {
     /// The guard's state reaches the stream for the servos that have one, and a servo on any
     /// other firmware is `null` — what its unused register 66 holds is not a state, and a 0 there
     /// would read as a guard that never fired.
+    /// An untouched `[bus]` is ROBOTIS's factory guard, `impact_guard = false` is off whatever
+    /// the six settings say, and a retuned one is written as asked.
+    #[test]
+    fn bus_params_pick_the_impact_guard() {
+        use duck_control::model::ImpactGuard;
+        let mut bus = params::Bus::default();
+        assert_eq!(impact_guard(&bus), ImpactGuard::FACTORY);
+        bus.impact_guard_decel = 1000;
+        bus.impact_guard_i_hold_ma = 800;
+        assert_eq!(
+            impact_guard(&bus),
+            ImpactGuard {
+                decel: 1000,
+                i_hold_ma: 800,
+                ..ImpactGuard::FACTORY
+            }
+        );
+        bus.impact_guard = false;
+        assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
+    }
+
     #[tokio::test]
     async fn the_frame_carries_the_impact_guard_of_the_servos_that_have_one() {
         let frame = a_frame_from(guarded_io(), Params::default()).await;

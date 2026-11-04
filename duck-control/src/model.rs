@@ -136,28 +136,61 @@ pub const CURRENT_LIMIT_MA: u16 = 1000;
 
 /// `firmware_version` of ROBOTIS's impact guard firmware (V3): a servo that hits something brakes
 /// and then holds softly, which is what keeps the gear teeth whole. Its settings are
-/// [`impact_guard_blocks`]; register 66 says what the guard is doing
+/// [`ImpactGuard`]; register 66 says what the guard is doing
 /// ([`crate::io::RobotIo::impact_guard`]).
 pub const IMPACT_GUARD_FIRMWARE: u8 = 3;
 
-/// The impact guard's settings on [`IMPACT_GUARD_FIRMWARE`], as the two EEPROM blocks they fill:
-/// 40–43 (V Min rad/s, Brake Time ms, Deceleration rad/s² `u16`) and 56–59 (i Hold mA `u16`,
-/// V Fast rad/s, PWM Fast %).
-///
-/// On is ROBOTIS's factory values, which are the gear-breakage bench's: brake 50 ms on a
-/// deceleration past 400 rad/s² toward the goal, then hold at 0.5 A; and a PWM limit falling from
-/// PWM Limit at rest to 50 % at 9 rad/s. Off is the factory firmware with only Current Limit: a
-/// deceleration no impact reaches, a hold current the motor never draws, and PWM Fast at the
-/// 100 % PWM Limit this robot keeps. V Fast stays 9 either way: the firmware divides by it.
-pub fn impact_guard_blocks(on: bool) -> [(u8, [u8; 4]); 2] {
-    let (decel, i_hold, pwm_fast): (u16, u16, u8) = if on {
-        (400, 500, 50)
-    } else {
-        (32767, 32767, 100)
+/// The impact guard's six settings on [`IMPACT_GUARD_FIRMWARE`], in the registers' own units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImpactGuard {
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster than this.
+    pub v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub decel: u16,
+    /// i Hold, mA: the current the hold allows after the brake, until the goal comes back past
+    /// the position.
+    pub i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `pwm_fast`. Never 0: the firmware divides
+    /// by it.
+    pub v_fast: u8,
+    /// PWM Fast, % of PWM Limit: the limit at `v_fast` and above.
+    pub pwm_fast: u8,
+}
+
+impl ImpactGuard {
+    /// ROBOTIS's factory values, which are the gear-breakage bench's: brake 50 ms on a
+    /// deceleration past 400 rad/s² toward the goal, then hold at 0.5 A; and a PWM limit falling
+    /// from PWM Limit at rest to 50 % at 9 rad/s.
+    pub const FACTORY: Self = Self {
+        v_min: 1,
+        brake_ms: 50,
+        decel: 400,
+        i_hold_ma: 500,
+        v_fast: 9,
+        pwm_fast: 50,
     };
-    let [d0, d1] = decel.to_le_bytes();
-    let [h0, h1] = i_hold.to_le_bytes();
-    [(40, [1, 50, d0, d1]), (56, [h0, h1, 9, pwm_fast])]
+
+    /// The factory firmware with only Current Limit: a deceleration no impact reaches, a hold
+    /// current the motor never draws, and PWM Fast at the 100 % PWM Limit this robot keeps.
+    pub const OFF: Self = Self {
+        decel: 32767,
+        i_hold_ma: 32767,
+        pwm_fast: 100,
+        ..Self::FACTORY
+    };
+
+    /// The two EEPROM blocks the settings fill, as (address, bytes): 40–43 (V Min, Brake Time,
+    /// Deceleration `u16`) and 56–59 (i Hold `u16`, V Fast, PWM Fast).
+    pub fn blocks(self) -> [(u8, [u8; 4]); 2] {
+        let [d0, d1] = self.decel.to_le_bytes();
+        let [h0, h1] = self.i_hold_ma.to_le_bytes();
+        [
+            (40, [self.v_min, self.brake_ms, d0, d1]),
+            (56, [h0, h1, self.v_fast, self.pwm_fast]),
+        ]
+    }
 }
 
 /// `homing_offset` on the knees, in raw position counts (0.088° each, so −45°).
@@ -246,20 +279,37 @@ mod tests {
             .for_each(|w| assert_ne!(w[0], w[1], "duplicate Dynamixel ID {}", w[0]));
     }
 
-    /// On must be byte for byte what ROBOTIS ships, the settings the bench validated; off must
-    /// be unreachable rather than merely high, and keep V Fast off zero, which the firmware
-    /// divides by.
+    /// The factory must be byte for byte what ROBOTIS ships, the settings the bench validated;
+    /// off must be unreachable rather than merely high, and keep V Fast off zero, which the
+    /// firmware divides by.
     #[test]
-    fn impact_guard_on_is_the_factory_and_off_never_fires() {
+    fn impact_guard_factory_is_robotis_and_off_never_fires() {
         assert_eq!(
-            impact_guard_blocks(true),
+            ImpactGuard::FACTORY.blocks(),
             [(40, [1, 50, 0x90, 0x01]), (56, [0xF4, 0x01, 9, 50])]
         );
-        let [(_, low), (_, high)] = impact_guard_blocks(false);
+        let [(_, low), (_, high)] = ImpactGuard::OFF.blocks();
         assert_eq!(u16::from_le_bytes([low[2], low[3]]), 32767, "deceleration");
         assert_eq!(u16::from_le_bytes([high[0], high[1]]), 32767, "i hold");
         assert_eq!(high[3], 100, "pwm fast: no taper");
         assert_ne!(high[2], 0, "v fast");
+    }
+
+    /// Every setting lands at its own address, the two `u16`s little-endian.
+    #[test]
+    fn impact_guard_settings_fill_their_registers() {
+        let guard = ImpactGuard {
+            v_min: 2,
+            brake_ms: 30,
+            decel: 1000,
+            i_hold_ma: 800,
+            v_fast: 8,
+            pwm_fast: 70,
+        };
+        assert_eq!(
+            guard.blocks(),
+            [(40, [2, 30, 0xE8, 0x03]), (56, [0x20, 0x03, 8, 70])]
+        );
     }
 
     /// The IMU board shares the bus with the servos, so its ID must not collide with one.

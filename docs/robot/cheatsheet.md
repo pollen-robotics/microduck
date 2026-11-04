@@ -113,11 +113,14 @@ and `loop.hz` and `loop.missed` on the same line say whether the loop kept its r
 names any servo not on V3 in the journal once a start, and sets every servo's Current Limit to
 1000 mA, at the next start with torque off if the robot was standing.
 
-`bus.impact_guard` in `sudo robotctl configure` switches every V3 servo between the guard as
-ROBOTIS ships it (on, the default) and settings that never fire (off): the factory firmware with
-only Current Limit, to compare the two on the same robot. It is written when `robotd` starts with
-torque off, so restart it with the robot limp, and `impact_guard` staying at 0 in the recording
-is what off looks like.
+`bus.impact_guard` in `sudo robotctl configure` switches every V3 servo between the guard (on,
+the default) and settings that never fire (off): the factory firmware with only Current Limit, to
+compare the two on the same robot. On writes the six `bus.impact_guard_*` rows beside it, which
+default to ROBOTIS's values: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
+V Fast (rad/s) and PWM Fast (%). Changing them is how to look for a gentler guard; a start on
+anything but the factory values names them in the journal. They are written when `robotd` starts
+with torque off, so restart it with the robot limp, and `impact_guard` staying at 0 in the
+recording is what off looks like.
 
 ### Configuring the robot
 
