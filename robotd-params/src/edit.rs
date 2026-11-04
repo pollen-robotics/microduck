@@ -338,6 +338,12 @@ impl Model {
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),
             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            "policy.accel_vx" | "policy.accel_vy" | "policy.accel_vyaw" => {
+                let axis = ["policy.accel_vx", "policy.accel_vy", "policy.accel_vyaw"]
+                    .iter()
+                    .position(|k| *k == key)?;
+                Some(policy.twist_accel[axis].map_or("none".to_owned(), |a| a.to_string()))
+            }
             "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
             "audio.pet_detect" => Some(
                 params

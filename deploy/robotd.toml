@@ -199,6 +199,17 @@ mode = "walk"
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
 
+# How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s² in
+# yaw. It acts after [control] cmd_alpha, so a small stick move is the EMA as before, and only a
+# big jump — full forward to full back — becomes a ramp at this slope. Unset resolves per mode:
+# no limit walking; the roller limits accel_vx to 1.0 (about a second to reverse) and leaves
+# strafe and yaw free, so it still turns as quickly. 0 is no limit. A roller reversing in the
+# bare EMA's quarter second fell over; lowering cmd_alpha instead kept it up but made it hard to
+# steer, since that slows every axis.
+# accel_vx = 1.0
+# accel_vy = 0
+# accel_vyaw = 0
+
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5
 
