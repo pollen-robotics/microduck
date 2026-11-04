@@ -241,9 +241,9 @@ impl DynamixelIo {
     /// The expected servo IDs that do not answer a ping, in [`JOINT_IDS`] order.
     ///
     /// Fifteen pings, each bounded by [`READ_TIMEOUT`], so about half a second when the servos
-    /// are unpowered and a few milliseconds when they are not. Run once at startup: this is
-    /// what decides whether [`Self::adopt_replacement`] has anything to do, and it is the only
-    /// bus traffic the replacement path costs a robot whose servos are all present.
+    /// are unpowered and a few milliseconds when they are not. Run at startup, where this is what
+    /// decides whether [`Self::adopt_replacement`] has anything to do, and by
+    /// [`RobotIo::census`] when a running loop's reads start failing — never on a tick.
     pub fn missing_servos(&mut self) -> Result<Vec<u8>> {
         let mut missing = Vec::new();
         for &id in &JOINT_IDS {
@@ -693,6 +693,13 @@ impl RobotIo for DynamixelIo {
             *slot = block.first().copied().unwrap_or(0);
         }
         Ok(Some(errors))
+    }
+
+    fn census(&mut self) -> Result<Option<crate::io::Census>> {
+        Ok(Some(crate::io::Census {
+            missing: self.missing_servos()?,
+            imu_answers: self.imu_answers()?,
+        }))
     }
 
     fn servo_identity(&mut self) -> Result<Option<[crate::io::ServoIdentity; NUM_JOINTS]>> {
