@@ -2020,13 +2020,6 @@ impl Engine {
             }
 
             let auto_rollback = self.config.auto_rollback();
-            tracing::warn!(
-                component = %pending.component,
-                version = %pending.version,
-                boots = pending.boots,
-                auto_rollback,
-                "pending update never confirmed healthy"
-            );
 
             // Its own run, and not a continuation of the apply that armed the trial — because it
             // is one. That apply ended when `updaterd` restarted itself, minutes and a reboot ago,
@@ -2069,6 +2062,14 @@ impl Engine {
                 outcomes.push(outcome);
                 continue;
             }
+
+            // `scripts/board-test.sh` greps for this line.
+            tracing::warn!(
+                component = %pending.component,
+                version = %pending.version,
+                boots = pending.boots,
+                "pending update never confirmed healthy; reverting"
+            );
 
             let store = self.store(&pending.component)?;
 
