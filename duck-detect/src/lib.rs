@@ -111,7 +111,11 @@ pub fn decode(raw: &[f32], letterbox: Letterbox, threshold: f32, iou_limit: f32)
     // the worst kind of wrong.
     for index in 0..candidates {
         let score = raw[4 * candidates + index];
-        if score < threshold {
+        // `NaN < threshold` is false and `+Inf` is above it, so a corrupt tensor value was
+        // kept as the most confident detection: `total_cmp` sorts both to the front, where NMS
+        // lets them suppress the real box underneath. `policy` and `pickup` already refuse
+        // non-finite inference output; this is the reader that did not.
+        if !score.is_finite() || score < threshold {
             continue;
         }
         let cx = raw[index];
@@ -250,5 +254,28 @@ mod tests {
             pad_y: 0.0,
         };
         assert_eq!(decode(&raw, fit, 0.5, 0.5).len(), 2);
+    }
+
+    /// A non-finite score is never below the threshold, and `total_cmp` sorts it to the front,
+    /// where NMS lets it suppress the real box in the same place. One bad tensor value would
+    /// otherwise become the duck the robot reaches for, with the good detection thrown away.
+    #[test]
+    fn a_non_finite_score_is_not_a_detection() {
+        let fit = || Letterbox {
+            scale: 1.0,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+        for bad in [f32::NAN, f32::INFINITY] {
+            // Two candidates over the same box: a real duck at 0.9 and the corrupt value.
+            let raw = vec![10.0, 10.0, 20.0, 20.0, 4.0, 4.0, 6.0, 6.0, 0.9, bad];
+            let found = decode(&raw, fit(), 0.5, 0.5);
+            assert_eq!(found.len(), 1, "{bad:?} must not replace the real duck");
+            assert_eq!(found[0].score, 0.9);
+
+            // With no good candidate either, there is nothing at all to report.
+            let alone = vec![10.0, 20.0, 4.0, 6.0, bad];
+            assert!(decode(&alone, fit(), 0.5, 0.5).is_empty(), "{bad:?}");
+        }
     }
 }
