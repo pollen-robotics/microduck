@@ -122,6 +122,30 @@ anything but the factory values names them in the journal. They are written when
 with torque off, so restart it with the robot limp, and `impact_guard` staying at 0 in the
 recording is what off looks like.
 
+The levels a robot test steps through, gentlest first (V Min rad/s, Brake Time ms, Deceleration
+rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
+
+| level | v_min | brake_ms | decel | i_hold_ma | v_fast | pwm_fast | what it is |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 off | | | | | | | `impact_guard = false`: Current Limit only |
+| 1 taper only | 1 | 50 | 32767 | 32767 | 9 | 80 | no brake, no hold, a gentle speed taper |
+| 2 light | 3 | 20 | 1500 | 1000 | 9 | 80 | hard impacts only, a short brake, a near-normal hold |
+| 3 medium | 2 | 30 | 1000 | 800 | 9 | 70 | |
+| 4 strong | 1 | 40 | 600 | 650 | 9 | 60 | close to the factory |
+| 5 factory | 1 | 50 | 400 | 500 | 9 | 50 | the defaults: ROBOTIS's, the gear bench's |
+| 5a factory, no taper | 1 | 50 | 400 | 500 | 9 | 100 | isolates the taper |
+| 5b factory, no hold | 1 | 50 | 400 | 32767 | 9 | 50 | the brake and the taper, no soft hold |
+
+On a walking robot a foot strike trips the guard, and the hold that follows lasts until the goal
+comes back past the position, which in stance it does not: knees and hip pitches go soft under the
+robot's weight. 5b keeps what cuts the impact peak on the bench, the brake and the taper, without
+that hold. It is one key in `/var/lib/robot/robotd.toml`, the five others staying at the factory:
+
+```toml
+[bus]
+impact_guard_i_hold_ma = 32767
+```
+
 ### Configuring the robot
 
 ```
