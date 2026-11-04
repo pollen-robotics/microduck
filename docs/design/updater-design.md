@@ -28,7 +28,8 @@ document is the update system only.
   (§5.5).
 - Trigger + monitor updates from the mobile app.
 - **Force-upgrade off known-bad releases** via a minimum-version floor.
-- Never brick a robot: atomic apply, automatic rollback, signed artifacts.
+- Never brick a robot: atomic apply, signed artifacts. Automatic rollback exists but is off by
+  default (§8).
 - Keep it simple; no fleet backend.
 - Be **reusable across the team's other robots** with minimal adaptation.
 - Support a per-component **post-install hook** for migrations / one-off steps.
@@ -699,6 +700,24 @@ daemon; it makes the situation true rather than overriding a check that says it 
 and the next update that ships the unit reinstalls it.
 
 ## 8. Health gate & rollback
+
+**Automatic rollback is off by default.** `[update_gate] auto_rollback` in `robotd.toml` turns it
+on; `robotctl configure` has the row. Every path below that reverts without being asked — the gate
+after `update apply`, `select` or `rollback`, the boot counter, and the boot check
+([`boot-recovery-net.md`](boot-recovery-net.md)) — reads it at the moment it would act.
+
+Off is the default because releases now reach robots as tested Yocto images. A separate daemon
+update is the dev-board case, where someone is holding the robot. There, a revert nobody asked
+for does more damage than a broken release left in place: it replaces the code under whoever is
+looking at the robot, as the boot-counter incident below shows. This is a soft deprecation. The
+code stays, tested and one setting away.
+
+With it off, the gate still runs and still decides. A release that fails stays live, and the
+outcome is `Stuck` with a reason that names the command that reverts it
+(`robotctl update rollback <component>`). The trial is cleared, so the boot counter does not ask
+again. The update log records it as `Stuck`, not rolled back, so `known_bad` does not blacklist a
+release nobody reverted. `updaterd` reads the key through `Config::robotd_config`, both layers,
+on every decision. Missing, unreadable or not a bool reads as off.
 
 - After apply, the new `robotd` must clear a **healthy flag** within a
   per-component timeout (motors ack, model loads, media pipeline inits).
