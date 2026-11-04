@@ -365,8 +365,8 @@ pub const REGISTRY: &[Entry] = &[
     // ── [idle] ───────────────────────────────────────────────────────────────
     feature(
         "idle.enabled",
-        Kind::Bool,
-        "Look around while nothing is happening",
+        Kind::TriBool,
+        "Look around while nothing is happening; unset: on walking, off on the roller",
     ),
     entry(
         "idle.after_s",

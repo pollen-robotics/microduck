@@ -1024,8 +1024,9 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IdleParams {
-    /// Master switch.
-    pub enabled: bool,
+    /// Master switch. Absent resolves per mode ([`Self::enabled_in`]): on walking, off on the
+    /// roller.
+    pub enabled: Option<bool>,
     /// Still for this long before it starts.
     pub after_s: f64,
     /// How long it takes to fade in, and out.
@@ -1088,7 +1089,7 @@ pub struct IdleParams {
 impl Default for IdleParams {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: None,
             after_s: 2.0,
             fade_s: 1.5,
             glance_yaw: 0.6,
@@ -1123,6 +1124,17 @@ impl Default for IdleParams {
 }
 
 impl IdleParams {
+    /// Whether the look-around runs in `mode`.
+    ///
+    /// Off for the roller unless asked for, because what it moves is the head *command*, and the
+    /// head command is an observation input (`duck_control::obs`, 51..55), not a target added on
+    /// top. `roller.onnx` was not trained with one moving, and folds under it: the robot collapsed
+    /// about three seconds after the stick was let go — the 2 s delay plus the fade-in. Walking
+    /// keeps it on, as it always had it.
+    pub fn enabled_in(&self, mode: Mode) -> bool {
+        self.enabled.unwrap_or(mode == Mode::Walk)
+    }
+
     /// What is wrong with these values, if anything, as (key, reason).
     fn invalid(&self) -> Option<(&'static str, &'static str)> {
         let finite = [
@@ -4427,6 +4439,27 @@ mod tests {
         let path = write(dir.path(), "[idle]\nhold_max_s = 1.5\nnudge_yaw = 0.0\n");
         let idle = Params::load(&path, true).unwrap().idle;
         assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
+    }
+
+    /// The look-around is on for walking and off for the roller unless the file says otherwise.
+    /// Its head command is an observation input, and `roller.onnx` folds under one it was not
+    /// trained with — seen on the robot as a collapse about three seconds after the stick was
+    /// let go. A file that already says `enabled = true` keeps saying it, in either mode.
+    #[test]
+    fn the_idle_look_around_resolves_per_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let unset = Params::load(&write(dir.path(), ""), true).unwrap().idle;
+        assert!(unset.enabled_in(Mode::Walk), "walking looks around");
+        assert!(!unset.enabled_in(Mode::Roller), "the roller does not");
+
+        let on = Params::load(&write(dir.path(), "[idle]\nenabled = true\n"), true)
+            .unwrap()
+            .idle;
+        assert!(on.enabled_in(Mode::Roller), "an explicit on wins");
+        let off = Params::load(&write(dir.path(), "[idle]\nenabled = false\n"), true)
+            .unwrap()
+            .idle;
+        assert!(!off.enabled_in(Mode::Walk), "an explicit off wins");
     }
 
     #[test]

@@ -484,7 +484,12 @@ mode = "walk"
 #
 # Angles are radians, durations seconds. All of it is taste: these are the knobs for how alive it
 # reads. Read once at startup, so a change needs robotd restarted.
-# enabled = true
+#
+# `enabled` unset resolves per mode: on walking, OFF on the roller. What it moves is the head
+# command, which the policy reads as an input — and roller.onnx was not trained with one moving:
+# left alone, the roller collapsed about three seconds after the stick was let go. Set it true
+# to have the roller look around anyway, once a roller policy is trained for it.
+# enabled = true      # unset: per mode, as above
 # after_s = 2.0
 # fade_s = 1.5
 

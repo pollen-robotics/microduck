@@ -3242,9 +3242,13 @@ async fn control_loop<T: RobotIo>(
         } else {
             body_ema = [0.0; 3];
         }
-        // Still: the policy has the robot, nothing asks it to move or is moving it, nobody has
-        // steered the head lately, and it is not singing (the chorale owns the head then).
-        let still = was_driving
+        // Still: the look-around is on in this mode, the policy has the robot, nothing asks it
+        // to move or is moving it, nobody has steered the head lately, and it is not singing (the
+        // chorale owns the head then). The mode is asked every tick because `robot.setMode`
+        // changes it under the loop — and the roller has it off by default, its network folding
+        // under a head command it was not trained with (`IdleParams::enabled_in`).
+        let still = params.idle.enabled_in(policy_cfg.mode)
+            && was_driving
             && !in_limp_fall
             && !pickup_paused
             && twist_target == [0.0; 3]

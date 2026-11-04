@@ -346,6 +346,7 @@ impl Model {
                     .to_string(),
             ),
             "audio.pet_model" => path(params.audio.pet_model_resolved()),
+            "idle.enabled" => Some(params.idle.enabled_in(params.policy.mode).to_string()),
             _ => None,
         }
     }
