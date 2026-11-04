@@ -120,7 +120,31 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
             (b"T", Some((&status, rest))) => {
                 let lang = (status & 0x3F) as usize;
                 let text = rest.get(lang..).unwrap_or_default();
-                records.push(Record::Text(String::from_utf8_lossy(text).into_owned()));
+                let text = if status & 0x80 == 0 {
+                    String::from_utf8_lossy(text).into_owned()
+                } else {
+                    let (little_endian, bytes) = match text {
+                        [0xFF, 0xFE, rest @ ..] => (true, rest),
+                        [0xFE, 0xFF, rest @ ..] => (false, rest),
+                        _ => (false, text),
+                    };
+                    if bytes.len() % 2 != 0 {
+                        return Err("truncated UTF-16 text".into());
+                    }
+                    let units: Vec<u16> = bytes
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            let pair = [pair[0], pair[1]];
+                            if little_endian {
+                                u16::from_le_bytes(pair)
+                            } else {
+                                u16::from_be_bytes(pair)
+                            }
+                        })
+                        .collect();
+                    String::from_utf16_lossy(&units)
+                };
+                records.push(Record::Text(text));
             }
             (b"U", Some((&prefix, rest))) => {
                 let prefix = URI_PREFIXES.get(prefix as usize).copied().unwrap_or("");
@@ -224,6 +248,57 @@ mod tests {
     fn a_text_record_reads_back_without_its_language() {
         let records = parse(&text_tag("98:B6:E9:28:06:09")).unwrap();
         assert_eq!(records, vec![Record::Text("98:B6:E9:28:06:09".into())]);
+    }
+
+    #[test]
+    fn utf16_text_records_preserve_the_pairing_address() {
+        // Phone writers may choose UTF-16 instead of UTF-8 for the same tag text.
+        let text = "🎮 98:B6:E9:28:06:09";
+        for (little_endian, with_bom) in [(false, true), (true, true), (false, false)] {
+            let mut payload = vec![0x82, b'e', b'n'];
+            if with_bom {
+                payload.extend(if little_endian {
+                    [0xFF, 0xFE]
+                } else {
+                    [0xFE, 0xFF]
+                });
+            }
+            for unit in text.encode_utf16() {
+                payload.extend(if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            let mut record = vec![0xD1, 1, payload.len() as u8, b'T'];
+            record.extend(payload);
+            let mut tag = vec![TLV_NDEF, record.len() as u8];
+            tag.extend(record);
+            tag.push(TLV_TERMINATOR);
+            let records = parse(&tag).unwrap();
+            assert_eq!(records, vec![Record::Text(text.into())]);
+            assert_eq!(mac_in(&records).as_deref(), Some("98:B6:E9:28:06:09"));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_utf16_code_unit_is_rejected() {
+        let tag = [
+            TLV_NDEF,
+            10,
+            0xD1,
+            1,
+            6,
+            b'T',
+            0x82,
+            b'e',
+            b'n',
+            0xFE,
+            0xFF,
+            0,
+            TLV_TERMINATOR,
+        ];
+        assert!(parse(&tag).is_err());
     }
 
     #[test]
