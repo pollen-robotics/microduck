@@ -501,16 +501,23 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
 /// shapes: an older reader prints the read failures and does not see the names.
 ///
-/// # v49 — a phase-encoded skill
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+///
+/// # v50 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v48 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v49 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 49;
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3793,6 +3800,11 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
+        reason: String,
+    },
 }
 
 /// One line of an update's transcript.
@@ -6240,7 +6252,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v48 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v49 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {

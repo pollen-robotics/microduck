@@ -154,6 +154,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
         // offering a robotd restart for it would be an edit that appears to do something.
         "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
+        // `updaterd` reads it at the moment it would revert, the way it reads `allow_community`;
+        // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
+        "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,

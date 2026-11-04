@@ -2507,6 +2507,7 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::Success => format!("{target}: applied"),
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
+        proto::Outcome::Stuck { reason } => format!("{target}: STUCK — {reason}"),
     }
 }
 
@@ -7658,6 +7659,12 @@ mod tests {
         }));
         assert!(rolled.contains("ROLLED BACK"), "{rolled}");
         assert!(rolled.contains("not healthy within 30s"), "{rolled}");
+        // Left live after a failed gate: something changed, so not "refused".
+        let stuck = describe_attempt(&entry(proto::Outcome::Stuck {
+            reason: "not healthy within 30s; auto-rollback is off".into(),
+        }));
+        assert!(stuck.contains("STUCK"), "{stuck}");
+        assert!(!stuck.contains("refused"), "{stuck}");
 
         // A first install has no `from`, and must not render as "None → 1.0.0".
         let first = proto::LogEntry {

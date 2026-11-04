@@ -111,9 +111,9 @@ robotctl version
 Two pushes of the same dirty tree never collide — the version carries the push's timestamp, not
 just the commit. The tree is expected to be dirty here.
 
-**This is an ordinary update.** The signature, the artifact hash, compatibility, the health gate
-and auto-rollback all run: a build that does not come up is reverted and the board is back on what
-it was running. Going back on purpose is the ordinary command too:
+**This is an ordinary update.** The signature, the artifact hash, compatibility and the health gate
+all run. A build that does not come up stays live and is reported stuck, unless `auto_rollback` is
+on in `robotctl configure`. Going back is the ordinary command:
 
 ```bash
 sudo robotctl update rollback daemon

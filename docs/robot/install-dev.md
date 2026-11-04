@@ -7,7 +7,7 @@ customer robot is set up differently and deliberately refuses those builds — e
 assumes a dev board, never a customer robot.
 
 Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
-auto-rollback. The only difference is which key signed it, and that is what keeps these builds
+rollback setting. The only difference is which key signed it, and that is what keeps these builds
 off customer robots — every `updaterd` carries the dev key, and uses it only on a robot that has
 been made a dev board ([below](#making-an-existing-board-take-dev-builds)).
 
@@ -260,7 +260,7 @@ with no token can still install from a local directory or a dev push.
 ## Installing without a network
 
 On a board that already has a release, install a local directory the ordinary way — through the
-daemon, with the health gate and auto-rollback:
+daemon, with the health gate:
 
 ```bash
 sudo robotctl update apply daemon --from /media/usb/release
