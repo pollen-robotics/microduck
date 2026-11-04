@@ -500,7 +500,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
 /// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
 /// shapes: an older reader prints the read failures and does not see the names.
-pub const API_VERSION: u32 = 48;
+///
+/// # v49 — a stand asked for on the way down is kept
+///
+/// `robot.do sit_toggle` while a duck is still sitting down — [`PoliciesResult::sitting`] already
+/// true, the seat not yet settled — stands it up once it is seated. It used to be accepted on the
+/// wire and then dropped by the control loop, so the duck stayed seated and a client had nothing
+/// to go on but a timer. Same call, same answer; a toggle sent again before the rise is the same
+/// request, not a second toggle. An older `robotd` still drops it.
+pub const API_VERSION: u32 = 49;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2782,6 +2790,10 @@ pub struct PoliciesResult {
     /// which the daemon drives itself — `init` argues with that rather than winning, and what ends
     /// a sit is `robot.do sit_toggle`. A client that guessed would sit a standing duck down every
     /// other press.
+    ///
+    /// True from the moment a sit starts, while the duck is still on its way down. A `sit_toggle`
+    /// sent then stands it up once it is seated (v49), and a second one sent meanwhile is the same
+    /// request, so a client may send it until this reads false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sitting: Option<bool>,
 
