@@ -492,16 +492,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
 /// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
 ///
-/// # v48 — a phase-encoded skill
+/// # v48 — hardware that goes quiet on a running robot
+///
+/// [`BusHealth::missing`] and [`ImuHealth::missing`] are no longer only about the bus coming up.
+/// During a run of failed reads `robotd` pings every servo and the IMU board and fills them the
+/// same way, and `robot.health` reports **degraded** naming what went silent — the verdict the
+/// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
+/// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
+/// shapes: an older reader prints the read failures and does not see the names.
+///
+/// # v49 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v47 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v48 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 48;
+pub const API_VERSION: u32 = 49;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -535,6 +544,16 @@ pub const ROBOT_MODEL: &str = "microduck";
 pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
+
+/// The file in `updaterd`'s `state_dir` whose presence makes this robot a dev board: it trusts
+/// the team dev key `updaterd` carries built in, so `robotctl update apply --ref <branch>`
+/// installs what CI built for that branch.
+///
+/// `robotctl configure --allow-dev-daemon on|off` writes and removes it; `updaterd` reads it at
+/// startup. A file in `state_dir` rather than a key in `updater.toml` because `/etc` is the
+/// image's on an A/B robot and an OS update replaces it, while `state_dir` is under
+/// `/var/lib/robot`, which survives. `docs/design/updater-design.md` §5.4 owns the mechanism.
+pub const DEV_BUILDS_MARKER: &str = "allow-dev-builds";
 
 pub mod led;
 pub mod vetbook;
@@ -4018,10 +4037,11 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
-    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
-    /// round, in that table's order. Empty once the bus is up, before the first round, and when
-    /// the port itself would not open. All fifteen is servo power off; some of them is servos
-    /// unplugged, and naming them is the point.
+    /// The expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping round, in that
+    /// table's order. Rounds run while `robotd` waits for the bus, and on a running loop during a
+    /// run of failed reads (non-zero `consecutive_errors`). Empty on a working bus, before the
+    /// first round, and when the port would not open or the ping itself failed. All fifteen is
+    /// servo power off; some of them is servos unplugged, and naming them is the point.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<u8>,
 }
@@ -4081,10 +4101,10 @@ pub struct ImuHealth {
     /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
     /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
     pub consecutive_stale_blocks: u64,
-    /// While the bus is coming up: every servo answered its ping and the IMU board did not.
-    /// `robotd` waits rather than run without orientation, so this is also why it is not
-    /// ticking. Cleared once the bus is up; never set at runtime, where a board that stops
-    /// answering shows as consecutive bus read failures instead.
+    /// Every servo answered its ping and the IMU board did not — the same rounds as
+    /// [`BusHealth::missing`]. While the bus is coming up `robotd` waits rather than run without
+    /// orientation, so this is also why it is not ticking; on a running loop it is why the reads
+    /// are failing. Cleared once a read succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }
@@ -6220,7 +6240,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v47 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v48 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {

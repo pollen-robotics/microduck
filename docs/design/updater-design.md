@@ -310,7 +310,7 @@ writes secret keys `0600`.
 | `release-1.pub/.key` | yes | password manager **and** CI secrets | every robot |
 | `release-2.pub/.key` | yes, **different passphrase** | password manager only — **never CI** | every robot |
 | `release-3.pub/.key` | yes, **different passphrase** | offline; ideally never on a networked machine | every robot |
-| `team.dev.pub/.key` | no | team store + CI | developer boards only |
+| `team.dev.pub/.key` | no | team store + CI | built into every `updaterd`, usable on dev boards only |
 
 Three things this table encodes, each easy to get wrong:
 
@@ -329,8 +329,31 @@ Releases are signed **in CI**, not locally — a deliberate choice, with the app
 that compensates for it documented in [`ci-setup.md`](../project/ci-setup.md).
 
 The dev key is deliberately unencrypted: CI signs non-interactively, and a passphrase
-stored beside the key it protects adds little. Its real protection is structural — it is
-absent from customer robots' trusted sets, and gated there by `allow_dev_keys = false`.
+stored beside the key it protects adds little. Its real protection is structural: it counts
+only on a robot that has been made a dev board.
+
+#### Dev boards
+
+Every `updaterd` carries the dev public key built in (`deploy/dev-key/team.dev.pub`, compiled
+into `updater::verify::BUILTIN_DEV_KEY`), always marked dev-only. A dev-only key is usable only
+when dev keys are allowed, and they are allowed when either of these holds:
+
+- the file `allow-dev-builds` (`duck_ipc_proto::DEV_BUILDS_MARKER`) exists in `state_dir` —
+  written by `sudo robotctl configure --allow-dev-daemon on`, removed by `off`, and toggled by
+  the `allow_dev_daemon` row of the `robotctl configure` editor; or
+- `allow_dev_keys = true` in `updater.toml` — what boards provisioned by `install.sh` with
+  `DUCK_DEV_KEY` carry, alongside a `team.dev.pub` copied into `trusted_keys_dir`.
+
+The marker is the supported way. It lives in `state_dir`, under `/var/lib/robot`, because on an
+A/B robot `/etc` belongs to the image and an OS update replaces it: a flag in `updater.toml` or a
+key file in `/etc/robot/trusted_keys` would quietly stop being there after the next OS update.
+And built in, rather than a file, because the file had to be copied by hand under exactly the
+right name — a copy not ending `.dev.pub` would have been trusted as a *release* key.
+
+So there is one barrier, not two: a root-only switch on the robot. That is what it is worth
+anyway — root on a robot can already install anything. Both are read at `updaterd` startup;
+the command restarts it. The shipped `updater.toml` keeps `allow_dev_keys = false`, and nothing
+ships the marker.
 
 ### 5.5 Models: one component each
 
@@ -1329,7 +1352,7 @@ Cheap additions that slot into the same IPC / engine and pay off:
   sign, copy, apply. Two things it does *not* do, both deliberate: it is not
   `updaterd install --from`, which forces `on_apply` and the gate off and therefore
   cannot be used on a live release; and it does not relax verification, which is why
-  it needs a dev key on the board rather than a flag that skips a check. The
+  it needs a dev board (§5.4) rather than a flag that skips a check. The
   downgrade guard stands aside for `--from` for the reason it stands aside for
   `--version` — an operator naming a directory is not a mirror that has gone
   backwards, and a local build is a prerelease that sorts below whatever the board is

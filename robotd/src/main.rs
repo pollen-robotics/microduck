@@ -90,6 +90,16 @@ const LOOP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// rate-limited: that is the spasm, and it stays as loud as it was.
 const BUS_DROP_QUIET: Duration = Duration::from_secs(60);
 
+/// How often a running loop whose reads keep failing pings the bus to find out what went quiet.
+///
+/// A run of failed reads is a fault either way, but whose: a servo unplugged mid-run fails every
+/// read exactly as a release with a broken read path does, and only the second one is something
+/// a rollback fixes. Fifteen servo pings and one IMU ping tell them apart, at up to half a second
+/// when nothing answers — so once when the run reaches `max_consecutive_errors`, then at this
+/// interval for as long as it lasts, which is what keeps the answer current while somebody
+/// replugs servos one at a time.
+const CENSUS_INTERVAL: Duration = Duration::from_secs(5);
+
 /// How fast the beak follows the vowel being sung, as a time constant.
 ///
 /// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
@@ -624,11 +634,12 @@ struct RobotState {
     /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
     /// answer and has never commanded anything.
     startup_bus_failures: AtomicU32,
-    /// While waiting: the servo IDs the last ping round found silent. Empty once the bus is up,
-    /// and when the port would not open at all — then nothing was asked.
-    startup_missing: ArcSwap<Vec<u8>>,
-    /// While waiting: every servo answered and the IMU board did not. False once the bus is up.
-    startup_imu_missing: AtomicBool,
+    /// The servo IDs the last ping round found silent: while waiting for the bus, and on a
+    /// running loop during a run of failed reads ([`CENSUS_INTERVAL`]). Empty on a working bus,
+    /// and when the port would not open or the ping itself failed — then nothing was learned.
+    bus_missing: ArcSwap<Vec<u8>>,
+    /// The same rounds: every servo answered and the IMU board did not.
+    imu_missing: AtomicBool,
     /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
@@ -806,8 +817,8 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             startup_bus_failures: AtomicU32::new(0),
-            startup_missing: ArcSwap::from_pointee(Vec::new()),
-            startup_imu_missing: AtomicBool::new(false),
+            bus_missing: ArcSwap::from_pointee(Vec::new()),
+            imu_missing: AtomicBool::new(false),
             battery_v: AtomicU64::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
@@ -883,13 +894,13 @@ impl RobotState {
                 bus: proto::BusHealth {
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
                     startup_failures: self.startup_bus_failures.load(Ordering::Relaxed),
-                    missing: self.startup_missing.load().as_ref().clone(),
+                    missing: self.bus_missing.load().as_ref().clone(),
                 },
                 imu: Some(proto::ImuHealth {
                     ready: self.imu_ready.load(Ordering::Relaxed),
                     stale_blocks: self.imu_stale_blocks.load(Ordering::Relaxed),
                     consecutive_stale_blocks: self.imu_stale_run.load(Ordering::Relaxed),
-                    missing: self.startup_imu_missing.load(Ordering::Relaxed),
+                    missing: self.imu_missing.load(Ordering::Relaxed),
                 }),
             };
 
@@ -910,38 +921,11 @@ impl RobotState {
             if waiting > 0 {
                 // Degraded, not unhealthy: an unpowered bench board must not roll back every
                 // release shipped to it. The bus not answering is the same before and after.
-                //
-                // Some servos answering is not "no robot": the robot is there with parts of it
-                // unplugged, and the fix is finding those, not the power switch.
-                let bus = proto::BusHealth {
-                    missing: self.startup_missing.load().as_ref().clone(),
-                    ..Default::default()
-                };
-                if bus.partly_missing() {
-                    return degraded(format!(
-                        "servo{} {} not answering on the motor bus after {waiting} attempts; \
-                         {} plugged in?",
-                        if bus.missing.len() == 1 { "" } else { "s" },
-                        bus.describe_missing(),
-                        if bus.missing.len() == 1 {
-                            "is it"
-                        } else {
-                            "are they"
-                        },
-                    ));
-                }
-                // Every servo answering is a robot, whatever the first read went on to do.
-                if self.startup_imu_missing.load(Ordering::Relaxed) {
-                    return degraded(format!(
-                        "the IMU board (id {}) is not answering on the motor bus after \
-                         {waiting} attempts; is it plugged in?",
-                        duck_control::model::IMU_DXL_ID,
-                    ));
-                }
-                return degraded(format!(
-                    "no robot on the motor bus after {waiting} attempts; \
-                     is servo power on and the bus wired?"
-                ));
+                let after = format!("after {waiting} attempts");
+                return degraded(
+                    self.silent_hardware(&after)
+                        .unwrap_or_else(|| no_robot_on_the_bus(&after)),
+                );
             }
             return unhealthy("control loop has not completed a cycle yet".into());
         }
@@ -979,6 +963,15 @@ impl RobotState {
 
         let errors = self.consecutive_errors.load(Ordering::Relaxed);
         if errors >= self.max_consecutive_errors {
+            // The same hardware as the waiting branch above, and the same verdict: a servo
+            // unplugged while the loop runs is the servo unplugged at boot, and reverting the
+            // daemon finds neither. Only a run where the ping round heard every device — or had
+            // nothing to say — is left unhealthy, because then it is the reading that fails.
+            if let Some(reason) =
+                self.silent_hardware(&format!("after {errors} consecutive failed reads"))
+            {
+                return degraded(reason);
+            }
             return unhealthy(format!("{errors} consecutive bus read failures"));
         }
 
@@ -1008,6 +1001,41 @@ impl RobotState {
         }
 
         describe(true, false, None)
+    }
+
+    /// What the last ping round found silent, in the words someone goes and looks with — or
+    /// `None` when it found nothing, or there has been no round to go on.
+    ///
+    /// `after` is what was failing while it was asked: attempts at bringing the bus up, or a run
+    /// of failed reads on a running loop.
+    fn silent_hardware(&self, after: &str) -> Option<String> {
+        let bus = proto::BusHealth {
+            missing: self.bus_missing.load().as_ref().clone(),
+            ..Default::default()
+        };
+        // Some servos answering is not "no robot": the robot is there with parts of it
+        // unplugged, and the fix is finding those, not the power switch.
+        if bus.partly_missing() {
+            let one = bus.missing.len() == 1;
+            return Some(format!(
+                "servo{} {} not answering on the motor bus {after}; {} plugged in?",
+                if one { "" } else { "s" },
+                bus.describe_missing(),
+                if one { "is it" } else { "are they" },
+            ));
+        }
+        if !bus.missing.is_empty() {
+            return Some(no_robot_on_the_bus(after));
+        }
+        // Every servo answering is a robot, whatever the read went on to do.
+        if self.imu_missing.load(Ordering::Relaxed) {
+            return Some(format!(
+                "the IMU board (id {}) is not answering on the motor bus {after}; \
+                 is it plugged in?",
+                duck_control::model::IMU_DXL_ID,
+            ));
+        }
+        None
     }
 
     /// The loop's own numbers, as the readout reports them.
@@ -1460,6 +1488,47 @@ type BusIo = duck_control::bus::DynamixelIo;
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
 
+/// Every servo silent, or nothing learned while waiting: the wording for servo power being off.
+fn no_robot_on_the_bus(after: &str) -> String {
+    format!("no robot on the motor bus {after}; is servo power on and the bus wired?")
+}
+
+/// Ping the bus during a run of failed reads and publish what went quiet, for `robot.health`.
+///
+/// What the round learned replaces the last round's, including learning nothing: a ping that
+/// could not be made says nothing about any servo, and leaves health with the read failures alone.
+fn take_census<T: RobotIo>(safety: &mut duck_control::safety::Safety<T>, state: &RobotState) {
+    let heard_nothing = || duck_control::Census {
+        missing: Vec::new(),
+        imu_answers: true,
+    };
+    let census = match safety.census() {
+        Ok(census) => census.unwrap_or_else(heard_nothing),
+        Err(e) => {
+            tracing::warn!(error = %e, "bus reads are failing and the servos cannot be pinged");
+            heard_nothing()
+        }
+    };
+    let before = state.bus_missing.load();
+    let imu_before = state.imu_missing.load(Ordering::Relaxed);
+    // As at startup: the IMU board counts as missing only when every servo answered, since
+    // power being off silences it along with them.
+    let imu_missing = census.missing.is_empty() && !census.imu_answers;
+    if before.as_slice() != census.missing.as_slice() || imu_before != imu_missing {
+        if census.anything_missing() {
+            tracing::error!(
+                missing = ?census.missing,
+                imu_answers = census.imu_answers,
+                "bus reads are failing and these stopped answering their pings; unplugged?"
+            );
+        } else if !before.is_empty() || imu_before {
+            tracing::warn!("every servo and the IMU board answer again; the reads still fail");
+        }
+    }
+    state.bus_missing.store(Arc::new(census.missing));
+    state.imu_missing.store(imu_missing, Ordering::Relaxed);
+}
+
 /// Open and verify the bus, waiting for a robot to answer.
 ///
 /// Same reasoning as [`adopt_startup_pose`], one step earlier: an unpowered board cannot
@@ -1486,8 +1555,8 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
             match imu_answers(&mut io, attempt) {
                 Some(true) => {
                     state.startup_bus_failures.store(0, Ordering::Relaxed);
-                    state.startup_missing.store(Arc::new(Vec::new()));
-                    state.startup_imu_missing.store(false, Ordering::Relaxed);
+                    state.bus_missing.store(Arc::new(Vec::new()));
+                    state.imu_missing.store(false, Ordering::Relaxed);
                     return Some(io);
                 }
                 Some(false) => imu_missing = true,
@@ -1499,10 +1568,8 @@ async fn open_bus_waiting(bus: &params::Bus, state: &RobotState) -> Option<BusIo
         attempt += 1;
         // Published before sleeping, so `robot.health` can name the cause immediately — and
         // which servos, when some answered and these did not, or that it is the IMU board.
-        state.startup_missing.store(Arc::new(missing));
-        state
-            .startup_imu_missing
-            .store(imu_missing, Ordering::Relaxed);
+        state.bus_missing.store(Arc::new(missing));
+        state.imu_missing.store(imu_missing, Ordering::Relaxed);
         state.startup_bus_failures.store(attempt, Ordering::Relaxed);
 
         // Nothing to retry on a platform that has no bus at all.
@@ -2267,6 +2334,9 @@ async fn control_loop<T: RobotIo>(
     // Dropped bus reads: when one was last reported, how many have gone unreported since, and how
     // many happened in this summary window. See [`BUS_DROP_QUIET`].
     let mut last_bus_drop: Option<Instant> = None;
+    // When this run of failed reads last pinged the bus — see [`CENSUS_INTERVAL`]. `None` on a
+    // working bus, which is also what says a good read has a census to clear.
+    let mut last_census: Option<Instant> = None;
     let mut bus_drops_quiet = 0u32;
     let mut bus_drops_window = 0u32;
     let mut was_driving = false;
@@ -2468,11 +2538,26 @@ async fn control_loop<T: RobotIo>(
         let fresh = match safety.read() {
             Ok(sensors) => {
                 state.consecutive_errors.store(0, Ordering::Relaxed);
+                if last_census.take().is_some() {
+                    // Everything is answering again, or this read could not have worked.
+                    state.bus_missing.store(Arc::new(Vec::new()));
+                    state.imu_missing.store(false, Ordering::Relaxed);
+                }
                 sensors_read_ns = read_at;
                 Some(sensors)
             }
             Err(e) => {
-                let n = state.consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                // Only this loop writes the count, so it can be published after the census:
+                // gated on the same threshold that turns the run into a health verdict, the bus is
+                // asked why before health can read the run as one.
+                let n = state.consecutive_errors.load(Ordering::Relaxed) + 1;
+                if n >= state.max_consecutive_errors
+                    && last_census.is_none_or(|at| at.elapsed() >= CENSUS_INTERVAL)
+                {
+                    last_census = Some(Instant::now());
+                    take_census(&mut safety, &state);
+                }
+                state.consecutive_errors.store(n, Ordering::Relaxed);
                 bus_drops_window += 1;
 
                 // A run of them is a fault, and stays as loud as it was: every tenth, at once.
@@ -7311,6 +7396,9 @@ mod tests {
         fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
             self.0.slow_sensors()
         }
+        fn census(&mut self) -> duck_control::io::Result<Option<duck_control::Census>> {
+            self.0.census()
+        }
     }
 
     /// **A change to a network that is not driving does not move the robot.**
@@ -8351,7 +8439,7 @@ mod tests {
             false,
         );
         s.startup_bus_failures.store(4, Ordering::Relaxed);
-        s.startup_missing.store(Arc::new(vec![32, 33, 34]));
+        s.bus_missing.store(Arc::new(vec![32, 33, 34]));
 
         let health = s.health();
         assert!(
@@ -8366,7 +8454,7 @@ mod tests {
         );
         assert!(!reason.contains("servo power"), "{reason}");
 
-        s.startup_missing.store(Arc::new(vec![13]));
+        s.bus_missing.store(Arc::new(vec![13]));
         let reason = s.health().reason.unwrap();
         assert!(
             reason.starts_with("servo 13 right_knee not answering"),
@@ -8387,7 +8475,7 @@ mod tests {
             false,
         );
         s.startup_bus_failures.store(4, Ordering::Relaxed);
-        s.startup_imu_missing.store(true, Ordering::Relaxed);
+        s.imu_missing.store(true, Ordering::Relaxed);
 
         let health = s.health();
         assert!(
@@ -9524,6 +9612,63 @@ mod tests {
         assert!(!health.degraded, "this must still roll back");
     }
 
+    /// A run of failed reads on a running loop, with servos the ping round found silent, is the
+    /// robot it would be on its next boot: degraded, naming them. It was unhealthy — the verdict
+    /// that blames the release — for no reason but having been unplugged after `robotd` started.
+    #[test]
+    fn servos_unplugged_on_a_running_loop_are_degraded_not_unhealthy() {
+        let s = state();
+        s.ticks.store(1, Ordering::Relaxed);
+        s.consecutive_errors
+            .store(s.max_consecutive_errors, Ordering::Relaxed);
+        s.bus_missing.store(Arc::new(vec![32, 33]));
+
+        let health = s.health();
+        assert!(health.degraded, "a cable must not roll a release back");
+        assert_eq!(health.bus.missing, vec![32, 33]);
+        let reason = health.reason.unwrap();
+        assert!(
+            reason.starts_with("servos 32 head_yaw, 33 head_roll not answering on the motor bus"),
+            "{reason}"
+        );
+        assert!(reason.contains("consecutive failed reads"), "{reason}");
+        assert!(reason.contains("are they plugged in?"), "{reason}");
+    }
+
+    /// Every servo silent mid-run is servo power gone, which is degraded at boot too.
+    #[test]
+    fn servo_power_lost_on_a_running_loop_is_degraded() {
+        let s = state();
+        s.ticks.store(1, Ordering::Relaxed);
+        s.consecutive_errors
+            .store(s.max_consecutive_errors, Ordering::Relaxed);
+        s.bus_missing.store(Arc::new(proto::JOINT_IDS.to_vec()));
+
+        let health = s.health();
+        assert!(health.degraded);
+        let reason = health.reason.unwrap();
+        assert!(
+            reason.starts_with("no robot on the motor bus after"),
+            "{reason}"
+        );
+    }
+
+    /// And the IMU board, when it is the one that went quiet.
+    #[test]
+    fn an_imu_board_unplugged_on_a_running_loop_is_degraded() {
+        let s = state();
+        s.ticks.store(1, Ordering::Relaxed);
+        s.consecutive_errors
+            .store(s.max_consecutive_errors, Ordering::Relaxed);
+        s.imu_missing.store(true, Ordering::Relaxed);
+
+        let health = s.health();
+        assert!(health.degraded);
+        assert!(health.imu.expect("always attached").missing);
+        let reason = health.reason.unwrap();
+        assert!(reason.starts_with("the IMU board (id 200)"), "{reason}");
+    }
+
     /// Before any read is attempted there is nothing to blame, so the plain starting-up
     /// message is still the honest one.
     #[test]
@@ -9609,6 +9754,9 @@ mod tests {
             }
             fn slow_sensors(&mut self) -> duck_control::io::Result<duck_control::SlowSensors> {
                 self.0.slow_sensors()
+            }
+            fn census(&mut self) -> duck_control::io::Result<Option<duck_control::Census>> {
+                self.0.census()
             }
         }
         control_loop(
@@ -10012,6 +10160,9 @@ mod tests {
         fn imu_ready(&self) -> bool {
             self.inner.imu_ready()
         }
+        fn census(&mut self) -> duck_control::io::Result<Option<duck_control::Census>> {
+            self.inner.census()
+        }
     }
 
     async fn until(what: impl Fn() -> bool, deadline: Duration, or: &str) {
@@ -10120,6 +10271,80 @@ mod tests {
                 "attempt {attempt}: robot.mode says {mode:?} and the walk slot is {walk}"
             );
         }
+
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+    }
+
+    /// The loop itself asks the bus, on a run of failed reads, and health reads what it learned:
+    /// degraded naming the servo while it is out, and the names gone once a read succeeds.
+    #[tokio::test]
+    async fn a_running_loop_names_the_servo_that_went_quiet() {
+        let down = Arc::new(AtomicBool::new(false));
+        let mut inner = FakeIo::at(DEFAULT_POSITION);
+        inner.census = Some(duck_control::Census {
+            missing: vec![13],
+            imu_answers: true,
+        });
+        let io = Flaky {
+            inner,
+            down: Arc::clone(&down),
+        };
+        let s = Arc::new(state());
+        let intents = Arc::new(Intents::new());
+        let handle = tokio::spawn({
+            let s = Arc::clone(&s);
+            let intents = Arc::clone(&intents);
+            async move {
+                let mut io = io;
+                control_loop_probe_with(&mut io, s, intents, Duration::from_millis(2)).await;
+            }
+        });
+        until(
+            || s.ticks.load(Ordering::Relaxed) >= 5,
+            Duration::from_secs(2),
+            "no ticks",
+        )
+        .await;
+        assert!(
+            s.bus_missing.load().is_empty(),
+            "a working bus is not pinged"
+        );
+
+        down.store(true, Ordering::Relaxed);
+        until(
+            || s.consecutive_errors.load(Ordering::Relaxed) >= s.max_consecutive_errors,
+            Duration::from_secs(2),
+            "the reads never failed",
+        )
+        .await;
+        // What the loop published, not the whole verdict: a host without ONNX Runtime has a
+        // policy error, which outranks the bus — the verdict tests above cover the mapping.
+        until(
+            || s.bus_missing.load().as_slice() == [13],
+            Duration::from_secs(2),
+            "the loop never pinged the bus",
+        )
+        .await;
+        let reason = s
+            .silent_hardware("after a run")
+            .expect("a silent servo is named");
+        assert!(
+            reason.starts_with("servo 13 right_knee not answering"),
+            "{reason}"
+        );
+
+        down.store(false, Ordering::Relaxed);
+        until(
+            || s.consecutive_errors.load(Ordering::Relaxed) == 0,
+            Duration::from_secs(2),
+            "the bus never came back",
+        )
+        .await;
+        assert!(
+            s.bus_missing.load().is_empty(),
+            "a good read clears the census"
+        );
 
         s.shutdown.store(true, Ordering::Relaxed);
         handle.await.unwrap();

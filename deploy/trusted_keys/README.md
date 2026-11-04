@@ -21,11 +21,12 @@ by hand. Shipping the spares now is free; retrofitting them is impossible. See
 what has to be public for anyone to verify what we sign. The private halves live in
 `~/.duck-keys` and a password manager, and only `release-1`'s is in CI.
 
-**`team.dev.pub` is deliberately not in this directory.** A robot that trusts the dev key
-installs anything anyone on the team builds. It belongs only in a developer board's
-`trusted_keys_dir`, alongside `allow_dev_keys = true` in that board's local
-`updater.toml` — never here, which is what every robot gets. It is committed at
-[`../dev-key/`](../dev-key/), which nothing installs by default.
+**`team.dev.pub` is deliberately not in this directory.** Every file here is trusted as a
+release key on every robot, and a robot that trusts the dev key that way installs anything anyone
+on the team builds. `updaterd` carries the dev key built in instead, usable only on a robot made
+a dev board with `sudo robotctl configure --allow-dev-daemon on`
+([`updater-design.md`](../../docs/design/updater-design.md) §5.4). It is committed at
+[`../dev-key/`](../dev-key/).
 
 ## Adding a rotation key
 

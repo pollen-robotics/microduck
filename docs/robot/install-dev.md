@@ -8,9 +8,8 @@ assumes a dev board, never a customer robot.
 
 Nothing is relaxed for a dev build: same signature and hash verification, same health gate, same
 auto-rollback. The only difference is which key signed it, and that is what keeps these builds
-off customer robots — they refuse a dev key twice over. `allow_dev_keys = false`, and a trusted
-key only counts as a dev key if its filename ends `.dev.pub`. Both halves of the setup below
-exist to flip exactly that.
+off customer robots — every `updaterd` carries the dev key, and uses it only on a robot that has
+been made a dev board ([below](#making-an-existing-board-take-dev-builds)).
 
 ## Flash the board
 
@@ -191,33 +190,31 @@ Three things stop it working, and it says which:
 
 ## Making an existing board take dev builds
 
-For a board provisioned some other way, or one set up before you had the key. Both halves are
-needed: either alone leaves a board that still refuses branch builds.
-
-The easy way is to re-run the installer with the key, which validates it and flips the flag in
-one step:
+For a board flashed with an image, provisioned some other way, or set up with `--no-dev-key`. On
+the board:
 
 ```bash
-sudo DUCK_TOKEN="$DUCK_TOKEN" DUCK_DEV_KEY=/tmp/team.dev.pub sh /tmp/install.sh
+sudo robotctl configure --allow-dev-daemon on
 ```
 
-It installs the key as `team.dev.pub` whatever the source file was called. That name matters: the
-`.dev.` infix is what classifies a key as a dev key, and a key landing under any other name is
-trusted as a **release** key.
-
-By hand, if you would rather see each step:
+That is the whole step. `updaterd` carries the team dev key built in, so there is no key to copy,
+and this switch — kept under `/var/lib/robot`, so an OS update does not undo it — tells it to use
+that key. It restarts `updaterd`. Then:
 
 ```bash
-sudo cp team.dev.pub /etc/robot/trusted_keys/team.dev.pub
+sudo robotctl update apply --ref main daemon
 ```
 
-```bash
-sudo sed -i 's/^allow_dev_keys.*/allow_dev_keys        = true/' /etc/robot/updater.toml
-```
+Swap `main` for any branch to get what CI last built for it. From here on, don't run
+`robotctl update apply daemon` without `--ref` or `--version`: it installs the latest stable
+release, which on a dev board is usually a downgrade.
 
-```bash
-sudo systemctl restart updaterd
-```
+`sudo robotctl configure --allow-dev-daemon off` makes it a robot that only takes releases again.
+The same switch is the first row of the `sudo robotctl configure` editor, `allow_dev_daemon` under
+`[dev board]`: SPACE toggles it, and saving offers the `updaterd` restart.
+
+The switch needs an `updaterd` that knows about it — a release from after it was added. On a board
+running an older one, `sudo robotctl update apply daemon` first, then the switch.
 
 ## The token, by hand
 
