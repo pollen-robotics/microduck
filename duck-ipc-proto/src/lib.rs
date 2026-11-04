@@ -500,7 +500,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
 /// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
 /// shapes: an older reader prints the read failures and does not see the names.
-pub const API_VERSION: u32 = 48;
+///
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+pub const API_VERSION: u32 = 49;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3777,6 +3784,11 @@ pub enum Outcome {
     },
     /// Refused before anything changed.
     Aborted {
+        reason: String,
+    },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
         reason: String,
     },
 }

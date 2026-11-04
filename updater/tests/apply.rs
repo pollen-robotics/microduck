@@ -1779,6 +1779,7 @@ async fn log_records_success_rollback_and_refusal() {
             Outcome::Success => "success",
             Outcome::RolledBack { .. } => "rolled_back",
             Outcome::Aborted { .. } => "aborted",
+            Outcome::Stuck { .. } => "stuck",
         })
         .collect();
 
@@ -3328,7 +3329,7 @@ async fn an_exhausted_trial_stays_live_when_auto_rollback_is_off() {
     assert!(
         log.iter().any(|e| matches!(
             &e.outcome,
-            Outcome::Aborted { reason } if reason.contains("auto-rollback is off")
+            Outcome::Stuck { reason } if reason.contains("auto-rollback is off")
         )),
         "{log:?}"
     );

@@ -715,7 +715,7 @@ code stays, tested and one setting away.
 With it off, the gate still runs and still decides. A release that fails stays live, and the
 outcome is `Stuck` with a reason that names the command that reverts it
 (`robotctl update rollback <component>`). The trial is cleared, so the boot counter does not ask
-again. The update log records it as aborted, not rolled back, so `known_bad` does not blacklist a
+again. The update log records it as `Stuck`, not rolled back, so `known_bad` does not blacklist a
 release nobody reverted. `updaterd` reads the key through `Config::robotd_config`, both layers,
 on every decision. Missing, unreadable or not a bool reads as off.
 

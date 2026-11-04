@@ -2878,8 +2878,8 @@ fn journal_outcome(
         ),
         Ok(ApplyResult::Stuck { version, reason }) => (
             Some(version.clone()),
-            Outcome::Aborted {
-                reason: format!("stuck on {version}: {reason}"),
+            Outcome::Stuck {
+                reason: reason.clone(),
             },
         ),
         Ok(ApplyResult::AlreadyCurrent { .. } | ApplyResult::DryRunPassed { .. }) => return None,
