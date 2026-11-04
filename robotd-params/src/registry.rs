@@ -116,6 +116,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    entry(
+        "bus.impact_guard",
+        Kind::Bool,
+        "Impact guard on V3 servos; off = factory firmware with Current Limit only",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

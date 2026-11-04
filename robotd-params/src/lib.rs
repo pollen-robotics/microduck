@@ -2517,6 +2517,12 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// The impact guard on servos running ROBOTIS's impact guard firmware (V3): a servo that
+    /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
+    /// broken gear teeth. Off writes settings that never fire, which leaves the factory firmware
+    /// with only Current Limit: the comparison a test on robots needs. Written to every V3 servo
+    /// at startup with torque off; servos on any other firmware have no guard to set.
+    pub impact_guard: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2614,6 +2620,7 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            impact_guard: true,
         }
     }
 }
@@ -4533,6 +4540,7 @@ mod tests {
 
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
+        assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);

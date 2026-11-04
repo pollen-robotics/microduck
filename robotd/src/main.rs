@@ -1621,6 +1621,10 @@ fn open_bus(
     if !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
     }
+    io.set_impact_guard(bus.impact_guard);
+    if !bus.impact_guard && loud {
+        tracing::warn!("bus.impact_guard is off; V3 servos run as the factory firmware");
+    }
     if !adopt_missing_servo(&mut io, loud, missing, adopted) {
         return None;
     }

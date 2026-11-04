@@ -46,6 +46,15 @@ port = "/dev/ttyS2"
 # this line. Needs a robotd restart.
 # fast_sync_read = true
 
+# The impact guard on servos running ROBOTIS's impact guard firmware (V3, firmware_version 3):
+# a servo that hits something brakes 50 ms, then holds at 0.5 A until its goal comes back,
+# and its PWM limit falls from 100 % at rest to 50 % at 9 rad/s — what keeps the gear teeth
+# whole. OFF writes settings that never fire, which leaves the factory firmware with only
+# Current Limit (1000 mA either way). robotd writes them to every V3 servo when it starts with
+# torque off; a robot standing at the restart gets them at the next start. Needs a robotd
+# restart.
+# impact_guard = true
+
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
 # /etc/robot/robotd.toml once and never overwrites it, so an uncommented value is frozen on

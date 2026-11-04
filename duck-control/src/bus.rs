@@ -26,8 +26,9 @@ use rustypot::servo::dynamixel::xl330::Xl330Controller;
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID,
-    JOINT_IDS, JOINT_NAMES, NUM_JOINTS, homing_offset,
+    BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID,
+    IMPACT_GUARD_FIRMWARE, IMU_DXL_ID, JOINT_IDS, JOINT_NAMES, NUM_JOINTS, homing_offset,
+    impact_guard_blocks,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -126,6 +127,8 @@ pub struct DynamixelIo {
     /// built without this would silently drop back to a plain sync read for the rest of the
     /// process — a motor swap quietly halving the tick's bus budget.
     fast_sync_read: bool,
+    /// `bus.impact_guard`: which of [`impact_guard_blocks`] the register check asserts.
+    impact_guard: bool,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
@@ -148,9 +151,16 @@ impl DynamixelIo {
             port: port.to_owned(),
             ids,
             fast_sync_read,
+            impact_guard: true,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
+    }
+
+    /// `bus.impact_guard` from `robotd.toml`: the guard as ROBOTIS ships it, or off — the factory
+    /// firmware with only Current Limit. Applied by [`Self::check_registers`], so call it before.
+    pub fn set_impact_guard(&mut self, on: bool) {
+        self.impact_guard = on;
     }
 
     /// The body IMU's sensor→trunk mount, which is the robot's ([`SflpDecoder::DEFAULT_MOUNT`]
@@ -250,21 +260,7 @@ impl DynamixelIo {
                 got: 0,
             })?;
         if got != CURRENT_LIMIT_MA {
-            // The first start on this value is usually an update restarting `robotd` under a
-            // standing robot, and a servo refuses an EEPROM write with torque on. Cutting torque
-            // would drop the robot, and failing the check would hold the loop off the bus: the
-            // write waits for the next start with the servos limp instead.
-            let torque = *self
-                .controller
-                .read_torque_enable(id)
-                .map_err(|e| IoError::Bus(format!("read torque_enable on {id}: {e}")))?
-                .first()
-                .ok_or(IoError::ShortRead {
-                    what: "register read",
-                    expected: 1,
-                    got: 0,
-                })?;
-            if torque {
+            if self.torque_on(id)? {
                 tracing::warn!(
                     id,
                     register = "current_limit",
@@ -293,7 +289,64 @@ impl DynamixelIo {
                 fixed += 1;
             }
         }
+
+        // The guard's settings exist only on its firmware: elsewhere these addresses are unused.
+        let firmware = *self
+            .controller
+            .read_firmware_version(id)
+            .map_err(|e| IoError::Bus(format!("read firmware_version on {id}: {e}")))?
+            .first()
+            .ok_or(IoError::ShortRead {
+                what: "register read",
+                expected: 1,
+                got: 0,
+            })?;
+        if firmware == IMPACT_GUARD_FIRMWARE {
+            for (addr, want) in impact_guard_blocks(self.impact_guard) {
+                let got = self
+                    .controller
+                    .read_raw_data(id, addr, want.len() as u8)
+                    .map_err(|e| IoError::Bus(format!("read impact guard {addr} on {id}: {e}")))?;
+                if got == want {
+                    continue;
+                }
+                if self.torque_on(id)? {
+                    tracing::warn!(
+                        id,
+                        addr,
+                        ?got,
+                        ?want,
+                        "impact guard: torque is on; setting it at the next start"
+                    );
+                    continue;
+                }
+                tracing::warn!(id, addr, ?got, ?want, "setting the impact guard");
+                self.controller
+                    .write_raw_data(id, addr, want.to_vec())
+                    .map_err(|e| IoError::Bus(format!("write impact guard {addr} on {id}: {e}")))?;
+                std::thread::sleep(EEPROM_SETTLE);
+                fixed += 1;
+            }
+        }
         Ok(fixed)
+    }
+
+    /// Whether `id` has torque on, which makes it refuse an EEPROM write.
+    ///
+    /// The first start on a new EEPROM value is usually an update restarting `robotd` under a
+    /// standing robot. Cutting torque would drop the robot, and failing the check would hold the
+    /// loop off the bus: such a write waits for the next start with the servos limp instead.
+    fn torque_on(&mut self, id: u8) -> Result<bool> {
+        self.controller
+            .read_torque_enable(id)
+            .map_err(|e| IoError::Bus(format!("read torque_enable on {id}: {e}")))?
+            .first()
+            .copied()
+            .ok_or(IoError::ShortRead {
+                what: "register read",
+                expected: 1,
+                got: 0,
+            })
     }
 
     /// The expected servo IDs that do not answer a ping, in [`JOINT_IDS`] order.
