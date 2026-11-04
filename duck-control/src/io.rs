@@ -202,6 +202,35 @@ pub trait RobotIo {
     fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
         Ok(None)
     }
+
+    /// Ping every expected servo and the IMU board: which of them are on the bus at all.
+    ///
+    /// For a running loop whose reads have started failing. A failed sync read says the bus
+    /// transaction failed, not why, and the two answers lead to different places: a servo that
+    /// no longer answers a ping is a cable or a connector, while everything answering and the
+    /// read still failing is the code that reads. Costs a transaction per device and a timeout
+    /// per silent one, so it is asked about a run of failures, never on a tick.
+    ///
+    /// `None` from a backend with no servos to ping, which is the default.
+    fn census(&mut self) -> Result<Option<Census>> {
+        Ok(None)
+    }
+}
+
+/// Who answered a ping — see [`RobotIo::census`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Expected servo IDs ([`crate::model::JOINT_IDS`]) that did not answer, in that order.
+    pub missing: Vec<u8>,
+    /// Whether the IMU board answered.
+    pub imu_answers: bool,
+}
+
+impl Census {
+    /// Something on the bus is silent.
+    pub fn anything_missing(&self) -> bool {
+        !self.missing.is_empty() || !self.imu_answers
+    }
 }
 
 /// What a servo can say about itself — see [`RobotIo::servo_identity`].
@@ -251,6 +280,11 @@ pub struct FakeIo {
     pub torque_writes: usize,
     /// Every servo id rebooted, in order.
     pub reboots: Vec<u8>,
+    /// What [`RobotIo::census`] reports. `None`, the default, is a backend with nothing to ping.
+    pub census: Option<Census>,
+    /// How many times [`RobotIo::census`] was asked, so a test can tell "asked about a run of
+    /// failures" from "asked every tick".
+    pub censuses: usize,
 }
 
 impl Default for FakeIo {
@@ -280,6 +314,8 @@ impl FakeIo {
             torque: None,
             torque_writes: 0,
             reboots: Vec::new(),
+            census: None,
+            censuses: 0,
         }
     }
 
@@ -383,6 +419,11 @@ impl RobotIo for FakeIo {
 
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         self.slow.ok_or(IoError::Simulated)
+    }
+
+    fn census(&mut self) -> Result<Option<Census>> {
+        self.censuses += 1;
+        Ok(self.census.clone())
     }
 }
 

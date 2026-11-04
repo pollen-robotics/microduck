@@ -2098,6 +2098,13 @@ fn render_health(report: &HealthReport) -> String {
                     format!("servos ok, waiting for the IMU board, {n} attempts")
                 }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
+                (n, _) if !health.bus.missing.is_empty() => format!(
+                    "{n} consecutive read failures, not answering: {}",
+                    health.bus.describe_missing()
+                ),
+                (n, _) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("{n} consecutive read failures, servos ok, the IMU board is silent")
+                }
                 (n, _) => format!("{n} consecutive read failures"),
             };
             let _ = writeln!(out, "  {:<9} {bus}", "bus");

@@ -861,6 +861,15 @@ afternoon, and a throttled clock on a robot that had got warm once — which is 
 of the three, since the release that would fix the heat is the one the gate would refuse to
 keep.
 
+**A run of failed reads could be either, so the loop asks the bus which.** A servo unplugged
+mid-run fails every sync read exactly as a release with a broken read path does, and only the
+second is something a rollback fixes. So once the run reaches `max_consecutive_errors`, and every
+few seconds while it lasts, the loop pings each servo and the IMU board. If any of them is silent,
+the verdict is degraded and names them, which is what the same robot gets on its next boot. If
+every one answers, or the ping itself fails, it stays unhealthy. Without the ping round, the
+verdict for the same hardware depended on whether it was unplugged before or after `robotd`
+started.
+
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
 starts a second round of questions. The loop section carries the very figures the verdict was
