@@ -26,8 +26,8 @@ use rustypot::servo::dynamixel::xl330::Xl330Controller;
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
-    BAUD_RATE, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID, JOINT_IDS,
-    JOINT_NAMES, NUM_JOINTS, homing_offset,
+    BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID, IMU_DXL_ID,
+    JOINT_IDS, JOINT_NAMES, NUM_JOINTS, homing_offset,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -52,6 +52,9 @@ const SLOW_READ_LEN: u8 = 3;
 
 /// `hardware_error_status`, one byte — see [`RobotIo::hardware_errors`].
 const HARDWARE_ERROR_ADDR: u8 = 70;
+
+/// The impact guard's state, one byte — see [`RobotIo::impact_guard`].
+const IMPACT_GUARD_ADDR: u8 = 66;
 
 /// `model_number` (0, `u16`) through `firmware_version` (6, `u8`): seven bytes, once a start.
 const IDENTITY_ADDR: u8 = 0;
@@ -234,6 +237,61 @@ impl DynamixelIo {
                 .map_err(|e| IoError::Bus(format!("write homing_offset on {id}: {e}")))?;
             std::thread::sleep(EEPROM_SETTLE);
             fixed += 1;
+        }
+
+        let got = *self
+            .controller
+            .read_current_limit(id)
+            .map_err(|e| IoError::Bus(format!("read current_limit on {id}: {e}")))?
+            .first()
+            .ok_or(IoError::ShortRead {
+                what: "register read",
+                expected: 1,
+                got: 0,
+            })?;
+        if got != CURRENT_LIMIT_MA {
+            // The first start on this value is usually an update restarting `robotd` under a
+            // standing robot, and a servo refuses an EEPROM write with torque on. Cutting torque
+            // would drop the robot, and failing the check would hold the loop off the bus: the
+            // write waits for the next start with the servos limp instead.
+            let torque = *self
+                .controller
+                .read_torque_enable(id)
+                .map_err(|e| IoError::Bus(format!("read torque_enable on {id}: {e}")))?
+                .first()
+                .ok_or(IoError::ShortRead {
+                    what: "register read",
+                    expected: 1,
+                    got: 0,
+                })?;
+            if torque {
+                tracing::warn!(
+                    id,
+                    register = "current_limit",
+                    got,
+                    want = CURRENT_LIMIT_MA,
+                    "torque is on; correcting at the next start"
+                );
+            } else {
+                tracing::warn!(
+                    id,
+                    register = "current_limit",
+                    got,
+                    want = CURRENT_LIMIT_MA,
+                    "correcting motor register"
+                );
+                self.controller
+                    .write_current_limit(id, CURRENT_LIMIT_MA)
+                    .map_err(|e| IoError::Bus(format!("write current_limit on {id}: {e}")))?;
+                std::thread::sleep(EEPROM_SETTLE);
+                // Position control caps the current at Goal Current, which takes Current Limit
+                // only at boot or on a mode change: without this the new limit waits for the
+                // next power cycle.
+                self.controller
+                    .write_goal_current(id, CURRENT_LIMIT_MA as i16)
+                    .map_err(|e| IoError::Bus(format!("write goal_current on {id}: {e}")))?;
+                fixed += 1;
+            }
         }
         Ok(fixed)
     }
@@ -693,6 +751,31 @@ impl RobotIo for DynamixelIo {
             *slot = block.first().copied().unwrap_or(0);
         }
         Ok(Some(errors))
+    }
+
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        let blocks = self
+            .controller
+            .sync_read_raw_data(&JOINT_IDS, IMPACT_GUARD_ADDR, 1)
+            .map_err(|e| IoError::Bus(format!("impact guard state sync_read: {e}")))?;
+        if blocks.len() != NUM_JOINTS {
+            return Err(IoError::ShortRead {
+                what: "impact guard blocks",
+                expected: NUM_JOINTS,
+                got: blocks.len(),
+            });
+        }
+        // Strict, unlike the alerts: an empty block read as 0 would say "armed" about a servo
+        // that did not answer.
+        let mut states = [0u8; NUM_JOINTS];
+        for (slot, block) in states.iter_mut().zip(&blocks) {
+            *slot = *block.first().ok_or(IoError::ShortRead {
+                what: "impact guard block",
+                expected: 1,
+                got: 0,
+            })?;
+        }
+        Ok(Some(states))
     }
 
     fn census(&mut self) -> Result<Option<crate::io::Census>> {

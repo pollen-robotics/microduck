@@ -128,6 +128,18 @@ pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("shutdown", 52),
 ];
 
+/// `current_limit`, mA, asserted alongside [`EXPECTED_REGISTERS`] and kept apart because it is a
+/// `u16`. The XL330 ships at 1750. 1000 is what a microduck walks the same ONNX with, and what the
+/// gear-breakage bench ran ROBOTIS's impact guard firmware at; that firmware is the one that
+/// enforces it in position control, the factory's only does so in the current-based modes.
+pub const CURRENT_LIMIT_MA: u16 = 1000;
+
+/// `firmware_version` of ROBOTIS's impact guard firmware (V3): a servo that hits something brakes
+/// and then holds softly, which is what keeps the gear teeth whole. Its settings are EEPROM with
+/// the bench's values as factory defaults, so nothing here writes them; register 66 says what the
+/// guard is doing ([`crate::io::RobotIo::impact_guard`]).
+pub const IMPACT_GUARD_FIRMWARE: u8 = 3;
+
 /// `homing_offset` on the knees, in raw position counts (0.088° each, so −45°).
 ///
 /// Every other joint is at 0. The value is `microduck_runtime`'s `setup_motor_rpi.py`, the

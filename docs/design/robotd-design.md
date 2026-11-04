@@ -154,6 +154,8 @@ write()         one sync_write     · goal positions
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
 every 1 s       slow_sensors()     · registers 144–146 · voltage + temperature (§2.1)
+
+while subscribed, after write()   impact_guard() · register 66 · servos on the guard firmware (§2.1)
 ```
 
 Where the data goes, once per period:
@@ -279,7 +281,11 @@ saying so:
   "latches on input-voltage faults" it says the opposite of what it does. Alongside them,
   `homing_offset` is −512 on the knees (13, 23) and 0 everywhere else, the values from the
   runtime's `setup_motor_rpi.py` flashing rig. Every pose and policy assumes the knees carry that
-  offset, and a servo straight from the box does not.
+  offset, and a servo straight from the box does not. And `current_limit = 1000` mA, against the
+  factory's 1750, with Goal Current written alongside because position control caps at Goal
+  Current, which takes Current Limit only at boot. A servo refuses an EEPROM write with torque on,
+  which is how a standing robot is when an update restarts `robotd`, so then the check says so
+  and leaves the write to the next start rather than cutting torque or holding the loop off.
 - **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
   57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
   the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
@@ -301,6 +307,15 @@ eight bytes past its end, with twelve bytes of trajectory registers nothing want
 so they are sampled together once a second in their own transaction (~1 ms) rather than
 widening the tick's read to 22 bytes per servo at 50 Hz. The sampling interval is the same
 window the achieved rate is measured over, so one clock drives both.
+
+**The impact guard's state is a fourth read, and only while someone records.** ROBOTIS's impact
+guard firmware (`firmware_version` 3) brakes a servo that hits something and then holds it softly,
+which is what keeps gear teeth whole; its register 66 says which of armed, braking or holding each
+servo is in. That is a transaction of its own (~1 ms), so it is read only on ticks with a
+`robot.state` subscriber, after the goal positions are written — the read→decide→write path is the
+same with or without it — and only from a robot where at least one servo runs that firmware. The
+firmware is read once a start with the vet book's identity read, and every servo on another one is
+named in the journal and published as `null`.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than

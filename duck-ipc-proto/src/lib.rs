@@ -507,7 +507,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
 /// means nothing changed, and `robotctl update log` printed them as "refused". An older client
 /// cannot parse a log holding one; an older `updaterd` skips the line.
-pub const API_VERSION: u32 = 49;
+///
+/// # v50 — the impact guard
+///
+/// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
+/// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
+/// servos have no guard.
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4308,6 +4314,15 @@ pub struct RobotState {
     /// empty is *not reported*, never zero load. (v36)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub currents_ma: Vec<f64>,
+    /// Each joint's impact guard, indexed as [`JOINT_NAMES`]: 0 armed, 1 braking after an
+    /// impact, 2 holding softly until the goal comes back past the position. `null` for a servo
+    /// whose firmware has no guard — anything but ROBOTIS's V3.
+    ///
+    /// Read after the tick's goal positions are written, and only on ticks with a subscriber, so
+    /// a robot nobody is recording runs the bus it always did. Empty when no servo has the guard,
+    /// or the read failed. (v50)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impact_guard: Vec<Option<u8>>,
     /// Where contact odometry believes the robot is. `default` so a frame from
     /// a `robotd` predating the estimator still parses — zeros, like a robot
     /// that has not moved.
@@ -6850,6 +6865,7 @@ mod tests {
             targets: vec![0.0; 15],
             velocities: Vec::new(),
             currents_ma: Vec::new(),
+            impact_guard: Vec::new(),
             odom: OdomState::default(),
             theremin: None,
             chorale: None,
