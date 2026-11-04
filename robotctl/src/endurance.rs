@@ -123,7 +123,12 @@ fn span(text: &str) -> Result<(f64, f64), String> {
             .map_err(|e| format!("{text:?}: {e}"))
     };
     let (lo, hi) = (parse(lo)?, parse(hi)?);
-    if !(lo > 0.0 && lo <= hi) {
+    // `f64::from_str` accepts `inf` and `NaN`, and `1:inf` still passes the ordering check.
+    // A drawn span reaches `wait`, where `Duration::from_secs_f64` panics on a non-finite or
+    // oversized value; `NaN.max(0.0)` instead makes every activity last zero seconds. Ask the
+    // same constructor what a legal number of seconds is, so a bad flag fails in front of the
+    // operator rather than inside a background unit nobody is watching.
+    if !(lo > 0.0 && lo <= hi) || Duration::try_from_secs_f64(hi).is_err() {
         return Err(format!("{text:?}: want MIN:MAX seconds, 0 < MIN <= MAX"));
     }
     Ok((lo, hi))
@@ -1353,6 +1358,18 @@ mod tests {
         assert!(span("60:20").is_err());
         assert!(span("0:5").is_err());
         assert!(span("a:b").is_err());
+    }
+
+    /// A non-finite or oversized bound parses as an f64, but the drawn span reaches
+    /// `Duration::from_secs_f64` in `wait`: `inf` panics there, while `NaN.max(0.0)` would make
+    /// every activity last zero seconds. The flag is the only place the operator can fix it —
+    /// the background unit would fail hours into a run with nobody attached.
+    #[test]
+    fn spans_refuse_seconds_a_duration_cannot_hold() {
+        for text in ["1:inf", "inf", "inf:inf", "NaN:5", "1:NaN", "1:2e19"] {
+            assert!(span(text).is_err(), "{text:?} must not parse");
+        }
+        assert_eq!(span("20:60"), Ok((20.0, 60.0)));
     }
 
     #[test]
