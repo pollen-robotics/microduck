@@ -444,6 +444,18 @@ impl Config {
             return bad("no components configured; nothing could ever be updated".into());
         }
 
+        // A zero archive budget does not disable the bound, it makes every archive fail it:
+        // the extractor refuses the first entry for exceeding zero entries, or the first byte
+        // for exceeding zero bytes. That reads like a broken release rather than a broken
+        // config, and it is discovered during an update — the one time `validate` exists to
+        // have spoken up earlier. The components' own size limit is already checked below.
+        if self.max_uncompressed_bytes == Some(0) {
+            return bad("max_uncompressed_bytes must be positive".into());
+        }
+        if self.max_archive_entries == Some(0) {
+            return bad("max_archive_entries must be positive".into());
+        }
+
         for (name, component) in &self.components {
             for required in &component.required_files {
                 if required.as_os_str().is_empty()
@@ -1062,6 +1074,33 @@ mod tests {
             ))
             .unwrap_err();
             assert!(matches!(err, crate::Error::Config(_)), "{setting}: {err}");
+        }
+    }
+
+    /// Setting a bound to zero does not switch it off. Without this check the config loads
+    /// happily and the first update is refused for exceeding zero bytes or zero entries, which
+    /// looks like a bad release and is the worst moment to find out the config was wrong.
+    #[test]
+    fn zero_archive_budgets_are_rejected_at_load_time() {
+        for setting in ["max_uncompressed_bytes = 0", "max_archive_entries = 0"] {
+            let err = Config::from_toml(&format!(
+                r#"
+                trusted_keys_dir = "/etc/robot/keys"
+                hw_rev = 1
+                state_dir = "/var/lib/robot/updater"
+                {setting}
+                [component.daemon]
+                install_dir = "/opt/robot/daemon"
+                source = {{ type = "local_dir", path = "/var/tmp/rel" }}
+                on_apply = {{ action = "none" }}
+                "#
+            ))
+            .unwrap_err();
+            assert!(matches!(err, crate::Error::Config(_)), "{setting}: {err}");
+            assert!(
+                err.to_string().contains("must be positive"),
+                "{setting}: {err}"
+            );
         }
     }
 
