@@ -237,8 +237,9 @@ pub struct Controller {
     /// `Sit::Sitting` from the first tick, but the robot is still travelling, and standing it
     /// back up halfway down is one move cut into another.
     sit_settle: f64,
-    /// Stand up by itself once `sit_settle` runs out — [`Self::settle_then_rise`].
-    auto_rise: bool,
+    /// Stand up by itself once `sit_settle` runs out: a seat found at the start
+    /// ([`Self::settle_then_rise`]), or a stand asked for on the way down ([`Self::sit_toggle`]).
+    rise_when_seated: bool,
     /// The network the last [`Self::step`] ran. `None` before the first.
     last_net: Option<Net>,
 }
@@ -255,7 +256,7 @@ impl Controller {
             active: None,
             sit: Sit::Up,
             sit_settle: 0.0,
-            auto_rise: false,
+            rise_when_seated: false,
             last_net: None,
         }
     }
@@ -299,7 +300,7 @@ impl Controller {
         self.active = from.active;
         self.sit = from.sit;
         self.sit_settle = from.sit_settle;
-        self.auto_rise = from.auto_rise;
+        self.rise_when_seated = from.rise_when_seated;
         self.last_net = from.last_net;
     }
 
@@ -325,7 +326,7 @@ impl Controller {
         self.ground_pick = None;
         self.active = None;
         self.sit_settle = 0.0;
-        self.auto_rise = false;
+        self.rise_when_seated = false;
         if matches!(self.sit, Sit::Rising { .. }) {
             self.sit = Sit::Up;
         }
@@ -341,7 +342,7 @@ impl Controller {
         self.active = None;
         self.sit = Sit::Up;
         self.sit_settle = 0.0;
-        self.auto_rise = false;
+        self.rise_when_seated = false;
     }
 
     /// Why a new move cannot start now, or `None` when it can.
@@ -443,8 +444,15 @@ impl Controller {
         Ok(true)
     }
 
-    /// Sit if standing, stand if sitting. Refused while any other move runs, mid-rise as the
-    /// prototype refuses it, and on the way down into the seat.
+    /// Sit if standing, stand if sitting. Refused while any other move runs, and mid-rise as the
+    /// prototype refuses it.
+    ///
+    /// **A stand asked for on the way down into the seat is kept, not refused.** Standing up
+    /// halfway down is one move cut into another, so the robot finishes sitting and then rises
+    /// by itself. Refusing it instead lost it: `robot.do` has answered "accepted" by the time
+    /// the control loop gets the toggle, so the refusal reached the journal and nobody else, and
+    /// a client saw a duck that stayed seated with no way to tell when to ask again. Asking twice
+    /// is asking once — a client that retries does not sit the duck straight back down.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
         if self.ground_pick.is_some() {
             return Err("a ground pick is running");
@@ -461,7 +469,10 @@ impl Controller {
                 self.sit_settle = self.skills.sitstand_ramp_s;
                 Ok("sit")
             }
-            Sit::Sitting if self.sit_settle > 0.0 => Err("still sitting down"),
+            Sit::Sitting if self.sit_settle > 0.0 => {
+                self.rise_when_seated = true;
+                Ok("stand, once seated")
+            }
             Sit::Sitting => {
                 self.sit = Sit::Rising {
                     remaining: self.skills.sitstand_rise_s,
@@ -480,8 +491,7 @@ impl Controller {
     }
 
     /// The robot was found sitting as torque came on: it is held where it is, and this is the seat
-    /// it is in. Already settled — it did not just sit down, so standing up is not refused as
-    /// "still sitting down".
+    /// it is in. Already settled — it did not just sit down, so standing up starts at once.
     pub fn enter_seat(&mut self) {
         self.sit = Sit::Sitting;
         self.sit_settle = 0.0;
@@ -494,7 +504,7 @@ impl Controller {
             self.sit = Sit::Up;
         }
         self.sit_settle = 0.0;
-        self.auto_rise = false;
+        self.rise_when_seated = false;
     }
 
     /// The robot was found sitting as the policy took over: settle into the seat with the
@@ -506,7 +516,7 @@ impl Controller {
     pub fn settle_then_rise(&mut self) {
         self.sit = Sit::Sitting;
         self.sit_settle = self.skills.sitstand_ramp_s;
-        self.auto_rise = true;
+        self.rise_when_seated = true;
     }
 
     /// Start the feedback state from a pose the robot is holding rather than from zero.
@@ -582,8 +592,8 @@ impl Controller {
         {
             self.sit = Sit::Up;
         }
-        if self.auto_rise && self.sit == Sit::Sitting && self.sit_settle <= 0.0 {
-            self.auto_rise = false;
+        if self.rise_when_seated && self.sit == Sit::Sitting && self.sit_settle <= 0.0 {
+            self.rise_when_seated = false;
             self.sit = Sit::Rising {
                 remaining: self.skills.sitstand_rise_s,
             };
@@ -920,16 +930,24 @@ mod tests {
         assert_eq!(c.start_ground_pick(), Ok(()), "standing again, it may");
     }
 
-    /// The glide down into the seat is a move too: standing up halfway down is refused.
+    /// The glide down into the seat is a move too: a stand asked for halfway down waits for the
+    /// seat, then happens by itself — once, however many times it was asked.
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
-    fn sitting_down_cannot_be_cut_short() {
+    fn a_stand_asked_for_on_the_way_down_waits_for_the_seat() {
         let mut c = full_controller();
         assert_eq!(c.sit_toggle(), Ok("sit"));
         tick(&mut c, 1.0);
-        assert!(c.sit_toggle().is_err());
+        assert_eq!(c.sit_toggle(), Ok("stand, once seated"));
+        assert_eq!(c.sit_toggle(), Ok("stand, once seated"), "a retry");
+        assert!(c.is_sitting() && !c.busy(), "still on the way down");
         tick(&mut c, 1.1);
-        assert_eq!(c.sit_toggle(), Ok("stand"));
+        assert!(!c.is_sitting() && c.busy(), "seated, and rising by itself");
+        tick(&mut c, 1.1);
+        assert!(
+            !c.is_sitting() && !c.busy(),
+            "standing, and not sat back down"
+        );
     }
 
     /// **One move at a time.** No kick inside a pick, no pick inside a kick, no sit inside
@@ -956,7 +974,7 @@ mod tests {
     }
 
     /// A seat found at torque-on is already settled: it refuses moves like any seat, and stands
-    /// up at once rather than as "still sitting down".
+    /// up at once.
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
     fn a_seat_found_at_torque_on_is_settled() {
@@ -976,7 +994,11 @@ mod tests {
         c.settle_then_rise();
         tick(&mut c, 1.0);
         assert!(c.is_sitting(), "still settling");
-        assert!(c.sit_toggle().is_err(), "no toggling mid-settle");
+        assert_eq!(
+            c.sit_toggle(),
+            Ok("stand, once seated"),
+            "a stand asked for meanwhile is the rise already coming"
+        );
         tick(&mut c, 1.1);
         assert!(!c.is_sitting() && c.busy(), "rising by itself");
         tick(&mut c, 1.1);
