@@ -31,11 +31,6 @@ RESEND = 0.15
 # A tick per call is a request per tick, and the rendezvous allows about 20 a second per token.
 MAX_FPS = 10.0
 
-# How long a sit takes to settle, `DEFAULT_SITSTAND_RAMP_S` in `robotd-params` (2 s, and a policy
-# set may say a little more), with a margin. A duck turned on in its seat settles for that long
-# and then stands by itself, and a toggle sent while a sit is settling is accepted and ignored.
-SEAT_SETTLE = 3.0
-
 
 class Duck:
     """A connected duck, found by name on the account the token belongs to.
@@ -184,45 +179,32 @@ class Duck:
     def stand(self, timeout: float = 10.0) -> None:
         """On its feet with the policy driving, from off, from its seat, or both.
 
-        `enable(True)` first, which is all a duck that was off needs: the robot checks how it is
-        sitting and stands itself up, out of a seat too. A duck that was already on and sitting,
-        as one does when its pad goes away, stays in its seat through any number of enables,
-        because what ends a sit is `sit_toggle`. That is sent only while `robot.policies` says the
-        duck is sitting (toggling on a guess sits a standing duck down) and has homed, and only
-        after `SEAT_SETTLE`, so a duck standing itself up gets to finish first.
+        A duck that was off stands itself up when `enable(True)` hands it to its policy: the
+        robot checks how it is sitting first, and rises out of a seat by itself. One that was
+        already on and sitting, as a duck is when its pad goes away, stays in its seat through
+        any number of enables, because what ends that sit is `sit_toggle`.
 
-        The robot accepts a toggle and then ignores it while a sit is still settling, so one is
-        sent again every `SEAT_SETTLE` until the duck is up, and a refusal is tried again the same
-        way. Raises `RpcError` if it is still sitting after `timeout`, with the last refusal if
-        there was one.
+        So the toggle goes before the enable, and only while `robot.policies` says the duck is
+        sitting (toggling on a guess sits a standing duck down). A duck the policy drives takes
+        it, even on its way down into the seat: it rises once seated (API v49). Any other duck
+        refuses it, and the enable stands that one. The toggle is never sent twice, and never
+        after the enable, where it could beat the robot's own check of the seat.
+
+        Raises `RpcError` if the duck is still sitting after `timeout`.
         """
+        deadline = time.monotonic() + timeout
+        refused = ""
+        if self.call("robot.policies").get("sitting"):
+            try:
+                self.do("sit_toggle")
+            except RpcError as e:
+                refused = f"; sit_toggle: {e.message}"
         self.enable(True)
-        now = time.monotonic()
-        deadline = now + timeout
-        next_toggle = now + SEAT_SETTLE
-        refused: RpcError | None = None
-        while True:
-            policies = self.call("robot.policies")
-            if "sitting" not in policies:
-                logger.warning(
-                    "this robot does not say whether it is sitting (robotd before 0.14), so only "
-                    "enable(True) was sent; do('sit_toggle') stands a seated one"
+        while self.call("robot.policies").get("sitting"):
+            if time.monotonic() >= deadline:
+                raise RpcError(
+                    "robot.do", {"message": f"still sitting after {timeout:g} s{refused}"}
                 )
-                return
-            if not policies["sitting"]:
-                return
-            now = time.monotonic()
-            if now >= deadline:
-                raise refused or RpcError(
-                    "robot.do", {"message": f"still sitting after {timeout:g} s"}
-                )
-            # `homed` false refuses every skill, and clears by itself.
-            if now >= next_toggle and policies.get("homed") is not False:
-                next_toggle = now + SEAT_SETTLE
-                try:
-                    self.do("sit_toggle")
-                except RpcError as e:
-                    refused = e
             time.sleep(0.25)
 
     def frame(self, timeout: float | None = 15.0) -> Any:
