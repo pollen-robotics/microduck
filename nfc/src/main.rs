@@ -7,7 +7,9 @@
 //! whose NDEF says [`ndef::PAIRING`]: if a pad is already connected nothing happens, otherwise
 //! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
-//! are in [`nfc::pairing`].
+//! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
+//! asks `robotd` to switch to it; which names there are, and which do nothing yet, is
+//! [`nfc::modes`].
 //!
 //! ## Why its own daemon
 //!
@@ -31,6 +33,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
+use nfc::modes::{self, Driver, ModeTag};
 use nfc::pairing::{self, Outcome, Robot, Touches};
 use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
@@ -222,7 +225,7 @@ fn open(device: &Path) -> nfc::Result<Chip> {
 }
 
 /// Poll until the reader stops answering, acting on every touch. Returns why it stopped.
-fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
+fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
     let mut touches = Touches::default();
     loop {
         let start = Instant::now();
@@ -256,7 +259,15 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
-                    tracing::warn!(tag = %id, ?records, "not a pairing tag")
+                    match ModeTag::in_records(&records) {
+                        Some(mode) => {
+                            tracing::warn!(tag = %id, mode = mode.text(), "mode tag touched");
+                            report_mode(mode, modes::on_touch(robot, mode));
+                        }
+                        None => {
+                            tracing::warn!(tag = %id, ?records, "neither a pairing nor a mode tag")
+                        }
+                    }
                 }
                 Ok(Ok(_)) => {
                     // Off while the pairing blocks: no reason to power the antenna for the
@@ -293,6 +304,18 @@ fn report(outcome: Outcome) {
             "not paired — is the pad in pairing mode? Lift the tag and touch again to retry"
         ),
         Outcome::Failed(why) => tracing::error!(%why, "could not ask the robot"),
+    }
+}
+
+fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
+    let tag = tag.text();
+    match outcome {
+        modes::Outcome::Switched(mode) => tracing::warn!(tag, mode, "mode switched"),
+        modes::Outcome::Refused(mode, why) => {
+            tracing::warn!(tag, mode, %why, "the robot refused the mode")
+        }
+        modes::Outcome::NotYet => tracing::warn!(tag, "this mode does nothing yet"),
+        modes::Outcome::Failed(why) => tracing::error!(tag, %why, "could not ask the robot"),
     }
 }
 
@@ -333,6 +356,21 @@ impl Robot for Sockets {
         } else {
             Err(outcome.reason.unwrap_or_else(|| "refused".into()))
         }
+    }
+}
+
+impl Driver for Sockets {
+    fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
+        Robot::sound(self, tag)
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<proto::IntentResult, String> {
+        let params = proto::SetModeParams { mode: mode.into() };
+        call(
+            &self.robot,
+            &proto::Call::RobotSetMode(params),
+            QUICK_ANSWER,
+        )
     }
 }
 

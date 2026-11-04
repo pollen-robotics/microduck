@@ -12,6 +12,7 @@
 //! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
 
 pub mod clrc663;
+pub mod modes;
 pub mod ndef;
 pub mod pairing;
 pub mod reader;
