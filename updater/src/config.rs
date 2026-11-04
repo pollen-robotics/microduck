@@ -72,6 +72,12 @@ pub struct Config {
     #[serde(default = "default_robot_socket")]
     pub robot_socket: PathBuf,
 
+    /// The `robotd.toml` whose `[update_gate] auto_rollback` decides whether a failed release is
+    /// reverted unasked ([`Self::auto_rollback`]). The board's by default; a test or a simulated
+    /// duck points it elsewhere.
+    #[serde(default = "default_robotd_config")]
+    pub robotd_config: PathBuf,
+
     /// Accept artifacts signed with a key marked dev-only. Off in production.
     ///
     /// Not the usual way to make a dev board any more: that is
@@ -362,11 +368,24 @@ fn default_robot_socket() -> PathBuf {
     PathBuf::from("/run/robotd.sock")
 }
 
+fn default_robotd_config() -> PathBuf {
+    PathBuf::from(robotd_params::DEFAULT_PATH)
+}
+
 fn default_policy_library() -> PathBuf {
     PathBuf::from(crate::policy::LIBRARY_ROOT)
 }
 
 impl Config {
+    /// Whether a release that fails — its gate, or its trial across boots — is reverted without
+    /// anyone asking. `[update_gate] auto_rollback` in [`Self::robotd_config`], off by default.
+    ///
+    /// Read at the moment of deciding rather than once at startup, so `robotctl configure`
+    /// applies without restarting `updaterd`. See `docs/design/updater-design.md` §8.
+    pub fn auto_rollback(&self) -> bool {
+        robotd_params::UpdateGate::auto_rollback_enabled(&self.robotd_config)
+    }
+
     /// Whether dev-only keys count on this robot: `allow_dev_keys` in this file, or
     /// [`duck_ipc_proto::DEV_BUILDS_MARKER`] in `state_dir` — which is what
     /// `robotctl configure --allow-dev-daemon on` writes. Read at startup, like the rest.

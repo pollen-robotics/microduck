@@ -118,6 +118,13 @@ hz = 50
 # below that a release whose updaterd cannot start passes. Clamped to 20–300.
 # boot_deadline_s = 60
 
+# Whether a failed release is reverted without anyone asking: the health gate after
+# `update apply` / `select` / `rollback`, the boot counter on an unconfirmed update, and the
+# boot check falling back to golden. Off, a release that fails stays live, reported stuck,
+# and `robotctl update rollback daemon` reverts it by hand. Read by updaterd when it would
+# revert, and by robot-boot-check once per boot — not by robotd.
+# auto_rollback = false
+
 [policy]
 # Whether to load a policy at all.
 #
