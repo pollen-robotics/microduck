@@ -30,7 +30,9 @@
 //! ```text
 //! A (South)       sit ↔ stand
 //! B (East)        ground pick
-//! X / Y, LB / RB  nothing, until a skill is bound there
+//! LB / RB        yes / no (emotions)
+//! Y (North)       excited (emotion)
+//! X (West)        nothing, until a skill is bound there
 //! RT / LT         mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! D-pad up        head mode — the sticks pose the head, the body holds still
 //! D-pad right     head + move — left stick walks and turns, right stick looks around

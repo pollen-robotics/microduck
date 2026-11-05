@@ -328,9 +328,9 @@ robotctl pad bindings
 a           sit_toggle
 b           ground_pick
 x             (nothing)
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 
 `robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
 ```
@@ -342,9 +342,9 @@ sudo robotctl pad bind x polite-bow
 a           sit_toggle
 b           ground_pick
 x           polite-bow
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 ```
 
 That writes one line, and only the button you named:
@@ -367,8 +367,9 @@ silently doing nothing when you press it.
 
 Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
-`pad reset <button>` puts one back. X and Y ship empty, so they are the place for a new skill; X
-re-sends while held, which is what a chaining skill like the roulade wants.
+`pad reset <button>` puts one back. Three ship with emotions (see *Emotions*): LB yes, RB no, Y
+excited. X ships empty, so it is the place for a new skill; it re-sends while held, which is what a
+chaining skill like the roulade wants.
 
 The rest of the pad is not bindable: Start stands the robot up and toggles the policy, the D-pad
 picks what the sticks mean, and held Select cuts torque and powers the robot off — the button that stops a robot is the one worth not
@@ -680,7 +681,9 @@ the thumb:
 | --- | --- |
 | **A** / cross | sit ↔ stand |
 | **B** / circle | ground pick |
-| **X**, **Y**, **LB / RB** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `lb kick_left`) |
+| **LB / RB** | the yes / no emotions |
+| **Y** | the excited emotion |
+| **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
