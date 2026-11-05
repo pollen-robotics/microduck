@@ -613,7 +613,7 @@ The tuning is the feature, and it is asymmetric: a false positive is a fall the 
 *caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
 deliberately on the late side.
 
-**Testing it needs a fall the policy is driving through**, which is what `robot.trip` (API v48)
+**Testing it needs a fall the policy is driving through**, which is what `robot.trip` (API v50)
 is for. Cutting the policy — the pad's Start mid-stride — does make a walking robot fall, but it
 makes `driving` false, which is the one condition the detector cannot fire without, and when the
 policy comes back the robot is already past the arming gate. Such a fall always lands stiff.
@@ -871,6 +871,15 @@ updated at all until someone works out why. Motor temperature would do the same 
 afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
 of the three, since the release that would fix the heat is the one the gate would refuse to
 keep.
+
+**A run of failed reads could be either, so the loop asks the bus which.** A servo unplugged
+mid-run fails every sync read exactly as a release with a broken read path does, and only the
+second is something a rollback fixes. So once the run reaches `max_consecutive_errors`, and every
+few seconds while it lasts, the loop pings each servo and the IMU board. If any of them is silent,
+the verdict is degraded and names them, which is what the same robot gets on its next boot. If
+every one answers, or the ping itself fails, it stays unhealthy. Without the ping round, the
+verdict for the same hardware depended on whether it was unplugged before or after `robotd`
+started.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just

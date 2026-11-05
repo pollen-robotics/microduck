@@ -154,6 +154,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Seconds after boot by which the boot check decides (20–300)",
     ),
+    entry(
+        "update_gate.auto_rollback",
+        Kind::Bool,
+        "Revert a release that fails its gate or its boot, unasked — default off",
+    ),
     // ── [policy] ─────────────────────────────────────────────────────────────
     feature(
         "policy.enabled",

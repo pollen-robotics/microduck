@@ -55,6 +55,66 @@ pub fn set(config: &Path, on: bool) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The switch as a row in `robotctl configure`'s editor: what the robot is now, and what the
+/// operator has toggled it to and not yet saved.
+///
+/// Its own thing rather than a key in the editor's model, because that model is `robotd.toml`'s
+/// and this is not in that file. It saves with the rest and adds `updaterd` to the restart offer.
+#[derive(Debug)]
+pub struct Switch {
+    config: PathBuf,
+    /// Whether this robot is a dev board right now.
+    pub on: bool,
+    /// What it has been toggled to, when that differs from [`Self::on`].
+    pub pending: Option<bool>,
+}
+
+impl Switch {
+    /// The name the editor shows.
+    pub const NAME: &'static str = "allow_dev_daemon";
+
+    /// The editor's one line of doc.
+    pub const DOC: &'static str = "accept branch builds (update apply --ref <branch>) signed with \
+         the team dev key · restarts updaterd · default off";
+
+    /// The switch for the `updater.toml` at `config`, or `None` where there is no `updaterd` to
+    /// configure — a laptop, a simulated duck — so the editor shows no row rather than an error.
+    pub fn load(config: &Path) -> Option<Self> {
+        let marker = marker_path(config).ok()?;
+        Some(Self {
+            config: config.to_path_buf(),
+            on: marker.exists(),
+            pending: None,
+        })
+    }
+
+    /// The value the row shows: the toggled one, else the robot's.
+    pub fn shown(&self) -> bool {
+        self.pending.unwrap_or(self.on)
+    }
+
+    pub fn toggle(&mut self) {
+        let next = !self.shown();
+        self.pending = (next != self.on).then_some(next);
+    }
+
+    /// Back to the default, which is off.
+    pub fn revert(&mut self) {
+        self.pending = self.on.then_some(false);
+    }
+
+    /// Write the toggled value, if there is one. Returns whether anything was written.
+    pub fn save(&mut self) -> Result<bool, String> {
+        let Some(on) = self.pending else {
+            return Ok(false);
+        };
+        let changed = set(&self.config, on)?;
+        self.on = on;
+        self.pending = None;
+        Ok(changed)
+    }
+}
+
 /// The command: set the marker, restart `updaterd` if it changed, say what to do next.
 pub fn run(config: &Path, on: bool) -> Result<(), String> {
     let changed = set(config, on)?;
@@ -115,6 +175,36 @@ mod tests {
             !set(&config, false).unwrap(),
             "a second `off` changes nothing"
         );
+    }
+
+    #[test]
+    fn the_editor_row_toggles_saves_and_reverts() {
+        let (_dir, config) = board();
+        let marker = marker_path(&config).unwrap();
+
+        let mut switch = Switch::load(&config).unwrap();
+        assert!(!switch.shown());
+        switch.toggle();
+        assert_eq!(switch.pending, Some(true));
+        switch.toggle();
+        assert_eq!(switch.pending, None, "toggled back is not a change");
+        switch.toggle();
+        assert!(switch.save().unwrap());
+        assert!(marker.exists());
+        assert!(switch.on && switch.pending.is_none());
+
+        switch.revert();
+        assert_eq!(switch.pending, Some(false));
+        assert!(switch.save().unwrap());
+        assert!(!marker.exists());
+        switch.revert();
+        assert_eq!(switch.pending, None, "already at the default");
+        assert!(!switch.save().unwrap());
+    }
+
+    #[test]
+    fn no_updater_config_means_no_row() {
+        assert!(Switch::load(Path::new("/nonexistent/updater.toml")).is_none());
     }
 
     #[test]

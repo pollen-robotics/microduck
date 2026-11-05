@@ -251,6 +251,9 @@ enum Namespace {
     /// this build does not know survive untouched, and nothing is written that robotd's own
     /// validation would reject. The config is read once at robotd's startup, so saving offers
     /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    ///
+    /// One row is not robotd's: `allow_dev_daemon`, at the top, makes this robot a dev board
+    /// (the same as `--allow-dev-daemon`).
     Configure {
         /// The file to edit. The default is where a provisioned robot keeps it.
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
@@ -276,7 +279,8 @@ enum Namespace {
         #[arg(long, value_name = "on|off", value_parser = parse_on_off, conflicts_with = "list")]
         allow_dev_daemon: Option<bool>,
 
-        /// `updaterd`'s config, for where it keeps its state. Only read by `--allow-dev-daemon`.
+        /// `updaterd`'s config, for where it keeps its state: read by `--allow-dev-daemon` and by
+        /// the editor's dev-board row, which is absent when this file is.
         #[arg(long, default_value = dev_daemon::UPDATER_CONFIG)]
         updater_config: PathBuf,
     },
@@ -2129,6 +2133,13 @@ fn render_health(report: &HealthReport) -> String {
                     format!("servos ok, waiting for the IMU board, {n} attempts")
                 }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
+                (n, _) if !health.bus.missing.is_empty() => format!(
+                    "{n} consecutive read failures, not answering: {}",
+                    health.bus.describe_missing()
+                ),
+                (n, _) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("{n} consecutive read failures, servos ok, the IMU board is silent")
+                }
                 (n, _) => format!("{n} consecutive read failures"),
             };
             let _ = writeln!(out, "  {:<9} {bus}", "bus");
@@ -2526,6 +2537,7 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::Success => format!("{target}: applied"),
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
+        proto::Outcome::Stuck { reason } => format!("{target}: STUCK — {reason}"),
     }
 }
 
@@ -5485,7 +5497,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
             } else if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &updater_config)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
@@ -7521,6 +7533,12 @@ mod tests {
         }));
         assert!(rolled.contains("ROLLED BACK"), "{rolled}");
         assert!(rolled.contains("not healthy within 30s"), "{rolled}");
+        // Left live after a failed gate: something changed, so not "refused".
+        let stuck = describe_attempt(&entry(proto::Outcome::Stuck {
+            reason: "not healthy within 30s; auto-rollback is off".into(),
+        }));
+        assert!(stuck.contains("STUCK"), "{stuck}");
+        assert!(!stuck.contains("refused"), "{stuck}");
 
         // A first install has no `from`, and must not render as "None → 1.0.0".
         let first = proto::LogEntry {

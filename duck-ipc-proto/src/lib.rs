@@ -492,13 +492,29 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
 /// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
 ///
-/// # v48 — a trip, on purpose
+/// # v48 — hardware that goes quiet on a running robot
+///
+/// [`BusHealth::missing`] and [`ImuHealth::missing`] are no longer only about the bus coming up.
+/// During a run of failed reads `robotd` pings every servo and the IMU board and fills them the
+/// same way, and `robot.health` reports **degraded** naming what went silent — the verdict the
+/// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
+/// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
+/// shapes: an older reader prints the read failures and does not see the names.
+///
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+///
+/// # v50 — a trip, on purpose
 ///
 /// [`method::ROBOT_TRIP`]: the leg targets held where they are for a few hundred milliseconds
 /// while the policy keeps running — a foot caught mid-stride — so a walking robot falls the way a
 /// real one does, recovery attempt, limp-fall and all ([`TripParams`]). For `robotctl stress` and
 /// for tuning it by hand. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
-pub const API_VERSION: u32 = 48;
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3840,6 +3856,11 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
+        reason: String,
+    },
 }
 
 /// One line of an update's transcript.
@@ -4084,10 +4105,11 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
-    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
-    /// round, in that table's order. Empty once the bus is up, before the first round, and when
-    /// the port itself would not open. All fifteen is servo power off; some of them is servos
-    /// unplugged, and naming them is the point.
+    /// The expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping round, in that
+    /// table's order. Rounds run while `robotd` waits for the bus, and on a running loop during a
+    /// run of failed reads (non-zero `consecutive_errors`). Empty on a working bus, before the
+    /// first round, and when the port would not open or the ping itself failed. All fifteen is
+    /// servo power off; some of them is servos unplugged, and naming them is the point.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<u8>,
 }
@@ -4147,10 +4169,10 @@ pub struct ImuHealth {
     /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
     /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
     pub consecutive_stale_blocks: u64,
-    /// While the bus is coming up: every servo answered its ping and the IMU board did not.
-    /// `robotd` waits rather than run without orientation, so this is also why it is not
-    /// ticking. Cleared once the bus is up; never set at runtime, where a board that stops
-    /// answering shows as consecutive bus read failures instead.
+    /// Every servo answered its ping and the IMU board did not — the same rounds as
+    /// [`BusHealth::missing`]. While the bus is coming up `robotd` waits rather than run without
+    /// orientation, so this is also why it is not ticking; on a running loop it is why the reads
+    /// are failing. Cleared once a read succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }

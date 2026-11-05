@@ -2638,6 +2638,15 @@ pub struct UpdateGate {
     /// refused here: every daemon reading this file exits on a value [`Params::load`] refuses,
     /// and a robotd that will not start is exactly what the check rolls a release back for.
     pub boot_deadline_s: u32,
+    /// Whether anything may put this robot back on another release without being asked: the
+    /// health gate reverting a failed `update apply` / `select` / `rollback`, the boot counter
+    /// reverting an unconfirmed trial, and `robot-boot-check` handing over to `robot-rescue`.
+    ///
+    /// Off by default. A release that fails is left live and reported `Stuck`, and the operator
+    /// reverts by hand (`robotctl update rollback`). Not robotd's: `updaterd` reads it at the
+    /// moment it would revert ([`UpdateGate::auto_rollback_enabled`]), and the boot check reads
+    /// it once per boot.
+    pub auto_rollback: bool,
 }
 
 /// The bounds `robot-boot-check` clamps `[update_gate] boot_deadline_s` to. The script repeats
@@ -2678,7 +2687,31 @@ impl Default for UpdateGate {
             stall_periods: 25,
             max_consecutive_errors: 10,
             boot_deadline_s: 60,
+            auto_rollback: false,
         }
+    }
+}
+
+impl UpdateGate {
+    /// Whether `[update_gate] auto_rollback` is on in `robotd.toml` at `path`, read on its own.
+    ///
+    /// For `updaterd`, at the moment it would revert, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a
+    /// file that is invalid somewhere else still answers. Both layers, the user's winning.
+    /// Missing, unreadable or not a bool is `false` — the default, and the answer that leaves the
+    /// release alone.
+    pub fn auto_rollback_enabled(path: &Path) -> bool {
+        let Ok(text) = layered_text(path) else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("update_gate")
+            .and_then(|gate| gate.get("auto_rollback"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -4900,5 +4933,33 @@ mod tests {
         assert!(!read("not toml ["));
         std::fs::remove_file(&path).expect("remove");
         assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// `updaterd` asks this before every revert, so it must answer from a file `robotd` would
+    /// reject, let the user layer win, and fall to "no" — leave the release alone — otherwise.
+    #[test]
+    fn auto_rollback_reads_one_key_layered_and_defaults_to_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            UpdateGate::auto_rollback_enabled(&path)
+        };
+        assert!(read("[update_gate]\nauto_rollback = true\n"));
+        assert!(
+            read("[update_gate]\nauto_rollback = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[update_gate]\nauto_rollback = false\n"));
+        assert!(!read("[update_gate]\n# auto_rollback = true\n"));
+        assert!(!read("[update_gate]\nauto_rollback = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!UpdateGate::auto_rollback_enabled(&path));
+        assert!(
+            !Params::default().update_gate.auto_rollback,
+            "off unless asked for"
+        );
     }
 }

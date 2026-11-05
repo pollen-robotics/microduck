@@ -407,7 +407,8 @@ points elsewhere.
 - **A file that has gone missing by the next boot costs its slot, not the robot.** The slot falls
   back to this robot's own policy, `robotctl health` reports *degraded* and names the file, and
   `policy reset <slot>` clears it. An official policy that will not load is still **unhealthy** —
-  that is a broken release, and the updater rolls it back.
+  that is a broken release, and the update reports it stuck (or rolls it back, with
+  `auto_rollback` on).
 
 `none` switches a slot off — every slot except `walk`, which is what the others fall back to and
 cannot be empty. Some policies need that: one that does its own standing wants the standing
@@ -1302,6 +1303,13 @@ sudo robotctl update reset-to-golden daemon
 `select` activates an installed release, `rollback` goes to the previously installed one, and
 `reset-to-golden` goes to the never-pruned known-good one.
 
+A release that fails its health gate stays live and is reported stuck; `rollback` is how you go
+back. To have the robot revert on its own instead:
+
+```
+sudo robotctl configure      # update_gate → auto_rollback
+```
+
 And refusing to move at all:
 
 ```
@@ -1377,7 +1385,7 @@ sudo robot-rescue --force --reboot
 
 **`rollback` needs a predecessor, but an update creates one.** A freshly provisioned board has
 exactly one release, so `rollback` right then has nothing older to go to and says so. Auto-rollback
-is *not* affected: applying a release unpacks it alongside the current one and only then moves
+(when `auto_rollback` is on) is *not* affected: applying a release unpacks it alongside the current one and only then moves
 `current`, so by the time the health gate runs there are two, and the release you came from is the
 target. `rollback_target` picks the highest installed version below `current` that the journal has
 not already recorded as bad — so a board with one release is fully protected from the moment it
