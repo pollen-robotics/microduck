@@ -655,7 +655,9 @@ side effects:
   a recovery update. A request made over WebRTC by the only peer connected is
   not refused for its own presence: `mediad` sets `interrupt_sessions` on it
   before forwarding (`mediad/src/session.rs`, `Seat`). The rendezvous control
-  lane is not a peer — it carries no media — so it is not counted.
+  lane carries no media, so it is counted as its client's peer only while the
+  same remote session also holds the bridged video. A browser still
+  negotiating counts from the moment `webrtcsink` adds it, until it gives up.
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.

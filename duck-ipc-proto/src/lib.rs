@@ -5838,7 +5838,7 @@ pub const CAMERA_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_
 ///
 /// The one answer to "is someone on a call with this robot?". `updaterd`'s preflight asks it
 /// before an update that would drop the call, and `mediad` asks it to tell a session that is
-/// alone from one with company (`updater-design.md` §11).
+/// alone from one with company (`updater-design.md` §7.2).
 ///
 /// `None` — `mediad` stopped, no camera, a file older than [`CAMERA_STATS_MAX_AGE`] — is for the
 /// caller to read, and the updater reads it as nobody: its check is a courtesy and must never be

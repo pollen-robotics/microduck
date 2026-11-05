@@ -723,7 +723,7 @@ fn main() -> ExitCode {
                 // handed over a consumer, so by definition there is media behind it.
                 Some(media.clone()),
                 // And one of the consumers `webrtcsink` counts, which is what makes it a peer.
-                mediad::session::Seat::PEER,
+                mediad::session::Seat::peer(),
             ));
         }
 
