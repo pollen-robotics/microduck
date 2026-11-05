@@ -67,6 +67,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+      - name: Test simulator body arguments
+        run: python3 scripts/tests/duck_sim_body_args.py
+
       # These are the pieces of this repo that run without being compiled — four on a robot,
       # and `provision-board.sh` and `dev-push.sh` on a developer's machine — so nothing else
       # would catch a typo in one until someone tried to provision a board. shellcheck is on the
