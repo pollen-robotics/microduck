@@ -248,8 +248,12 @@ fn permits(call: &proto::Call) -> bool {
         // and a new root filesystem (§4: no authorisation on this transport). It was not: the
         // image's own page on port 8090 takes `POST /api/apply` and `/api/switch` from the same
         // LAN, unauthenticated. Routing them here sends them through `updaterd` instead, with
-        // its engine lock and its preflight — the robot is not moving, the clock is set — which
-        // the page skips. A bridged peer has signed in to the rendezvous as the robot's owner.
+        // its engine lock and its preflight — the robot is not moving, and for an apply the clock
+        // is set — which the page skips. A bridged peer has signed in to the rendezvous as the
+        // robot's owner.
+        //
+        // That preflight also refuses while a remote session is active, and this session is one.
+        // It passes only because nothing reports one yet; `remote-webrtc.md` §8 owns the fix.
         OsApply(_) | OsSwitch(_) => true,
         // The dashboard's switch for anonymous usage data. With no authorisation here (§4) any
         // LAN peer can flip it, which is acceptable for a choice that sends nothing personal,

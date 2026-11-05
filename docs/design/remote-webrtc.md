@@ -459,7 +459,9 @@ Two things have to change for the mutations, and both are small and specific:
 
 Worth writing down now precisely because nothing sets the flag yet. The moment `mediad` reports
 honestly, an update requested over WebRTC would refuse itself, and that would look like a bug in
-the update path rather than a missing distinction here.
+the update path rather than a missing distinction here. `os.apply` and `os.switch` are already
+permitted over WebRTC and run the same check, so they would be the first to refuse themselves:
+the distinction has to cover them too.
 
 ## 9. Authority: the premise this feature breaks, noted and not acted on
 
