@@ -185,6 +185,25 @@ Same run directory shape as `endurance` (`meta.json`, `samples.csv`, `events.csv
 - the plot script can overlay several run directories (several robots) lap by lap: get-up time
   and battery against lap number.
 
+The data is expensive, so a run has to survive what happens to the robot:
+
+- **Where.** `/var/lib/robot/stress/`, on the data partition. `/var/lib` is on the root filesystem,
+  which is one per A/B slot: on 2026-11-04 a fallback from B to A hid a morning of runs on the slot
+  no longer booted.
+- **When.** Nothing starts until a time server has set the clock. The board has no battery-backed
+  clock and boots on the last time it saved; a boot with no wifi stayed there, and its runs took
+  yesterday's name and wall times, wrong by an amount nothing recorded. Waiting is simpler and
+  surer than correcting afterwards, and the cost is that a robot with no network does not test.
+- **Whole files.** `meta.json` is replaced atomically (written in place, it was left at 0 bytes). A
+  reopened run cuts a half-written row off each CSV before appending, and logs `repaired`; an
+  unreadable `meta.json` is set aside, not overwritten.
+- **What it ran on.** Each segment records `revision`, `release`, `slot`, `os`, `policies` (SHA-256
+  by file), `config` (the whole `robotd.toml`) and `note`. Every build of a release says the same
+  version, which is how mixed builds went unnoticed.
+- **Why it did what it did.** At each start, every earlier boot with a run here and no saved log
+  gets `journal/<boot id>.txt` in that run, before the journal rotates it away.
+- **Checking.** `robotctl stress verify` and the plot script make the same checks.
+
 ## Running it
 
 `sudo robotctl stress` (background), `robotctl stress status`, `sudo robotctl stress stop`;
@@ -195,7 +214,7 @@ than balancing on. Running out of battery ends it as `endurance` does. Documente
 **At boot**, with `[stress] on_boot = true` (`robotctl configure`; off by default): for a bench
 robot left to repeat the test, each charge-and-boot is the next run. `robotctl-stress-boot.timer`
 fires 10 s into every boot — time to set the robot down — and runs `robotctl stress boot`, which
-reads the key, waits up to 120 s for robotd to be publishing state (not just its socket: robotd
+reads the key, waits for the clock, waits up to 120 s for robotd to be publishing state (not just its socket: robotd
 answers before it publishes, and a run started then dies `fatal`) and starts the default run exactly as
 `sudo robotctl stress` would. The oneshot has no `[Install]` section, like `robot-boot-check`'s, so
 neither an install nor an update ever starts a run; changing the key starts or stops nothing until

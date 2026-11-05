@@ -149,7 +149,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         // `robotctl stress boot` reads it once per boot, from its timer. Nothing running now
         // reads it, so there is nothing to restart — and a running stress test is started and
         // stopped by `robotctl stress`, not by this key.
-        "stress" if name == "on_boot" => Apply::NextBoot("robotctl-stress-boot"),
+        "stress" if matches!(name, "on_boot" | "note") => Apply::NextBoot("robotctl-stress-boot"),
         // A running stress test re-reads the trip at every fall — the next fall is the change.
         "stress" => Apply::Live(STRESS_READER),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
@@ -1366,6 +1366,13 @@ mod tests {
             plan_for_written(&["stress.trip_ms".to_string(), "stress.trip_legs".to_string()]);
         assert_eq!(plan.live, vec![STRESS_READER]);
         assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// A note is read when a run starts, so a running test would not take it at a fall.
+    #[test]
+    fn the_stress_note_applies_at_the_next_boot() {
+        let plan = plan_for_written(&["stress.note".to_string()]);
+        assert!(plan.live.is_empty(), "{plan:?}");
     }
 
     /// Either half of the pad source restarted alone leaves the other on the old answer.

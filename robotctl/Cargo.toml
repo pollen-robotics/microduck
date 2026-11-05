@@ -22,6 +22,7 @@ clap = { version = "4.6.4", features = ["derive"] }
 # no runtime, and nothing on the recovery path depends on it.
 clap_complete = "4.6.4"
 serde_json.workspace = true
+sha2 = "0.11.0"
 serde.workspace = true
 libc = "0.2.189"
 # Pure geometry (the ToF reprojection the monitor overlays) — deliberately NOT the `tof`

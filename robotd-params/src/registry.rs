@@ -642,6 +642,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::TRIP_LEGS_LABELS),
         "Which legs a stress fall holds — both, or one foot caught",
     ),
+    entry(
+        "stress.note",
+        Kind::Text,
+        "Kept with every stress run: what the logs cannot know, like \"left hip part replaced\"",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same

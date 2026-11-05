@@ -29,8 +29,8 @@ pub(crate) const FRAME_MAX_AGE: Duration = Duration::from_secs(1);
 pub(crate) struct Unit {
     /// The transient unit the background run lives in. One at a time: two drivers would fight.
     pub(crate) name: &'static str,
-    /// Where runs go unless `--out` says otherwise. Under `/var/lib` because it survives the
-    /// reboot that ends every run; `/var/log` is a tmpfs on the Yocto image.
+    /// Where runs go unless `--out` says otherwise. It has to survive the reboot that ends every
+    /// run, and `/var/log` is a tmpfs on the Yocto image.
     pub(crate) runs_dir: &'static str,
     /// The `robotctl` subcommand, for the hints printed to a person.
     pub(crate) command: &'static str,
@@ -259,10 +259,13 @@ impl DurableCsv {
     /// build that logs more (or fewer) columns stays one aligned table: what the old header has
     /// no column for is dropped.
     pub(crate) fn open(path: &Path, fields: Vec<String>) -> std::io::Result<Self> {
-        let existing = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| s.lines().next().map(str::to_owned))
-            .filter(|h| !h.is_empty());
+        // The first line alone: damage further down must not read as a file with no header, and
+        // get a second one written into the middle of the table.
+        let mut existing = String::new();
+        if let Ok(file) = File::open(path) {
+            let _ = std::io::BufReader::new(file).read_line(&mut existing);
+        }
+        let existing = Some(existing.trim_end().to_owned()).filter(|h| !h.is_empty());
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         // Column names are never quoted, so a plain split reads the header back.
         let fields = match existing {
@@ -290,8 +293,11 @@ impl DurableCsv {
             .collect();
         // A failed write is reported on the journal and the run goes on: losing one row is
         // better than losing the rest.
-        if let Err(e) =
-            writeln!(self.file, "{}", line.join(",")).and_then(|()| self.file.sync_data())
+        let row = format!("{}\n", line.join(","));
+        if let Err(e) = self
+            .file
+            .write_all(row.as_bytes())
+            .and_then(|()| self.file.sync_data())
         {
             eprintln!("could not write a row: {e}");
         }
@@ -302,6 +308,252 @@ pub(crate) fn fsync_dir(path: &Path) {
     if let Ok(dir) = File::open(path) {
         let _ = dir.sync_all();
     }
+}
+
+/// Replace `path` in one step: a power cut leaves the old file or the new one, never an empty
+/// one. Written in place, `meta.json` was left at 0 bytes on real runs.
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let mut file = File::create(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fsync_dir(parent);
+    }
+    Ok(())
+}
+
+/// Cut a CSV back to its last whole row, returning how many bytes went. A power cut in the middle
+/// of a write leaves half a row with no newline, and the next start would append to it, gluing
+/// two rows into one that fits neither.
+pub(crate) fn repair_tail(path: &Path) -> std::io::Result<u64> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let keep = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let cut = bytes.len() - keep;
+    if cut > 0 {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(keep as u64)?;
+        file.sync_all()?;
+    }
+    Ok(cut as u64)
+}
+
+// ── a clock worth naming a run by ───────────────────────────────────────────────────────────
+
+/// How often the wait for the clock says it is still waiting.
+const CLOCK_REPORT: Duration = Duration::from_secs(30);
+
+/// `timedatectl`'s answer, as `timedatectl show -p NTPSynchronized --value` prints it.
+fn says_synchronized(output: &str) -> bool {
+    output.trim() == "yes"
+}
+
+fn clock_synchronized() -> bool {
+    std::process::Command::new("timedatectl")
+        .args(["show", "-p", "NTPSynchronized", "--value"])
+        .output()
+        .is_ok_and(|o| o.status.success() && says_synchronized(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// Hold until a time server has set the clock, however long that takes.
+///
+/// The board has no battery-backed clock: it boots on the last time it saved, and stays there for
+/// as long as it has no network. Runs started like that were named after the day before, with
+/// every wall time wrong by an amount nothing recorded. Nothing is created until this returns.
+pub(crate) fn wait_for_clock() {
+    let t0 = Instant::now();
+    let mut next_report = Duration::ZERO;
+    while !clock_synchronized() {
+        if t0.elapsed() >= next_report {
+            println!(
+                "waiting for the network time before starting ({} s so far): no run until the \
+                 clock is right, so check the wifi",
+                t0.elapsed().as_secs()
+            );
+            next_report += CLOCK_REPORT;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+// ── what a run ran on ───────────────────────────────────────────────────────────────────────
+
+/// Where the release's policies live: what `robotd` logs loading.
+const POLICIES: &str = "/opt/robot/policies/current";
+
+/// `rauc.slot=` on the kernel command line.
+fn boot_slot(cmdline: &str) -> Option<&str> {
+    cmdline
+        .split_whitespace()
+        .find_map(|arg| arg.strip_prefix("rauc.slot="))
+}
+
+/// `VERSION=` in os-release, unquoted.
+fn os_version(os_release: &str) -> Option<&str> {
+    os_release
+        .lines()
+        .find_map(|line| line.strip_prefix("VERSION="))
+        .map(|v| v.trim_matches('"'))
+}
+
+/// Each policy's SHA-256, by file name, in name order.
+fn policy_hashes(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "onnx"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|path| {
+            let digest = Sha256::digest(std::fs::read(path).ok()?);
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            Some((path.file_name()?.to_string_lossy().into_owned(), hex.into()))
+        })
+        .collect()
+}
+
+/// Exactly what this segment ran on. Every build of a release says `0.18.4`, which could not tell
+/// two different stress tests apart; the revision and the release can.
+fn provenance() -> serde_json::Value {
+    let build = proto::build_info!();
+    let cmdline = read_text(Path::new("/proc/cmdline")).unwrap_or_default();
+    let os_release = read_text(Path::new("/etc/os-release")).unwrap_or_default();
+    serde_json::json!({
+        "revision": build.revision,
+        "built_at": build.built_at,
+        "release": std::env::current_exe()
+            .ok()
+            .and_then(|exe| proto::release_from_path(&exe.to_string_lossy()))
+            .map(|version| version.to_string()),
+        "slot": boot_slot(&cmdline),
+        "os": os_version(&os_release),
+        "policies": policy_hashes(Path::new(POLICIES)),
+    })
+}
+
+// ── the journal of the boots before this one ────────────────────────────────────────────────
+
+/// The units whose logs explain a run: what happened to the robot, why the run did what it did,
+/// and whether the boot itself was well.
+const JOURNAL_UNITS: &[&str] = &[
+    "robotd",
+    "NetworkManager",
+    "systemd-timesyncd",
+    "microduck-slot-health",
+    "rauc-mark-good",
+];
+
+/// The boot ids in `journalctl --list-boots`, whatever else its columns say.
+fn listed_boots(list: &str) -> Vec<String> {
+    list.lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter(|id| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Which run directory under `parent` each boot wrote to, by journal-style boot id. A boot with
+/// two runs answers the later one.
+fn runs_by_boot(parent: &Path) -> std::collections::HashMap<String, PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort();
+    let mut runs = std::collections::HashMap::new();
+    for dir in dirs {
+        let Some(meta) = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        else {
+            continue;
+        };
+        for segment in meta["segments"].as_array().into_iter().flatten() {
+            if let Some(id) = segment["boot_id"].as_str() {
+                runs.insert(id.trim().replace('-', ""), dir.clone());
+            }
+        }
+    }
+    runs
+}
+
+fn save_journal(boot: &str, units: &[&str], to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to.parent().unwrap_or(Path::new(".")))?;
+    let mut tmp = to.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let file = File::create(&tmp)?;
+    let mut journal = std::process::Command::new("journalctl");
+    journal.args(["-b", boot, "--no-pager", "-o", "short-iso"]);
+    for unit in units {
+        journal.args(["-u", unit]);
+    }
+    // To the file, not through memory: a boot's log can be tens of megabytes on a 1 GB board.
+    let status = journal.stdout(file.try_clone()?).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("journalctl: {status}")));
+    }
+    file.sync_all()?;
+    std::fs::rename(&tmp, to)?;
+    if let Some(parent) = to.parent() {
+        fsync_dir(parent);
+    }
+    Ok(())
+}
+
+/// Keep the log of every earlier boot that has a run under `out`'s parent, in that run's
+/// `journal/<boot id>.txt`, in the background. Those logs are how a run gets explained, and the
+/// journal rotates them away within days. A boot's log is only whole once the boot is over, so
+/// each is taken from the boot after; one that cannot be read costs an event, never the run.
+pub(crate) fn save_earlier_journals(run: Arc<Run>, out: &Path, unit: &'static str) {
+    let Some(parent) = out.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let current = read_text(Path::new("/proc/sys/kernel/random/boot_id"))
+        .unwrap_or_default()
+        .replace('-', "");
+    std::thread::spawn(move || {
+        let Ok(list) = std::process::Command::new("journalctl")
+            .args(["--list-boots", "--no-pager"])
+            .output()
+        else {
+            return run.event("journal_failed", "could not run journalctl");
+        };
+        let runs = runs_by_boot(&parent);
+        let mut units = JOURNAL_UNITS.to_vec();
+        units.push(unit);
+        for boot in listed_boots(&String::from_utf8_lossy(&list.stdout)) {
+            let Some(dir) = runs.get(&boot).filter(|_| boot != current) else {
+                continue;
+            };
+            let to = dir.join("journal").join(format!("{boot}.txt"));
+            if to.exists() {
+                continue;
+            }
+            match save_journal(&boot, &units, &to) {
+                Ok(()) => run.event("journal_saved", &to.display().to_string()),
+                Err(e) => run.event("journal_failed", &format!("{boot}: {e}")),
+            }
+        }
+    });
 }
 
 /// What the driver and the sampler share.
@@ -805,10 +1057,23 @@ pub(crate) fn open_run(out: &Path, segment: serde_json::Value) -> Result<Arc<Run
     }
 
     let meta_path = out.join("meta.json");
-    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({ "segments": [] }));
+    let mut notes = Vec::new();
+    let mut meta = serde_json::json!({ "segments": [] });
+    if let Ok(bytes) = std::fs::read(&meta_path) {
+        match serde_json::from_slice(&bytes) {
+            Ok(read) => meta = read,
+            // Starting over must not be the end of what it says; set it aside for a person.
+            Err(e) => {
+                let aside = out.join(format!("meta.json.unreadable-{}", unix_secs() as u64));
+                std::fs::rename(&meta_path, &aside)
+                    .map_err(|e| io("setting aside meta.json", e))?;
+                notes.push(format!(
+                    "meta.json unreadable ({e}), moved to {}",
+                    aside.display()
+                ));
+            }
+        }
+    }
     let now = unix_secs();
     let (y, mo, d, h, mi, s) = crate::show::civil(now as i64);
     let mut entry = serde_json::json!({
@@ -818,32 +1083,47 @@ pub(crate) fn open_run(out: &Path, segment: serde_json::Value) -> Result<Arc<Run
         "host": read_text(Path::new("/proc/sys/kernel/hostname")),
         "robotctl": env!("CARGO_PKG_VERSION"),
     });
-    if let (Some(entry), serde_json::Value::Object(extra)) = (entry.as_object_mut(), segment) {
-        entry.extend(extra);
+    for extra in [provenance(), segment] {
+        if let (Some(entry), serde_json::Value::Object(extra)) = (entry.as_object_mut(), extra) {
+            entry.extend(extra);
+        }
     }
     if let Some(segments) = meta["segments"].as_array_mut() {
         segments.push(entry);
     }
-    std::fs::write(
+    write_atomic(
         &meta_path,
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        serde_json::to_string_pretty(&meta)
+            .unwrap_or_default()
+            .as_bytes(),
     )
     .map_err(|e| io("writing meta.json", e))?;
-    fsync_dir(out);
+
+    for name in ["events.csv", "samples.csv"] {
+        match repair_tail(&out.join(name)) {
+            Ok(0) => {}
+            Ok(cut) => notes.push(format!("{name}: cut {cut} bytes of an unfinished row")),
+            Err(e) => return Err(io("repairing a csv", e)),
+        }
+    }
 
     let events = DurableCsv::open(
         &out.join("events.csv"),
         ["wall", "t_s", "kind", "detail"].map(String::from).to_vec(),
     )
     .map_err(|e| io("opening events.csv", e))?;
-    Ok(Arc::new(Run {
+    let run = Arc::new(Run {
         t0: Instant::now(),
         shared: Mutex::new(Shared {
             activity: "starting".into(),
             ..Shared::default()
         }),
         events: Mutex::new(events),
-    }))
+    });
+    for note in notes {
+        run.event("repaired", &note);
+    }
+    Ok(run)
 }
 
 /// Log until a signal, touching nothing — the tail of a run that has stopped driving.
@@ -921,5 +1201,164 @@ mod tests {
             .unwrap()
             .write(&[row("a", "3"), row("new", "x"), row("b", "4")]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n3,4\n");
+    }
+
+    #[test]
+    fn a_torn_row_is_cut_before_the_next_start_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.csv");
+        std::fs::write(&path, "a,b\n1,2\n3,").unwrap();
+        assert_eq!(repair_tail(&path).unwrap(), 2);
+        let row = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        DurableCsv::open(&path, vec!["a".into(), "b".into()])
+            .unwrap()
+            .write(&[row("a", "5"), row("b", "6")]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n5,6\n");
+    }
+
+    #[test]
+    fn a_whole_file_and_a_missing_one_need_no_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.csv");
+        assert_eq!(repair_tail(&path).unwrap(), 0);
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+        assert_eq!(repair_tail(&path).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n1,2\n");
+    }
+
+    #[test]
+    fn a_torn_header_is_rewritten_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.csv");
+        std::fs::write(&path, "a,").unwrap();
+        repair_tail(&path).unwrap();
+        DurableCsv::open(&path, vec!["a".into(), "b".into()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a,b\n");
+    }
+
+    #[test]
+    fn damage_after_the_header_does_not_cost_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samples.csv");
+        let mut bytes = b"a,b\n".to_vec();
+        bytes.extend([0xff, 0xfe, b'\n']);
+        std::fs::write(&path, &bytes).unwrap();
+        DurableCsv::open(&path, vec!["x".into()]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "no second header");
+    }
+
+    #[test]
+    fn an_atomic_write_replaces_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    fn open(out: &Path) -> Arc<Run> {
+        open_run(out, serde_json::json!({ "lap": "x" })).unwrap_or_else(|_| panic!("open_run"))
+    }
+
+    #[test]
+    fn reopening_a_run_adds_a_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run");
+        open(&out);
+        open(&out);
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(out.join("meta.json")).unwrap()).unwrap();
+        let segments = meta["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["lap"], "x");
+        assert!(segments[0].get("policies").is_some(), "{}", segments[0]);
+    }
+
+    #[test]
+    fn an_unreadable_meta_is_set_aside_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("meta.json"), "{ cut off").unwrap();
+        std::fs::write(out.join("events.csv"), "wall,t_s,kind,detail\n1.0,0.0,st").unwrap();
+        open(&out);
+        let kept: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("meta.json.unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(out.join(&kept[0])).unwrap(),
+            "{ cut off"
+        );
+        let events = std::fs::read_to_string(out.join("events.csv")).unwrap();
+        assert!(events.contains("repaired,"), "{events}");
+        assert!(events.contains("meta.json unreadable"), "{events}");
+        assert!(events.contains("events.csv: cut 10 bytes"), "{events}");
+        assert_eq!(events.matches("wall,t_s").count(), 1, "{events}");
+    }
+
+    #[test]
+    fn only_a_yes_from_timedatectl_is_a_synced_clock() {
+        assert!(says_synchronized("yes\n"));
+        assert!(!says_synchronized("no\n"));
+        assert!(!says_synchronized(""));
+    }
+
+    #[test]
+    fn provenance_reads_the_slot_and_the_os() {
+        let cmdline = "root=PARTLABEL=rootfs_a rauc.slot=A rw rootwait";
+        assert_eq!(boot_slot(cmdline), Some("A"));
+        assert_eq!(boot_slot("root=/dev/mmcblk0p2 rw"), None);
+        let release = "ID=microduck\nVERSION=\"1.0.1 (wrynose)\"\nVERSION_ID=1.0.1\n";
+        assert_eq!(os_version(release), Some("1.0.1 (wrynose)"));
+    }
+
+    #[test]
+    fn policies_are_hashed_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("walk.onnx"), b"abc").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"abc").unwrap();
+        let hashes = policy_hashes(dir.path());
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(
+            hashes["walk.onnx"],
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn boots_are_read_from_either_list_format() {
+        let list = "IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY\n \
+                    -1 d788cdfe1f6b4561a8d785fb87c8d1c0 Tue 2026-11-03 11:55:59 UTC Tue\n  \
+                    0 f71ac0d1ac394adc82069b679c737783 Wed 2026-11-04 02:43:12 UTC Wed\n\
+                    -- No entries --\n";
+        assert_eq!(
+            listed_boots(list),
+            [
+                "d788cdfe1f6b4561a8d785fb87c8d1c0",
+                "f71ac0d1ac394adc82069b679c737783"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_boot_finds_the_run_it_wrote_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("run");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(
+            out.join("meta.json"),
+            r#"{"segments":[{"boot_id":"f437bd57-c8e1-4248-aacf-031045e0c4ca"}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("broken")).unwrap();
+        std::fs::write(dir.path().join("broken/meta.json"), "").unwrap();
+        let runs = runs_by_boot(dir.path());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs["f437bd57c8e14248aacf031045e0c4ca"], out);
     }
 }

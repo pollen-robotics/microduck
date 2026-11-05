@@ -25,6 +25,7 @@
 mod getup;
 pub(crate) mod guard;
 mod lap;
+mod verify;
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -44,7 +45,9 @@ use lap::{Action, Schedule, Step};
 
 const UNIT: Unit = Unit {
     name: "robotctl-stress",
-    runs_dir: "/var/lib/stress",
+    // On the data partition: `/var/lib` is on the root filesystem, one per A/B slot, and a run
+    // written there vanishes from view the moment the robot boots the other slot.
+    runs_dir: "/var/lib/robot/stress",
     command: "stress",
     description: "robotctl stress: falls and get-ups until the battery is empty",
     stopped: "the policy is off, the robot holding its home pose",
@@ -84,11 +87,17 @@ pub enum StressCommand {
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
         config: PathBuf,
     },
+    /// Check that runs are whole: every file there and readable, every row with all its columns,
+    /// time running forwards. Exits non-zero if any run has a problem.
+    Verify {
+        /// One run directory, or a directory of them. Default: all of this robot's runs.
+        dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug, Clone, Serialize)]
 pub struct StressArgs {
-    /// Run directory. Default: /var/lib/stress/<hostname>-<UTC time>. An existing one is
+    /// Run directory. Default: /var/lib/robot/stress/<hostname>-<UTC time>. An existing one is
     /// appended to.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -122,6 +131,10 @@ pub struct StressArgs {
     /// The config the trip is read from.
     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
     config: PathBuf,
+    /// What is true of this robot that the logs cannot know: "left hip part replaced". Kept with
+    /// the run. Default: `[stress] note`.
+    #[arg(long)]
+    note: Option<String>,
     /// With --fall cut: how long the policy is cut, s. Longer lets the robot settle and fall
     /// softly.
     #[arg(long, default_value_t = 0.5, help_heading = "Lap")]
@@ -159,9 +172,53 @@ pub fn run(
         Some(StressCommand::Status) => UNIT.status(),
         Some(StressCommand::Stop) => UNIT.stop(),
         Some(StressCommand::Boot { config }) => boot(robot_socket, tof_socket, &config),
+        Some(StressCommand::Verify { dir }) => verify(dir.as_deref()),
         None if args.foreground => foreground(robot_socket, tof_socket, args),
-        None => UNIT.start(robot_socket, args.out.as_deref()),
+        None => {
+            UNIT.need_root("starting a run")?;
+            // Before the name: the run directory is named from the clock.
+            runlog::wait_for_clock();
+            UNIT.start(robot_socket, args.out.as_deref())
+        }
     }
+}
+
+/// `robotctl stress verify`: print each run's state, and fail if any has a problem.
+fn verify(dir: Option<&Path>) -> Result<(), Failure> {
+    let root = dir.unwrap_or(Path::new(UNIT.runs_dir));
+    let mut runs: Vec<PathBuf> = if root.join("samples.csv").exists() {
+        vec![root.to_owned()]
+    } else {
+        std::fs::read_dir(root)
+            .map_err(|e| Failure::new(exit::FAILED, format!("{}: {e}", root.display())))?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    };
+    runs.sort();
+    let mut bad = 0;
+    for run in &runs {
+        let report = verify::check(run);
+        let (samples, events) = (report.samples, report.events);
+        if report.problems.is_empty() {
+            println!("ok   {}: {samples} samples, {events} events", run.display());
+        } else {
+            bad += 1;
+            println!("BAD  {}: {samples} samples, {events} events", run.display());
+            for problem in &report.problems {
+                println!("       {problem}");
+            }
+        }
+    }
+    println!("{} runs, {bad} with problems", runs.len());
+    if bad > 0 {
+        return Err(Failure::new(
+            exit::FAILED,
+            format!("{bad} runs have problems"),
+        ));
+    }
+    Ok(())
 }
 
 // ── at boot ─────────────────────────────────────────────────────────────────────────────────
@@ -193,6 +250,9 @@ fn boot(robot_socket: &Path, tof_socket: &Path, config: &Path) -> Result<(), Fai
         println!("a stress run is already going ({}); leaving it", UNIT.name);
         return Ok(());
     }
+    // First, and with no limit: a boot with no wifi waits for it rather than logging a run nobody
+    // can place in time. robotd's wait below then has its full length, whatever this one took.
+    runlog::wait_for_clock();
     // Not just the socket: robotd answers on it before it publishes any `robot.state`, and a run
     // started in that window spends its first 35 s finding no state and stops `fatal`. That was
     // three boots in seven on the first beta runs.
@@ -1071,12 +1131,24 @@ fn activity(action: Action) -> &'static str {
 
 fn foreground(robot_socket: &Path, tof_socket: &Path, args: StressArgs) -> Result<(), Failure> {
     runlog::need_robotd(robot_socket)?;
+    // Already done by whoever started this unit; this is `--foreground` by hand.
+    runlog::wait_for_clock();
     let out = args.out.clone().unwrap_or_else(|| UNIT.default_out());
+    let file_note = robotd_params::Params::load(&args.config, false)
+        .ok()
+        .map(|params| params.stress.note)
+        .filter(|note| !note.is_empty());
     let run = runlog::open_run(
         &out,
-        serde_json::json!({ "lap": lap::VERSION, "args": &args }),
+        serde_json::json!({
+            "lap": lap::VERSION,
+            "args": &args,
+            "note": args.note.clone().or(file_note),
+            "config": runlog::read_text(&args.config),
+        }),
     )?;
     run.event("start", &format!("logging to {}", out.display()));
+    runlog::save_earlier_journals(run.clone(), &out, UNIT.name);
 
     runlog::install_signal_handlers();
 

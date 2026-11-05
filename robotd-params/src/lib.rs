@@ -1023,6 +1023,8 @@ pub struct StressParams {
     pub trip_ms: u32,
     /// Which legs it holds.
     pub trip_legs: duck_ipc_proto::TripLegs,
+    /// What is true of this robot that the logs cannot know, kept with every run it does.
+    pub note: String,
 }
 
 impl Default for StressParams {
@@ -1032,6 +1034,7 @@ impl Default for StressParams {
             // 250 was caught by the policy too often to count as a fall; 500 goes over.
             trip_ms: 500,
             trip_legs: duck_ipc_proto::TripLegs::Both,
+            note: String::new(),
         }
     }
 }

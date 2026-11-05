@@ -673,11 +673,31 @@ does: the robot holds its home pose.
 for a robot left to repeat the test charge after charge; it takes effect at the next boot, and an
 update never starts a run.
 
-Same background unit, battery hand-off and files as `endurance`, under `/var/lib/stress/` —
+Any start waits for a time server to set the clock, for as long as that takes, and nothing is
+written until then: the board has no battery-backed clock, and a run started without one gets
+another day's name and wall times nothing can correct. A robot that will not start and is doing
+nothing has no wifi; `journalctl -u robotctl-stress-boot` says so every 30 s.
+
+Runs live on the data partition, so a slot switch or an OS update leaves them in place. Each
+segment of `meta.json` records the revision, release, slot, OS, policy hashes and `robotd.toml` it
+ran on, and `[stress] note` (or `--note`) for what the logs cannot know, like a replaced part. Each
+later run saves the journal of the boots before it into their own runs, as
+`journal/<boot id>.txt`.
+
+```
+robotctl stress verify
+```
+
+checks that every run is whole — files there and readable, rows complete, time running forward —
+and exits non-zero if not. A run reopened after a power cut cuts the half-written row off its CSV
+and logs `repaired`.
+
+Same background unit, battery hand-off and files as `endurance`, under `/var/lib/robot/stress/` —
 `samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
 `fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
 `fallen_unprovoked`, `wall_guard`, `square_guard`, `home_moved`, `look_back`, `trip_refused` and `limp` (the
-limp-fall caught it; seconds after the trip). `scripts/endurance-plot.py` draws one run or compares
+limp-fall caught it; seconds after the trip). `scripts/endurance-plot.py` warns about anything
+`verify` would, leaves out rows that are not whole, and draws one run or compares
 several side by side, lap for lap; `--concatenate DIR` charts every run folder inside DIR as one
 run — back to back, the time between cut out, laps numbered on — into `DIR/concatenated/`. It writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
 page of the report give each servo's mean current and highest peak.

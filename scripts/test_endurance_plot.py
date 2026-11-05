@@ -182,3 +182,31 @@ def test_a_resumed_run_follows_the_piece_before_it():
     # The first piece ends at 25 s (its last event), so the second starts there.
     assert list(s * 3600) == pytest.approx([0, 10, 20, 25, 35])
     assert list(e * 3600) == pytest.approx([0, 25, 25, 37])
+
+
+def test_a_whole_run_has_no_problems(tmp_path):
+    run = write_run(tmp_path / "run", "stress-v1", [(1.0, "start", "")])
+    assert plot.check_run(run) == []
+
+
+def test_an_empty_meta_is_reported(tmp_path):
+    run = write_run(tmp_path / "run", "stress-v1", [(1.0, "start", "")])
+    (run / "meta.json").write_text("")
+    assert [p for p in plot.check_run(run) if "meta.json" in p]
+
+
+def test_a_torn_row_is_reported_and_left_out(tmp_path):
+    run = write_run(tmp_path / "run", "stress-v1", [(1.0, "start", "")])
+    whole = len(plot.load(run)[0])
+    with open(run / "samples.csv", "a") as f:
+        f.write("1120,120,up")
+    assert [p for p in plot.check_run(run) if "cut short" in p]
+    assert [p for p in plot.check_run(run) if "columns" in p]
+    assert len(plot.load(run)[0]) == whole
+
+
+def test_a_clock_going_backwards_is_reported(tmp_path):
+    run = write_run(tmp_path / "run", "stress-v1", [(1.0, "start", "")])
+    with open(run / "samples.csv", "a") as f:
+        f.write("1,120,up,8.0,85,0,41,36,knee,walk,4,A1.fwd\n")
+    assert [p for p in plot.check_run(run) if "backwards" in p]

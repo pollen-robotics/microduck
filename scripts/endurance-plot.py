@@ -39,6 +39,8 @@ runs of different laps (`meta.json` `lap`) are not the same test and are refused
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import re
 import sys
@@ -89,10 +91,72 @@ plt.rcParams.update({
 })
 
 
+def read_rows(path: Path, **kwargs) -> pd.DataFrame:
+    """A run's CSV, keeping only rows with every column: `check_run` reports the others."""
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        rows = list(csv.reader(line.replace("\0", "") for line in f))
+    whole = io.StringIO()
+    csv.writer(whole, lineterminator="\n").writerows(r for r in rows if len(r) == len(rows[0]))
+    whole.seek(0)
+    return pd.read_csv(whole, **kwargs)
+
+
+def check_csv(run: Path, name: str, resumes: int | None) -> list[str]:
+    path = run / name
+    if not path.exists():
+        return [f"{name}: missing"]
+    raw = path.read_bytes()
+    if not raw:
+        return [f"{name}: empty"]
+    problems = []
+    if not raw.endswith(b"\n"):
+        problems.append(f"{name}: the last row is cut short")
+    text = raw.decode("utf-8", errors="replace")
+    if "\ufffd" in text or "\0" in text:
+        problems.append(f"{name}: holds bytes that are not text")
+    rows = list(csv.reader(io.StringIO(text.replace("\0", ""), newline="")))
+    header, body = rows[0], rows[1:]
+    whole = [r for r in body if len(r) == len(header)]
+    if len(whole) != len(body):
+        problems.append(f"{name}: {len(body) - len(whole)} rows do not have {len(header)} columns")
+
+    def steps_back(column: str) -> int:
+        if column not in header:
+            return 0
+        values = pd.to_numeric(pd.Series([r[header.index(column)] for r in whole]), errors="coerce").dropna()
+        return int((values.diff() < -1.0).sum())
+
+    if resumes is not None and steps_back("t_s") > resumes:
+        problems.append(f"{name}: the run's timer restarted {steps_back('t_s')} times, "
+                        f"with {resumes} resumes to explain it")
+    if steps_back("wall"):
+        problems.append(f"{name}: the wall clock goes backwards {steps_back('wall')} times")
+    return problems
+
+
+def check_run(run: Path) -> list[str]:
+    """What is wrong with a run, as `robotctl stress verify` would say it, printed as a warning."""
+    problems, resumes = [], None
+    if not (run / "meta.json").exists():
+        problems.append("meta.json: missing")
+    else:
+        try:
+            segments = json.loads((run / "meta.json").read_bytes()).get("segments") or []
+            resumes = max(len(segments) - 1, 0)
+            if not segments:
+                problems.append("meta.json: no segments")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            problems.append(f"meta.json: unreadable: {e}")
+    problems += check_csv(run, "samples.csv", resumes) + check_csv(run, "events.csv", resumes)
+    for problem in problems:
+        print(f"{run}: warning: {problem}", file=sys.stderr)
+    return problems
+
+
 def load(run: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(run / "samples.csv")
+    df = read_rows(run / "samples.csv")
     ev_path = run / "events.csv"
-    ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+    ev = read_rows(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
     if "t_s" in df and df["t_s"].notna().all() and (not len(ev) or ev["t_s"].notna().all()):
         df["h"], ev["h"] = run_hours(df["t_s"], ev["t_s"])
     else:
@@ -837,8 +901,11 @@ def concatenate(parent: Path) -> Path:
     run's last. `meta.json` carries every run's segments in order.
     """
     out = parent / "concatenated"
-    runs = sorted((d for d in parent.iterdir() if d.is_dir() and d != out and (d / "samples.csv").exists()),
-                  key=lambda d: pd.read_csv(d / "samples.csv", usecols=["wall"])["wall"].min())
+    found = [d for d in parent.iterdir() if d.is_dir() and d != out and (d / "samples.csv").exists()]
+    for run in found:
+        check_run(run)
+    runs = sorted((d for d in found if (d / "samples.csv").stat().st_size),
+                  key=lambda d: read_rows(d / "samples.csv", usecols=["wall"])["wall"].min())
     if not runs:
         raise SystemExit(f"{parent}: no run directories (none holds a samples.csv)")
     if why := mixed_laps(runs):
@@ -852,10 +919,10 @@ def concatenate(parent: Path) -> Path:
     shift, laps_before = None, 0
     end = None
     for i, run in enumerate(runs):
-        df = pd.read_csv(run / "samples.csv")
+        df = read_rows(run / "samples.csv")
         df["session"] = i
         ev_path = run / "events.csv"
-        ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+        ev = read_rows(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
         start = df["wall"].min()
         step = df["wall"].diff().median() if len(df) > 1 else 10.0
         shift = 0.0 if end is None else (end + (0 if pd.isna(step) else step)) - start
@@ -886,6 +953,8 @@ def main() -> int:
     p.add_argument("--concatenate", action="append", type=Path, default=[], metavar="DIR",
                    help="a directory of run directories, charted as one run (repeatable)")
     args = p.parse_args()
+    for run in args.runs:
+        check_run(run)
     args.runs += [concatenate(d) for d in args.concatenate]
     if not args.runs:
         p.error("give run directories, --concatenate DIR, or both")

@@ -458,7 +458,7 @@ enum Namespace {
     /// Every get-up is timed; a robot still down 7 s after the policy came back gets a 2 s cut
     /// and one more try, then the run gives up and cuts torque. Stays in a 1 m square on
     /// odometry and stops short of walls on the head ToF. Starts in the background like
-    /// `endurance`, logging to /var/lib/stress. Needs root; no pad connected.
+    /// `endurance`, logging to /var/lib/robot/stress. Needs root; no pad connected.
     #[command(args_conflicts_with_subcommands = true)]
     Stress {
         #[command(subcommand)]
