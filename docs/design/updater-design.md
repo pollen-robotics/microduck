@@ -449,7 +449,7 @@ What the container cannot cover, and hardware must: a real `systemctl restart`
 against the real filesystem, and whether the health-gate timeouts suit a robot that
 takes tens of seconds to stand up.
 
-**Two boards, one build.** The Zero 3W and the beta are both RK3566, so one aarch64 release
+**Every board, one build.** The Zero 3W and the beta (with either face board) are all RK3566, so one aarch64 release
 runs on either. No variant / IMU / camera matrix, no per-device hardware profile, no artifact
 selection logic: what differs between the boards is the daemon's business, keyed on the board
 the robot declares, not the updater's.
@@ -457,7 +457,7 @@ the robot declares, not the updater's.
 What the updater keeps is deliberately minimal:
 - **`min_hw_rev`** in the manifest (§5.3): one integer, refused when it is above the robot's.
 - **The robot's revision is its declared board**: `[board] version` in `robotd.toml`
-  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2), read before every check.
+  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2, face-board-v1 is 3), read before every check.
   `hw_rev` in `updater.toml` applies only when no board is declared — every robot installed
   before the board was a setting carries `hw_rev = 1`, and a board provisioned against a
   release that still shipped it does too, so it cannot be allowed to outrank the board.

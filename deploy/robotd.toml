@@ -23,8 +23,9 @@
 
 [board]
 # Which electronic board this robot is built on: "zero3" (the Radxa Zero 3W with the prototype's
-# HAT) or "beta" (the custom board). Set when the robot is provisioned — `provision-board.sh
-# --board` — and not something to change on a robot that works. The updater reads it for the
+# HAT), "beta" (the custom board) or "face-board-v1" (the custom board with the V1.0 face board).
+# Set when the robot is provisioned — `provision-board.sh --board`, or the OS image built for the
+# board — and not something to change on a robot that works. The updater reads it for the
 # hardware revision a release is checked against, so declaring the wrong board can cost a robot
 # its updates; `robotctl health` says when this and the device tree disagree.
 # version = "zero3"
