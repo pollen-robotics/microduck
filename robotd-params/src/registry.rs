@@ -244,6 +244,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Gain multiplier during the ground pick",
     ),
+    entry(
+        "policy.accel_vx",
+        Kind::OptionalFloat,
+        "Forward/back acceleration limit, m/s²; unset: none walking, 1.0 roller; 0 none",
+    ),
+    entry(
+        "policy.accel_vy",
+        Kind::OptionalFloat,
+        "Sideways acceleration limit, m/s²; unset or 0: none",
+    ),
+    entry(
+        "policy.accel_vyaw",
+        Kind::OptionalFloat,
+        "Yaw acceleration limit, rad/s²; unset or 0: none",
+    ),
     feature(
         "policy.voltage_adapt",
         Kind::Bool,
@@ -370,8 +385,8 @@ pub const REGISTRY: &[Entry] = &[
     // ── [idle] ───────────────────────────────────────────────────────────────
     feature(
         "idle.enabled",
-        Kind::Bool,
-        "Look around while nothing is happening",
+        Kind::TriBool,
+        "Look around while nothing is happening; unset: on walking, off on the roller",
     ),
     entry(
         "idle.after_s",

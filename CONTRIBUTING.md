@@ -83,7 +83,7 @@ the daemons — one crate each, one unit each, all in the same release artifact
   padd/           gamepad → intents — an ordinary socket client, no privileged access
   mediad/         camera, mic, WebRTC, the remote gateway, and the console it serves
   tof/            tofd: the head's 8×8 depth sensor. Publishes frames, reads nothing
-  nfc/            nfcd: the NFC reader. A touched tag names a gamepad, and configd pairs it
+  nfc/            nfcd: the NFC reader. A touched pairing tag has configd pair the pad in pairing mode
 
 the libraries they drive — no sockets, no systemd, nothing starts them
   duck-ipc-proto/ the wire contract

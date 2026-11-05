@@ -1025,8 +1025,9 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IdleParams {
-    /// Master switch.
-    pub enabled: bool,
+    /// Master switch. Absent resolves per mode ([`Self::enabled_in`]): on walking, off on the
+    /// roller.
+    pub enabled: Option<bool>,
     /// Still for this long before it starts.
     pub after_s: f64,
     /// How long it takes to fade in, and out.
@@ -1089,7 +1090,7 @@ pub struct IdleParams {
 impl Default for IdleParams {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: None,
             after_s: 2.0,
             fade_s: 1.5,
             glance_yaw: 0.6,
@@ -1124,6 +1125,17 @@ impl Default for IdleParams {
 }
 
 impl IdleParams {
+    /// Whether the look-around runs in `mode`.
+    ///
+    /// Off for the roller unless asked for, because what it moves is the head *command*, and the
+    /// head command is an observation input (`duck_control::obs`, 51..55), not a target added on
+    /// top. `roller.onnx` was not trained with one moving, and folds under it: the robot collapsed
+    /// about three seconds after the stick was let go — the 2 s delay plus the fade-in. Walking
+    /// keeps it on, as it always had it.
+    pub fn enabled_in(&self, mode: Mode) -> bool {
+        self.enabled.unwrap_or(mode == Mode::Walk)
+    }
+
     /// What is wrong with these values, if anything, as (key, reason).
     fn invalid(&self) -> Option<(&'static str, &'static str)> {
         let finite = [
@@ -1576,6 +1588,16 @@ pub struct PolicyParams {
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s²
+    /// in yaw. Applied after `[control] cmd_alpha`, so a small stick move is the EMA it always
+    /// was and only a large one — full forward to full back — becomes a ramp at this slope. An
+    /// EMA alone moves fastest exactly then, its rate being proportional to the jump.
+    ///
+    /// Absent resolves per mode: no limit walking; the roller limits `vx` to 1.0 and leaves
+    /// `vy` and `vyaw` free. `0` is no limit.
+    pub accel_vx: Option<f64>,
+    pub accel_vy: Option<f64>,
+    pub accel_vyaw: Option<f64>,
     /// The one-shot skills this robot has, in priority order.
     ///
     /// Empty means the built-in three — kicks and roulade, with the numbers they have always
@@ -2153,6 +2175,8 @@ pub struct ResolvedPolicy {
     pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
+    /// The twist's acceleration limit per axis, `[vx, vy, vyaw]`; `None` is no limit.
+    pub twist_accel: [Option<f64>; 3],
     /// Seconds the sitstand network rises before the gait takes over.
     pub sitstand_rise_s: f64,
     /// Seconds the seat takes to settle after the flag flips.
@@ -2389,6 +2413,14 @@ impl PolicyParams {
                     Mode::Roller => 0.8,
                 }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
+            // Only the roller's forward/back. A roller reversing from full forward to full back
+            // in the EMA's ~0.25 s fell over; walking never asked for a limit, and the roller's
+            // yaw has to stay quick enough to steer.
+            twist_accel: {
+                let roller_vx = (self.mode == Mode::Roller).then_some(1.0);
+                [self.accel_vx.or(roller_vx), self.accel_vy, self.accel_vyaw]
+                    .map(|a| a.filter(|a| *a > 0.0))
+            },
             sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
             sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
@@ -2482,6 +2514,9 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
+            accel_vx: None,
+            accel_vy: None,
+            accel_vyaw: None,
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
@@ -2733,6 +2768,12 @@ pub enum ParamsError {
         min: f64,
         max: f64,
     },
+    #[error("{path}: policy.{key} {reason}")]
+    Policy {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
     #[error("{path}: idle.{key} {reason}")]
     Idle {
         path: String,
@@ -2935,6 +2976,19 @@ impl Params {
                     axis,
                     min,
                     max,
+                });
+            }
+        }
+        for (key, accel) in [
+            ("accel_vx", self.policy.accel_vx),
+            ("accel_vy", self.policy.accel_vy),
+            ("accel_vyaw", self.policy.accel_vyaw),
+        ] {
+            if accel.is_some_and(|a| !(a.is_finite() && a >= 0.0)) {
+                return Err(ParamsError::Policy {
+                    path: path.display().to_string(),
+                    key,
+                    reason: "must be finite and nonnegative (0 is no limit)",
                 });
             }
         }
@@ -4479,6 +4533,81 @@ mod tests {
         let path = write(dir.path(), "[idle]\nhold_max_s = 1.5\nnudge_yaw = 0.0\n");
         let idle = Params::load(&path, true).unwrap().idle;
         assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
+    }
+
+    /// The look-around is on for walking and off for the roller unless the file says otherwise.
+    /// Its head command is an observation input, and `roller.onnx` folds under one it was not
+    /// trained with — seen on the robot as a collapse about three seconds after the stick was
+    /// let go. A file that already says `enabled = true` keeps saying it, in either mode.
+    #[test]
+    fn the_idle_look_around_resolves_per_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let unset = Params::load(&write(dir.path(), ""), true).unwrap().idle;
+        assert!(unset.enabled_in(Mode::Walk), "walking looks around");
+        assert!(!unset.enabled_in(Mode::Roller), "the roller does not");
+
+        let on = Params::load(&write(dir.path(), "[idle]\nenabled = true\n"), true)
+            .unwrap()
+            .idle;
+        assert!(on.enabled_in(Mode::Roller), "an explicit on wins");
+        let off = Params::load(&write(dir.path(), "[idle]\nenabled = false\n"), true)
+            .unwrap()
+            .idle;
+        assert!(!off.enabled_in(Mode::Walk), "an explicit off wins");
+    }
+
+    /// The twist acceleration limit is the roller's: walking runs exactly as before, with no
+    /// limit on any axis. The roller ramps forward/back, and leaves strafe and yaw to the EMA —
+    /// a global `cmd_alpha` low enough to keep it up through a full reversal made it hard to turn.
+    #[test]
+    fn the_twist_acceleration_limit_resolves_per_mode() {
+        let walk = super::PolicyParams::default().resolved_with(None);
+        assert_eq!(walk.twist_accel, [None; 3], "walking is not limited");
+
+        let roller = super::PolicyParams {
+            mode: Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(roller.twist_accel, [Some(1.0), None, None]);
+
+        let tuned = super::PolicyParams {
+            mode: Mode::Roller,
+            accel_vx: Some(0.0),
+            accel_vyaw: Some(4.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(
+            tuned.twist_accel,
+            [None, None, Some(4.0)],
+            "an explicit value wins, and 0 is off"
+        );
+
+        let walk_tuned = super::PolicyParams {
+            accel_vx: Some(2.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(walk_tuned.twist_accel[0], Some(2.0), "walking can opt in");
+    }
+
+    #[test]
+    fn a_negative_twist_acceleration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            ("[policy]\naccel_vx = -1.0\n", "policy.accel_vx"),
+            ("[policy]\naccel_vyaw = nan\n", "policy.accel_vyaw"),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(dir.path(), "[policy]\naccel_vy = 0.5\n");
+        assert_eq!(
+            Params::load(&path, true).unwrap().policy.accel_vy,
+            Some(0.5)
+        );
     }
 
     #[test]

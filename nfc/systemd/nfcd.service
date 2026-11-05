@@ -1,4 +1,4 @@
-# The NFC reader daemon: touch a tag carrying a gamepad's address, and that pad is paired.
+# The NFC reader daemon: touch a pairing tag, and the gamepad in pairing mode is paired.
 #
 # Nothing depends on this unit, and most robots have no reader fitted. `nfcd` then logs one line
 # and retries the port every thirty seconds, so plugging a reader in is all it takes — no restart,
