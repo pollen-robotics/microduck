@@ -1280,8 +1280,11 @@ The rest is the client's to follow: poll `os.status`, expect the link to drop
 at `rebooting`, and read `last_result` after the reboot.
 
 Routing: `btd` permits all four (§4.1's argument for `update.apply`, and the
-switch is the rollback); `mediad` permits only the reads, because `mediad` is in
-`allow_users` and its transport has no authorisation of its own. A board with
+switch is the rollback), and so does `mediad`. Its transport has no
+authorisation of its own, but neither does the image's page on port 8090, which
+takes the same two mutations from the same LAN; through `mediad` they at least
+pass `updaterd`'s lock and preflight. The reboot drops a WebRTC session as it
+drops a BLE link, and the client rides it out the same way. A board with
 no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
 the periodic check does not look at the channel.
 
