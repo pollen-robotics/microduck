@@ -27,8 +27,9 @@ robot_socket = "/run/robotd.sock"
 
 # Both false, and this is the file that makes them false on a client robot. `allow_dev_keys`
 # would let anything a teammate builds install itself; `allow_fault_injection` would let the
-# updater be told to fail on purpose. Developer boards override these locally — they are not
-# overridden by an update, because updates do not touch /etc.
+# updater be told to fail on purpose. A developer board is made one with
+# `sudo robotctl configure --allow-dev-daemon on`, which leaves this file alone: it writes a marker
+# under /var/lib/robot, because an A/B OS update replaces /etc (updater-design.md §5.4).
 allow_dev_keys        = false
 allow_fault_injection = false
 
@@ -117,8 +118,8 @@ manifest_asset = "manifest.json"
 # Separate from tag_prefix because the two streams must never be confusable: a dev tag
 # *moves* (it points at whatever that branch last built) while a release tag is immutable,
 # and `latest` for the fleet must never consider a dev tag. Installing one also requires
-# allow_dev_keys and the dev public key, so a client robot cannot take a branch build even
-# if it somehow resolved the tag.
+# a dev board (`robotctl configure --allow-dev-daemon on`), so a client robot cannot take a branch
+# build even if it somehow resolved the tag.
 # ref_tag_prefix = "daemon-dev-"
 
 # Where `--staging` looks: the tags `release.yml` pushes for release candidates. Shown for

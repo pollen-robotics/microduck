@@ -154,6 +154,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Seconds after boot by which the boot check decides (20–300)",
     ),
+    entry(
+        "update_gate.auto_rollback",
+        Kind::Bool,
+        "Revert a release that fails its gate or its boot, unasked — default off",
+    ),
     // ── [policy] ─────────────────────────────────────────────────────────────
     feature(
         "policy.enabled",
@@ -238,6 +243,21 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
+    ),
+    entry(
+        "policy.accel_vx",
+        Kind::OptionalFloat,
+        "Forward/back acceleration limit, m/s²; unset: none walking, 1.0 roller; 0 none",
+    ),
+    entry(
+        "policy.accel_vy",
+        Kind::OptionalFloat,
+        "Sideways acceleration limit, m/s²; unset or 0: none",
+    ),
+    entry(
+        "policy.accel_vyaw",
+        Kind::OptionalFloat,
+        "Yaw acceleration limit, rad/s²; unset or 0: none",
     ),
     feature(
         "policy.voltage_adapt",
@@ -365,8 +385,8 @@ pub const REGISTRY: &[Entry] = &[
     // ── [idle] ───────────────────────────────────────────────────────────────
     feature(
         "idle.enabled",
-        Kind::Bool,
-        "Look around while nothing is happening",
+        Kind::TriBool,
+        "Look around while nothing is happening; unset: on walking, off on the roller",
     ),
     entry(
         "idle.after_s",

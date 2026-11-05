@@ -118,6 +118,13 @@ hz = 50
 # below that a release whose updaterd cannot start passes. Clamped to 20–300.
 # boot_deadline_s = 60
 
+# Whether a failed release is reverted without anyone asking: the health gate after
+# `update apply` / `select` / `rollback`, the boot counter on an unconfirmed update, and the
+# boot check falling back to golden. Off, a release that fails stays live, reported stuck,
+# and `robotctl update rollback daemon` reverts it by hand. Read by updaterd when it would
+# revert, and by robot-boot-check once per boot — not by robotd.
+# auto_rollback = false
+
 [policy]
 # Whether to load a policy at all.
 #
@@ -198,6 +205,17 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+
+# How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s² in
+# yaw. It acts after [control] cmd_alpha, so a small stick move is the EMA as before, and only a
+# big jump — full forward to full back — becomes a ramp at this slope. Unset resolves per mode:
+# no limit walking; the roller limits accel_vx to 1.0 (about a second to reverse) and leaves
+# strafe and yaw free, so it still turns as quickly. 0 is no limit. A roller reversing in the
+# bare EMA's quarter second fell over; lowering cmd_alpha instead kept it up but made it hard to
+# steer, since that slows every axis.
+# accel_vx = 1.0
+# accel_vy = 0
+# accel_vyaw = 0
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5
@@ -484,7 +502,12 @@ mode = "walk"
 #
 # Angles are radians, durations seconds. All of it is taste: these are the knobs for how alive it
 # reads. Read once at startup, so a change needs robotd restarted.
-# enabled = true
+#
+# `enabled` unset resolves per mode: on walking, OFF on the roller. What it moves is the head
+# command, which the policy reads as an input — and roller.onnx was not trained with one moving:
+# left alone, the roller collapsed about three seconds after the stick was let go. Set it true
+# to have the roller look around anyway, once a roller policy is trained for it.
+# enabled = true      # unset: per mode, as above
 # after_s = 2.0
 # fade_s = 1.5
 

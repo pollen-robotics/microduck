@@ -5,8 +5,8 @@
 # every push, and both are enforced somewhere other than this file:
 #
 #   1. **Signed with `team.dev`, not `release-1`.** A customer robot refuses these outright:
-#      `allow_dev_keys = false` in the shipped config, *and* a trusted key is only usable as
-#      a dev key if its filename ends `.dev.pub`. Two independent conditions.
+#      `updaterd` uses that key only on a robot made a dev board (`robotctl configure
+#      --allow-dev-daemon on`, docs/design/updater-design.md §5.4), and nothing ships one.
 #   2. **The version is a semver prerelease** (`0.1.0-dev.42.abc1234`), so it sorts *below*
 #      the release it precedes and can never be what `latest` resolves to for the fleet.
 #      GitHub's prerelease flag below is the second, independent guard.
@@ -286,9 +286,9 @@ jobs:
           sudo robotctl update apply daemon --ref ${GITHUB_REF_NAME}
           \`\`\`
 
-          Signed with \`team.dev\`, so a customer robot refuses it. The board needs
-          \`team.dev.pub\` in its trusted keys and \`allow_dev_keys = true\` — see
-          docs/deploy.md.
+          Signed with \`team.dev\`, so a customer robot refuses it. Make a board a dev
+          board once with \`sudo robotctl configure --allow-dev-daemon on\` — see
+          docs/robot/install-dev.md.
 
           \`duckctl\` from this branch, on Linux or macOS:
 

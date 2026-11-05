@@ -841,7 +841,6 @@ robot.
 | `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
-| `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
 
 Health is computed by the IPC side from atomics the loop publishes — a last-tick timestamp plus
 counters — never by asking the loop. That is what lets a *wedged* loop report itself unhealthy
@@ -860,6 +859,15 @@ updated at all until someone works out why. Motor temperature would do the same 
 afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
 of the three, since the release that would fix the heat is the one the gate would refuse to
 keep.
+
+**A run of failed reads could be either, so the loop asks the bus which.** A servo unplugged
+mid-run fails every sync read exactly as a release with a broken read path does, and only the
+second is something a rollback fixes. So once the run reaches `max_consecutive_errors`, and every
+few seconds while it lasts, the loop pings each servo and the IMU board. If any of them is silent,
+the verdict is degraded and names them, which is what the same robot gets on its next boot. If
+every one answers, or the ping itself fails, it stays unhealthy. Without the ping round, the
+verdict for the same hardware depended on whether it was unplugged before or after `robotd`
+started.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
