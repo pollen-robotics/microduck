@@ -1171,6 +1171,8 @@ impl Relay {
                 // said what the video is — which is possible because the relay starts first, on
                 // purpose. `session::run` refuses `media.video` rather than answering with zeros.
                 video,
+                // No media path, so not one of the peers an OS update would drop.
+                crate::session::Seat::LANE,
             ));
 
             let mut budget = Budget::new(NOTIFICATIONS_PER_WINDOW, NOTIFICATION_WINDOW);

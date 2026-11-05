@@ -79,6 +79,10 @@ pub struct Preflight<'a> {
     pub available_bytes: u64,
     /// Skip only the remote-session check. Never affects verification.
     pub interrupt_sessions: bool,
+    /// WebRTC peers `mediad` is serving, from [`crate::proto::read_webrtc_peers`]. Read by the
+    /// caller and handed in, so a test can say how many without a `mediad`. `None` is "not
+    /// saying" and passes: the check is a courtesy, never the reason a recovery update is refused.
+    pub webrtc_peers: Option<u32>,
     pub robot_query_timeout: Duration,
     /// The directory `apply --from <dir>` was pointed at, if any. `None` for every other
     /// target, which reads its manifest from the configured source instead.
@@ -106,7 +110,7 @@ impl Preflight<'_> {
         results.push(self.check_disk());
         results.push(self.check_sideload_dir());
         results.push(self.check_robot_stopped().await);
-        results.push(self.check_no_remote_session().await);
+        results.push(self.check_no_remote_session());
 
         Ok(Report { results })
     }
@@ -208,7 +212,7 @@ impl Preflight<'_> {
         }
     }
 
-    async fn check_no_remote_session(&self) -> CheckResult {
+    fn check_no_remote_session(&self) -> CheckResult {
         if self.interrupt_sessions {
             return CheckResult {
                 check: Check::NoRemoteSession,
@@ -217,15 +221,17 @@ impl Preflight<'_> {
             };
         }
 
-        let active = self
-            .robot
-            .remote_session_active(self.robot_query_timeout)
-            .await;
+        let peers = self.webrtc_peers.unwrap_or(0);
         CheckResult {
             check: Check::NoRemoteSession,
-            passed: !active,
-            detail: active.then(|| {
-                "a remote/telepresence session is active; restarting would drop it".to_owned()
+            passed: peers == 0,
+            detail: (peers > 0).then(|| {
+                format!(
+                    "{peers} WebRTC session{} connected, and this would drop {}; \
+                     ask again with interrupt_sessions to go ahead",
+                    if peers == 1 { " is" } else { "s are" },
+                    if peers == 1 { "it" } else { "them" },
+                )
             }),
         }
     }
@@ -243,7 +249,6 @@ mod tests {
     /// a real crash.
     struct FakeRobot {
         safe: SafeToRestart,
-        session: bool,
     }
 
     #[async_trait::async_trait]
@@ -257,9 +262,6 @@ mod tests {
         async fn model_api(&self, _t: Duration) -> Option<u32> {
             Some(1)
         }
-        async fn remote_session_active(&self, _t: Duration) -> bool {
-            self.session
-        }
         async fn reload_policies(&self, _timeout: Duration) -> bool {
             true
         }
@@ -271,6 +273,7 @@ mod tests {
             required_bytes: required,
             available_bytes: available,
             interrupt_sessions: false,
+            webrtc_peers: None,
             robot_query_timeout: Duration::from_millis(50),
             from_dir: None,
         }
@@ -280,7 +283,6 @@ mod tests {
     async fn passes_when_everything_is_fine() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let report = preflight(&robot, 100, 1_000).run().await.unwrap();
         assert!(report.passed(), "{:?}", report.first_failure());
@@ -290,7 +292,6 @@ mod tests {
     async fn fails_when_disk_is_short() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let report = preflight(&robot, 5_000, 1_000).run().await.unwrap();
         assert!(!report.passed());
@@ -305,7 +306,6 @@ mod tests {
     async fn a_sideload_dir_under_var_tmp_names_the_namespace() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let mut pf = preflight(&robot, 0, 1_000);
         let dir = Path::new("/var/tmp/duck-sideload-does-not-exist");
@@ -325,7 +325,6 @@ mod tests {
     async fn a_missing_dir_elsewhere_is_reported_plainly() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let mut pf = preflight(&robot, 0, 1_000);
         pf.from_dir = Some(Path::new("/var/lib/robot/no-such-sideload"));
@@ -346,7 +345,6 @@ mod tests {
     async fn a_visible_dir_passes_wherever_it_is() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let dir = tempfile::tempdir().unwrap();
         let mut pf = preflight(&robot, 0, 1_000);
@@ -360,7 +358,6 @@ mod tests {
     async fn fails_while_robot_is_moving() {
         let robot = FakeRobot {
             safe: SafeToRestart::No("walking".into()),
-            session: false,
         };
         let report = preflight(&robot, 0, 1_000).run().await.unwrap();
         assert!(!report.passed());
@@ -388,7 +385,6 @@ mod tests {
     async fn an_unreadable_answer_blocks_the_restart() {
         let robot = FakeRobot {
             safe: SafeToRestart::Incompatible("missing field `safe`".into()),
-            session: false,
         };
         let report = preflight(&robot, 0, 1_000).run().await.unwrap();
 
@@ -408,7 +404,6 @@ mod tests {
     async fn stopping_the_robot_is_the_way_past_it() {
         let unreadable = FakeRobot {
             safe: SafeToRestart::Incompatible("missing field `safe`".into()),
-            session: false,
         };
         assert!(
             !preflight(&unreadable, 0, 1_000)
@@ -430,16 +425,18 @@ mod tests {
     async fn active_session_blocks_unless_bypassed() {
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: true,
         };
 
-        let report = preflight(&robot, 0, 1_000).run().await.unwrap();
+        let mut with_a_call = preflight(&robot, 0, 1_000);
+        with_a_call.webrtc_peers = Some(1);
+        let report = with_a_call.run().await.unwrap();
         assert_eq!(
             report.first_failure().unwrap().check,
             Check::NoRemoteSession
         );
 
         let mut bypass = preflight(&robot, 0, 1_000);
+        bypass.webrtc_peers = Some(1);
         bypass.interrupt_sessions = true;
         assert!(bypass.run().await.unwrap().passed());
     }
@@ -449,9 +446,10 @@ mod tests {
     async fn reports_every_failure_not_just_the_first() {
         let robot = FakeRobot {
             safe: SafeToRestart::No("walking".into()),
-            session: true,
         };
-        let report = preflight(&robot, 5_000, 1_000).run().await.unwrap();
+        let mut everything = preflight(&robot, 5_000, 1_000);
+        everything.webrtc_peers = Some(2);
+        let report = everything.run().await.unwrap();
         let failures = report.results.iter().filter(|r| !r.passed).count();
         assert_eq!(failures, 3, "{:?}", report.results);
     }
@@ -461,7 +459,6 @@ mod tests {
         // Guards against the floor being set past "now" by mistake.
         let robot = FakeRobot {
             safe: SafeToRestart::Yes,
-            session: false,
         };
         let report = preflight(&robot, 0, 1_000).run().await.unwrap();
         let clock = report

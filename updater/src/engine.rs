@@ -1444,6 +1444,7 @@ impl Engine {
             required_bytes: 0,
             available_bytes: u64::MAX,
             interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: None,
         }
@@ -2557,6 +2558,7 @@ impl Engine {
             required_bytes: required,
             available_bytes: available,
             interrupt_sessions: options.interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: options.from_dir.as_deref(),
         }

@@ -507,7 +507,16 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
 /// means nothing changed, and `robotctl update log` printed them as "refused". An older client
 /// cannot parse a log holding one; an older `updaterd` skips the line.
-pub const API_VERSION: u32 = 49;
+///
+/// # v50 — the remote-session check sees WebRTC peers
+///
+/// `os.apply` and `os.switch` are permitted over WebRTC. The preflight's remote-session check,
+/// which `robotd` used to answer with a constant `false`, now counts `mediad`'s WebRTC peers
+/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with
+/// `PREFLIGHT_FAILED` while one is connected, unless `interrupt_sessions` is set. A request made
+/// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
+/// `updaterd`'s question, refused to every client.
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -691,8 +700,6 @@ pub mod method {
     pub const ROBOT_HEALTH: &str = "robot.health";
     /// Which model API version does this build implement?
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
-    /// Is a telepresence session live?
-    pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
 
     // ── intents ──────────────────────────────────────────────────────────────
     //
@@ -1166,7 +1173,6 @@ pub enum Call {
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
-    RobotRemoteSessionActive,
 
     // ── intents ──────────────────────────────────────────────────────────────
     /// Continuous. Send as a notification.
@@ -1385,7 +1391,6 @@ impl Call {
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
-            Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotLook(_) => method::ROBOT_LOOK,
@@ -1598,7 +1603,6 @@ impl Call {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
@@ -1767,7 +1771,6 @@ impl Call {
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
@@ -1828,7 +1831,6 @@ impl Call {
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
-            method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
@@ -1989,7 +1991,6 @@ pub mod test_support {
             Call::RobotSafeToRestart,
             Call::RobotHealth,
             Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
             Call::RobotMove(MoveParams {
                 vx: 0.2,
                 vy: -0.1,
@@ -4513,12 +4514,6 @@ pub struct ModelApiResult {
     pub model_api: u32,
 }
 
-/// Answer to [`Call::RobotRemoteSessionActive`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionActiveResult {
-    pub active: bool,
-}
-
 // ── net.* results ────────────────────────────────────────────────────────────
 
 /// What the wifi link is doing.
@@ -5817,13 +5812,52 @@ fn camera_stats_path() -> std::path::PathBuf {
 
 /// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
 pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
-    let path = camera_stats_path();
+    publish_camera_stats_at(&camera_stats_path(), stats)
+}
+
+/// [`publish_camera_stats`] at `path`.
+///
+/// Written aside and renamed into place, because [`read_webrtc_peers`] gates an OS update on this
+/// file and a reader catching it half-written would read "nobody is connected".
+fn publish_camera_stats_at(path: &std::path::Path, stats: &CameraStats) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
     json.push(b'\n');
-    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+    let aside = path.with_extension("json.new");
+    std::fs::write(&aside, json).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How old [`CameraStats`] may be and still count as `mediad`'s answer. It is rewritten every
+/// second while the camera delivers frames, so this is several missed rewrites.
+pub const CAMERA_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many WebRTC peers `mediad` is serving right now, or `None` when it is not saying.
+///
+/// The one answer to "is someone on a call with this robot?". `updaterd`'s preflight asks it
+/// before an update that would drop the call, and `mediad` asks it to tell a session that is
+/// alone from one with company (`updater-design.md` §11).
+///
+/// `None` — `mediad` stopped, no camera, a file older than [`CAMERA_STATS_MAX_AGE`] — is for the
+/// caller to read, and the updater reads it as nobody: its check is a courtesy and must never be
+/// the reason a recovery update is refused.
+pub fn read_webrtc_peers() -> Option<u32> {
+    webrtc_peers_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    // A file from the future is a clock that stepped, not a fresh answer; either way it is not old.
+    if now
+        .duration_since(modified)
+        .is_ok_and(|age| age > CAMERA_STATS_MAX_AGE)
+    {
+        return None;
+    }
+    let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(stats.consumers)
 }
 
 /// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
@@ -5990,6 +6024,49 @@ mod tests {
     use super::test_support::every_call;
     use super::*;
 
+    fn camera_stats(consumers: u32) -> CameraStats {
+        CameraStats {
+            fps: 30.0,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 1,
+            dropped: 0,
+            consumers,
+        }
+    }
+
+    /// The count an OS update is gated on: read back as written, and only while it is fresh.
+    #[test]
+    fn webrtc_peers_are_read_only_while_fresh() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(webrtc_peers_at(&path, now), None, "no file is no answer");
+
+        publish_camera_stats_at(&path, &camera_stats(2)).unwrap();
+        assert_eq!(webrtc_peers_at(&path, now), Some(2));
+        assert!(
+            !path.with_extension("json.new").exists(),
+            "renamed into place"
+        );
+
+        let later = now + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            webrtc_peers_at(&path, later),
+            None,
+            "a stopped writer is no answer"
+        );
+
+        std::fs::write(&path, b"{\"fps\":").unwrap();
+        assert_eq!(
+            webrtc_peers_at(&path, now),
+            None,
+            "a torn file is no answer"
+        );
+    }
+
     /// The path a release actually installs to, which is what makes "which version is running"
     /// answerable at all.
     #[test]
@@ -6120,7 +6197,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            79,
+            78,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

@@ -5753,12 +5753,6 @@ fn dispatch(
                 model_api: MODEL_API,
             },
         ),
-        // No media stack, so no session can be live. `mediad` owns the real answer
-        // (architecture.md §5.2); reporting `false` here is honest for now, and the updater
-        // treats unknown as false anyway.
-        proto::Call::RobotRemoteSessionActive => {
-            proto::Response::ok(Some(id), &proto::SessionActiveResult { active: false })
-        }
         proto::Call::Hello(_) => proto::Response::ok(
             Some(id),
             &proto::HelloResult {
@@ -6824,16 +6818,6 @@ mod tests {
                 .result_as()
                 .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
-
-        let session: proto::SessionActiveResult = dispatch(
-            &s,
-            &Intents::new(),
-            id(),
-            &proto::Call::RobotRemoteSessionActive,
-        )
-        .result_as()
-        .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
-        assert!(!session.active);
 
         let mode: proto::ModeResult = dispatch(&s, &Intents::new(), id(), &proto::Call::RobotMode)
             .result_as()

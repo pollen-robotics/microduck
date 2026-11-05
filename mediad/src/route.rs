@@ -252,8 +252,10 @@ fn permits(call: &proto::Call) -> bool {
         // is set — which the page skips. A bridged peer has signed in to the rendezvous as the
         // robot's owner.
         //
-        // That preflight also refuses while a remote session is active, and this session is one.
-        // It passes only because nothing reports one yet; `remote-webrtc.md` §8 owns the fix.
+        // That preflight also refuses while another WebRTC peer is connected, so one session
+        // cannot reboot the robot under someone else's call. This session is a peer too, and is
+        // not refused for its own presence: `session::Seat` answers the check for it when it is
+        // alone.
         OsApply(_) | OsSwitch(_) => true,
         // The dashboard's switch for anonymous usage data. With no authorisation here (§4) any
         // LAN peer can flip it, which is acceptable for a choice that sends nothing personal,
@@ -288,8 +290,8 @@ fn permits(call: &proto::Call) -> bool {
         // Applying, rolling back or selecting a release restarts `mediad`, which drops the session
         // the client is watching progress on. **A deferral, not a rule** — a phone updating a
         // robot over WebRTC is wanted, and `remote-webrtc.md` §8 lists the two things it needs: a
-        // client that reconnects and re-subscribes, and `RobotRemoteSessionActive` learning to
-        // tell a bystander session from the one that requested the update.
+        // client that reconnects and re-subscribes, and the session that asked being exempt from
+        // the remote-session check, as `os.apply` already is (`session.rs`).
         Apply(_) | Rollback(_) | Select(_) => false,
 
         // Reconfiguring wifi moves the robot to another network and takes this session with it.
@@ -321,7 +323,7 @@ fn permits(call: &proto::Call) -> bool {
         //
         // `updaterd`'s private queries to `robotd`. Internal plumbing of the update decision, of
         // no use to a client and misleading if exposed.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi => false,
 
         // ── refused: this transport does not authenticate ────────────────────
         //

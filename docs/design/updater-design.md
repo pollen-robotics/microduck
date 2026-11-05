@@ -646,9 +646,16 @@ side effects:
   stopped/parked (motors safe). `updaterd` still does a light "safe to restart?"
   query to `robotd` and refuses if not — cheap insurance against restarting
   motor control mid-motion.
-- **No active remote session.** Restarting `robotd`/`mediad` mid-telepresence is a
-  bad surprise; refuse, or warn and require explicit confirmation. See
-  [`architecture.md`](architecture.md) §5.
+- **No active remote session.** Restarting `robotd`/`mediad` mid-call is a bad
+  surprise, so the check refuses while any WebRTC peer is connected, and
+  `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
+  the `consumers` it writes to `/run/mediad/camera.json` every second, read
+  through `duck_ipc_proto::read_webrtc_peers`. A missing or stale file (over
+  5 s) passes, because the check is a courtesy and must never be what refuses
+  a recovery update. A request made over WebRTC by the only peer connected is
+  not refused for its own presence: `mediad` sets `interrupt_sessions` on it
+  before forwarding (`mediad/src/session.rs`, `Seat`). The rendezvous control
+  lane is not a peer — it carries no media — so it is not counted.
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
@@ -1284,7 +1291,10 @@ switch is the rollback), and so does `mediad`. Its transport has no
 authorisation of its own, but neither does the image's page on port 8090, which
 takes the same two mutations from the same LAN; through `mediad` they at least
 pass `updaterd`'s lock and preflight. The reboot drops a WebRTC session as it
-drops a BLE link, and the client rides it out the same way. A board with
+drops a BLE link, and the client rides it out the same way. Another peer's call
+is what the session check (§7.2) protects: with anyone else connected the
+update is refused, and the client asks again with `interrupt_sessions` once its
+user has agreed to drop them. A board with
 no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
 the periodic check does not look at the channel.
 
