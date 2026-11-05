@@ -647,8 +647,9 @@ side effects:
   query to `robotd` and refuses if not — cheap insurance against restarting
   motor control mid-motion.
 - **No active remote session.** Restarting `robotd`/`mediad` mid-call is a bad
-  surprise, so the check refuses while any WebRTC peer is connected, and
-  `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
+  surprise, so the check refuses while any WebRTC peer is connected, with
+  `SESSIONS_CONNECTED` (16) rather than `PREFLIGHT_FAILED` so a client can
+  tell it apart, and `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
   the `consumers` it writes to `/run/mediad/camera.json` every second, read
   through `duck_ipc_proto::read_webrtc_peers`. A missing or stale file (over
   5 s) passes, because the check is a courtesy and must never be what refuses

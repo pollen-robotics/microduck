@@ -1456,11 +1456,7 @@ impl Engine {
             .filter(|r| network || r.check != preflight::Check::Clock)
             .find(|r| !r.passed);
         match failure {
-            Some(failure) => Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            ))),
+            Some(failure) => Err(preflight::refusal(failure)),
             None => Ok(()),
         }
     }
@@ -2566,11 +2562,7 @@ impl Engine {
         .await?;
 
         if let Some(failure) = report.first_failure() {
-            return Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            )));
+            return Err(preflight::refusal(failure));
         }
         Ok(())
     }

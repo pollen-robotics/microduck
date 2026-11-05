@@ -512,8 +512,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// `os.apply` and `os.switch` are permitted over WebRTC. The preflight's remote-session check,
 /// which `robotd` used to answer with a constant `false`, now counts `mediad`'s WebRTC peers
-/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with
-/// `PREFLIGHT_FAILED` while one is connected, unless `interrupt_sessions` is set. A request made
+/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with the new
+/// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
 /// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
 /// `updaterd`'s question, refused to every client.
 pub const API_VERSION: u32 = 50;
@@ -1133,6 +1133,11 @@ pub mod code {
     /// board whose image has no A/B slots. Not [`METHOD_NOT_FOUND`]: the daemon has the route,
     /// and upgrading the app would not change the answer.
     pub const NOT_SUPPORTED: i32 = 15;
+    /// An update refused only because a WebRTC peer is connected and it would drop them. Its own
+    /// code, not [`PREFLIGHT_FAILED`], because a client answers it differently from every other
+    /// refusal: it asks its user whether to drop them, and on yes sends the same call again with
+    /// `interrupt_sessions`. Matching a message would break the first time it was reworded.
+    pub const SESSIONS_CONNECTED: i32 = 16;
 }
 
 /// Request identifier. `None` on a [`Request`] makes it a notification.

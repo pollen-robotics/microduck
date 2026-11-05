@@ -62,6 +62,19 @@ pub struct Report {
     pub results: Vec<CheckResult>,
 }
 
+/// The error for the first check that failed.
+///
+/// `SessionsConnected` only when that check is the remote-session one. It runs last, so being
+/// first to fail means nothing else did, and a client that drops the sessions and asks again will
+/// not then meet a refusal it was never told about.
+pub fn refusal(failure: &CheckResult) -> Error {
+    let detail = failure.detail.clone().unwrap_or_default();
+    match failure.check {
+        Check::NoRemoteSession => Error::SessionsConnected(detail),
+        check => Error::Preflight(format!("{check:?}: {detail}")),
+    }
+}
+
 impl Report {
     pub fn passed(&self) -> bool {
         self.results.iter().all(|r| r.passed)
@@ -433,6 +446,12 @@ mod tests {
         assert_eq!(
             report.first_failure().unwrap().check,
             Check::NoRemoteSession
+        );
+
+        assert_eq!(
+            refusal(report.first_failure().unwrap()).code(),
+            crate::proto::code::SESSIONS_CONNECTED,
+            "its own code, so a client can offer to drop them"
         );
 
         let mut bypass = preflight(&robot, 0, 1_000);
