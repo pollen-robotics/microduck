@@ -1,12 +1,13 @@
-//! `nfcd` — owns the NFC reader, and pairs the gamepad a touched tag names.
+//! `nfcd` — owns the NFC reader, and starts a gamepad pairing when a pairing tag is touched.
 //!
 //! ## What it does
 //!
-//! Polls the reader five times a second. When a tag arrives, the first Bluetooth address in its
-//! NDEF is taken as a pad's: if a pad is already connected nothing happens, otherwise `configd` is
-//! asked to pair that one — with a quack from `robotd` when the tag is read and a different sound
-//! once the pad is paired. The rule and why it is that rule are
-//! in [`nfc::pairing`].
+//! Polls the reader five times a second, asking as ISO 14443A and then as ISO 15693, so a
+//! Type 2 tag (an NTAG) and a Type 5 one (an ST25TV, an ICODE) both answer. When a tag arrives
+//! whose NDEF says [`ndef::PAIRING`]: if a pad is already connected nothing happens, otherwise
+//! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
+//! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
+//! are in [`nfc::pairing`].
 //!
 //! ## Why its own daemon
 //!
@@ -34,8 +35,8 @@ use nfc::pairing::{self, Outcome, Robot, Touches};
 use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
 use nfc::spi::Spidev;
-use nfc::st25r100::{Antenna, St25r100};
-use nfc::{Error, ndef, tag};
+use nfc::st25r100::{Antenna, Proto, St25r100};
+use nfc::{Error, ndef, tag, vtag};
 
 /// Between attempts to open a reader that is not there, doubling to the cap.
 ///
@@ -52,7 +53,7 @@ const QUICK_ANSWER: Duration = Duration::from_secs(5);
 #[derive(Parser, Debug)]
 #[command(
     name = "nfcd",
-    about = "NFC reader daemon: touch a tag, pair its gamepad",
+    about = "NFC reader daemon: touch a pairing tag, pair the gamepad in pairing mode",
     version
 )]
 struct Args {
@@ -61,7 +62,9 @@ struct Args {
     #[arg(long)]
     device: Option<PathBuf>,
 
-    /// Polls a second. Detecting a tag alone costs ~35 ms, so 20 is the ceiling.
+    /// Polls a second. Detecting a tag alone costs ~35 ms on the USB reader, so 20 is the ceiling.
+    /// The beta board asks twice on each of two antennas, ~110 ms with nothing there: keep it at
+    /// 5 or below.
     #[arg(long, default_value_t = 5.0)]
     hz: f64,
 
@@ -136,6 +139,15 @@ enum Chip {
     Spi(St25r100<Spidev>),
 }
 
+/// Which protocol a tag answered on, so the read that follows knows its memory layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tech {
+    /// ISO 14443A: a Type 2 tag (NTAG), read a page at a time.
+    A,
+    /// ISO 15693: a Type 5 tag (ST25TV, ICODE), read a block at a time.
+    V,
+}
+
 impl Chip {
     fn begin(&mut self) -> nfc::Result<()> {
         match self {
@@ -151,20 +163,33 @@ impl Chip {
         }
     }
 
-    /// Look for a tag on every antenna in turn; the first one seen wins, and the field stays on
-    /// that antenna for whatever is read next.
-    fn select(&mut self) -> nfc::Result<Vec<u8>> {
+    /// Look for a tag on every antenna in turn, asking as ISO 14443A first and then as ISO
+    /// 15693; the first one seen wins, and the field stays on that antenna for whatever is read
+    /// next.
+    fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech)> {
         let Chip::Spi(c) = self else {
-            return tag::select(self);
+            return tag::select(self).map(|uid| (uid, Tech::A));
         };
+        // Whatever the last touch left the chip framing, the 14443A ask starts from its own.
+        c.set_proto(Proto::A)?;
         let mut last = Error::NoTag;
         for antenna in [Antenna::One, Antenna::Two] {
             c.set_antenna(antenna)?;
             match tag::select(c) {
-                Ok(uid) => return Ok(uid),
+                Ok(uid) => return Ok((uid, Tech::A)),
+                Err(e) if !e.is_tag() => return Err(e),
+                _ => {}
+            }
+            // The 14443A error is superseded by whatever the 15693 ask says. The field is cycled
+            // so it comes back with the AM regulator ISO 15693 is sent through.
+            c.set_proto(Proto::V)?;
+            c.reset_field()?;
+            match vtag::inventory(c) {
+                Ok(uid) => return Ok((uid, Tech::V)),
                 Err(e) if e.is_tag() => last = e,
                 Err(e) => return Err(e),
             }
+            c.set_proto(Proto::A)?;
         }
         Err(last)
     }
@@ -201,8 +226,8 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
     let mut touches = Touches::default();
     loop {
         let start = Instant::now();
-        let uid = match chip.select() {
-            Ok(uid) => Some(uid),
+        let touched = match chip.select() {
+            Ok(found) => Some(found),
             Err(e) if e.is_tag() => None,
             Err(e) => {
                 // A desynchronised link comes back with a soft reset; an unplugged one does not,
@@ -215,31 +240,35 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
             }
         };
 
-        if let Some(uid) = uid.as_deref()
+        if let Some((uid, tech)) = touched.as_ref().map(|(uid, tech)| (uid.as_slice(), *tech))
             && touches.seen(Some(uid))
         {
             let id = hex(uid);
-            match tag::read_ndef_area(chip).map(|data| ndef::parse(&data)) {
+            let read = match tech {
+                Tech::A => tag::read_ndef_area(chip),
+                Tech::V => vtag::read_ndef_area(chip, uid),
+            };
+            match read.map(|data| ndef::parse(&data)) {
                 Err(e) if !e.is_tag() => return e,
                 Err(e) => {
                     tracing::info!(tag = %id, error = %e, "tag not read; trying again");
                     touches.unread();
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
-                Ok(Ok(records)) => match ndef::mac_in(&records) {
-                    None => tracing::warn!(tag = %id, ?records, "tag carries no Bluetooth address"),
-                    Some(mac) => {
-                        // Off while the pairing blocks: no reason to power the antenna for the
-                        // fifteen seconds nobody is reading it.
-                        if let Err(e) = chip.field_off() {
-                            return e;
-                        }
-                        tracing::warn!(tag = %id, %mac, "tag touched");
-                        report(&mac, pairing::on_touch(robot, &mac));
+                Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
+                    tracing::warn!(tag = %id, ?records, "not a pairing tag")
+                }
+                Ok(Ok(_)) => {
+                    // Off while the pairing blocks: no reason to power the antenna for the
+                    // fifteen seconds nobody is reading it.
+                    if let Err(e) = chip.field_off() {
+                        return e;
                     }
-                },
+                    tracing::warn!(tag = %id, "pairing tag touched — looking for a pad in pairing mode");
+                    report(pairing::on_touch(robot));
+                }
             }
-        } else if uid.is_none() {
+        } else if touched.is_none() {
             touches.seen(None);
         }
 
@@ -249,20 +278,21 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
     }
 }
 
-fn report(mac: &str, outcome: Outcome) {
+fn report(outcome: Outcome) {
     match outcome {
         Outcome::AlreadyConnected(pad) => {
-            tracing::warn!(%mac, driving = %pad.mac, name = %pad.name, "a pad is already connected — nothing to do")
+            tracing::warn!(driving = %pad.mac, name = %pad.name, "a pad is already connected — nothing to do")
         }
         Outcome::Paired(pad) => tracing::warn!(mac = %pad.mac, name = %pad.name, "paired"),
         Outcome::PairedSilently(pad, why) => {
             tracing::warn!(mac = %pad.mac, name = %pad.name, %why, "paired, but the robot would not make a sound")
         }
         Outcome::NotPaired(reason, detail) => tracing::warn!(
-            %mac, ?reason, ?detail,
+            ?reason,
+            ?detail,
             "not paired — is the pad in pairing mode? Lift the tag and touch again to retry"
         ),
-        Outcome::Failed(why) => tracing::error!(%mac, %why, "could not ask the robot"),
+        Outcome::Failed(why) => tracing::error!(%why, "could not ask the robot"),
     }
 }
 
@@ -290,11 +320,8 @@ impl Robot for Sockets {
         Ok(status.pads)
     }
 
-    fn pair(&mut self, mac: &str) -> Result<proto::PadPairResult, String> {
-        let params = proto::PadPairParams {
-            mac: Some(mac.to_owned()),
-            timeout_seconds: None,
-        };
+    fn pair(&mut self) -> Result<proto::PadPairResult, String> {
+        let params = proto::PadPairParams::default();
         call(&self.config, &proto::Call::PadPair(params), PAIR_ANSWER)
     }
 

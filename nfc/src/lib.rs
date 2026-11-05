@@ -1,4 +1,5 @@
-//! The NFC reader: a CLRC663 on USB serial, reading NTAG215 tags.
+//! The NFC reader: a CLRC663 on USB serial or an ST25R100 on SPI, reading Type 2 (NTAG) and
+//! Type 5 (ISO 15693) tags.
 //!
 //! A port of `ntag663` from the winnie repo, cut down to what `nfcd` does — find a tag, read its
 //! NDEF — and without its writer, which stays a bench tool on a laptop. The measurements behind
@@ -6,9 +7,9 @@
 //! were made on that board and are kept next to the code they justify.
 //!
 //! Layered as the Python is: [`transport`] frames register accesses over the serial link,
-//! [`clrc663`] is the chip, [`tag`] is ISO-14443A selection and the Type 2 reads, [`ndef`] is
-//! pure parsing. [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a
-//! laptop.
+//! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
+//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
+//! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
 
 pub mod clrc663;
 pub mod ndef;
@@ -20,6 +21,7 @@ pub mod spi;
 pub mod st25r100;
 pub mod tag;
 pub mod transport;
+pub mod vtag;
 
 /// Everything that can go wrong between the serial port and a tag.
 #[derive(Debug)]
