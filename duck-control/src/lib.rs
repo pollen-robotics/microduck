@@ -20,7 +20,7 @@ pub mod safety;
 pub mod sim;
 
 pub use imu::ImuData;
-pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
+pub use io::{Census, FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
     REST_POSITION, battery_percent,

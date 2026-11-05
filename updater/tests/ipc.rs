@@ -115,11 +115,17 @@ impl Harness {
     }
 
     fn engine_with(&self, healthy: bool, faults: Faults, extra: &str) -> Engine {
+        // On: what this file tests about failed releases — the unattended path not retrying one —
+        // is about a release that was reverted.
+        let robotd = self.root.join("etc/robot/robotd.toml");
+        std::fs::create_dir_all(robotd.parent().unwrap()).unwrap();
+        std::fs::write(&robotd, "[update_gate]\nauto_rollback = true\n").unwrap();
         let config = Config::from_toml(&format!(
             r#"
 trusted_keys_dir = "{keys}"
 hw_rev = 1
 state_dir = "{state}"
+robotd_config = "{robotd}"
 
 {extra}
 
@@ -131,6 +137,7 @@ health = {{ probe = "socket", timeout = "2s" }}
 "#,
             keys = self.root.join("keys").display(),
             state = self.root.join("var/lib/robot/updater").display(),
+            robotd = robotd.display(),
             install = self.root.join("opt/robot/daemon").display(),
             published = self.publisher.releases.display(),
             extra = extra,

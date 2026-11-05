@@ -1,25 +1,23 @@
 # The team dev key
 
 `team.dev.pub` — the public half of the key CI signs branch builds with, so
-`robotctl update apply --ref <branch>` works on a board that trusts it.
+`robotctl update apply --ref <branch>` works on a dev board.
 
-**Not in [`../trusted_keys/`](../trusted_keys/), deliberately.** That directory is copied onto
-*every* robot by `scripts/install.sh`, and a robot that trusts this key installs anything anyone
-on the team builds. This one is here instead, where nothing installs it by default —
-`provision-board.sh` sends it, and `--no-dev-key` declines.
+**`updaterd` compiles this file in** (`updater::verify::BUILTIN_DEV_KEY`), always as a dev-only
+key: every robot carries it, and it counts only on a robot made a dev board with
+`sudo robotctl configure --allow-dev-daemon on`. Nobody copies it onto a board for that.
+[`updater-design.md`](../../docs/design/updater-design.md) §5.4 owns the mechanism.
+
+**Not in [`../trusted_keys/`](../trusted_keys/), deliberately.** Every file there is copied onto
+every robot by `scripts/install.sh` and trusted as a *release* key, so a robot would install
+anything anyone on the team builds. Provisioning still sends this file (`provision-board.sh`,
+`--no-dev-key` declines), which is the path for an `updaterd` that predates the built-in key.
 
 **Committing a public key gives nothing away.** Signing a build needs the private half, which
-lives in `~/.duck-keys` and never leaves it. A board still only accepts dev builds if two
-separate things are true — the key is in that board's `trusted_keys_dir`, *and*
-`allow_dev_keys = true` in its `updater.toml`. Both are off on a customer robot, and neither is
-changed by this file existing.
+lives in `~/.duck-keys` and never leaves it.
 
-It was previously kept out of the repository entirely. That protected nothing the two flags above
-do not already protect, and cost every new developer a round trip asking someone for a file.
-
-Regenerating it, if the private half is ever lost — every existing dev board then needs the new
-public half installed by hand, because a board only trusts what is already in its
-`trusted_keys_dir`:
+Regenerating it, if the private half is ever lost — the new public half reaches dev boards with
+the release built from it, since it is compiled into `updaterd`:
 
 ```bash
 minisign -R -s ~/.duck-keys/team.dev.key -p team.dev.pub

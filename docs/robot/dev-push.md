@@ -111,9 +111,9 @@ robotctl version
 Two pushes of the same dirty tree never collide — the version carries the push's timestamp, not
 just the commit. The tree is expected to be dirty here.
 
-**This is an ordinary update.** The signature, the artifact hash, compatibility, the health gate
-and auto-rollback all run: a build that does not come up is reverted and the board is back on what
-it was running. Going back on purpose is the ordinary command too:
+**This is an ordinary update.** The signature, the artifact hash, compatibility and the health gate
+all run. A build that does not come up stays live and is reported stuck, unless `auto_rollback` is
+on in `robotctl configure`. Going back is the ordinary command:
 
 ```bash
 sudo robotctl update rollback daemon
@@ -265,14 +265,14 @@ is one. On a board whose release predates that check, the same mistake reads as
 manifest.
 
 **`verification failed: signature did not verify against any of N usable trusted key(s)`** — reads
-like a corrupt release, and usually means the board is not a dev board: the dev key never landed, or
-`allow_dev_keys` is off, either of which leaves that key out of the usable set. On the board:
+like a corrupt release, and usually means the board is not a dev board, which leaves the dev key
+out of the usable set. On the board:
 
 ```bash
-grep -c 'DEV BOARD' /var/lib/robot/provision.log
+sudo robotctl configure --allow-dev-daemon on
 ```
 
-`0` means the key is missing; [`install-dev.md`](install-dev.md) has both halves of the fix.
+It says so if the board already was one ([`install-dev.md`](install-dev.md#making-an-existing-board-take-dev-builds)).
 
 **`could not reach <name> over Bluetooth`** — the robot has to be advertising and in range for
 the name path to resolve an address.
