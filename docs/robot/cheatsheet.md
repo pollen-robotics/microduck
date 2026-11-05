@@ -139,6 +139,7 @@ rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
 | 7 late short brake | 6 | 20 | 400 | 32767 | 9 | 50 | brakes on arrivals above 6 rad/s only |
 | 8 late brake | 6 | 50 | 400 | 32767 | 9 | 50 | 7 with the factory brake length |
 | 9 earlier short brake | 4 | 20 | 400 | 32767 | 9 | 50 | 7 from 4 rad/s |
+| R recommended | 6 | 20 | 400 | 32767 | 7 | 40 | 7 with a stronger taper: arrivals capped near 7 rad/s |
 
 With the same ONNX, 0 walks and 5, 5a and 5b keep falling. The taper is not the cause: in a
 guard-off walk the gait never needed more PWM than the factory taper leaves (one sample in 3,455).
@@ -147,20 +148,26 @@ step of each knee, mostly from under 3 rad/s, and 50 ms of shorted bridge is clo
 knee in stance. The hold made it worse, since it lasts until the goal comes back past the position,
 which in stance it does not.
 
-6 to 9 keep the factory taper, drop the hold and move the brake. 6 never brakes. 7 and 8 brake
-only on arrivals faster than 6 rad/s, which a knee reaches during 1.5 % of a guard-off walk, and 7
-against 8 is the brake's length. 9 brakes from 4 rad/s. Step through them in order until the robot
-walks worse: the level before is the compromise, and the hold comes back on it last
-(`impact_guard_i_hold_ma` 800, then 650). Record every run: `impact_guard` says which joints braked
-or held. Each level is the keys that differ from the factory, in `/var/lib/robot/robotd.toml`, for
-7:
+On lavandiere (2026-11-05, same ONNX, a minute of walking and about ten pushes per setting), 6 and
+7 walked and recovered like 0: no fall in 20 pushes. Every hold (800, 650 or 500 mA, on 7 or 8)
+and the 50 ms brake weakened push recovery: 6 falls in 31 pushes. A recovery step trips the brake,
+and the hold then softens the stance leg; a hold reads about half its setting in Present Current.
+So the hold stays off until the firmware can end it on its own (after 100-150 ms, or once the servo
+is still). The taper costs nothing up to 40 % from 7 rad/s, which keeps arrivals near 7 rad/s
+(8.5 guard off). 30 % from 7 felt slightly less steady, so R is one notch inside that edge. R held
+over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is the keys that
+differ from the factory, in `/var/lib/robot/robotd.toml`:
 
 ```toml
 [bus]
 impact_guard_v_min = 6
 impact_guard_brake_ms = 20
 impact_guard_i_hold_ma = 32767
+impact_guard_v_fast = 7
+impact_guard_pwm_fast = 40
 ```
+
+Record every run: `impact_guard` says which joints braked or held.
 
 ### Configuring the robot
 
