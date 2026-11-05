@@ -135,14 +135,30 @@ rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
 | 5 factory | 1 | 50 | 400 | 500 | 9 | 50 | the defaults: ROBOTIS's, the gear bench's |
 | 5a factory, no taper | 1 | 50 | 400 | 500 | 9 | 100 | isolates the taper |
 | 5b factory, no hold | 1 | 50 | 400 | 32767 | 9 | 50 | the brake and the taper, no soft hold |
+| 6 factory taper only | 1 | 50 | 32767 | 32767 | 9 | 50 | never brakes |
+| 7 late short brake | 6 | 20 | 400 | 32767 | 9 | 50 | brakes on arrivals above 6 rad/s only |
+| 8 late brake | 6 | 50 | 400 | 32767 | 9 | 50 | 7 with the factory brake length |
+| 9 earlier short brake | 4 | 20 | 400 | 32767 | 9 | 50 | 7 from 4 rad/s |
 
-On a walking robot a foot strike trips the guard, and the hold that follows lasts until the goal
-comes back past the position, which in stance it does not: knees and hip pitches go soft under the
-robot's weight. 5b keeps what cuts the impact peak on the bench, the brake and the taper, without
-that hold. It is one key in `/var/lib/robot/robotd.toml`, the five others staying at the factory:
+With the same ONNX, 0 walks and 5, 5a and 5b keep falling. The taper is not the cause: in a
+guard-off walk the gait never needed more PWM than the factory taper leaves (one sample in 3,455).
+The brake is: at 5 it fired about 6 times a second across the legs while walking, on nearly every
+step of each knee, mostly from under 3 rad/s, and 50 ms of shorted bridge is close to limp for a
+knee in stance. The hold made it worse, since it lasts until the goal comes back past the position,
+which in stance it does not.
+
+6 to 9 keep the factory taper, drop the hold and move the brake. 6 never brakes. 7 and 8 brake
+only on arrivals faster than 6 rad/s, which a knee reaches during 1.5 % of a guard-off walk, and 7
+against 8 is the brake's length. 9 brakes from 4 rad/s. Step through them in order until the robot
+walks worse: the level before is the compromise, and the hold comes back on it last
+(`impact_guard_i_hold_ma` 800, then 650). Record every run: `impact_guard` says which joints braked
+or held. Each level is the keys that differ from the factory, in `/var/lib/robot/robotd.toml`, for
+7:
 
 ```toml
 [bus]
+impact_guard_v_min = 6
+impact_guard_brake_ms = 20
 impact_guard_i_hold_ma = 32767
 ```
 
