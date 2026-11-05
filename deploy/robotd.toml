@@ -47,27 +47,29 @@ port = "/dev/ttyS2"
 # fast_sync_read = true
 
 # The impact guard on servos running ROBOTIS's impact guard firmware (V3, firmware_version 3):
-# a servo that hits something brakes 50 ms, then holds at 0.5 A until its goal comes back,
-# and its PWM limit falls from 100 % at rest to 50 % at 9 rad/s — what keeps the gear teeth
-# whole. OFF writes settings that never fire, which leaves the factory firmware with only
-# Current Limit (1000 mA either way). robotd writes them to every V3 servo when it starts with
-# torque off; a robot standing at the restart gets them at the next start. Needs a robotd
-# restart.
+# a servo that arrives faster than 6 rad/s and hits something brakes 20 ms, and its PWM limit
+# falls from 100 % at rest to 40 % at 7 rad/s, which keeps arrivals near 7 rad/s — what keeps
+# the gear teeth whole and still lets the policy walk and catch a push. OFF writes settings that
+# never fire, which leaves the factory firmware with only Current Limit (1000 mA either way).
+# robotd writes them to every V3 servo when it starts with torque off; a robot standing at the
+# restart gets them at the next start. Needs a robotd restart.
 # impact_guard = true
 
-# What ON writes, in the registers' units — ROBOTIS's factory values below, the ones the gear
-# bench validated. An impact is a deceleration past impact_guard_decel rad/s² while the servo
-# moves toward its goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for
-# impact_guard_brake_ms and the servo holds at impact_guard_i_hold_ma until its goal comes back
-# past it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at
-# impact_guard_v_fast rad/s (never 0). A start that writes anything else says so in the journal,
-# so a recording can be matched to the settings it ran on.
-# impact_guard_v_min = 1
-# impact_guard_brake_ms = 50
+# What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's
+# factory values, the gear bench's (V Min 1, brake 50, hold 500 mA, 50 % at 9 rad/s), tripped
+# the brake on nearly every step and their hold softened the stance leg, so the robot fell.
+# An impact is a deceleration past impact_guard_decel rad/s² while the servo moves toward its
+# goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for impact_guard_brake_ms
+# and the servo holds at impact_guard_i_hold_ma (32767: no hold) until its goal comes back past
+# it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at impact_guard_v_fast
+# rad/s (never 0). A start that writes anything else says so in the journal, so a recording can
+# be matched to the settings it ran on.
+# impact_guard_v_min = 6
+# impact_guard_brake_ms = 20
 # impact_guard_decel = 400
-# impact_guard_i_hold_ma = 500
-# impact_guard_v_fast = 9
-# impact_guard_pwm_fast = 50
+# impact_guard_i_hold_ma = 32767
+# impact_guard_v_fast = 7
+# impact_guard_pwm_fast = 40
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to

@@ -160,16 +160,20 @@ pub struct ImpactGuard {
 }
 
 impl ImpactGuard {
-    /// ROBOTIS's factory values, which are the gear-breakage bench's: brake 50 ms on a
-    /// deceleration past 400 rad/s² toward the goal, then hold at 0.5 A; and a PWM limit falling
-    /// from PWM Limit at rest to 50 % at 9 rad/s.
-    pub const FACTORY: Self = Self {
-        v_min: 1,
-        brake_ms: 50,
+    /// What a microduck walks with: brake 20 ms on a deceleration past 400 rad/s² toward the goal
+    /// faster than 6 rad/s, no hold, and a PWM limit falling from PWM Limit at rest to 40 % at
+    /// 7 rad/s, which keeps arrivals near 7 rad/s. Found on a robot with the walking ONNX
+    /// (2026-11-05). ROBOTIS's factory values, the gear bench's (V Min 1, brake 50 ms, hold
+    /// 0.5 A, 50 % at 9 rad/s), tripped the brake on nearly every step, and the hold, which
+    /// lasts until the goal comes back past the position, softened the stance leg: the robot
+    /// kept falling. The hold stays off until the firmware can end it on its own.
+    pub const DEFAULT: Self = Self {
+        v_min: 6,
+        brake_ms: 20,
         decel: 400,
-        i_hold_ma: 500,
-        v_fast: 9,
-        pwm_fast: 50,
+        i_hold_ma: 32767,
+        v_fast: 7,
+        pwm_fast: 40,
     };
 
     /// The factory firmware with only Current Limit: a deceleration no impact reaches, a hold
@@ -178,7 +182,7 @@ impl ImpactGuard {
         decel: 32767,
         i_hold_ma: 32767,
         pwm_fast: 100,
-        ..Self::FACTORY
+        ..Self::DEFAULT
     };
 
     /// The two EEPROM blocks the settings fill, as (address, bytes): 40–43 (V Min, Brake Time,
@@ -279,14 +283,14 @@ mod tests {
             .for_each(|w| assert_ne!(w[0], w[1], "duplicate Dynamixel ID {}", w[0]));
     }
 
-    /// The factory must be byte for byte what ROBOTIS ships, the settings the bench validated;
-    /// off must be unreachable rather than merely high, and keep V Fast off zero, which the
-    /// firmware divides by.
+    /// The default must be byte for byte the setting the robot test settled on; off must be
+    /// unreachable rather than merely high, and keep V Fast off zero, which the firmware divides
+    /// by.
     #[test]
-    fn impact_guard_factory_is_robotis_and_off_never_fires() {
+    fn impact_guard_default_is_the_robot_setting_and_off_never_fires() {
         assert_eq!(
-            ImpactGuard::FACTORY.blocks(),
-            [(40, [1, 50, 0x90, 0x01]), (56, [0xF4, 0x01, 9, 50])]
+            ImpactGuard::DEFAULT.blocks(),
+            [(40, [6, 20, 0x90, 0x01]), (56, [0xFF, 0x7F, 7, 40])]
         );
         let [(_, low), (_, high)] = ImpactGuard::OFF.blocks();
         assert_eq!(u16::from_le_bytes([low[2], low[3]]), 32767, "deceleration");

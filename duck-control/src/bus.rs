@@ -151,13 +151,13 @@ impl DynamixelIo {
             port: port.to_owned(),
             ids,
             fast_sync_read,
-            impact_guard: ImpactGuard::FACTORY,
+            impact_guard: ImpactGuard::DEFAULT,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
     }
 
-    /// The impact guard settings `robotd.toml` asks for: ROBOTIS's factory values unless told
+    /// The impact guard settings `robotd.toml` asks for: [`ImpactGuard::DEFAULT`] unless told
     /// otherwise, or [`ImpactGuard::OFF`]. Applied by [`Self::check_registers`], so call it before.
     pub fn set_impact_guard(&mut self, guard: ImpactGuard) {
         self.impact_guard = guard;

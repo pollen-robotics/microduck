@@ -2522,9 +2522,10 @@ pub struct Bus {
     /// broken gear teeth. Off writes settings that never fire, which leaves the factory firmware
     /// with only Current Limit: the comparison a test on robots needs. Written to every V3 servo
     /// at startup with torque off; servos on any other firmware have no guard to set. On writes
-    /// the six `impact_guard_*` settings below, ROBOTIS's factory values (the gear-breakage
-    /// bench's) unless changed: changing them is how a robot test looks for a guard that keeps the
-    /// gears whole and still lets the policy walk.
+    /// the six `impact_guard_*` settings below. Their defaults are what a microduck walks with:
+    /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
+    /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
+    /// test looks for a guard that keeps the gears whole and still lets the policy walk.
     pub impact_guard: bool,
     /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
     pub impact_guard_v_min: u8,
@@ -2657,12 +2658,12 @@ impl Default for Bus {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
             impact_guard: true,
-            impact_guard_v_min: 1,
-            impact_guard_brake_ms: 50,
+            impact_guard_v_min: 6,
+            impact_guard_brake_ms: 20,
             impact_guard_decel: 400,
-            impact_guard_i_hold_ma: 500,
-            impact_guard_v_fast: 9,
-            impact_guard_pwm_fast: 50,
+            impact_guard_i_hold_ma: 32767,
+            impact_guard_v_fast: 7,
+            impact_guard_pwm_fast: 40,
         }
     }
 }

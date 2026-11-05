@@ -317,9 +317,10 @@ same with or without it — and only from a robot where at least one servo runs 
 firmware is read once a start with the vet book's identity read, and every servo on another one is
 named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
 (40–43 and 56–59), asserted by the same startup check as the registers above: the six
-`bus.impact_guard_*` settings, ROBOTIS's factory values by default, or with
-`bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never draws
-and no speed taper — the factory firmware with only Current Limit.
+`bus.impact_guard_*` settings, by default what a microduck walks with (a short brake on fast
+arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
+with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
+draws and no speed taper — the factory firmware with only Current Limit.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than

@@ -116,9 +116,9 @@ names any servo not on V3 in the journal once a start, and sets every servo's Cu
 `bus.impact_guard` in `sudo robotctl configure` switches every V3 servo between the guard (on,
 the default) and settings that never fire (off): the factory firmware with only Current Limit, to
 compare the two on the same robot. On writes the six `bus.impact_guard_*` rows beside it, which
-default to ROBOTIS's values: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
-V Fast (rad/s) and PWM Fast (%). Changing them is how to look for a gentler guard; a start on
-anything but the factory values names them in the journal. They are written when `robotd` starts
+default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
+V Fast (rad/s) and PWM Fast (%). Changing them is how to look for another guard; a start on
+anything but the defaults names them in the journal. They are written when `robotd` starts
 with torque off, so restart it with the robot limp, and `impact_guard` staying at 0 in the
 recording is what off looks like.
 
@@ -132,14 +132,14 @@ rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
 | 2 light | 3 | 20 | 1500 | 1000 | 9 | 80 | hard impacts only, a short brake, a near-normal hold |
 | 3 medium | 2 | 30 | 1000 | 800 | 9 | 70 | |
 | 4 strong | 1 | 40 | 600 | 650 | 9 | 60 | close to the factory |
-| 5 factory | 1 | 50 | 400 | 500 | 9 | 50 | the defaults: ROBOTIS's, the gear bench's |
+| 5 factory | 1 | 50 | 400 | 500 | 9 | 50 | ROBOTIS's factory values, the gear bench's |
 | 5a factory, no taper | 1 | 50 | 400 | 500 | 9 | 100 | isolates the taper |
 | 5b factory, no hold | 1 | 50 | 400 | 32767 | 9 | 50 | the brake and the taper, no soft hold |
 | 6 factory taper only | 1 | 50 | 32767 | 32767 | 9 | 50 | never brakes |
 | 7 late short brake | 6 | 20 | 400 | 32767 | 9 | 50 | brakes on arrivals above 6 rad/s only |
 | 8 late brake | 6 | 50 | 400 | 32767 | 9 | 50 | 7 with the factory brake length |
 | 9 earlier short brake | 4 | 20 | 400 | 32767 | 9 | 50 | 7 from 4 rad/s |
-| R recommended | 6 | 20 | 400 | 32767 | 7 | 40 | 7 with a stronger taper: arrivals capped near 7 rad/s |
+| R default | 6 | 20 | 400 | 32767 | 7 | 40 | 7 with a stronger taper: arrivals capped near 7 rad/s |
 
 With the same ONNX, 0 walks and 5, 5a and 5b keep falling. The taper is not the cause: in a
 guard-off walk the gait never needed more PWM than the factory taper leaves (one sample in 3,455).
@@ -155,16 +155,16 @@ and the hold then softens the stance leg; a hold reads about half its setting in
 So the hold stays off until the firmware can end it on its own (after 100-150 ms, or once the servo
 is still). The taper costs nothing up to 40 % from 7 rad/s, which keeps arrivals near 7 rad/s
 (8.5 guard off). 30 % from 7 felt slightly less steady, so R is one notch inside that edge. R held
-over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is the keys that
-differ from the factory, in `/var/lib/robot/robotd.toml`:
+over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is the default;
+a robot that should run ROBOTIS's factory values instead takes, in `/var/lib/robot/robotd.toml`:
 
 ```toml
 [bus]
-impact_guard_v_min = 6
-impact_guard_brake_ms = 20
-impact_guard_i_hold_ma = 32767
-impact_guard_v_fast = 7
-impact_guard_pwm_fast = 40
+impact_guard_v_min = 1
+impact_guard_brake_ms = 50
+impact_guard_i_hold_ma = 500
+impact_guard_v_fast = 9
+impact_guard_pwm_fast = 50
 ```
 
 Record every run: `impact_guard` says which joints braked or held.
