@@ -691,8 +691,8 @@ the thumb:
 | **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
 | **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
 | **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
-| **Select**, let go between 2 and 4 s | rest (`robot.rest`): a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
-| **Select**, held 4 s | power off (`robot.shutdown`): the same sit and rest pose, then the board switches off. The release afterwards does nothing more |
+| **Select**, held 2 s | rest (`robot.rest`), at once, without waiting for the release — the robot sitting down says the two seconds are up: a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
+| **Select**, held 4 s | power off (`robot.shutdown`): kept by the robot until the rest it started at 2 s has ended, then the board switches off. The release afterwards does nothing more |
 
 **One move at a time.** A kick, a pick or a sit is refused while another is running, and a
 seated robot only accepts A (stand up). Stopping the policy while it sits keeps it seated; cutting

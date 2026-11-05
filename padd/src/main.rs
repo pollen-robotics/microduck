@@ -41,8 +41,8 @@
 //! Home            flashlight on / off (a board with one)
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
-//! Select, 2–4 s   let go: sit, rest pose, then torque off and every servo rebooted
-//! Select, 4 s     sit, rest pose, then power off
+//! Select, 2 s     still held: sit, rest pose, then torque off and every servo rebooted
+//! Select, 4 s     still held: power off once that rest has ended
 //! ```
 //!
 //! The D-pad *selects* a mode rather than toggling one, so a press always lands where its arrow
@@ -296,7 +296,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — A sit, B ground pick, triggers mouth; D-pad up head, \
          right head + move, left move, down body + head; Start stands up then toggles the policy, \
-         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
+         Start (1.5s) home pose; Select (2s) rest, Select (4s) power off"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
