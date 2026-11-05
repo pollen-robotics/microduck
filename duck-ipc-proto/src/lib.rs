@@ -5718,7 +5718,6 @@ pub mod clock {
             assert!(b >= a);
             assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
         }
-
     }
 }
 
