@@ -190,15 +190,18 @@ The data is expensive, so a run has to survive what happens to the robot:
 - **Where.** `/var/lib/robot/stress/`, on the data partition. `/var/lib` is on the root filesystem,
   which is one per A/B slot: on 2026-11-04 a fallback from B to A hid a morning of runs on the slot
   no longer booted.
-- **When.** Nothing starts until a time server has set the clock. The board has no battery-backed
+- **When.** Nothing starts until the network has set the clock. The board has no battery-backed
   clock and boots on the last time it saved; a boot with no wifi stayed there, and its runs took
   yesterday's name and wall times, wrong by an amount nothing recorded. Waiting is simpler and
   surer than correcting afterwards, and the cost is that a robot with no network does not test.
+  NTP does not always get through (the image's servers are Google's, unreachable from mainland
+  China), so from 20 s the `Date` headers of web servers set the clock once two agree within 5 s; `clock` in the segment says which it was. The wait has no limit, so
+  neither does the boot unit's `TimeoutStartSec`.
 - **Whole files.** `meta.json` is replaced atomically (written in place, it was left at 0 bytes). A
   reopened run cuts a half-written row off each CSV before appending, and logs `repaired`; an
   unreadable `meta.json` is set aside, not overwritten.
 - **What it ran on.** Each segment records `revision`, `release`, `slot`, `os`, `policies` (SHA-256
-  by file), `config` (the whole `robotd.toml`) and `note`. Every build of a release says the same
+  by file), `config` (the whole `robotd.toml`), `clock` and `note`. Every build of a release says the same
   version, which is how mixed builds went unnoticed.
 - **Why it did what it did.** At each start, every earlier boot with a run here and no saved log
   gets `journal/<boot id>.txt` in that run, before the journal rotates it away.

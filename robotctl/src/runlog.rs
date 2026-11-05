@@ -7,6 +7,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -353,6 +354,21 @@ pub(crate) fn repair_tail(path: &Path) -> std::io::Result<u64> {
 
 /// How often the wait for the clock says it is still waiting.
 const CLOCK_REPORT: Duration = Duration::from_secs(30);
+/// The servers asked for `Date:`, of which two must agree, and by how much, s. All answer plain
+/// HTTP with one (`github.com` does not). Two groups, because neither reaches everywhere: from
+/// mainland China the second pair is usually blocked, and so are Google's time servers.
+const WEB_CLOCKS: [&str; 4] = [
+    "www.baidu.com",
+    "www.qq.com",
+    "www.google.com",
+    "huggingface.co",
+];
+const WEB_CLOCK_AGREE: i64 = 5;
+/// How long a time server gets before the web is asked as well, then how often that is retried.
+const WEB_CLOCK_AFTER: Duration = Duration::from_secs(20);
+const WEB_CLOCK_EVERY: Duration = Duration::from_secs(15);
+/// Says the clock was set from the web this boot, and from what.
+const WEB_CLOCK_MARK: &str = "/run/robotctl-clock-from-web";
 
 /// `timedatectl`'s answer, as `timedatectl show -p NTPSynchronized --value` prints it.
 fn says_synchronized(output: &str) -> bool {
@@ -366,15 +382,129 @@ fn clock_synchronized() -> bool {
         .is_ok_and(|o| o.status.success() && says_synchronized(&String::from_utf8_lossy(&o.stdout)))
 }
 
-/// Hold until a time server has set the clock, however long that takes.
+/// `Date:` from a web server. Plain HTTP because this is what runs while the clock is unknown, and
+/// checking a certificate needs the clock. [`web_time`] is what stands in for that check.
+fn http_date(host: &str, port: u16) -> Option<i64> {
+    const PATIENCE: Duration = Duration::from_secs(5);
+    let mut stream = (host, port)
+        .to_socket_addrs()
+        .ok()?
+        .find_map(|addr| TcpStream::connect_timeout(&addr, PATIENCE).ok())?;
+    stream.set_read_timeout(Some(PATIENCE)).ok()?;
+    let ask = format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(ask.as_bytes()).ok()?;
+    std::io::BufReader::new(stream)
+        .lines()
+        .map_while(Result::ok)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("date")
+                .then(|| parse_http_date(value))?
+        })
+}
+
+/// `Thu, 05 Nov 2026 03:24:12 GMT` as Unix seconds.
+fn parse_http_date(text: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let [_weekday, day, month, year, time, "GMT"] =
+        *text.split_whitespace().collect::<Vec<_>>().as_slice()
+    else {
+        return None;
+    };
+    let month = MONTHS.iter().position(|m| *m == month)? as i64 + 1;
+    let (day, year): (i64, i64) = (day.parse().ok()?, year.parse().ok()?);
+    let mut clock = time.split(':').map(str::parse::<i64>);
+    let (hour, minute, second) = (
+        clock.next()?.ok()?,
+        clock.next()?.ok()?,
+        clock.next()?.ok()?,
+    );
+    // Days from the civil calendar: the year starts in March, so a leap day comes last.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y.rem_euclid(400);
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Two of these within [`WEB_CLOCK_AGREE`] of each other, and the later of them. One server is a
+/// captive portal or a stale cache away from being wrong; two that agree are not.
+fn agreed(times: &[i64]) -> Option<i64> {
+    let mut sorted = times.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .windows(2)
+        .find(|pair| pair[1] - pair[0] <= WEB_CLOCK_AGREE)
+        .map(|pair| pair[1])
+}
+
+/// The web's time, and which servers gave it. Asked in turn, stopping at the first two that agree.
+fn web_time() -> Option<(i64, Vec<&'static str>)> {
+    let (mut times, mut hosts) = (Vec::new(), Vec::new());
+    for host in WEB_CLOCKS {
+        if let Some(time) = http_date(host, 80) {
+            times.push(time);
+            hosts.push(host);
+            if let Some(now) = agreed(&times) {
+                return Some((now, hosts));
+            }
+        }
+    }
+    None
+}
+
+fn set_clock(unix_secs: i64) -> bool {
+    let now = libc::timespec {
+        tv_sec: unix_secs as libc::time_t,
+        tv_nsec: 0,
+    };
+    // Safety: `now` is a valid timespec for the length of the call.
+    unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &now) == 0 }
+}
+
+/// Set from the web this boot, or by a time server. The mark is in `/run`, so it lasts exactly as
+/// long as the clock it vouches for.
+fn clock_trusted() -> bool {
+    Path::new(WEB_CLOCK_MARK).exists() || clock_synchronized()
+}
+
+/// Hold until the clock has been set over the network, however long that takes.
 ///
 /// The board has no battery-backed clock: it boots on the last time it saved, and stays there for
 /// as long as it has no network. Runs started like that were named after the day before, with
 /// every wall time wrong by an amount nothing recorded. Nothing is created until this returns.
+///
+/// A time server is the answer wherever NTP gets through, but some wifi blocks it outright while
+/// the web works, so after [`WEB_CLOCK_AFTER`] the web is asked too. That sets the system clock,
+/// which is what a time server would have done, and `timesyncd` still corrects it if it ever can.
 pub(crate) fn wait_for_clock() {
     let t0 = Instant::now();
     let mut next_report = Duration::ZERO;
-    while !clock_synchronized() {
+    let mut next_web = WEB_CLOCK_AFTER;
+    while !clock_trusted() {
+        if t0.elapsed() >= next_web {
+            next_web += WEB_CLOCK_EVERY;
+            match web_time() {
+                Some((now, hosts)) if set_clock(now) => {
+                    let source = format!("web: {}", hosts.join(", "));
+                    if let Err(e) = std::fs::write(WEB_CLOCK_MARK, &source) {
+                        eprintln!("could not write {WEB_CLOCK_MARK}: {e}");
+                    }
+                    println!("no answer from a time server; clock set from the {source}");
+                    return;
+                }
+                Some(_) => println!("the web has the time, but setting the clock needs root"),
+                None => println!(
+                    "no time from the web yet either ({})",
+                    WEB_CLOCKS.join(", ")
+                ),
+            }
+        }
         if t0.elapsed() >= next_report {
             println!(
                 "waiting for the network time before starting ({} s so far): no run until the \
@@ -444,6 +574,7 @@ fn provenance() -> serde_json::Value {
         "slot": boot_slot(&cmdline),
         "os": os_version(&os_release),
         "policies": policy_hashes(Path::new(POLICIES)),
+        "clock": read_text(Path::new(WEB_CLOCK_MARK)).unwrap_or_else(|| "ntp".into()),
     })
 }
 
@@ -1299,6 +1430,57 @@ mod tests {
         assert!(events.contains("meta.json unreadable"), "{events}");
         assert!(events.contains("events.csv: cut 10 bytes"), "{events}");
         assert_eq!(events.matches("wall,t_s").count(), 1, "{events}");
+    }
+
+    #[test]
+    fn an_http_date_reads_as_unix_seconds() {
+        let at = parse_http_date(" Thu, 05 Nov 2026 03:24:12 GMT").unwrap();
+        assert_eq!(crate::show::civil(at), (2026, 11, 5, 3, 24, 12));
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_http_date("Sun, 29 Feb 2032 12:00:01 GMT").map(crate::show::civil),
+            Some((2032, 2, 29, 12, 0, 1))
+        );
+        assert_eq!(parse_http_date("soon"), None);
+        assert_eq!(parse_http_date("Thu, 05 Nov 2026 03:24:12 PST"), None);
+    }
+
+    #[test]
+    fn two_servers_must_agree() {
+        assert_eq!(agreed(&[]), None);
+        assert_eq!(agreed(&[1000]), None, "one alone proves nothing");
+        assert_eq!(agreed(&[1000, 1003]), Some(1003));
+        assert_eq!(agreed(&[1000, 2000]), None);
+        assert_eq!(
+            agreed(&[0, 2000, 2002]),
+            Some(2002),
+            "a stale one is outvoted"
+        );
+    }
+
+    #[test]
+    fn the_date_comes_from_the_server_s_headers() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut peer, _) = server.accept().unwrap();
+            let mut asked = [0; 256];
+            let _ = std::io::Read::read(&mut peer, &mut asked);
+            peer.write_all(
+                b"HTTP/1.1 301 Moved\r\nServer: x\r\nDATE: Thu, 05 Nov 2026 03:24:12 GMT\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let at = http_date("127.0.0.1", port).unwrap();
+        assert_eq!(crate::show::civil(at), (2026, 11, 5, 3, 24, 12));
+    }
+
+    /// Against the real servers, from wherever this is run: `--ignored web_clocks_answer`.
+    #[test]
+    #[ignore = "needs the network"]
+    fn web_clocks_answer() {
+        let (now, _) = web_time().expect("two servers answered and agreed");
+        assert!((now - unix_secs() as i64).abs() < 86_400 * 2, "{now}");
     }
 
     #[test]

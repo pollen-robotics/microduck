@@ -1,7 +1,7 @@
 # Start `robotctl stress` at boot when `[stress] on_boot` says so (`robotctl configure`).
 #
 # The run itself is the transient `robotctl-stress` unit, exactly as `sudo robotctl stress` makes
-# it; this oneshot only reads the key, waits for robotd's socket and asks for that run. With the key
+# it; this oneshot only reads the key, waits for the clock and robotd, and asks for that run. With the key
 # off — every robot that has not opted in — it says so and exits 0.
 #
 # Started by `robotctl-stress-boot.timer` and by nothing else. **There is deliberately no
@@ -19,7 +19,8 @@ Before=shutdown.target
 [Service]
 Type=oneshot
 ExecStart=/opt/robot/daemon/current/bin/robotctl stress boot
-# It waits up to 120 s for robotd's socket before giving up.
-TimeoutStartSec=180
+# No limit: it holds for the clock for as long as that takes (a robot with no network waits for
+# one), and bounds its own wait for robotd's socket at 120 s after that.
+TimeoutStartSec=infinity
 # A board that did not bring robotd up has a bigger problem; trying again is not the answer.
 Restart=no
