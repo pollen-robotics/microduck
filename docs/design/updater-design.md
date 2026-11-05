@@ -646,9 +646,19 @@ side effects:
   stopped/parked (motors safe). `updaterd` still does a light "safe to restart?"
   query to `robotd` and refuses if not — cheap insurance against restarting
   motor control mid-motion.
-- **No active remote session.** Restarting `robotd`/`mediad` mid-telepresence is a
-  bad surprise; refuse, or warn and require explicit confirmation. See
-  [`architecture.md`](architecture.md) §5.
+- **No active remote session.** Restarting `robotd`/`mediad` mid-call is a bad
+  surprise, so the check refuses while any WebRTC peer is connected, with
+  `SESSIONS_CONNECTED` (16) rather than `PREFLIGHT_FAILED` so a client can
+  tell it apart, and `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
+  the `consumers` it writes to `/run/mediad/camera.json` every second, read
+  through `duck_ipc_proto::read_webrtc_peers`. A missing or stale file (over
+  5 s) passes, because the check is a courtesy and must never be what refuses
+  a recovery update. A request made over WebRTC by the only peer connected is
+  not refused for its own presence: `mediad` sets `interrupt_sessions` on it
+  before forwarding (`mediad/src/session.rs`, `Seat`). The rendezvous control
+  lane carries no media, so it is counted as its client's peer only while the
+  same remote session also holds the bridged video. A browser still
+  negotiating counts from the moment `webrtcsink` adds it, until it gives up.
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
@@ -1280,8 +1290,14 @@ The rest is the client's to follow: poll `os.status`, expect the link to drop
 at `rebooting`, and read `last_result` after the reboot.
 
 Routing: `btd` permits all four (§4.1's argument for `update.apply`, and the
-switch is the rollback); `mediad` permits only the reads, because `mediad` is in
-`allow_users` and its transport has no authorisation of its own. A board with
+switch is the rollback), and so does `mediad`. Its transport has no
+authorisation of its own, but neither does the image's page on port 8090, which
+takes the same two mutations from the same LAN; through `mediad` they at least
+pass `updaterd`'s lock and preflight. The reboot drops a WebRTC session as it
+drops a BLE link, and the client rides it out the same way. Another peer's call
+is what the session check (§7.2) protects: with anyone else connected the
+update is refused, and the client asks again with `interrupt_sessions` once its
+user has agreed to drop them. A board with
 no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
 the periodic check does not look at the channel.
 

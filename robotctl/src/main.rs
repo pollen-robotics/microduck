@@ -3071,6 +3071,7 @@ impl Failure {
             code::BUSY => exit::BUSY,
             code::INCOMPATIBLE
             | code::PREFLIGHT_FAILED
+            | code::SESSIONS_CONNECTED
             | code::VERIFICATION_FAILED
             | code::WOULD_DOWNGRADE
             | code::NOT_INSTALLED

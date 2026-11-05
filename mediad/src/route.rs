@@ -21,9 +21,10 @@
 //!
 //! 1. **It authorises a different transport.** The pairing PIN. A peer that can rewrite it can
 //!    lock a phone out of BLE, which is the recovery path.
-//! 2. **It would drop the session it was asked over.** The update mutations, and reconfiguring
-//!    wifi. §8 covers what update needs before it can be permitted; it is a deferral rather than
-//!    a rule.
+//! 2. **It would drop the session it was asked over.** The daemon-release mutations, and
+//!    reconfiguring wifi. §8 covers what a daemon update needs before it can be permitted; it is
+//!    a deferral rather than a rule. An OS update drops the session too, and is permitted: the
+//!    client rides out its reboot by polling, as over BLE.
 //! 3. **It is not a client's question.** `updaterd`'s internal queries to `robotd`.
 //!
 //! ## What it does *not* decide
@@ -238,6 +239,24 @@ fn permits(call: &proto::Call) -> bool {
         // The OS's two reads, for the same reason: which build each slot holds is a question a
         // remote client may ask of a robot it cannot change.
         OsStatus | OsCheck => true,
+        // Updating the OS, and booting the other slot — the undo. Both end in a reboot that drops
+        // this session, and that is the client's to ride out: it polls `os.status` until the
+        // robot is back and reads `last_result`, exactly as it does over BLE, whose link the
+        // reboot drops just the same. Nothing streams, so there is no subscription to lose.
+        //
+        // Refused here once on the grounds that this arm was the only thing between a LAN peer
+        // and a new root filesystem (§4: no authorisation on this transport). It was not: the
+        // image's own page on port 8090 takes `POST /api/apply` and `/api/switch` from the same
+        // LAN, unauthenticated. Routing them here sends them through `updaterd` instead, with
+        // its engine lock and its preflight — the robot is not moving, and for an apply the clock
+        // is set — which the page skips. A bridged peer has signed in to the rendezvous as the
+        // robot's owner.
+        //
+        // That preflight also refuses while another WebRTC peer is connected, so one session
+        // cannot reboot the robot under someone else's call. This session is a peer too, and is
+        // not refused for its own presence: `session::Seat` answers the check for it when it is
+        // alone.
+        OsApply(_) | OsSwitch(_) => true,
         // The dashboard's switch for anonymous usage data. With no authorisation here (§4) any
         // LAN peer can flip it, which is acceptable for a choice that sends nothing personal,
         // moves nothing, and is undone by flipping it back. Not mutating for the same reason, so
@@ -271,16 +290,9 @@ fn permits(call: &proto::Call) -> bool {
         // Applying, rolling back or selecting a release restarts `mediad`, which drops the session
         // the client is watching progress on. **A deferral, not a rule** — a phone updating a
         // robot over WebRTC is wanted, and `remote-webrtc.md` §8 lists the two things it needs: a
-        // client that reconnects and re-subscribes, and `RobotRemoteSessionActive` learning to
-        // tell a bystander session from the one that requested the update.
+        // client that reconnects and re-subscribes, and the session that asked being exempt from
+        // the remote-session check, as `os.apply` already is (`session.rs`).
         Apply(_) | Rollback(_) | Select(_) => false,
-        // An OS update ends in a reboot, which drops every session, this one included — and,
-        // unlike a daemon release, there is no `mediad` restart for a reconnecting client to ride
-        // out quickly: the robot is gone for a minute and may come back on the other slot. And
-        // `mediad` is in `updaterd`'s `allow_users`, so this arm is the only thing between a LAN
-        // peer and a new root filesystem (§4: no authorisation on this transport). The phone over
-        // BLE and a shell on the robot are where an OS update comes from.
-        OsApply(_) | OsSwitch(_) => false,
 
         // Reconfiguring wifi moves the robot to another network and takes this session with it.
         // And unlike the update case there is nothing to defer *to*: provisioning is what BLE
@@ -311,7 +323,7 @@ fn permits(call: &proto::Call) -> bool {
         //
         // `updaterd`'s private queries to `robotd`. Internal plumbing of the update decision, of
         // no use to a client and misleading if exposed.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi => false,
 
         // ── refused: this transport does not authenticate ────────────────────
         //
@@ -432,6 +444,12 @@ mod tests {
                 // and `account.status` makes the answer visible to anyone who asks.
                 proto::method::ACCOUNT_LOGIN,
                 proto::method::ACCOUNT_LOGOUT,
+                // Updating the OS, and switching back to the other slot. The port-8090 page
+                // already offers both to this LAN with no authorisation at all; through here they
+                // pass `updaterd`'s lock and preflight. The reboot ends the session, and the
+                // client polls `os.status` until the robot is back.
+                proto::method::OS_APPLY,
+                proto::method::OS_SWITCH,
                 // Renaming it. The console shows the name in its header, so the place to change
                 // it is the place it is wrong.
                 proto::method::SYSTEM_SET_NAME,

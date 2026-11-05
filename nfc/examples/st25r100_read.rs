@@ -23,14 +23,15 @@ fn main() -> nfc::Result<()> {
                 match tag::select(&mut chip) {
                     Ok(uid) => {
                         let data = tag::read_ndef_area(&mut chip);
-                        let mac = data
+                        let records = data
                             .as_ref()
                             .ok()
                             .and_then(|d| ndef::parse(d).ok())
-                            .and_then(|r| ndef::mac_in(&r));
+                            .unwrap_or_default();
                         println!(
-                            "{antenna:?}: tag {uid:02x?}  ndef {} bytes  mac {mac:?}",
-                            data.as_ref().map(|d| d.len()).unwrap_or(0)
+                            "{antenna:?}: tag {uid:02x?}  ndef {} bytes  {records:?}  pairing {}",
+                            data.as_ref().map(|d| d.len()).unwrap_or(0),
+                            ndef::asks_to_pair(&records)
                         );
                     }
                     Err(nfc::Error::NoTag) => {}

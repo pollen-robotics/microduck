@@ -854,9 +854,6 @@ mod tests {
             async fn model_api(&self, _: std::time::Duration) -> Option<u32> {
                 None
             }
-            async fn remote_session_active(&self, _: std::time::Duration) -> bool {
-                false
-            }
             async fn reload_policies(&self, _: std::time::Duration) -> bool {
                 false
             }

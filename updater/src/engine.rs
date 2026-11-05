@@ -1444,6 +1444,7 @@ impl Engine {
             required_bytes: 0,
             available_bytes: u64::MAX,
             interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: None,
         }
@@ -1455,11 +1456,7 @@ impl Engine {
             .filter(|r| network || r.check != preflight::Check::Clock)
             .find(|r| !r.passed);
         match failure {
-            Some(failure) => Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            ))),
+            Some(failure) => Err(preflight::refusal(failure)),
             None => Ok(()),
         }
     }
@@ -2557,6 +2554,7 @@ impl Engine {
             required_bytes: required,
             available_bytes: available,
             interrupt_sessions: options.interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: options.from_dir.as_deref(),
         }
@@ -2564,11 +2562,7 @@ impl Engine {
         .await?;
 
         if let Some(failure) = report.first_failure() {
-            return Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            )));
+            return Err(preflight::refusal(failure));
         }
         Ok(())
     }
