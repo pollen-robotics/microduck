@@ -59,12 +59,22 @@ impl Journal {
         {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(&self.path)
                 .map_err(|e| Error::Io {
                     path: self.path.clone(),
                     source: e,
                 })?;
+            // A torn tail has no newline, so this entry would be glued onto it and the line that
+            // results parses as neither: the entry written after a power cut — very often the
+            // one recording the rollback that cut caused — would be lost along with the torn one.
+            if !ends_with_newline(&mut file).map_err(|e| Error::Io {
+                path: self.path.clone(),
+                source: e,
+            })? {
+                line.insert(0, b'\n');
+            }
             file.write_all(&line).map_err(|e| Error::Io {
                 path: self.path.clone(),
                 source: e,
@@ -158,6 +168,18 @@ impl Journal {
             .filter_map(|(v, bad)| bad.then_some(v))
             .collect())
     }
+}
+
+/// Whether `file` is empty or ends in a newline, i.e. whether a line appended now starts a line.
+fn ends_with_newline(file: &mut std::fs::File) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if file.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
 }
 
 /// Single-flight lock, using std's advisory file locking
@@ -646,6 +668,42 @@ mod tests {
 
         let recent = journal.recent(10).unwrap();
         assert_eq!(recent.len(), 1, "intact entry must still be readable");
+    }
+
+    /// The entry after a torn line must not be lost with it. Appended straight onto the torn
+    /// tail, it made one unparseable line out of two, so the first outcome recorded after a power
+    /// cut — the rollback that cut caused, as often as not, which `known_bad` relies on — vanished.
+    #[test]
+    fn an_entry_appended_after_a_torn_line_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), 100).unwrap();
+        journal
+            .append(&entry("daemon", "1.0.0", Outcome::Success))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("update-log.jsonl"))
+            .unwrap()
+            .write_all(br#"{"at":1,"component":"daemon","#)
+            .unwrap();
+
+        journal
+            .append(&entry(
+                "daemon",
+                "1.1.0",
+                Outcome::RolledBack {
+                    reason: "health".into(),
+                },
+            ))
+            .unwrap();
+
+        let recent = journal.recent(10).unwrap();
+        assert_eq!(recent.len(), 2, "the entry after the torn line was lost");
+        assert_eq!(recent[0].to, Some(semver::Version::new(1, 1, 0)));
+        assert_eq!(
+            journal.known_bad("daemon").unwrap(),
+            [semver::Version::new(1, 1, 0)]
+        );
     }
 
     #[test]
