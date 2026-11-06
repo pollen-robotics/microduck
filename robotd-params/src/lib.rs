@@ -2574,6 +2574,50 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
+    /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
+    /// broken gear teeth. Off leaves the factory firmware with only Current Limit, the comparison
+    /// a test on robots needs: settings that never fire on V3, the switch on V4, which keeps the
+    /// settings it has. On writes the six `impact_guard_*` settings below to every V3 and V4 servo
+    /// at startup with torque off, and V4's Impact Guard Enable follows this with every torque
+    /// on; servos on any other firmware have no guard to set. Their defaults are what a microduck walks with:
+    /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
+    /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
+    /// test looks for a guard that keeps the gears whole and still lets the policy walk.
+    pub impact_guard: bool,
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
+    pub impact_guard_v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub impact_guard_brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub impact_guard_decel: u16,
+    /// i Hold, mA: the current allowed after the brake, until the goal comes back past the
+    /// position.
+    pub impact_guard_i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `impact_guard_pwm_fast`. Not 0: the
+    /// firmware divides by it.
+    pub impact_guard_v_fast: u8,
+    /// PWM Fast, % of PWM Limit, at `impact_guard_v_fast` and above.
+    pub impact_guard_pwm_fast: u8,
+}
+
+impl Bus {
+    /// The first impact guard setting the firmware cannot take, and why.
+    fn invalid(&self) -> Option<(&'static str, &'static str)> {
+        if self.impact_guard_v_fast == 0 {
+            return Some((
+                "impact_guard_v_fast",
+                "must be above 0: the firmware divides by it",
+            ));
+        }
+        if !(1..=100).contains(&self.impact_guard_pwm_fast) {
+            return Some((
+                "impact_guard_pwm_fast",
+                "must be 1 to 100, a percentage of PWM Limit",
+            ));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2671,6 +2715,13 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            impact_guard: true,
+            impact_guard_v_min: 6,
+            impact_guard_brake_ms: 20,
+            impact_guard_decel: 400,
+            impact_guard_i_hold_ma: 32767,
+            impact_guard_v_fast: 7,
+            impact_guard_pwm_fast: 40,
         }
     }
 }
@@ -2770,6 +2821,12 @@ pub enum ParamsError {
         axis: &'static str,
         min: f64,
         max: f64,
+    },
+    #[error("{path}: bus.{key} {reason}")]
+    Bus {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
     },
     #[error("{path}: policy.{key} {reason}")]
     Policy {
@@ -2981,6 +3038,13 @@ impl Params {
                     max,
                 });
             }
+        }
+        if let Some((key, reason)) = self.bus.invalid() {
+            return Err(ParamsError::Bus {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
         }
         for (key, accel) in [
             ("accel_vx", self.policy.accel_vx),
@@ -4538,6 +4602,40 @@ mod tests {
         assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
     }
 
+    /// Impact guard settings the firmware cannot take are refused by name, so `robotctl configure`
+    /// cannot write them; a retuned guard loads.
+    #[test]
+    fn an_impact_guard_the_firmware_cannot_take_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            (
+                "[bus]\nimpact_guard_v_fast = 0\n",
+                "bus.impact_guard_v_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 0\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 120\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(
+            dir.path(),
+            "[bus]\nimpact_guard_decel = 1000\nimpact_guard_i_hold_ma = 800\n",
+        );
+        let bus = Params::load(&path, true).unwrap().bus;
+        assert_eq!(
+            (bus.impact_guard_decel, bus.impact_guard_i_hold_ma),
+            (1000, 800)
+        );
+    }
+
     /// The look-around is on for walking and off for the roller unless the file says otherwise.
     /// Its head command is an observation input, and `roller.onnx` folds under one it was not
     /// trained with — seen on the robot as a collapse about three seconds after the stick was
@@ -4684,6 +4782,18 @@ mod tests {
 
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
+        assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
+        let guard = |b: &Bus| {
+            (
+                b.impact_guard_v_min,
+                b.impact_guard_brake_ms,
+                b.impact_guard_decel,
+                b.impact_guard_i_hold_ma,
+                b.impact_guard_v_fast,
+                b.impact_guard_pwm_fast,
+            )
+        };
+        assert_eq!(guard(&from_file.bus), guard(&built_in.bus));
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);

@@ -203,6 +203,16 @@ pub trait RobotIo {
         Ok(None)
     }
 
+    /// Each servo's impact guard state (register 66 on [`crate::model::IMPACT_GUARD_FIRMWARES`]),
+    /// in joint order: 0 armed, 1 braking after an impact, 2 holding softly until the goal comes
+    /// back past the position. A servo on any other firmware answers whatever its unused register
+    /// holds, so the caller masks those out. A transaction of its own, about a millisecond.
+    ///
+    /// `None` from a backend with no servos to ask, which is the default.
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        Ok(None)
+    }
+
     /// Ping every expected servo and the IMU board: which of them are on the bus at all.
     ///
     /// For a running loop whose reads have started failing. A failed sync read says the bus
@@ -285,6 +295,13 @@ pub struct FakeIo {
     /// How many times [`RobotIo::census`] was asked, so a test can tell "asked about a run of
     /// failures" from "asked every tick".
     pub censuses: usize,
+    /// What [`RobotIo::servo_identity`] reports. `None`, the default, is a backend with no servos.
+    pub identity: Option<[ServoIdentity; NUM_JOINTS]>,
+    /// What [`RobotIo::impact_guard`] reports. `None`, the default, is a backend with no servos.
+    pub impact_guard: Option<[u8; NUM_JOINTS]>,
+    /// How many times [`RobotIo::impact_guard`] was asked: it is a bus transaction, and a test
+    /// has to be able to tell "while someone records" from "every tick".
+    pub impact_guard_reads: usize,
 }
 
 impl Default for FakeIo {
@@ -316,6 +333,9 @@ impl FakeIo {
             reboots: Vec::new(),
             census: None,
             censuses: 0,
+            identity: None,
+            impact_guard: None,
+            impact_guard_reads: 0,
         }
     }
 
@@ -424,6 +444,15 @@ impl RobotIo for FakeIo {
     fn census(&mut self) -> Result<Option<Census>> {
         self.censuses += 1;
         Ok(self.census.clone())
+    }
+
+    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+        Ok(self.identity)
+    }
+
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        self.impact_guard_reads += 1;
+        Ok(self.impact_guard)
     }
 }
 

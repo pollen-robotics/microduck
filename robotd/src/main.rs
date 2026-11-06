@@ -1600,6 +1600,22 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
+/// What `[bus]` asks the servos' impact guard to be: its six settings, or off.
+fn impact_guard(bus: &params::Bus) -> duck_control::model::ImpactGuard {
+    use duck_control::model::ImpactGuard;
+    if !bus.impact_guard {
+        return ImpactGuard::OFF;
+    }
+    ImpactGuard {
+        v_min: bus.impact_guard_v_min,
+        brake_ms: bus.impact_guard_brake_ms,
+        decel: bus.impact_guard_decel,
+        i_hold_ma: bus.impact_guard_i_hold_ma,
+        v_fast: bus.impact_guard_v_fast,
+        pwm_fast: bus.impact_guard_pwm_fast,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_bus(
     bus: &params::Bus,
@@ -1627,6 +1643,14 @@ fn open_bus(
     // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
     if !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
+    }
+    let guard = impact_guard(bus);
+    io.set_impact_guard(guard);
+    if !bus.impact_guard && loud {
+        tracing::warn!("bus.impact_guard is off; guard servos run as the factory firmware");
+    } else if guard != duck_control::model::ImpactGuard::DEFAULT && loud {
+        // Said once a start so a recording can be matched to the settings it ran on.
+        tracing::warn!(?guard, "bus.impact_guard_* differ from the defaults");
     }
     if !adopt_missing_servo(&mut io, loud, missing, adopted) {
         return None;
@@ -2319,8 +2343,26 @@ async fn control_loop<T: RobotIo>(
     // The vet book's tally for this process, and what each servo says it is. Read once, here,
     // before the loop has a deadline to keep: a servo is not going to change model mid-run.
     let mut vettally = vetbook::Tracker::default();
+    // Which servos run ROBOTIS's impact guard firmware, from the same read. Any other firmware
+    // still drives the robot: it is named here, once a start, and left out of the guard state.
+    let mut guarded = [false; NUM_JOINTS];
     match safety.servo_identity() {
-        Ok(Some(ids)) => state.vetbook.identify(&ids),
+        Ok(Some(ids)) => {
+            state.vetbook.identify(&ids);
+            guarded =
+                ids.map(|s| duck_control::model::IMPACT_GUARD_FIRMWARES.contains(&s.firmware));
+            let unguarded: Vec<_> = (0..NUM_JOINTS)
+                .filter(|&j| !guarded[j])
+                .map(|j| format!("{}={}", duck_control::JOINT_NAMES[j], ids[j].firmware))
+                .collect();
+            if !unguarded.is_empty() {
+                tracing::warn!(
+                    servos = unguarded.join(" "),
+                    want = ?duck_control::model::IMPACT_GUARD_FIRMWARES,
+                    "servo firmware without the impact guard"
+                );
+            }
+        }
         Ok(None) => {}
         Err(e) => tracing::debug!(error = %e, "vet book: servo identity read failed"),
     }
@@ -4107,6 +4149,19 @@ async fn control_loop<T: RobotIo>(
         if state.state_tx.receiver_count() > 0
             && let Some(sensors) = sensors.as_ref()
         {
+            // A bus transaction of its own (~1 ms), so here: after the goal positions went out,
+            // where it cannot delay a read or a write the policy depends on, and only while
+            // someone is recording.
+            let impact_guard = match guarded.contains(&true).then(|| safety.impact_guard()) {
+                Some(Ok(Some(states))) => (0..NUM_JOINTS)
+                    .map(|j| guarded[j].then_some(states[j]))
+                    .collect(),
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "impact guard state read failed");
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
             let _ = state.state_tx.send(proto::RobotState {
                 t: state.started.elapsed().as_secs_f64(),
                 movement: proto::MoveState {
@@ -4147,6 +4202,7 @@ async fn control_loop<T: RobotIo>(
                 } else {
                     Vec::new()
                 },
+                impact_guard,
                 odom: proto::OdomState {
                     position: odometry.position(),
                     yaw: odometry.yaw(),
@@ -7390,6 +7446,15 @@ mod tests {
         fn census(&mut self) -> duck_control::io::Result<Option<duck_control::Census>> {
             self.0.census()
         }
+        fn servo_identity(
+            &mut self,
+        ) -> duck_control::io::Result<Option<[duck_control::io::ServoIdentity; NUM_JOINTS]>>
+        {
+            self.0.servo_identity()
+        }
+        fn impact_guard(&mut self) -> duck_control::io::Result<Option<[u8; NUM_JOINTS]>> {
+            self.0.impact_guard()
+        }
     }
 
     /// **A change to a network that is not driving does not move the robot.**
@@ -8064,6 +8129,105 @@ mod tests {
 
         assert!(frame.velocities.is_empty(), "{:?}", frame.velocities);
         assert!(frame.currents_ma.is_empty(), "{:?}", frame.currents_ma);
+    }
+
+    /// Servos on ROBOTIS's impact guard firmwares, V3 and one on V4, every one but the mouth
+    /// here, with the guard holding after an impact.
+    fn guarded_io() -> FakeIo {
+        use duck_control::model::{IMPACT_GUARD_ENABLE_FIRMWARE, IMPACT_GUARD_FIRMWARES};
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        let mut identity = [duck_control::io::ServoIdentity {
+            model: 1200,
+            firmware: IMPACT_GUARD_FIRMWARES[0],
+        }; NUM_JOINTS];
+        identity[0].firmware = IMPACT_GUARD_ENABLE_FIRMWARE;
+        identity[duck_control::model::MOUTH_INDEX].firmware = 53;
+        io.identity = Some(identity);
+        io.impact_guard = Some([2; NUM_JOINTS]);
+        io
+    }
+
+    /// An untouched `[bus]` is setting R, `impact_guard = false` is off whatever the six settings
+    /// say, and a retuned one is written as asked.
+    #[test]
+    fn bus_params_pick_the_impact_guard() {
+        use duck_control::model::ImpactGuard;
+        let mut bus = params::Bus::default();
+        assert_eq!(impact_guard(&bus), ImpactGuard::DEFAULT);
+        bus.impact_guard_decel = 1000;
+        bus.impact_guard_i_hold_ma = 800;
+        assert_eq!(
+            impact_guard(&bus),
+            ImpactGuard {
+                decel: 1000,
+                i_hold_ma: 800,
+                ..ImpactGuard::DEFAULT
+            }
+        );
+        bus.impact_guard = false;
+        assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
+    }
+
+    /// The guard's state reaches the stream for the servos that have one, and a servo on any
+    /// other firmware is `null` — what its unused register 66 holds is not a state, and a 0 there
+    /// would read as a guard that never fired.
+    #[tokio::test]
+    async fn the_frame_carries_the_impact_guard_of_the_servos_that_have_one() {
+        let frame = a_frame_from(guarded_io(), Params::default()).await;
+
+        let mouth = duck_control::model::MOUTH_INDEX;
+        assert_eq!(frame.impact_guard.len(), NUM_JOINTS);
+        assert_eq!(frame.impact_guard[mouth], None);
+        assert!(
+            (0..NUM_JOINTS)
+                .filter(|&j| j != mouth)
+                .all(|j| frame.impact_guard[j] == Some(2)),
+            "{:?}",
+            frame.impact_guard
+        );
+    }
+
+    /// The guard's state is a bus transaction of its own, so a robot nobody is recording must not
+    /// pay for it: the tick's bus traffic is what it was before the guard existed.
+    #[tokio::test]
+    async fn nobody_recording_means_no_impact_guard_read() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = guarded_io();
+            control_loop(
+                Borrowed(&mut io),
+                loop_state,
+                Arc::new(Intents::new()),
+                params,
+                PathBuf::from("/nonexistent/robotd.toml"),
+                Duration::from_millis(2),
+                noop_poweroff(),
+            )
+            .await;
+            tx.send(io.impact_guard_reads).unwrap();
+        });
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(rx.recv().unwrap(), 0);
     }
 
     /// Run the loop over one backend until it publishes a frame, and stop it.
