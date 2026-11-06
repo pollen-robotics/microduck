@@ -455,7 +455,7 @@ fn main() -> ExitCode {
         // `get_frame` surface in `architecture.md` §5.3 is what the rest of it is for. The branch
         // runs from the start rather than being added later, because a tee inserted into a live
         // pipeline is a different and much harder problem than a tee that was always there.
-        let (_pipeline, mut channels, frames, stream_branch, peers) = match mediad::pipeline::start(
+        let (_pipeline, mut channels, frames, stream_branch, peers, video_valve) = match mediad::pipeline::start(
             source.clone(),
             &producer,
             &settings,
@@ -662,9 +662,12 @@ fn main() -> ExitCode {
             tokio::spawn(mediad::indicator::run(peers, move || streamer.is_streaming()));
         }
 
+        // One gate for every session's vote on the video track — `media.video {on}`.
+        let gate = mediad::session::Gate::new(move |on| video_valve.set(on));
         let media = mediad::session::Media {
             video: video.clone(),
             streamer: std::sync::Arc::clone(&streamer),
+            gate: Some(gate),
         };
 
         // The relay has been up since before the pipeline; this is the point its control lanes can

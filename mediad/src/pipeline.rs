@@ -7,13 +7,13 @@
 //! ## Shape
 //!
 //! ```text
-//!                                                ┌─ queue ─ webrtcsink ─ setup → mpph264enc
+//!                                                ┌─ queue ─ valve ─ webrtcsink ─ setup → mpph264enc
 //! videotestsrc | camera ─ NV12 ─ videoflip ─ tee ┤          │  │    └ setup → opusenc
-//!                                                └─ queue ─ │  │ run-signalling-server=true
-//!                                       (leaky)     │       │  │
-//!                                          │        │       │  └ consumer-added → "control" channel
-//!                                      appsink      │       │
-//!                                   a frame on request      appsrc ← robotd's mic tap (crate::mic)
+//!                                                └─ queue ─ │      │  │ run-signalling-server=true
+//!                                       (leaky)     │       │      │  │
+//!                                          │        │  media.video │  └ consumer-added → "control" channel
+//!                                      appsink      │   {on}       │
+//!                                   a frame on request             appsrc ← robotd's mic tap (crate::mic)
 //! ```
 //!
 //! **The tee is on raw NV12, before the encoder**, and that placement is the point of it.
@@ -403,6 +403,7 @@ pub type Started = (
     Frames,
     Option<StreamBranch>,
     Consumers,
+    VideoValve,
 );
 
 /// Build and start the pipeline. Returns it, plus a stream of control channels — one per peer —
@@ -639,11 +640,27 @@ pub fn start(
     // Handing `webrtcsink` the encoder would otherwise *lose* them, which would make this change a
     // regression rather than an improvement: `profile` defaults to High and `header-mode` to
     // first-frame, and both matter — see `wire_encoder_setup`.
-    wire_encoder_setup(&sink)?;
+    let encoders = Encoders::default();
+    wire_encoder_setup(&sink, encoders.clone())?;
 
     let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
     wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
+
+    // The video track's valve, between the branch's queue and `webrtcsink`: what
+    // `media.video {on: false}` closes, so neither the encoders nor `webrtcsink` see a frame.
+    // [`VideoValve`] has why here and what reopening it does.
+    let valve = make("valve")?;
+    // Caps and segments through while closed, so a source that renegotiated meanwhile is
+    // described before its first buffer rather than after. Present since GStreamer 1.20; without
+    // it the valve re-sends them on opening, which is the same thing a moment later.
+    if valve.has_property("drop-mode") {
+        valve.set_property_from_str("drop-mode", "forward-sticky-events");
+    }
+    let video_valve = VideoValve {
+        valve: valve.clone(),
+        encoders: encoders.clone(),
+    };
 
     // ── the raw branch ──────────────────────────────────────────────────────
     //
@@ -714,6 +731,7 @@ pub fn start(
             &capsfilter,
             &tee,
             &video_queue,
+            &valve,
             &sink,
             &raw_queue,
             appsink.upcast_ref(),
@@ -740,7 +758,7 @@ pub fn start(
         "could not link the source to the tee. A caps failure here means the source cannot \
          produce NV12 at the requested size and rate.",
     )?;
-    gst::Element::link_many([&video_queue, &sink])
+    gst::Element::link_many([&video_queue, &valve, &sink])
         .context("could not link the video queue to webrtcsink")?;
     gst::Element::link_many([&raw_queue, appsink.upcast_ref()])
         .context("could not link the raw branch to its appsink")?;
@@ -800,7 +818,14 @@ pub fn start(
         mic,
         "signalling server listening"
     );
-    Ok((pipeline, channels_rx, frames, stream_branch, consumers))
+    Ok((
+        pipeline,
+        channels_rx,
+        frames,
+        stream_branch,
+        consumers,
+        video_valve,
+    ))
 }
 
 /// The microphone track: `appsrc ! webrtcsink.audio_%u`, fed by [`crate::mic::feed`] on a thread
@@ -1251,6 +1276,91 @@ impl StreamBranch {
                 tracing::debug!("the encoder would not take a keyframe request");
             }
         }
+    }
+}
+
+/// The WebRTC video track's valve: closed, no frame reaches `webrtcsink` or any of its encoders.
+///
+/// **Measured on the board with one bridge connected: `mediad` at 182% of a core, against 14% with
+/// nobody**, the wifi driver another 19%, and the SoC at 86 °C, throttled to 408 MHz. The video's
+/// share is per frame — the encoder, `webrtcsink`'s per-consumer pipeline, the payloader,
+/// congestion control, SRTP, the radio. A consumer that wants the mic and the control channel all the time and a
+/// picture only now and then should not pay that, so `media.video {on: false}` closes this, and
+/// `crate::session::Gate` decides when — video flows while any session wants it.
+///
+/// **Before `webrtcsink` rather than inside it**, because one valve stops every consumer's
+/// encoder at once and is the only place in the path that is ours. Frames still reach the tee —
+/// the camera, the raw branch and the detector are untouched, and so is the camera LED, which
+/// says the robot is sending: it still is, its sound.
+///
+/// **Reopening asks every live encoder for a keyframe.** Without it the first frames after the gap
+/// reference a picture the receiver threw away, and nothing decodes until the encoder's own GOP
+/// comes round — or until the receiver notices and sends a PLI, which a receiver that saw no frames
+/// has no reason to. The request is sent where the encoder takes it, upstream into its *source*
+/// pad. The encoders are the ones `encoder-setup` handed over, held weakly: a consumer that left
+/// takes its encoder with it.
+#[derive(Clone)]
+pub struct VideoValve {
+    valve: gst::Element,
+    encoders: Encoders,
+}
+
+impl VideoValve {
+    pub fn set(&self, on: bool) {
+        // `drop` is the valve's, and the guard is `StreamBranch::gate`'s reason: a panic here runs
+        // inside the task answering the call, and costs that call its answer.
+        if !self
+            .valve
+            .has_property_with_type("drop", bool::static_type())
+        {
+            tracing::error!("the video valve has no `drop` property, so it cannot be gated");
+            return;
+        }
+        if on {
+            // Asked first: an encoder holds the request until its next frame, so it cannot miss
+            // the first one through.
+            let asked = self.encoders.request_keyframes();
+            self.valve.set_property("drop", false);
+            tracing::debug!(encoders = asked, "video valve open, keyframe requested");
+        } else {
+            self.valve.set_property("drop", true);
+        }
+    }
+}
+
+/// The video encoders `webrtcsink` built for real consumers, for [`VideoValve`]'s keyframes.
+#[derive(Clone, Default)]
+pub struct Encoders(Arc<Mutex<Vec<glib::WeakRef<gst::Element>>>>);
+
+impl Encoders {
+    fn add(&self, encoder: &gst::Element) {
+        let mut encoders = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Pruned here, so the list is as long as the consumers that are actually connected.
+        encoders.retain(|weak| weak.upgrade().is_some());
+        encoders.push(encoder.downgrade());
+    }
+
+    /// Ask each for a keyframe; answers how many were asked.
+    fn request_keyframes(&self) -> usize {
+        let encoders: Vec<gst::Element> = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(glib::WeakRef::upgrade)
+            .collect();
+        for encoder in &encoders {
+            let Some(pad) = encoder.static_pad("src") else {
+                continue;
+            };
+            let event = gst_video::UpstreamForceKeyUnitEvent::builder()
+                .all_headers(true)
+                .build();
+            if !pad.send_event(event) {
+                tracing::debug!("a video encoder would not take a keyframe request");
+            }
+        }
+        encoders.len()
     }
 }
 
@@ -2019,7 +2129,7 @@ fn set_congestion_control(sink: &gst::Element, mode: robotd_params::CongestionCo
 ///
 /// Returns `false`, so `webrtcsink` still applies its own configuration on top: it owns the
 /// bitrate now, and congestion control moving it is the reason for this whole arrangement.
-fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
+fn wire_encoder_setup(sink: &gst::Element, encoders: Encoders) -> Result<()> {
     if glib::subclass::signal::SignalId::lookup("encoder-setup", sink.type_()).is_none() {
         return Err(anyhow!(
             "webrtcsink has no encoder-setup signal; without it the encoder cannot be configured \
@@ -2048,6 +2158,16 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
             .and_then(|v| v.get::<String>().ok())
             .unwrap_or_default();
         let discovering = consumer == "discovery";
+
+        // Every real consumer's video encoder, whatever it is, so reopening the valve can ask it
+        // for a keyframe.
+        let video = encoder
+            .factory()
+            .and_then(|f| f.metadata("klass").map(|klass| klass.contains("Video")))
+            .unwrap_or(false);
+        if video && !discovering {
+            encoders.add(&encoder);
+        }
 
         // Only `mpph264enc` has these properties, and setting a property an element lacks panics —
         // which in a signal handler aborts. So this is keyed on the factory rather than attempted
@@ -2253,9 +2373,24 @@ fn wire_consumers(
     // Counted here rather than inferred from the log, so `robotctl health` can say whether anyone
     // is actually watching. `consumer-removed` is guarded the same way `consumer-added` is: a
     // signal that has moved upstream should degrade the count, not abort the daemon.
+    // Each consumer's way to end its control session, by peer id — see [`Closer`].
+    let closers: Arc<Mutex<std::collections::HashMap<String, Closer>>> = Arc::default();
+
     if glib::subclass::signal::SignalId::lookup("consumer-removed", sink.type_()).is_some() {
         let leaving = consumers.clone();
-        sink.connect("consumer-removed", false, move |_| {
+        let closing = closers.clone();
+        sink.connect("consumer-removed", false, move |values| {
+            // (webrtcsink, peer_id, webrtcbin). Its session ends here, which is what takes its
+            // video vote and its service connections with it.
+            if let Some(peer) = values.get(1).and_then(|v| v.get::<String>().ok()) {
+                let closer = closing
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&peer);
+                if let Some(closer) = closer {
+                    closer.close();
+                }
+            }
             // A saturating decrement rather than `fetch_sub`, so a spurious removal cannot wrap
             // the count around to four billion viewers. Spelled as a compare-exchange loop rather
             // than `try_update`/`fetch_update`: `try_update` needs Rust 1.99, which the Yocto
@@ -2307,7 +2442,11 @@ fn wire_consumers(
         watch_ice_connection(&webrtcbin, &peer);
 
         match open_control_channel(&webrtcbin, &peer, &runtime) {
-            Ok(channel) => {
+            Ok((channel, closer)) => {
+                closers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(peer.clone(), closer);
                 // A full queue means nobody is accepting sessions, which is a bug rather than
                 // backpressure — say so instead of blocking a GStreamer signal handler.
                 if channels.try_send(channel).is_err() {
@@ -2707,12 +2846,32 @@ fn report_candidates(
     }
 }
 
+/// How a consumer's control session is ended once `webrtcsink` has dropped the consumer.
+///
+/// **Without it the session outlived its peer, every time.** The channel's message handler holds
+/// the sender `session::run` reads from, and the writer task holds the channel, waiting on the
+/// session's outbound sender — so neither side could be the first to go, and each disconnect left
+/// a session behind with its connections to every service. Nothing noticed until a session's vote
+/// on the video (`session::Gate`) did: a peer that had left kept the picture on for the one still
+/// here. Disconnecting the handler drops the sender, the session sees its inbound end, and the
+/// writer follows when the session drops its outbound.
+struct Closer {
+    channel: gst_webrtc::WebRTCDataChannel,
+    handler: glib::SignalHandlerId,
+}
+
+impl Closer {
+    fn close(self) {
+        self.channel.disconnect(self.handler);
+    }
+}
+
 /// Create the `control` datachannel on one peer's `webrtcbin` and bridge it to channels.
 fn open_control_channel(
     webrtcbin: &gst::Element,
     peer: &str,
     runtime: &tokio::runtime::Handle,
-) -> Result<Channel> {
+) -> Result<(Channel, Closer)> {
     // `emit_by_name` panics when the signal is absent or its signature differs — and a panic here
     // aborts the process rather than unwinding, because this runs inside a C closure. Checked
     // first so an upstream change becomes a logged refusal to open a control channel, with the
@@ -2750,7 +2909,7 @@ fn open_control_channel(
     let (outbound, mut outbound_rx) = mpsc::channel::<String>(64);
 
     let peer_label = peer.to_owned();
-    channel.connect("on-message-string", false, move |values| {
+    let handler = channel.connect("on-message-string", false, move |values| {
         if let Some(line) = values.get(1).and_then(|v| v.get::<String>().ok()) {
             // Dropping a control frame is bad, but blocking a GStreamer signal handler is worse:
             // it would stall the whole pipeline, media included.
@@ -2773,7 +2932,13 @@ fn open_control_channel(
     });
 
     tracing::info!(peer, "control channel open");
-    Ok(Channel { inbound, outbound })
+    Ok((
+        Channel { inbound, outbound },
+        Closer {
+            channel: channel.clone(),
+            handler,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -2820,13 +2985,17 @@ mod tests {
             // point: the raw branch below must not wait on a microphone that is not there.
             mic: Some(std::env::temp_dir().join("mediad-test-no-such-mic.sock")),
         };
-        let (pipeline, _channels, frames, _stream, _peers) = start(
+        let (pipeline, _channels, frames, _stream, _peers, video) = start(
             Source::Test,
             &producer,
             &settings,
             crate::turn::Relays::empty(),
         )
         .expect("the pipeline starts on the test pattern");
+
+        // With the video track paused, as a bridge leaves it between snapshots: the raw branch is
+        // on the other side of the tee and must not notice.
+        video.set(false);
 
         // Several asks, because the first can legitimately land before the source has produced
         // anything; what must not happen is every one of them timing out.
@@ -2841,6 +3010,89 @@ mod tests {
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.format, CAPTURE_FORMAT);
         assert_eq!(frame.data.len(), 320 * 240 * 2, "packed UYVY");
+    }
+
+    /// **The valve stops the encoder, and reopening it starts on a keyframe.** A live source, a
+    /// `VideoValve` and an encoder with a GOP far longer than the test, so the only keyframes after
+    /// the first are ones the valve asked for. The request goes into the encoder's *source* pad;
+    /// sent to its sink pad, an upstream event is refused for travelling the wrong way, and the
+    /// receiver would wait for the GOP.
+    #[test]
+    fn reopening_the_video_valve_starts_on_a_keyframe() {
+        gst::init().expect("gstreamer");
+        let Some(encoder) = ["mpph264enc", "x264enc", "openh264enc"]
+            .into_iter()
+            .find_map(|name| gst::ElementFactory::make(name).build().ok())
+        else {
+            eprintln!("SKIPPED: no H.264 encoder here");
+            return;
+        };
+        // Each encoder spells its GOP differently, and types it differently too: from a string,
+        // whichever this one is.
+        for (property, value) in [
+            ("key-int-max", "10000"),
+            ("gop-size", "10000"),
+            ("gop", "10000"),
+            ("tune", "zerolatency"),
+        ] {
+            if encoder.has_property(property) {
+                encoder.set_property_from_str(property, value);
+            }
+        }
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        let valve = gst::ElementFactory::make("valve").build().unwrap();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        let pipeline = gst::Pipeline::new();
+        pipeline
+            .add_many([&src, &valve, &encoder, sink.upcast_ref()])
+            .unwrap();
+        gst::Element::link_many([&src, &valve, &encoder, sink.upcast_ref()]).unwrap();
+
+        let encoders = Encoders::default();
+        encoders.add(&encoder);
+        let video = VideoValve { valve, encoders };
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let pull = |within: u64| sink.try_pull_sample(gst::ClockTime::from_mseconds(within));
+        let first = pull(5_000).expect("the encoder produces something");
+        assert!(
+            !first
+                .buffer()
+                .unwrap()
+                .flags()
+                .contains(gst::BufferFlags::DELTA_UNIT)
+        );
+        for _ in 0..5 {
+            let sample = pull(2_000).expect("frames while open");
+            assert!(
+                sample
+                    .buffer()
+                    .unwrap()
+                    .flags()
+                    .contains(gst::BufferFlags::DELTA_UNIT),
+                "no keyframe nobody asked for"
+            );
+        }
+
+        video.set(false);
+        // What was already inside the encoder may still come out.
+        while pull(300).is_some() {}
+        assert!(pull(500).is_none(), "a closed valve reaches no encoder");
+
+        video.set(true);
+        let resumed = pull(5_000).expect("frames again once open");
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(
+            !resumed
+                .buffer()
+                .unwrap()
+                .flags()
+                .contains(gst::BufferFlags::DELTA_UNIT),
+            "the first frame after reopening decodes on its own"
+        );
     }
 
     /// The four types ICE defines, in the shape `webrtcbin` hands them over.

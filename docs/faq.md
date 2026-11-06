@@ -42,7 +42,12 @@ Two caveats worth knowing before you are surprised by them:
 
 ## My consumer is a program and the stream runs all day. Is there something cheaper?
 
-There is a fallback, and it is a fallback rather than a second design: **`media.stream`**, where
+If what you want all day is the control channel or the mic, and a picture only now and then, stay on
+WebRTC and **pause the video**: `media.setVideo {on: false}` over the control channel stops the
+robot encoding and sending it until you ask again, and a console that connects meanwhile still
+gets its picture. `remote-webrtc.md` §2.2 has the rule and how long the first frame takes.
+
+For frames all day, there is a fallback, and it is a fallback rather than a second design: **`media.stream`**, where
 the robot dials *your* WebSocket and pushes frames outbound.
 
 ```

@@ -54,7 +54,8 @@ pub struct Video {
 }
 
 /// The methods a peer asks with. Answered here rather than routed: no service owns them.
-const VIDEO_METHOD: &str = "media.video";
+const VIDEO_METHOD: &str = proto::method::MEDIA_VIDEO;
+const SET_VIDEO_METHOD: &str = proto::method::MEDIA_SET_VIDEO;
 const STREAM_METHOD: &str = "media.stream";
 
 /// What this daemon can answer about its own media, when it has a pipeline to answer from.
@@ -67,6 +68,118 @@ const STREAM_METHOD: &str = "media.stream";
 pub struct Media {
     pub video: Video,
     pub streamer: std::sync::Arc<crate::stream::Streamer>,
+    /// The video track's valve, which `media.setVideo` votes on. `None` for a pipeline built
+    /// without one, which answers every vote `accepted: false`.
+    pub gate: Option<std::sync::Arc<Gate>>,
+}
+
+/// Whether the WebRTC video track is encoded and sent, decided by the sessions watching it.
+///
+/// **Video flows while any session wants it**, and a session wants it from the moment it opens
+/// until it says otherwise — so a console that knows nothing of this method never finds the
+/// picture paused by somebody else's bridge, and a bridge that pauses it gets it paused only for as
+/// long as it is alone. A session's vote ends with the session.
+///
+/// **With no session at all the valve is open**, which is how the pipeline was built and what
+/// `webrtcsink` needs: it learns the video's caps from the first buffer it is handed and offers
+/// nothing to a consumer until it has. Nobody is encoding then anyway — `webrtcsink` builds an
+/// encoder per consumer — so open costs nothing that closed would save.
+///
+/// The decision is here, portable and tested; what it switches is `pipeline::VideoValve`'s, handed
+/// in as `apply` and called only on a change, under the lock, so two sessions voting at once
+/// cannot apply their answers out of order. `remote-webrtc.md` §2.2.
+pub struct Gate {
+    votes: std::sync::Mutex<Votes>,
+    apply: Box<dyn Fn(bool) + Send + Sync>,
+}
+
+#[derive(Debug)]
+struct Votes {
+    sessions: usize,
+    off: usize,
+    /// What `apply` was last told, which starts as the pipeline was built: open.
+    flowing: bool,
+}
+
+impl Gate {
+    pub fn new(apply: impl Fn(bool) + Send + Sync + 'static) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            votes: std::sync::Mutex::new(Votes {
+                sessions: 0,
+                off: 0,
+                flowing: true,
+            }),
+            apply: Box::new(apply),
+        })
+    }
+
+    /// Whether the video is being sent now.
+    pub fn flowing(&self) -> bool {
+        self.lock().flowing
+    }
+
+    // A panic while holding this leaves two counters, which are as good as they were.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Votes> {
+        self.votes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Change the counts, and tell the valve if the answer moved.
+    fn tally(&self, change: impl FnOnce(&mut Votes)) -> bool {
+        let mut votes = self.lock();
+        change(&mut votes);
+        let flowing = votes.sessions == 0 || votes.off < votes.sessions;
+        if flowing != votes.flowing {
+            votes.flowing = flowing;
+            tracing::info!(
+                sessions = votes.sessions,
+                "{}",
+                if flowing {
+                    "video resumed: a session wants the picture"
+                } else {
+                    "video paused: every session asked for it off"
+                }
+            );
+            (self.apply)(flowing);
+        }
+        votes.flowing
+    }
+}
+
+/// One session's say in [`Gate`]: wanting the video when cast, and gone when dropped.
+pub struct Vote {
+    gate: std::sync::Arc<Gate>,
+    on: bool,
+}
+
+impl Vote {
+    pub fn cast(gate: std::sync::Arc<Gate>) -> Self {
+        gate.tally(|votes| votes.sessions += 1);
+        Self { gate, on: true }
+    }
+
+    /// Change this session's mind, and answer whether the video is now flowing.
+    pub fn set(&mut self, on: bool) -> bool {
+        let was = std::mem::replace(&mut self.on, on);
+        self.gate.tally(|votes| match (was, on) {
+            (true, false) => votes.off += 1,
+            (false, true) => votes.off -= 1,
+            _ => {}
+        })
+    }
+}
+
+impl Drop for Vote {
+    fn drop(&mut self) {
+        let off = !self.on;
+        self.gate.tally(|votes| {
+            votes.sessions -= 1;
+            if off {
+                votes.off -= 1;
+            }
+        });
+    }
 }
 
 /// Where this session sits among the WebRTC peers `mediad` is serving, for the one decision that
@@ -86,6 +199,10 @@ pub struct Seat {
     /// is the client's own presence, not company.
     counted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     peers: fn() -> Option<u32>,
+    /// Whether this session has a say in the video track ([`Gate`]). A datachannel does: it rides
+    /// the session that carries the track. A rendezvous lane does not — it has no track, and a
+    /// lane that left a vote on would hold the video open for a client watching nothing.
+    votes: bool,
 }
 
 impl Seat {
@@ -94,6 +211,7 @@ impl Seat {
         Seat {
             counted: std::sync::Arc::new(|| true),
             peers: proto::read_webrtc_peers,
+            votes: true,
         }
     }
 
@@ -102,6 +220,7 @@ impl Seat {
         Seat {
             counted: std::sync::Arc::new(counted),
             peers: proto::read_webrtc_peers,
+            votes: false,
         }
     }
 
@@ -207,24 +326,37 @@ pub async fn run(
 ) {
     // A peer that came with the video is a visit, and how long it stays is video streamed.
     let _visit = media.is_some().then(crate::vetbook::visit);
+    // Wanting the video from the first line, and dropped — with whatever it last said — when the
+    // channel ends.
+    let mut vote = media
+        .as_ref()
+        .and_then(|media| media.gate.clone())
+        .filter(|_| seat.votes)
+        .map(Vote::cast);
     while let Some(line) = inbound.recv().await {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line, &mut pool, media.as_ref(), &seat).await {
+        if let Some(reply) = handle(&line, &mut pool, media.as_ref(), &seat, vote.as_mut()).await {
             // A closed outbound means the peer is gone; there is nothing left to do for it.
             if outbound.send(reply).await.is_err() {
                 break;
             }
         }
     }
-    tracing::debug!("control channel ended");
+    tracing::info!("control channel ended");
 }
 
 /// Route one line. Returns a reply to send back only when this transport answers it itself —
 /// which is to say, only when it refuses.
-async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>, seat: &Seat) -> Option<String> {
+async fn handle(
+    line: &str,
+    pool: &mut Pool,
+    media: Option<&Media>,
+    seat: &Seat,
+    vote: Option<&mut Vote>,
+) -> Option<String> {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -248,7 +380,11 @@ async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>, seat: &Seat)
     if request.method == VIDEO_METHOD {
         return Some(match media {
             Some(media) => {
-                serde_json::to_string(&proto::Response::ok(id, &video_params(&media.video)))
+                let mut answer = video_params(&media.video);
+                // Whether the picture is being sent, which only this call can say: the
+                // notification is pushed once, before anybody has voted.
+                answer["on"] = media.gate.as_deref().is_none_or(Gate::flowing).into();
+                serde_json::to_string(&proto::Response::ok(id, &answer))
                     .expect("Response serialises")
             }
             None => error_line(
@@ -259,6 +395,49 @@ async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>, seat: &Seat)
                 ),
             ),
         });
+    }
+
+    // This session's vote on the video track — `Gate` has the rule. Answered here for
+    // `media.video`'s reason.
+    if request.method == SET_VIDEO_METHOD {
+        let Some(media) = media else {
+            return Some(error_line(
+                id,
+                proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "this robot is not publishing video, so there is none to pause",
+                ),
+            ));
+        };
+        let params = request
+            .params
+            .clone()
+            .map(serde_json::from_value::<proto::MediaSetVideoParams>);
+        let on = match params {
+            Some(Ok(params)) => params.on,
+            Some(Err(e)) => {
+                return Some(error_line(
+                    id,
+                    proto::Error::new(
+                        proto::code::INVALID_PARAMS,
+                        format!("media.setVideo takes {{\"on\": true|false}}: {e}"),
+                    ),
+                ));
+            }
+            None => {
+                return Some(error_line(
+                    id,
+                    proto::Error::new(
+                        proto::code::INVALID_PARAMS,
+                        "media.setVideo takes {\"on\": true|false}",
+                    ),
+                ));
+            }
+        };
+        let switch = switch(on, media.gate.as_deref(), vote);
+        return Some(
+            serde_json::to_string(&proto::Response::ok(id, &switch)).expect("Response serialises"),
+        );
     }
 
     // **The one call that makes this robot send its camera somewhere it was told about.**
@@ -332,6 +511,35 @@ async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>, seat: &Seat)
                 }
             }
         }
+    }
+}
+
+/// What a `media.setVideo` call does to the video track, and what it is now.
+///
+/// A caller with no vote — a rendezvous lane, or a pipeline with no valve — is answered with the
+/// state it could not change rather than refused, so a client that sends it everywhere reads one
+/// field to learn whether it counted.
+fn switch(on: bool, gate: Option<&Gate>, vote: Option<&mut Vote>) -> proto::MediaVideoSwitch {
+    match (gate, vote) {
+        (_, Some(vote)) => proto::MediaVideoSwitch {
+            accepted: true,
+            on: vote.set(on),
+            reason: None,
+        },
+        (Some(gate), None) => proto::MediaVideoSwitch {
+            accepted: false,
+            on: gate.flowing(),
+            reason: Some(
+                "a rendezvous control lane carries no video; vote over the WebRTC session's \
+                 control channel"
+                    .into(),
+            ),
+        },
+        (None, None) => proto::MediaVideoSwitch {
+            accepted: false,
+            on: true,
+            reason: Some("this pipeline was built without a video valve".into()),
+        },
     }
 }
 
@@ -446,6 +654,7 @@ mod tests {
         Seat {
             counted: std::sync::Arc::new(|| true),
             peers: || None,
+            votes: true,
         }
     }
 
@@ -454,6 +663,15 @@ mod tests {
     }
 
     fn seated(sockets: Sockets, dir: tempfile::TempDir, seat: Seat) -> Harness {
+        gated(sockets, dir, seat, None)
+    }
+
+    fn gated(
+        sockets: Sockets,
+        dir: tempfile::TempDir,
+        seat: Seat,
+        gate: Option<std::sync::Arc<Gate>>,
+    ) -> Harness {
         let (from_peer, inbound) = mpsc::channel(16);
         let (outbound, to_peer) = mpsc::channel(64);
         let (replies_tx, mut replies_rx) = mpsc::channel::<String>(64);
@@ -502,6 +720,7 @@ mod tests {
                     90,
                     dir.path().join("hf-token"),
                 )),
+                gate,
             }),
             seat,
         ));
@@ -567,15 +786,18 @@ mod tests {
         let peer = |n: fn() -> Option<u32>| Seat {
             counted: std::sync::Arc::new(|| true),
             peers: n,
+            votes: true,
         };
         let lane = |n: fn() -> Option<u32>| Seat {
             counted: std::sync::Arc::new(|| false),
             peers: n,
+            votes: false,
         };
         // A lane whose client is also watching: its own video is not company.
         let watching = |n: fn() -> Option<u32>| Seat {
             counted: std::sync::Arc::new(|| true),
             peers: n,
+            votes: false,
         };
         assert!(peer(|| Some(1)).alone(), "only itself");
         assert!(!peer(|| Some(2)).alone(), "one other peer");
@@ -622,6 +844,7 @@ mod tests {
         let crowded = Seat {
             counted: std::sync::Arc::new(|| true),
             peers: || Some(2),
+            votes: true,
         };
         let (call, line) = os_apply("");
         assert_eq!(exempt_if_alone(&call, &line, &crowded), None);
@@ -899,6 +1122,149 @@ mod tests {
         assert_eq!(parsed["result"]["rotate"], 90);
         // No service was involved: it is answered here, and nothing was forwarded.
         assert!(parsed.get("error").is_none(), "{reply}");
+    }
+
+    /// A gate whose valve is a log of what it was told.
+    fn recorded() -> (
+        std::sync::Arc<Gate>,
+        std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    ) {
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&told);
+        (Gate::new(move |on| log.lock().unwrap().push(on)), told)
+    }
+
+    /// **The console is never surprised.** Video flows while any session wants it, a session wants
+    /// it until it says otherwise, and a vote leaves with its session — so a bridge alone can
+    /// pause the picture, a console arriving resumes it, and the bridge is paused again only once
+    /// the console has gone. The valve is told only on a change, because each telling asks the
+    /// encoders for a keyframe.
+    #[test]
+    fn video_flows_while_any_session_wants_it() {
+        let (gate, told) = recorded();
+        assert!(gate.flowing(), "built open, with nobody here");
+
+        let mut bridge = Vote::cast(gate.clone());
+        assert!(gate.flowing(), "a new session wants the video");
+        assert!(!bridge.set(false), "alone, it can pause it");
+        assert!(!bridge.set(false), "and saying so twice changes nothing");
+
+        let console = Vote::cast(gate.clone());
+        assert!(gate.flowing(), "a session that arrives wants the picture");
+        drop(console);
+        assert!(!gate.flowing(), "and its vote leaves with it");
+
+        assert!(bridge.set(true));
+        assert!(!bridge.set(false));
+        drop(bridge);
+        assert!(
+            gate.flowing(),
+            "nobody left: open again, so the next consumer's negotiation has caps"
+        );
+        assert_eq!(
+            *told.lock().unwrap(),
+            [false, true, false, true, false, true]
+        );
+    }
+
+    /// A session ending with its vote still on takes nothing off with it.
+    #[test]
+    fn a_session_leaving_with_the_video_wanted_changes_nothing() {
+        let (gate, told) = recorded();
+        let mut bridge = Vote::cast(gate.clone());
+        let console = Vote::cast(gate.clone());
+        assert!(bridge.set(false), "the console still wants it");
+        drop(console);
+        assert!(!gate.flowing());
+        drop(bridge);
+        assert_eq!(*told.lock().unwrap(), [false, true]);
+    }
+
+    async fn ask(h: &mut Harness, line: &str) -> serde_json::Value {
+        h.from_peer.send(line.into()).await.unwrap();
+        serde_json::from_str(&h.to_peer.recv().await.unwrap()).expect("valid json")
+    }
+
+    /// `media.setVideo` over a datachannel is this session's vote, answered with `accepted` and
+    /// what the track is doing now — which `media.video` reports too. And the session's end takes
+    /// the vote with it: the channel closing is what reopens the valve.
+    #[tokio::test]
+    async fn media_set_video_is_this_sessions_vote() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gate, told) = recorded();
+        let mut h = gated(sockets_in(dir.path()), dir, alone(), Some(gate.clone()));
+        let set = |id: u32, params: &str| {
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"media.setVideo","params":{params}}}"#)
+        };
+        let read = r#"{"jsonrpc":"2.0","id":9,"method":"media.video","params":{}}"#;
+
+        let video = ask(&mut h, read).await;
+        assert_eq!(video["result"]["width"], 1280, "{video}");
+        assert_eq!(video["result"]["on"], true, "a new session's video is on");
+
+        let off = ask(&mut h, &set(2, r#"{"on":false}"#)).await;
+        assert_eq!(
+            off["result"],
+            serde_json::json!({"accepted": true, "on": false}),
+            "{off}"
+        );
+        assert!(!gate.flowing());
+        let video = ask(&mut h, read).await;
+        assert_eq!(video["result"]["on"], false, "the read says so too");
+
+        let on = ask(&mut h, &set(3, r#"{"on":true}"#)).await;
+        assert_eq!(on["result"]["on"], true, "{on}");
+
+        for bad in [r#"{"on":"off"}"#, "{}", "null"] {
+            let bad = ask(&mut h, &set(4, bad)).await;
+            assert_eq!(bad["error"]["code"], proto::code::INVALID_PARAMS, "{bad}");
+        }
+        let bare = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":5,"method":"media.setVideo"}"#,
+        )
+        .await;
+        assert_eq!(bare["error"]["code"], proto::code::INVALID_PARAMS, "{bare}");
+
+        let off = ask(&mut h, &set(6, r#"{"on":false}"#)).await;
+        assert_eq!(off["result"]["on"], false, "{off}");
+
+        // The peer goes; `run` ends, and the vote with it.
+        drop(h.from_peer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gate.flowing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the vote outlived its session"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(*told.lock().unwrap(), [false, true, false, true]);
+    }
+
+    /// A rendezvous lane has no video track and so no vote: its `on` is answered, not counted,
+    /// and the answer says why.
+    #[tokio::test]
+    async fn a_lane_cannot_pause_the_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gate, told) = recorded();
+        let lane = Seat {
+            counted: std::sync::Arc::new(|| false),
+            peers: || None,
+            votes: false,
+        };
+        let mut h = gated(sockets_in(dir.path()), dir, lane, Some(gate.clone()));
+
+        let off = ask(
+            &mut h,
+            r#"{"jsonrpc":"2.0","id":1,"method":"media.setVideo","params":{"on":false}}"#,
+        )
+        .await;
+        assert_eq!(off["result"]["accepted"], false, "{off}");
+        assert_eq!(off["result"]["on"], true);
+        assert!(off["result"]["reason"].as_str().unwrap().contains("lane"));
+        assert!(gate.flowing());
+        assert!(told.lock().unwrap().is_empty());
     }
 
     /// Garbage is answered rather than dropped, with a null id because there is none to echo.

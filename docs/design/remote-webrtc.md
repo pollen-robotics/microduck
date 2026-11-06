@@ -156,7 +156,7 @@ that protocol is what a remote bridge proxies (§7).
 
 ```
 peer (browser / phone / server-side program)
-   ├── video track      camera, hardware H.264 (mpph264enc, constrained-baseline)
+   ├── video track      camera, hardware H.264 (mpph264enc, constrained-baseline); pausable (§2.2)
    ├── audio track      mic, robot → peer, Opus mono (§2.1); peer → robot not built
    ├── datachannel "control"   reliable, ordered      → the robot API (§5)
    └── datachannel "teleop"    unreliable, unordered  → input and high-rate telemetry
@@ -169,15 +169,17 @@ takes the newest.
 **The first version opens `control` only.** Teleop is not the near-term priority, and leaving it
 out is not merely deferral — §6 is about what it removes.
 
-**`webrtcsink` takes pre-encoded H.264 on its sink pad**, so the encoder never reaches
-negotiation. Verified on hardware; the four encoder properties that are decisions rather than
+**`webrtcsink` is handed raw video and owns the encoder**, one `mpph264enc` per consumer, set up
+through its `encoder-setup` signal. It took pre-encoded H.264 at first, which cost its congestion
+control the encoder and a peer's PLI its keyframe. `mediad/src/pipeline.rs`'s header has that
+history and the plugin patch it needed; the encoder properties that are decisions rather than
 defaults are in [`media-bringup.md`](../project/media-bringup.md).
 
-**The pipeline tees raw NV12 before the encoder**, and that placement is deliberate:
+**The pipeline tees raw frames before any encoder**, and that placement is deliberate:
 
 ```text
-                              ┌─ queue ─ mpph264enc ─ h264parse ─ webrtcsink
-capture ─ NV12 ─ capsfilter ─ tee
+                              ┌─ queue ─ valve (§2.2) ─ webrtcsink ─ mpph264enc per consumer
+capture ─ UYVY ─ capsfilter ─ tee
                               └─ queue(leaky, 1) ─ appsink ─ a frame on request
 ```
 
@@ -256,6 +258,101 @@ the tone arrives at its frequency and level, the tap opens on the first peer and
 last, and a tap restarting mid-session comes back in the same session with nothing lost. Not yet
 measured on a board: the encoder's CPU cost at these settings, and the tap and petting detection
 running together.
+
+### 2.2 Pausing the video: `media.setVideo`
+
+**A consumer that wants the mic and the control channel all the time, and a picture only now and
+then, can stop the video without ending the session.** The Claude bridge is that consumer: it
+listens and drives continuously and looks only for a snapshot or while a follow skill runs. On
+graphite-ziouuuuu with the bridge connected, `mediad` ran at 182% of a core against 14% with
+nobody, the wifi driver at 19%, and the board sat at 86 °C, throttled to 408 MHz. The video's
+share of that is per frame: the encoder, `webrtcsink`'s per-consumer pipeline, the payloader, SRTP
+and the radio. How large a share it is on the board is not yet measured (see the end of this
+section).
+
+```
+→ {"jsonrpc":"2.0","id":1,"method":"media.setVideo","params":{"on":false}}
+← {"jsonrpc":"2.0","id":1,"result":{"accepted":true,"on":false}}
+```
+
+- **`on` in the answer is the track's state after the call, not an echo.** Video flows while any
+  session wants it, and a session wants it from the moment it opens until it says otherwise. So a
+  bridge alone can pause the picture. A console that connects meanwhile gets video without knowing
+  this method exists, and the bridge's next `on:false` is answered `on: true`. A session's vote ends
+  with the session, which is when its control channel closes. `media.video` reports the same `on`
+  next to the geometry.
+- **`accepted: false` means the vote was not counted**, with a `reason`. That is a rendezvous
+  control lane, which carries no video of its own, or a pipeline built without the valve. A `mediad`
+  predating the method answers METHOD_NOT_FOUND. In all three cases the video stays on, as it always
+  was.
+- **It is answered by the session, not routed.** Like `media.video` and `media.stream`, no service
+  owns the pipeline, so `route.rs` never sees the call. It reaches any session that has the
+  pipeline, which is what `session::run` is for.
+
+**The mechanism is a `valve` between the video branch's queue and `webrtcsink`.** Closed, no frame
+reaches `webrtcsink` or any of its encoders, so nothing new runs per frame. The valve drops in its
+chain function, and everything behind it is idle. It sits before `webrtcsink`, not inside it,
+because one valve stops every consumer's encoder at once and it is the only point on that path that
+is ours. The tee still splits every capture. The raw branch, auto-exposure, the duck detector,
+`media.frame` and `media.stream` are untouched, and so is the camera LED, which says the robot is
+sending: it still is, its sound.
+
+`crate::session::Gate` decides; `pipeline::VideoValve` switches. The rule:
+
+- **With no session at all, the valve is open.** That is how the pipeline was built and what
+  `webrtcsink` needs: it learns the video's caps from the first buffer and offers nothing until it
+  has them. Nobody is encoding then anyway, so leaving it closed would save nothing. The valve's
+  `drop-mode` is `forward-sticky-events`, so caps and segments pass even while it is closed.
+- **The valve is told only on a change.** A session that went away without closing its channel,
+  if `webrtcbin` ever leaked one, can hold only its last vote. A stale "off" is outvoted by the next
+  session to arrive. A stale "on" is the behaviour before this method existed.
+
+**Reopening asks every live encoder for a keyframe.** Without it the first frames after the gap
+predict from a picture the receiver threw away, and nothing decodes until the encoder's own GOP
+comes round. A receiver that saw no frames has no reason to send a PLI. The encoders are the ones
+`encoder-setup` handed over, held weakly. The request is an upstream force-key-unit event sent into
+the encoder's **source** pad: sent to its sink pad, GStreamer refuses an upstream event for
+travelling the wrong way, silently. `pipeline::tests::reopening_the_video_valve_starts_on_a_keyframe`
+pins it, and fails if the request goes to the wrong pad.
+
+**The session survives the gap.** Nothing in WebRTC times a session out for lack of media. ICE
+consent freshness is STUN on its own schedule, and RTCP keeps flowing with the audio track.
+
+**A vote leaves with its session, and that took a fix.** Before it, a session never ended when
+`webrtcsink` dropped its consumer. The datachannel's message handler held the sender
+`session::run` reads from, and the writer task held the datachannel, so each disconnect left a
+session behind, together with its connections to every service. With votes, a peer that had left
+kept the picture on for the one still here. `consumer-removed` now disconnects that handler
+(`pipeline::Closer`), and the journal says `control channel ended`.
+
+**What a client should do.** Ask for `on: true` and then wait for a frame decoded *after* the
+answer. On a laptop that came 51 to 68 ms after the call, so a deadline of one second has a wide
+margin on the board too: the next capture is at most 33 ms away, and the hardware encoder takes
+under 10 ms. Read `on` rather than assuming it, and treat `accepted: false` or METHOD_NOT_FOUND as
+"the video stays on".
+
+**What is verified, and where.** On a laptop, against a real `mediad` fed a 720p30 stand-in camera
+and the stand-in mic tap, with an `aiortc` 1.14 client (the bridge's stack, with its DTLS cipher
+shim):
+
+- **Off.** `{"on": false}` → `{accepted: true, on: false}`, then 0 video frames in 8 s while the
+  audio kept its 50 frames a second.
+- **A three-minute pause.** ICE stayed `completed`, `media.video` answered every 30 s, and nothing
+  tore the session down.
+- **On.** The first decoded frame arrived 65 ms after `on: true` following the three-minute gap,
+  and 51 to 68 ms over six shorter cycles, with no misses.
+- **Votes.** A second session arriving resumed the first one's video within 70 ms. Its leaving
+  paused it again, which is the session-end fix above. With the browser console connected, the
+  client's `on: false` left the video on.
+- **The tests.** `session::tests` covers the rule and the call. The pipeline test covers the
+  keyframe on an encoder with a GOP longer than the test.
+
+Per thread, pausing takes every `video_0:src` thread (encode, payload, send) to nothing: about 17%
+of a core there, with the laptop's GPU encoder. Not measured on a board: what pausing saves out of
+the 182%. On this laptop's plugin build, one `webrtcsink` runtime thread (`tokio-runtime-w`) spins
+at 50 to 70% of a core for each connected session, whether or not video flows, and with or without
+the mic track. A pause does not touch that thread. The board's earlier per-thread table does not
+show it, but whether the board's bridge sessions do is worth one `top -H -p $(pidof mediad)`.
 
 ## 3. `mediad` runs the signalling server itself
 
@@ -575,6 +672,9 @@ means the IMX219 module's design figures (3.04 mm over a 1.12 µm pitch, princip
 central, no distortion model), which is good to a few percent and enough to map a room; `true`
 means a measurement: *this* robot's, written into `[media.intrinsics]`, or — the default, since the camera and lens are one part across the alpha family — the family's solve that `robotd-params` ships. A consumer that needs
 metrology can tell that it needs to ask.
+
+It also says whether the video is being sent right now, `on`, which a session can change with
+`media.setVideo` (§2.2).
 
 **And the key is absent when the geometry is unknown**, rather than present and wrong. That is a
 robot streaming a test pattern, or one where `media-ctl` would not set the sensor mode — in which

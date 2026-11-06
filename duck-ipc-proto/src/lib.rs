@@ -516,7 +516,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
 /// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
 /// `updaterd`'s question, refused to every client.
-pub const API_VERSION: u32 = 50;
+///
+/// # v51 — a WebRTC session can pause the video
+///
+/// [`method::MEDIA_SET_VIDEO`] ([`MediaSetVideoParams`], answered [`MediaVideoSwitch`]): a WebRTC
+/// session's vote on whether `mediad` encodes and sends its video track. Video flows while any
+/// session wants it, and a session wants it until it says otherwise. [`method::MEDIA_VIDEO`]'s
+/// geometry answer gains `on`, the same state. A new route: a `mediad` predating it answers
+/// METHOD_NOT_FOUND, and the video stays on as it always was. `remote-webrtc.md` §2.2.
+pub const API_VERSION: u32 = 51;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -693,6 +701,15 @@ pub mod method {
     /// Deliberately not a `Call`: its binary tail must never enter Service/Lane routing
     /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
     pub const MEDIA_FRAME: &str = "media.frame";
+
+    /// What the WebRTC video is — its geometry, and whether it is being sent. Answered by
+    /// `mediad`'s session itself, over a WebRTC control channel or a rendezvous lane, so it is not
+    /// a [`super::Call`] either: no service owns the pipeline.
+    pub const MEDIA_VIDEO: &str = "media.video";
+
+    /// This session's vote on the video track, [`super::MediaSetVideoParams`], answered with
+    /// [`super::MediaVideoSwitch`]. Answered by the session for [`MEDIA_VIDEO`]'s reason.
+    pub const MEDIA_SET_VIDEO: &str = "media.setVideo";
 
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
@@ -3603,6 +3620,30 @@ impl MediaFrameHeader {
     }
 }
 
+/// Parameters of [`method::MEDIA_SET_VIDEO`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaSetVideoParams {
+    /// `false` to stop the video track for this session's sake, `true` to want it again.
+    pub on: bool,
+}
+
+/// Answer to [`method::MEDIA_SET_VIDEO`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaVideoSwitch {
+    /// Whether `on` was counted as this session's vote. `false` for a caller with no vote to cast
+    /// — a rendezvous control lane, which carries no video of its own — and for a pipeline built
+    /// without the valve; [`Self::reason`] says which.
+    pub accepted: bool,
+    /// Whether the video is being sent **now**, after this call: the result of every session's
+    /// vote, not an echo of this one's. `true` after an `on: false` means another session (the
+    /// console, say) still wants the picture.
+    pub on: bool,
+    /// Why the vote was not counted. Absent when it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Where an in-flight update has got to. Mirrors the state machine in
 /// `docs/design/updater-design.md` §7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6066,6 +6107,46 @@ pub mod clock {
 mod tests {
     use super::test_support::every_call;
     use super::*;
+
+    /// `media.setVideo` takes exactly a boolean `on`: missing, mistyped or accompanied by a field
+    /// this release does not know, it is refused by name rather than read as a vote it was not.
+    #[test]
+    fn media_set_video_params_are_one_boolean() {
+        let off: MediaSetVideoParams = serde_json::from_str(r#"{"on":false}"#).unwrap();
+        assert!(!off.on);
+        let on: MediaSetVideoParams = serde_json::from_str(r#"{"on":true}"#).unwrap();
+        assert!(on.on);
+        for refused in ["{}", r#"{"on":"no"}"#, r#"{"on":true,"for":"x"}"#] {
+            assert!(
+                serde_json::from_str::<MediaSetVideoParams>(refused).is_err(),
+                "{refused}"
+            );
+        }
+        assert_eq!(method::MEDIA_SET_VIDEO, "media.setVideo");
+    }
+
+    /// The answer is two flat booleans, always present, and a reason only when not counted.
+    #[test]
+    fn media_video_switch_serialises_flat() {
+        let counted = MediaVideoSwitch {
+            accepted: true,
+            on: false,
+            reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&counted).unwrap(),
+            serde_json::json!({"accepted": true, "on": false})
+        );
+        let lane = MediaVideoSwitch {
+            accepted: false,
+            on: true,
+            reason: Some("no vote".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&lane).unwrap(),
+            serde_json::json!({"accepted": false, "on": true, "reason": "no vote"})
+        );
+    }
 
     fn camera_stats(consumers: u32) -> CameraStats {
         CameraStats {
