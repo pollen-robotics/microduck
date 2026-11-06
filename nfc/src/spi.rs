@@ -12,6 +12,15 @@ use std::io;
 pub trait Bus {
     /// Send `tx`, then clock `rx.len()` more bytes and keep what the chip sent during those.
     fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> io::Result<()>;
+
+    /// Several write-only transactions in order, each framed by its own chip select. Sent one at
+    /// a time unless the bus can do better; [`Spidev`] sends them as one message, one ioctl.
+    fn write_each(&mut self, frames: &[&[u8]]) -> io::Result<()> {
+        for tx in frames {
+            self.transfer(tx, &mut [])?;
+        }
+        Ok(())
+    }
 }
 
 /// The SPI clock asked for, Hz. The board's device tree allows up to this.
@@ -29,7 +38,14 @@ mod ioctl {
     pub const SPI_IOC_WR_BITS_PER_WORD: libc::c_ulong = 0x4001_6b03;
     pub const SPI_IOC_WR_MAX_SPEED_HZ: libc::c_ulong = 0x4004_6b04;
     /// `SPI_IOC_MESSAGE(1)`: one `spi_ioc_transfer`, 32 bytes.
-    pub const SPI_IOC_MESSAGE_1: libc::c_ulong = 0x4020_6b00;
+    pub const SPI_IOC_MESSAGE_1: libc::c_ulong = message(1);
+    /// The most transfers one message can carry: the size field is 14 bits.
+    pub const MESSAGE_MAX: usize = ((1 << 14) - 1) / 32;
+
+    /// `SPI_IOC_MESSAGE(n)`: `_IOW('k', 0, char[n * 32])`.
+    pub const fn message(n: usize) -> libc::c_ulong {
+        0x4000_6b00 | ((n * 32) as libc::c_ulong) << 16
+    }
     pub const SPI_MODE_1: u8 = 0x01;
 
     /// `struct spi_ioc_transfer`.
@@ -120,6 +136,43 @@ impl Bus for Spidev {
             "spi"
         );
         rx.copy_from_slice(&back[tx.len()..]);
+        Ok(())
+    }
+
+    fn write_each(&mut self, frames: &[&[u8]]) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        for chunk in frames.chunks(ioctl::MESSAGE_MAX) {
+            let last = chunk.len() - 1;
+            let transfers: Vec<ioctl::Transfer> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, tx)| ioctl::Transfer {
+                    tx_buf: tx.as_ptr() as u64,
+                    len: tx.len() as u32,
+                    speed_hz: SPEED_HZ,
+                    bits_per_word: 8,
+                    // Chip select up between transfers, so each is a transaction of its own; on
+                    // the last one this would mean the opposite — held for the next message.
+                    cs_change: u8::from(i != last),
+                    ..Default::default()
+                })
+                .collect();
+            // Safety: every `tx_buf` is a borrowed slice that outlives the call, `len` bytes
+            // long; no transfer reads, so no `rx_buf`.
+            let done = unsafe {
+                libc::ioctl(
+                    self.fd.as_raw_fd(),
+                    ioctl::message(transfers.len()),
+                    transfers.as_ptr(),
+                )
+            };
+            if done < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for tx in chunk {
+                tracing::trace!(tx = ?&tx[..tx.len().min(12)], "spi");
+            }
+        }
         Ok(())
     }
 }

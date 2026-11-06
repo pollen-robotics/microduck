@@ -231,6 +231,14 @@ impl<B: Bus> St25r100<B> {
         Ok(self.bus.transfer(&[code], &mut [])?)
     }
 
+    /// Register writes (`[reg, values…]`) and direct commands (`[code]`), each its own
+    /// transaction, sent as one bus message. A poll with no tag is mostly these, and each separate
+    /// transaction is a syscall and a wakeup.
+    fn send(&mut self, frames: &[&[u8]]) -> Result<()> {
+        debug_assert!(frames.iter().all(|f| !f.is_empty() && f[0] & READ == 0));
+        Ok(self.bus.write_each(frames)?)
+    }
+
     /// The three IRQ status registers in one read, which also clears them (§5.8.1).
     fn irqs(&mut self) -> Result<[u8; 3]> {
         let mut v = [0u8; 3];
@@ -297,9 +305,8 @@ impl<B: Bus> St25r100<B> {
             .ok_or_else(|| Error::Desync("protocol switched before begin()".into()))?;
         match proto {
             Proto::A => {
-                for (r, value) in nfca {
-                    self.write(r, &[value])?;
-                }
+                let frames = nfca.map(|(r, value)| [r, value]);
+                self.send(&frames.each_ref().map(|f| f.as_slice()))?;
             }
             Proto::V => {
                 let was = |r: u8| nfca.iter().find(|(at, _)| *at == r).map_or(0, |(_, v)| *v);
@@ -326,9 +333,8 @@ impl<B: Bus> St25r100<B> {
                         (was(reg::RX_ANA2) & !RX_ANA2_GAIN_TD_MASK) | RX_ANA2_GAIN_TD_NFCV,
                     ),
                 ];
-                for (r, value) in values {
-                    self.write(r, &[value])?;
-                }
+                let frames = values.map(|(r, value)| [r, value]);
+                self.send(&frames.each_ref().map(|f| f.as_slice()))?;
             }
         }
         self.proto = proto;
@@ -350,8 +356,10 @@ impl<B: Bus> St25r100<B> {
     /// Put the field on the other antenna. Takes effect at the next [`Reader::reset_field`].
     pub fn set_antenna(&mut self, antenna: Antenna) -> Result<()> {
         self.antenna = antenna;
-        self.write(reg::OPERATION, &[self.op_ready()])?;
-        self.write(reg::GENERAL, &[antenna.general()])
+        self.send(&[
+            &[reg::OPERATION, self.op_ready()],
+            &[reg::GENERAL, antenna.general()],
+        ])
     }
 
     fn wait(
@@ -431,8 +439,6 @@ impl<B: Bus> Reader for St25r100<B> {
     /// The transceive sequence of §5.10: stop, clear the gain, frame it, load the FIFO,
     /// transmit, then read the IRQ status until the reception ends or the timer says nothing came.
     fn transceive(&mut self, data: &[u8], exchange: Exchange) -> Result<Vec<u8>> {
-        self.command(cmd::STOP_ALL)?;
-        self.command(cmd::CLEAR_RX_GAIN)?;
         let tx = TX_PARITY | if exchange.crc { TX_CRC } else { 0 };
         let mut rx = RX_B_SOF_EOF | RX_PARITY | if exchange.rx_crc() { RX_CRC } else { 0 };
         // The 15693 receiver wants the anticollision bit as well, on every exchange — ST's reader
@@ -441,16 +447,24 @@ impl<B: Bus> Reader for St25r100<B> {
         if matches!(self.proto, Proto::V) {
             rx |= RX_ANTCL;
         }
-        self.write(reg::PROTOCOL_TX1, &[tx])?;
-        self.write(reg::PROTOCOL_RX1, &[rx])?;
         let ticks = nrt_ticks(exchange.timeout_ms).to_be_bytes();
-        // NRT GPT config, then NRT1 (MSB) and NRT2 (LSB), auto-incremented: nrt_step 0
-        // (4.72 µs), normal mode.
-        self.write(reg::NRT_GPT_CONFIG, &[0x00, ticks[0], ticks[1]])?;
         let (ntx, nbtx) = frame_length(data.len(), exchange.tx_bits);
-        self.write(reg::TX_FRAME1, &tx_frame(ntx, nbtx))?;
-        self.write(FIFO, data)?;
-        self.command(cmd::TRANSMIT_DATA)?;
+        let [frame1, frame2] = tx_frame(ntx, nbtx);
+        let mut fifo = Vec::with_capacity(1 + data.len());
+        fifo.push(FIFO);
+        fifo.extend_from_slice(data);
+        self.send(&[
+            &[cmd::STOP_ALL],
+            &[cmd::CLEAR_RX_GAIN],
+            &[reg::PROTOCOL_TX1, tx],
+            &[reg::PROTOCOL_RX1, rx],
+            // NRT GPT config, then NRT1 (MSB) and NRT2 (LSB), auto-incremented: nrt_step 0
+            // (4.72 µs), normal mode.
+            &[reg::NRT_GPT_CONFIG, 0x00, ticks[0], ticks[1]],
+            &[reg::TX_FRAME1, frame1, frame2],
+            &fifo,
+            &[cmd::TRANSMIT_DATA],
+        ])?;
 
         let until = Instant::now() + Duration::from_millis(exchange.timeout_ms + 20);
         let mut seen = [0u8; 3];
