@@ -231,12 +231,19 @@
            does the scaling, and neither a resize nor a change of mount rotation needs any code. -->
       <svg id="boxes" preserveAspectRatio="none" aria-hidden="true"></svg>
     </div>
+    <!-- The duck's microphone, on its own element rather than the video's: that one has to stay
+         `muted` to be allowed to autoplay at all, so sound needs an element a click can unmute.
+         Muted until somebody asks — a page that starts talking on connect is a surprise, and in a
+         room with the duck it is the same sound twice. -->
+    <audio id="mic" autoplay muted></audio>
     <div class="row stats">
       <span><b>bitrate</b> <span id="bitrate">–</span></span>
       <span><b>ducks</b> <span id="detections">–</span></span>
       <span><b>fps</b> <span id="fps">–</span></span>
       <span><b>loss</b> <span id="loss">–</span></span>
       <span><b>rtt</b> <span id="rtt">–</span></span>
+      <span><b>mic</b> <span id="miclevel">–</span></span>
+      <button id="listen" disabled title="Hear the duck's microphone">listen</button>
       <span id="gaze" class="pill dim" hidden>gaze clamped</span>
     </div>
     <p class="hint">Drag on the picture to look at a point. The robot solves the IK and says when a
@@ -879,7 +886,7 @@ $("robots").onchange = () => {
   if (sessionId) {
     send({ type: "endSession", sessionId });
     sessionId = null;
-    if (pc) { pc.close(); pc = null; }
+    if (pc) { pc.close(); pc = null; forgetMic(); }
     setDc("no control channel"); setLive(false);
     stopTelemetry();
   }
@@ -894,7 +901,7 @@ function teardown() {
   ws = null; stream = null; sessionId = null; control = null;
   wanted = false; starting = false;
   stopTelemetry();
-  if (pc) { pc.close(); pc = null; }
+  if (pc) { pc.close(); pc = null; forgetMic(); }
   if (reconnecting) {
     reconnecting = false;
     setTimeout(() => $("connect").onclick(), RECONNECT_DELAY_MS);
@@ -1091,7 +1098,7 @@ async function onSignalling(raw) {
         sessionId = null;
         wanted = false;
         starting = false;
-        if (pc) { pc.close(); pc = null; }
+        if (pc) { pc.close(); pc = null; forgetMic(); }
         setState("signalling"); setDc("no control channel"); setLive(false);
         stopTelemetry();
         break;
@@ -1183,6 +1190,13 @@ function newPeerConnection() {
 
   pc.ontrack = (event) => {
     log("dim", "track:", event.track.kind);
+    // The microphone, when `[media] mic` is on. A track of its own on an element of its own, so
+    // the picture's element keeps the `muted` its autoplay depends on.
+    if (event.track.kind === "audio") {
+      $("mic").srcObject = new MediaStream([event.track]);
+      $("listen").disabled = false;
+      return;
+    }
     $("video").srcObject = event.streams[0];
   };
 
@@ -1476,6 +1490,28 @@ function onState(state) {
   $("t-applied").className = limited ? "warn" : "";
 }
 
+// ── the microphone ─────────────────────────────────────────────────────────────
+//
+// Robot to page only: the duck can be heard, it does not play what is said here. `remote-webrtc.md`
+// §2.1 is the track.
+
+function setListening(on) {
+  $("mic").muted = !on;
+  $("listen").textContent = on ? "mute" : "listen";
+  // The click is the gesture a browser wants before it plays sound; `play()` is what turns it
+  // into sound on one that paused the element for want of one.
+  if (on) $("mic").play().catch((e) => log("bad", "!! the browser would not play the mic:", e.message));
+}
+$("listen").onclick = () => setListening($("mic").muted);
+
+/// A session that went away took its track with it; the next one brings its own.
+function forgetMic() {
+  $("mic").srcObject = null;
+  setListening(false);
+  $("listen").disabled = true;
+  $("miclevel").textContent = "–";
+}
+
 // ── link quality ───────────────────────────────────────────────────────────────
 //
 // A stream that degrades is otherwise a picture that looks worse and a log that says nothing.
@@ -1485,11 +1521,19 @@ let lastStats = null;
 async function readStats() {
   if (!pc) return;
   const report = await pc.getStats();
-  let inbound = null, pair = null;
+  let inbound = null, pair = null, audio = null;
   report.forEach((s) => {
     if (s.type === "inbound-rtp" && s.kind === "video") inbound = s;
+    if (s.type === "inbound-rtp" && s.kind === "audio") audio = s;
     if (s.type === "candidate-pair" && s.nominated) pair = s;
   });
+  // How loud the room is, in dBFS, from a linear 0..1 the browser reports. Only while listening:
+  // Chrome measures the level where the audio is played out, so a muted element reads zero
+  // whatever the room is doing, and "silent" there would be a claim about the duck it cannot make.
+  if (audio) {
+    $("miclevel").textContent = $("mic").muted ? "muted"
+      : audio.audioLevel > 0 ? `${Math.round(20 * Math.log10(audio.audioLevel))} dB` : "silent";
+  }
   if (inbound) {
     if (lastStats && inbound.timestamp > lastStats.timestamp) {
       const seconds = (inbound.timestamp - lastStats.timestamp) / 1000;

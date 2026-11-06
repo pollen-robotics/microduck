@@ -789,6 +789,14 @@ pub struct MediaParams {
     /// Which sensor the head camera must be. `board`, the default, is the declared board's — see
     /// [`MediaSensor`] for why anything else is the exception.
     pub sensor: MediaSensor,
+    /// Publish the onboard microphone as an Opus track beside the video, robot to peer only.
+    ///
+    /// **On by default because it is cheap and because a peer that hears nothing has no way to
+    /// ask for it.** `mediad` takes the stream `robotd` already captures for the petting
+    /// classifier, encodes it only for a connected peer, and asks `robotd` for it only while one
+    /// is connected — so a robot nobody is watching captures nothing it did not capture before.
+    /// Off means no audio track in the offer at all. `remote-webrtc.md` §2.1 has the track.
+    pub mic: bool,
 }
 
 /// A camera calibration, as OpenCV's `calibrateCamera` produces one.
@@ -895,6 +903,8 @@ impl Default for MediaParams {
             congestion_control: CongestionControl::default(),
             // The board's camera: a sensor named here is a deliberate exception.
             sensor: MediaSensor::Board,
+            // A voice the peer can hear, for the price of one Opus encoder per peer.
+            mic: true,
         }
     }
 }

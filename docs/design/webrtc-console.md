@@ -108,7 +108,10 @@ copy of the protocol version to keep in step with the `.so` we ship, so not in t
 **But it is where this ends up, and here is why.** A browser gives a page served over plain http
 to a private address no microphone, and depending on the browser no gamepad either — those are
 secure-context APIs, and `http://192.168.1.42` is not a secure context (`http://localhost` is,
-which is precisely why nobody has hit this yet). Two-way audio is in `remote-webrtc.md` §2. The
+which is precisely why nobody has hit this yet). *Hearing* the robot needs none of that: the page
+plays the robot's mic track behind a **listen** button (the click is the gesture a browser wants
+before it plays sound), and `remote-webrtc.md` §2.1 has the track. Two-way audio is in
+`remote-webrtc.md` §12. The
 robot will need to serve TLS, and `webrtcsink`'s built-in server offers no way to configure a
 certificate, while an `axum` server offers the ordinary one. So the sequence is: two ports now,
 our own signalling server when audio or a browser gamepad is wanted, TLS on the same day.

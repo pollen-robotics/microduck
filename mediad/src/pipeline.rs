@@ -8,12 +8,12 @@
 //!
 //! ```text
 //!                                                ┌─ queue ─ webrtcsink ─ setup → mpph264enc
-//! videotestsrc | camera ─ NV12 ─ videoflip ─ tee ┤          │
-//!                                                └─ queue ─ │  run-signalling-server=true
-//!                                       (leaky)     │
-//!                                          │        └─ consumer-added → "control" channel
-//!                                      appsink
-//!                                   a frame on request
+//! videotestsrc | camera ─ NV12 ─ videoflip ─ tee ┤          │  │    └ setup → opusenc
+//!                                                └─ queue ─ │  │ run-signalling-server=true
+//!                                       (leaky)     │       │  │
+//!                                          │        │       │  └ consumer-added → "control" channel
+//!                                      appsink      │       │
+//!                                   a frame on request      appsrc ← robotd's mic tap (crate::mic)
 //! ```
 //!
 //! **The tee is on raw NV12, before the encoder**, and that placement is the point of it.
@@ -194,6 +194,9 @@ pub struct Settings {
     /// How far the *pipeline* turns the picture; see [`Rotation`]. Almost always `None` — the
     /// capture geometry above is then also what leaves the tee.
     pub rotation: Rotation,
+    /// `robotd`'s mic tap, for an Opus track beside the video — or `None` for no audio track at
+    /// all, which is `[media] mic = false`. See [`crate::mic`].
+    pub mic: Option<std::path::PathBuf>,
 }
 
 /// Where the video comes from.
@@ -592,6 +595,13 @@ pub fn start(
         );
     }
 
+    // Opus and nothing else, for the same reason as the video: it is what every WebRTC peer
+    // decodes, and `webrtcsink` would otherwise offer whatever else it found an encoder for.
+    // Only set when there is a track to describe.
+    if settings.mic.is_some() && sink.has_property("audio-caps") {
+        sink.set_property("audio-caps", gst::Caps::builder("audio/x-opus").build());
+    }
+
     // Offer H.264 and nothing else. Left alone `webrtcsink` proposes everything it can encode:
     // `mppvp8enc`, `mpph265enc` and `mpph264enc` on the VPU, but `vp9enc` and `av1enc` in
     // *software*. A browser preferring AV1 would have this robot software-encoding AV1 on four
@@ -744,6 +754,25 @@ pub fn start(
             .context("could not attach the H.264 branch to the tee")?;
     }
 
+    // ── the mic ─────────────────────────────────────────────────────────────
+    //
+    // After the video is linked, and a failure here costs the track and nothing else: a robot
+    // that streams and drives with no sound is the robot it was before this branch existed.
+    let mic = match settings.mic.as_ref() {
+        Some(socket) => build_mic_branch(&pipeline, &sink, socket.clone(), consumers.clone())
+            .inspect_err(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "no microphone track; video and control are unaffected"
+                );
+            })
+            .is_ok(),
+        None => {
+            tracing::info!("[media] mic = false: no microphone track");
+            false
+        }
+    };
+
     // **Watch the bus, or every media failure is silent.**
     //
     // This was learned the hard way. `webrtcsink` drops a codec whose discovery pipeline fails
@@ -768,9 +797,127 @@ pub fn start(
         out_height,
         ?rotation,
         fps,
+        mic,
         "signalling server listening"
     );
     Ok((pipeline, channels_rx, frames, stream_branch, consumers))
+}
+
+/// The microphone track: `appsrc ! webrtcsink.audio_%u`, fed by [`crate::mic::feed`] on a thread
+/// of its own.
+///
+/// **Raw audio in, and `webrtcsink` owns the encoder** — `opusenc`, configured in
+/// [`wire_encoder_setup`] — for the video's reason: it builds one per consumer, so a robot nobody
+/// is connected to encodes nothing.
+///
+/// **The feed starts with the pipeline and never waits for the mic**: `webrtcsink` negotiates
+/// nothing until every input has caps, so this branch pushes silence from the first tick and the
+/// mic's audio only once `robotd` hands some over. The timestamps are this thread's clock — the
+/// running time at the first chunk, then 20 ms a chunk — rather than `do-timestamp`, which would
+/// stamp a burst of catch-up chunks a microsecond apart.
+fn build_mic_branch(
+    pipeline: &gst::Pipeline,
+    sink: &gst::Element,
+    socket: std::path::PathBuf,
+    consumers: Consumers,
+) -> Result<()> {
+    let caps = gst::Caps::builder("audio/x-raw")
+        .field("format", "S16LE")
+        .field("rate", proto::MIC_RATE as i32)
+        .field("channels", 1i32)
+        .field("layout", "interleaved")
+        .build();
+    let src = gst_app::AppSrc::builder()
+        .name("mic")
+        .caps(&caps)
+        .format(gst::Format::Time)
+        .is_live(true)
+        .do_timestamp(false)
+        // A second of audio at most, and never block the feed: a stalled sink costs chunks, and
+        // the feed's own clock is what keeps the track honest about time.
+        .max_bytes((proto::MIC_RATE * 2) as u64)
+        .block(false)
+        // **Said, because the default is a lie that costs the video.** Left unset a live appsrc
+        // answers the latency query with a maximum of zero, and the pipeline — whose video side
+        // needs 220 ms — logs "Impossible to configure latency" and runs unsynchronised. A chunk
+        // is the least a buffer can be late, and the queue above is the most.
+        .min_latency(crate::mic::CHUNK.as_nanos() as i64)
+        .max_latency(1_000_000_000)
+        .build();
+
+    let pad = sink.request_pad_simple("audio_%u").ok_or_else(|| {
+        anyhow!("webrtcsink would not give an audio pad; these plugins may predate audio input")
+    })?;
+    pipeline
+        .add(&src)
+        .context("could not add the mic source to the pipeline")?;
+    let linked = src
+        .static_pad("src")
+        .context("appsrc has no src pad, which cannot happen")
+        .and_then(|src_pad| {
+            src_pad
+                .link(&pad)
+                .map_err(|e| anyhow!("could not link the mic to webrtcsink: {e:?}"))
+        });
+    if let Err(error) = linked {
+        // An unlinked source in a live pipeline is a not-linked error waiting for its first push;
+        // take it back out so the rest of the pipeline is exactly what it would have been.
+        let _ = pipeline.remove(&src);
+        sink.release_request_pad(&pad);
+        return Err(error);
+    }
+
+    let feeding = src.clone();
+    std::thread::Builder::new()
+        .name("mic-feed".into())
+        .spawn(move || {
+            let mut base: Option<gst::ClockTime> = None;
+            let mut pushed: u64 = 0;
+            let mut said_refused = false;
+            crate::mic::feed(
+                socket,
+                move || consumers.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                |chunk, discont| {
+                    // No running time until the pipeline is PLAYING; nothing to stamp a chunk
+                    // with, and nobody to hear it.
+                    let Some(now) = feeding.current_running_time() else {
+                        return crate::mic::Flow::Continue;
+                    };
+                    if discont || base.is_none() {
+                        base = Some(now);
+                        pushed = 0;
+                    }
+                    let chunk_ns = crate::mic::CHUNK.as_nanos() as u64;
+                    let pts =
+                        base.unwrap_or(now) + gst::ClockTime::from_nseconds(pushed * chunk_ns);
+                    pushed += 1;
+                    let mut buffer = gst::Buffer::from_slice(chunk.to_vec());
+                    if let Some(buffer) = buffer.get_mut() {
+                        buffer.set_pts(pts);
+                        buffer.set_duration(gst::ClockTime::from_nseconds(chunk_ns));
+                        if discont {
+                            buffer.set_flags(gst::BufferFlags::DISCONT);
+                        }
+                    }
+                    match feeding.push_buffer(buffer) {
+                        Ok(_) => crate::mic::Flow::Continue,
+                        // Shutting down, or the pipeline was never going to play.
+                        Err(gst::FlowError::Eos) => crate::mic::Flow::Stop,
+                        Err(gst::FlowError::Flushing) => crate::mic::Flow::Continue,
+                        Err(error) => {
+                            if !said_refused {
+                                tracing::warn!(?error, "the mic track refused a chunk");
+                                said_refused = true;
+                            }
+                            crate::mic::Flow::Continue
+                        }
+                    }
+                },
+            );
+            tracing::debug!("mic feed ended");
+        })
+        .context("could not start the mic feed")?;
+    Ok(())
 }
 
 /// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! videoconvert ! enc !
@@ -1911,6 +2058,11 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
             if !discovering {
                 tracing::info!(encoder = %name, %consumer, "hardware H.264, configured for WebRTC");
             }
+        } else if name == "opusenc" {
+            configure_opus(&encoder);
+            if !discovering {
+                tracing::info!(encoder = %name, %consumer, "microphone, Opus");
+            }
         } else if !discovering {
             // Only meaningful for a real consumer. During discovery this fires once per codec —
             // including `mppvp8enc` and `mpph265enc`, which are *hardware* — so warning there
@@ -1928,6 +2080,49 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
         Some(false.to_value())
     });
     Ok(())
+}
+
+/// Opus for one mono voice, in software on the cores the control loop shares.
+///
+/// - **`audio-type=voice`**: the encoder's speech mode, which is what this mic carries and what a
+///   transcriber on the other end wants. Its default is `generic`, tuned for music.
+/// - **24 kb/s**: wideband speech is transparent well below this; the default is sized for
+///   full-band stereo, which a 16 kHz mono capture cannot use.
+/// - **`complexity=5`** rather than 10. Half the encoder's search for a quality difference that a
+///   16 kHz voice does not have room to show, on a board whose CPU already runs hot.
+///
+/// Each checked against the element's own description first: `set_property_from_str` panics on a
+/// name these plugins lack or a value their enum does not know, and a panic here aborts the daemon
+/// from inside a signal. A setting that does not fit leaves the encoder at its default.
+fn configure_opus(encoder: &gst::Element) {
+    for (property, value) in [
+        ("audio-type", "voice"),
+        ("bitrate", "24000"),
+        ("complexity", "5"),
+    ] {
+        if accepts(encoder, property, value) {
+            encoder.set_property_from_str(property, value);
+        } else {
+            tracing::debug!(property, value, "opusenc kept its default");
+        }
+    }
+}
+
+/// Whether `element` has `property` and `value` is one it takes — an enum nick, or an integer in
+/// range. Anything else is `false`, which is the safe answer for the only caller.
+fn accepts(element: &gst::Element, property: &str, value: &str) -> bool {
+    let Some(spec) = element.find_property(property) else {
+        return false;
+    };
+    if let Some(class) = glib::EnumClass::with_type(spec.value_type()) {
+        return class.value_by_nick(value).is_some();
+    }
+    match spec.downcast_ref::<glib::ParamSpecInt>() {
+        Some(int) => value
+            .parse::<i32>()
+            .is_ok_and(|v| (int.minimum()..=int.maximum()).contains(&v)),
+        None => false,
+    }
 }
 
 /// Live count of what the consumers see, so [`meter_capture_rate`] can report it and the camera
@@ -2621,6 +2816,9 @@ mod tests {
             height: 240,
             fps: 15,
             rotation: Rotation::None,
+            // A tap nobody serves, so the mic branch is built and feeds silence — which is the
+            // point: the raw branch below must not wait on a microphone that is not there.
+            mic: Some(std::env::temp_dir().join("mediad-test-no-such-mic.sock")),
         };
         let (pipeline, _channels, frames, _stream, _peers) = start(
             Source::Test,
@@ -2635,8 +2833,10 @@ mod tests {
         let frame = tokio::task::spawn_blocking(move || (0..10).find_map(|_| frames.next_frame()))
             .await
             .expect("the reader thread");
+        let mic = pipeline.by_name("mic").is_some();
         let _ = pipeline.set_state(gst::State::Null);
 
+        assert!(mic, "the microphone branch is part of the pipeline");
         let frame = frame.expect("a frame within five seconds; the raw branch is starved");
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.format, CAPTURE_FORMAT);

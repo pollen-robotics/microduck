@@ -157,7 +157,7 @@ that protocol is what a remote bridge proxies (§7).
 ```
 peer (browser / phone / server-side program)
    ├── video track      camera, hardware H.264 (mpph264enc, constrained-baseline)
-   ├── audio track      mic; two-way for telepresence
+   ├── audio track      mic, robot → peer, Opus mono (§2.1); peer → robot not built
    ├── datachannel "control"   reliable, ordered      → the robot API (§5)
    └── datachannel "teleop"    unreliable, unordered  → input and high-rate telemetry
 ```
@@ -207,6 +207,55 @@ the same "no frame" path it always did.
 
 The branch exists from the start rather than being added when something reads it: inserting a tee
 into a live pipeline is a materially harder problem than having one that was always there.
+
+### 2.1 The microphone track
+
+**One way, robot to peer.** The duck's onboard mic is a mono Opus track in the same session as
+the video, so every consumer of a session hears it: the console, `reachy_mini`'s
+`central_consumer`, and anything else reaching the robot through the rendezvous. The duck does not
+play what a peer says. Peer-to-robot audio is §12.
+
+```text
+robotd's mic tap ── mediad::mic::feed ── appsrc ── webrtcsink.audio_%u ── opusenc (per consumer)
+ /run/robotd/mic.sock   20 ms chunks, zeros     S16LE 16 kHz mono         audio-type=voice, 24 kb/s,
+ (robotd-design §4.6)   when there is no audio                              complexity 5
+```
+
+- **`mediad` does not open the mic.** The capture is `robotd`'s petting worker, which lends it over
+  a socket. `robotd-design.md` §4.6 owns that, and why it is not `dsnoop`.
+- **The track never waits for the mic.** `webrtcsink` negotiates nothing until every input pad has
+  caps. An audio branch that waited for a microphone would make video and the control channel wait
+  for one too. So `mediad::mic::feed` runs on its own clock from the moment the pipeline plays:
+  every 20 ms it pushes the next chunk of the mic, or zeros. `robotd` restarting, `[audio]` off, or
+  a twin with no codec all mean a peer hears silence. None of them is a session that will not start.
+- **The tap is held only while a peer is connected.** The feed connects when `webrtcsink`'s
+  consumer count goes above zero and closes when it falls back. With petting detection off, that
+  is the only thing that makes `robotd` record at all. So the mic leaves the robot exactly when the
+  picture does, and the beta board's camera LED (§12) covers both.
+- **A small jitter buffer.** `robotd` passes on `arecord`'s reads whole, 125 ms at a time, so the
+  feed gathers 200 ms before it plays and drops back to that above 500 ms. That buffer is most of
+  the track's latency, about a quarter of a second, which is fine for a voice being listened to
+  or transcribed.
+- **`webrtcsink` owns the encoder**, as it does the video's: one `opusenc` per consumer, set up in
+  `encoder-setup`. `audio-caps` is restricted to Opus, as `video-caps` is to H.264. Its settings
+  are chosen for one voice on a CPU the control loop shares: speech mode, 24 kb/s, half the default
+  search effort.
+- **Timestamps come from the feed's clock**: the running time at the first chunk, then 20 ms a
+  chunk, and a fresh start, flagged as a discontinuity, after the thread falls 200 ms behind.
+  `appsrc` declares a 20 ms to 1 s latency. Left at its default it answers the latency query with
+  a maximum of zero, and the pipeline reports "Impossible to configure latency" against the
+  video's 220 ms.
+
+**The switch is `[media] mic`, on by default**, and `systemctl restart mediad` applies it. Off
+removes the track from the offer. On costs a 50 Hz push of 640 bytes with nobody connected, and one
+Opus encoder per connected peer.
+
+**What is verified, and where.** On a laptop, against a real `mediad` on the test pattern and a
+stand-in tap sending `arecord`-sized bursts: the console negotiates `OPUS/48000/2` next to H.264,
+the tone arrives at its frequency and level, the tap opens on the first peer and closes after the
+last, and a tap restarting mid-session comes back in the same session with nothing lost. Not yet
+measured on a board: the encoder's CPU cost at these settings, and the tap and petting detection
+running together.
 
 ## 3. `mediad` runs the signalling server itself
 
@@ -568,6 +617,11 @@ along with a transport. `remote-access-design.md` §9 carries it as open.
 
 ## 12. Deferred, with reasons
 
+- **Peer-to-robot audio.** The duck answers with its own voice, not a peer's, so nothing plays
+  what arrives. It also needs the browser's microphone, which a page over plain http to a private
+  address does not get (`webrtc-console.md` §1.3). And the codec's playback PCM is `robotd`'s
+  voice, so it would need its own sharing decision of the kind `robotd-design.md` §4.6 records
+  for capture.
 - **The `teleop` datachannel.** Not the near-term priority; §6 covers what deferring it removes,
   what it costs in the meantime, and the sequence numbers it will need.
 - **Multi-peer video.** One media session at a time, plus control-only clients. Simulcast and

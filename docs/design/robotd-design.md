@@ -1045,6 +1045,57 @@ is to be *operable*, and that is the cheat sheet's job: [the voice], [the choral
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
 
+### 4.6 The mic has one reader, and lends what it hears
+
+The onboard mic gained a second consumer: `mediad`, which sends it to WebRTC peers as an Opus track
+(`remote-webrtc.md` §2.1). That makes the mic's sharing a contract with two parties, so it is
+written down here, beside the worker that owns the capture.
+
+**One capture, and it is `robotd`'s.** The petting worker (`pet-detect/src/worker.rs`) runs
+`arecord -D plughw:aic3104,0 -r 16000 -c 1` and reads it. It also hands every read, unchanged, to a
+tap: `robotd/src/mic.rs` serves it on `/run/robotd/mic.sock` (`duck_ipc_proto::mic_socket_path`). The
+wire is raw S16LE mono at 16 kHz with no header, mode 0660 to the `robot` group. A listener hears
+exactly what the classifier hears.
+
+- **The capture runs only for someone.** With petting detection on, it runs as it always did. With
+  it off (the default), the worker has no classifier, waits on the tap, starts `arecord` when the
+  first listener connects, and stops it within one read of the last one leaving. `mediad` connects
+  only while a WebRTC peer is there. So a robot nobody is watching records nothing, exactly as it
+  did before there was a tap. `[audio] enabled = false` serves no tap and captures nothing; a peer
+  then hears silence.
+- **A listener that stops reading is dropped, not waited for.** The writes happen on the worker's
+  thread and are non-blocking. A short write is a disconnect too: half a sample written would put
+  every sample after it a byte out of step. The kernel buffers several seconds of this stream, so
+  a listener dropped here had already stopped reading. It reconnects and loses nothing worth having.
+- **Nothing here touches the tick.** The tap's accept loop is a thread of its own. The worker pays
+  one call per read, and only while somebody is connected.
+
+**Why not let `mediad` open the mic itself.** The TLV320AIC3104's capture PCM opens once. A second
+`arecord` on the same device while the worker holds it gets `EBUSY`. The ALSA answer to that is
+`dsnoop`, which this deploy would have to ship as a config file. Three properties of these two
+units each break it:
+
+- **The handoff goes through `/tmp`.** alsa-lib's direct plugins pass the hardware descriptor to
+  each client over a unix socket at a fixed `/tmp/alsa-dmix-…` path. `mediad` runs with
+  `PrivateTmp=yes` under `ProtectSystem=strict`, so it can neither reach a socket `robotd` created
+  nor create one itself without giving up both.
+- **The server belongs to whoever opened first.** The process holding the device is forked from the
+  first client, so it lives in that unit's cgroup. `systemctl restart robotd` would take
+  `mediad`'s audio with it, and restarting `mediad` would cut off the petting worker. Each would
+  recover, but each daemon's restarts would become the other's faults.
+- **The shared memory needs a common group.** The stock `dsnoop` creates its segments `0660` to
+  `audio`. `mediad` is not in `audio`, and the deploy would need its own definition to change that.
+
+There is also nothing for `dsnoop` to add: both readers want the same 16 kHz mono stream, so one
+capture handed on is the same audio with no system configuration, no sandbox change, and no
+lifecycle coupling. The classifier's input is byte-for-byte what it was.
+
+**What it costs.** The mic is only as available as `robotd`. A `robotd` restarting is a second or
+two of silence on the track: `mediad` fills it with zeros and reconnects, and the session stays up.
+And the stream is the classifier's format: 16 kHz is wideband speech, enough for a voice and for a
+speech recogniser, not for music. If perception moves to `mediad` (the M5 row in §5.2), this
+reverses: `mediad` owns the capture and `robotd` reads it. The rule to keep is one capture.
+
 ## 5. Why it exists, and where it came from
 
 ### 5.1 The goal, which is not "a good `robotd`"

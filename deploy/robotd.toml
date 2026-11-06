@@ -626,6 +626,14 @@ mode = "walk"
 # for a board fitted with another camera on purpose. Not something a normal robot sets.
 # sensor = "board"
 
+# Send the onboard mic to WebRTC peers: one mono Opus track beside the video, robot to peer only —
+# the duck can be heard, it does not play what a peer says. The audio is the stream robotd already
+# reads for the petting classifier, and mediad asks robotd for it only while a peer is connected,
+# so a duck nobody is watching captures nothing. Off removes the track from the offer. Needs
+# [audio] enabled, since that is robotd's switch for the mic at all; with it off a peer hears
+# silence.
+# mic = true
+
 # ── Controller-IMU head control ─────────────────────────────────────────────────────────────
 #
 # Read by `padd`, not by `robotd`. Some pads carry an inertial unit — the "Pro Controller" Switch

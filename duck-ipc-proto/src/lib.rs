@@ -605,6 +605,26 @@ pub fn identity_path(service: &str) -> std::path::PathBuf {
     runtime_root().join(service).join("identity.json")
 }
 
+/// `robotd`'s microphone tap: `/run/robotd/mic.sock`.
+///
+/// **Raw PCM and nothing else** — signed 16-bit little-endian, mono, [`MIC_RATE`] Hz, from the
+/// moment a client connects, with no header and no framing. It is the stream `robotd`'s petting
+/// worker already reads, handed on as it arrives, so a reader hears exactly what the classifier
+/// hears. `robotd` captures only while somebody is connected (or petting detection is on); a client
+/// that stops reading is disconnected rather than waited for. `robotd-design.md` §4.6 says why the
+/// mic is shared this way and not through ALSA.
+///
+/// Under [`runtime_root`] rather than a constant in [`socket`], because it lives in `robotd`'s
+/// `RuntimeDirectory=` beside its identity — and so a duck in the twin, whose runtime root is its own
+/// state directory, does not reach for another duck's microphone.
+pub fn mic_socket_path() -> std::path::PathBuf {
+    runtime_root().join("robotd").join("mic.sock")
+}
+
+/// The sample rate of [`mic_socket_path`]'s stream. The petting model was trained at it, which is
+/// why it is not a parameter: there is one capture, and it is the classifier's.
+pub const MIC_RATE: u32 = 16_000;
+
 /// Where the per-service runtime directories live: `/run`, unless `DUCK_RUNTIME_DIR` says otherwise.
 ///
 /// Not a configuration knob for a robot — nothing on the board sets it. It exists so this is testable

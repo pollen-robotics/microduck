@@ -80,7 +80,7 @@ counter ([`updater-design.md`](updater-design.md)).
 
 | service | owns | listens on | reaches out to |
 |---|---|---|---|
-| `robotd` | motor control, sensing, policies, safety, `robot.health` | `/run/robotd.sock` | the Dynamixel bus |
+| `robotd` | motor control, sensing, policies, safety, `robot.health` — and the mic's one capture | `/run/robotd.sock`; `/run/robotd/mic.sock`, raw mic audio for `mediad`'s track ([`robotd-design.md`](robotd-design.md) §4.6) | the Dynamixel bus |
 | `configd` | wifi, robot identity and name, pairing PIN, gamepad bonding, reboot | `/run/configd.sock` | BlueZ and NetworkManager over D-Bus |
 | `updaterd` | releases: verify, install, swap, health-gate, roll back | `/run/updaterd.sock` | GitHub releases, `systemctl`, `robotd` |
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |

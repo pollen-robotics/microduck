@@ -652,6 +652,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::MEDIA_SENSOR_LABELS),
         "Head camera sensor — board follows the declared board; naming one forces it",
     ),
+    feature(
+        "media.mic",
+        Kind::Bool,
+        "Send the onboard mic to WebRTC peers as an Opus track; captured only while one is connected",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
@@ -1347,6 +1352,7 @@ mod tests {
                 "audio.pet_detect",
                 "media.source",
                 "media.quality",
+                "media.mic",
                 // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
                 "pad.a",

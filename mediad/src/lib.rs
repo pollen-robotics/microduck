@@ -23,6 +23,9 @@ pub mod camera;
 pub mod config;
 /// The camera LED: lit while the picture is leaving the robot. `architecture.md` §3.2 and §7.
 pub mod indicator;
+/// The microphone track's source: `robotd`'s mic tap, paced into 20 ms chunks, silence when there
+/// is nothing to hear. `remote-webrtc.md` §2.1.
+pub mod mic;
 /// The account credential `updaterd` writes, read by the two things here that need it.
 pub mod producer;
 /// The outward connection to the rendezvous service — what makes a duck reachable from off its

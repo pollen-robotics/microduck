@@ -168,6 +168,10 @@ struct Args {
     pad_socket: Option<std::path::PathBuf>,
     #[arg(long)]
     updater_socket: Option<std::path::PathBuf>,
+    /// `robotd`'s mic tap, which the microphone track is fed from. Unset is
+    /// `duck_ipc_proto::mic_socket_path`, under the runtime root like the identities.
+    #[arg(long)]
+    mic_socket: Option<std::path::PathBuf>,
     /// Local raw camera snapshot endpoint (not the control datachannel).
     #[arg(long, default_value = duck_ipc_proto::socket::MEDIA)]
     frame_socket: std::path::PathBuf,
@@ -282,6 +286,7 @@ fn main() -> ExitCode {
         fps,
         bitrate = media.bitrate_resolved(),
         congestion_control = media.congestion_control.nick(),
+        mic = media.mic,
         "streaming"
     );
     // The same angle the detector needs, in its own vocabulary: it folds the turn into the
@@ -439,6 +444,11 @@ fn main() -> ExitCode {
             height,
             fps,
             rotation,
+            mic: media.mic.then(|| {
+                args.mic_socket
+                    .clone()
+                    .unwrap_or_else(duck_ipc_proto::mic_socket_path)
+            }),
         };
 
         // `frames` is the raw tap off the tee: the auto-exposure loop meters it, and the

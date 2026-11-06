@@ -25,6 +25,7 @@ mod head_imu;
 mod idle_head;
 mod intents;
 mod leds;
+mod mic;
 mod params;
 mod pickup;
 mod posture;
@@ -2452,6 +2453,14 @@ async fn control_loop<T: RobotIo>(
         .audio
         .enabled
         .then(|| sound::Sound::new(params.audio.bank.clone(), audio.playback.clone()));
+    // The mic, lent to `mediad` for a WebRTC peer to hear. Served whenever audio is on, and costs
+    // nothing until somebody connects: with petting off the worker below captures only while a
+    // listener is there. `mic.rs` says why this is a socket here rather than a second ALSA client.
+    let mic_tap: Option<Arc<dyn pet_detect::worker::Tap>> = if params.audio.enabled {
+        mic::serve_default().map(|tap| tap as Arc<dyn pet_detect::worker::Tap>)
+    } else {
+        None
+    };
     let pet: Option<pet_detect::worker::PetHandle> = if params.audio.enabled
         && params.audio.pet_detect_resolved(params.policy.mode)
         && let Some(model) = params.audio.pet_model_resolved()
@@ -2462,6 +2471,7 @@ async fn control_loop<T: RobotIo>(
             model_path: model.clone(),
             enter_threshold: params.audio.pet_enter_threshold,
             exit_threshold: params.audio.pet_exit_threshold,
+            tap: mic_tap.clone(),
         }) {
             Ok(handle) => {
                 tracing::warn!(model = %model.display(), "petting detection listening");
@@ -2470,14 +2480,17 @@ async fn control_loop<T: RobotIo>(
             Err(e) => {
                 // Not unhealthy: the classifier is a feature, not the robot. A missing
                 // model on a release that ships one is caught by the packaging tripwires.
+                // The mic can still be lent out, so a listener does not pay for the model.
                 tracing::warn!(error = %e, "petting detection unavailable");
-                None
+                mic_tap
+                    .map(|tap| pet_detect::worker::PetHandle::spawn_tap(audio.capture.clone(), tap))
             }
         }
     } else {
         // Configured on but nothing to run: a bench robotd, a board that predates the
         // model, or audio off. Quietly so on purpose — the mic is optional equipment.
-        None
+        // A capture for the tap alone, when there is one: idle until a listener connects.
+        mic_tap.map(|tap| pet_detect::worker::PetHandle::spawn_tap(audio.capture.clone(), tap))
     };
 
     // Pick-up detection (`[pickup]`). Off by default, and then this is `None` and nothing in

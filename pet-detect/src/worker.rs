@@ -3,7 +3,8 @@
 //! The audio source is an `arecord` subprocess rather than an in-process ALSA binding — the
 //! same pattern the standalone `pet-detect` binary documents, and no new native dependency.
 //! The capture device is single-client, so everything that analyses the mic shares this one
-//! stream.
+//! stream — including what is not in this crate: a [`Tap`] is handed every read as it arrives,
+//! which is how `mediad` gets the mic without a second capture (`robotd-design.md` §4.6).
 //!
 //! Ported from the prototype's `pet_worker.rs`; `println!` diagnostics became `tracing`.
 
@@ -195,6 +196,25 @@ impl SoundSentry {
     }
 }
 
+/// Something outside the classifier that wants the raw capture.
+///
+/// **The worker's other reader, and the reason it can run without a model.** With petting
+/// detection on, the capture runs anyway and a tap costs one call per read. With it off there is
+/// no classifier to keep the mic open, so the capture runs only while [`Tap::wanted`] says
+/// somebody is listening — a robot nobody is listening to records nothing, exactly as before
+/// there was a tap.
+pub trait Tap: Send + Sync {
+    /// Whether anybody wants audio now. Asked after every read, so a capture kept open only for
+    /// the tap closes within one read of the last listener leaving.
+    fn wanted(&self) -> bool;
+    /// Block for up to `timeout` until somebody wants audio; `true` if somebody does. The idle
+    /// worker sleeps here, and wakes on its own only to notice a shutdown.
+    fn wait_wanted(&self, timeout: Duration) -> bool;
+    /// One read's worth of capture: S16LE, mono, 16 kHz, exactly as `arecord` delivered it.
+    /// Called on the worker's thread, so it must not block.
+    fn send(&self, pcm: &[u8]);
+}
+
 pub struct PetConfig {
     /// ALSA capture device passed to arecord.
     pub alsa_device: String,
@@ -204,6 +224,8 @@ pub struct PetConfig {
     pub enter_threshold: f32,
     /// Probability below which petting ends.
     pub exit_threshold: f32,
+    /// Who else hears the capture. See [`Tap`].
+    pub tap: Option<Arc<dyn Tap>>,
 }
 
 impl Default for PetConfig {
@@ -214,6 +236,7 @@ impl Default for PetConfig {
             model_path: PathBuf::from("/opt/robot/daemon/current/models/pet_detect.onnx"),
             enter_threshold: lib.enter_threshold,
             exit_threshold: lib.exit_threshold,
+            tap: None,
         }
     }
 }
@@ -244,23 +267,39 @@ impl PetHandle {
         })
         .unwrap_or_else(|_| Err(anyhow::anyhow!("the ONNX runtime is not loadable")))?;
 
+        Ok(Self::start(config.alsa_device, Some(detector), config.tap))
+    }
+
+    /// The capture with no classifier behind it: for `tap` alone, and only while it is wanted.
+    ///
+    /// For a robot with petting detection off — the default — that still lends its mic to
+    /// somebody. The event receivers exist and never yield anything, so a caller that drains them
+    /// every tick need not know which kind of worker it has.
+    pub fn spawn_tap(alsa_device: String, tap: Arc<dyn Tap>) -> Self {
+        Self::start(alsa_device, None, Some(tap))
+    }
+
+    fn start(
+        alsa_device: String,
+        detector: Option<PettingDetector>,
+        tap: Option<Arc<dyn Tap>>,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (tx_sound, rx_sound) = mpsc::channel();
         let sd = shutdown.clone();
-        let dev = config.alsa_device.clone();
 
         let join = thread::Builder::new()
             .name("pet-worker".into())
-            .spawn(move || worker_loop(&dev, detector, &tx, &tx_sound, &sd))
+            .spawn(move || worker_loop(&alsa_device, detector, tap.as_deref(), &tx, &tx_sound, &sd))
             .expect("spawn pet worker");
 
-        Ok(Self {
+        Self {
             rx,
             rx_sound,
             shutdown,
             join: Some(join),
-        })
+        }
     }
 
     /// Non-blocking; the next petting event if one is queued. Once per control tick.
@@ -298,9 +337,13 @@ const RESTART_HEALTHY: Duration = Duration::from_secs(5);
 /// trying (a codec that comes back should be heard) but stops narrating it.
 const RESTART_QUIET_AFTER: u32 = 5;
 
+/// How long the idle, tap-only worker sleeps between looks at the shutdown flag.
+const IDLE_WAIT: Duration = Duration::from_millis(500);
+
 fn worker_loop(
     alsa_device: &str,
-    mut detector: PettingDetector,
+    mut detector: Option<PettingDetector>,
+    tap: Option<&dyn Tap>,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
     shutdown: &Arc<AtomicBool>,
@@ -308,18 +351,45 @@ fn worker_loop(
     let mut sentry = SoundSentry::new();
     let mut failures: u32 = 0;
     while !shutdown.load(Ordering::Acquire) {
+        // Nothing to classify, so nothing to capture until somebody listens.
+        if detector.is_none() {
+            match tap {
+                Some(tap) => {
+                    if !tap.wait_wanted(IDLE_WAIT) {
+                        continue;
+                    }
+                }
+                None => return,
+            }
+        }
         let started = Instant::now();
+        let mut idle = false;
         match spawn_arecord(alsa_device) {
             Ok(mut c) => {
-                if let Err(e) = pump(&mut c, &mut detector, &mut sentry, tx, tx_sound, shutdown) {
-                    log_restart(failures, &e.to_string());
+                let stdout = c.stdout.take();
+                match stdout {
+                    Some(stdout) => match pump(
+                        stdout,
+                        detector.as_mut(),
+                        tap,
+                        &mut sentry,
+                        tx,
+                        tx_sound,
+                        shutdown,
+                    ) {
+                        Ok(Pumped::Unwanted) => idle = true,
+                        Ok(Pumped::Shutdown) => {}
+                        Err(e) => log_restart(failures, &e.to_string()),
+                    },
+                    None => log_restart(failures, "arecord stdout missing"),
                 }
                 let _ = c.kill();
                 let _ = c.wait();
             }
             Err(e) => log_restart(failures, &e.to_string()),
         }
-        if started.elapsed() >= RESTART_HEALTHY {
+        // The last listener left: a capture that ended on purpose is not one to back off from.
+        if idle || started.elapsed() >= RESTART_HEALTHY {
             failures = 0;
             continue;
         }
@@ -373,18 +443,23 @@ fn spawn_arecord(device: &str) -> Result<Child> {
         .spawn()?)
 }
 
+/// Why a capture that did not fail stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Pumped {
+    Shutdown,
+    /// No classifier, and the tap's last listener left.
+    Unwanted,
+}
+
 fn pump(
-    child: &mut Child,
-    detector: &mut PettingDetector,
+    mut stdout: impl Read,
+    mut detector: Option<&mut PettingDetector>,
+    tap: Option<&dyn Tap>,
     sentry: &mut SoundSentry,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
     shutdown: &Arc<AtomicBool>,
-) -> Result<()> {
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("arecord stdout missing"))?;
+) -> Result<Pumped> {
     let mut buf = [0u8; 4096];
     let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
 
@@ -396,6 +471,18 @@ fn pump(
         if !n.is_multiple_of(2) {
             return Err(anyhow::anyhow!("odd byte count from arecord"));
         }
+        // Before the classifier, so a listener hears a read as soon as it arrives rather than
+        // after an inference — and as bytes, because that is what the listener wants too.
+        if let Some(tap) = tap {
+            if tap.wanted() {
+                tap.send(&buf[..n]);
+            } else if detector.is_none() {
+                return Ok(Pumped::Unwanted);
+            }
+        }
+        let Some(detector) = detector.as_deref_mut() else {
+            continue;
+        };
         i16_buf.clear();
         for chunk in buf[..n].as_chunks::<2>().0 {
             i16_buf.push(i16::from_le_bytes(*chunk));
@@ -412,7 +499,7 @@ fn pump(
         for ev in events {
             if tx.send(ev).is_err() {
                 // Receiver dropped — the daemon is shutting down.
-                return Ok(());
+                return Ok(Pumped::Shutdown);
             }
         }
         // Ambient sound events off the same stream, muted while petting (head scratches
@@ -428,12 +515,101 @@ fn pump(
             let _ = tx_sound.send(sev);
         }
     }
-    Ok(())
+    Ok(Pumped::Shutdown)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tap that records what it was sent, and stops wanting after `budget` reads.
+    struct Recorder {
+        heard: std::sync::Mutex<Vec<u8>>,
+        budget: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Recorder {
+        fn wanting(budget: usize) -> Self {
+            Self {
+                heard: std::sync::Mutex::new(Vec::new()),
+                budget: std::sync::atomic::AtomicUsize::new(budget),
+            }
+        }
+    }
+
+    impl Tap for Recorder {
+        fn wanted(&self) -> bool {
+            self.budget.load(Ordering::Acquire) > 0
+        }
+        fn wait_wanted(&self, _timeout: Duration) -> bool {
+            self.wanted()
+        }
+        fn send(&self, pcm: &[u8]) {
+            self.heard.lock().unwrap().extend_from_slice(pcm);
+            self.budget.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Reads of a fixed size, the way `arecord` hands over a period at a time.
+    struct Periods {
+        left: usize,
+        size: usize,
+    }
+
+    impl Read for Periods {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            self.left -= 1;
+            let n = self.size.min(buf.len());
+            buf[..n].fill(0x11);
+            Ok(n)
+        }
+    }
+
+    fn pump_for(tap: &Recorder, periods: usize) -> Result<Pumped> {
+        let (tx, _rx) = mpsc::channel();
+        let (tx_sound, _rx_sound) = mpsc::channel();
+        pump(
+            Periods {
+                left: periods,
+                size: 640,
+            },
+            None,
+            Some(tap),
+            &mut SoundSentry::new(),
+            &tx,
+            &tx_sound,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// **A capture held open only for a listener closes when the listener goes.** Without this a
+    /// robot with petting off would keep its mic open from the first WebRTC peer until robotd
+    /// restarted — recording, for nobody, the room it sits in.
+    #[test]
+    fn a_tap_only_capture_stops_when_nobody_wants_it() {
+        let tap = Recorder::wanting(3);
+        assert_eq!(pump_for(&tap, 100).unwrap(), Pumped::Unwanted);
+        assert_eq!(
+            tap.heard.lock().unwrap().len(),
+            3 * 640,
+            "every read while wanted, and nothing after"
+        );
+    }
+
+    /// The listener gets the bytes as `arecord` delivered them — no conversion, no batching — so it
+    /// hears what the classifier hears, and as soon as the classifier does.
+    #[test]
+    fn a_wanted_tap_hears_every_read_until_the_capture_ends() {
+        let tap = Recorder::wanting(usize::MAX);
+        let ended = pump_for(&tap, 5).expect_err("the stream ended, which is a failure to restart");
+        assert!(ended.to_string().contains("EOF"), "{ended}");
+        let heard = tap.heard.lock().unwrap();
+        assert_eq!(heard.len(), 5 * 640);
+        assert!(heard.iter().all(|b| *b == 0x11));
+    }
 
     /// One sentry frame of a constant amplitude, pushed through as the mic would deliver it.
     fn frames(sentry: &mut SoundSentry, amplitude: f32, count: u32) {
