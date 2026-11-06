@@ -121,9 +121,8 @@ compare the two on the same robot. On writes the six `bus.impact_guard_*` rows b
 default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
 V Fast (rad/s) and PWM Fast (%). Changing them is how to look for another guard; a start on
 anything but the defaults names them in the journal. They are written when `robotd` starts
-with torque off, so relax and restart it: V3 runs them from the next Start, no reboot needed.
-Whether V4 needs one is not checked yet, so on V4 also run `robotctl robot reboot-motors` before
-that Start. On V4 the on/off switch needs none of this: it follows `bus.impact_guard` at the
+with torque off, so relax and restart it: the servos run them from the next Start, no reboot
+needed. On V4 the on/off switch needs none of this: it follows `bus.impact_guard` at the
 first Start after a restart, relaxed or not, and off leaves the six settings as they are.
 `impact_guard` staying at 0 in the recording is what off looks like.
 

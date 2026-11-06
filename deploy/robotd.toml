@@ -65,9 +65,8 @@ port = "/dev/ttyS2"
 # goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for impact_guard_brake_ms
 # and the servo holds at impact_guard_i_hold_ma (32767: no hold) until its goal comes back past
 # it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at impact_guard_v_fast
-# rad/s (never 0). Change these with the robot relaxed: V3 runs them from the next Start; V4 is
-# not checked yet, so reboot its motors after the robotd restart. A start that writes anything
-# else says so in the journal, so a recording can
+# rad/s (never 0). Change these with the robot relaxed: the servos run them from the next Start,
+# no reboot needed. A start that writes anything else says so in the journal, so a recording can
 # be matched to the settings it ran on.
 # impact_guard_v_min = 6
 # impact_guard_brake_ms = 20

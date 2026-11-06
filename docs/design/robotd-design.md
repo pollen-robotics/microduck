@@ -325,9 +325,9 @@ Enable (67, RAM), off after every power-up and with it the whole guard, and off 
 settings: the switch does it, so the toggle cannot leave stale settings behind. The torque-on write
 sets it to what `bus.impact_guard` asks first; that one moment follows every way a servo can lose
 RAM (power-up, reboot, a latched error), each of which leaves it limp, and a servo still stiff after
-a `robotd` restart takes the write too. New settings are written with torque off. V3 runs them from
-the next torque on without a reboot: on lavandiere (2026-11-05) each restart's hold current and
-taper showed in the very next walk. Whether V4 needs a reboot for them is not checked yet.
+a `robotd` restart takes the write too. New settings are written with torque off and run from the
+next torque on, without a reboot: on V3, each restart's hold current and taper showed in the very
+next walk on lavandiere (2026-11-05); on V4, the gear bench's first shot after the write ran them.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
