@@ -50,6 +50,18 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
 
+/// The walking pick's trained beak (`static_ground_pick.onnx`), as fractions of its cycle: open
+/// to 0.775 (22°) over 0.02..0.10, closed on the object over 0.34..0.40. robotd plays it because
+/// no client can: padd re-sends the mouth every tick, and its clock is not the pick's.
+const PICK_MOUTH_OPEN: f64 = 0.775;
+const PICK_MOUTH_OPEN_PHASES: (f64, f64) = (0.02, 0.10);
+const PICK_MOUTH_CLOSE_PHASES: (f64, f64) = (0.34, 0.40);
+
+fn pick_mouth(phase: f64) -> f64 {
+    let ramp = |(start, end): (f64, f64)| ((phase - start) / (end - start)).clamp(0.0, 1.0);
+    PICK_MOUTH_OPEN * ramp(PICK_MOUTH_OPEN_PHASES) * (1.0 - ramp(PICK_MOUTH_CLOSE_PHASES))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// Scales raw policy output before it becomes a joint offset. The prototype's current
@@ -397,6 +409,12 @@ impl Controller {
         }
         self.ground_pick = Some(0.0);
         Ok(())
+    }
+
+    /// The beak the running ground pick plays, for the caller to write in place of the mouth
+    /// intent; `None` outside a pick.
+    pub fn ground_pick_mouth(&self) -> Option<f64> {
+        self.ground_pick.map(pick_mouth)
     }
 
     /// Every one-shot skill this robot has, in priority order — what a client may ask for.
@@ -767,6 +785,23 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pick's beak plays the schedule the static grasp was trained with: closed as it
+    /// starts, open on the way down, closed on the object from phase 0.34.
+    #[test]
+    fn the_pick_mouth_plays_the_training_schedule() {
+        assert_eq!(pick_mouth(0.0), 0.0, "closed as the pick starts");
+        assert!(
+            (pick_mouth(0.06) - 0.3875).abs() < 1e-9,
+            "halfway open at 0.06"
+        );
+        assert_eq!(pick_mouth(0.2), 0.775, "fully open on the way down");
+        assert!(
+            (pick_mouth(0.37) - 0.3875).abs() < 1e-9,
+            "halfway closed at 0.37"
+        );
+        assert_eq!(pick_mouth(0.5), 0.0, "closed on the object");
+    }
 
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
