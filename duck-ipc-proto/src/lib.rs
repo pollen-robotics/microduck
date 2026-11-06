@@ -5854,21 +5854,38 @@ pub fn read_webrtc_peers() -> Option<u32> {
 }
 
 fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    // A file from the future is a clock that stepped, not a fresh answer; either way it is not old.
-    if now
-        .duration_since(modified)
-        .is_ok_and(|age| age > CAMERA_STATS_MAX_AGE)
-    {
+    if camera_stats_age_at(path, now)? > CAMERA_STATS_MAX_AGE {
         return None;
     }
     let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     Some(stats.consumers)
 }
 
-/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+/// What `mediad` published about its camera, or `None` — not running, or no camera.
+///
+/// Not aged: the file is only rewritten while frames arrive, so a camera that has stopped leaves
+/// its last rate behind. [`camera_stats_age`] is how a reader tells the two apart.
 pub fn read_camera_stats() -> Option<CameraStats> {
     serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
+/// How long ago `mediad` last rewrote [`CameraStats`], or `None` when there is no file.
+///
+/// Past [`CAMERA_STATS_MAX_AGE`] the camera has stopped delivering frames, whatever the file's
+/// `fps` says. A file from the future — a clock that stepped — reads as fresh.
+pub fn camera_stats_age() -> Option<std::time::Duration> {
+    camera_stats_age_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+/// [`camera_stats_age`] for the file at `path`, as of `now`. The one place the clock-step rule
+/// lives: a file from the future is a clock that stepped, not a fresh answer, and either way it is
+/// not old — so it reads as age zero.
+fn camera_stats_age_at(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(now.duration_since(modified).unwrap_or_default())
 }
 
 /// What `mediad`'s relay is doing with the rendezvous service, published for `robotctl` to read.
@@ -6041,6 +6058,32 @@ mod tests {
             dropped: 0,
             consumers,
         }
+    }
+
+    /// How old the camera file is: nothing without one, measured from its mtime, and zero rather
+    /// than an error when the clock has stepped back past it.
+    #[test]
+    fn camera_stats_age_is_measured_from_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(camera_stats_age_at(&path, now), None, "no file, no age");
+
+        publish_camera_stats_at(&path, &camera_stats(0)).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let later = modified + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            camera_stats_age_at(&path, later),
+            Some(CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1)),
+        );
+
+        let earlier = modified - std::time::Duration::from_secs(60);
+        assert_eq!(
+            camera_stats_age_at(&path, earlier),
+            Some(std::time::Duration::ZERO),
+            "a clock that stepped back reads as fresh"
+        );
     }
 
     /// The count an OS update is gated on: read back as written, and only while it is fresh.

@@ -431,6 +431,7 @@ pub fn start(
 
     // `GST_DEBUG` has to be in the environment before `init`, which is when GStreamer parses it.
     set_gstreamer_log_threshold();
+    cap_mpp_encoder_pending_frames();
 
     gst::init().context("gstreamer would not initialise")?;
 
@@ -1175,6 +1176,41 @@ fn set_gstreamer_log_threshold() {
         // SAFETY: single-threaded here — this runs before `gst::init` and before any task is
         // spawned, which is the only point at which setting an env var is sound.
         unsafe { std::env::set_var("GST_DEBUG", "*:WARNING") };
+    }
+}
+
+/// How many frames an `mpph264enc` may hold before it must hand one back. Upstream's default is
+/// sixteen.
+///
+/// **Sixteen starves the camera.** The capture pool is eight deep — `CAPTURE_BUFFERS` plus the
+/// four `v4l2src` adds on top (`raise_capture_buffers` has the arithmetic), and `bufcnt:8` in
+/// `/proc/rkisp-vir0` on an idle board — and since gstreamer-rockchip took DMABuf input on its
+/// encoders (JeffyCN/mirrors 048e72f) an encoder holds the capture buffers themselves rather than
+/// RGA copies of them. One allowed sixteen can hold all eight, `v4l2src` has nothing to queue, and
+/// capture stops for good — no error, no EOS, just
+/// `frameloss` climbing in `/proc/rkisp-vir0` with `bufcnt:0`. On microduck OS 1.1.0 that happened
+/// three seconds after start, on every boot and before anyone had connected: `webrtcsink`'s codec
+/// discovery pipeline encodes from the same buffers.
+///
+/// Two keeps the encoder pipelined, and an encoder then holds at most three — two in MPP and the
+/// one waiting in `handle_frame` for a slot. Two encoders at once, discovery and a viewer's
+/// session, hold six and leave the pool two. Measured on the beta board: capture held 30 fps where
+/// it had stopped dead, and a 30 s WebRTC session kept it there with `bufcnt` at 7–8.
+const MPP_ENC_MAX_PENDING: &str = "2";
+
+/// Cap every `mpph264enc` this process will create, before any exists. See
+/// [`MPP_ENC_MAX_PENDING`].
+///
+/// The environment rather than the `max-pending` property, because one of those encoders is not
+/// ours to configure: `webrtcsink` builds its discovery pipeline itself, and that is the one that
+/// stalled the camera. The plugin reads `GST_MPP_ENC_MAX_PENDING` once, when the element class is
+/// first initialised, so it reaches every instance including that one. Honoured if already set,
+/// so a board can still be tuned by hand.
+fn cap_mpp_encoder_pending_frames() {
+    if std::env::var_os("GST_MPP_ENC_MAX_PENDING").is_none() {
+        // SAFETY: as in `set_gstreamer_log_threshold`, which runs at the same point and for the
+        // same reason — before `gst::init`, and before any task is spawned.
+        unsafe { std::env::set_var("GST_MPP_ENC_MAX_PENDING", MPP_ENC_MAX_PENDING) };
     }
 }
 
