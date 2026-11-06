@@ -354,18 +354,20 @@ impl Mapper {
             })));
         }
 
-        // Select: nothing on a tap. Let go between two and four seconds, a rest; held to four, a
-        // power-off. Both sit and ease into the rest pose before torque goes, which is why the
-        // rest waits for the release: until then the same hold may still become a power-off.
+        // Select: nothing on a tap. Held two seconds, a rest, at once — the robot sitting down is
+        // how the person holding it knows the two seconds are up. Still held at four, a power-off:
+        // `robotd` keeps it latched until the rest it interrupts has ended, then powers off the
+        // limp robot. The release does nothing either way.
         match self.select.tick(
             pad.held.contains(Buttons::SELECT),
             pad.released.contains(Buttons::SELECT),
             now,
             &[REST_HOLD, SHUTDOWN_HOLD],
         ) {
-            HoldAction::ReleasedAfter(0) => {
+            HoldAction::Reached(0) => {
                 tracing::warn!(
-                    "Select released — robot.rest: sit, rest pose, then torque off and servo reboot"
+                    "Select held 2 s — robot.rest: sit, rest pose, then torque off and servo \
+                     reboot. Keep holding to power off"
                 );
                 // A reboot at the end rather than a bare relax: a servo that tripped its overload
                 // comes back with it, so this is also the way out of a tripped servo without
@@ -374,18 +376,15 @@ impl Mapper {
                 self.up = false;
                 out.push(Out::Request(proto::Call::RobotRest));
             }
-            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
+            HoldAction::Reached(_) => {
+                self.up = false;
+                tracing::warn!("Select held 4 s — asking the robot to power off");
+                out.push(Out::Request(proto::Call::RobotShutdown));
+            }
             HoldAction::Tap => {
                 tracing::info!("Select tapped — hold it 2 s to rest, 4 s to power off")
             }
-            HoldAction::Reached(0) => {
-                tracing::warn!("Select held 2 s — let go to rest, keep holding to power off")
-            }
-            HoldAction::Reached(_) => {
-                self.up = false;
-                tracing::warn!("Select held on — asking the robot to power off");
-                out.push(Out::Request(proto::Call::RobotShutdown));
-            }
+            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
         }
 
         // Either trigger opens the mouth; the max wins, as in the prototype — where RT
@@ -617,6 +616,57 @@ mod tests {
         };
         m.tick(&pad, &cfg, t, &mut out, &mut frame);
         assert_eq!(flashlight(&out), 0, "held is not a second press");
+    }
+
+    /// Select held: the rest goes at two seconds without waiting for the release, the power-off at
+    /// four, and letting go sends nothing more.
+    #[test]
+    fn select_rests_at_two_seconds_held_and_powers_off_at_four() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let ms = |n| t + std::time::Duration::from_millis(n);
+        let asked = |out: &[Out]| {
+            out.iter()
+                .filter_map(|o| match o {
+                    Out::Request(proto::Call::RobotRest) => Some("rest"),
+                    Out::Request(proto::Call::RobotShutdown) => Some("shutdown"),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let held = PadFrame {
+            held: Buttons::SELECT,
+            ..Default::default()
+        };
+
+        let down = PadFrame {
+            pressed: Buttons::SELECT,
+            ..held
+        };
+        m.tick(&down, &cfg, ms(0), &mut out, &mut frame);
+        assert!(asked(&out).is_empty());
+        m.tick(&held, &cfg, ms(1_900), &mut out, &mut frame);
+        assert!(asked(&out).is_empty(), "not yet two seconds");
+        m.tick(&held, &cfg, ms(2_000), &mut out, &mut frame);
+        assert_eq!(asked(&out), ["rest"], "two seconds, still held");
+        m.tick(&held, &cfg, ms(3_000), &mut out, &mut frame);
+        assert!(asked(&out).is_empty(), "the rest is sent once");
+        m.tick(&held, &cfg, ms(4_000), &mut out, &mut frame);
+        assert_eq!(asked(&out), ["shutdown"]);
+        let up = PadFrame {
+            released: Buttons::SELECT,
+            ..Default::default()
+        };
+        m.tick(&up, &cfg, ms(4_100), &mut out, &mut frame);
+        assert!(asked(&out).is_empty(), "the release asks nothing");
+
+        // Let go between two and four: the rest already went, nothing else follows.
+        m.tick(&down, &cfg, ms(10_000), &mut out, &mut frame);
+        m.tick(&held, &cfg, ms(12_000), &mut out, &mut frame);
+        assert_eq!(asked(&out), ["rest"]);
+        m.tick(&up, &cfg, ms(13_000), &mut out, &mut frame);
+        m.tick(&PadFrame::default(), &cfg, ms(15_000), &mut out, &mut frame);
+        assert!(asked(&out).is_empty());
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! The face board's LEDs: their names, and the one way a daemon switches one.
 //!
 //! **Which daemon owns which LED, and what each one says, is `architecture.md` §3.2.** This is
-//! the mechanism they share: an LED is a directory under `/sys/class/leds` that the beta board's
-//! device tree hands to `gpio-leds`, and switching it is a write to `brightness` or `trigger`.
+//! the mechanism they share: an LED is a directory under `/sys/class/leds`, from `gpio-leds` on the
+//! beta board's expander and from the Awinic PWM drivers on face-board-v1, and switching it is a
+//! write to `brightness` or `trigger`. On is the LED's own `max_brightness`, not `1`: that is the
+//! same thing on an on/off LED, and one step in 255 on a PWM one.
 //!
 //! Here rather than in each daemon because three of them write LEDs and they must agree on two
 //! things that are easy to get subtly wrong: that a blinking LED is switched on by dropping its
@@ -63,6 +65,8 @@ impl From<bool> for Light {
 #[derive(Debug)]
 pub struct Led {
     path: PathBuf,
+    /// What [`Light::On`] writes: the LED's `max_brightness`.
+    full: String,
     shown: Option<Light>,
 }
 
@@ -75,9 +79,21 @@ impl Led {
     /// The LED `name` under `dir` — a fake tree, in tests.
     pub fn open_in(dir: &Path, name: &str) -> Option<Led> {
         let path = dir.join(name);
-        path.join("brightness")
-            .exists()
-            .then_some(Led { path, shown: None })
+        if !path.join("brightness").exists() {
+            return None;
+        }
+        // The kernel always publishes it; without it, `1` is lit on any LED.
+        let full = std::fs::read_to_string(path.join("max_brightness"))
+            .ok()
+            .and_then(|max| max.trim().parse::<u32>().ok())
+            .filter(|&max| max > 0)
+            .unwrap_or(1)
+            .to_string();
+        Some(Led {
+            path,
+            full,
+            shown: None,
+        })
     }
 
     /// Show `light`. A no-op when it is already showing it.
@@ -95,7 +111,7 @@ impl Led {
             Light::Off => self.write("brightness", "0"),
             Light::On => {
                 self.write("trigger", "none")?;
-                self.write("brightness", "1")
+                self.write("brightness", &self.full)
             }
             Light::Blink => self.write("trigger", "timer"),
         }
@@ -118,6 +134,7 @@ mod tests {
             let led = dir.path().join(name);
             std::fs::create_dir(&led).unwrap();
             std::fs::write(led.join("brightness"), "0").unwrap();
+            std::fs::write(led.join("max_brightness"), "1\n").unwrap();
             std::fs::write(led.join("trigger"), "[none] timer").unwrap();
         }
         dir
@@ -145,6 +162,16 @@ mod tests {
         assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
         led.set(Light::Off).unwrap();
         assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "0");
+    }
+
+    #[test]
+    fn on_is_the_full_brightness_of_a_pwm_led() {
+        let dir = fake(&[name::FLASHLIGHT_RED]);
+        let max = dir.path().join(name::FLASHLIGHT_RED).join("max_brightness");
+        std::fs::write(&max, "255\n").unwrap();
+        let mut led = Led::open_in(dir.path(), name::FLASHLIGHT_RED).unwrap();
+        led.set(Light::On).unwrap();
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "255");
     }
 
     #[test]

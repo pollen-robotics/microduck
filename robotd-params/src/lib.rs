@@ -196,6 +196,7 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub emotions: EmotionsParams,
     pub theremin: ThereminParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
@@ -270,9 +271,9 @@ pub struct PadDriveParams {
 }
 
 impl Default for PadDriveParams {
-    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Since the
-    /// v8 velstand, which tracks yaw commands, forward/back is 0.4 m/s and turning 1.0 rad/s —
-    /// what that policy follows well on the robot.
+    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward/back
+    /// is 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
+    /// velstand, and these still feel right on the robot.
     fn default() -> Self {
         Self {
             vx_max: 0.4,
@@ -383,9 +384,11 @@ impl Default for PadImuHeadControlParams {
 /// needs. It would also put "the button that stops the robot" behind a config key, which is the
 /// one binding worth not being able to lose.
 ///
-/// The defaults keep the pad sparse on purpose: A sits or stands, B picks up, and X, Y and the
-/// bumpers do nothing until somebody puts a skill there (the kicks are still in the set, unbound). A named button is rebound; the rest
-/// stay as they were.
+/// The defaults: A sits or stands, B picks up, the bumpers nod yes and shake no, Y is excited —
+/// three emotions (`robotd/src/emotion.rs`) — and X does nothing until somebody puts a skill there
+/// (the kicks are still in the set, unbound). An emotion whose files are missing is a skill the
+/// robot does not have, so its button does nothing. A named button is rebound; the rest stay as
+/// they were.
 ///
 /// A name here is not checked against anything at parse time: which skills exist is a property of
 /// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
@@ -400,12 +403,13 @@ pub struct PadParams {
     /// X (West). Free by default. Held, it is re-sent every tick, so a chaining skill such as
     /// the roulade keeps going for as long as it is held.
     pub x: String,
-    /// Y (North). Free by default.
+    /// Y (North). The excited emotion, by default.
     pub y: String,
     /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
-    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses. The yes
+    /// emotion, by default.
     pub lb: String,
-    /// The right bumper, likewise.
+    /// The right bumper, likewise. The no emotion, by default.
     pub rb: String,
 }
 
@@ -415,9 +419,9 @@ impl Default for PadParams {
             a: "sit_toggle".to_owned(),
             b: "ground_pick".to_owned(),
             x: String::new(),
-            y: String::new(),
-            lb: String::new(),
-            rb: String::new(),
+            y: "excited".to_owned(),
+            lb: "yes".to_owned(),
+            rb: "no".to_owned(),
         }
     }
 }
@@ -1345,18 +1349,16 @@ impl HeadImuParams {
     /// board's default — off for the BMI088 a `zero3` reads on the CPU, on for the `beta`'s
     /// self-fusing LSM6DSV16X.
     pub fn enabled_on(&self, board: board::Board) -> bool {
-        self.enabled.unwrap_or(match board {
-            board::Board::Zero3 => false,
-            board::Board::Beta => true,
-        })
+        self.enabled.unwrap_or(board.is_beta_main_board())
     }
 
     /// The daemon that reads the head IMU on `board`, and so the one to restart when this
     /// section changes.
     pub fn reader(board: board::Board) -> &'static str {
-        match board {
-            board::Board::Zero3 => "tofd",
-            board::Board::Beta => "robotd",
+        if board.is_beta_main_board() {
+            "robotd"
+        } else {
+            "tofd"
         }
     }
 }
@@ -1373,6 +1375,7 @@ mod head_imu_tests {
         let unset = HeadImuParams::default();
         assert!(!unset.enabled_on(Board::Zero3));
         assert!(unset.enabled_on(Board::Beta));
+        assert!(unset.enabled_on(Board::FaceBoardV1));
         let off = HeadImuParams {
             enabled: Some(false),
         };
@@ -1387,6 +1390,7 @@ mod head_imu_tests {
     fn each_board_names_the_daemon_that_reads_it() {
         assert_eq!(HeadImuParams::reader(Board::Zero3), "tofd");
         assert_eq!(HeadImuParams::reader(Board::Beta), "robotd");
+        assert_eq!(HeadImuParams::reader(Board::FaceBoardV1), "robotd");
     }
 }
 
@@ -1492,6 +1496,24 @@ impl AudioParams {
             Some(p) if is_none_sentinel(p) => None,
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
+}
+
+/// `[emotions]` — the robot's own emotions, `<name>.json` keyframes and `<name>.wav` beside them,
+/// read once at startup on top of the set the release ships (`emotions/` in [`RELEASE_DIR`]): a
+/// file here adds one or replaces the shipped one of the same name. A directory that is not there
+/// is a robot with only the shipped set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmotionsParams {
+    pub dir: PathBuf,
+}
+
+impl Default for EmotionsParams {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/robot/emotions"),
         }
     }
 }
@@ -3575,16 +3597,16 @@ mod tests {
         );
     }
 
-    /// The shipped mapping: A sits, B picks up, X, Y and the bumpers are free.
+    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X is free.
     #[test]
     fn the_default_bindings() {
         let pad = super::PadParams::default();
         assert_eq!(pad.a, "sit_toggle");
         assert_eq!(pad.b, "ground_pick");
         assert_eq!(pad.x, "");
-        assert_eq!(pad.y, "");
-        assert_eq!(pad.lb, "");
-        assert_eq!(pad.rb, "");
+        assert_eq!(pad.y, "excited");
+        assert_eq!(pad.lb, "yes");
+        assert_eq!(pad.rb, "no");
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is
