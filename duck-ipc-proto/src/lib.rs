@@ -516,7 +516,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
 /// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
 /// `updaterd`'s question, refused to every client.
-pub const API_VERSION: u32 = 50;
+///
+/// # v51 — which pads were in pairing mode
+///
+/// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
+/// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
+/// reads as an empty list, and a client that does not know it ignores it.
+pub const API_VERSION: u32 = 51;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4876,6 +4882,15 @@ pub enum PadPairResult {
         reason: PadPairFailure,
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
+        /// For [`PadPairFailure::Ambiguous`]: the pads that were in pairing mode, so a client can
+        /// show them and retry with [`PadPairParams::mac`] set to the one meant. Empty for every
+        /// other reason.
+        ///
+        /// A list rather than `detail`'s prose because the next step needs the addresses: a
+        /// refusal that only said "two pads" left a phone with nothing to offer but "switch one
+        /// off", which is not an option when the other belongs to somebody across the room.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidates: Vec<Pad>,
     },
 }
 
@@ -6046,6 +6061,22 @@ pub mod clock {
 mod tests {
     use super::test_support::every_call;
     use super::*;
+
+    /// `candidates` is v51's, so both directions of a mixed install must still parse: a refusal
+    /// from an older `configd` has no such key, and one that has nothing to list must not grow
+    /// one — an older client parses the same bytes it always did.
+    #[test]
+    fn a_pad_refusal_without_candidates_reads_and_writes_as_before() {
+        let old =
+            r#"{"outcome":"failed","reason":"ambiguous","detail":"2 pads are in pairing mode"}"#;
+        let parsed: PadPairResult = serde_json::from_str(old).expect("an older configd's refusal");
+        assert!(matches!(
+            &parsed,
+            PadPairResult::Failed { reason: PadPairFailure::Ambiguous, candidates, .. }
+                if candidates.is_empty()
+        ));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+    }
 
     fn camera_stats(consumers: u32) -> CameraStats {
         CameraStats {
