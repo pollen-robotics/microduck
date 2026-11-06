@@ -1182,16 +1182,20 @@ fn set_gstreamer_log_threshold() {
 /// How many frames an `mpph264enc` may hold before it must hand one back. Upstream's default is
 /// sixteen.
 ///
-/// **Sixteen starves the camera.** The capture pool is `CAPTURE_BUFFERS` deep, and since
-/// gstreamer-rockchip took DMABuf input on its encoders (JeffyCN/mirrors 048e72f) an encoder holds
-/// the capture buffers themselves rather than RGA copies of them. One that keeps four empties the
-/// pool, `v4l2src` has nothing to queue, and capture stops for good — no error, no EOS, just
+/// **Sixteen starves the camera.** The capture pool is eight deep — `CAPTURE_BUFFERS` plus the
+/// four `v4l2src` adds on top (`raise_capture_buffers` has the arithmetic), and `bufcnt:8` in
+/// `/proc/rkisp-vir0` on an idle board — and since gstreamer-rockchip took DMABuf input on its
+/// encoders (JeffyCN/mirrors 048e72f) an encoder holds the capture buffers themselves rather than
+/// RGA copies of them. One allowed sixteen can hold all eight, `v4l2src` has nothing to queue, and
+/// capture stops for good — no error, no EOS, just
 /// `frameloss` climbing in `/proc/rkisp-vir0` with `bufcnt:0`. On microduck OS 1.1.0 that happened
 /// three seconds after start, on every boot and before anyone had connected: `webrtcsink`'s codec
 /// discovery pipeline encodes from the same buffers.
 ///
-/// Two keeps the encoder pipelined — one frame in MPP, one waiting for a slot — and leaves the
-/// pool its spare. Measured on a beta board: capture held 30 fps where it had stopped dead.
+/// Two keeps the encoder pipelined, and an encoder then holds at most three — two in MPP and the
+/// one waiting in `handle_frame` for a slot. Two encoders at once, discovery and a viewer's
+/// session, hold six and leave the pool two. Measured on the beta board: capture held 30 fps where
+/// it had stopped dead, and a 30 s WebRTC session kept it there with `bufcnt` at 7–8.
 const MPP_ENC_MAX_PENDING: &str = "2";
 
 /// Cap every `mpph264enc` this process will create, before any exists. See

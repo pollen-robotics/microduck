@@ -365,13 +365,14 @@ returning capture buffers to the driver.
 
 That release pins gstreamer-rockchip at a tip where `mpph264enc` takes DMABuf input (JeffyCN/mirrors
 048e72f), so it holds the capture buffers themselves rather than RGA copies of them, and it may hold
-up to `max-pending` of them — sixteen by default. The capture pool is four deep. `webrtcsink`'s
-codec-discovery pipeline encodes from those buffers, and one encoder holding four of them empties the
-pool for good.
+up to `max-pending` of them — sixteen by default. The capture pool is eight deep. `webrtcsink`'s
+codec-discovery pipeline encodes from those buffers, and an encoder allowed sixteen can hold all
+eight, which empties the pool for good.
 
 `mediad` sets `GST_MPP_ENC_MAX_PENDING=2` before `gst::init` (`cap_mpp_encoder_pending_frames`), which
 reaches every `mpph264enc` in the process, `webrtcsink`'s own included. Measured on the beta board:
-capture back at 30 fps, `bufcnt:7`, seven frames lost since start.
+capture back at 30 fps, `bufcnt:7`, seven frames lost since start, and the same through a 30 s
+WebRTC session.
 
 ### The 3A engine has to be waiting before the stream starts
 
