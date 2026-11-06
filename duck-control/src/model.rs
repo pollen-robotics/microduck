@@ -134,13 +134,18 @@ pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
 /// enforces it in position control, the factory's only does so in the current-based modes.
 pub const CURRENT_LIMIT_MA: u16 = 1000;
 
-/// `firmware_version` of ROBOTIS's impact guard firmware (V3): a servo that hits something brakes
-/// and then holds softly, which is what keeps the gear teeth whole. Its settings are
-/// [`ImpactGuard`]; register 66 says what the guard is doing
+/// `firmware_version` of ROBOTIS's impact guard firmwares, V3 and V4: a servo that hits something
+/// brakes and then holds softly, which is what keeps the gear teeth whole. Their settings are
+/// [`ImpactGuard`], at the same addresses on both; register 66 says what the guard is doing
 /// ([`crate::io::RobotIo::impact_guard`]).
-pub const IMPACT_GUARD_FIRMWARE: u8 = 3;
+pub const IMPACT_GUARD_FIRMWARES: [u8; 2] = [3, IMPACT_GUARD_ENABLE_FIRMWARE];
 
-/// The impact guard's six settings on [`IMPACT_GUARD_FIRMWARE`], in the registers' own units.
+/// `firmware_version` of V4, whose guard does nothing until Impact Guard Enable (register 67, RAM)
+/// is on. Every power-up and every start of the firmware turns it off: the gear bench lost two
+/// teeth in about 17 shots to a V4 servo left that way (2026-11-06).
+pub const IMPACT_GUARD_ENABLE_FIRMWARE: u8 = 4;
+
+/// The impact guard's six settings on [`IMPACT_GUARD_FIRMWARES`], in the registers' own units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImpactGuard {
     /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster than this.

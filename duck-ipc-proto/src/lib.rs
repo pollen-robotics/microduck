@@ -4322,7 +4322,7 @@ pub struct RobotState {
     pub currents_ma: Vec<f64>,
     /// Each joint's impact guard, indexed as [`JOINT_NAMES`]: 0 armed, 1 braking after an
     /// impact, 2 holding softly until the goal comes back past the position. `null` for a servo
-    /// whose firmware has no guard — anything but ROBOTIS's V3.
+    /// whose firmware has no guard — anything but ROBOTIS's V3 and V4.
     ///
     /// Read after the tick's goal positions are written, and only on ticks with a subscriber, so
     /// a robot nobody is recording runs the bus it always did. Empty when no servo has the guard,

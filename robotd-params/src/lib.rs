@@ -2552,11 +2552,12 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
-    /// The impact guard on servos running ROBOTIS's impact guard firmware (V3): a servo that
+    /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
     /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
     /// broken gear teeth. Off writes settings that never fire, which leaves the factory firmware
-    /// with only Current Limit: the comparison a test on robots needs. Written to every V3 servo
-    /// at startup with torque off; servos on any other firmware have no guard to set. On writes
+    /// with only Current Limit: the comparison a test on robots needs. Written to every V3 and V4
+    /// servo at startup with torque off, and V4's Impact Guard Enable is turned on with every
+    /// torque on; servos on any other firmware have no guard to set. On writes
     /// the six `impact_guard_*` settings below. Their defaults are what a microduck walks with:
     /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
     /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot

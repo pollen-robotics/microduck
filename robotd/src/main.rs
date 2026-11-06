@@ -1593,7 +1593,7 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
-/// What `[bus]` asks the V3 servos' impact guard to be: its six settings, or off.
+/// What `[bus]` asks the servos' impact guard to be: its six settings, or off.
 fn impact_guard(bus: &params::Bus) -> duck_control::model::ImpactGuard {
     use duck_control::model::ImpactGuard;
     if !bus.impact_guard {
@@ -1640,7 +1640,7 @@ fn open_bus(
     let guard = impact_guard(bus);
     io.set_impact_guard(guard);
     if !bus.impact_guard && loud {
-        tracing::warn!("bus.impact_guard is off; V3 servos run as the factory firmware");
+        tracing::warn!("bus.impact_guard is off; guard servos run as the factory firmware");
     } else if guard != duck_control::model::ImpactGuard::DEFAULT && loud {
         // Said once a start so a recording can be matched to the settings it ran on.
         tracing::warn!(?guard, "bus.impact_guard_* differ from the defaults");
@@ -2342,7 +2342,8 @@ async fn control_loop<T: RobotIo>(
     match safety.servo_identity() {
         Ok(Some(ids)) => {
             state.vetbook.identify(&ids);
-            guarded = ids.map(|s| s.firmware == duck_control::model::IMPACT_GUARD_FIRMWARE);
+            guarded =
+                ids.map(|s| duck_control::model::IMPACT_GUARD_FIRMWARES.contains(&s.firmware));
             let unguarded: Vec<_> = (0..NUM_JOINTS)
                 .filter(|&j| !guarded[j])
                 .map(|j| format!("{}={}", duck_control::JOINT_NAMES[j], ids[j].firmware))
@@ -2350,7 +2351,7 @@ async fn control_loop<T: RobotIo>(
             if !unguarded.is_empty() {
                 tracing::warn!(
                     servos = unguarded.join(" "),
-                    want = duck_control::model::IMPACT_GUARD_FIRMWARE,
+                    want = ?duck_control::model::IMPACT_GUARD_FIRMWARES,
                     "servo firmware without the impact guard"
                 );
             }
@@ -7999,25 +8000,24 @@ mod tests {
         assert!(frame.currents_ma.is_empty(), "{:?}", frame.currents_ma);
     }
 
-    /// Servos on ROBOTIS's impact guard firmware, every one but the mouth here, with the guard
-    /// holding after an impact.
+    /// Servos on ROBOTIS's impact guard firmwares, V3 and one on V4, every one but the mouth
+    /// here, with the guard holding after an impact.
     fn guarded_io() -> FakeIo {
+        use duck_control::model::{IMPACT_GUARD_ENABLE_FIRMWARE, IMPACT_GUARD_FIRMWARES};
         let mut io = FakeIo::at(DEFAULT_POSITION);
         let mut identity = [duck_control::io::ServoIdentity {
             model: 1200,
-            firmware: duck_control::model::IMPACT_GUARD_FIRMWARE,
+            firmware: IMPACT_GUARD_FIRMWARES[0],
         }; NUM_JOINTS];
+        identity[0].firmware = IMPACT_GUARD_ENABLE_FIRMWARE;
         identity[duck_control::model::MOUTH_INDEX].firmware = 53;
         io.identity = Some(identity);
         io.impact_guard = Some([2; NUM_JOINTS]);
         io
     }
 
-    /// The guard's state reaches the stream for the servos that have one, and a servo on any
-    /// other firmware is `null` — what its unused register 66 holds is not a state, and a 0 there
-    /// would read as a guard that never fired.
-    /// An untouched `[bus]` is ROBOTIS's factory guard, `impact_guard = false` is off whatever
-    /// the six settings say, and a retuned one is written as asked.
+    /// An untouched `[bus]` is setting R, `impact_guard = false` is off whatever the six settings
+    /// say, and a retuned one is written as asked.
     #[test]
     fn bus_params_pick_the_impact_guard() {
         use duck_control::model::ImpactGuard;
@@ -8037,6 +8037,9 @@ mod tests {
         assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
     }
 
+    /// The guard's state reaches the stream for the servos that have one, and a servo on any
+    /// other firmware is `null` — what its unused register 66 holds is not a state, and a 0 there
+    /// would read as a guard that never fired.
     #[tokio::test]
     async fn the_frame_carries_the_impact_guard_of_the_servos_that_have_one() {
         let frame = a_frame_from(guarded_io(), Params::default()).await;

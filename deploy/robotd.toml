@@ -46,13 +46,15 @@ port = "/dev/ttyS2"
 # this line. Needs a robotd restart.
 # fast_sync_read = true
 
-# The impact guard on servos running ROBOTIS's impact guard firmware (V3, firmware_version 3):
+# The impact guard on servos running ROBOTIS's impact guard firmwares (V3 and V4,
+# firmware_version 3 and 4):
 # a servo that arrives faster than 6 rad/s and hits something brakes 20 ms, and its PWM limit
 # falls from 100 % at rest to 40 % at 7 rad/s, which keeps arrivals near 7 rad/s — what keeps
 # the gear teeth whole and still lets the policy walk and catch a push. OFF writes settings that
 # never fire, which leaves the factory firmware with only Current Limit (1000 mA either way).
-# robotd writes them to every V3 servo when it starts with torque off; a robot standing at the
-# restart gets them at the next start. Needs a robotd restart.
+# robotd writes them to every V3 and V4 servo when it starts with torque off; a robot standing
+# at the restart gets them at the next start. V4 also has an on/off switch that every power-up
+# turns off, and robotd turns it on with every torque on. Needs a robotd restart.
 # impact_guard = true
 
 # What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's

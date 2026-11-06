@@ -119,7 +119,7 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "bus.impact_guard",
         Kind::Bool,
-        "Impact guard on V3 servos; off = factory firmware with Current Limit only",
+        "Impact guard on V3 and V4 servos; off = factory firmware with Current Limit only",
     ),
     entry(
         "bus.impact_guard_v_min",

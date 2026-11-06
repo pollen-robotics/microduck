@@ -203,7 +203,7 @@ pub trait RobotIo {
         Ok(None)
     }
 
-    /// Each servo's impact guard state (register 66 on [`crate::model::IMPACT_GUARD_FIRMWARE`]),
+    /// Each servo's impact guard state (register 66 on [`crate::model::IMPACT_GUARD_FIRMWARES`]),
     /// in joint order: 0 armed, 1 braking after an impact, 2 holding softly until the goal comes
     /// back past the position. A servo on any other firmware answers whatever its unused register
     /// holds, so the caller masks those out. A transaction of its own, about a millisecond.

@@ -309,8 +309,8 @@ widening the tick's read to 22 bytes per servo at 50 Hz. The sampling interval i
 window the achieved rate is measured over, so one clock drives both.
 
 **The impact guard's state is a fourth read, and only while someone records.** ROBOTIS's impact
-guard firmware (`firmware_version` 3) brakes a servo that hits something and then holds it softly,
-which is what keeps gear teeth whole; its register 66 says which of armed, braking or holding each
+guard firmwares (`firmware_version` 3, 4) brake a servo that hits something and hold it softly,
+which is what keeps gear teeth whole; their register 66 says which of armed, braking or holding each
 servo is in. That is a transaction of its own (~1 ms), so it is read only on ticks with a
 `robot.state` subscriber, after the goal positions are written — the read→decide→write path is the
 same with or without it — and only from a robot where at least one servo runs that firmware. The
@@ -320,7 +320,10 @@ named in the journal and published as `null`. The guard's own settings are EEPRO
 `bus.impact_guard_*` settings, by default what a microduck walks with (a short brake on fast
 arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
 with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
-draws and no speed taper — the factory firmware with only Current Limit.
+draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
+Enable (67, RAM), off after every power-up and with it the whole guard, so the torque-on write
+switches it on first, with the servo still limp; that one moment follows every way a servo can
+lose RAM (power-up, reboot, a latched error), each of which leaves it limp.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than

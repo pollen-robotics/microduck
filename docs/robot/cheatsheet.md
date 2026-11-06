@@ -105,15 +105,17 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
-On a robot whose servos run ROBOTIS's impact guard firmware (V3), each line also carries
+On a robot whose servos run ROBOTIS's impact guard firmware (V3 or V4), each line also carries
 `impact_guard`: per joint, 0 armed, 1 braking after an impact, 2 holding softly until the goal
 comes back past the position, `null` for a servo on another firmware. Reading it costs the bus a
 millisecond per tick, after the goal positions go out and only while something is subscribed,
 and `loop.hz` and `loop.missed` on the same line say whether the loop kept its rate. `robotd`
-names any servo not on V3 in the journal once a start, and sets every servo's Current Limit to
-1000 mA, at the next start with torque off if the robot was standing.
+names any servo on neither in the journal once a start, and sets every servo's Current Limit to
+1000 mA, at the next start with torque off if the robot was standing. V4 hides the guard behind
+Impact Guard Enable (register 67), which every power-up turns off: `robotd` turns it on with every
+torque on, so a V4 servo is guarded from the first Start.
 
-`bus.impact_guard` in `sudo robotctl configure` switches every V3 servo between the guard (on,
+`bus.impact_guard` in `sudo robotctl configure` switches every guard servo between the guard (on,
 the default) and settings that never fire (off): the factory firmware with only Current Limit, to
 compare the two on the same robot. On writes the six `bus.impact_guard_*` rows beside it, which
 default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),

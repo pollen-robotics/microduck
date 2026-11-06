@@ -27,8 +27,8 @@ use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
     BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID,
-    IMPACT_GUARD_FIRMWARE, IMU_DXL_ID, ImpactGuard, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
-    homing_offset,
+    IMPACT_GUARD_ENABLE_FIRMWARE, IMPACT_GUARD_FIRMWARES, IMU_DXL_ID, ImpactGuard, JOINT_IDS,
+    JOINT_NAMES, NUM_JOINTS, homing_offset,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -56,6 +56,9 @@ const HARDWARE_ERROR_ADDR: u8 = 70;
 
 /// The impact guard's state, one byte — see [`RobotIo::impact_guard`].
 const IMPACT_GUARD_ADDR: u8 = 66;
+
+/// V4's Impact Guard Enable, one byte, 0 off or 1 on — see [`IMPACT_GUARD_ENABLE_FIRMWARE`].
+const IMPACT_GUARD_ENABLE_ADDR: u8 = 67;
 
 /// `model_number` (0, `u16`) through `firmware_version` (6, `u8`): seven bytes, once a start.
 const IDENTITY_ADDR: u8 = 0;
@@ -127,8 +130,11 @@ pub struct DynamixelIo {
     /// built without this would silently drop back to a plain sync read for the rest of the
     /// process — a motor swap quietly halving the tick's bus budget.
     fast_sync_read: bool,
-    /// `bus.impact_guard*`: the settings the register check asserts on V3 servos.
+    /// `bus.impact_guard*`: the settings the register check asserts on the guard's firmwares.
     impact_guard: ImpactGuard,
+    /// Servos on [`IMPACT_GUARD_ENABLE_FIRMWARE`], found by the register check: every torque on
+    /// switches their guard on first.
+    guard_switch: Vec<u8>,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
@@ -152,6 +158,7 @@ impl DynamixelIo {
             ids,
             fast_sync_read,
             impact_guard: ImpactGuard::DEFAULT,
+            guard_switch: Vec::new(),
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
@@ -301,7 +308,12 @@ impl DynamixelIo {
                 expected: 1,
                 got: 0,
             })?;
-        if firmware == IMPACT_GUARD_FIRMWARE {
+        // A swapped-in servo is checked again under the same id, maybe on another firmware.
+        self.guard_switch.retain(|&s| s != id);
+        if firmware == IMPACT_GUARD_ENABLE_FIRMWARE {
+            self.guard_switch.push(id);
+        }
+        if IMPACT_GUARD_FIRMWARES.contains(&firmware) {
             for (addr, want) in self.impact_guard.blocks() {
                 let got = self
                     .controller
@@ -531,8 +543,23 @@ impl DynamixelIo {
     /// locked, because the tick that saw the error was the last one that could have retried.
     /// Writing the rest costs the same as it would have, and the error names every joint that
     /// did not answer so the caller can decide whether to ask again.
+    ///
+    /// **Torque on switches a V4 servo's guard on first.** Its switch is off after every power-up
+    /// and every start of its firmware, and whether a reboot, torque off or a latched error also
+    /// clears it is unknown; every one of those ends limp, so torque on is the one moment that
+    /// covers them all, and the servo's torque is still off when its switch is written.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         let mut failed = Vec::new();
+        if on {
+            for &id in &self.guard_switch {
+                if let Err(e) =
+                    self.controller
+                        .write_raw_data(id, IMPACT_GUARD_ENABLE_ADDR, vec![1])
+                {
+                    failed.push(format!("impact guard enable on {id}: {e}"));
+                }
+            }
+        }
         for &id in &JOINT_IDS {
             if let Err(e) = self.controller.write_torque_enable(id, on) {
                 failed.push(format!("torque {on} on {id}: {e}"));
