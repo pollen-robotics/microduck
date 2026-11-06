@@ -5393,6 +5393,16 @@ fn dispatch(
         // Never refused: an aim is an intent like `robot.head`, and the closest-possible
         // gaze at a clamped target is still the most useful thing the head can do.
         proto::Call::RobotLook(p) => {
+            if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() || !p.neck_pitch.is_finite()
+            {
+                return proto::Response::err(
+                    Some(id),
+                    proto::Error::new(
+                        proto::code::INVALID_PARAMS,
+                        "look target coordinates and neck_pitch must be finite",
+                    ),
+                );
+            }
             static HEAD_FK: std::sync::LazyLock<kinematics::head::HeadFk> =
                 std::sync::LazyLock::new(kinematics::head::HeadFk::alpha);
             let gaze = HEAD_FK.look_at([p.x, p.y, p.z], p.neck_pitch);
@@ -6949,6 +6959,37 @@ mod tests {
             ],
             "the answer must be exactly what the head was sent"
         );
+    }
+
+    /// A look target with non-finite coordinates or neck pitch is refused with INVALID_PARAMS,
+    /// so an accidental NaN cannot poison the head intent and trip Limit::NotFinite in safety.
+    #[test]
+    fn a_non_finite_look_target_is_refused() {
+        let intents = Intents::new();
+        let state = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let resp = dispatch(
+            &state,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotLook(proto::LookParams {
+                x: f64::NAN,
+                y: 0.0,
+                z: 0.0,
+                neck_pitch: 0.0,
+            }),
+        );
+        let err = resp.error.expect("NaN target must be refused");
+        assert_eq!(err.code, proto::code::INVALID_PARAMS);
+        assert!(err.message.contains("finite"), "{}", err.message);
+
+        // Intents must stay unpoisoned
+        let head = intents.snapshot().command.head;
+        assert!(head.iter().all(|v| v.is_finite()));
     }
 
     /// A board without a flashlight says so; one with it records the toggle for the LED task.
