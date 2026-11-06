@@ -318,6 +318,7 @@ const RESTART_QUIET_AFTER: u32 = 5;
 
 /// How a read ended. EOF is a failure for the mic — `arecord` should run until we stop it —
 /// and the natural end for a recording, so the two callers read the same value differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PumpEnd {
     Eof,
     Shutdown,
@@ -357,8 +358,17 @@ fn read_recording(
     };
     let mut sentry = SoundSentry::new();
     let mut reader = BufReader::new(file);
+    // `Eof` and `Shutdown` are both clean ends but mean different things: one is the take
+    // finishing, the other is the daemon going away mid-take. Reporting "played to the end"
+    // for a shutdown would put a completion in the log that did not happen.
     match pump(&mut reader, detector, &mut sentry, tx, tx_sound, shutdown) {
-        Ok(_) => tracing::info!(path = %path.display(), "pet worker: recording played to the end"),
+        Ok(PumpEnd::Eof) => {
+            tracing::info!(path = %path.display(), "pet worker: recording played to the end")
+        }
+        Ok(PumpEnd::Shutdown) => tracing::debug!(
+            path = %path.display(),
+            "pet worker: stopped before the end of the recording"
+        ),
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "pet worker: recording failed")
         }
@@ -453,6 +463,30 @@ fn spawn_arecord(device: &str) -> Result<Child> {
         .spawn()?)
 }
 
+/// One read from the PCM stream: `None` at end of stream, otherwise the samples in it.
+///
+/// Split out of [`pump`] so the decode-and-terminate half can be exercised without a model:
+/// everything downstream of this needs a [`PettingDetector`], and constructing one means
+/// loading an ONNX file that the tests do not ship.
+fn read_block(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    i16_buf: &mut Vec<i16>,
+) -> Result<Option<Vec<f32>>> {
+    let n = reader.read(buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if !n.is_multiple_of(2) {
+        return Err(anyhow::anyhow!("odd byte count in the PCM stream"));
+    }
+    i16_buf.clear();
+    for chunk in buf[..n].as_chunks::<2>().0 {
+        i16_buf.push(i16::from_le_bytes(*chunk));
+    }
+    Ok(Some(i16_to_f32(i16_buf)))
+}
+
 fn pump(
     reader: &mut impl Read,
     detector: &mut PettingDetector,
@@ -465,18 +499,10 @@ fn pump(
     let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
 
     while !shutdown.load(Ordering::Acquire) {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Ok(PumpEnd::Eof);
-        }
-        if !n.is_multiple_of(2) {
-            return Err(anyhow::anyhow!("odd byte count in the PCM stream"));
-        }
-        i16_buf.clear();
-        for chunk in buf[..n].as_chunks::<2>().0 {
-            i16_buf.push(i16::from_le_bytes(*chunk));
-        }
-        let samples = i16_to_f32(&i16_buf);
+        let samples = match read_block(reader, &mut buf, &mut i16_buf)? {
+            Some(samples) => samples,
+            None => return Ok(PumpEnd::Eof),
+        };
         // Read before the sentry sees this batch, deliberately: the answer is a one-second
         // hangover rather than a verdict on these 128 ms, so it spans batches and reading it
         // one batch early costs nothing. Reading it after would mean pushing to the sentry
@@ -535,41 +561,72 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }
-
-    /// A recording is read to the end and stops there. Nothing restarts it, so this has to
-    /// return on its own rather than sitting in the mic's retry loop.
+    /// A recording is read to its last sample and then reports end of stream — the value
+    /// `read_recording` turns into a clean stop rather than a restart.
+    ///
+    /// This goes through `read_block`, the same function `pump` uses, so a regression that
+    /// makes the reader swallow the tail or spin at EOF is caught here.
     #[test]
     fn a_recording_is_read_to_eof_and_stops() {
         let dir = temp_dir("eof");
         let path = write_recording(&dir, 0, 4);
-        let file = File::open(&path).expect("open");
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(File::open(&path).expect("open"));
         let mut buf = [0u8; 4096];
-        let mut total = 0;
-        loop {
-            let n = reader.read(&mut buf).expect("read");
-            if n == 0 {
-                break;
+        let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
+
+        // Bounded on purpose: if `read_block` ever stops reporting end of stream, the failure
+        // should be an assertion here rather than a test that hangs until the harness kills it.
+        let mut blocks = 0usize;
+        let mut samples = 0usize;
+        for _ in 0..64 {
+            match read_block(&mut reader, &mut buf, &mut i16_buf).expect("read") {
+                Some(block) => {
+                    blocks += 1;
+                    samples += block.len();
+                }
+                None => break,
             }
-            total += n;
         }
         assert_eq!(
-            total,
-            SENTRY_FRAME as usize * 4 * 2,
-            "every byte of the take"
+            samples,
+            SENTRY_FRAME as usize * 4,
+            "every sample of the take"
+        );
+        assert!(blocks >= 1, "the take is not empty");
+        assert!(blocks < 64, "the reader never reported end of stream");
+
+        // The next call after EOF keeps saying EOF rather than turning into data.
+        assert!(
+            read_block(&mut reader, &mut buf, &mut i16_buf)
+                .expect("EOF is not an error")
+                .is_none(),
+            "end of stream must be reported again"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The bytes a recording yields are what the sentry would have heard from the mic: the
-    /// same loud frames produce the same `Voice` event. This is the whole point of the file
-    /// source — the pipeline away from a robot sees what the robot would.
+    /// An odd byte count is a malformed stream, not an end of stream. One is a clean stop and
+    /// the other is a bug in whatever produced the file, so they must not be conflated.
+    #[test]
+    fn an_odd_byte_count_is_an_error_not_an_end() {
+        let dir = temp_dir("odd");
+        let path = dir.join("odd.pcm");
+        std::fs::write(&path, [1u8, 2, 3]).expect("write");
+        let mut reader = BufReader::new(File::open(&path).expect("open"));
+        let mut buf = [0u8; 4096];
+        let mut i16_buf: Vec<i16> = Vec::new();
+        let err = read_block(&mut reader, &mut buf, &mut i16_buf)
+            .expect_err("three bytes is not a whole sample");
+        assert!(err.to_string().contains("odd byte count"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud take produces the event the mic would have produced: 16 loud frames then 3
+    /// quiet ones, past the 12-frame transient boundary that separates `Noise` from `Voice`
+    /// and then below the off-threshold long enough to close the event.
     #[test]
     fn a_loud_recording_produces_the_event_the_mic_would() {
         let dir = temp_dir("loud");
-        // 16 loud frames then 3 quiet ones: past the 12-frame transient boundary, then three
-        // frames below the off-threshold, which is what makes the sentry close the event and
-        // call it a Voice rather than a Noise.
         let path = write_recording(&dir, 16, 3);
 
         let mut sentry = SoundSentry::new();
@@ -577,16 +634,8 @@ mod tests {
         let mut reader = BufReader::new(File::open(&path).expect("open"));
         let mut buf = [0u8; 4096];
         let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
-        loop {
-            let n = reader.read(&mut buf).expect("read");
-            if n == 0 {
-                break;
-            }
-            i16_buf.clear();
-            for chunk in buf[..n].as_chunks::<2>().0 {
-                i16_buf.push(i16::from_le_bytes(*chunk));
-            }
-            sentry.push(&i16_to_f32(&i16_buf), false, &mut out);
+        while let Some(samples) = read_block(&mut reader, &mut buf, &mut i16_buf).expect("read") {
+            sentry.push(&samples, false, &mut out);
         }
         assert!(
             out.contains(&SoundEvent::Voice),
