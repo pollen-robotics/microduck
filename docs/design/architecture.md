@@ -382,8 +382,9 @@ update", "select model" are actions, dispatched as RPC to the owning service.
 
 ### 3.2 The face LEDs
 
-The beta board's face carries twelve LEDs on a GPIO expander, which its device tree names
-`face:<place>:<colour>` under `/sys/class/leds`. An LED shows a piece of state, so it follows
+The beta board's face carries twelve LEDs on a GPIO expander and face-board-v1's on PWM drivers;
+either device tree names them `face:<place>:<colour>` under `/sys/class/leds`, and on is the LED's
+`max_brightness`. An LED shows a piece of state, so it follows
 invariant 4: **each LED has one writer, the daemon that owns what it shows.** A Zero 3W has none of
 them, and every owner does nothing on a board without its LED.
 
