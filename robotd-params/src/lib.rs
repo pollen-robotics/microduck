@@ -2556,7 +2556,7 @@ pub struct Bus {
     /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
     /// broken gear teeth. Off writes settings that never fire, which leaves the factory firmware
     /// with only Current Limit: the comparison a test on robots needs. Written to every V3 and V4
-    /// servo at startup with torque off, and V4's Impact Guard Enable is turned on with every
+    /// servo at startup with torque off, and V4's Impact Guard Enable follows this with every
     /// torque on; servos on any other firmware have no guard to set. On writes
     /// the six `impact_guard_*` settings below. Their defaults are what a microduck walks with:
     /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory

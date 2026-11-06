@@ -190,6 +190,12 @@ impl ImpactGuard {
         ..Self::DEFAULT
     };
 
+    /// What V4's Impact Guard Enable should hold: 0, which is V2's behaviour, for [`Self::OFF`],
+    /// and 1 for anything else.
+    pub fn enable(self) -> u8 {
+        u8::from(self != Self::OFF)
+    }
+
     /// The two EEPROM blocks the settings fill, as (address, bytes): 40–43 (V Min, Brake Time,
     /// Deceleration `u16`) and 56–59 (i Hold `u16`, V Fast, PWM Fast).
     pub fn blocks(self) -> [(u8, [u8; 4]); 2] {
@@ -305,6 +311,14 @@ mod tests {
     }
 
     /// Every setting lands at its own address, the two `u16`s little-endian.
+    /// `bus.impact_guard = false` has to reach V4's switch: off settings behind a switch left on
+    /// are still the guard's code path.
+    #[test]
+    fn only_off_turns_the_v4_switch_off() {
+        assert_eq!(ImpactGuard::OFF.enable(), 0);
+        assert_eq!(ImpactGuard::DEFAULT.enable(), 1);
+    }
+
     #[test]
     fn impact_guard_settings_fill_their_registers() {
         let guard = ImpactGuard {

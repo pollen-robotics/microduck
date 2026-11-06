@@ -112,8 +112,8 @@ millisecond per tick, after the goal positions go out and only while something i
 and `loop.hz` and `loop.missed` on the same line say whether the loop kept its rate. `robotd`
 names any servo on neither in the journal once a start, and sets every servo's Current Limit to
 1000 mA, at the next start with torque off if the robot was standing. V4 hides the guard behind
-Impact Guard Enable (register 67), which every power-up turns off: `robotd` turns it on with every
-torque on, so a V4 servo is guarded from the first Start.
+Impact Guard Enable (register 67), which every power-up turns off: `robotd` sets it to
+`bus.impact_guard` with every torque on, so a V4 servo is guarded from the first Start.
 
 `bus.impact_guard` in `sudo robotctl configure` switches every guard servo between the guard (on,
 the default) and settings that never fire (off): the factory firmware with only Current Limit, to

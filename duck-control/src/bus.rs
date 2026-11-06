@@ -133,7 +133,7 @@ pub struct DynamixelIo {
     /// `bus.impact_guard*`: the settings the register check asserts on the guard's firmwares.
     impact_guard: ImpactGuard,
     /// Servos on [`IMPACT_GUARD_ENABLE_FIRMWARE`], found by the register check: every torque on
-    /// switches their guard on first.
+    /// sets their guard switch first.
     guard_switch: Vec<u8>,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
@@ -544,17 +544,20 @@ impl DynamixelIo {
     /// Writing the rest costs the same as it would have, and the error names every joint that
     /// did not answer so the caller can decide whether to ask again.
     ///
-    /// **Torque on switches a V4 servo's guard on first.** Its switch is off after every power-up
-    /// and every start of its firmware, and whether a reboot, torque off or a latched error also
-    /// clears it is unknown; every one of those ends limp, so torque on is the one moment that
-    /// covers them all, and the servo's torque is still off when its switch is written.
+    /// **Torque on sets a V4 servo's guard switch first**, to what `bus.impact_guard` asks
+    /// ([`ImpactGuard::enable`]). Its switch is off after every power-up and every start of its
+    /// firmware, and whether a reboot, torque off or a latched error also clears it is unknown;
+    /// every one of those ends limp, so torque on is the one moment that covers them all, and the
+    /// servo's torque is still off when its switch is written. Written either way, because a
+    /// switch left on by an earlier run survives a `robotd` restart.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         let mut failed = Vec::new();
         if on {
+            let enable = self.impact_guard.enable();
             for &id in &self.guard_switch {
                 if let Err(e) =
                     self.controller
-                        .write_raw_data(id, IMPACT_GUARD_ENABLE_ADDR, vec![1])
+                        .write_raw_data(id, IMPACT_GUARD_ENABLE_ADDR, vec![enable])
                 {
                     failed.push(format!("impact guard enable on {id}: {e}"));
                 }

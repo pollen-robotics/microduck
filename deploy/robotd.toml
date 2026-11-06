@@ -54,7 +54,7 @@ port = "/dev/ttyS2"
 # never fire, which leaves the factory firmware with only Current Limit (1000 mA either way).
 # robotd writes them to every V3 and V4 servo when it starts with torque off; a robot standing
 # at the restart gets them at the next start. V4 also has an on/off switch that every power-up
-# turns off, and robotd turns it on with every torque on. Needs a robotd restart.
+# turns off, and robotd sets it to this value with every torque on. Needs a robotd restart.
 # impact_guard = true
 
 # What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's

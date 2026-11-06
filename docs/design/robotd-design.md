@@ -322,8 +322,8 @@ arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walki
 with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
 draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
 Enable (67, RAM), off after every power-up and with it the whole guard, so the torque-on write
-switches it on first, with the servo still limp; that one moment follows every way a servo can
-lose RAM (power-up, reboot, a latched error), each of which leaves it limp.
+sets it to what `bus.impact_guard` asks first, with the servo still limp; that one moment follows
+every way a servo can lose RAM (power-up, reboot, a latched error), each of which leaves it limp.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
