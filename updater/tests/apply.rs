@@ -2786,6 +2786,42 @@ async fn an_unknown_ref_says_which_ref() {
     );
 }
 
+/// A branch build on a robot that is not a dev board says what to do about it, first, rather than
+/// asking whether the signing key was rotated.
+#[tokio::test]
+async fn a_dev_signed_build_on_a_non_dev_board_says_how_to_allow_it() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+
+    // The publisher's key becomes a dev key, so what it signed is what CI signs a branch with.
+    let keys = fx.root.join("keys");
+    std::fs::rename(keys.join("prod.pub"), keys.join("team.dev.pub")).unwrap();
+    let release = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    let release_pk = release.pk.to_box().unwrap().to_string();
+    std::fs::write(
+        keys.join("prod.pub"),
+        release_pk.lines().next_back().unwrap(),
+    )
+    .unwrap();
+
+    let mut engine = fx.engine_healthy();
+    let err = apply_latest(&mut engine).await.unwrap_err();
+    assert!(
+        matches!(err, updater::Error::DevBuildsNotAllowed { .. }),
+        "got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.starts_with("if you are trying to install a non-stable version"),
+        "{message}"
+    );
+    assert!(
+        message.contains("allow_dev_daemon in `sudo robotctl configure`"),
+        "{message}"
+    );
+    assert_eq!(fx.live_version(), None);
+}
+
 /// A ref that would escape the directory is refused. `local_dir` turns a ref into a
 /// filename, so this is a path-traversal guard, and it fails as a verification error rather
 /// than quietly reading something else.

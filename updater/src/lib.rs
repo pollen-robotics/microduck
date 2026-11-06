@@ -193,6 +193,15 @@ pub enum Error {
     #[error("verification failed: {0}")]
     Verification(String),
 
+    /// A good signature from a dev key this robot is not using: a branch build on a robot that
+    /// is not a dev board. Its own variant so the instruction is the first thing the message
+    /// says, ahead of a "verification failed" that reads like a corrupt release.
+    #[error(
+        "if you are trying to install a non-stable version of the {channel}, turn on \
+         allow_dev_daemon in `sudo robotctl configure`, then run the same command again."
+    )]
+    DevBuildsNotAllowed { channel: String },
+
     #[error("incompatible with this robot: {0}")]
     Incompatible(String),
 
@@ -303,7 +312,9 @@ impl Error {
             // exactly right for a release whose upload is still in flight, so a new code would
             // be an `API_VERSION` bump that changed no client's mind about what to do.
             Error::ReleaseNotReady { .. } => code::NETWORK,
-            Error::Verification(_) => code::VERIFICATION_FAILED,
+            // Shares the verification code: the answer to a client is the same refusal, and what
+            // distinguishes it is the message.
+            Error::Verification(_) | Error::DevBuildsNotAllowed { .. } => code::VERIFICATION_FAILED,
             Error::Incompatible(_) => code::INCOMPATIBLE,
             // Shares the incompatible code rather than adding one, for the reason `SelfTest`
             // shares health's: to a client this is the same answer — "that release will not run
