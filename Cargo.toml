@@ -56,7 +56,7 @@ runtime = "v2.3.2"
 # and it is bumped when a slot's default names a file only the new set carries.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
-version = "v8"
+version = "v9"
 
 # The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
 # and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
