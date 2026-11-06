@@ -191,16 +191,15 @@ impl ImpactGuard {
     };
 
     /// Whether the startup check writes these settings to a servo on `firmware`. Never to one
-    /// with no guard, and [`Self::OFF`] never to V4: its switch already turns the guard off, and
-    /// a servo loads its settings only when it reboots, so OFF left in its EEPROM could be what
-    /// it runs after the guard is back on, unguarded behind a switch that says otherwise.
+    /// with no guard, and [`Self::OFF`] never to V4: its switch turns the guard off, so off leaves
+    /// in place the settings that switching it back on will run.
     pub fn written_to(self, firmware: u8) -> bool {
         IMPACT_GUARD_FIRMWARES.contains(&firmware)
             && !(firmware == IMPACT_GUARD_ENABLE_FIRMWARE && self == Self::OFF)
     }
 
-    /// What V4's Impact Guard Enable should hold: 0, which is V2's behaviour, for [`Self::OFF`],
-    /// and 1 for anything else.
+    /// What V4's Impact Guard Enable should hold: 0, the factory firmware's behaviour, for
+    /// [`Self::OFF`], and 1 for anything else.
     pub fn enable(self) -> u8 {
         u8::from(self != Self::OFF)
     }
@@ -319,7 +318,6 @@ mod tests {
         assert_ne!(high[2], 0, "v fast");
     }
 
-    /// Every setting lands at its own address, the two `u16`s little-endian.
     /// `bus.impact_guard = false` has to reach V4's switch: off settings behind a switch left on
     /// are still the guard's code path.
     #[test]
@@ -338,6 +336,7 @@ mod tests {
         assert!(!ImpactGuard::DEFAULT.written_to(53));
     }
 
+    /// Every setting lands at its own address, the two `u16`s little-endian.
     #[test]
     fn impact_guard_settings_fill_their_registers() {
         let guard = ImpactGuard {
