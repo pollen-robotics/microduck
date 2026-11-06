@@ -59,6 +59,10 @@ ExecStart=/opt/robot/daemon/current/bin/mediad
 # padd's and tofd's sockets are handed to the `robot` group by those daemons themselves, so the
 # pad tap and the depth stream are reachable through the same membership.
 #
+# **`robot-account` is the account credential**, `0640` with this group, which the relay signs
+# in with. Its own group because everything that talks to a daemon is in `robot`, and mediad is
+# the only process that needs the token.
+#
 # **`render` is the NPU.** The rknpu driver registers as a DRM device, `root:render` mode 660, so
 # the duck detector cannot open the NPU without this group — and the failure is an `rknn_init` that
 # returns a number rather than anything about permissions. Which `/dev/dri/renderD*` it takes is not
@@ -68,7 +72,7 @@ ExecStart=/opt/robot/daemon/current/bin/mediad
 # and not on one where it is enabled.
 User=mediad
 Group=mediad
-SupplementaryGroups=video render robot
+SupplementaryGroups=video render robot robot-account
 
 # Restart=always for padd's reason: mediad exits when it cannot start a pipeline, and a missing
 # plugin or an unopenable device node is a state to retry rather than one to stay down in — a
