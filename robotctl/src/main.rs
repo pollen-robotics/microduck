@@ -5059,7 +5059,7 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
             }
             Ok(())
         }
-        proto::PadPairResult::Failed { reason, detail } => {
+        proto::PadPairResult::Failed { reason, detail, .. } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
                     "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
