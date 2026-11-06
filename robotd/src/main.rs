@@ -364,6 +364,7 @@ struct PolicyNames {
     walk: Option<String>,
     stand: Option<String>,
     sitstand: Option<String>,
+    crouchstand: Option<String>,
     ground_pick: Option<String>,
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
@@ -381,6 +382,7 @@ impl PolicyNames {
             walk: file_name(&policy.walk),
             stand: name(&policy.stand),
             sitstand: name(&policy.sitstand),
+            crouchstand: name(&policy.crouchstand),
             ground_pick: name(&policy.ground_pick),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
         }
@@ -2064,6 +2066,7 @@ fn change_disturbs(
         Driving::Stand => before.stand != after.stand,
         Driving::SitStand => before.sitstand != after.sitstand,
         Driving::Seated => false,
+        Driving::CrouchStand => before.crouchstand != after.crouchstand,
         Driving::GroundPick => before.ground_pick != after.ground_pick,
         Driving::Skill(_) => before.skills != after.skills,
     }
@@ -2142,12 +2145,16 @@ fn try_controller(
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
+            crouchstand_pause_s: params::DEFAULT_CROUCHSTAND_PAUSE_S,
+            crouchstand_ramp_s: params::DEFAULT_CROUCHSTAND_RAMP_S,
+            crouchstand_rise_s: params::DEFAULT_CROUCHSTAND_RISE_S,
             skills: policy_cfg.skills.clone(),
         };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
             stand: policy_cfg.stand.clone(),
             sitstand: policy_cfg.sitstand.clone(),
+            crouchstand: policy_cfg.crouchstand.clone(),
             ground_pick: policy_cfg.ground_pick.clone(),
             // Only the skills whose file resolves — a slot switched off with `"none"` is
             // already filtered out by `resolved_skills`.
@@ -2782,6 +2789,12 @@ async fn control_loop<T: RobotIo>(
                         match controller.sit_toggle() {
                             Ok(direction) => tracing::warn!(direction, "sit toggle"),
                             Err(reason) => tracing::warn!(reason, "sit toggle refused"),
+                        }
+                    }
+                    if requests.crouch_toggle {
+                        match controller.crouch_toggle() {
+                            Ok(direction) => tracing::warn!(direction, "crouch toggle"),
+                            Err(reason) => tracing::warn!(reason, "crouch toggle refused"),
                         }
                     }
                     // The configurable one-shots, in priority order. A held button lands here
@@ -4902,12 +4915,13 @@ fn skills_report(state: &RobotState) -> proto::SkillsResult {
                 overridden: overridden.contains(&skill.name),
             })
             .collect(),
-        built_in: ["ground_pick", "sit_toggle"]
+        built_in: params::DAEMON_OWNED_SKILLS
             .into_iter()
             .filter(|name| {
                 names.skills.iter().all(|s| s != name)
                     && match *name {
                         "ground_pick" => names.ground_pick.is_some(),
+                        "crouch_toggle" => names.crouchstand.is_some(),
                         _ => names.sitstand.is_some(),
                     }
             })
@@ -5340,6 +5354,9 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     if policies.sitstand.is_some() {
         names.push("sit_toggle".to_owned());
     }
+    if policies.crouchstand.is_some() {
+        names.push("crouch_toggle".to_owned());
+    }
     names.extend(policies.skills.iter().cloned());
     names.extend(emotions.names().map(str::to_owned));
     names
@@ -5354,6 +5371,10 @@ fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
         }
         "sit_toggle" if policies.sitstand.is_some() => {
             intents.request_sit_toggle();
+            true
+        }
+        "crouch_toggle" if policies.crouchstand.is_some() => {
+            intents.request_crouch_toggle();
             true
         }
         name => match policies.skills.iter().position(|s| s == name) {
@@ -9415,9 +9436,11 @@ mod tests {
         assert!(result.enabled);
         assert_eq!(result.slots.len(), Slot::ALL.len());
         for slot in &result.slots {
-            // `stand` is the empty row by default — velstand stands on its own — and an
-            // empty slot has no file to have come from anywhere.
-            let expected = (slot.slot != "stand").then_some("official");
+            // `stand` is the empty row by default — velstand stands on its own — and so is
+            // `crouchstand`, which no set ships yet. An empty slot has no file to have come from
+            // anywhere.
+            let expected = !matches!(slot.slot.as_str(), "stand" | "crouchstand");
+            let expected = expected.then_some("official");
             assert_eq!(
                 slot.origin.as_deref(),
                 expected,

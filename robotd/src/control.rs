@@ -35,6 +35,13 @@
 //! A second: **one move at a time, and none from the seat** ([`Controller::move_blocked`]). The
 //! prototype let a pick preempt a kick's tail and a chaining skill roll out of a kick or the seat;
 //! here each is refused, and a seated robot accepts only standing up.
+//!
+//! **The crouch is the seat's twin, stricter** ([`Controller::crouch_toggle`]). The crouchstand
+//! network is trained on the sitstand contract — flag 1 squats, flag 0 rises — so it is driven the
+//! same way, with two differences. It starts with a short pause standing still, twist zeroed,
+//! because a robot asked to squat mid-stride fell over. And from the request until it is standing
+//! again the robot counts as busy: no skill, no ground pick, no sit, no emotion, no walking — only
+//! the toggle that stands it up.
 
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
@@ -99,6 +106,12 @@ pub struct SkillTuning {
     /// network is trained on. The shutdown sit waits this plus a second before easing into the
     /// rest pose.
     pub sitstand_ramp_s: f64,
+    /// Standing still before the crouch starts — see [`Crouch::Pausing`].
+    pub crouchstand_pause_s: f64,
+    /// How long the squat takes after the flag flips; standing up is refused until it is over.
+    pub crouchstand_ramp_s: f64,
+    /// How long the crouchstand network rises (flag 0) before the gait takes over.
+    pub crouchstand_rise_s: f64,
     /// The one-shot skills, in priority order — name, duration, whether holding chains, and
     /// what each changes about the robot while it runs. Config, resolved over the built-ins.
     pub skills: Vec<robotd_params::SkillDef>,
@@ -113,6 +126,9 @@ impl Default for SkillTuning {
             ground_pick_gain_ratio: 1.0,
             sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
             sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
+            crouchstand_pause_s: robotd_params::DEFAULT_CROUCHSTAND_PAUSE_S,
+            crouchstand_ramp_s: robotd_params::DEFAULT_CROUCHSTAND_RAMP_S,
+            crouchstand_rise_s: robotd_params::DEFAULT_CROUCHSTAND_RISE_S,
             skills: Vec::new(),
         }
     }
@@ -143,6 +159,23 @@ enum Sit {
     Sitting,
     /// The sitstand network rises (posture flag 0) for the remaining seconds, then the
     /// main policy takes over.
+    Rising {
+        remaining: f64,
+    },
+}
+
+/// Where the robot is in the crouch↔stand cycle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Crouch {
+    Up,
+    /// Asked to crouch: standing still, twist zeroed, for the remaining seconds before the
+    /// crouchstand network takes it down. A robot walking into a squat tipped over.
+    Pausing {
+        remaining: f64,
+    },
+    /// The crouchstand network squats and holds it (posture flag 1).
+    Down,
+    /// The crouchstand network rises (flag 0) for the remaining seconds, then the gait.
     Rising {
         remaining: f64,
     },
@@ -191,6 +224,8 @@ pub enum Driving {
     /// network can be swapped under without the robot noticing, which is why it is its own
     /// variant rather than a flag beside `SitStand`.
     Seated,
+    /// The crouchstand network, going down, holding the squat or rising.
+    CrouchStand,
     GroundPick,
     /// A one-shot skill, by its config name.
     Skill(String),
@@ -203,6 +238,7 @@ impl std::fmt::Display for Driving {
             Driving::Stand => f.write_str("stand"),
             Driving::SitStand => f.write_str("sitstand"),
             Driving::Seated => f.write_str("seated"),
+            Driving::CrouchStand => f.write_str("crouchstand"),
             Driving::GroundPick => f.write_str("ground_pick"),
             Driving::Skill(name) => f.write_str(name),
         }
@@ -239,6 +275,10 @@ pub struct Controller {
     sit_settle: f64,
     /// Stand up by itself once `sit_settle` runs out — [`Self::settle_then_rise`].
     auto_rise: bool,
+    crouch: Crouch,
+    /// Seconds left of the squat after the flag flipped. Standing up before it is over is one
+    /// move cut into another, as for the seat.
+    crouch_settle: f64,
     /// The network the last [`Self::step`] ran. `None` before the first.
     last_net: Option<Net>,
 }
@@ -256,6 +296,8 @@ impl Controller {
             sit: Sit::Up,
             sit_settle: 0.0,
             auto_rise: false,
+            crouch: Crouch::Up,
+            crouch_settle: 0.0,
             last_net: None,
         }
     }
@@ -267,6 +309,7 @@ impl Controller {
             Net::Stand => Driving::Stand,
             Net::SitStand if self.sit == Sit::Sitting => Driving::Seated,
             Net::SitStand => Driving::SitStand,
+            Net::CrouchStand => Driving::CrouchStand,
             Net::GroundPick => Driving::GroundPick,
             Net::Skill(index) => Driving::Skill(
                 self.skills
@@ -300,6 +343,8 @@ impl Controller {
         self.sit = from.sit;
         self.sit_settle = from.sit_settle;
         self.auto_rise = from.auto_rise;
+        self.crouch = from.crouch;
+        self.crouch_settle = from.crouch_settle;
         self.last_net = from.last_net;
     }
 
@@ -329,6 +374,10 @@ impl Controller {
         if matches!(self.sit, Sit::Rising { .. }) {
             self.sit = Sit::Up;
         }
+        // Unlike the seat, the squat is not kept: stopping the policy ramps the robot to its
+        // standing home pose, so it is up once that is done.
+        self.crouch = Crouch::Up;
+        self.crouch_settle = 0.0;
     }
 
     /// Forget everything about where the robot was: the seat, any move in flight, and the
@@ -342,6 +391,8 @@ impl Controller {
         self.sit = Sit::Up;
         self.sit_settle = 0.0;
         self.auto_rise = false;
+        self.crouch = Crouch::Up;
+        self.crouch_settle = 0.0;
     }
 
     /// Why a new move cannot start now, or `None` when it can.
@@ -356,11 +407,23 @@ impl Controller {
         if self.active.is_some() {
             return Some("a scripted move is already running");
         }
+        match self.crouch {
+            Crouch::Pausing { .. } | Crouch::Down => {
+                return Some("the robot is crouching — stand it up first");
+            }
+            Crouch::Rising { .. } => return Some("the robot is standing up"),
+            Crouch::Up => {}
+        }
         match self.sit {
             Sit::Sitting => Some("the robot is sitting — stand it up first"),
             Sit::Rising { .. } => Some("the robot is standing up"),
             Sit::Up => None,
         }
+    }
+
+    /// Anywhere in the crouch cycle, from the request until the rise has handed back.
+    pub fn is_crouching(&self) -> bool {
+        self.crouch != Crouch::Up
     }
 
     pub fn has_sitstand(&self) -> bool {
@@ -383,6 +446,9 @@ impl Controller {
         self.ground_pick.is_some()
             || self.active.is_some()
             || matches!(self.sit, Sit::Rising { .. })
+            // The whole crouch, held squat included: busy is what keeps the emotions, the fall
+            // reflex and a daemon restart off a robot that is not standing on its own.
+            || self.is_crouching()
     }
 
     /// Start a one-shot ground pick. Refused while any other move runs or the robot is
@@ -446,6 +512,9 @@ impl Controller {
     /// Sit if standing, stand if sitting. Refused while any other move runs, mid-rise as the
     /// prototype refuses it, and on the way down into the seat.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
+        if self.is_crouching() {
+            return Err("the robot is crouching — stand it up first");
+        }
         if self.ground_pick.is_some() {
             return Err("a ground pick is running");
         }
@@ -472,11 +541,47 @@ impl Controller {
         }
     }
 
+    /// Crouch if standing, stand if crouched. Refused while any other move runs or the robot is
+    /// sitting, during the pause and the way down, and mid-rise.
+    pub fn crouch_toggle(&mut self) -> Result<&'static str, &'static str> {
+        match self.crouch {
+            Crouch::Up => {
+                if !self.policy.has_crouchstand() {
+                    return Err("no crouchstand policy loaded");
+                }
+                if let Some(reason) = self.move_blocked() {
+                    return Err(reason);
+                }
+                self.crouch = if self.skills.crouchstand_pause_s > 0.0 {
+                    Crouch::Pausing {
+                        remaining: self.skills.crouchstand_pause_s,
+                    }
+                } else {
+                    self.crouch_settle = self.skills.crouchstand_ramp_s;
+                    Crouch::Down
+                };
+                Ok("crouch")
+            }
+            Crouch::Pausing { .. } => Err("about to crouch"),
+            Crouch::Down if self.crouch_settle > 0.0 => Err("still crouching down"),
+            Crouch::Down => {
+                self.crouch = Crouch::Rising {
+                    remaining: self.skills.crouchstand_rise_s,
+                };
+                Ok("stand")
+            }
+            Crouch::Rising { .. } => Err("already standing up"),
+        }
+    }
+
     /// Engage the sit for the shutdown sequence. The caller owns the timing (sit for a few
     /// seconds, then cut torque and power off); this just puts the sitstand network in
     /// charge with the posture flag at 1.
     pub fn begin_shutdown_sit(&mut self) {
         self.sit = Sit::Sitting;
+        // The sit takes over from wherever the crouch was; the two latches never both hold.
+        self.crouch = Crouch::Up;
+        self.crouch_settle = 0.0;
     }
 
     /// The robot was found sitting as torque came on: it is held where it is, and this is the seat
@@ -582,6 +687,14 @@ impl Controller {
         {
             self.sit = Sit::Up;
         }
+        match self.crouch {
+            Crouch::Pausing { remaining } if remaining <= 0.0 => {
+                self.crouch = Crouch::Down;
+                self.crouch_settle = self.skills.crouchstand_ramp_s;
+            }
+            Crouch::Rising { remaining } if remaining <= 0.0 => self.crouch = Crouch::Up,
+            _ => {}
+        }
         if self.auto_rise && self.sit == Sit::Sitting && self.sit_settle <= 0.0 {
             self.auto_rise = false;
             self.sit = Sit::Rising {
@@ -622,6 +735,28 @@ impl Controller {
                 ..Command::default()
             };
             (Net::GroundPick, c, "ground_pick".into())
+        } else if self.crouch != Crouch::Up {
+            // The sitstand contract: the flag rides the twist vx slot, head and body stay live.
+            // The sticks' twist never reaches the network — a crouched robot does not walk.
+            let mut c = *command;
+            match self.crouch {
+                Crouch::Pausing { .. } => {
+                    c.twist = [0.0; 3];
+                    if self.policy.will_stand(0.0) {
+                        (Net::Stand, c, "crouch_pause".into())
+                    } else {
+                        (Net::Walk, c, "crouch_pause".into())
+                    }
+                }
+                Crouch::Down => {
+                    c.twist = [1.0, 0.0, 0.0];
+                    (Net::CrouchStand, c, "crouch".into())
+                }
+                Crouch::Rising { .. } | Crouch::Up => {
+                    c.twist = [0.0; 3];
+                    (Net::CrouchStand, c, "crouch_rise".into())
+                }
+            }
         } else {
             let mut c = *command;
             match self.sit {
@@ -669,7 +804,7 @@ impl Controller {
         // standing network exists — which is how a kick window and the sitstand rise end up
         // at standing gain in the prototype, so they do here too.
         let standing_tuned = matches!(net, Net::Stand)
-            || (matches!(net, Net::Skill(_) | Net::SitStand)
+            || (matches!(net, Net::Skill(_) | Net::SitStand | Net::CrouchStand)
                 && self.policy.will_stand(effective.twist_magnitude()));
         let (scale, gain) = match net {
             // A skill's own overrides, falling back to the gait's — which is how a kick keeps
@@ -697,7 +832,7 @@ impl Controller {
                 self.skills.ground_pick_action_scale,
                 (self.tuning.gain as f64 * self.skills.ground_pick_gain_ratio).round() as u16,
             ),
-            Net::SitStand => (
+            Net::SitStand | Net::CrouchStand => (
                 // The prototype's `start_sit_toggle` pins the scale at 1.0 for the whole
                 // sit/rise cycle.
                 1.0,
@@ -754,6 +889,10 @@ impl Controller {
             *remaining -= dt;
         }
         self.sit_settle = (self.sit_settle - dt).max(0.0);
+        if let Crouch::Pausing { remaining } | Crouch::Rising { remaining } = &mut self.crouch {
+            *remaining -= dt;
+        }
+        self.crouch_settle = (self.crouch_settle - dt).max(0.0);
 
         Ok(Step {
             targets,
@@ -831,6 +970,12 @@ mod tests {
         assert_eq!(s.ground_pick_gain_ratio, 1.0);
         assert_eq!(s.sitstand_rise_s, 1.0);
         assert_eq!(s.sitstand_ramp_s, 2.0);
+        assert_eq!(s.crouchstand_pause_s, 0.5);
+        assert_eq!(
+            s.crouchstand_ramp_s, 1.0,
+            "feat/crouchstand's POSTURE_RAMP_S"
+        );
+        assert_eq!(s.crouchstand_rise_s, 1.0);
         // The one-shots' numbers live with the skills now — `robotd_params` owns the built-in
         // three and asserts their durations, and this struct simply carries the resolved list.
         assert!(
@@ -867,6 +1012,7 @@ mod tests {
             &duck_control::policy::PolicyPaths {
                 walk: net.clone(),
                 sitstand: Some(net.clone()),
+                crouchstand: Some(net.clone()),
                 ground_pick: Some(net.clone()),
                 skills: vec![net.clone(), net],
                 ..Default::default()
@@ -918,6 +1064,106 @@ mod tests {
         assert!(c.start_ground_pick().is_err(), "not while it rises");
         tick(&mut c, 1.1);
         assert_eq!(c.start_ground_pick(), Ok(()), "standing again, it may");
+    }
+
+    /// One tick driven by a stick pushed fully forward, returning which network ran.
+    fn step_walking(controller: &mut Controller) -> String {
+        let command = Command {
+            twist: [1.0, 0.0, 0.0],
+            ..Command::default()
+        };
+        controller
+            .step(
+                &duck_control::Sensors::default(),
+                &command,
+                false,
+                0.02,
+                1.0,
+            )
+            .unwrap()
+            .label
+            .into_owned()
+    }
+
+    /// **The crouch stands still first, then squats, and nothing else runs until it is up.** The
+    /// stick stays pushed throughout: the pause zeroes it, and the squat never sees it.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_crouch_pauses_squats_and_blocks_every_other_move_until_it_is_up() {
+        let mut c = full_controller();
+        assert_eq!(step_walking(&mut c), "walk");
+
+        assert_eq!(c.crouch_toggle(), Ok("crouch"));
+        assert_eq!(step_walking(&mut c), "crouch_pause", "standing still first");
+        assert!(c.busy() && c.is_crouching());
+        assert_eq!(c.crouch_toggle(), Err("about to crouch"));
+        for _ in 0..30 {
+            step_walking(&mut c);
+        }
+        assert_eq!(step_walking(&mut c), "crouch", "the squat after the pause");
+        assert_eq!(c.crouch_toggle(), Err("still crouching down"));
+
+        let blocked = "the robot is crouching — stand it up first";
+        assert_eq!(c.start_ground_pick(), Err(blocked));
+        assert_eq!(c.start_skill(0), Err(blocked));
+        assert_eq!(c.start_skill(1), Err(blocked), "no roll out of the squat");
+        assert_eq!(c.sit_toggle(), Err(blocked));
+
+        tick(&mut c, 1.1);
+        assert_eq!(step_walking(&mut c), "crouch", "held while nobody asks");
+        assert!(
+            c.busy(),
+            "a held squat is still busy: no emotion, no fall reflex"
+        );
+        assert_eq!(c.crouch_toggle(), Ok("stand"));
+        assert_eq!(step_walking(&mut c), "crouch_rise");
+        assert_eq!(c.start_ground_pick(), Err("the robot is standing up"));
+        tick(&mut c, 1.1);
+        assert!(!c.busy() && !c.is_crouching());
+        assert_eq!(step_walking(&mut c), "walk", "the gait has it back");
+    }
+
+    /// A seated robot cannot crouch, and a robot with no crouchstand policy says so.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn no_crouch_from_the_seat_nor_without_the_policy() {
+        let mut c = full_controller();
+        assert_eq!(c.sit_toggle(), Ok("sit"));
+        tick(&mut c, 3.0);
+        assert_eq!(
+            c.crouch_toggle(),
+            Err("the robot is sitting — stand it up first")
+        );
+
+        let net = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../duck-control/tests/fixtures/feedforward.onnx");
+        let policy = Policy::load(
+            &duck_control::policy::PolicyPaths {
+                walk: net,
+                ..Default::default()
+            },
+            0.05,
+        )
+        .unwrap();
+        let mut bare = Controller::new(policy, Tuning::default(), SkillTuning::default());
+        assert_eq!(bare.crouch_toggle(), Err("no crouchstand policy loaded"));
+    }
+
+    /// Stopping the policy ramps the robot to its standing home pose, so the squat is not kept the
+    /// way the seat is; the shutdown sit takes over from it.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_stop_or_a_shutdown_sit_ends_the_crouch() {
+        let mut c = full_controller();
+        assert_eq!(c.crouch_toggle(), Ok("crouch"));
+        tick(&mut c, 2.0);
+        c.stop_moves();
+        assert!(!c.is_crouching());
+
+        assert_eq!(c.crouch_toggle(), Ok("crouch"));
+        tick(&mut c, 2.0);
+        c.begin_shutdown_sit();
+        assert!(!c.is_crouching() && c.is_sitting());
     }
 
     /// The glide down into the seat is a move too: standing up halfway down is refused.

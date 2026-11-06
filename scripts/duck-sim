@@ -254,6 +254,7 @@ enabled = true
 walk = "$POLICIES/velstand.onnx"
 stand = "none"
 sitstand = "$POLICIES/alpha_sitstand.onnx"
+crouchstand = "none"
 ground_pick = "$POLICIES/alpha_ground_pick.onnx"
 kick_left = "$POLICIES/ball_kick_left.onnx"
 kick_right = "$POLICIES/ball_kick_right.onnx"

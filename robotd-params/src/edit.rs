@@ -329,6 +329,7 @@ impl Model {
             "policy.walk" => Some(policy.walk.display().to_string()),
             "policy.stand" => path(policy.stand),
             "policy.sitstand" => path(policy.sitstand),
+            "policy.crouchstand" => path(policy.crouchstand),
             "policy.ground_pick" => path(policy.ground_pick),
             "policy.kick_left" => path(policy.kick_left),
             "policy.kick_right" => path(policy.kick_right),

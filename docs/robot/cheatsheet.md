@@ -199,13 +199,14 @@ Two tables: the seven slots, then the skills — what runs by default, and what 
  * polite-bow        4 s  fffiloni/microduck-polite-bow-b1d864/main/policy.onnx
    ground_pick         —  driven by the robot itself
    sit_toggle          —  driven by the robot itself
+   crouch_toggle       —  driven by the robot itself
 ```
 
 A `*` marks every row config has an opinion about, with a count at the bottom. A slot you switched
 off says `switched off` rather than looking like one the robot never had. The directory comes off
 the path because the `ORIGIN` column already says which one it was.
 
-`ground_pick` and `sit_toggle` have no length because the robot drives them itself — they answer
+`ground_pick`, `sit_toggle` and `crouch_toggle` have no length because the robot drives them itself — they answer
 to `robot do` like the rest, but they are not entries you can change.
 
 #### A newer official set
@@ -327,7 +328,7 @@ robotctl pad bindings
 ```text
 a           sit_toggle
 b           ground_pick
-x             (nothing)
+x           crouch_toggle
 y           excited
 lb          yes
 rb          no
@@ -368,13 +369,29 @@ silently doing nothing when you press it.
 Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
 `pad reset <button>` puts one back. Three ship with emotions (see *Emotions*): LB yes, RB no, Y
-excited. X ships empty, so it is the place for a new skill; it re-sends while held, which is what a
-chaining skill like the roulade wants.
+excited. X crouches and stands (*Crouching*, below). Bound to something else, X re-sends while held,
+which is what a chaining skill like the roulade wants — but never `crouch_toggle`, `sit_toggle` or
+`ground_pick`, which a held button would set off again and again.
 
 The rest of the pad is not bindable: Start stands the robot up and toggles the policy, the D-pad
 picks what the sticks mean, and held Select cuts torque and powers the robot off — the button that stops a robot is the one worth not
 being able to lose to a config edit. A name is checked against what the robot actually has, so a
 typo is refused with the list rather than becoming a dead button.
+
+#### Crouching
+
+X squats the robot on its feet and stands it back up, with the `crouchstand` policy
+(`microduck_rl`, `feat/crouchstand`). No set ships one yet, so the slot is empty and X answers
+"not on this robot" until a file is put there:
+
+```
+sudo robotctl policy load crouchstand /path/to/crouchstand.onnx
+```
+
+The robot first stands still for half a second, sticks ignored — a robot asked to squat
+mid-stride fell over — then glides down in a second and holds the squat. From the press until it
+is standing again it does nothing else: no skill, no ground pick, no sit, no emotion, no walking.
+X again stands it up, once the squat is finished. Start or Select end it the usual way.
 
 #### Emotions
 
@@ -420,8 +437,8 @@ oddly and you are not sure what was left set.
 
 #### The slots, and four things worth knowing
 
-The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-`roulade`. `load` writes the choice into `/var/lib/robot/robotd.toml`, so it survives a reboot and
+The slots are `walk`, `stand`, `sitstand`, `crouchstand`, `ground_pick`, `kick_left`,
+`kick_right` and `roulade`. `load` writes the choice into `/var/lib/robot/robotd.toml`, so it survives a reboot and
 survives updates — a release replaces the binaries and the policies it ships, not the line that
 points elsewhere.
 
@@ -683,7 +700,7 @@ the thumb:
 | **B** / circle | ground pick |
 | **LB / RB** | the yes / no emotions |
 | **Y** | the excited emotion |
-| **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
+| **X** | crouch ↔ stand (`crouch_toggle`, see *Crouching*); rebind it with `robotctl pad bind x <skill>` |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |

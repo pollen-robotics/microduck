@@ -81,6 +81,8 @@ pub struct SkillRequests {
     /// Latched, and driven internally by the shutdown sit as well as by a button, which is why it
     /// is not one of the configurable one-shots either.
     pub sit_toggle: bool,
+    /// The crouch's latch, the sit's twin.
+    pub crouch_toggle: bool,
     /// The configurable one-shots, as a mask over the resolved skill list.
     ///
     /// A mask and not a queue for the same reason the whole set was one before: two buttons in
@@ -91,7 +93,7 @@ pub struct SkillRequests {
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.sit_toggle || self.skills != 0
+        self.ground_pick || self.sit_toggle || self.crouch_toggle || self.skills != 0
     }
 
     /// The indices requested, lowest first — which is priority order, since the skill list is
@@ -101,20 +103,21 @@ impl SkillRequests {
     }
 }
 
-// Bit positions for the two skills that are not in the configurable list.
+// Bit positions for the skills that are not in the configurable list.
 const SKILL_GROUND_PICK: u32 = 1 << 0;
 const SKILL_SIT_TOGGLE: u32 = 1 << 1;
+const SKILL_CROUCH_TOGGLE: u32 = 1 << 2;
 
 /// How many configurable one-shots a robot may have, bounded by the mask being a `u32`.
 ///
 /// Not a number anybody should reach: every skill's network is loaded and warmed at startup, so
-/// thirty of them is thirty ONNX sessions and thirty warm-up inferences before the first tick.
+/// twenty-nine of them is twenty-nine ONNX sessions and as many warm-up inferences before the first tick.
 /// The ceiling is here so that exceeding it is a refusal with a reason rather than a silently
 /// ignored button.
-pub const MAX_SKILLS: usize = 30;
+pub const MAX_SKILLS: usize = 29;
 
-/// Bits the two non-configurable skills occupy at the bottom of the mask.
-const SKILL_BITS: usize = 2;
+/// Bits the three non-configurable skills occupy at the bottom of the mask.
+const SKILL_BITS: usize = 3;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -350,6 +353,12 @@ impl Intents {
             .fetch_or(SKILL_SIT_TOGGLE, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Queue the crouch toggle, likewise.
+    pub fn request_crouch_toggle(&self) {
+        self.skills
+            .fetch_or(SKILL_CROUCH_TOGGLE, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Queue a configurable one-shot by its index in the resolved skill list.
     pub fn request_skill(&self, index: usize) {
         if index >= MAX_SKILLS {
@@ -384,6 +393,7 @@ impl Intents {
         SkillRequests {
             ground_pick: bits & SKILL_GROUND_PICK != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
+            crouch_toggle: bits & SKILL_CROUCH_TOGGLE != 0,
             skills: bits >> SKILL_BITS,
         }
     }

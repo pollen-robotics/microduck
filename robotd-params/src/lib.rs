@@ -385,8 +385,8 @@ impl Default for PadImuHeadControlParams {
 /// one binding worth not being able to lose.
 ///
 /// The defaults: A sits or stands, B picks up, the bumpers nod yes and shake no, Y is excited —
-/// three emotions (`robotd/src/emotion.rs`) — and X does nothing until somebody puts a skill there
-/// (the kicks are still in the set, unbound). An emotion whose files are missing is a skill the
+/// three emotions (`robotd/src/emotion.rs`) — and X crouches or stands (`crouch_toggle`, which does
+/// nothing on a robot with no `crouchstand` policy). The kicks are still in the set, unbound. An emotion whose files are missing is a skill the
 /// robot does not have, so its button does nothing. A named button is rebound; the rest stay as
 /// they were.
 ///
@@ -400,8 +400,9 @@ pub struct PadParams {
     pub a: String,
     /// B (East). The ground pick, by default.
     pub b: String,
-    /// X (West). Free by default. Held, it is re-sent every tick, so a chaining skill such as
-    /// the roulade keeps going for as long as it is held.
+    /// X (West). Crouch ↔ stand, by default. Held, a skill bound here is re-sent every tick, so a
+    /// chaining one such as the roulade keeps going for as long as it is held — except the
+    /// daemon's own toggles, which a held button would flip back and forth.
     pub x: String,
     /// Y (North). The excited emotion, by default.
     pub y: String,
@@ -418,7 +419,7 @@ impl Default for PadParams {
         Self {
             a: "sit_toggle".to_owned(),
             b: "ground_pick".to_owned(),
-            x: String::new(),
+            x: "crouch_toggle".to_owned(),
             y: "excited".to_owned(),
             lb: "yes".to_owned(),
             rb: "no".to_owned(),
@@ -1561,6 +1562,9 @@ pub struct PolicyParams {
     /// Commanded sit↔stand (posture flag in the twist `vx` slot). Sit toggle and the shutdown
     /// sit both need it.
     pub sitstand: Option<PathBuf>,
+    /// Commanded crouch↔stand, feet only (posture flag in the twist `vx` slot, as `sitstand`).
+    /// No set ships one yet, so it is empty unless set here; `crouch_toggle` needs it.
+    pub crouchstand: Option<PathBuf>,
     /// Phase-scripted ground pick. In roller mode this slot holds the crouch.
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
@@ -1979,7 +1983,7 @@ impl SetManifest {
 /// has its own arm of the control cascade, so a table entry answering to either name is
 /// unreachable: `robot.do` matches the built-in first, and the entry sits in the list being
 /// offered and never run.
-pub const DAEMON_OWNED_SKILLS: [&str; 2] = ["ground_pick", "sit_toggle"];
+pub const DAEMON_OWNED_SKILLS: [&str; 3] = ["ground_pick", "sit_toggle", "crouch_toggle"];
 
 /// The ground pick hands back at this fraction of its cycle when the set does not say — the
 /// prototype's cutoff. Ending at 100% replays the reach on the way out.
@@ -1990,6 +1994,15 @@ pub const DEFAULT_SITSTAND_RISE_S: f64 = 1.0;
 /// How long the seat takes after the flag flips, when the set does not say: the ~2 s glide the
 /// sit↔stand is trained on (`POSTURE_RAMP_S`).
 pub const DEFAULT_SITSTAND_RAMP_S: f64 = 2.0;
+/// How long a robot asked to crouch stands still first, twist zeroed, before the crouchstand
+/// network takes it down. Going straight from a walk into the squat tipped it over: the network is
+/// trained from a robot standing still, not one mid-stride.
+pub const DEFAULT_CROUCHSTAND_PAUSE_S: f64 = 0.5;
+/// How long the squat takes after the flag flips: the 1 s glide `feat/crouchstand` is trained on
+/// (`POSTURE_RAMP_S`). Standing up is refused until it is over.
+pub const DEFAULT_CROUCHSTAND_RAMP_S: f64 = 1.0;
+/// How long the crouchstand network rises (flag 0) before the gait takes over — the same ramp.
+pub const DEFAULT_CROUCHSTAND_RISE_S: f64 = 1.0;
 
 /// Read the installed set's manifest, if it has one.
 pub fn set_manifest() -> Option<SetManifest> {
@@ -2090,6 +2103,7 @@ pub enum Slot {
     Walk,
     Stand,
     SitStand,
+    CrouchStand,
     GroundPick,
     KickLeft,
     KickRight,
@@ -2098,10 +2112,11 @@ pub enum Slot {
 
 impl Slot {
     /// Every slot, in the order `[policy]` lists them and the order a report should print them.
-    pub const ALL: [Slot; 7] = [
+    pub const ALL: [Slot; 8] = [
         Slot::Walk,
         Slot::Stand,
         Slot::SitStand,
+        Slot::CrouchStand,
         Slot::GroundPick,
         Slot::KickLeft,
         Slot::KickRight,
@@ -2118,6 +2133,7 @@ impl Slot {
             Slot::Walk => "walk",
             Slot::Stand => "stand",
             Slot::SitStand => "sitstand",
+            Slot::CrouchStand => "crouchstand",
             Slot::GroundPick => "ground_pick",
             Slot::KickLeft => "kick_left",
             Slot::KickRight => "kick_right",
@@ -2163,6 +2179,7 @@ pub struct ResolvedPolicy {
     pub walk: PathBuf,
     pub stand: Option<PathBuf>,
     pub sitstand: Option<PathBuf>,
+    pub crouchstand: Option<PathBuf>,
     pub ground_pick: Option<PathBuf>,
     pub kick_left: Option<PathBuf>,
     pub kick_right: Option<PathBuf>,
@@ -2198,6 +2215,7 @@ impl ResolvedPolicy {
             Slot::Walk => Some(self.walk.as_path()),
             Slot::Stand => self.stand.as_deref(),
             Slot::SitStand => self.sitstand.as_deref(),
+            Slot::CrouchStand => self.crouchstand.as_deref(),
             Slot::GroundPick => self.ground_pick.as_deref(),
             Slot::KickLeft => self.kick_left.as_deref(),
             Slot::KickRight => self.kick_right.as_deref(),
@@ -2283,6 +2301,7 @@ impl PolicyParams {
             Slot::Walk => &self.walk,
             Slot::Stand => &self.stand,
             Slot::SitStand => &self.sitstand,
+            Slot::CrouchStand => &self.crouchstand,
             Slot::GroundPick => &self.ground_pick,
             Slot::KickLeft => &self.kick_left,
             Slot::KickRight => &self.kick_right,
@@ -2297,6 +2316,7 @@ impl PolicyParams {
             Slot::Walk => &mut self.walk,
             Slot::Stand => &mut self.stand,
             Slot::SitStand => &mut self.sitstand,
+            Slot::CrouchStand => &mut self.crouchstand,
             Slot::GroundPick => &mut self.ground_pick,
             Slot::KickLeft => &mut self.kick_left,
             Slot::KickRight => &mut self.kick_right,
@@ -2385,6 +2405,8 @@ impl PolicyParams {
                 .unwrap_or_else(|| PathBuf::from(POLICY_DIR).join(walk_default)),
             stand: path(&self.stand, stand),
             sitstand: path(&self.sitstand, sitstand),
+            // No set ships one: only a path someone wrote here.
+            crouchstand: path(&self.crouchstand, None),
             ground_pick: path(&self.ground_pick, ground_pick),
             kick_left: skill_file("kick_left"),
             kick_right: skill_file("kick_right"),
@@ -2503,6 +2525,7 @@ impl Default for PolicyParams {
             walk: None,
             stand: None,
             sitstand: None,
+            crouchstand: None,
             ground_pick: None,
             kick_left: None,
             kick_right: None,
@@ -3570,13 +3593,13 @@ mod tests {
         );
     }
 
-    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X is free.
+    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X crouches.
     #[test]
     fn the_default_bindings() {
         let pad = super::PadParams::default();
         assert_eq!(pad.a, "sit_toggle");
         assert_eq!(pad.b, "ground_pick");
-        assert_eq!(pad.x, "");
+        assert_eq!(pad.x, "crouch_toggle");
         assert_eq!(pad.y, "excited");
         assert_eq!(pad.lb, "yes");
         assert_eq!(pad.rb, "no");

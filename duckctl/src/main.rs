@@ -1360,7 +1360,8 @@ enum Policy {
     /// is not `obs[1,61] -> actions[1,14]` is refused before anything changes, and a load that
     /// fails anyway keeps the policy that was running.
     Load {
-        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        /// `walk`, `stand`, `sitstand`, `crouchstand`, `ground_pick`, `kick_left`, `kick_right`
+        /// or `roulade`.
         slot: String,
         /// Absolute path on the robot. Relative is refused: the daemon's working directory is
         /// not the caller's, and a path meaning one file to each would be worse than a refusal.

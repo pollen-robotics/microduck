@@ -344,11 +344,16 @@ impl Mapper {
         // notification, because fifty answered requests a second would spend their time waiting
         // on replies, and the press above already got the real answer.
         //
-        // Whatever X is bound to, nothing by default: a skill that does not chain simply refuses
-        // the resend, which costs a notification nobody reads. Only X, because it is the button
-        // the prototype held the roulade on.
+        // Whatever X is bound to: a skill that does not chain simply refuses the resend, which
+        // costs a notification nobody reads. Only X, because it is the button the prototype held
+        // the roulade on.
+        //
+        // **Not the daemon's own skills.** `crouch_toggle` (X's default) and `sit_toggle` are
+        // toggles, and the ground pick runs again on any request after its cycle: resent while
+        // held, a thumb left on X would crouch, stand and crouch again for as long as it stayed.
         let held = cfg.bindings.skill("x").unwrap_or_default();
-        if pad.held.contains(Buttons::X) && !pad.pressed.contains(Buttons::X) && !held.is_empty() {
+        let resends = !held.is_empty() && !robotd_params::DAEMON_OWNED_SKILLS.contains(&held);
+        if pad.held.contains(Buttons::X) && !pad.pressed.contains(Buttons::X) && resends {
             out.push(Out::Notify(proto::Call::RobotDo(proto::DoParams {
                 skill: held.to_owned(),
             })));
@@ -578,6 +583,45 @@ mod tests {
 
     fn cfg() -> Config {
         Config::defaults(false, &Default::default())
+    }
+
+    /// X held re-sends a chaining skill every tick, but never X's default, the crouch toggle: a
+    /// thumb left on X would crouch, stand and crouch again.
+    #[test]
+    fn x_held_resends_a_chaining_skill_but_not_the_crouch_toggle() {
+        let t = Instant::now();
+        let robot_do = |out: &[Out]| {
+            out.iter()
+                .filter_map(|o| match o {
+                    Out::Request(proto::Call::RobotDo(p)) => Some(format!("ask {}", p.skill)),
+                    Out::Notify(proto::Call::RobotDo(p)) => Some(format!("resend {}", p.skill)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let press = PadFrame {
+            pressed: Buttons::X,
+            held: Buttons::X,
+            ..Default::default()
+        };
+        let held = PadFrame {
+            held: Buttons::X,
+            ..Default::default()
+        };
+
+        for (bound, held_sends) in [
+            ("crouch_toggle", vec![]),
+            ("roulade", vec!["resend roulade"]),
+        ] {
+            let mut cfg = cfg();
+            cfg.bindings.x = bound.to_owned();
+            let (mut m, mut out, mut frame) = (Mapper::new(), Vec::new(), Vec::new());
+            m.tick(&press, &cfg, t, &mut out, &mut frame);
+            assert_eq!(robot_do(&out), [format!("ask {bound}")]);
+            m.tick(&held, &cfg, t, &mut out, &mut frame);
+            assert_eq!(robot_do(&out), held_sends, "{bound} held");
+        }
+        assert_eq!(cfg().bindings.x, "crouch_toggle", "X's default");
     }
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change

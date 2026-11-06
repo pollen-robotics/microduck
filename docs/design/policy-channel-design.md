@@ -43,7 +43,7 @@ already cover.
 
 ## 2. Three origins, one slot
 
-A slot — `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right`, `roulade` — is
+A slot — `walk`, `stand`, `sitstand`, `crouchstand`, `ground_pick`, `kick_left`, `kick_right`, `roulade` — is
 filled from exactly one of three origins:
 
 | | comes from | provenance | signed | auto-updates | reset target |

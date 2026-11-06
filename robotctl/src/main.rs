@@ -321,8 +321,8 @@ enum Namespace {
 
     /// Which `.onnx` runs in which slot — try a policy, and put it back.
     ///
-    /// Slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
-    /// `roulade`. Each one is a config key; `load` writes it and `reset` removes it, so a change
+    /// Slots are `walk`, `stand`, `sitstand`, `crouchstand`, `ground_pick`, `kick_left`,
+    /// `kick_right` and `roulade`. Each one is a config key; `load` writes it and `reset` removes it, so a change
     /// survives a reboot and undoing it is one command rather than an edit.
     ///
     /// The swap is live, without a restart and without going limp. Only a change to the network
@@ -1101,7 +1101,8 @@ enum PolicyCommand {
     /// directory you are in, and the file has to still be there at the next boot — a slot whose
     /// file has gone falls back to this robot's own policy and says so in `robotctl health`.
     Load {
-        /// `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` or `roulade`.
+        /// `walk`, `stand`, `sitstand`, `crouchstand`, `ground_pick`, `kick_left`, `kick_right`
+        /// or `roulade`.
         slot: String,
         /// A file on this robot, a Hub repo to fetch it from, or `none` to switch the slot off.
         ///

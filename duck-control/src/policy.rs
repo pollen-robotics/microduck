@@ -209,6 +209,9 @@ pub enum Net {
     Stand,
     /// Commanded sit↔stand: the twist `vx` slot carries a posture flag, 1 = sit, 0 = stand.
     SitStand,
+    /// Commanded crouch↔stand, feet only: the same contract as [`Net::SitStand`], with the
+    /// flag at 1 meaning a squat rather than a seat.
+    CrouchStand,
     /// Phase-scripted ground pick; the twist slots carry `[cos φ, sin φ, 0]`.
     GroundPick,
     /// A one-shot skill, by its index in [`PolicyPaths::skills`].
@@ -227,6 +230,7 @@ pub struct PolicyPaths {
     pub walk: PathBuf,
     pub stand: Option<PathBuf>,
     pub sitstand: Option<PathBuf>,
+    pub crouchstand: Option<PathBuf>,
     pub ground_pick: Option<PathBuf>,
     /// One-shot skills, in the priority order the caller wants them considered. Each is
     /// selected only by an explicit request, so an empty list is a robot with no tricks rather
@@ -243,6 +247,7 @@ pub struct Policy {
     walk: Network,
     stand: Option<Network>,
     sitstand: Option<Network>,
+    crouchstand: Option<Network>,
     ground_pick: Option<Network>,
     skills: Vec<Network>,
     standing_threshold: f64,
@@ -286,6 +291,7 @@ impl Policy {
                 walk: open_warm(&paths.walk, &zero)?,
                 stand: open_opt(&paths.stand, &zero)?,
                 sitstand: open_opt(&paths.sitstand, &zero)?,
+                crouchstand: open_opt(&paths.crouchstand, &zero)?,
                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
                 skills: paths
                     .skills
@@ -323,6 +329,10 @@ impl Policy {
         self.sitstand.is_some()
     }
 
+    pub fn has_crouchstand(&self) -> bool {
+        self.crouchstand.is_some()
+    }
+
     pub fn has_ground_pick(&self) -> bool {
         self.ground_pick.is_some()
     }
@@ -345,6 +355,7 @@ impl Policy {
         let net = match net {
             Net::Stand if self.stand.is_none() => Net::Walk,
             Net::SitStand if self.sitstand.is_none() => Net::Walk,
+            Net::CrouchStand if self.crouchstand.is_none() => Net::Walk,
             Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
             Net::Skill(i) if i >= self.skills.len() => Net::Walk,
             net => net,
@@ -354,6 +365,7 @@ impl Policy {
             Net::Walk => &mut self.walk,
             Net::Stand => self.stand.as_mut().unwrap(),
             Net::SitStand => self.sitstand.as_mut().unwrap(),
+            Net::CrouchStand => self.crouchstand.as_mut().unwrap(),
             Net::GroundPick => self.ground_pick.as_mut().unwrap(),
             Net::Skill(i) => &mut self.skills[i],
         };
@@ -383,6 +395,7 @@ impl Policy {
             Net::Walk => Some(&mut self.walk),
             Net::Stand => self.stand.as_mut(),
             Net::SitStand => self.sitstand.as_mut(),
+            Net::CrouchStand => self.crouchstand.as_mut(),
             Net::GroundPick => self.ground_pick.as_mut(),
             Net::Skill(i) => self.skills.get_mut(i),
         };
@@ -390,6 +403,7 @@ impl Policy {
             Net::Walk => Some(&from.walk),
             Net::Stand => from.stand.as_ref(),
             Net::SitStand => from.sitstand.as_ref(),
+            Net::CrouchStand => from.crouchstand.as_ref(),
             Net::GroundPick => from.ground_pick.as_ref(),
             Net::Skill(i) => from.skills.get(i),
         };
@@ -421,6 +435,7 @@ impl Policy {
             .stand
             .iter_mut()
             .chain(self.sitstand.iter_mut())
+            .chain(self.crouchstand.iter_mut())
             .chain(self.ground_pick.iter_mut())
             .chain(self.skills.iter_mut())
         {

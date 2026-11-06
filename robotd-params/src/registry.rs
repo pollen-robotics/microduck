@@ -192,6 +192,11 @@ pub const REGISTRY: &[Entry] = &[
         "Sit/stand policy; sit toggle and shutdown sit need it",
     ),
     entry(
+        "policy.crouchstand",
+        Kind::OptionalPath,
+        "Crouch/stand policy (feet only); crouch toggle needs it. Unset = none",
+    ),
+    entry(
         "policy.ground_pick",
         Kind::OptionalPath,
         "Ground-pick policy (roller: the crouch)",

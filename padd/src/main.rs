@@ -32,7 +32,7 @@
 //! B (East)        ground pick
 //! LB / RB        yes / no (emotions)
 //! Y (North)       excited (emotion)
-//! X (West)        nothing, until a skill is bound there
+//! X (West)        crouch ↔ stand (a robot with a crouchstand policy)
 //! RT / LT         mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! D-pad up        head mode — the sticks pose the head, the body holds still
 //! D-pad right     head + move — left stick walks and turns, right stick looks around

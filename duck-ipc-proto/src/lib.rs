@@ -2738,8 +2738,8 @@ pub struct ModeResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoadPolicyParams {
-    /// `"walk"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"kick_left"`, `"kick_right"` or
-    /// `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
+    /// `"walk"`, `"stand"`, `"sitstand"`, `"crouchstand"`, `"ground_pick"`, `"kick_left"`,
+    /// `"kick_right"` or `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
     /// does not have should be refused with the list of ones it does, not fail to parse.
     pub slot: Option<String>,
     /// The `.onnx` to run. Absolute — the daemon resolves nothing relative, because its working
