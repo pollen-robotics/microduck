@@ -1911,6 +1911,21 @@ fn slew(ema: &mut f64, target: f64, alpha: f64) {
     }
 }
 
+/// [`slew`], then at most `accel × dt` of change: the twist's per-axis acceleration limit
+/// (`[policy] accel_*`, resolved per mode). `None` is the bare EMA, unchanged.
+///
+/// After the EMA rather than instead of it, so a small stick move is exactly the EMA it always
+/// was: the EMA's rate is proportional to the jump, and only a large one — full forward to full
+/// back — reaches the slope and becomes a ramp.
+fn ramp(ema: &mut f64, target: f64, alpha: f64, accel: Option<f64>, dt: f64) {
+    let before = *ema;
+    slew(ema, target, alpha);
+    if let Some(accel) = accel {
+        let step = accel * dt;
+        *ema = before + (*ema - before).clamp(-step, step);
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -3355,8 +3370,12 @@ async fn control_loop<T: RobotIo>(
         if in_limp_fall {
             twist_ema = [0.0; 3];
         }
-        for (ema, target) in twist_ema.iter_mut().zip(twist_target) {
-            slew(ema, target, cmd_alpha);
+        for ((ema, target), accel) in twist_ema
+            .iter_mut()
+            .zip(twist_target)
+            .zip(policy_cfg.twist_accel)
+        {
+            ramp(ema, target, cmd_alpha, accel, period.as_secs_f64());
         }
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
             slew(ema, target, head_alpha);
@@ -3368,9 +3387,13 @@ async fn control_loop<T: RobotIo>(
         } else {
             body_ema = [0.0; 3];
         }
-        // Still: the policy has the robot, nothing asks it to move or is moving it, nobody has
-        // steered the head lately, and it is not singing (the chorale owns the head then).
-        let still = was_driving
+        // Still: the look-around is on in this mode, the policy has the robot, nothing asks it
+        // to move or is moving it, nobody has steered the head lately, and it is not singing (the
+        // chorale owns the head then). The mode is asked every tick because `robot.setMode`
+        // changes it under the loop — and the roller has it off by default, its network folding
+        // under a head command it was not trained with (`IdleParams::enabled_in`).
+        let still = params.idle.enabled_in(policy_cfg.mode)
+            && was_driving
             && !in_limp_fall
             && !pickup_paused
             && twist_target == [0.0; 3]
@@ -5785,12 +5808,6 @@ fn dispatch(
                 model_api: MODEL_API,
             },
         ),
-        // No media stack, so no session can be live. `mediad` owns the real answer
-        // (architecture.md §5.2); reporting `false` here is honest for now, and the updater
-        // treats unknown as false anyway.
-        proto::Call::RobotRemoteSessionActive => {
-            proto::Response::ok(Some(id), &proto::SessionActiveResult { active: false })
-        }
         proto::Call::Hello(_) => proto::Response::ok(
             Some(id),
             &proto::HelloResult {
@@ -6006,6 +6023,49 @@ mod mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full forward to full back on the roller's 1 m/s² limit: never faster than the slope, and
+    /// there in the 1.1 s that 1.1 m/s takes at it, plus the EMA's own tail for the last few
+    /// hundredths — where the bare EMA got there in a quarter of a second and the robot fell over.
+    #[test]
+    fn an_acceleration_limit_turns_a_reversal_into_a_ramp() {
+        let dt = 0.02;
+        let mut v = 0.6;
+        let mut ticks = 0;
+        while (v - -0.5f64).abs() > 1e-3 {
+            let before = v;
+            ramp(&mut v, -0.5, 0.2, Some(1.0), dt);
+            assert!((before - v) <= 1.0 * dt + 1e-12, "faster than the slope");
+            ticks += 1;
+            assert!(ticks < 500, "never got there");
+        }
+        let seconds = f64::from(ticks) * dt;
+        assert!((1.1..1.6).contains(&seconds), "{seconds} s");
+    }
+
+    /// Without a limit it is the EMA, bit for bit: walking must not move by a hair.
+    #[test]
+    fn without_a_limit_the_ramp_is_the_ema() {
+        let (mut a, mut b) = (0.6, 0.6);
+        for _ in 0..50 {
+            slew(&mut a, -0.5, 0.2);
+            ramp(&mut b, -0.5, 0.2, None, 0.02);
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// A small stick move stays the EMA under the limit, and a bad target is still dropped.
+    #[test]
+    fn the_limit_only_bites_on_a_large_jump() {
+        let (mut a, mut b) = (0.0, 0.0);
+        slew(&mut a, 0.05, 0.2);
+        ramp(&mut b, 0.05, 0.2, Some(1.0), 0.02);
+        assert_eq!(a, b, "0.01 m/s in a tick is under 0.02");
+
+        let mut v = 0.3;
+        ramp(&mut v, f64::INFINITY, 0.2, Some(1.0), 0.02);
+        assert_eq!(v, 0.3);
+    }
 
     /// A `RobotState` over a real config file, for the two calls that write one.
     fn state_over(text: &str) -> (tempfile::TempDir, Arc<RobotState>) {
@@ -6813,16 +6873,6 @@ mod tests {
                 .result_as()
                 .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
-
-        let session: proto::SessionActiveResult = dispatch(
-            &s,
-            &Intents::new(),
-            id(),
-            &proto::Call::RobotRemoteSessionActive,
-        )
-        .result_as()
-        .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
-        assert!(!session.active);
 
         let mode: proto::ModeResult = dispatch(&s, &Intents::new(), id(), &proto::Call::RobotMode)
             .result_as()
