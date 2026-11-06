@@ -121,6 +121,9 @@ jobs:
           sh -n hooks/postinstall
           shellcheck --shell=sh hooks/postinstall
 
+      - name: Test simulator shutdown identity
+        run: python3 scripts/tests/duck_sim_shutdown.py
+
       # `board-test.sh` separately, because it needs different flags and was excluded for it.
       #
       # It builds the container-side checks as one enormous single-quoted string, so two codes fire on
