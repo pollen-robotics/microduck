@@ -10,9 +10,11 @@ them runs at a time (see [what the robot does](#what-the-robot-does)).
 **It is a quick, unauthenticated LAN tool, made for one case: a pad driving a robot on a network you
 trust, with as little latency as possible.** Anyone on that network who can reach the port can
 drive the robot, stand it up, sit it down and power it off — see [trust](#trust). It is not the
-way to control a robot in general: that is WebRTC, which is authenticated and encrypted, carries a
-return path, and works from outside the LAN —
-[`../design/remote-webrtc.md`](../design/remote-webrtc.md).
+way to control a robot in general: that is WebRTC. Over the remote (rendezvous) path it is
+authenticated and encrypted, carries a return path, and works from outside the LAN —
+[`../design/remote-webrtc.md`](../design/remote-webrtc.md). Over the LAN it is not
+authenticated: anyone on the same network can reach the console and the camera, because the
+pairing PIN is shared and authenticates nobody (§4 there).
 
 Pairing a Bluetooth pad is a different thing, and it is
 [`pair-a-gamepad.md`](pair-a-gamepad.md).
