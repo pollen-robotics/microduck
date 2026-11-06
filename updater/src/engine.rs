@@ -1146,7 +1146,9 @@ impl Engine {
                 // Pruning is best-effort — the update has already succeeded — but a
                 // failure must be visible, or a robot slowly filling its eMMC looks
                 // perfectly healthy.
-                match store.prune(cfg.keep_previous, cfg.golden.as_ref()) {
+                // Unreadable, the journal costs only the preference for good releases.
+                let known_bad = self.journal.known_bad(component).unwrap_or_default();
+                match store.prune(cfg.keep_previous, cfg.golden.as_ref(), &known_bad) {
                     Ok(removed) if !removed.is_empty() => {
                         tracing::info!(?removed, "pruned old releases");
                         rec.say(format!(
