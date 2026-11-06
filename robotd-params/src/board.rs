@@ -31,24 +31,41 @@ pub enum Board {
     /// the IMX219 camera.
     #[default]
     Zero3,
-    /// The custom board's first spin: Seeed's RK3566 main board.
+    /// The custom board's first spin: Seeed's RK3566 main board, with its first face board (a
+    /// PCA9535 expander switching the face LEDs).
     Beta,
+    /// The beta's main board with the V1.0 face board: two Awinic LED drivers (AW21009, AW2023)
+    /// in place of the expander, and a button. Everything off the face board is the beta's, so
+    /// it answers like one wherever the main board decides ([`Board::is_beta_main_board`]).
+    #[serde(rename = "face-board-v1")]
+    FaceBoardV1,
 }
 
 /// Every board, in the order an editor cycles them — and the strings the file uses.
 ///
 /// [`tests::every_board_label_round_trips`] pins it to the enum in both directions.
-pub const BOARD_LABELS: &[&str] = &["zero3", "beta"];
+pub const BOARD_LABELS: &[&str] = &["zero3", "beta", "face-board-v1"];
 
 impl Board {
     /// The boards, in [`BOARD_LABELS`] order.
-    pub const ALL: [Board; 2] = [Board::Zero3, Board::Beta];
+    pub const ALL: [Board; 3] = [Board::Zero3, Board::Beta, Board::FaceBoardV1];
 
     /// The name this board has in the file.
     pub fn label(self) -> &'static str {
         match self {
             Board::Zero3 => "zero3",
             Board::Beta => "beta",
+            Board::FaceBoardV1 => "face-board-v1",
+        }
+    }
+
+    /// Whether this is Seeed's RK3566 main board, whichever face board it carries: the body IMU's
+    /// mount, the head IMU, the camera, the ToF and NFC on SPI, the SoC serial. Only the face
+    /// LEDs and the button tell the two apart, and those are read from the kernel, not from here.
+    pub fn is_beta_main_board(self) -> bool {
+        match self {
+            Board::Zero3 => false,
+            Board::Beta | Board::FaceBoardV1 => true,
         }
     }
 
@@ -60,6 +77,7 @@ impl Board {
         match self {
             Board::Zero3 => 1,
             Board::Beta => 2,
+            Board::FaceBoardV1 => 3,
         }
     }
 
@@ -70,7 +88,7 @@ impl Board {
     pub fn camera_sensor(self) -> crate::CameraSensor {
         match self {
             Board::Zero3 => crate::CameraSensor::Imx219,
-            Board::Beta => crate::CameraSensor::Gc2093,
+            Board::Beta | Board::FaceBoardV1 => crate::CameraSensor::Gc2093,
         }
     }
 
@@ -82,7 +100,7 @@ impl Board {
     pub fn camera_mount_degrees(self) -> u32 {
         match self {
             Board::Zero3 => 90,
-            Board::Beta => 0,
+            Board::Beta | Board::FaceBoardV1 => 0,
         }
     }
 
@@ -97,6 +115,7 @@ impl Board {
         match self {
             Board::Zero3 => None,
             Board::Beta => None,
+            Board::FaceBoardV1 => None,
         }
     }
 
@@ -104,14 +123,16 @@ impl Board {
     ///
     /// The strings are the boards' own: radxa's tree for the Zero 3W (`radxa,zero3w-aic8800ds2`
     /// on the image, `radxa,zero3` on Armbian), our device tree for the beta
-    /// (`pollen,microduck-beta`), and Seeed's factory image for the same board
-    /// (`seeed,microduck`).
+    /// (`pollen,microduck-beta`, and `pollen,microduck-face-board-v1` ahead of it on the V1.0
+    /// face board), and Seeed's factory image for the same board (`seeed,microduck`).
     pub fn detect(compatible: &[u8]) -> Option<Board> {
         compatible
             .split(|&b| b == 0)
             .filter_map(|s| std::str::from_utf8(s).ok())
             .find_map(|s| {
-                if s.starts_with("pollen,microduck") || s.starts_with("seeed,microduck") {
+                if s == "pollen,microduck-face-board-v1" {
+                    Some(Board::FaceBoardV1)
+                } else if s.starts_with("pollen,microduck") || s.starts_with("seeed,microduck") {
                     Some(Board::Beta)
                 } else if s.starts_with("radxa,zero3") || s.starts_with("radxa,zero-3") {
                     Some(Board::Zero3)
@@ -252,7 +273,7 @@ mod tests {
     fn the_release_after_a_board_is_last_leaves_it_behind() {
         let retired = |board| match board {
             Board::Zero3 => Some("0.21.0"),
-            Board::Beta => None,
+            Board::Beta | Board::FaceBoardV1 => None,
         };
         let at = |v: &str| min_hw_rev_given(&semver::Version::parse(v).unwrap(), retired);
         assert_eq!(at("0.20.3"), Some(1));
@@ -272,6 +293,7 @@ mod tests {
     fn each_board_mounts_its_camera_its_own_way() {
         assert_eq!(Board::Zero3.camera_mount_degrees(), 90);
         assert_eq!(Board::Beta.camera_mount_degrees(), 0);
+        assert_eq!(Board::FaceBoardV1.camera_mount_degrees(), 0);
         assert_eq!(Board::default().camera_mount_degrees(), 90);
     }
 
@@ -288,6 +310,11 @@ mod tests {
                 Some(Board::Beta),
             ),
             (b"seeed,microduck\0rockchip,rk3566\0", Some(Board::Beta)),
+            // The face board's DTS keeps the beta's string after its own; the first wins.
+            (
+                b"pollen,microduck-face-board-v1\0pollen,microduck-beta\0rockchip,rk3566\0",
+                Some(Board::FaceBoardV1),
+            ),
             (b"rockchip,rk3566\0", None),
             (b"", None),
         ];
@@ -313,6 +340,10 @@ mod tests {
             Some(Board::Beta)
         );
         assert_eq!(read("[board]\nversion = \"zero3\"\n"), Some(Board::Zero3));
+        assert_eq!(
+            read("[board]\nversion = \"face-board-v1\"\n"),
+            Some(Board::FaceBoardV1)
+        );
         assert_eq!(read("[bus]\nport = \"/dev/ttyS2\"\n"), None);
         assert_eq!(read("[board]\n# version = \"zero3\"\n"), None);
         assert_eq!(read("[board]\nversion = \"gamma\"\n"), None);

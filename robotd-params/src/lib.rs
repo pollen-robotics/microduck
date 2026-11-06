@@ -1349,18 +1349,16 @@ impl HeadImuParams {
     /// board's default — off for the BMI088 a `zero3` reads on the CPU, on for the `beta`'s
     /// self-fusing LSM6DSV16X.
     pub fn enabled_on(&self, board: board::Board) -> bool {
-        self.enabled.unwrap_or(match board {
-            board::Board::Zero3 => false,
-            board::Board::Beta => true,
-        })
+        self.enabled.unwrap_or(board.is_beta_main_board())
     }
 
     /// The daemon that reads the head IMU on `board`, and so the one to restart when this
     /// section changes.
     pub fn reader(board: board::Board) -> &'static str {
-        match board {
-            board::Board::Zero3 => "tofd",
-            board::Board::Beta => "robotd",
+        if board.is_beta_main_board() {
+            "robotd"
+        } else {
+            "tofd"
         }
     }
 }
@@ -1377,6 +1375,7 @@ mod head_imu_tests {
         let unset = HeadImuParams::default();
         assert!(!unset.enabled_on(Board::Zero3));
         assert!(unset.enabled_on(Board::Beta));
+        assert!(unset.enabled_on(Board::FaceBoardV1));
         let off = HeadImuParams {
             enabled: Some(false),
         };
@@ -1391,6 +1390,7 @@ mod head_imu_tests {
     fn each_board_names_the_daemon_that_reads_it() {
         assert_eq!(HeadImuParams::reader(Board::Zero3), "tofd");
         assert_eq!(HeadImuParams::reader(Board::Beta), "robotd");
+        assert_eq!(HeadImuParams::reader(Board::FaceBoardV1), "robotd");
     }
 }
 

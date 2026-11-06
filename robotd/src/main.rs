@@ -1594,7 +1594,9 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     use duck_control::imu::SflpDecoder;
     match board {
         robotd_params::board::Board::Zero3 => SflpDecoder::DEFAULT_MOUNT,
-        robotd_params::board::Board::Beta => SflpDecoder::BETA_MOUNT,
+        robotd_params::board::Board::Beta | robotd_params::board::Board::FaceBoardV1 => {
+            SflpDecoder::BETA_MOUNT
+        }
     }
 }
 
@@ -4490,9 +4492,8 @@ async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, Uni
 /// Only the `beta`'s is: on `zero3` the BMI088 is tofd's (it shares the HAT's bus with the ToF),
 /// and a subscriber here is told so rather than handed silence.
 fn start_head_imu(state: &Arc<RobotState>, params: &Params, no_hardware: bool) {
-    use robotd_params::board::Board;
     let board = params.board.version;
-    if board != Board::Beta {
+    if !board.is_beta_main_board() {
         state.head_imu.lost(format!(
             "on this board the head IMU is read by {}: subscribe to head_imu.stream on its socket",
             robotd_params::HeadImuParams::reader(board)
@@ -5828,12 +5829,6 @@ fn dispatch(
                 model_api: MODEL_API,
             },
         ),
-        // No media stack, so no session can be live. `mediad` owns the real answer
-        // (architecture.md §5.2); reporting `false` here is honest for now, and the updater
-        // treats unknown as false anyway.
-        proto::Call::RobotRemoteSessionActive => {
-            proto::Response::ok(Some(id), &proto::SessionActiveResult { active: false })
-        }
         proto::Call::Hello(_) => proto::Response::ok(
             Some(id),
             &proto::HelloResult {
@@ -6905,16 +6900,6 @@ mod tests {
                 .result_as()
                 .expect("robot.safeToRestart must deserialize as SafeToRestartResult");
         assert!(safe.safe);
-
-        let session: proto::SessionActiveResult = dispatch(
-            &s,
-            &Intents::new(),
-            id(),
-            &proto::Call::RobotRemoteSessionActive,
-        )
-        .result_as()
-        .expect("robot.remoteSessionActive must deserialize as SessionActiveResult");
-        assert!(!session.active);
 
         let mode: proto::ModeResult = dispatch(&s, &Intents::new(), id(), &proto::Call::RobotMode)
             .result_as()
