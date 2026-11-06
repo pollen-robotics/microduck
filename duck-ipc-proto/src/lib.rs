@@ -5865,9 +5865,27 @@ fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option
     Some(stats.consumers)
 }
 
-/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+/// What `mediad` published about its camera, or `None` — not running, or no camera.
+///
+/// Not aged: the file is only rewritten while frames arrive, so a camera that has stopped leaves
+/// its last rate behind. [`camera_stats_age`] is how a reader tells the two apart.
 pub fn read_camera_stats() -> Option<CameraStats> {
     serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
+/// How long ago `mediad` last rewrote [`CameraStats`], or `None` when there is no file.
+///
+/// Past [`CAMERA_STATS_MAX_AGE`] the camera has stopped delivering frames, whatever the file's
+/// `fps` says. A file from the future — a clock that stepped — reads as fresh.
+pub fn camera_stats_age() -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(camera_stats_path())
+        .and_then(|m| m.modified())
+        .ok()?;
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default(),
+    )
 }
 
 /// What `mediad`'s relay is doing with the rendezvous service, published for `robotctl` to read.
