@@ -1909,6 +1909,29 @@ fn ramp(ema: &mut f64, target: f64, alpha: f64, accel: Option<f64>, dt: f64) {
     }
 }
 
+/// Update the applied twist EMA, snapping to zero once a stopped target decays below
+/// the stillness threshold.
+///
+/// In binary64 arithmetic, `ema += alpha * (0 - ema)` multiplies by `(1 - alpha)` each
+/// tick and takes ~1,670 ticks (~33 s at 50 Hz) before underflowing to 0.0. Snapping
+/// to `[0.0; 3]` once all target components are zero and all EMA components have decayed
+/// below `1e-3` allows `robot.safeToRestart` to become true without waiting out the float
+/// underflow (#351).
+fn update_twist_ema(
+    twist_ema: &mut [f64; 3],
+    twist_target: [f64; 3],
+    twist_accel: [Option<f64>; 3],
+    cmd_alpha: f64,
+    dt: f64,
+) {
+    for ((ema, target), accel) in twist_ema.iter_mut().zip(twist_target).zip(twist_accel) {
+        ramp(ema, target, cmd_alpha, accel, dt);
+    }
+    if twist_target == [0.0; 3] && twist_ema.iter().all(|v| v.is_finite() && v.abs() < 1e-3) {
+        *twist_ema = [0.0; 3];
+    }
+}
+
 async fn adopt_startup_pose<T: RobotIo>(
     safety: &mut Safety<T>,
     state: &RobotState,
@@ -3389,13 +3412,13 @@ async fn control_loop<T: RobotIo>(
         if in_limp_fall {
             twist_ema = [0.0; 3];
         }
-        for ((ema, target), accel) in twist_ema
-            .iter_mut()
-            .zip(twist_target)
-            .zip(policy_cfg.twist_accel)
-        {
-            ramp(ema, target, cmd_alpha, accel, period.as_secs_f64());
-        }
+        update_twist_ema(
+            &mut twist_ema,
+            twist_target,
+            policy_cfg.twist_accel,
+            cmd_alpha,
+            period.as_secs_f64(),
+        );
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
             slew(ema, target, head_alpha);
         }
@@ -6086,6 +6109,39 @@ mod tests {
         let mut v = 0.3;
         ramp(&mut v, f64::INFINITY, 0.2, Some(1.0), 0.02);
         assert_eq!(v, 0.3);
+    }
+
+    /// A stopped twist snaps to zero once decayed below threshold rather than lingering for 33 s (#351).
+    #[test]
+    fn stopped_twist_snaps_to_zero_after_decay() {
+        let mut twist = [0.5, 0.2, 0.1];
+        let target = [0.0; 3];
+        let accel = [Some(1.0), Some(1.0), Some(1.0)];
+        let dt = 0.02; // 50 Hz
+        let cmd_alpha = 0.2;
+
+        let mut ticks = 0;
+        while twist != [0.0; 3] {
+            update_twist_ema(&mut twist, target, accel, cmd_alpha, dt);
+            ticks += 1;
+            assert!(
+                ticks < 100,
+                "twist must snap to zero within ~35 ticks, took {ticks}"
+            );
+        }
+
+        let seconds = f64::from(ticks) * dt;
+        assert!((0.5..1.0).contains(&seconds), "{seconds} s");
+        assert_eq!(twist, [0.0; 3]);
+    }
+
+    #[test]
+    fn small_nonzero_target_does_not_snap() {
+        let mut twist = [0.0; 3];
+        let target = [0.0005, 0.0, 0.0];
+        let accel = [None; 3];
+        update_twist_ema(&mut twist, target, accel, 0.2, 0.02);
+        assert!(twist[0] > 0.0, "nonzero target must not snap to zero");
     }
 
     /// A `RobotState` over a real config file, for the two calls that write one.
