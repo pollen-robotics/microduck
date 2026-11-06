@@ -537,6 +537,19 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+**Tripping it on purpose**, to tune `robotctl stress`'s falls: drive with the pad and, from ssh,
+
+```
+sudo robotctl robot trip 500                # hold both legs 500 ms mid-stride; --legs left|right for one foot
+```
+
+The policy keeps running through the trip, so it tries to recover, and a robot that goes over
+does it with the limp-fall live (`robotctl monitor` shows `limp`). Too short and it is caught;
+raise it until the fall is the one you want, then set `[stress] trip_ms` (and `trip_legs`) in
+`sudo robotctl configure` — a running stress test takes it at its next fall — or pin it for one run
+with `robotctl stress --trip-ms N`. Refused while the
+policy is off; never reachable over Bluetooth or WebRTC.
+
 `reboot-motors` is also reachable over Bluetooth, as `duckctl reboot-motors`
 ([`duckctl.md`](duckctl.md)) — `relax` is not.
 
@@ -665,7 +678,8 @@ sudo robotctl endurance stop
 
 Walks, stands and sits at random, for random lengths, within half a metre of where it started, until
 the battery is empty — and logs the charge, every thermal zone, the CPU clock and throttle, servo
-temperature and current, and odometry every 10 s. It starts in the background as the
+temperature, each servo's current (its mean over the 10 s and its peak, read on every control tick),
+and odometry every 10 s. It starts in the background as the
 `robotctl-endurance` unit and returns, so you can close the ssh session; `journalctl -u
 robotctl-endurance -f` is the live view. Put the robot on clear floor first, with no pad connected:
 an idle pad sends zero velocities that cancel these.
@@ -682,6 +696,78 @@ scp -r microduck@<duck>:/var/lib/endurance/ . && uv run scripts/endurance-plot.p
 `stop` leaves the robot standing. `--dry-run` logs without moving — the idle-drain baseline — and
 `--out` on an existing run directory appends to it, so a restarted test stays one battery curve.
 Walk speed, turn rate, the radius and the activity mix are options; `--help` lists them.
+
+### Falls and get-ups test
+
+```
+sudo robotctl stress
+robotctl stress status
+sudo robotctl stress stop
+```
+
+A violent test, the same on every robot so runs compare lap for lap: it walks, is made to fall,
+gets itself up, and does it again until the battery is empty. A fall is a trip: the legs held
+mid-stride for 500 ms (`[stress] trip_ms` / `trip_legs` in `robotctl configure`, re-read at every
+fall; `--trip-ms` / `--trip-legs` pin them for a run; tune with `robotctl robot trip`) while the
+policy keeps running, so it tries to recover and robotd's limp-fall catches it as it would a real
+stumble. `--fall cut` is the old fall, the policy off for `--cut` 0.5 s, which lands stiff. One
+lap (`stress-v1`, written into `meta.json`):
+
+| block | steps |
+| --- | --- |
+| A ×3 | 2 s forward → fall forward; 2 s back → fall back |
+| B | 3 s forward, 3 s back, 2 s turn left, 2 s turn right |
+| C ×3 | 3 s seated, 2 s standing |
+
+Every get-up is timed: up means not fallen for 1 s, seated upright counts (it is stood up after).
+Still down 7 s after the policy came back (`--getup-timeout`), the policy is cut for 2 s
+(`--reset`) and given one more 7 s; still down then, the run gives up, cuts torque and only logs —
+and calls for help, two quacks and a wheee every 15 s (`--call-every`, 0 for silence), so you hear
+it from the next room.
+It stays within ±0.5 m of where it started on odometry (`--square`; coarse, since falls drift it)
+and turns away from anything closer than 30 cm ahead on the head ToF (`--wall`); a wall between it
+and its start means odometry drifted the start behind it, and the start moves (`home_moved`).
+Before backing up it looks behind — body and head a quarter turn left, so the forward-only ToF faces
+the way it will back — and with a wall nearer than the backing up plus `--wall`, turns round to
+back away from it instead (`look_back`). A duck without
+the ToF logs `no_tof` once and runs on odometry alone. Run it in a pen, with no pad connected.
+Unlike `endurance`, `stop` (or ctrl-C in `--foreground`) turns the policy off, as the pad's Start
+does: the robot holds its home pose.
+
+`[stress] on_boot = true` (`sudo robotctl configure`) starts the default run once robotd is publishing state, from 10 s into every boot,
+for a robot left to repeat the test charge after charge; it takes effect at the next boot, and an
+update never starts a run.
+
+Any start waits for the network to set the clock, for as long as that takes, and nothing is
+written until then: the board has no battery-backed clock, and a run started without one gets
+another day's name and wall times nothing can correct. Where NTP is blocked, as Google's time
+servers are from mainland China, the `Date` headers of web servers set it after 20 s, once two
+agree. A robot that will not start and is doing nothing
+has no network; `journalctl -u robotctl-stress-boot` says so every 30 s.
+
+Runs live on the data partition, so a slot switch or an OS update leaves them in place. Each
+segment of `meta.json` records the revision, release, slot, OS, policy hashes, `robotd.toml` and
+clock source it ran on, and `[stress] note` (or `--note`) for what the logs cannot know, like a replaced part. Each
+later run saves the journal of the boots before it into their own runs, as
+`journal/<boot id>.txt`.
+
+```
+robotctl stress verify
+```
+
+checks that every run is whole — files there and readable, rows complete, time running forward —
+and exits non-zero if not. A run reopened after a power cut cuts the half-written row off its CSV
+and logs `repaired`.
+
+Same background unit, battery hand-off and files as `endurance`, under `/var/lib/robot/stress/` —
+`samples.csv` gains `lap` and `step`, and `events.csv` carries `lap_start`, `fall_triggered`,
+`fallen`, `no_fall`, `got_up` (seconds), `getup_failed`, `long_reset`, `gave_up`,
+`fallen_unprovoked`, `wall_guard`, `square_guard`, `home_moved`, `look_back`, `trip_refused` and `limp` (the
+limp-fall caught it; seconds after the trip). `scripts/endurance-plot.py` warns about anything
+`verify` would, leaves out rows that are not whole, and draws one run or compares
+several side by side, lap for lap; `--concatenate DIR` charts every run folder inside DIR as one
+run — back to back, the time between cut out, laps numbered on — into `DIR/concatenated/`. It writes each stress run a `report.pdf` to read or pass on; `currents.png` and a
+page of the report give each servo's mean current and highest peak.
 
 ### Gamepad (`configd`)
 

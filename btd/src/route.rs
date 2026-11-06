@@ -498,6 +498,9 @@ fn permits(call: &proto::Call) -> bool {
         // the hazard is "stops holding them for nothing in return".
         RobotRelax => false,
 
+        // A trip exists to make the robot fall. Same argument as `relax`, more so.
+        RobotTrip(_) => false,
+
         // `robot.stop` deserves its own line, because refusing it looks wrong. An emergency stop
         // in the app is exactly what someone reaches for, and §6 does say local should preempt
         // remote — but a stop button that works over an unbonded, high-latency, sometimes-absent

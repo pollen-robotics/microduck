@@ -821,6 +821,14 @@ install_units() {
   a release whose daemons cannot start will need robot-rescue by hand."
     fi
 
+    # `robotctl stress` at boot, for a robot whose `[stress] on_boot` is set — the oneshot reads
+    # the key and does nothing on every other robot. A timer for the reason above: enabled, not
+    # started, so neither provisioning nor an update starts a run. Its oneshot has no `[Install]`.
+    if [ -f "${UNIT_DIR}/robotctl-stress-boot.timer" ]; then
+        enable_at_boot robotctl-stress-boot.timer || warn "the stress boot timer did not enable;
+  [stress] on_boot will not start a run until it does."
+    fi
+
     # Anything the release ships that this script does not know how to start. Reported rather
     # than started blindly: a unit may be a template, or something another unit pulls in, and
     # guessing is how a robot ends up running a service nobody chose. Named, so adding a daemon
@@ -842,6 +850,8 @@ install_units() {
             robot-boot-check.timer) ;;
             # Started by its timer, never enabled. See above.
             robot-boot-check.service) ;;
+            # The same pair's shape: a timer enabled above, and the oneshot it starts.
+            robotctl-stress-boot.timer|robotctl-stress-boot.service) ;;
             *) warn "${unit} was installed but not enabled — this script does not know where
   it belongs in the start order. Add it to install_units, or start it by hand." ;;
         esac

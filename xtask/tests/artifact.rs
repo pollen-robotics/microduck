@@ -353,6 +353,33 @@ fn the_boot_recovery_net_is_packaged_whole() {
     }
 }
 
+/// `[stress] on_boot` arrives as a timer and its oneshot, and the oneshot must never be started by
+/// an install: with an `[Install]` section `hooks/postinstall` would `enable --now` it, and a robot
+/// opted in would start a stress run — falls on purpose — in the middle of an update.
+#[test]
+fn the_stress_boot_pair_is_packaged_and_only_a_boot_starts_it() {
+    for workflow in PACKAGING_SITES {
+        let entries = packaged_release(workflow);
+        for path in [
+            "systemd/robotctl-stress-boot.timer",
+            "systemd/robotctl-stress-boot.service",
+        ] {
+            assert!(
+                entries.contains_key(path),
+                "{workflow}'s artifact has no {path}"
+            );
+        }
+        let (_, oneshot) = &entries["systemd/robotctl-stress-boot.service"];
+        assert!(
+            !String::from_utf8_lossy(oneshot)
+                .lines()
+                .any(|l| l.starts_with("[Install]")),
+            "robotctl-stress-boot.service has an [Install] section, so an update would start a \
+             stress run rather than leaving it to the next boot"
+        );
+    }
+}
+
 /// Hooks must arrive executable, and `preinstall` must arrive at all.
 ///
 /// The engine spawns these directly; a hook without its executable bit fails the update, inside

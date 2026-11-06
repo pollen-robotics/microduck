@@ -191,6 +191,32 @@ enum LimpFall {
     },
 }
 
+/// A `robot.trip` in progress.
+///
+/// The policy is stepped as ever — it observes the joints not going where it sent them, which
+/// is what a caught foot looks like from inside — and only the held legs' targets are replaced.
+/// So `driving` stays true, the fall predictor stays armed, and if the robot goes over, the
+/// limp-fall catches it exactly as it would a real stumble.
+#[derive(Debug, Clone, Copy)]
+struct Trip {
+    until: Instant,
+    /// The targets commanded the tick before the trip.
+    held: [f64; NUM_JOINTS],
+    legs: proto::TripLegs,
+}
+
+impl Trip {
+    /// The policy's targets with the held legs put back where the trip caught them.
+    fn apply(&self, mut targets: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
+        for (i, name) in duck_control::model::JOINT_NAMES.iter().enumerate() {
+            if self.legs.holds(name) {
+                targets[i] = self.held[i];
+            }
+        }
+        targets
+    }
+}
+
 /// Watching a limping robot for the moment it stops moving.
 ///
 /// The end of the limp is read from the gyro rather than timed, because the falls are not
@@ -2464,6 +2490,8 @@ async fn control_loop<T: RobotIo>(
     let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
     let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
     let mut limp_fall = LimpFall::Idle;
+    // `robot.trip` in progress: the leg targets held, the policy still stepping. See [`Trip`].
+    let mut trip: Option<Trip> = None;
 
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
@@ -3775,6 +3803,38 @@ async fn control_loop<T: RobotIo>(
         }
         was_driving = driving;
 
+        // `robot.trip`: from this tick, the legs hold the targets they were last sent while the
+        // policy keeps stepping — a foot caught mid-stride. Only on a robot the walking or
+        // standing network is driving: a skill, a sit or a limp-fall owns its joints, and a trip
+        // there would break a move rather than test a fall.
+        if let Some(asked) = intents.take_trip() {
+            let free = driving
+                && policy_cfg.mode == Mode::Walk
+                && controller
+                    .as_ref()
+                    .is_some_and(|c| !c.busy() && !c.is_sitting());
+            if free {
+                tracing::warn!(
+                    ms = asked.ms,
+                    legs = asked.legs.as_str(),
+                    "robot.trip: legs held, the policy still running"
+                );
+                trip = Some(Trip {
+                    until: tick_start + Duration::from_millis(u64::from(asked.ms)),
+                    held: last_targets,
+                    legs: asked.legs,
+                });
+            } else {
+                tracing::warn!("robot.trip dropped: the walking policy does not have the robot");
+            }
+        }
+        if let Some(t) = &trip
+            && (!driving || tick_start >= t.until)
+        {
+            tracing::warn!(cut_short = !driving, "robot.trip: legs released");
+            trip = None;
+        }
+
         // Voltage adaptation: the servos' effective kP tracks their supply, so scaling the
         // action by (nominal / measured) holds the robot's response steady as the pack
         // sags. The EMA is clamped to a plausible band so a bad reading cannot become a
@@ -3843,7 +3903,10 @@ async fn control_loop<T: RobotIo>(
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
                     Ok(step) => (
-                        step.targets,
+                        match &trip {
+                            Some(t) => t.apply(step.targets),
+                            None => step.targets,
+                        },
                         step.gain,
                         // A scripted move is motion whatever the twist says; so is walking.
                         step.busy || command.twist_magnitude() > 0.0,
@@ -5794,6 +5857,40 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // A test instrument (`robotctl stress`, `robotctl robot trip`): hold the legs mid-stride
+        // so the robot falls with its own fall handling live. Refused while the policy is off,
+        // since a trip is something that happens to a robot the policy is driving; the loop
+        // also drops one that arrives while something else (a skill, a sit, a limp-fall) has
+        // the robot, and says so in the log.
+        proto::Call::RobotTrip(p) => {
+            if p.ms == 0 || p.ms > proto::TripParams::MAX_MS {
+                return proto::Response::err(
+                    Some(id),
+                    proto::Error::new(
+                        proto::code::INVALID_PARAMS,
+                        format!("ms must be 1 to {}", proto::TripParams::MAX_MS),
+                    ),
+                );
+            }
+            let result = if intents.enabled() {
+                intents.request_trip(*p);
+                proto::IntentResult {
+                    accepted: true,
+                    reason: Some(format!(
+                        "tripping: {} leg(s) held for {} ms",
+                        p.legs.as_str(),
+                        p.ms
+                    )),
+                }
+            } else {
+                proto::IntentResult {
+                    accepted: false,
+                    reason: Some("the policy is off; a trip needs a robot it is driving".into()),
+                }
+            };
+            proto::Response::ok(Some(id), &result)
+        }
+
         // Never refused: a robot with a tripped servo is exactly the one that needs it.
         proto::Call::RobotRebootMotors(p) => {
             intents.request_reboot_motors(p.ids.clone());
@@ -6425,6 +6522,30 @@ mod tests {
             .pose_target(now, over)
             .is_none()
         );
+    }
+
+    /// A trip holds exactly the legs it names, and leaves the head and mouth to the policy.
+    #[test]
+    fn a_trip_holds_only_the_legs_it_names() {
+        let held = [1.0; NUM_JOINTS];
+        let policy = [2.0; NUM_JOINTS];
+        for (legs, left, right) in [
+            (proto::TripLegs::Both, true, true),
+            (proto::TripLegs::Left, true, false),
+            (proto::TripLegs::Right, false, true),
+        ] {
+            let trip = Trip {
+                until: Instant::now(),
+                held,
+                legs,
+            };
+            let out = trip.apply(policy);
+            for (i, name) in duck_control::model::JOINT_NAMES.iter().enumerate() {
+                let want_held =
+                    (left && name.starts_with("left_")) || (right && name.starts_with("right_"));
+                assert_eq!(out[i], if want_held { 1.0 } else { 2.0 }, "{legs:?} {name}");
+            }
+        }
     }
 
     /// The landing detector. The limp ends when the robot has been still for the full hold,

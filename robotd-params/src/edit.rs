@@ -1182,7 +1182,11 @@ mod tests {
         for row in m.rows() {
             assert!(!row.overridden(), "{}", row.entry.key);
             // X, Y and the bumpers ship with no skill, and an empty binding is a button switched off.
-            if !matches!(row.entry.key, "pad.x" | "pad.y" | "pad.lb" | "pad.rb") {
+            // A robot has no stress note until somebody writes one.
+            if !matches!(
+                row.entry.key,
+                "pad.x" | "pad.y" | "pad.lb" | "pad.rb" | "stress.note"
+            ) {
                 assert!(!row.effective().is_empty(), "{}", row.entry.key);
             }
         }
@@ -1983,6 +1987,7 @@ mod tests {
                 "head_imu",
                 "audio",
                 "media",
+                "stress",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad",

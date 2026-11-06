@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib>=3.8", "numpy>=1.26", "pandas>=2.1"]
 # ///
-"""Charts and a summary for a run of `robotctl endurance`.
+"""Charts and a summary for a run of `robotctl endurance` or `robotctl stress`.
 
     uv run scripts/endurance-plot.py <run dir> [<run dir> ...]
 
@@ -14,14 +14,35 @@ Writes into each run directory:
     breakdown.png  the odometry track against the 0.5 m circle, time per activity, drain rate
                    and board temperature per activity
     summary.md     the numbers: runtime, peak temperatures, time throttled, drain per activity
+    currents.png   each servo's mean current over the run and its highest peak (when the run
+                   logged per-joint current)
 
-Given several runs it also writes `compare.png` beside the first, battery against time for each.
+For a stress run it also writes:
+
+    getup.png      every get-up's time against the lap it happened in
+    report.pdf     the same, to read or pass on: an overview (headline numbers, how each fall
+                   ended, get-up times), the per-lap table, the timeline, servo currents and every
+                   incident
+    summary.md     … plus a table per lap: falls, get-ups, failures, guards, battery, hottest servo
+
+`--concatenate DIR` treats every run directory inside DIR as one run, back to back in start
+order: the time between them (a charge, a reboot) is cut out, and laps are numbered on from the
+previous run's. The merged `samples.csv`, `events.csv` and `meta.json` are written to
+`DIR/concatenated/`, which is then charted like any run directory — and can be compared with
+others. Give it more than once to compare several concatenated series.
+
+Given several runs it also writes `compare.png` beside the first, battery against time for each —
+or, for stress runs, median get-up time and battery against lap number, one line per robot. Stress
+runs of different laps (`meta.json` `lap`) are not the same test and are refused together.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -32,6 +53,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.patches import Circle, Patch  # noqa: E402
+from matplotlib.ticker import MaxNLocator  # noqa: E402
 
 # Categorical slots in fixed order (one per activity, never cycled), plus neutrals.
 ACTIVITY_COLORS = {
@@ -69,15 +91,100 @@ plt.rcParams.update({
 })
 
 
+def read_rows(path: Path, **kwargs) -> pd.DataFrame:
+    """A run's CSV, keeping only rows with every column: `check_run` reports the others."""
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        rows = list(csv.reader(line.replace("\0", "") for line in f))
+    whole = io.StringIO()
+    csv.writer(whole, lineterminator="\n").writerows(r for r in rows if len(r) == len(rows[0]))
+    whole.seek(0)
+    return pd.read_csv(whole, **kwargs)
+
+
+def check_csv(run: Path, name: str, resumes: int | None) -> list[str]:
+    path = run / name
+    if not path.exists():
+        return [f"{name}: missing"]
+    raw = path.read_bytes()
+    if not raw:
+        return [f"{name}: empty"]
+    problems = []
+    if not raw.endswith(b"\n"):
+        problems.append(f"{name}: the last row is cut short")
+    text = raw.decode("utf-8", errors="replace")
+    if "\ufffd" in text or "\0" in text:
+        problems.append(f"{name}: holds bytes that are not text")
+    rows = list(csv.reader(io.StringIO(text.replace("\0", ""), newline="")))
+    header, body = rows[0], rows[1:]
+    whole = [r for r in body if len(r) == len(header)]
+    if len(whole) != len(body):
+        problems.append(f"{name}: {len(body) - len(whole)} rows do not have {len(header)} columns")
+
+    def steps_back(column: str) -> int:
+        if column not in header:
+            return 0
+        values = pd.to_numeric(pd.Series([r[header.index(column)] for r in whole]), errors="coerce").dropna()
+        return int((values.diff() < -1.0).sum())
+
+    if resumes is not None and steps_back("t_s") > resumes:
+        problems.append(f"{name}: the run's timer restarted {steps_back('t_s')} times, "
+                        f"with {resumes} resumes to explain it")
+    if steps_back("wall"):
+        problems.append(f"{name}: the wall clock goes backwards {steps_back('wall')} times")
+    return problems
+
+
+def check_run(run: Path) -> list[str]:
+    """What is wrong with a run, as `robotctl stress verify` would say it, printed as a warning."""
+    problems, resumes = [], None
+    if not (run / "meta.json").exists():
+        problems.append("meta.json: missing")
+    else:
+        try:
+            segments = json.loads((run / "meta.json").read_bytes()).get("segments") or []
+            resumes = max(len(segments) - 1, 0)
+            if not segments:
+                problems.append("meta.json: no segments")
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            problems.append(f"meta.json: unreadable: {e}")
+    problems += check_csv(run, "samples.csv", resumes) + check_csv(run, "events.csv", resumes)
+    for problem in problems:
+        print(f"{run}: warning: {problem}", file=sys.stderr)
+    return problems
+
+
 def load(run: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(run / "samples.csv")
-    # Wall clock, not `t_s`: a run resumed after a crash restarts `t_s` at zero.
-    df["h"] = (df["wall"] - df["wall"].iloc[0]) / 3600.0
+    df = read_rows(run / "samples.csv")
     ev_path = run / "events.csv"
-    ev = pd.read_csv(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "kind", "detail"])
-    if len(ev):
+    ev = read_rows(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+    if "t_s" in df and df["t_s"].notna().all() and (not len(ev) or ev["t_s"].notna().all()):
+        df["h"], ev["h"] = run_hours(df["t_s"], ev["t_s"])
+    else:
+        # A file from before `t_s` was logged: the wall clock is all there is.
+        df["h"] = (df["wall"] - df["wall"].iloc[0]) / 3600.0
         ev["h"] = (ev["wall"] - df["wall"].iloc[0]) / 3600.0
     return df, ev
+
+
+def run_hours(samples_t: pd.Series, events_t: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Hours of running, from the run's own timer (`t_s`), for samples and events alike.
+
+    Not the wall clock: a board with no battery-backed clock boots on the last time it saved and
+    jumps forward when it syncs, minutes to an hour into a run, and every jump was a stretch of
+    nothing on the timeline. `t_s` is monotonic, but restarts at zero for each piece of a run —
+    `--out` appending a resumed run, or each join of `--concatenate` — so the pieces, found where
+    `t_s` drops, are laid end to end. Rows are in the order they were written.
+    """
+    def piece(t: pd.Series) -> pd.Series:
+        return (t.diff() < -1.0).cumsum()
+
+    sp, ep = piece(samples_t), piece(events_t)
+    pieces = int(max(sp.max() if len(sp) else 0, ep.max() if len(ep) else 0)) + 1
+    ends = [max(samples_t[sp == k].max() if (sp == k).any() else 0.0,
+                events_t[ep == k].max() if (ep == k).any() else 0.0) for k in range(pieces)]
+    offsets = np.concatenate([[0.0], np.cumsum(ends)[:-1]])
+    return ((samples_t + offsets[sp.to_numpy()]) / 3600.0,
+            (events_t + offsets[ep.to_numpy()]) / 3600.0 if len(ep) else events_t.astype(float))
 
 
 def temp_columns(df: pd.DataFrame) -> list[str]:
@@ -136,7 +243,7 @@ def end_label(ax, x, y, text, color=INK_2) -> None:
                 fontsize=8, color=color)
 
 
-def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
+def timeline_figure(run: Path, df: pd.DataFrame, ev: pd.DataFrame):
     temps = temp_columns(df)
     has_motor = df.get("motor_max_c", pd.Series(dtype=float)).notna().any()
     has_current = df.get("motor_current_ma", pd.Series(dtype=float)).notna().any()
@@ -202,9 +309,14 @@ def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
 
     if "current" in ax_of:
         ax = ax_of["current"]
-        ax.plot(df["h"], df["motor_current_ma"] / 1000, color=SERIES[0], lw=1)
+        if df.get("motor_current_peak_ma", pd.Series(dtype=float)).notna().any():
+            ax.plot(df["h"], df["motor_current_peak_ma"] / 1000, color=SERIES[1], lw=0.8,
+                    alpha=0.7, label="peak")
+        ax.plot(df["h"], df["motor_current_ma"] / 1000, color=SERIES[0], lw=1, label="mean")
         ax.set_ylabel("A")
-        ax.set_title("Servo current, sum of |joint current|, mean over each sample")
+        ax.set_title("Servo current, sum of |joint current| over each sample")
+        if "motor_current_peak_ma" in df:
+            ax.legend(loc="upper left", ncol=2)
 
     for _, e in ev[ev["kind"].isin(["fence", "paused", "sit_refused", "rise_refused", "connection_lost"])].iterrows():
         axes[0].axvline(e["h"], color=INK_2, lw=0.6, ls=":")
@@ -220,8 +332,50 @@ def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
     fig.legend(handles=handles, loc="upper right", ncol=len(handles), bbox_to_anchor=(0.99, 0.995))
     fig.suptitle(run.name, x=0.01, ha="left", fontweight="bold", color=INK)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
+def timeline(run: Path, df: pd.DataFrame, ev: pd.DataFrame) -> None:
+    fig = timeline_figure(run, df, ev)
     fig.savefig(run / "timeline.png", dpi=130)
     plt.close(fig)
+
+
+def motor_currents(df: pd.DataFrame) -> pd.DataFrame:
+    """Per joint: mean current over the run, the highest peak, and when and doing what it hit.
+
+    Empty for a run logged before per-joint current (only `motor_current_ma`, the sum)."""
+    joints = [c.removesuffix("_current_peak_ma") for c in df.columns
+              if c.endswith("_current_peak_ma") and c != "motor_current_peak_ma"
+              and df[c].notna().any()]
+    rows = []
+    for j in joints:
+        peak = df[f"{j}_current_peak_ma"]
+        i = peak.idxmax()
+        rows.append({"joint": j, "mean_a": df[f"{j}_current_ma"].mean() / 1000,
+                     "peak_a": peak.max() / 1000, "peak_h": df.loc[i, "h"],
+                     "peak_activity": str(df.loc[i, "step"] if "step" in df and
+                                          not pd.isna(df.loc[i, "step"]) else df.loc[i, "activity"])})
+    return pd.DataFrame(rows, columns=["joint", "mean_a", "peak_a", "peak_h", "peak_activity"]
+                        ).set_index("joint")
+
+
+def currents_figure(run: Path, cur: pd.DataFrame, figsize=(10, 6)):
+    fig, ax = plt.subplots(figsize=figsize)
+    y = np.arange(len(cur))[::-1]
+    ax.barh(y, cur["peak_a"], color=SERIES[1], alpha=0.35, height=0.7, label="highest peak")
+    ax.barh(y, cur["mean_a"], color=SERIES[0], height=0.7, label="mean over the run")
+    for yi, (_, r) in zip(y, cur.iterrows()):
+        ax.annotate(f"{r['mean_a']:.2f} / {r['peak_a']:.2f} A", (r["peak_a"], yi), xytext=(4, 0),
+                    textcoords="offset points", va="center", fontsize=8, color=INK_2)
+    ax.set_yticks(y, [j.replace("_", " ") for j in cur.index])
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("A")
+    ax.set_xlim(0, cur["peak_a"].max() * 1.25)
+    ax.set_title(f"Servo current per joint — {run.name}")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig
 
 
 def drain_by_activity(df: pd.DataFrame) -> pd.DataFrame:
@@ -235,6 +389,10 @@ def drain_by_activity(df: pd.DataFrame) -> pd.DataFrame:
     d["dh"] = d["h"].diff().shift(-1)
     d["dp"] = -d["battery_pct"].diff().shift(-1)
     d["same"] = d["activity"] == d["activity"].shift(-1)
+    # A concatenated run's joins are a charge, not a drain: never pair samples across one.
+    if "session" in df:
+        session = df.loc[d.index, "session"]
+        d["same"] &= session == session.shift(-1)
     d = d[d["same"] & (d["dh"] > 0)]
     g = d.groupby("activity").agg(hours=("dh", "sum"), pct=("dp", "sum"))
     g["pct_per_h"] = g["pct"] / g["hours"]
@@ -350,6 +508,10 @@ def summary(run: Path, df: pd.DataFrame, ev: pd.DataFrame, drain: pd.DataFrame) 
         i = df["motor_max_c"].idxmax()
         lines.append(f"- Hottest servo: {df.loc[i, 'motor_max_c']:.0f} °C ({df.loc[i, 'motor_hottest']}) "
                      f"at {df.loc[i, 'h']:.2f} h")
+    if "motor_current_peak_ma" in df and df["motor_current_peak_ma"].notna().any():
+        i = df["motor_current_peak_ma"].idxmax()
+        lines.append(f"- Servo current, all joints: mean {df['motor_current_ma'].mean() / 1000:.2f} A, "
+                     f"peak {df.loc[i, 'motor_current_peak_ma'] / 1000:.2f} A at {df.loc[i, 'h']:.2f} h")
     if "odom_dist" in df and df["odom_dist"].notna().any():
         lines.append(f"- Odometry: max {df['odom_dist'].max():.2f} m from start, "
                      f"{(ev['kind'] == 'fence').sum()} fence trips")
@@ -363,6 +525,12 @@ def summary(run: Path, df: pd.DataFrame, ev: pd.DataFrame, drain: pd.DataFrame) 
         lines += ["", "Drain is read off robotd's percentage, which is linear in voltage between 6.6 V "
                       "and full — not in charge — so per-activity rates depend on where in the curve "
                       "each activity happened. Compare them within a run, not across chemistries."]
+    cur = motor_currents(df)
+    if len(cur):
+        lines += ["", "| joint | mean A | peak A | peak at | doing |", "|---|---:|---:|---:|---|"]
+        for j, r in cur.iterrows():
+            lines.append(f"| {j} | {r['mean_a']:.2f} | {r['peak_a']:.2f} | {r['peak_h']:.2f} h | {r['peak_activity']} |")
+        lines += ["", "Peaks are read off every control tick, means are of each sample's mean."]
     text = "\n".join(lines) + "\n"
     (run / "summary.md").write_text(text)
     return text
@@ -385,28 +553,450 @@ def compare(runs: list[tuple[Path, pd.DataFrame]], out: Path) -> None:
     plt.close(fig)
 
 
+# ── stress runs ─────────────────────────────────────────────────────────────────────────────
+
+# `limp` is robotd's limp-fall catching a fall (from `--fall trip`); a run made by cuts has none.
+LAP_COUNTS = ["fall_triggered", "no_fall", "got_up", "getup_failed", "long_reset", "gave_up",
+              "fallen_unprovoked", "square_guard", "wall_guard", "limp"]
+
+
+def read_meta(run: Path) -> dict:
+    path = run / "meta.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        # A run cut off before its meta.json reached the disk — a freeze or a power cut in its
+        # first seconds. Its samples are still data; it just has no settings or lap version.
+        print(f"{run}: meta.json is unreadable (cut off?); charting it without", file=sys.stderr)
+        return {}
+
+
+def lap_version(meta: dict) -> str | None:
+    """The lap a stress run ran, from its latest segment; None for an endurance run."""
+    segments = meta.get("segments") or [{}]
+    return segments[-1].get("lap")
+
+
+def mixed_laps(runs: list[Path]) -> str | None:
+    """Why these runs cannot be overlaid lap for lap, or None when they can."""
+    versions = {run: lap_version(read_meta(run)) for run in runs}
+    stress = {run: v for run, v in versions.items() if v}
+    if len(set(stress.values())) <= 1:
+        return None
+    first = next(iter(stress.values()))
+    odd = ", ".join(f"{run.name} ({v})" for run, v in stress.items() if v != first)
+    return f"not the same lap: the first stress run ran {first}, but {odd}"
+
+
+def getup_seconds(detail: str) -> float:
+    m = re.match(r"\s*([0-9.]+)", str(detail))
+    return float(m.group(1)) if m else float("nan")
+
+
+def stress_laps(df: pd.DataFrame, ev: pd.DataFrame) -> pd.DataFrame:
+    """One row per lap: what happened in it and what the battery and servos were at its end.
+    Empty for a run with no laps."""
+    if not len(ev) or not (ev["kind"] == "lap_start").any():
+        return pd.DataFrame()
+    ev = ev.sort_values("wall").copy()
+    ev["lap"] = (ev["kind"] == "lap_start").cumsum()
+    ev = ev[ev["lap"] > 0]
+    rows = []
+    for lap, e in ev.groupby("lap"):
+        row = {"lap": int(lap)}
+        for kind in LAP_COUNTS:
+            row["falls" if kind == "fall_triggered" else kind] = int((e["kind"] == kind).sum())
+        times = e.loc[e["kind"] == "got_up", "detail"].map(getup_seconds)
+        row["getup_median_s"] = times.median() if len(times) else float("nan")
+        row["getup_max_s"] = times.max() if len(times) else float("nan")
+        s = df[df["lap"] == lap] if "lap" in df else df.iloc[0:0]
+        b = s["battery_pct"].dropna() if "battery_pct" in s else pd.Series(dtype=float)
+        row["battery_pct"] = b.iloc[-1] if len(b) else float("nan")
+        m = s["motor_max_c"].dropna() if "motor_max_c" in s else pd.Series(dtype=float)
+        row["motor_max_c"] = m.max() if len(m) else float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("lap")
+
+
+def stress_summary(laps: pd.DataFrame, version: str) -> str:
+    def num(v, fmt):
+        return "–" if pd.isna(v) else format(v, fmt)
+
+    tot = laps.sum(numeric_only=True)
+    times = laps["getup_median_s"].dropna()
+    lines = [
+        "",
+        f"## Stress: {len(laps)} laps of {version}",
+        "",
+        f"- Falls provoked: **{int(tot['falls'])}**; no fall {int(tot['no_fall'])}, "
+        f"got up {int(tot['got_up'])}, after a reset {int(tot['long_reset'])}, "
+        f"gave up {int(tot['gave_up'])}; caught by the limp-fall {int(tot['limp'])}",
+        f"- Falls nobody asked for: {int(tot['fallen_unprovoked'])}; guards: square "
+        f"{int(tot['square_guard'])}, wall {int(tot['wall_guard'])}",
+    ]
+    if len(times):
+        lines.append(f"- Median get-up per lap: {times.iloc[0]:.2f} s on lap 1, "
+                     f"{times.iloc[-1]:.2f} s on the last")
+    lines += ["", "| lap | falls | no fall | got up | median s | max s | failed | gave up | "
+                  "square | wall | battery % | hottest servo °C |",
+              "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for lap, r in laps.iterrows():
+        n = {k: int(r[k]) for k in ["falls", "no_fall", "got_up", "getup_failed", "gave_up",
+                                    "square_guard", "wall_guard"]}
+        lines.append(
+            f"| {lap} | {n['falls']} | {n['no_fall']} | {n['got_up']} | "
+            f"{num(r['getup_median_s'], '.2f')} | {num(r['getup_max_s'], '.2f')} | "
+            f"{n['getup_failed']} | {n['gave_up']} | {n['square_guard']} | {n['wall_guard']} | "
+            f"{num(r['battery_pct'], '.0f')} | {num(r['motor_max_c'], '.0f')} |")
+    return "\n".join(lines) + "\n"
+
+
+def getup_chart(run: Path, ev: pd.DataFrame) -> None:
+    ev = ev.sort_values("wall").copy()
+    ev["lap"] = (ev["kind"] == "lap_start").cumsum()
+    up = ev[ev["kind"] == "got_up"]
+    fig, ax = plt.subplots(figsize=(10, 4))
+    reset = up["detail"].astype(str).str.contains("reset")
+    ax.scatter(up.loc[~reset, "lap"], up.loc[~reset, "detail"].map(getup_seconds),
+               s=14, color=SERIES[0], label="got up")
+    ax.scatter(up.loc[reset, "lap"], up.loc[reset, "detail"].map(getup_seconds),
+               s=22, color=CRITICAL, label="got up after the reset")
+    ax.set_xlabel("lap")
+    ax.set_ylabel("s")
+    ax.set_ylim(bottom=0)
+    ax.set_title("Get-up time, fall by fall")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(run / "getup.png", dpi=130)
+    plt.close(fig)
+
+
+def compare_laps(runs: list[tuple[Path, pd.DataFrame]], out: Path) -> None:
+    fig, (top, bottom) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    for i, (run, laps) in enumerate(runs[: len(SERIES)]):
+        top.plot(laps.index, laps["getup_median_s"], color=SERIES[i], label=run.name)
+        bottom.plot(laps.index, laps["battery_pct"], color=SERIES[i], label=run.name)
+    top.set_ylabel("s")
+    top.set_ylim(bottom=0)
+    top.set_title("Median get-up time per lap")
+    top.legend(loc="upper left")
+    bottom.set_ylabel("%")
+    bottom.set_ylim(0, 105)
+    bottom.set_xlabel("lap")
+    bottom.set_title("Battery at the end of each lap")
+    bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    plt.close(fig)
+
+
+OUTCOMES = {  # how a fall ended, in the order the bars stack; gray is not an outcome to count
+    "up": ("got up", SERIES[0]),
+    "up_after_reset": ("got up after the reset", SERIES[3]),
+    "gave_up": ("gave up", CRITICAL),
+    "no_fall": ("policy caught it", OTHER_COLOR),
+}
+# `session` is a join made by --concatenate: where one run ended and the next began.
+INCIDENTS = ["session", "getup_failed", "long_reset", "gave_up", "fallen_unprovoked", "odometry_jump",
+             "robotd_unreachable", "connection_lost", "no_tof", "enable_timeout", "rise_timeout",
+             "sit_timeout", "fatal", "signal", "stop"]
+A4 = (11.69, 8.27)
+
+
+def fall_outcomes(ev: pd.DataFrame) -> pd.DataFrame:
+    """One row per fall, provoked or not, with the lap it was in, how it ended and in how long."""
+    ev = ev.sort_values("wall")
+    lap, open_fall, rows = 0, None, []
+    for e in ev.itertuples():
+        if e.kind == "lap_start":
+            lap += 1
+        elif e.kind in ("fall_triggered", "fallen_unprovoked"):
+            open_fall = {"lap": lap, "h": e.h, "provoked": e.kind == "fall_triggered"}
+        elif open_fall and e.kind in ("got_up", "no_fall", "gave_up"):
+            reset = e.kind == "got_up" and "reset" in str(e.detail)
+            outcome = {"got_up": "up_after_reset" if reset else "up"}.get(e.kind, e.kind)
+            seconds = getup_seconds(e.detail) if e.kind == "got_up" else float("nan")
+            rows.append({**open_fall, "outcome": outcome, "seconds": seconds})
+            open_fall = None
+    return pd.DataFrame(rows, columns=["lap", "h", "provoked", "outcome", "seconds"])
+
+
+def _tile(ax, x, w, value, label, color=INK) -> None:
+    ax.add_patch(plt.Rectangle((x, 0.05), w, 0.9, transform=ax.transAxes, facecolor="white",
+                               edgecolor=GRID, linewidth=1))
+    ax.text(x + 0.012, 0.55, value, transform=ax.transAxes, fontsize=20, fontweight="bold",
+            color=color, va="center")
+    ax.text(x + 0.012, 0.2, label, transform=ax.transAxes, fontsize=8.5, color=INK_2, va="center")
+
+
+def _page(pdf, title: str, subtitle: str = ""):
+    fig = plt.figure(figsize=A4)
+    fig.text(0.04, 0.95, title, fontsize=16, fontweight="bold", color=INK, va="top")
+    if subtitle:
+        fig.text(0.04, 0.905, subtitle, fontsize=9.5, color=INK_2, va="top")
+    return fig
+
+
+def _table(ax, header: list[str], rows: list[list[str]], widths: list[float] | None = None,
+           left: int = 0) -> None:
+    """A table filling `ax` from the top; the first `left` columns are text, aligned left."""
+    ax.axis("off")
+    t = ax.table(cellText=rows, colLabels=header, loc="upper left", cellLoc="right",
+                 colLoc="right", colWidths=widths)
+    t.auto_set_font_size(False)
+    t.set_fontsize(8.5)
+    t.scale(1, 1.35)
+    for (r, c), cell in t.get_celld().items():
+        if c < left:
+            cell.get_text().set_horizontalalignment("left")
+            cell.PAD = 0.03
+        cell.set_edgecolor(GRID)
+        cell.set_linewidth(0.6)
+        if r == 0:
+            cell.set_text_props(fontweight="bold", color=INK)
+            cell.set_facecolor("#f1f0ec")
+        else:
+            cell.set_facecolor("white" if r % 2 else SURFACE)
+            cell.get_text().set_color(INK)
+
+
+def stress_report(run: Path, df: pd.DataFrame, ev: pd.DataFrame, laps: pd.DataFrame,
+                  meta: dict) -> Path:
+    """`report.pdf`: an overview page, the per-lap table, the timeline and the incident log."""
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    out = run / "report.pdf"
+    falls = fall_outcomes(ev)
+    provoked = falls[falls["provoked"]]
+    seg = (meta.get("segments") or [{}])[0]
+    minutes = (df["h"].iloc[-1] - df["h"].iloc[0]) * 60 if len(df) else 0
+    batt = df["battery_pct"].dropna() if "battery_pct" in df else pd.Series(dtype=float)
+    subtitle = "  ·  ".join(x for x in [
+        str(seg.get("host") or run.name), str(seg.get("started_utc") or ""),
+        f"lap {lap_version(meta) or '?'}", f"{len(laps)} laps", f"{minutes:.0f} min logged",
+        f"battery {batt.iloc[0]:.0f}% → {batt.iloc[-1]:.0f}%" if len(batt) else ""] if x)
+    count = lambda o, f=provoked: int((f["outcome"] == o).sum())  # noqa: E731
+    fell = len(provoked) - count("no_fall")
+    times = falls.loc[falls["outcome"] == "up", "seconds"]
+
+    with PdfPages(out) as pdf:
+        # 1 — overview
+        fig = _page(pdf, f"Stress test — {run.name}", subtitle)
+        tiles = fig.add_axes([0.04, 0.72, 0.92, 0.14])
+        tiles.axis("off")
+        w, gap = 0.155, 0.014
+        for i, (value, label, color) in enumerate([
+            (f"{len(provoked)}", "falls provoked", INK),
+            (f"{100 * fell / len(provoked):.0f}%" if len(provoked) else "–",
+             "of the cuts made it fall", INK),
+            (f"{times.median():.2f} s" if len(times) else "–", "median get-up (first try)", INK),
+            (f"{count('up_after_reset', falls)}", "needed the 2 s reset", INK),
+            (f"{count('gave_up', falls)}", "gave up", CRITICAL if count("gave_up", falls) else INK),
+            (f"{int((~falls['provoked']).sum())}", "falls nobody asked for", INK),
+        ]):
+            _tile(tiles, i * (w + gap), w, value, label, color)
+
+        bars = fig.add_axes([0.06, 0.16, 0.4, 0.46])
+        per_lap = (provoked.groupby(["lap", "outcome"]).size().unstack(fill_value=0)
+                   .reindex(columns=list(OUTCOMES), fill_value=0))
+        bottom = np.zeros(len(per_lap))
+        for key, (label, color) in OUTCOMES.items():
+            bars.bar(per_lap.index, per_lap[key], bottom=bottom, color=color, label=label,
+                     width=0.7, edgecolor=SURFACE, linewidth=2)
+            bottom += per_lap[key].to_numpy()
+        bars.set_title("How each provoked fall ended, lap by lap")
+        bars.set_xlabel("lap")
+        bars.set_ylabel("falls")
+        bars.xaxis.set_major_locator(MaxNLocator(integer=True))
+        bars.yaxis.set_major_locator(MaxNLocator(integer=True))
+        bars.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=4)
+
+        dots = fig.add_axes([0.55, 0.16, 0.41, 0.46])
+        for key in ["up", "up_after_reset"]:
+            f = falls[falls["outcome"] == key]
+            dots.scatter(f["lap"], f["seconds"], s=22, color=OUTCOMES[key][1],
+                         edgecolor=SURFACE, linewidth=1, label=OUTCOMES[key][0], zorder=3)
+        med = falls[falls["outcome"] == "up"].groupby("lap")["seconds"].median()
+        dots.plot(med.index, med.to_numpy(), color=INK_2, linewidth=1.5, label="median, first try")
+        dots.set_title("Get-up time, every fall")
+        dots.set_xlabel("lap")
+        dots.set_ylabel("seconds")
+        dots.set_ylim(bottom=0)
+        dots.xaxis.set_major_locator(MaxNLocator(integer=True))
+        dots.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=3)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 2 — per lap
+        fig = _page(pdf, "Lap by lap", "falls: provoked  ·  got up: every fall, provoked or "
+                    "not  ·  failed: still down at 7 s  ·  unasked: falls nobody provoked  ·  "
+                    "square, wall: guard trips")
+
+        def num(v, fmt):
+            return "–" if pd.isna(v) else format(v, fmt)
+
+        rows = [[str(lap), str(int(r["falls"])), str(int(r["no_fall"])), str(int(r["got_up"])),
+                 num(r["getup_median_s"], ".2f"), num(r["getup_max_s"], ".2f"),
+                 str(int(r["getup_failed"])), str(int(r["gave_up"])),
+                 str(int(r["fallen_unprovoked"])), str(int(r["square_guard"])),
+                 str(int(r["wall_guard"])), num(r["battery_pct"], ".0f"),
+                 num(r["motor_max_c"], ".0f")] for lap, r in laps.iterrows()]
+        header = ["lap", "falls", "no fall", "got up", "median s", "max s", "failed",
+                  "gave up", "unasked", "square", "wall", "battery %", "servo °C"]
+        for i in range(0, max(len(rows), 1), 28):
+            if i:
+                fig = _page(pdf, "Lap by lap (continued)")
+            _table(fig.add_axes([0.04, 0.05, 0.92, 0.82]), header, rows[i:i + 28])
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # 3 — timeline, drawn again rather than pasted from the PNG, so it stays sharp
+        fig = timeline_figure(run, df, ev)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # 4 — servo currents
+        cur = motor_currents(df)
+        if len(cur):
+            fig = currents_figure(run, cur, figsize=A4)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # 5 — incidents
+        ev = ev.sort_values("wall").copy()
+        ev["lap"] = (ev["kind"] == "lap_start").cumsum()
+        # `fillna` first: under pandas 3 `astype(str)` keeps NaN, and a run with no `activity`
+        # event at all would then have no strings for `.str` to work on.
+        steps = ev["detail"].where(ev["kind"] == "activity").fillna("").astype(str).str.split().str[-1]
+        ev["step"] = steps.ffill().fillna("")
+        inc = ev[ev["kind"].isin(INCIDENTS)]
+        rows = [[f"{(r.wall - ev['wall'].iloc[0]) / 60:.1f}", str(r.lap or ""), r.step, r.kind,
+                 str(r.detail)[:70] if not pd.isna(r.detail) else ""] for r in inc.itertuples()]
+        if not rows:
+            rows = [["", "", "", "nothing went wrong", ""]]
+        for i in range(0, len(rows), 30):
+            fig = _page(pdf, "Incidents" + (" (continued)" if i else ""),
+                        "" if i else "everything that was not the lap going to plan")
+            _table(fig.add_axes([0.04, 0.05, 0.92, 0.82]),
+                   ["min", "lap", "step", "event", "detail"], rows[i:i + 30],
+                   [0.06, 0.05, 0.12, 0.17, 0.6], left=5)
+            pdf.savefig(fig)
+            plt.close(fig)
+        d = pdf.infodict()
+        d["Title"] = f"Stress test — {run.name}"
+        d["Subject"] = subtitle
+    return out
+
+
+def concatenate(parent: Path) -> Path:
+    """Every run directory in `parent` as one run, written to `parent/concatenated/`.
+
+    Runs go in the order they started. Each one's clock is shifted to begin one sample interval
+    after the previous one's last sample, so the charts show time spent running, not the hours
+    on the charger between; a `session` event marks each join. A stress run's `lap` column is
+    renumbered on from the laps before it, so lap 1 of the second run is the lap after the first
+    run's last. `meta.json` carries every run's segments in order.
+    """
+    out = parent / "concatenated"
+    found = [d for d in parent.iterdir() if d.is_dir() and d != out and (d / "samples.csv").exists()]
+    for run in found:
+        check_run(run)
+    runs = sorted((d for d in found if (d / "samples.csv").stat().st_size),
+                  key=lambda d: read_rows(d / "samples.csv", usecols=["wall"])["wall"].min())
+    if not runs:
+        raise SystemExit(f"{parent}: no run directories (none holds a samples.csv)")
+    if why := mixed_laps(runs):
+        raise SystemExit(f"{parent}: {why}")
+    falls = {str(((read_meta(r).get("segments") or [{}])[-1].get("args") or {}).get("fall")) for r in runs}
+    if len(falls) > 1:
+        print(f"{parent}: warning: these runs made their falls differently ({', '.join(sorted(falls))}); "
+              "their get-ups are not one measurement", file=sys.stderr)
+
+    samples, events, segments = [], [], []
+    shift, laps_before = None, 0
+    end = None
+    for i, run in enumerate(runs):
+        df = read_rows(run / "samples.csv")
+        df["session"] = i
+        ev_path = run / "events.csv"
+        ev = read_rows(ev_path) if ev_path.exists() else pd.DataFrame(columns=["wall", "t_s", "kind", "detail"])
+        start = df["wall"].min()
+        step = df["wall"].diff().median() if len(df) > 1 else 10.0
+        shift = 0.0 if end is None else (end + (0 if pd.isna(step) else step)) - start
+        df["wall"] += shift
+        ev["wall"] = ev["wall"] + shift
+        if "lap" in df:
+            df["lap"] = df["lap"].where(df["lap"].isna() | (df["lap"] <= 0), df["lap"] + laps_before)
+        laps_before += int((ev["kind"] == "lap_start").sum())
+        # At t_s 0, which is also what tells `run_hours` a new piece of the run starts here.
+        join = pd.DataFrame([{"wall": df["wall"].min(), "t_s": 0, "kind": "session", "detail": run.name}])
+        events += [join, ev]
+        samples.append(df)
+        segments += (read_meta(run).get("segments") or [{}])
+        end = df["wall"].max()
+
+    out.mkdir(exist_ok=True)
+    pd.concat(samples, ignore_index=True).to_csv(out / "samples.csv", index=False)
+    # In written order, not sorted: `run_hours` finds each piece where `t_s` drops.
+    pd.concat(events, ignore_index=True).to_csv(out / "events.csv", index=False)
+    (out / "meta.json").write_text(json.dumps({"segments": segments, "concatenated": [r.name for r in runs]}, indent=2))
+    print(f"{parent}: {len(runs)} runs as one → {out}")
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("runs", nargs="+", type=Path, help="run directories written by robotctl endurance")
+    p.add_argument("runs", nargs="*", type=Path, help="run directories written by robotctl endurance or stress")
+    p.add_argument("--concatenate", action="append", type=Path, default=[], metavar="DIR",
+                   help="a directory of run directories, charted as one run (repeatable)")
     args = p.parse_args()
-    loaded = []
+    for run in args.runs:
+        check_run(run)
+    args.runs += [concatenate(d) for d in args.concatenate]
+    if not args.runs:
+        p.error("give run directories, --concatenate DIR, or both")
     for run in args.runs:
         if not (run / "samples.csv").exists():
             print(f"{run}: no samples.csv", file=sys.stderr)
             return 1
+    if why := mixed_laps(args.runs):
+        print(why, file=sys.stderr)
+        return 1
+    loaded, lapped = [], []
+    for run in args.runs:
         df, ev = load(run)
-        meta = json.loads((run / "meta.json").read_text()) if (run / "meta.json").exists() else {}
+        meta = read_meta(run)
         timeline(run, df, ev)
         drain = breakdown(run, df, ev, meta)
-        print(summary(run, df, ev, drain))
-        print(f"→ {run / 'timeline.png'}\n→ {run / 'breakdown.png'}\n→ {run / 'summary.md'}\n")
+        text = summary(run, df, ev, drain)
+        made = [run / "timeline.png", run / "breakdown.png"]
+        cur = motor_currents(df)
+        if len(cur):
+            fig = currents_figure(run, cur)
+            fig.savefig(run / "currents.png", dpi=130)
+            plt.close(fig)
+            made.append(run / "currents.png")
+        laps = stress_laps(df, ev)
+        if len(laps):
+            text += stress_summary(laps, lap_version(meta) or "?")
+            (run / "summary.md").write_text(text)
+            getup_chart(run, ev)
+            made += [run / "getup.png", stress_report(run, df, ev, laps, meta)]
+            lapped.append((run, laps))
+        print(text)
+        print("".join(f"→ {m}\n" for m in made + [run / "summary.md"]))
         loaded.append((run, df))
     if len(loaded) > 1:
         out = args.runs[0].parent / "compare.png"
-        compare(loaded, out)
+        if len(lapped) == len(loaded):
+            compare_laps(lapped, out)
+        else:
+            compare(loaded, out)
         print(f"→ {out}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

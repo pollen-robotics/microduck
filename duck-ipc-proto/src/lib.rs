@@ -522,7 +522,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
-pub const API_VERSION: u32 = 51;
+///
+/// # v52 — a trip, on purpose
+///
+/// [`method::ROBOT_TRIP`]: the leg targets held where they are for a few hundred milliseconds
+/// while the policy keeps running — a foot caught mid-stride — so a walking robot falls the way a
+/// real one does, recovery attempt, limp-fall and all ([`TripParams`]). For `robotctl stress` and
+/// for tuning it by hand. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
+pub const API_VERSION: u32 = 52;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -734,6 +741,13 @@ pub mod method {
     pub const ROBOT_STOP: &str = "robot.stop";
     /// Turn policy execution on or off.
     pub const ROBOT_ENABLE: &str = "robot.enable";
+    /// Trip the robot: hold the leg targets where they are for [`TripParams::ms`] while the
+    /// policy keeps running, as a foot caught mid-stride would. The policy sees its actions go
+    /// nowhere and tries to recover; if it cannot, the robot falls with `robotd`'s whole fall
+    /// handling live — the limp-fall included — unlike cutting the policy, which switches that
+    /// handling off for exactly the moment the robot goes down. Discrete; send as a request.
+    /// Refused while the policy is off.
+    pub const ROBOT_TRIP: &str = "robot.trip";
 
     // ── power to the joints ──────────────────────────────────────────────────
     //
@@ -1194,6 +1208,8 @@ pub enum Call {
     RobotLook(LookParams),
     RobotStop,
     RobotEnable(EnableParams),
+    /// Trip the robot mid-stride. See [`method::ROBOT_TRIP`].
+    RobotTrip(TripParams),
     /// Power the joints and ramp to the home pose. No policy needed.
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
@@ -1407,6 +1423,7 @@ impl Call {
             Call::RobotLook(_) => method::ROBOT_LOOK,
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
+            Call::RobotTrip(_) => method::ROBOT_TRIP,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
@@ -1629,6 +1646,7 @@ impl Call {
             | Call::RobotLook(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
+            | Call::RobotTrip(_)
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotRebootMotors(_)
@@ -1742,6 +1760,7 @@ impl Call {
             Call::RobotHead(p) => encode(p),
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
+            Call::RobotTrip(p) => encode(p),
             Call::RobotDo(p) => encode(p),
             Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
@@ -1847,6 +1866,7 @@ impl Call {
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
+            method::ROBOT_TRIP => Call::RobotTrip(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
@@ -2023,6 +2043,10 @@ pub mod test_support {
             Call::RobotEnable(EnableParams {
                 on: true,
                 toggle: false,
+            }),
+            Call::RobotTrip(TripParams {
+                ms: 250,
+                legs: TripLegs::Left,
             }),
             Call::RobotInit,
             Call::RobotRelax,
@@ -2659,6 +2683,52 @@ pub struct ThereminState {
 /// The five above are still the names a stock robot answers to. An unknown one is refused with
 /// the list it does know, which is the same shape as a bad policy slot.
 pub type Skill = String;
+
+/// A trip: which legs, and for how long. See [`method::ROBOT_TRIP`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TripParams {
+    /// How long the leg targets are held, ms. 1 to [`TripParams::MAX_MS`].
+    pub ms: u32,
+    /// Which legs are held. Both by default; one is a single foot caught.
+    #[serde(default)]
+    pub legs: TripLegs,
+}
+
+impl TripParams {
+    /// The longest trip `robotd` takes. Past a second it is not a trip, it is a robot standing on
+    /// frozen legs while its policy flails.
+    pub const MAX_MS: u32 = 1000;
+}
+
+/// Which legs a [`TripParams`] holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TripLegs {
+    #[default]
+    Both,
+    Left,
+    Right,
+}
+
+impl TripLegs {
+    /// Whether this trip holds the joint named `joint` ([`JOINT_NAMES`]).
+    pub fn holds(self, joint: &str) -> bool {
+        match self {
+            Self::Both => joint.starts_with("left_") || joint.starts_with("right_"),
+            Self::Left => joint.starts_with("left_"),
+            Self::Right => joint.starts_with("right_"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
 
 /// Which servos [`method::ROBOT_REBOOT_MOTORS`] reboots. Empty means every servo.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6217,7 +6287,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            78,
+            79,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

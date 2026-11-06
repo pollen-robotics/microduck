@@ -650,6 +650,31 @@ mode = "walk"
 # for a board fitted with another camera on purpose. Not something a normal robot sets.
 # sensor = "board"
 
+[stress]
+# Start `robotctl stress` at every boot: a fixed lap of walks cut mid-stride so the robot falls,
+# and sit/stands, until the battery is empty and robotd's own shutdown ends it. For a bench robot
+# left to repeat the test — charge it, switch it on, and the next run starts with nobody logged in.
+#
+# Read once per boot by `robotctl stress boot` (robotctl-stress-boot.timer), never mid-update, so
+# changing it starts or stops nothing now: `sudo robotctl stress` / `stop` for that. The run is
+# the default one, logging to /var/lib/robot/stress. It starts once the network has set the
+# clock (a time server, or web servers where NTP is blocked), however long that takes, so a robot
+# with no wifi waits rather than logging a run nobody can place in time. Off by default, and it should be: this makes the robot throw itself on the
+# floor because it was switched on.
+# on_boot = false
+#
+# How each provoked fall is made: the legs held mid-stride for `trip_ms` while the policy keeps
+# running (`robot.trip`), so it tries to recover and robotd's limp-fall catches the fall. 250 ms
+# was too often caught; 500 goes over. `trip_legs` is both, left or right — one foot caught. A
+# running test re-reads these at every fall, so they can be tuned without restarting it;
+# `robotctl stress --trip-ms` / `--trip-legs` override them for one run.
+# trip_ms = 500
+# trip_legs = "both"
+#
+# Kept with every run: what is true of this robot that the logs cannot know. Read when a run
+# starts; `robotctl stress --note` overrides it for one run.
+# note = "left hip part replaced 2026-11-03"
+
 # ── Controller-IMU head control ─────────────────────────────────────────────────────────────
 #
 # Read by `padd`, not by `robotd`. Some pads carry an inertial unit — the "Pro Controller" Switch

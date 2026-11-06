@@ -202,6 +202,9 @@ pub struct Params {
     pub chorale: ChoraleParams,
     pub idle: IdleParams,
     pub media: MediaParams,
+    /// `robotctl stress` on boot. Read by `robotctl stress boot`, which its timer runs once per
+    /// boot; nothing else reads it.
+    pub stress: StressParams,
     ///
     /// `[detect]` until 2026-09: in `robotctl configure` that read as "detect what?", one line
     /// from `chorale.accept`. Named for what it detects. The alias keeps a file written under the
@@ -995,6 +998,49 @@ impl DuckDetectorParams {
 /// `updater::policy::DETECTOR_FILES` download exactly this list, and a test in each place holds
 /// them together.
 pub const DETECTOR_FILES: [&str; 2] = ["duck_detect.rknn", "duck_detect.onnx"];
+
+/// `[stress]` — whether this robot starts `robotctl stress` by itself at boot.
+///
+/// For a bench robot left to run the stress test over and over: charge it, switch it on, and the
+/// run starts with no ssh session; it ends with the battery empty and `robotd`'s own shutdown,
+/// so the next charge-and-boot is the next run. The run is the default one — the test is the same
+/// on every robot (`docs/superpowers/specs/2026-10-27-stress-test-design.md`), so there is
+/// nothing here to tune it with.
+///
+/// `on_boot` is read by `robotctl stress boot`, which `robotctl-stress-boot.timer` runs once per
+/// boot and nothing runs mid-update. **Off by default**: a robot that starts throwing itself on the
+/// floor because it was switched on is a robot nobody should own by accident.
+///
+/// `trip_ms` and `trip_legs` are how a stress fall is made (`robot.trip`), re-read by a running
+/// test at every fall so they can be tuned mid-run. `robotctl stress --trip-ms` / `--trip-legs`
+/// override them for one run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StressParams {
+    /// Start a stress run at every boot.
+    pub on_boot: bool,
+    /// How long a provoked fall holds the legs, ms. 1 to [`duck_ipc_proto::TripParams::MAX_MS`].
+    pub trip_ms: u32,
+    /// Which legs it holds.
+    pub trip_legs: duck_ipc_proto::TripLegs,
+    /// What is true of this robot that the logs cannot know, kept with every run it does.
+    pub note: String,
+}
+
+impl Default for StressParams {
+    fn default() -> Self {
+        Self {
+            on_boot: false,
+            // 250 was caught by the policy too often to count as a fall; 500 goes over.
+            trip_ms: 500,
+            trip_legs: duck_ipc_proto::TripLegs::Both,
+            note: String::new(),
+        }
+    }
+}
+
+/// `[stress] trip_legs`'s choices, as serde spells them.
+pub const TRIP_LEGS_LABELS: &[&str] = &["both", "left", "right"];
 
 /// `[chorale]` — several ducks singing one piece.
 ///
@@ -2788,6 +2834,8 @@ pub enum ParamsError {
     },
     #[error("{path}: {reason}")]
     Netpad { path: String, reason: String },
+    #[error("{path}: [stress] trip_ms is {got}; a trip is 1 to {max} ms")]
+    TripMs { path: String, got: u32, max: u32 },
     #[error(
         "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
@@ -3000,6 +3048,16 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // robotd refuses a trip outside this range, so a file asking for one would make every
+        // stress fall a `trip_refused`. Caught by the editor instead.
+        let max = duck_ipc_proto::TripParams::MAX_MS;
+        if !(1..=max).contains(&self.stress.trip_ms) {
+            return Err(ParamsError::TripMs {
+                path: path.display().to_string(),
+                got: self.stress.trip_ms,
+                max,
             });
         }
         // Signed bounds, so a positive `_min` is somebody who wrote a magnitude: full stick
@@ -4038,6 +4096,24 @@ mod tests {
         let path = dir.join("robotd.toml");
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    /// robotd refuses a trip outside 1..=1000 ms, so the file must not be able to ask for one.
+    #[test]
+    fn a_stress_trip_out_of_range_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [0, 1001] {
+            let path = write(dir.path(), &format!("[stress]\ntrip_ms = {bad}\n"));
+            assert!(Params::load(&path, true).is_err(), "accepted {bad}");
+        }
+        let path = write(
+            dir.path(),
+            "[stress]\ntrip_ms = 1000\ntrip_legs = \"left\"\n",
+        );
+        let p = Params::load(&path, true).unwrap();
+        assert_eq!(p.stress.trip_ms, 1000);
+        assert_eq!(p.stress.trip_legs, duck_ipc_proto::TripLegs::Left);
+        assert_eq!(StressParams::default().trip_ms, 500);
     }
 
     /// The capture device is derived from the playback one, and the derivation must be

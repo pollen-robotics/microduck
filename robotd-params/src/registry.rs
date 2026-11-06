@@ -681,6 +681,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::MEDIA_SENSOR_LABELS),
         "Head camera sensor — board follows the declared board; naming one forces it",
     ),
+    // ── [stress] ─────────────────────────────────────────────────────────────
+    feature(
+        "stress.on_boot",
+        Kind::Bool,
+        "Start `robotctl stress` at every boot — falls on purpose until the battery is empty",
+    ),
+    entry(
+        "stress.trip_ms",
+        Kind::Integer,
+        "How long a stress fall holds the legs mid-stride, ms (1–1000) — longer falls more surely",
+    ),
+    entry(
+        "stress.trip_legs",
+        Kind::Choice(crate::TRIP_LEGS_LABELS),
+        "Which legs a stress fall holds — both, or one foot caught",
+    ),
+    entry(
+        "stress.note",
+        Kind::Text,
+        "Kept with every stress run: what the logs cannot know, like \"left hip part replaced\"",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
@@ -1376,6 +1397,7 @@ mod tests {
                 "audio.pet_detect",
                 "media.source",
                 "media.quality",
+                "stress.on_boot",
                 // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
                 "pad.a",

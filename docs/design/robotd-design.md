@@ -633,6 +633,17 @@ The tuning is the feature, and it is asymmetric: a false positive is a fall the 
 *caused*, which is worse than the stiff landing it was trying to avoid. The defaults sit
 deliberately on the late side.
 
+**Testing it needs a fall the policy is driving through**, which is what `robot.trip` (API v52)
+is for. Cutting the policy — the pad's Start mid-stride — does make a walking robot fall, but it
+makes `driving` false, which is the one condition the detector cannot fire without, and when the
+policy comes back the robot is already past the arming gate. Such a fall always lands stiff.
+`robot.trip { ms, legs }` instead holds the leg targets where they were last sent for `ms` (≤ 1 s)
+while the policy keeps stepping: it sees its actions go nowhere, as with a foot caught, tries to
+recover, and if it cannot the robot goes over with `driving` true and the detector armed. Only
+the walking and standing networks can be tripped; a trip that arrives while a skill, a sit or the
+limp-fall has the robot is dropped and logged. `robotctl robot trip MS` fires one by hand;
+`robotctl stress` makes its falls this way.
+
 #### 2.4.2 Being held is a fourth
 
 A policy has no idea its feet have left the floor. Picked up mid-walk, it keeps stepping, and the

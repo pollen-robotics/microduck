@@ -873,6 +873,7 @@ impl Server {
             | Call::RobotLook(_)
             | Call::RobotStop
             | Call::RobotEnable(_)
+            | Call::RobotTrip(_)
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotRebootMotors(_)

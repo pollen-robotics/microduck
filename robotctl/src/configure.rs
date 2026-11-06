@@ -157,11 +157,20 @@ fn apply_for(key: &str) -> Option<Apply> {
         // `updaterd` reads it at the moment it would revert, the way it reads `allow_community`;
         // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
         "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
+        // `robotctl stress boot` reads it once per boot, from its timer. Nothing running now
+        // reads it, so there is nothing to restart — and a running stress test is started and
+        // stopped by `robotctl stress`, not by this key.
+        "stress" if matches!(name, "on_boot" | "note") => Apply::NextBoot("robotctl-stress-boot"),
+        // A running stress test re-reads the trip at every fall — the next fall is the change.
+        "stress" => Apply::Live(STRESS_READER),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
     })
 }
+
+/// `[stress]`'s trip keys are read by a running `robotctl stress`, at every fall.
+const STRESS_READER: &str = "robotctl stress";
 
 /// What a set of written keys needs, with each daemon named once.
 ///
@@ -741,14 +750,19 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
                 plan.reload.join(" and ")
             );
         }
-        if !plan.live.is_empty() {
-            let names = plan.live.join(" and ");
-            let reads = if plan.live.len() == 1 {
-                "picks"
-            } else {
-                "pick"
-            };
+        // A running stress test is not a daemon watching the file: it reads the trip at each
+        // fall, which is "the next fall", not "within a second".
+        let (stress, daemons): (Vec<&str>, Vec<&str>) =
+            plan.live.iter().partition(|unit| **unit == STRESS_READER);
+        if !daemons.is_empty() {
+            let names = daemons.join(" and ");
+            let reads = if daemons.len() == 1 { "picks" } else { "pick" };
             println!("  {names} {reads} this up within a second — nothing to restart");
+        }
+        if !stress.is_empty() {
+            println!(
+                "  a running `robotctl stress` takes this at its next fall — nothing to restart"
+            );
         }
         if !plan.next_boot.is_empty() {
             println!(
@@ -1477,6 +1491,30 @@ mod tests {
         assert_eq!(plan.next_boot, vec!["robot-boot-check"]);
         assert!(plan.restart.is_empty(), "{plan:?}");
         assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// Switching the boot run on starts nothing now, and restarts nothing: the timer reads it.
+    #[test]
+    fn the_stress_boot_switch_waits_for_a_boot() {
+        let plan = plan_for_written(&["stress.on_boot".to_string()]);
+        assert_eq!(plan.next_boot, vec!["robotctl-stress-boot"]);
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// The trip is read at every fall by a running test: nothing to restart.
+    #[test]
+    fn the_stress_trip_applies_at_the_next_fall() {
+        let plan =
+            plan_for_written(&["stress.trip_ms".to_string(), "stress.trip_legs".to_string()]);
+        assert_eq!(plan.live, vec![STRESS_READER]);
+        assert!(plan.is_quiet(), "{plan:?}");
+    }
+
+    /// A note is read when a run starts, so a running test would not take it at a fall.
+    #[test]
+    fn the_stress_note_applies_at_the_next_boot() {
+        let plan = plan_for_written(&["stress.note".to_string()]);
+        assert!(plan.live.is_empty(), "{plan:?}");
     }
 
     /// Either half of the pad source restarted alone leaves the other on the old answer.

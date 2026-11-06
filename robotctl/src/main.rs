@@ -52,7 +52,9 @@ mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
+mod runlog;
 mod show;
+mod stress;
 mod vetbook;
 
 /// Exit codes. Stable — CI asserts on these.
@@ -453,6 +455,22 @@ enum Namespace {
         args: endurance::EnduranceArgs,
     },
 
+    /// Falls and get-ups until the battery is empty: a fixed lap of short walks cut mid-stride
+    /// by switching the policy off for half a second, a longer walk with two turns, and three
+    /// sit/stands — the same on every robot, so runs compare lap for lap.
+    ///
+    /// Every get-up is timed; a robot still down 7 s after the policy came back gets a 2 s cut
+    /// and one more try, then the run gives up and cuts torque. Stays in a 1 m square on
+    /// odometry and stops short of walls on the head ToF. Starts in the background like
+    /// `endurance`, logging to /var/lib/robot/stress. Needs root; no pad connected.
+    #[command(args_conflicts_with_subcommands = true)]
+    Stress {
+        #[command(subcommand)]
+        command: Option<stress::StressCommand>,
+        #[command(flatten)]
+        args: stress::StressArgs,
+    },
+
     /// Print a shell completion script on stdout.
     ///
     /// Generated from this binary's own command tree, so the completions a robot offers
@@ -587,6 +605,23 @@ enum RobotCommand {
         /// Let go without asking.
         #[arg(long)]
         yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Trip the robot mid-stride: hold its legs where they are for MS milliseconds while the
+    /// policy keeps running, as a caught foot would. **It is meant to make the robot fall.**
+    ///
+    /// Drive it with the pad and fire this from ssh to tune a fall by hand: too short and the
+    /// policy catches it, long enough and it goes over with robotd's own fall handling — the
+    /// limp-fall — live, which a cut policy (Start) switches off. `robotctl stress --trip-ms`
+    /// is what the stress test then uses. Refused while the policy is off.
+    Trip {
+        /// How long the legs are held, ms (1–1000).
+        ms: u32,
+        /// Which legs: both, or one foot caught.
+        #[arg(long, default_value = "both", value_parser = ["both", "left", "right"])]
+        legs: String,
         #[arg(long)]
         json: bool,
     },
@@ -3475,6 +3510,13 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             }),
             *json,
         ),
+        RobotCommand::Trip { ms, legs, json } => (
+            proto::Call::RobotTrip(proto::TripParams {
+                ms: *ms,
+                legs: trip_legs(legs),
+            }),
+            *json,
+        ),
         RobotCommand::RebootMotors { ids, json } => (
             proto::Call::RobotRebootMotors(proto::RebootMotorsParams { ids: ids.clone() }),
             *json,
@@ -3562,9 +3604,21 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
             println!("rebooting servos {ids:?}, torque off — then `robot init` or Start")
         }
         RobotCommand::Do { skill, .. } => println!("{skill:?} queued"),
+        RobotCommand::Trip { .. } => {
+            println!("{}", outcome.reason.as_deref().unwrap_or("tripping"))
+        }
         RobotCommand::Mode { .. } | RobotCommand::Look { .. } => unreachable!("answered above"),
     }
     Ok(())
+}
+
+/// `--legs`, as clap has already checked it.
+pub(crate) fn trip_legs(legs: &str) -> proto::TripLegs {
+    match legs {
+        "left" => proto::TripLegs::Left,
+        "right" => proto::TripLegs::Right,
+        _ => proto::TripLegs::Both,
+    }
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].
@@ -5410,6 +5464,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Endurance { command, args } => {
             return endurance::run(&cli.robot_socket, command, args);
+        }
+        Namespace::Stress { command, args } => {
+            return stress::run(&cli.robot_socket, &cli.tof_socket, command, args);
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);

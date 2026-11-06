@@ -833,6 +833,36 @@ fn frame_zone(frame: &proto::TofFrame, index: usize) -> tof_zone::Zone {
     tof_zone::Zone::Unusable(status)
 }
 
+/// A depth frame's zones through the head FK: which returns are floor, which are obstacles, and
+/// where each sits in the trunk frame. The joint indices are `JOINT_NAMES` order — neck_pitch,
+/// head_pitch, head_yaw, head_roll at 5..9. `robotctl stress` keeps off walls with the same
+/// reading.
+pub(crate) fn classify_tof(
+    tof: &proto::TofFrame,
+    state: &proto::RobotState,
+    reprojector: &kinematics::tof::Reprojector,
+) -> Option<[kinematics::tof::Zone; kinematics::tof::ROWS * kinematics::tof::COLS]> {
+    let head: Vec<f64> = (5..9)
+        .filter_map(|i| state.joints.get(i).copied())
+        .collect();
+    let head: [f64; 4] = head.try_into().ok()?;
+    let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
+    for (i, slot) in ranges.iter_mut().enumerate() {
+        if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
+            *slot = Some(f64::from(m));
+        }
+    }
+    // The trunk's own tilt and measured height, so a robot leaned by hand
+    // still calls the floor the floor. Odometry Z of zero means "no
+    // estimate" (an older robotd, or an unconverged IMU) — fall back to
+    // the model's rest height rather than believing the trunk is buried.
+    let posture = kinematics::tof::Posture {
+        gravity: state.safety.gravity,
+        trunk_height_m: (state.odom.position[2] > 0.02).then_some(state.odom.position[2]),
+    };
+    Some(reprojector.project(&ranges, head, &posture))
+}
+
 /// One cell: the distance coloured by range, or a mark for the two cases that
 /// have no distance.
 fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<'static> {
@@ -2525,27 +2555,7 @@ impl View {
     fn classified_tof(
         &self,
     ) -> Option<[kinematics::tof::Zone; kinematics::tof::ROWS * kinematics::tof::COLS]> {
-        let tof = self.tof.as_ref()?;
-        let state = self.latest.as_ref()?;
-        let head: Vec<f64> = (5..9)
-            .filter_map(|i| state.joints.get(i).copied())
-            .collect();
-        let head: [f64; 4] = head.try_into().ok()?;
-        let mut ranges = [None; kinematics::tof::ROWS * kinematics::tof::COLS];
-        for (i, slot) in ranges.iter_mut().enumerate() {
-            if let tof_zone::Zone::Range(m) = frame_zone(tof, i) {
-                *slot = Some(f64::from(m));
-            }
-        }
-        // The trunk's own tilt and measured height, so a robot leaned by hand
-        // still calls the floor the floor. Odometry Z of zero means "no
-        // estimate" (an older robotd, or an unconverged IMU) — fall back to
-        // the model's rest height rather than believing the trunk is buried.
-        let posture = kinematics::tof::Posture {
-            gravity: state.safety.gravity,
-            trunk_height_m: (state.odom.position[2] > 0.02).then_some(state.odom.position[2]),
-        };
-        Some(self.reprojector.project(&ranges, head, &posture))
+        classify_tof(self.tof.as_ref()?, self.latest.as_ref()?, &self.reprojector)
     }
 
     /// The depth frame as contact points for the 3D view: yellow for a thing,
