@@ -321,9 +321,12 @@ named in the journal and published as `null`. The guard's own settings are EEPRO
 arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
 with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
 draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
-Enable (67, RAM), off after every power-up and with it the whole guard, so the torque-on write
-sets it to what `bus.impact_guard` asks first, with the servo still limp; that one moment follows
-every way a servo can lose RAM (power-up, reboot, a latched error), each of which leaves it limp.
+Enable (67, RAM), off after every power-up and with it the whole guard, and off there writes no
+settings: the switch does it, so the toggle cannot leave stale settings behind. The torque-on write
+sets it to what `bus.impact_guard` asks first; that one moment follows every way a servo can lose
+RAM (power-up, reboot, a latched error), each of which leaves it limp, and a servo still stiff after
+a `robotd` restart takes the write too. New settings are written with torque off and left for the
+servo's next reboot to pick up: they rarely change, so nothing reboots a servo for them.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than

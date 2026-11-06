@@ -190,6 +190,15 @@ impl ImpactGuard {
         ..Self::DEFAULT
     };
 
+    /// Whether the startup check writes these settings to a servo on `firmware`. Never to one
+    /// with no guard, and [`Self::OFF`] never to V4: its switch already turns the guard off, and
+    /// a servo loads its settings only when it reboots, so OFF left in its EEPROM could be what
+    /// it runs after the guard is back on, unguarded behind a switch that says otherwise.
+    pub fn written_to(self, firmware: u8) -> bool {
+        IMPACT_GUARD_FIRMWARES.contains(&firmware)
+            && !(firmware == IMPACT_GUARD_ENABLE_FIRMWARE && self == Self::OFF)
+    }
+
     /// What V4's Impact Guard Enable should hold: 0, which is V2's behaviour, for [`Self::OFF`],
     /// and 1 for anything else.
     pub fn enable(self) -> u8 {
@@ -317,6 +326,16 @@ mod tests {
     fn only_off_turns_the_v4_switch_off() {
         assert_eq!(ImpactGuard::OFF.enable(), 0);
         assert_eq!(ImpactGuard::DEFAULT.enable(), 1);
+    }
+
+    /// V3 has no switch, so off is its settings; V4 is switched off and keeps its own.
+    #[test]
+    fn off_writes_settings_only_to_the_firmware_without_a_switch() {
+        assert!(ImpactGuard::OFF.written_to(3));
+        assert!(!ImpactGuard::OFF.written_to(IMPACT_GUARD_ENABLE_FIRMWARE));
+        assert!(ImpactGuard::DEFAULT.written_to(3));
+        assert!(ImpactGuard::DEFAULT.written_to(IMPACT_GUARD_ENABLE_FIRMWARE));
+        assert!(!ImpactGuard::DEFAULT.written_to(53));
     }
 
     #[test]

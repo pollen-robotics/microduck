@@ -27,8 +27,8 @@ use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
     BAUD_RATE, CURRENT_LIMIT_MA, EXPECTED_REGISTERS, FACTORY_BAUD_RATE, FACTORY_ID,
-    IMPACT_GUARD_ENABLE_FIRMWARE, IMPACT_GUARD_FIRMWARES, IMU_DXL_ID, ImpactGuard, JOINT_IDS,
-    JOINT_NAMES, NUM_JOINTS, homing_offset,
+    IMPACT_GUARD_ENABLE_FIRMWARE, IMU_DXL_ID, ImpactGuard, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
+    homing_offset,
 };
 
 /// Start of the contiguous block read every tick: `present_pwm`, `present_current`,
@@ -313,7 +313,7 @@ impl DynamixelIo {
         if firmware == IMPACT_GUARD_ENABLE_FIRMWARE {
             self.guard_switch.push(id);
         }
-        if IMPACT_GUARD_FIRMWARES.contains(&firmware) {
+        if self.impact_guard.written_to(firmware) {
             for (addr, want) in self.impact_guard.blocks() {
                 let got = self
                     .controller
@@ -547,8 +547,8 @@ impl DynamixelIo {
     /// **Torque on sets a V4 servo's guard switch first**, to what `bus.impact_guard` asks
     /// ([`ImpactGuard::enable`]). Its switch is off after every power-up and every start of its
     /// firmware, and whether a reboot, torque off or a latched error also clears it is unknown;
-    /// every one of those ends limp, so torque on is the one moment that covers them all, and the
-    /// servo's torque is still off when its switch is written. Written either way, because a
+    /// every one of those ends limp, so torque on is the one moment that covers them all. A servo
+    /// still stiff after a `robotd` restart takes the write too. Written either way, because a
     /// switch left on by an earlier run survives a `robotd` restart.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
         let mut failed = Vec::new();

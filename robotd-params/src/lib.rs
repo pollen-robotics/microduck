@@ -2554,8 +2554,9 @@ pub struct Bus {
     pub fast_sync_read: bool,
     /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
     /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
-    /// broken gear teeth. Off writes settings that never fire, which leaves the factory firmware
-    /// with only Current Limit: the comparison a test on robots needs. Written to every V3 and V4
+    /// broken gear teeth. Off leaves the factory firmware with only Current Limit, the comparison
+    /// a test on robots needs: settings that never fire on V3, the switch on V4, which keeps the
+    /// settings it has. Written to every V3 and V4
     /// servo at startup with torque off, and V4's Impact Guard Enable follows this with every
     /// torque on; servos on any other firmware have no guard to set. On writes
     /// the six `impact_guard_*` settings below. Their defaults are what a microduck walks with:

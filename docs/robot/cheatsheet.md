@@ -121,8 +121,10 @@ compare the two on the same robot. On writes the six `bus.impact_guard_*` rows b
 default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
 V Fast (rad/s) and PWM Fast (%). Changing them is how to look for another guard; a start on
 anything but the defaults names them in the journal. They are written when `robotd` starts
-with torque off, so restart it with the robot limp, and `impact_guard` staying at 0 in the
-recording is what off looks like.
+with torque off, so relax, restart it, then run `robot reboot-motors`: count on a change only
+after that reboot. On V4 the on/off switch needs none of this: it follows `bus.impact_guard` at the
+first Start after a restart, relaxed or not, and off leaves the six settings as they are.
+`impact_guard` staying at 0 in the recording is what off looks like.
 
 The levels a robot test steps through, gentlest first (V Min rad/s, Brake Time ms, Deceleration
 rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
