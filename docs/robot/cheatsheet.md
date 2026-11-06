@@ -313,6 +313,15 @@ an all-zero command and being selected *is* the trigger. A policy that reads its
 something else — flamingo's is `[flag, side, 0]` — needs it spelled out, and its README says
 what the slots mean.
 
+`--dry-run` runs every check `add` does, prints the entry it would write (name, resolved
+`repo@revision:file` and sha, kind, encoding, duration, unwind, commands, action_scale, and
+whether it would override a skill this robot already ships), and writes nothing. A Hub fetch is
+still cached; the skill is not registered.
+
+```
+sudo robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864 --dry-run
+```
+
 `sudo robotctl policy remove <name>` takes one out. A skill this robot's release ships comes back
 when you do, since removing the entry only removes the override.
 
