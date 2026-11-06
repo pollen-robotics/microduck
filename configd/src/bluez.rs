@@ -430,6 +430,11 @@ struct Snapshot {
     icon: Option<String>,
     class: Option<u32>,
     appearance: Option<u16>,
+    /// Signal strength of the last report heard **in the current discovery session**. BlueZ resets
+    /// it when discovery stops (`discovery_cleanup` → `invalidate_rssi_and_tx_power` in
+    /// `src/adapter.c`) and omits the property while it is zero, so present means "this device
+    /// answered the sweep `pad pair` is running", not "it is in BlueZ's cache".
+    rssi: Option<i16>,
     paired: bool,
     trusted: bool,
     connected: bool,
@@ -456,6 +461,7 @@ impl Snapshot {
             icon: text("Icon"),
             class: get("Class").and_then(|v| u32::try_from(v).ok()),
             appearance: get("Appearance").and_then(|v| u16::try_from(v).ok()),
+            rssi: get("RSSI").and_then(|v| i16::try_from(v).ok()),
             paired: flag("Paired"),
             trusted: flag("Trusted"),
             connected: flag("Connected"),
@@ -483,6 +489,35 @@ impl Snapshot {
 
     fn is_gamepad(&self) -> bool {
         self.evidence().is_some()
+    }
+
+    /// Heard in this discovery session — see [`Snapshot::rssi`].
+    fn seen_now(&self) -> bool {
+        self.rssi.is_some()
+    }
+
+    /// A device `pad pair` may answer with: one in range right now, either because this sweep heard
+    /// it or because it is connected.
+    ///
+    /// BlueZ's object tree is not "what is in range". A bonded pad stays in it forever, switched off
+    /// in a drawer or not, and an unbonded one lingers for minutes after the discovery that found
+    /// it. Answering from the tree is how `pad pair` could "repair the trust" of a pad nobody was
+    /// holding and call that a success, or try to bond a device a previous sweep had found.
+    fn in_range(&self) -> bool {
+        self.connected || self.seen_now()
+    }
+
+    /// A bond this robot holds for a pad that is **in pairing mode** — the pad has dropped its half.
+    ///
+    /// Bonded, not connected, and answering discovery. BlueZ records an `RSSI` only for a report
+    /// from a *discoverable* device (`btd_adapter_device_found` in `src/adapter.c`), and a pad makes
+    /// itself discoverable to form a **new** bond — a bonded classic pad merely switched on pages the
+    /// robot instead, and is never heard here. So the key kept here is dead. See [`stale_bonds`].
+    ///
+    /// Not measured: whether an LE pad reconnecting to its bond ever advertises as discoverable. If
+    /// one does, it is caught here and re-bonded, which costs a pairing rather than a pad.
+    fn is_stale_bond(&self) -> bool {
+        self.paired && !self.connected && self.seen_now()
     }
 
     /// Unbonded, and a pad on the radio's word rather than its name's — the only kind of match the
@@ -606,23 +641,56 @@ impl BlueZ {
     /// what it has, which may be the pad already bonded. The cost is that re-running `pad pair` with nothing new in pairing mode takes the whole
     /// window before saying "already paired" — `--timeout` shortens it.
     ///
-    /// An explicit address ends the sweep as soon as it appears, paired or not: the caller has named
-    /// what they want and there is nothing to prefer.
+    /// An explicit address ends the sweep as soon as it is in range, paired or not: the caller has
+    /// named what they want and there is nothing to prefer.
+    ///
+    /// **Only devices in range count** — heard by this sweep, or connected ([`Snapshot::in_range`]).
+    /// And a bonded pad heard by the sweep is in pairing mode, so its bond is dropped here and it
+    /// comes back fresh ([`stale_bonds`]).
     ///
     /// Also returns **everything else it saw**, which matters more than it looks: BlueZ reports a
     /// freshly-discovered device with an address and often nothing else — no `Name`, no `Class`, no
     /// `Icon` — because those need a further exchange. A pad that never resolves any of them is
     /// invisible to [`Snapshot::is_gamepad`], and a bare "no gamepad found" would leave someone with
     /// no way to learn the address that `--mac` needs. So the refusal carries the list.
-    async fn find(&self, mac: Option<&str>, timeout: Duration) -> PadResult<Found> {
+    async fn find(
+        &self,
+        adapter: &AdapterProxy<'_>,
+        mac: Option<&str>,
+        timeout: Duration,
+    ) -> PadResult<Found> {
         let deadline = tokio::time::Instant::now() + timeout;
         // When the first classified, unbonded candidate was seen, so the sweep can run
         // [`SIBLING_GRACE`] past it before deciding.
         let mut first_fresh: Option<tokio::time::Instant> = None;
         loop {
             let seen = self.devices().await?;
+
+            // A bond the pad itself has dropped: remove it now, while discovery is still running, so
+            // the pad comes straight back as a new device and takes the unbonded path like any other.
+            // This is the `bluetoothctl remove` that used to be the only way out.
+            let mut dropped: Vec<&OwnedObjectPath> = Vec::new();
+            for stale in stale_bonds(&seen, mac) {
+                match adapter.remove_device(&stale.path.as_ref()).await {
+                    Ok(()) => tracing::info!(
+                        mac = %stale.mac,
+                        name = %stale.name,
+                        "a bonded pad is in pairing mode: dropping its old bond to pair it afresh"
+                    ),
+                    Err(e) => tracing::warn!(
+                        mac = %stale.mac,
+                        error = %e,
+                        "could not drop the old bond of a pad in pairing mode"
+                    ),
+                }
+                // Out of this sweep either way: the object is gone, or it still carries a key that
+                // `bond` would mistake for a working one.
+                dropped.push(&stale.path);
+            }
+
             let matches: Vec<Snapshot> = seen
                 .iter()
+                .filter(|device| device.in_range() && !dropped.contains(&&device.path))
                 .filter(|device| match mac {
                     // An explicit address bypasses the heuristic entirely. That is the escape hatch
                     // for hardware this does not recognise, and it must not be second-guessed.
@@ -901,6 +969,29 @@ impl BlueZ {
     }
 }
 
+/// Bonds to drop before pairing: the pads this robot is bonded to that are in pairing mode.
+///
+/// Without this, a pad paired here once and then put back into pairing mode — after pairing with a
+/// phone, or for an Xbox pad, after any other host took its one bond slot — could not be paired again.
+/// It is bonded, so it is never a *fresh* candidate; the search ran its whole window and then bonded
+/// whatever else was unbonded and in range. Seen on the beta board (2026-11-05/06) with a Pro
+/// Controller clone: the search picked the pad's own LE face and hung in `Connect()`, or another pad
+/// in the room and timed out authenticating, every attempt, until `bluetoothctl remove` made the
+/// classic face fresh again.
+///
+/// Restricted to gamepads, or to the one address named: `pad pair` drops nothing it would not have
+/// paired.
+fn stale_bonds<'a>(devices: &'a [Snapshot], mac: Option<&str>) -> Vec<&'a Snapshot> {
+    devices
+        .iter()
+        .filter(|d| d.is_stale_bond())
+        .filter(|d| match mac {
+            Some(wanted) => wanted.eq_ignore_ascii_case(&d.mac),
+            None => d.is_gamepad(),
+        })
+        .collect()
+}
+
 /// Bonded pads worth re-paging: trusted, a gamepad, on the classic transport, link down.
 ///
 /// Empty while any pad is connected — the pad that is driving wins, and re-paging another one
@@ -1038,7 +1129,7 @@ impl Pads for BlueZ {
             .map_err(|e| format!("cannot start Bluetooth discovery: {e}"))?;
         tracing::info!(?timeout, "looking for a gamepad in pairing mode");
 
-        let found = self.find(mac, timeout).await;
+        let found = self.find(&adapter, mac, timeout).await;
 
         // Stop discovery before connecting, always — including on the error path, so a failed
         // search does not leave the adapter scanning.
@@ -1097,8 +1188,9 @@ impl Pads for BlueZ {
                 match fresh.as_slice() {
                     [only] => (*only).clone(),
                     // Nothing new: report the bonded one, and let `bond` re-assert `Trusted`. This is
-                    // the idempotent re-run, and the one case where several bonded pads are in range
-                    // — either is a correct answer, so take the first by address for determinism.
+                    // the idempotent re-run. Every bonded match is connected — `find` dropped the
+                    // ones in pairing mode and skips the ones out of range — so either is a correct
+                    // answer, and the first by address is taken for determinism.
                     [] => several
                         .iter()
                         .min_by(|a, b| a.mac.cmp(&b.mac))
@@ -1109,6 +1201,7 @@ impl Pads for BlueZ {
                             .iter()
                             .map(|d| format!("{} ({})", d.name, d.mac))
                             .collect();
+                        tracing::warn!(candidates = %names.join(", "), "more than one pad in pairing mode");
                         return Ok(proto::PadPairResult::Failed {
                             reason: proto::PadPairFailure::Ambiguous,
                             detail: Some(format!(
@@ -1253,9 +1346,18 @@ mod tests {
             icon: None,
             class,
             appearance: None,
+            rssi: None,
             paired: false,
             trusted: false,
             connected: false,
+        }
+    }
+
+    /// Heard by the sweep that is running.
+    fn heard(snapshot: Snapshot) -> Snapshot {
+        Snapshot {
+            rssi: Some(-60),
+            ..snapshot
         }
     }
 
@@ -1344,5 +1446,74 @@ mod tests {
         };
         let speaker = bonded("00:11:22:33:44:55", "BT Speaker", Some(0x240414), false);
         assert!(needs_reconnect(&[le, untrusted, speaker]).is_empty());
+    }
+
+    /// The beta board's failure: the pad is bonded, in pairing mode, and heard by the sweep. Its bond
+    /// is dropped, so it comes back fresh.
+    #[test]
+    fn a_bonded_pad_heard_in_discovery_is_a_stale_bond() {
+        let pad = heard(bonded(
+            "98:B6:E9:93:4B:32",
+            "Pro Controller",
+            Some(0x2508),
+            false,
+        ));
+        let devices = [pad];
+        let stale = stale_bonds(&devices, None);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].mac, "98:B6:E9:93:4B:32");
+    }
+
+    /// A bonded pad merely in the cache — switched off, or on and paging the robot — keeps its bond,
+    /// and so does the one someone is driving with, heard or not.
+    #[test]
+    fn a_working_bond_is_never_dropped() {
+        let in_a_drawer = bonded("98:B6:E9:93:4B:32", "Pro Controller", Some(0x2508), false);
+        let driving = heard(bonded(
+            "78:86:2E:BB:13:28",
+            "Xbox Wireless Controller",
+            None,
+            true,
+        ));
+        assert!(stale_bonds(&[in_a_drawer, driving], None).is_empty());
+    }
+
+    /// `pad pair` drops nothing it would not have paired: not a bonded speaker in pairing mode, and
+    /// with an address named, not any pad but that one.
+    #[test]
+    fn only_a_pad_this_would_pair_loses_its_bond() {
+        let speaker = heard(bonded(
+            "00:11:22:33:44:55",
+            "BT Speaker",
+            Some(0x240414),
+            false,
+        ));
+        let pad = heard(bonded(
+            "98:B6:E9:93:4B:32",
+            "Pro Controller",
+            Some(0x2508),
+            false,
+        ));
+        let devices = [speaker, pad];
+        assert_eq!(stale_bonds(&devices, None).len(), 1);
+        assert!(stale_bonds(&devices, Some("78:86:2E:BB:13:28")).is_empty());
+        assert_eq!(stale_bonds(&devices, Some("98:b6:e9:93:4b:32")).len(), 1);
+    }
+
+    /// The tree is not what is in range: an unbonded device left over from an earlier sweep and a
+    /// bonded pad switched off are both out; a device heard now and a connected pad are in.
+    #[test]
+    fn only_a_device_heard_now_or_connected_is_in_range() {
+        assert!(!face("D6:20:41:A9:AF:F3", "Wireless Controller", Some(0x2508)).in_range());
+        assert!(!bonded("98:B6:E9:93:4B:32", "Pro Controller", Some(0x2508), false).in_range());
+        assert!(
+            heard(face(
+                "D6:20:41:A9:AF:F3",
+                "Wireless Controller",
+                Some(0x2508)
+            ))
+            .in_range()
+        );
+        assert!(bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller", None, true).in_range());
     }
 }

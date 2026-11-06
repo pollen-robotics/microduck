@@ -287,7 +287,13 @@ impl Pads for FakePads {
         // just put into pairing mode. A pad the robot already has is not a competing answer, and
         // treating it as one is what made a second pad impossible to add.
         let fresh: Vec<&proto::Pad> = candidates.iter().filter(|pad| !pad.paired).collect();
-        let pad = match (fresh.as_slice(), candidates.as_slice()) {
+        // A bonded pad answers only while connected — one switched off is in BlueZ's cache, not in
+        // range, and "re-asserting trust" on it would report a pairing nobody made.
+        let connected: Vec<&proto::Pad> = candidates
+            .iter()
+            .filter(|pad| pad.paired && pad.connected)
+            .collect();
+        let pad = match (fresh.as_slice(), connected.as_slice()) {
             ([only], _) => (*only).clone(),
             ([], []) => {
                 return Ok(proto::PadPairResult::Failed {
@@ -297,11 +303,11 @@ impl Pads for FakePads {
             }
             // Nothing new in pairing mode, so the answer is the pad already bonded: an idempotent
             // re-run, which is also how a lost `Trusted` is repaired.
-            ([], already) => already
+            ([], already) => (*already
                 .iter()
                 .min_by(|a, b| a.mac.cmp(&b.mac))
-                .expect("non-empty")
-                .clone(),
+                .expect("non-empty"))
+            .clone(),
             (several, _) => {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::Ambiguous,
@@ -491,6 +497,22 @@ mod tests {
         };
         assert_eq!(pad.mac, "78:86:2E:BB:13:28");
         assert!(pad.trusted, "the re-run must restore trust: {pad:?}");
+    }
+
+    /// A bonded pad that is not connected is not in range as far as `pad pair` can tell, so it is
+    /// not a "nothing new, repair the trust" success.
+    #[tokio::test]
+    async fn a_bonded_pad_switched_off_is_not_found() {
+        let mut off = bonded("78:86:2E:BB:13:28", "Xbox Wireless Controller");
+        off.connected = false;
+        let pads = FakePads::with(vec![off]);
+        assert!(matches!(
+            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
+            proto::PadPairResult::Failed {
+                reason: proto::PadPairFailure::NotFound,
+                ..
+            }
+        ));
     }
 
     /// Two pads in pairing mode: refuse rather than guess, because guessing bonds the robot to
