@@ -501,6 +501,9 @@ pub struct Relay {
     /// Where to publish [`RemoteStatus`] for `robotctl health`. An argument for `sockets`' reason:
     /// a test must not write the board's `/run/mediad`, and `main` must not forget to name it.
     status_path: PathBuf,
+    /// Which remote session holds the bridged video, so its control lane knows that video is its
+    /// own client's.
+    video_holder: VideoHolder,
 }
 
 impl Relay {
@@ -541,6 +544,7 @@ impl Relay {
             video: None,
             sockets,
             status_path: status_path.into(),
+            video_holder: VideoHolder::default(),
         })
     }
 
@@ -952,6 +956,7 @@ impl Relay {
                     }
                 });
                 *bridged = Some(Bridged {
+                    _holding: self.video_holder.hold(&session_id),
                     remote_id: session_id,
                     to_local,
                     task,
@@ -1161,6 +1166,7 @@ impl Relay {
         let video = self.video.as_ref().and_then(|watch| watch.borrow().clone());
         let remote_id = session_id.to_owned();
         let session_id = session_id.to_owned();
+        let seat = self.video_holder.seat_for(&session_id);
 
         let task = tokio::spawn(async move {
             let session = tokio::spawn(crate::session::run(
@@ -1171,6 +1177,8 @@ impl Relay {
                 // said what the video is — which is possible because the relay starts first, on
                 // purpose. `session::run` refuses `media.video` rather than answering with zeros.
                 video,
+                // No media path of its own, so counted only while its client holds the video.
+                seat,
             ));
 
             let mut budget = Budget::new(NOTIFICATIONS_PER_WINDOW, NOTIFICATION_WINDOW);
@@ -1272,6 +1280,8 @@ impl Hub {
 
 /// A bridged session, from the rendezvous side's point of view.
 struct Bridged {
+    /// Marks this session as the one holding the video, for exactly as long as it exists.
+    _holding: Holding,
     /// The id the *service* knows this session by.
     remote_id: String,
     /// Envelopes from the service, on their way to the local signalling server.
@@ -1291,6 +1301,58 @@ impl Drop for Bridged {
         // The task owns a WebSocket and a channel; aborting it closes both, which is what tells
         // `webrtcsink` the consumer went away.
         self.task.abort();
+    }
+}
+
+/// Which remote session, if any, holds the bridged video.
+///
+/// A remote client may hold a video session, a control lane, or both, under one `sessionId`. Its
+/// lane has no media of its own, but when the same client is watching, one of the WebRTC peers
+/// `updaterd` counts is that client — and an OS update it asks for over the lane must not be
+/// refused for its own video (`session::Seat`). The relay knows both ids; this is where the lane
+/// asks.
+#[derive(Clone, Default)]
+struct VideoHolder(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl VideoHolder {
+    /// Record `session_id` as holding the video until the returned guard drops.
+    ///
+    /// A guard rather than a set and a clear, because a [`Bridged`] goes away from several places
+    /// — replaced, ended by the service, finished, failed to forward — and one of them forgetting
+    /// to clear would leave a lane counting video nobody is watching.
+    fn hold(&self, session_id: &str) -> Holding {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_owned());
+        Holding {
+            holder: self.clone(),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    fn holds(&self, session_id: &str) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(session_id)
+    }
+
+    /// The seat for the lane of `session_id`: counted while that session holds the video.
+    fn seat_for(&self, session_id: &str) -> crate::session::Seat {
+        let holder = self.clone();
+        let session_id = session_id.to_owned();
+        crate::session::Seat::lane(move || holder.holds(&session_id))
+    }
+}
+
+/// See [`VideoHolder::hold`].
+struct Holding {
+    holder: VideoHolder,
+    session_id: String,
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        // Only if still ours: a new session is recorded before the old one is dropped.
+        let mut held = self.holder.0.lock().unwrap_or_else(|e| e.into_inner());
+        if held.as_deref() == Some(self.session_id.as_str()) {
+            *held = None;
+        }
     }
 }
 
@@ -1450,6 +1512,29 @@ fn jittered(base: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lane counts its client's video exactly while that client's session holds it, and a
+    /// replaced session does not clear the one that replaced it.
+    #[test]
+    fn a_lane_counts_the_video_only_while_its_own_session_holds_it() {
+        let holder = VideoHolder::default();
+        assert!(!holder.holds("a"), "nobody is watching");
+
+        let a = holder.hold("a");
+        assert!(holder.holds("a"));
+        assert!(
+            !holder.holds("b"),
+            "another client's lane does not own a's video"
+        );
+
+        // `*bridged = Some(new)` builds the new one before dropping the old.
+        let b = holder.hold("b");
+        drop(a);
+        assert!(holder.holds("b"), "dropping a must not clear b");
+
+        drop(b);
+        assert!(!holder.holds("b"), "the video ended with its session");
+    }
 
     fn meta() -> Meta {
         Meta {

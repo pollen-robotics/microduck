@@ -254,8 +254,8 @@ would leave the robot with no pad and nothing saying so.
 
 ## 4. At boot
 
-systemd starts the daemons from `multi-user.target`, and `robot-boot-check.timer` arms the
-recovery check for 180 seconds in. There is **no ordering between the daemons** beyond `padd` and
+systemd starts the daemons from `multi-user.target`, and `robot-boot-check.timer` starts the
+recovery check a second in. There is **no ordering between the daemons** beyond `padd` and
 `netpadd` after `robotd` (advisory — each exits and retries every 5 s if the socket is absent) and
 `btd` after `dbus`/`bluetooth`. Nothing waits on `updaterd`, and `updaterd` waits on nothing but
 `network-online.target`, which is `Wants` rather than `Requires`.
@@ -310,11 +310,11 @@ A trial only exists if an apply was interrupted between step 9 and step 15 of §
 interruption logs "update still on trial" and the *second* reverts.
 
 **Every step above presupposes an `updaterd` that starts.** One more thing happens at boot for the
-case where none of it runs: `robot-boot-check.timer` fires 180 s in, asks whether `robotd`, `configd`,
+case where none of it runs: from a second in, `robot-boot-check` watches whether `robotd`, `configd`,
 `btd` and `updaterd` came up, and hands over to a `/bin/sh` rescue that swaps `current` to golden and
 reboots if they did not. It is deliberately outside every process on this page —
-[`boot-recovery-net.md`](boot-recovery-net.md) owns it, including why it is a deadline rather than
-`OnFailure=` on these units.
+[`boot-recovery-net.md`](boot-recovery-net.md) owns it, including why it watches rather than relying
+on `OnFailure=` on these units.
 
 ## 5. The startup reconciliation — did the restarts happen?
 

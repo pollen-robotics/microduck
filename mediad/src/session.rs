@@ -69,6 +69,84 @@ pub struct Media {
     pub streamer: std::sync::Arc<crate::stream::Streamer>,
 }
 
+/// Where this session sits among the WebRTC peers `mediad` is serving, for the one decision that
+/// depends on who else is here: whether an OS update this session asks for may drop the others.
+///
+/// `updaterd` refuses an update while any WebRTC peer is connected (`updater-design.md` §7.2),
+/// counting from the same [`proto::read_webrtc_peers`] read here. A session asking for one is
+/// itself a peer, and must not be refused for its own presence — so when nobody *else* is here,
+/// [`handle`] answers the check for it by setting `interrupt_sessions`. With company it forwards
+/// the call as sent, and the check refuses on the company's behalf.
+#[derive(Clone)]
+pub struct Seat {
+    /// Whether this session's own client is one of the peers counted. Always for a datachannel,
+    /// which exists because `webrtcsink` added a consumer. For the rendezvous control lane, only
+    /// while the same remote client also holds the bridged video session: the lane carries no
+    /// media itself, but its client may be watching over WebRTC at the same time, and that video
+    /// is the client's own presence, not company.
+    counted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    peers: fn() -> Option<u32>,
+}
+
+impl Seat {
+    /// A datachannel: one of the peers `webrtcsink` counts.
+    pub fn peer() -> Seat {
+        Seat {
+            counted: std::sync::Arc::new(|| true),
+            peers: proto::read_webrtc_peers,
+        }
+    }
+
+    /// The rendezvous control lane, counted while `counted` says its client holds the video.
+    pub fn lane(counted: impl Fn() -> bool + Send + Sync + 'static) -> Seat {
+        Seat {
+            counted: std::sync::Arc::new(counted),
+            peers: proto::read_webrtc_peers,
+        }
+    }
+
+    /// Whether this session is the only one an update would drop. `None` from the count is
+    /// `updaterd`'s "not saying", which it lets through, so it is alone here too.
+    fn alone(&self) -> bool {
+        let peers = (self.peers)().unwrap_or(0);
+        peers.saturating_sub(u32::from((self.counted)())) == 0
+    }
+}
+
+/// The line to forward for `call`: unchanged, except an OS update from a session that is
+/// [alone](Seat::alone), which goes with `interrupt_sessions` set.
+///
+/// The rest of the request is kept as the peer sent it. Rebuilding it from `call` would drop
+/// anything this release does not model, and the one thing `handle` must never do is change a
+/// request it only meant to route.
+fn exempt_if_alone(call: &proto::Call, line: &str, seat: &Seat) -> Option<String> {
+    let asked = match call {
+        proto::Call::OsApply(p) => p.interrupt_sessions,
+        proto::Call::OsSwitch(p) => p.interrupt_sessions,
+        _ => return None,
+    };
+    if asked || !seat.alone() {
+        return None;
+    }
+    let mut request: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = request.as_object_mut()?;
+    // `params` is optional for both — `{"method":"os.apply"}` is the channel's newest.
+    let params = object
+        .entry("params")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if params.is_null() {
+        *params = serde_json::Value::Object(Default::default());
+    }
+    params
+        .as_object_mut()?
+        .insert("interrupt_sessions".into(), true.into());
+    tracing::info!(
+        method = call.method(),
+        "no other WebRTC session to drop; asking updaterd to go ahead"
+    );
+    Some(request.to_string())
+}
+
 /// What the video is, told to a peer once when its channel opens.
 ///
 /// **The rotation is the whole point.** Nothing on the robot rotates pixels any more — a `videoflip`
@@ -125,6 +203,7 @@ pub async fn run(
     outbound: mpsc::Sender<String>,
     mut pool: Pool,
     media: Option<Media>,
+    seat: Seat,
 ) {
     // A peer that came with the video is a visit, and how long it stays is video streamed.
     let _visit = media.is_some().then(crate::vetbook::visit);
@@ -133,7 +212,7 @@ pub async fn run(
         if line.is_empty() {
             continue;
         }
-        if let Some(reply) = handle(&line, &mut pool, media.as_ref()).await {
+        if let Some(reply) = handle(&line, &mut pool, media.as_ref(), &seat).await {
             // A closed outbound means the peer is gone; there is nothing left to do for it.
             if outbound.send(reply).await.is_err() {
                 break;
@@ -145,7 +224,7 @@ pub async fn run(
 
 /// Route one line. Returns a reply to send back only when this transport answers it itself —
 /// which is to say, only when it refuses.
-async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>) -> Option<String> {
+async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>, seat: &Seat) -> Option<String> {
     let request: proto::Request = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(e) => {
@@ -231,7 +310,11 @@ async fn handle(line: &str, pool: &mut Pool, media: Option<&Media>) -> Option<St
             Some(error_line(id, route::refusal(&call)))
         }
         Route::To(service, lane) => {
-            match pool.send(service, lane, line).await {
+            let exempted = exempt_if_alone(&call, line, seat);
+            match pool
+                .send(service, lane, exempted.as_deref().unwrap_or(line))
+                .await
+            {
                 Ok(()) => None,
                 Err(e) => {
                     // The service is not there, or stopped reading. Answering is important: a
@@ -357,7 +440,20 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    /// A peer with nobody else connected, which is how every test but the ones about company sees
+    /// the robot. `None`, not `Some(1)`: no test should depend on a `/run/mediad` it cannot see.
+    fn alone() -> Seat {
+        Seat {
+            counted: std::sync::Arc::new(|| true),
+            peers: || None,
+        }
+    }
+
     fn harness(sockets: Sockets, dir: tempfile::TempDir) -> Harness {
+        seated(sockets, dir, alone())
+    }
+
+    fn seated(sockets: Sockets, dir: tempfile::TempDir, seat: Seat) -> Harness {
         let (from_peer, inbound) = mpsc::channel(16);
         let (outbound, to_peer) = mpsc::channel(64);
         let (replies_tx, mut replies_rx) = mpsc::channel::<String>(64);
@@ -407,6 +503,7 @@ mod tests {
                     dir.path().join("hf-token"),
                 )),
             }),
+            seat,
         ));
         Harness {
             to_peer,
@@ -448,6 +545,112 @@ mod tests {
         assert!(reply.contains(r#""healthy":true"#), "{reply}");
         // And it did not go to the wrong service.
         assert!(updater_seen.try_recv().is_err());
+    }
+
+    fn os_apply(params: &str) -> (proto::Call, String) {
+        let line = format!(r#"{{"jsonrpc":"2.0","id":3,"method":"os.apply"{params}}}"#);
+        let call = serde_json::from_str::<proto::Request>(&line)
+            .unwrap()
+            .as_call()
+            .unwrap();
+        (call, line)
+    }
+
+    fn interrupts(line: &str) -> bool {
+        let request: serde_json::Value = serde_json::from_str(line).unwrap();
+        request["params"]["interrupt_sessions"] == true
+    }
+
+    /// Who counts as company: the other datachannels, and every datachannel for the lane.
+    #[test]
+    fn a_session_is_alone_when_nobody_else_would_be_dropped() {
+        let peer = |n: fn() -> Option<u32>| Seat {
+            counted: std::sync::Arc::new(|| true),
+            peers: n,
+        };
+        let lane = |n: fn() -> Option<u32>| Seat {
+            counted: std::sync::Arc::new(|| false),
+            peers: n,
+        };
+        // A lane whose client is also watching: its own video is not company.
+        let watching = |n: fn() -> Option<u32>| Seat {
+            counted: std::sync::Arc::new(|| true),
+            peers: n,
+        };
+        assert!(peer(|| Some(1)).alone(), "only itself");
+        assert!(!peer(|| Some(2)).alone(), "one other peer");
+        assert!(lane(|| Some(0)).alone());
+        assert!(!lane(|| Some(1)).alone(), "a peer the lane is not");
+        assert!(
+            watching(|| Some(1)).alone(),
+            "the lane's own client's video"
+        );
+        assert!(!watching(|| Some(2)).alone(), "and someone else's");
+        // `updaterd` lets an unknown count through, so treating it as company here would refuse
+        // nothing and only log a lie.
+        assert!(peer(|| None).alone());
+        assert!(lane(|| None).alone());
+    }
+
+    /// Alone, an OS update goes with the check answered; the rest of the request is untouched.
+    #[test]
+    fn an_os_update_from_a_session_alone_skips_the_session_check() {
+        let (call, line) = os_apply(r#","params":{"build":"20261028093000"}"#);
+        let sent = exempt_if_alone(&call, &line, &alone()).expect("rewritten");
+        assert!(interrupts(&sent), "{sent}");
+        assert!(sent.contains("20261028093000"), "{sent}");
+        assert!(sent.contains(r#""id":3"#), "{sent}");
+
+        // No `params` at all is the channel's newest, and still gets the flag.
+        let (call, line) = os_apply("");
+        assert!(interrupts(
+            &exempt_if_alone(&call, &line, &alone()).unwrap()
+        ));
+        let switch = r#"{"jsonrpc":"2.0","id":4,"method":"os.switch","params":null}"#;
+        let call = serde_json::from_str::<proto::Request>(switch)
+            .unwrap()
+            .as_call()
+            .unwrap();
+        assert!(interrupts(
+            &exempt_if_alone(&call, switch, &alone()).unwrap()
+        ));
+    }
+
+    /// With company, the call goes as sent, so `updaterd` refuses on the company's behalf.
+    #[test]
+    fn an_os_update_with_company_is_left_for_updaterd_to_refuse() {
+        let crowded = Seat {
+            counted: std::sync::Arc::new(|| true),
+            peers: || Some(2),
+        };
+        let (call, line) = os_apply("");
+        assert_eq!(exempt_if_alone(&call, &line, &crowded), None);
+
+        // A client that asked to interrupt has nothing to rewrite.
+        let (call, line) = os_apply(r#","params":{"interrupt_sessions":true}"#);
+        assert_eq!(exempt_if_alone(&call, &line, &alone()), None);
+
+        // And nothing else is touched: a daemon release is refused here anyway, and every other
+        // call is the peer's own.
+        let line = r#"{"jsonrpc":"2.0","id":5,"method":"robot.health"}"#;
+        let call = serde_json::from_str::<proto::Request>(line)
+            .unwrap()
+            .as_call()
+            .unwrap();
+        assert_eq!(exempt_if_alone(&call, line, &alone()), None);
+    }
+
+    /// End to end: what reaches `updaterd` is the rewritten line.
+    #[tokio::test]
+    async fn updaterd_receives_the_exempted_os_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut updater_seen = fake_daemon(dir.path(), "updaterd.sock", vec![]);
+        let h = harness(sockets_in(dir.path()), dir);
+
+        h.from_peer.send(os_apply("").1).await.unwrap();
+
+        let seen = updater_seen.recv().await.unwrap();
+        assert!(interrupts(&seen), "{seen}");
     }
 
     /// A refused call is answered by `mediad` and never reaches a socket.

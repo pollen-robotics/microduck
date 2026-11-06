@@ -44,6 +44,7 @@ use robotd_params::board::Board;
 mod camera;
 mod cells;
 mod configure;
+mod dev_daemon;
 mod duck;
 mod endurance;
 mod frame;
@@ -248,6 +249,9 @@ enum Namespace {
     /// this build does not know survive untouched, and nothing is written that robotd's own
     /// validation would reject. The config is read once at robotd's startup, so saving offers
     /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    ///
+    /// One row is not robotd's: `allow_dev_daemon`, at the top, makes this robot a dev board
+    /// (the same as `--allow-dev-daemon`).
     Configure {
         /// The file to edit. The default is where a provisioned robot keeps it.
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
@@ -263,6 +267,20 @@ enum Namespace {
         /// With `--list`, emit JSON for a support bundle.
         #[arg(long, requires = "list")]
         json: bool,
+
+        /// Make this robot a dev board (`on`), so `robotctl update apply --ref <branch> daemon`
+        /// installs what CI built for that branch — or a robot that only takes releases (`off`).
+        ///
+        /// Nothing to copy: `updaterd` carries the team dev key and uses it only on a dev board.
+        /// The setting is kept under /var/lib/robot, so it survives an OS update, and changing it
+        /// restarts `updaterd`. Run with sudo.
+        #[arg(long, value_name = "on|off", value_parser = parse_on_off, conflicts_with = "list")]
+        allow_dev_daemon: Option<bool>,
+
+        /// `updaterd`'s config, for where it keeps its state: read by `--allow-dev-daemon` and by
+        /// the editor's dev-board row, which is absent when this file is.
+        #[arg(long, default_value = dev_daemon::UPDATER_CONFIG)]
+        updater_config: PathBuf,
     },
 
     /// The gamepad. Pair one, see what is paired, forget one.
@@ -1207,8 +1225,8 @@ enum UpdateCommand {
         ///
         /// Resolves to the moving `daemon-dev-<ref>` tag CI publishes on every push, so the
         /// exact version — `0.2.0-dev.17.abc1234` — never has to be typed. Dev builds are
-        /// signed with the team key, so a robot only accepts one if `allow_dev_keys` is on
-        /// and that key is in its trusted set: a customer robot refuses them.
+        /// signed with the team key, so a robot only accepts one once it is a dev board
+        /// (`sudo robotctl configure --allow-dev-daemon on`): a customer robot refuses them.
         ///
         /// `conflicts_with` version rather than a silent precedence: asking for both a ref
         /// and a version is a mistake worth reporting, not one to resolve by guessing.
@@ -1241,9 +1259,9 @@ enum UpdateCommand {
         /// reverted. That is the whole difference from `updaterd install --from`, which
         /// forces the gate off and therefore refuses to touch a live release at all.
         ///
-        /// Being local relaxes nothing: a build installs because the dev key is in this
-        /// robot's trusted set and `allow_dev_keys` is on, so a customer robot refuses it
-        /// exactly as it refuses `--ref`.
+        /// Being local relaxes nothing: a build installs because this robot is a dev board
+        /// and so trusts the dev key, and a customer robot refuses it exactly as it refuses
+        /// `--ref`.
         ///
         /// **Not under /tmp or /var/tmp.** `updaterd.service` sets `PrivateTmp=yes`, so the
         /// daemon that reads this directory has its own pair of those and neither is the one
@@ -2080,6 +2098,13 @@ fn render_health(report: &HealthReport) -> String {
                     format!("servos ok, waiting for the IMU board, {n} attempts")
                 }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
+                (n, _) if !health.bus.missing.is_empty() => format!(
+                    "{n} consecutive read failures, not answering: {}",
+                    health.bus.describe_missing()
+                ),
+                (n, _) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("{n} consecutive read failures, servos ok, the IMU board is silent")
+                }
                 (n, _) => format!("{n} consecutive read failures"),
             };
             let _ = writeln!(out, "  {:<9} {bus}", "bus");
@@ -2477,6 +2502,7 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::Success => format!("{target}: applied"),
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
+        proto::Outcome::Stuck { reason } => format!("{target}: STUCK — {reason}"),
     }
 }
 
@@ -3040,6 +3066,7 @@ impl Failure {
             code::BUSY => exit::BUSY,
             code::INCOMPATIBLE
             | code::PREFLIGHT_FAILED
+            | code::SESSIONS_CONNECTED
             | code::VERIFICATION_FAILED
             | code::WOULD_DOWNGRADE
             | code::NOT_INSTALLED
@@ -5402,11 +5429,19 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
         }
-        Namespace::Configure { file, list, json } => {
-            let result = if list {
+        Namespace::Configure {
+            file,
+            list,
+            json,
+            allow_dev_daemon,
+            updater_config,
+        } => {
+            let result = if let Some(on) = allow_dev_daemon {
+                dev_daemon::run(&updater_config, on)
+            } else if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &updater_config)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
@@ -5675,6 +5710,15 @@ fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
 fn compact(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
+/// `on`/`off` for a flag that takes one, accepting the obvious spellings of each.
+fn parse_on_off(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(format!("`{other}` is not on or off")),
+    }
+}
+
 #[cfg(test)]
 mod head_imu_tests {
     use super::head_attitude;
@@ -7433,6 +7477,12 @@ mod tests {
         }));
         assert!(rolled.contains("ROLLED BACK"), "{rolled}");
         assert!(rolled.contains("not healthy within 30s"), "{rolled}");
+        // Left live after a failed gate: something changed, so not "refused".
+        let stuck = describe_attempt(&entry(proto::Outcome::Stuck {
+            reason: "not healthy within 30s; auto-rollback is off".into(),
+        }));
+        assert!(stuck.contains("STUCK"), "{stuck}");
+        assert!(!stuck.contains("refused"), "{stuck}");
 
         // A first install has no `from`, and must not render as "None → 1.0.0".
         let first = proto::LogEntry {

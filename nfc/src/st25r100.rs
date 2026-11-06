@@ -20,9 +20,14 @@ use crate::{Error, Result};
 mod reg {
     pub const OPERATION: u8 = 0x00;
     pub const GENERAL: u8 = 0x01;
+    pub const TX_MOD: u8 = 0x04;
+    pub const RX_ANA2: u8 = 0x07;
+    pub const RX_DIG: u8 = 0x08;
     pub const CORR1: u8 = 0x09;
+    pub const CORR4: u8 = 0x0c;
     pub const CORR5: u8 = 0x0d;
     pub const DISPLAY1: u8 = 0x0f;
+    pub const PROTOCOL: u8 = 0x12;
     pub const PROTOCOL_TX1: u8 = 0x13;
     pub const PROTOCOL_RX1: u8 = 0x16;
     pub const NRT_GPT_CONFIG: u8 = 0x1e;
@@ -48,6 +53,10 @@ const FIFO: u8 = 0x5f;
 // Operation register (§5.13.1).
 const OP_TX_EN: u8 = 1 << 5;
 const OP_RX_EN: u8 = 1 << 4;
+/// `am_en`, the AM regulator, which modulates through Tx modulation 1 `reg_am`. Set in ISO 15693
+/// only: without it the downlink does not reach the tag (measured 2026-10-27). ISO 14443A runs
+/// with it off, as it always has.
+const OP_AM_EN: u8 = 1 << 3;
 const OP_EN: u8 = 1 << 1;
 // General register (§5.13.2): single-ended driving on the RFO/RFI pair `rfo2` names.
 const GEN_SINGLE: u8 = 1 << 5;
@@ -61,6 +70,9 @@ const TX_CRC: u8 = 1 << 5;
 const RX_B_SOF_EOF: u8 = 0b0011_0000;
 const RX_PARITY: u8 = 1 << 3;
 const RX_CRC: u8 = 1 << 2;
+/// The anticollision bit, which the ISO 15693 receiver needs to see a subcarrier answer — on every
+/// exchange in that mode, block reads as well as the inventory.
+const RX_ANTCL: u8 = 1 << 0;
 // IRQ status 1/2/3 (§5.13.61-63).
 const I_COL: u8 = 1 << 6;
 const I_RXE: u8 = 1 << 3;
@@ -79,6 +91,45 @@ const CORR1_NFCA_106: u8 = 0xc3;
 /// kbit/s, against 3 at power-on.
 const DEC_F_MASK: u8 = 0b0000_0111;
 const DEC_F_NFCA_106: u8 = 0b010;
+/// 4 for ISO 15693 at 26.48 kbit/s, and `en_subc_end` besides — both what ST's reader library
+/// sets for that mode.
+const DEC_F_NFCV_26: u8 = 0b100;
+const EN_SUBC_END: u8 = 1 << 4;
+/// The correlator-1 coefficients for ISO 15693 at 26.48 kbit/s.
+const CORR1_NFCV_26: u8 = 0xc0;
+
+/// Protocol register (§5.13.19): `om<3:0>` picks the framing. ISO 14443A is what `begin` leaves,
+/// and the rate fields stay as they are — 26.48 kbit/s is the same code as 106.
+const OM_MASK: u8 = 0x0f;
+const OM_ISO15693: u8 = 0x05;
+
+/// Rx path digital register (§5.13.9), the filter coefficients: 0x08 for ISO 15693 at 26.48
+/// (ST's reader library). ISO 14443A keeps what `begin` leaves.
+const RX_DIG_FILT_MASK: u8 = 0b0111_1100;
+const RX_DIG_NFCV_26: u8 = 0x08;
+/// Correlator 4 (§5.13.13): collision and data levels, 0xAA for ISO 15693. That is also its
+/// power-on value; written anyway, so the mode does not depend on what ISO 14443A left there.
+const CORR4_NFCV_26: u8 = 0xaa;
+/// Tx modulation 1 (§5.13.5): `am_mod<3:0>` in the top nibble and `reg_am` at bit 0. ISO 15693
+/// is sent at 12% AM (`am_mod` = 4, Table 14) through the regulator — ST's reader library's
+/// setting, without which a tag answered nothing (2026-10-27). Power-on is 15%, regulator off.
+const TX_MOD_AM_MASK: u8 = 0xf1;
+const TX_MOD_NFCV_12PCT: u8 = 0x41;
+/// Rx analog 2 (§5.13.8): `afe_gain_td<3:0>`, the receiver gain in wake-up mode — 14 dB (Table
+/// 20) where power-on is 2 dB. Part of the configuration measured working for ISO 15693.
+const RX_ANA2_GAIN_TD_MASK: u8 = 0x0f;
+const RX_ANA2_GAIN_TD_NFCV: u8 = 0x04;
+
+/// The registers [`Proto::V`] writes, and [`Proto::A`] restores.
+const NFCV_REGS: [u8; 7] = [
+    reg::PROTOCOL,
+    reg::RX_DIG,
+    reg::CORR1,
+    reg::CORR4,
+    reg::CORR5,
+    reg::TX_MOD,
+    reg::RX_ANA2,
+];
 
 /// `ic_type` in the identity register's top five bits (§5.13.64).
 const IC_TYPE_ST25R100: u8 = 0b10101;
@@ -98,6 +149,18 @@ pub enum Antenna {
     Two,
 }
 
+/// Which protocol the transceiver frames: the operation mode, the modulation and the receiver
+/// settings it needs. [`St25r100::transceive`] also adds the anticollision bit for
+/// [`Proto::V`]; parity and CRC it programs the same way for both — the parity bit does nothing
+/// outside ISO 14443A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    /// ISO 14443A at 106 kbit/s: NFC Type 2 tags (NTAG).
+    A,
+    /// ISO 15693 at 26.48 kbit/s: NFC Type 5 tags (ST25TV, ICODE).
+    V,
+}
+
 impl Antenna {
     fn general(self) -> u8 {
         GEN_SINGLE
@@ -111,11 +174,29 @@ impl Antenna {
 pub struct St25r100<B> {
     bus: B,
     antenna: Antenna,
+    proto: Proto,
+    /// Every register [`Proto::V`] changes, as [`St25r100::begin`] left them for ISO 14443A.
+    /// Going back to [`Proto::A`] writes these back, so an NTAG is read with exactly the settings
+    /// it was read with before ISO 15693 existed here.
+    nfca: Option<[(u8, u8); 7]>,
 }
 
 impl<B: Bus> St25r100<B> {
     pub fn new(bus: B, antenna: Antenna) -> Self {
-        Self { bus, antenna }
+        Self {
+            bus,
+            antenna,
+            proto: Proto::A,
+            nfca: None,
+        }
+    }
+
+    /// The operation register's base, field off: the AM regulator on in ISO 15693 only.
+    fn op_ready(&self) -> u8 {
+        match self.proto {
+            Proto::A => OP_EN,
+            Proto::V => OP_EN | OP_AM_EN,
+        }
     }
 
     pub fn antenna(&self) -> Antenna {
@@ -185,18 +266,84 @@ impl<B: Bus> St25r100<B> {
         self.write(reg::CORR1, &[CORR1_NFCA_106])?;
         let corr5 = self.read(reg::CORR5)?;
         self.write(reg::CORR5, &[(corr5 & !DEC_F_MASK) | DEC_F_NFCA_106])?;
+        // That is ISO 14443A, complete. What ISO 15693 is about to change is kept as it stands, so
+        // coming back restores it rather than re-deriving it.
+        let mut nfca = [(0u8, 0u8); 7];
+        for (slot, r) in nfca.iter_mut().zip(NFCV_REGS) {
+            *slot = (r, self.read(r)?);
+        }
+        self.nfca = Some(nfca);
+        self.proto = Proto::A;
         self.write(reg::OPERATION, &[OP_EN])
+    }
+
+    /// Frame the transceiver for one protocol. [`Proto::V`] sets ST's reader library's values for
+    /// ISO 15693 at 26.48 kbit/s, measured working on this board (2026-10-27, the beta's reader and
+    /// an ST25TV); [`Proto::A`] writes back what [`St25r100::begin`] had. Nothing is written when
+    /// the chip is already in that mode.
+    pub fn set_proto(&mut self, proto: Proto) -> Result<()> {
+        if proto == self.proto {
+            return Ok(());
+        }
+        let nfca = self
+            .nfca
+            .ok_or_else(|| Error::Desync("protocol switched before begin()".into()))?;
+        match proto {
+            Proto::A => {
+                for (r, value) in nfca {
+                    self.write(r, &[value])?;
+                }
+            }
+            Proto::V => {
+                let was = |r: u8| nfca.iter().find(|(at, _)| *at == r).map_or(0, |(_, v)| *v);
+                let values = [
+                    (reg::PROTOCOL, (was(reg::PROTOCOL) & !OM_MASK) | OM_ISO15693),
+                    (
+                        reg::RX_DIG,
+                        (was(reg::RX_DIG) & !RX_DIG_FILT_MASK) | RX_DIG_NFCV_26,
+                    ),
+                    (reg::CORR1, CORR1_NFCV_26),
+                    (reg::CORR4, CORR4_NFCV_26),
+                    (
+                        reg::CORR5,
+                        (was(reg::CORR5) & !(DEC_F_MASK | EN_SUBC_END))
+                            | EN_SUBC_END
+                            | DEC_F_NFCV_26,
+                    ),
+                    (
+                        reg::TX_MOD,
+                        (was(reg::TX_MOD) & !TX_MOD_AM_MASK) | TX_MOD_NFCV_12PCT,
+                    ),
+                    (
+                        reg::RX_ANA2,
+                        (was(reg::RX_ANA2) & !RX_ANA2_GAIN_TD_MASK) | RX_ANA2_GAIN_TD_NFCV,
+                    ),
+                ];
+                for (r, value) in values {
+                    self.write(r, &[value])?;
+                }
+            }
+        }
+        self.proto = proto;
+        // The AM regulator follows the mode, and nothing else changes: a field that is on stays on.
+        // A caller about to talk to a tag cycles it with `reset_field`, so the regulator is in
+        // place before the field comes back.
+        let operation = self.read(reg::OPERATION)?;
+        self.write(
+            reg::OPERATION,
+            &[(operation & !OP_AM_EN) | (self.op_ready() & OP_AM_EN)],
+        )
     }
 
     /// Field off, chip still ready.
     pub fn field_off(&mut self) -> Result<()> {
-        self.write(reg::OPERATION, &[OP_EN])
+        self.write(reg::OPERATION, &[self.op_ready()])
     }
 
     /// Put the field on the other antenna. Takes effect at the next [`Reader::reset_field`].
     pub fn set_antenna(&mut self, antenna: Antenna) -> Result<()> {
         self.antenna = antenna;
-        self.write(reg::OPERATION, &[OP_EN])?;
+        self.write(reg::OPERATION, &[self.op_ready()])?;
         self.write(reg::GENERAL, &[antenna.general()])
     }
 
@@ -266,9 +413,10 @@ fn outcome(irq: [u8; 3]) -> Option<Result<()>> {
 
 impl<B: Bus> Reader for St25r100<B> {
     fn reset_field(&mut self) -> Result<()> {
-        self.write(reg::OPERATION, &[OP_EN])?;
+        let ready = self.op_ready();
+        self.write(reg::OPERATION, &[ready])?;
         sleep(FIELD_RESET);
-        self.write(reg::OPERATION, &[OP_EN | OP_RX_EN | OP_TX_EN])?;
+        self.write(reg::OPERATION, &[ready | OP_RX_EN | OP_TX_EN])?;
         sleep(GUARD);
         Ok(())
     }
@@ -279,7 +427,13 @@ impl<B: Bus> Reader for St25r100<B> {
         self.command(cmd::STOP_ALL)?;
         self.command(cmd::CLEAR_RX_GAIN)?;
         let tx = TX_PARITY | if exchange.crc { TX_CRC } else { 0 };
-        let rx = RX_B_SOF_EOF | RX_PARITY | if exchange.rx_crc() { RX_CRC } else { 0 };
+        let mut rx = RX_B_SOF_EOF | RX_PARITY | if exchange.rx_crc() { RX_CRC } else { 0 };
+        // The 15693 receiver wants the anticollision bit as well, on every exchange — ST's reader
+        // library sets it, and without it a tag's answer does not register (measured
+        // 2026-10-27).
+        if matches!(self.proto, Proto::V) {
+            rx |= RX_ANTCL;
+        }
         self.write(reg::PROTOCOL_TX1, &[tx])?;
         self.write(reg::PROTOCOL_RX1, &[rx])?;
         let ticks = nrt_ticks(exchange.timeout_ms).to_be_bytes();
@@ -353,6 +507,79 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// A chip as a register file: writes land (auto-incremented), reads answer from it, direct
+    /// commands are accepted and do nothing.
+    struct Registers([u8; 0x40]);
+
+    impl Bus for Registers {
+        fn transfer(&mut self, tx: &[u8], rx: &mut [u8]) -> std::io::Result<()> {
+            let (&first, values) = tx.split_first().expect("a transaction is never empty");
+            if first & READ != 0 {
+                let at = (first & 0x3f) as usize;
+                rx.copy_from_slice(&self.0[at..at + rx.len()]);
+            } else if first < FIFO {
+                let at = first as usize;
+                self.0[at..at + values.len()].copy_from_slice(values);
+            }
+            Ok(())
+        }
+    }
+
+    fn powered_up() -> St25r100<Registers> {
+        let mut regs = [0u8; 0x40];
+        regs[reg::IC_IDENTITY as usize] = 0xa9;
+        regs[reg::DISPLAY1 as usize] = OSC_OK;
+        regs[reg::IRQ_STATUS1 as usize + 2] = I_DCT;
+        // Power-on values of the registers ISO 15693 changes (§5.13), so the masks have bits to keep.
+        regs[reg::TX_MOD as usize] = 0x70;
+        regs[reg::RX_ANA2 as usize] = 0x08;
+        regs[reg::CORR4 as usize] = 0xaa;
+        regs[reg::PROTOCOL as usize] = 0x01;
+        regs[reg::RX_DIG as usize] = 0x4c;
+        let mut chip = St25r100::new(Registers(regs), Antenna::One);
+        chip.begin().unwrap();
+        chip
+    }
+
+    /// The promise that keeps NTAG reading as it was: a trip through ISO 15693 leaves every
+    /// register it touched as `begin` had it, and the AM regulator off.
+    #[test]
+    fn back_from_iso15693_every_register_is_as_begin_left_it() {
+        let mut chip = powered_up();
+        let before = chip.bus.0;
+        assert_eq!(before[reg::OPERATION as usize] & OP_AM_EN, 0);
+
+        chip.set_proto(Proto::V).unwrap();
+        let v = chip.bus.0;
+        assert_eq!(v[reg::PROTOCOL as usize] & OM_MASK, OM_ISO15693);
+        assert_eq!(
+            v[reg::TX_MOD as usize],
+            0x41,
+            "12% AM through the regulator"
+        );
+        assert_eq!(v[reg::RX_ANA2 as usize], 0x04);
+        assert_eq!(v[reg::CORR5 as usize] & EN_SUBC_END, EN_SUBC_END);
+        assert_ne!(v[reg::OPERATION as usize] & OP_AM_EN, 0);
+        chip.reset_field().unwrap();
+        assert_ne!(chip.bus.0[reg::OPERATION as usize] & OP_AM_EN, 0);
+
+        chip.set_proto(Proto::A).unwrap();
+        for r in NFCV_REGS {
+            assert_eq!(
+                chip.bus.0[r as usize], before[r as usize],
+                "register 0x{r:02x}"
+            );
+        }
+        chip.reset_field().unwrap();
+        assert_eq!(chip.bus.0[reg::OPERATION as usize] & OP_AM_EN, 0);
+    }
+
+    #[test]
+    fn a_protocol_switch_before_begin_is_refused() {
+        let mut chip = St25r100::new(Registers([0; 0x40]), Antenna::One);
+        assert!(chip.set_proto(Proto::V).is_err());
     }
 
     #[test]

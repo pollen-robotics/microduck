@@ -51,6 +51,18 @@ impl Default for ArchiveLimits {
 /// set, so a production robot won't install a team member's local build.
 const DEV_KEY_SUFFIX: &str = ".dev.pub";
 
+/// The team dev key, carried in the binary so a dev board needs no key file copied onto it.
+///
+/// Always dev-only: it counts only when dev keys are allowed, which on a robot that has not been
+/// made a dev board they are not. Built in rather than shipped in `trusted_keys/` because that
+/// directory is `/etc` — replaced by an A/B OS update — and because a file there is one more
+/// thing to get wrong by hand (a copy under any name not ending `.dev.pub` would be trusted as a
+/// *release* key). `docs/design/updater-design.md` §5.4.
+pub const BUILTIN_DEV_KEY: &str = include_str!("../../deploy/dev-key/team.dev.pub");
+
+/// The id the built-in dev key is logged under when it admits an artifact.
+pub const BUILTIN_DEV_KEY_ID: &str = "team.dev.pub (built in)";
+
 pub struct TrustedKey {
     /// Filename, so the update log can record which key admitted an artifact.
     pub id: String,
@@ -136,6 +148,22 @@ impl KeyRing {
             keys,
             allow_dev_keys,
         })
+    }
+
+    /// Add [`BUILTIN_DEV_KEY`], dev-only.
+    ///
+    /// After [`Self::load`], never instead of it: the empty-directory check stays about the
+    /// directory, so a misconfigured `trusted_keys_dir` is still fatal rather than a keyring
+    /// holding only a key that most robots will not use.
+    pub fn with_builtin_dev_key(mut self) -> Result<Self, Error> {
+        let key = PublicKey::decode(BUILTIN_DEV_KEY)
+            .map_err(|e| Error::Config(format!("built-in dev key: {e}")))?;
+        self.keys.push(TrustedKey {
+            id: BUILTIN_DEV_KEY_ID.to_owned(),
+            dev_only: true,
+            key,
+        });
+        Ok(self)
     }
 
     /// Construct directly. For tests, and for callers that already hold keys.
@@ -467,6 +495,30 @@ mod tests {
         assert_eq!(ring.usable().count(), 1, "dev key must be excluded");
 
         let ring = KeyRing::load(dir.path(), true).unwrap();
+        assert_eq!(ring.usable().count(), 2);
+    }
+
+    #[test]
+    fn builtin_dev_key_counts_only_when_dev_keys_are_allowed() {
+        let (_, pk) = keypair();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("prod.pub"), &pk).unwrap();
+
+        let ring = KeyRing::load(dir.path(), false)
+            .unwrap()
+            .with_builtin_dev_key()
+            .unwrap();
+        assert_eq!(ring.keys.len(), 2);
+        assert_eq!(
+            ring.usable().count(),
+            1,
+            "built-in dev key must be excluded"
+        );
+
+        let ring = KeyRing::load(dir.path(), true)
+            .unwrap()
+            .with_builtin_dev_key()
+            .unwrap();
         assert_eq!(ring.usable().count(), 2);
     }
 

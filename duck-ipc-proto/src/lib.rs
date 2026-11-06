@@ -485,7 +485,38 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// installs. Served by `updaterd`, which hands the work to the image's `microduck-osupdate`
 /// ([`OsStatus`]). New routes: an `updaterd` predating them answers METHOD_NOT_FOUND, and a board
 /// whose image has no A/B slots answers [`code::NOT_SUPPORTED`].
-pub const API_VERSION: u32 = 46;
+///
+/// # v47 — anonymous usage data
+///
+/// [`method::TELEMETRY_STATUS`] and [`method::TELEMETRY_SET`]: whether the robot shares anonymous
+/// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
+/// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
+///
+/// # v48 — hardware that goes quiet on a running robot
+///
+/// [`BusHealth::missing`] and [`ImuHealth::missing`] are no longer only about the bus coming up.
+/// During a run of failed reads `robotd` pings every servo and the IMU board and fills them the
+/// same way, and `robot.health` reports **degraded** naming what went silent — the verdict the
+/// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
+/// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
+/// shapes: an older reader prints the read failures and does not see the names.
+///
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+///
+/// # v50 — the remote-session check sees WebRTC peers
+///
+/// `os.apply` and `os.switch` are permitted over WebRTC. The preflight's remote-session check,
+/// which `robotd` used to answer with a constant `false`, now counts `mediad`'s WebRTC peers
+/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with the new
+/// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
+/// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
+/// `updaterd`'s question, refused to every client.
+pub const API_VERSION: u32 = 50;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -519,6 +550,16 @@ pub const ROBOT_MODEL: &str = "microduck";
 pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
+
+/// The file in `updaterd`'s `state_dir` whose presence makes this robot a dev board: it trusts
+/// the team dev key `updaterd` carries built in, so `robotctl update apply --ref <branch>`
+/// installs what CI built for that branch.
+///
+/// `robotctl configure --allow-dev-daemon on|off` writes and removes it; `updaterd` reads it at
+/// startup. A file in `state_dir` rather than a key in `updater.toml` because `/etc` is the
+/// image's on an A/B robot and an OS update replaces it, while `state_dir` is under
+/// `/var/lib/robot`, which survives. `docs/design/updater-design.md` §5.4 owns the mechanism.
+pub const DEV_BUILDS_MARKER: &str = "allow-dev-builds";
 
 pub mod led;
 pub mod vetbook;
@@ -659,8 +700,6 @@ pub mod method {
     pub const ROBOT_HEALTH: &str = "robot.health";
     /// Which model API version does this build implement?
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
-    /// Is a telepresence session live?
-    pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
 
     // ── intents ──────────────────────────────────────────────────────────────
     //
@@ -912,6 +951,17 @@ pub mod method {
     /// Reboot into the other slot as it is, with no download: the way back from an OS update.
     pub const OS_SWITCH: &str = "os.switch";
 
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    //
+    // Anonymous usage data, sent to PostHog: on by default, and this is the owner's switch.
+    // Served by `updaterd`, which has the network stack and is up whenever the board is. What is
+    // sent and what never is: `docs/robot/telemetry.md`.
+
+    /// Whether this robot shares anonymous usage data.
+    pub const TELEMETRY_STATUS: &str = "telemetry.status";
+    /// Turn sharing on or off, at once and across reboots. Off also forgets the random robot id.
+    pub const TELEMETRY_SET: &str = "telemetry.set";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -1083,6 +1133,11 @@ pub mod code {
     /// board whose image has no A/B slots. Not [`METHOD_NOT_FOUND`]: the daemon has the route,
     /// and upgrading the app would not change the answer.
     pub const NOT_SUPPORTED: i32 = 15;
+    /// An update refused only because a WebRTC peer is connected and it would drop them. Its own
+    /// code, not [`PREFLIGHT_FAILED`], because a client answers it differently from every other
+    /// refusal: it asks its user whether to drop them, and on yes sends the same call again with
+    /// `interrupt_sessions`. Matching a message would break the first time it was reworded.
+    pub const SESSIONS_CONNECTED: i32 = 16;
 }
 
 /// Request identifier. `None` on a [`Request`] makes it a notification.
@@ -1123,7 +1178,6 @@ pub enum Call {
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
-    RobotRemoteSessionActive,
 
     // ── intents ──────────────────────────────────────────────────────────────
     /// Continuous. Send as a notification.
@@ -1220,6 +1274,12 @@ pub enum Call {
     OsApply(OsApplyParams),
     /// Reboot into the other slot; see [`method::OS_SWITCH`].
     OsSwitch(OsSwitchParams),
+
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    /// Whether usage data is shared; see [`method::TELEMETRY_STATUS`].
+    TelemetryStatus,
+    /// Turn sharing on or off; see [`method::TELEMETRY_SET`].
+    TelemetrySet(TelemetrySetParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -1336,7 +1396,6 @@ impl Call {
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
-            Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotLook(_) => method::ROBOT_LOOK,
@@ -1380,6 +1439,8 @@ impl Call {
             Call::OsCheck => method::OS_CHECK,
             Call::OsApply(_) => method::OS_APPLY,
             Call::OsSwitch(_) => method::OS_SWITCH,
+            Call::TelemetryStatus => method::TELEMETRY_STATUS,
+            Call::TelemetrySet(_) => method::TELEMETRY_SET,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1538,6 +1599,8 @@ impl Call {
             // worth of waiting, so a refusal the script makes at once comes back as an error
             // rather than as a phase. Long enough to want its own lane, and they change the robot.
             Call::OsApply(_) | Call::OsSwitch(_) => (Updater, Operation),
+            // A small file and a flag; the sending happens in a task `updaterd` owns.
+            Call::TelemetryStatus | Call::TelemetrySet(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1545,7 +1608,6 @@ impl Call {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
@@ -1688,6 +1750,7 @@ impl Call {
             Call::VetbookShare(p) => encode(p),
             Call::OsApply(p) => encode(p),
             Call::OsSwitch(p) => encode(p),
+            Call::TelemetrySet(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
@@ -1713,7 +1776,6 @@ impl Call {
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
@@ -1729,6 +1791,7 @@ impl Call {
             | Call::AccountLogout
             | Call::OsStatus
             | Call::OsCheck
+            | Call::TelemetryStatus
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1773,7 +1836,6 @@ impl Call {
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
-            method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
@@ -1830,6 +1892,8 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::OsSwitch(decode(params.or(Some(&empty)))?)
             }
+            method::TELEMETRY_STATUS => Call::TelemetryStatus,
+            method::TELEMETRY_SET => Call::TelemetrySet(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1932,7 +1996,6 @@ pub mod test_support {
             Call::RobotSafeToRestart,
             Call::RobotHealth,
             Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
             Call::RobotMove(MoveParams {
                 vx: 0.2,
                 vy: -0.1,
@@ -2020,6 +2083,8 @@ pub mod test_support {
             Call::OsSwitch(OsSwitchParams {
                 interrupt_sessions: true,
             }),
+            Call::TelemetryStatus,
+            Call::TelemetrySet(TelemetrySetParams { enabled: false }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -3021,6 +3086,23 @@ pub struct OsSwitchParams {
     pub interrupt_sessions: bool,
 }
 
+/// Parameters of [`Call::TelemetrySet`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySetParams {
+    pub enabled: bool,
+}
+
+/// Answer to both `telemetry.*` calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryResult {
+    /// The owner's choice, as stored.
+    pub enabled: bool,
+    /// Whether anything is actually sent: `enabled`, and no `MICRODUCK_TELEMETRY=0` or
+    /// `DO_NOT_TRACK=1` in `updaterd`'s environment.
+    pub active: bool,
+}
+
 /// Answer to every `os.*` call: the board's two slots, what its channel offers, and where an
 /// update has got to.
 ///
@@ -3710,6 +3792,11 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
+        reason: String,
+    },
 }
 
 /// One line of an update's transcript.
@@ -3954,10 +4041,11 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
-    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
-    /// round, in that table's order. Empty once the bus is up, before the first round, and when
-    /// the port itself would not open. All fifteen is servo power off; some of them is servos
-    /// unplugged, and naming them is the point.
+    /// The expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping round, in that
+    /// table's order. Rounds run while `robotd` waits for the bus, and on a running loop during a
+    /// run of failed reads (non-zero `consecutive_errors`). Empty on a working bus, before the
+    /// first round, and when the port would not open or the ping itself failed. All fifteen is
+    /// servo power off; some of them is servos unplugged, and naming them is the point.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<u8>,
 }
@@ -4017,10 +4105,10 @@ pub struct ImuHealth {
     /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
     /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
     pub consecutive_stale_blocks: u64,
-    /// While the bus is coming up: every servo answered its ping and the IMU board did not.
-    /// `robotd` waits rather than run without orientation, so this is also why it is not
-    /// ticking. Cleared once the bus is up; never set at runtime, where a board that stops
-    /// answering shows as consecutive bus read failures instead.
+    /// Every servo answered its ping and the IMU board did not — the same rounds as
+    /// [`BusHealth::missing`]. While the bus is coming up `robotd` waits rather than run without
+    /// orientation, so this is also why it is not ticking; on a running loop it is why the reads
+    /// are failing. Cleared once a read succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }
@@ -4429,12 +4517,6 @@ pub struct ModelApiResult {
     /// Sensor-input / actuator-output contract this build implements
     /// (`updater-design.md` §5.5).
     pub model_api: u32,
-}
-
-/// Answer to [`Call::RobotRemoteSessionActive`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionActiveResult {
-    pub active: bool,
 }
 
 // ── net.* results ────────────────────────────────────────────────────────────
@@ -5735,13 +5817,52 @@ fn camera_stats_path() -> std::path::PathBuf {
 
 /// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
 pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
-    let path = camera_stats_path();
+    publish_camera_stats_at(&camera_stats_path(), stats)
+}
+
+/// [`publish_camera_stats`] at `path`.
+///
+/// Written aside and renamed into place, because [`read_webrtc_peers`] gates an OS update on this
+/// file and a reader catching it half-written would read "nobody is connected".
+fn publish_camera_stats_at(path: &std::path::Path, stats: &CameraStats) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
     json.push(b'\n');
-    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+    let aside = path.with_extension("json.new");
+    std::fs::write(&aside, json).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// How old [`CameraStats`] may be and still count as `mediad`'s answer. It is rewritten every
+/// second while the camera delivers frames, so this is several missed rewrites.
+pub const CAMERA_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many WebRTC peers `mediad` is serving right now, or `None` when it is not saying.
+///
+/// The one answer to "is someone on a call with this robot?". `updaterd`'s preflight asks it
+/// before an update that would drop the call, and `mediad` asks it to tell a session that is
+/// alone from one with company (`updater-design.md` §7.2).
+///
+/// `None` — `mediad` stopped, no camera, a file older than [`CAMERA_STATS_MAX_AGE`] — is for the
+/// caller to read, and the updater reads it as nobody: its check is a courtesy and must never be
+/// the reason a recovery update is refused.
+pub fn read_webrtc_peers() -> Option<u32> {
+    webrtc_peers_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    // A file from the future is a clock that stepped, not a fresh answer; either way it is not old.
+    if now
+        .duration_since(modified)
+        .is_ok_and(|age| age > CAMERA_STATS_MAX_AGE)
+    {
+        return None;
+    }
+    let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(stats.consumers)
 }
 
 /// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
@@ -5908,6 +6029,49 @@ mod tests {
     use super::test_support::every_call;
     use super::*;
 
+    fn camera_stats(consumers: u32) -> CameraStats {
+        CameraStats {
+            fps: 30.0,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 1,
+            dropped: 0,
+            consumers,
+        }
+    }
+
+    /// The count an OS update is gated on: read back as written, and only while it is fresh.
+    #[test]
+    fn webrtc_peers_are_read_only_while_fresh() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(webrtc_peers_at(&path, now), None, "no file is no answer");
+
+        publish_camera_stats_at(&path, &camera_stats(2)).unwrap();
+        assert_eq!(webrtc_peers_at(&path, now), Some(2));
+        assert!(
+            !path.with_extension("json.new").exists(),
+            "renamed into place"
+        );
+
+        let later = now + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            webrtc_peers_at(&path, later),
+            None,
+            "a stopped writer is no answer"
+        );
+
+        std::fs::write(&path, b"{\"fps\":").unwrap();
+        assert_eq!(
+            webrtc_peers_at(&path, now),
+            None,
+            "a torn file is no answer"
+        );
+    }
+
     /// The path a release actually installs to, which is what makes "which version is running"
     /// answerable at all.
     #[test]
@@ -6038,7 +6202,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            77,
+            78,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

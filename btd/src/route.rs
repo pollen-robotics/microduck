@@ -138,6 +138,10 @@ fn permits(call: &proto::Call) -> bool {
         OsStatus | OsCheck => true,
         OsApply(_) | OsSwitch(_) => true,
 
+        // The owner's switch for anonymous usage data. The phone is where an owner looks for a
+        // privacy setting, and the reply is two booleans.
+        TelemetryStatus | TelemetrySet(_) => true,
+
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => true,
 
@@ -235,10 +239,10 @@ fn permits(call: &proto::Call) -> bool {
         ResetToGolden(_) => false,
 
         // `updaterd`'s private questions to `robotd` — may I restart the control loop, which
-        // model API is this, is a telepresence session live. Internal plumbing of the update
+        // model API is this. Internal plumbing of the update
         // decision, of no use to a client and misleading if exposed: a phone reading
         // `safeToRestart` would learn nothing it could act on.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi => false,
 
         // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
         // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
@@ -730,7 +734,6 @@ mod tests {
             }),
             proto::Call::RobotSafeToRestart,
             proto::Call::RobotModelApi,
-            proto::Call::RobotRemoteSessionActive,
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());
         }

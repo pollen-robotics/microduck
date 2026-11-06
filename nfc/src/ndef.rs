@@ -1,4 +1,4 @@
-//! NDEF, read-only and limited to text and URI records — and the Bluetooth address in them.
+//! NDEF, read-only and limited to text and URI records — and whether they ask to pair a gamepad.
 //!
 //! Pure: no hardware, entirely testable off a board.
 
@@ -170,37 +170,13 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
-/// The first Bluetooth address in these records, as `AA:BB:CC:DD:EE:FF`.
-///
-/// Written by a person, so spelled however they like: `:` or `-` between the octets or nothing,
-/// either case, inside other text. Twelve hex digits with a separator used consistently, and
-/// not part of a longer run of hex — which is what keeps a serial number from reading as one.
-pub fn mac_in(records: &[Record]) -> Option<String> {
-    records.iter().find_map(|r| mac_in_text(r.value()))
-}
+/// What a pairing tag holds: every one is written with this text, and none names a pad.
+pub const PAIRING: &str = "microduck_gamepad_pairing";
 
-fn mac_in_text(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let hex = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_hexdigit);
-    for start in 0..bytes.len() {
-        if start > 0 && hex(start - 1) {
-            continue;
-        }
-        for sep in [Some(b':'), Some(b'-'), None] {
-            let step = if sep.is_some() { 3 } else { 2 };
-            let end = start + 5 * step + 2;
-            let fits = (0..6).all(|k| hex(start + k * step) && hex(start + k * step + 1))
-                && (1..6).all(|k| sep.is_none_or(|s| bytes.get(start + k * step - 1) == Some(&s)))
-                && !hex(end);
-            if fits {
-                let octets: Vec<String> = (0..6)
-                    .map(|k| text[start + k * step..start + k * step + 2].to_ascii_uppercase())
-                    .collect();
-                return Some(octets.join(":"));
-            }
-        }
-    }
-    None
+/// Does one of these records say "pair a gamepad"? The whole record, surrounding whitespace aside —
+/// a tag that merely mentions it in other text is not a pairing tag.
+pub fn asks_to_pair(records: &[Record]) -> bool {
+    records.iter().any(|r| r.value().trim() == PAIRING)
 }
 
 #[cfg(test)]
@@ -222,8 +198,8 @@ mod tests {
 
     #[test]
     fn a_text_record_reads_back_without_its_language() {
-        let records = parse(&text_tag("98:B6:E9:28:06:09")).unwrap();
-        assert_eq!(records, vec![Record::Text("98:B6:E9:28:06:09".into())]);
+        let records = parse(&text_tag(PAIRING)).unwrap();
+        assert_eq!(records, vec![Record::Text(PAIRING.into())]);
     }
 
     #[test]
@@ -237,7 +213,7 @@ mod tests {
 
     #[test]
     fn the_tlv_size_is_known_from_the_first_bytes() {
-        let tag = text_tag("98:B6:E9:28:06:09");
+        let tag = text_tag(PAIRING);
         assert_eq!(tlv_size(&tag), Some(2 + tag[1] as usize + 1));
         assert_eq!(tlv_size(&[0x00, 0x00]), None);
     }
@@ -248,17 +224,25 @@ mod tests {
         assert_eq!(parse(&[TLV_NDEF, 0, TLV_TERMINATOR]).unwrap(), vec![]);
     }
 
+    /// Phone NFC apps write a Lock Control TLV ahead of the record; the walk has to skip
+    /// unknown TLVs by their length, which is what keeps such a tag readable.
     #[test]
-    fn an_address_is_found_however_it_is_spelled() {
-        let mac = |s: &str| mac_in(&[Record::Text(s.into())]);
-        let want = Some("98:B6:E9:28:06:09".to_owned());
-        assert_eq!(mac("98:B6:E9:28:06:09"), want);
-        assert_eq!(mac("pad=98-b6-e9-28-06-09 !"), want);
-        assert_eq!(mac("98b6e9280609"), want);
-        // Mixed separators, or a longer run of hex, are not an address.
-        assert_eq!(mac("98:B6-E9:28:06:09"), None);
-        assert_eq!(mac("198:B6:E9:28:06:09"), None);
-        assert_eq!(mac("98b6e92806091"), None);
-        assert_eq!(mac("nothing here"), None);
+    fn a_lock_tlv_ahead_of_the_message_is_walked_past() {
+        let mut tag = vec![0x01, 0x03, 0xA0, 0x0C, 0x34]; // a phone app's lock TLV
+        tag.extend(text_tag(PAIRING));
+        assert!(asks_to_pair(&parse(&tag).unwrap()));
+    }
+
+    #[test]
+    fn only_the_pairing_text_itself_asks_to_pair() {
+        let asks = |r: Record| asks_to_pair(&[r]);
+        assert!(asks(Record::Text(PAIRING.into())));
+        assert!(asks(Record::Text(format!(" {PAIRING}\n"))));
+        assert!(asks(Record::Uri(PAIRING.into())));
+        // The old tags, an address and nothing else, no longer pair anything.
+        assert!(!asks(Record::Text("98:B6:E9:28:06:09".into())));
+        assert!(!asks(Record::Text(format!("not {PAIRING}"))));
+        assert!(!asks(Record::Text("MICRODUCK_GAMEPAD_PAIRING".into())));
+        assert!(!asks_to_pair(&[]));
     }
 }

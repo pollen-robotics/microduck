@@ -610,6 +610,96 @@ fn become_program(program: &str, argv: &[String]) -> Result<(), Box<dyn std::err
     }
 }
 
+/// How long a remembered address gets to answer on port 22 before the radio is turned on instead.
+///
+/// A robot on the same LAN answers a SYN in milliseconds; this is generous for wifi and still a
+/// tenth of [`SCAN_TIME`], which is what it is saving.
+const REMEMBERED_PROBE: Duration = Duration::from_millis(800);
+
+/// How many robots' addresses are remembered. A bench, not a fleet.
+const REMEMBERED_ROBOTS: usize = 16;
+
+/// Where the last address of each robot is kept: `$XDG_CACHE_HOME/duckctl/addresses`, else
+/// `~/.cache/duckctl/addresses`, else under `%LOCALAPPDATA%`.
+///
+/// A cache in the strict sense — deleting it costs one scan and nothing else — so it goes where
+/// caches go rather than beside configuration.
+fn remembered_path() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))?;
+    Some(base.join("duckctl").join("addresses"))
+}
+
+/// The remembered address for `wanted`, or for whichever robot was reached last when nobody named
+/// one — the same "no name, first one wins" rule the scan follows, with the last run as "first".
+///
+/// One line per robot, most recent first: the address, a space, and the name it advertised under.
+/// Address first because a macOS name can have spaces in it (`radxa-zero3 [duck-c51b]`).
+fn recall(contents: &str, wanted: Option<&str>) -> Option<(Ipv4Addr, String)> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (address, name) = line.split_once(' ')?;
+            Some((address.parse().ok()?, name.to_owned()))
+        })
+        .find(|(_, name)| wanted.is_none_or(|wanted| answers_to(name, wanted)))
+}
+
+/// `contents` with `name` at `address` moved to the top, and any older line for that robot gone.
+fn remembered(contents: &str, name: &str, address: &str) -> String {
+    let mut lines = vec![format!("{address} {name}")];
+    lines.extend(
+        contents
+            .lines()
+            .filter(|line| line.split_once(' ').is_some_and(|(_, other)| other != name))
+            .take(REMEMBERED_ROBOTS - 1)
+            .map(str::to_owned),
+    );
+    lines.join("\n") + "\n"
+}
+
+/// Note where a robot was found, for the next `ssh` or `scp` to try before scanning.
+///
+/// Best effort, and silent when it fails: a read-only home costs the next run a scan, which is what
+/// every run cost before this existed.
+fn remember(name: &str, address: &str) {
+    let Some(path) = remembered_path() else {
+        return;
+    };
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, remembered(&contents, name, address));
+}
+
+/// The remembered address for the target, if something there still answers on ssh's port.
+///
+/// **Only for `ssh` and `scp`**, because they are the commands that check what they reach: a robot
+/// whose lease went to another machine is a host-key warning from ssh, not a silent wrong answer.
+/// `ip` and `open` would print or browse to whatever holds the address now, so they always scan —
+/// and refresh this file as they do.
+///
+/// Nothing answering is the case this exists to fall through: the robot moved, is off, or this
+/// laptop is on another network. The scan then runs exactly as it would have, and records the new
+/// address.
+fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
+    let contents = std::fs::read_to_string(remembered_path()?).ok()?;
+    let (address, name) = recall(&contents, target.wanted())?;
+    let socket = std::net::SocketAddr::from((address, 22));
+    match std::net::TcpStream::connect_timeout(&socket, REMEMBERED_PROBE) {
+        Ok(_) => Some((address, name)),
+        Err(_) => {
+            eprintln!("{name} is no longer at {address}; scanning instead");
+            None
+        }
+    }
+}
+
 /// Where the console is, given where the robot is.
 ///
 /// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
@@ -1395,8 +1485,8 @@ enum Update {
         version: Option<duck_ipc_proto::semver::Version>,
         /// Install what a branch last built, e.g. `--ref my-branch`.
         ///
-        /// A dev build, so a robot only accepts one if the team key is in its trusted set and
-        /// `allow_dev_keys` is on: a customer robot refuses it.
+        /// A dev build, so a robot only accepts one once it is a dev board
+        /// (`sudo robotctl configure --allow-dev-daemon on` on it): a customer robot refuses it.
         #[arg(long = "ref", value_name = "REF", conflicts_with = "version")]
         git_ref: Option<String>,
         /// Install the release candidate from the staging channel.
@@ -1555,6 +1645,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // own terms, and finding the robot first would charge eight seconds for the privilege.
     if let Command::Scp { paths, .. } = &cli.command {
         scp_refusal(paths)?;
+    }
+
+    // The last address this robot was found at, before the eight seconds: a laptop reaches the
+    // same robot at the same address nearly every time. `recall_reachable` says why only these two.
+    if matches!(cli.command, Command::Ssh { .. } | Command::Scp { .. })
+        && let Some((address, name)) = recall_reachable(&target)
+    {
+        eprintln!("{name} at {address}, remembered from the last run");
+        return deliver(&cli.command, &address.to_string());
     }
 
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
@@ -1729,7 +1828,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // which a new lease has already broken ssh.
     if resolving {
         match choose(std::mem::take(&mut addresses), &target) {
-            Ok((Address::At(address), _)) => return deliver(&cli.command, &address.to_string()),
+            Ok((Address::At(address), name)) => {
+                let address = address.to_string();
+                remember(&name, &address);
+                return deliver(&cli.command, &address);
+            }
             // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
             // that did not say. Asking `net.status` over a connection would return the same nothing
             // more slowly, so this answers now.
@@ -1963,7 +2066,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
-                    Some(address) => deliver(&cli.command, address),
+                    Some(address) => {
+                        remember(&name, address);
+                        deliver(&cli.command, address)
+                    }
                     None => Err(no_address(&name).into()),
                 };
             }
@@ -2817,7 +2923,7 @@ fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static
     }
     // Only when something actually moved. `already_current` and `dry_run_passed` restart nothing.
     match reply["result"]["outcome"].as_str()? {
-        "applied" | "rolled_back" => Some(
+        "applied" | "rolled_back" | "stuck" => Some(
             "note: the robot restarts its daemons now, and `btd` about five seconds after this \
              reply — so this connection drops. That is the update working. Reconnect and run \
              `duckctl update status`: `last_attempt` carries the outcome of what just ran.",
@@ -2829,6 +2935,43 @@ fn restart_note(command: &Command, reply: &serde_json::Value) -> Option<&'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a name the last robot reached wins; with one, that robot's line, matched the way a
+    /// scan matches it — so `DUCK_ROBOT=duck-c51b` finds the line macOS wrote as a composite.
+    #[test]
+    fn recall_picks_the_last_robot_or_the_named_one() {
+        let contents = "192.168.1.42 radxa-zero3 [duck-c51b]\n10.0.0.7 duck-ffff\n";
+        let last = (
+            Ipv4Addr::new(192, 168, 1, 42),
+            "radxa-zero3 [duck-c51b]".to_owned(),
+        );
+        assert_eq!(recall(contents, None), Some(last.clone()));
+        assert_eq!(recall(contents, Some("duck-c51b")), Some(last));
+        assert_eq!(
+            recall(contents, Some("duck-ffff")),
+            Some((Ipv4Addr::new(10, 0, 0, 7), "duck-ffff".to_owned()))
+        );
+        assert_eq!(recall(contents, Some("duck-0000")), None);
+        assert_eq!(
+            recall("garbage\n", None),
+            None,
+            "an unreadable line is skipped"
+        );
+    }
+
+    /// A robot that moved has one line, at the top, with its new address.
+    #[test]
+    fn remembering_moves_the_robot_to_the_top() {
+        let before = "10.0.0.7 duck-ffff\n192.168.1.42 duck-c51b\n";
+        assert_eq!(
+            remembered(before, "duck-c51b", "192.168.1.50"),
+            "192.168.1.50 duck-c51b\n10.0.0.7 duck-ffff\n"
+        );
+        assert_eq!(
+            remembered("", "duck-c51b", "1.2.3.4"),
+            "1.2.3.4 duck-c51b\n"
+        );
+    }
 
     /// The ordinary case, and the only one on Linux: one name, reported as it was advertised.
     #[test]
