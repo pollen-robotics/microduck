@@ -183,14 +183,17 @@ impl Reprojector {
                 zones[i] = Zone::Floor { point };
                 continue;
             }
-            let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
-            if horizontal < Self::MIN_RANGE_M {
+            let horizontal_from_sensor =
+                r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
+            if horizontal_from_sensor < Self::MIN_RANGE_M {
                 zones[i] = Zone::TooClose;
                 continue;
             }
+            let px_level = r.mul_add(dir_level[0], sensor_level[0]);
+            let py_level = r.mul_add(dir_level[1], sensor_level[1]);
             zones[i] = Zone::Hit {
                 point,
-                range: horizontal,
+                range: px_level.hypot(py_level),
             };
         }
         zones
@@ -260,7 +263,39 @@ mod tests {
         assert!((0.8..=1.2).contains(&point[0]), "x: {point:?}");
         assert!(point[1].abs() < 0.3, "y: {point:?}");
         assert!((point[2] - sensor.pos[2]).abs() < 0.3, "z: {point:?}");
-        assert!((0.8..=1.05).contains(&range), "range: {range}");
+        assert!((0.8..=1.2).contains(&range), "range: {range}");
+        // On level posture, range from trunk origin's vertical axis matches hypot(point.x, point.y)
+        assert!(
+            (range - point[0].hypot(point[1])).abs() < 1e-6,
+            "range {range} should match horizontal distance from trunk origin {}",
+            point[0].hypot(point[1])
+        );
+    }
+
+    /// `Zone::Hit.range` is the horizontal distance from the trunk origin's
+    /// vertical axis, not from the sensor (issue #430).
+    #[test]
+    fn hit_range_is_measured_from_trunk_axis() {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk(LEVEL);
+        assert!(
+            sensor.pos[0] > 0.05,
+            "sensor is forward of trunk: {:?}",
+            sensor.pos
+        );
+
+        let r = 0.30;
+        let zones = rp.project(&one_return(CENTRE, r), LEVEL, &Posture::default());
+        let Zone::Hit { point, range } = zones[CENTRE] else {
+            panic!("expected a hit, got {:?}", zones[CENTRE]);
+        };
+
+        let trunk_axis_dist = point[0].hypot(point[1]);
+        assert!((range - trunk_axis_dist).abs() < 1e-6);
+        assert!(
+            range > r + 0.05,
+            "range {range} must exceed return distance {r} by sensor offset"
+        );
     }
 
     /// Head pitched down: a bottom-row beam at floor distance is the floor;
