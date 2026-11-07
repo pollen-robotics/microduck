@@ -96,8 +96,9 @@ impl Reprojector {
     /// the prototype's tuned value.
     pub const FLOOR_SAFETY: f64 = 0.85;
 
-    /// Returns closer than this (horizontally) are discarded: under ~10 cm the
-    /// sensor's own crosstalk produces phantom short readings.
+    /// Returns closer than this horizontally to the sensor are discarded:
+    /// under ~10 cm its own crosstalk produces phantom short readings. This
+    /// is sensor-relative, unlike the trunk-axis distance in [`Zone::Hit`].
     pub const MIN_RANGE_M: f64 = 0.10;
 
     pub fn new(model: &'static Model) -> Self {
@@ -188,9 +189,14 @@ impl Reprojector {
                 zones[i] = Zone::TooClose;
                 continue;
             }
+            // The noise band above is the sensor's own, so it is judged from
+            // the sensor; the range a consumer compares against a stop
+            // threshold is from the trunk origin's vertical axis, as
+            // `Zone::Hit` documents (#430).
+            let point_level = level.rotate(point);
             zones[i] = Zone::Hit {
                 point,
-                range: horizontal,
+                range: point_level[0].hypot(point_level[1]),
             };
         }
         zones
@@ -260,7 +266,9 @@ mod tests {
         assert!((0.8..=1.2).contains(&point[0]), "x: {point:?}");
         assert!(point[1].abs() < 0.3, "y: {point:?}");
         assert!((point[2] - sensor.pos[2]).abs() < 0.3, "z: {point:?}");
-        assert!((0.8..=1.05).contains(&range), "range: {range}");
+        // The alpha mount is about 8.2 cm ahead of the trunk axis. A
+        // sensor-relative result (~0.999 m) must fail this sanity check.
+        assert!((1.08..=1.09).contains(&range), "range: {range}");
     }
 
     /// Head pitched down: a bottom-row beam at floor distance is the floor;
@@ -389,5 +397,47 @@ mod tests {
             l[1] > a[1] + 0.3,
             "a yawed-left head must place the return further left: {a:?} vs {l:?}"
         );
+    }
+
+    /// `range` is the horizontal distance from the trunk origin's vertical
+    /// axis, as `Zone::Hit` documents (#430) — not from the sensor, which
+    /// sits several centimetres forward of that axis.
+    fn assert_range_from_trunk_axis(head: [f64; 4], posture: &Posture, r: f64) {
+        let rp = Reprojector::alpha();
+        let zones = rp.project(&one_return(CENTRE, r), head, posture);
+        let Zone::Hit { point, range } = zones[CENTRE] else {
+            panic!("expected a hit, got {:?}", zones[CENTRE]);
+        };
+        let p = level_from_gravity(posture.gravity).rotate(point);
+        let expected = p[0].hypot(p[1]);
+        assert!(
+            (range - expected).abs() < 1e-9,
+            "range {range} is not the trunk-axis distance {expected} (head {head:?}, r {r})"
+        );
+    }
+
+    #[test]
+    fn hit_range_is_from_the_trunk_axis_level_head() {
+        for r in [0.3, 1.0, 2.5] {
+            assert_range_from_trunk_axis(LEVEL, &Posture::default(), r);
+        }
+    }
+
+    #[test]
+    fn hit_range_is_from_the_trunk_axis_walking_head() {
+        for r in [0.3, 1.0] {
+            assert_range_from_trunk_axis([0.3, 0.2, 0.0, 0.0], &Posture::default(), r);
+        }
+    }
+
+    /// With the trunk leaned, the distance is still measured in the levelled
+    /// frame: horizontal means the world's horizontal, not the trunk's.
+    #[test]
+    fn hit_range_is_from_the_trunk_axis_leaning_trunk() {
+        let posture = Posture {
+            gravity: [0.1, 0.05, -0.99],
+            ..Posture::default()
+        };
+        assert_range_from_trunk_axis(LEVEL, &posture, 0.5);
     }
 }
