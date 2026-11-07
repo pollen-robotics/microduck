@@ -294,8 +294,9 @@ Moving past it is `robotctl policy update` (§9.1), which is the thing that make
 reach a robot without a daemon release, and therefore the thing that makes this whole channel
 worth having.
 
-Three things it does not do. It does not re-download a set it already has, so an update whose pin
-is unchanged touches no network — which matters because the post-install hook runs under a
+Three things it does not do. It does not re-download a complete set it already has: its manifest
+and every listed file are present and nonempty, so an update whose pin is unchanged touches no
+network — which matters because the post-install hook runs under a
 120-second timeout and a hook that times out rolls the update back. It never installs a partial
 download: everything lands in a staging directory and `current` moves only once the whole set has
 arrived. And it does not replace a working set with an older one when a fetch fails — a
@@ -307,12 +308,19 @@ person could make, into a directory `robotd` shape-checks everything out of. The
 also what catches a truncated file, which is why no hashes are pinned here to go stale on every
 retrain.
 
-One rule makes that a bootstrap rather than a second home: **a set that is already installed is
-never replaced, whatever the pin says**. There are two states — something is installed, or
-nothing is — and only the second one fetches. Everything after the first install belongs to
-§9.1.
+An incomplete official seed **at the same pin** retries into staging when its manifest or a
+listed file is missing or empty. Same-version sets installed by other tools are left alone.
+Repairs alternate between `seed-<pin>` and `seed-<pin>-repair`, preserving the live directory
+until the replacement is complete. `policy update` keeps the actual predecessor directory,
+so updating a repaired seed retains that complete set rather than its old fallback.
 
-That rule got stricter after a board proved the looser one wrong. It used to replace an older
+HTTP 404 reports a missing manifest; timeout, HTTP 5xx and other curl failures report a fetch
+failure. Both permit a first fallback install for older tags. Without a local manifest later
+runs make one bounded manifest request, keeping the installed set until the manifest and every
+listed file arrive. Failed downloads remove staging and leave `current` alone. This also
+repairs fallbacks installed by older seeders, without an extra completeness marker.
+
+The no-downgrade rule followed a board proving the looser one wrong. It used to replace an older
 `seed-*` on the reasoning that a daemon update was still how a retrained gait reached a robot.
 `policy update` is now how, and the old rule became a trap: a board moved forward to `v2` by hand
 has `current -> releases/seed-v2`, which matches the pattern the seeder called its own, so the
