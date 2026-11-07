@@ -31,7 +31,17 @@ DRY_RUN=
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --space) SPACE="$2"; shift 2 ;;
+        --space)
+            # `set -u` turns a missing value into "unbound variable" with exit 1 and no hint
+            # about which flag; a following option would instead be swallowed as the Space id.
+            # Both are bad arguments, and this script answers those with a reason and exit 2.
+            [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ] || {
+                echo "--space needs an org/name" >&2
+                exit 2
+            }
+            SPACE="$2"
+            shift 2
+            ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
