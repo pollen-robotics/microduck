@@ -23,6 +23,9 @@ Steps 1 and 2 are the active scope. The beta board is a compatibility test devic
 do not replace production-image qualification. Movement tests require a clear test area and a
 supported robot pose; read-only control-channel tests can run on the desk.
 
+Step 3's proposed factory workflow, Recovery USB versus charge-port wiring, and outstanding
+hardware confirmations are documented in [factory provisioning](../design/factory-provisioning.md).
+
 ## Prepare one robot
 
 Choose a unique ASCII robot identifier. On a trusted computer, run this from the source checkout

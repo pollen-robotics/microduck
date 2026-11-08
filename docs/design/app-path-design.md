@@ -613,16 +613,8 @@ BLE session; once Wi-Fi joins, it uses that identity against the separate authen
 camera/control gateway. Desktop clients can be enrolled later by an owner app over the local
 gateway, without requiring a desktop Bluetooth bootstrap path.
 
-On face-board-v1, the practical first storage candidate is a root-only file under
-`/var/lib/robot/config` on the eMMC `data` partition, provisioned **after** the common image is
-flashed. `configd` would read it; unprivileged `btd` would receive only the authentication result.
-That partition survives daemon releases and RAUC A/B switches, but a full `.wic` reflash erases it.
-The board-ID 24C32 EEPROM and Rockchip vendor storage hold readable identity data, not a
-non-exportable secret. The design must explicitly fail closed if the `data` mount or credential is
-missing: the current OS permits a missing `data` partition to fall back to rootfs directories so
-recovery services can start. Recovery, transfer of ownership, and replacement after a full flash
-need a factory procedure. Root or physical eMMC access can still extract a software-held key; a
-stronger physical-attacker requirement would need separate hardware and boot-chain review.
+The proposed post-flash storage, Recovery USB factory sequence, QR verification, recovery and
+hardware acceptance gates are owned by [factory provisioning](factory-provisioning.md).
 
 **Decision required before implementation:** confirm manufacturing can generate, program, print,
 verify, and recover a distinct secret for each unit; confirm the mobile app can scan and protect
@@ -635,10 +627,9 @@ This is the contract to implement after the credential decision, not a descripti
 wire protocol. It applies to iOS and Android; the gamepad is a separate Bluetooth HID peer and
 never receives the robot's QR secret.
 
-1. Manufacturing generates a random 256-bit secret and a non-secret robot identifier. It writes
-   the secret to the robot after flashing the common image, prints a QR containing both values,
-   and verifies the printed QR against the programmed robot. The QR must not be derived from the
-   serial or Bluetooth address. The app stores it in the platform's protected credential store,
+1. Manufacturing provisions the random 256-bit secret and public robot identifier through the
+   proposed [factory workflow](factory-provisioning.md), including printed-QR verification.
+   The app stores the secret in the platform's protected credential store,
    never in analytics, logs, a backup export, or a URL. This requires an app storage migration:
    `microduck-app/src-tauri/src/remembered.rs` currently serializes the six-digit PIN in clear
    into `robots.json`. The new secret must never enter `Remembered`, JSON or webview state.
