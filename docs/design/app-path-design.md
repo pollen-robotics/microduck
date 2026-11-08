@@ -658,9 +658,10 @@ never receives the robot's QR secret.
    the other holds the PSK before serving application requests.
    References: [Noise specification §9](https://noiseprotocol.org/noise.html#pre-shared-symmetric-keys)
    and [`snow` builder documentation](https://docs.rs/snow/latest/snow/struct.Builder.html).
-   `duck-auth` now contains a shared, host-tested prototype of this exchange and protected
-   message state machine. Neither `btd` nor the app calls it yet; adding the crate does not make
-   current Bluetooth provisioning safe against an active intermediary.
+   `duck-auth` now contains the shared, host-tested exchange and protected message state
+   machine. `btd --secure-psk-file` serves it as an opt-in development mode; the matching app
+   branch is documented in [`authenticated-app-mvp.md`](../robot/authenticated-app-mvp.md).
+   Neither the installed service default nor production credential provisioning has changed.
 3. All privileged BLE RPCs, including `net.connect`, are encrypted and integrity-protected with
    distinct send/receive keys, sequence numbers and a session identifier. Reject replay, missing
    sequence numbers, unknown versions, failed key confirmation and plaintext privileged requests.
