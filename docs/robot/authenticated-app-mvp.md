@@ -51,4 +51,21 @@ app never writes the `md1:` code to `robots.json`.
 The app's legacy PIN path still opens LAN media directly. Treat this as an opt-in development
 MVP, not a production security claim. Before production: QR scanning, owner enrollment and
 revocation, protected device storage, factory credential provisioning and recovery, independent
-protocol review, rate limiting, and iOS/Android tests on the face-board-v1 image remain required.
+protocol review, rate limiting, iPhone testing, and tests on the production face-board-v1 image
+remain required.
+
+## Beta board validation (8 November 2026)
+
+The signed `0.18.9-dev.1646.c829879` daemon release passed this robot's update dry run and health
+gate on a face-board-v1 beta unit. With a temporary per-robot key and runtime-only service
+overrides, the Android debug app authenticated over BLE, read robot and Wi-Fi status, and displayed
+the camera through `duck-gateway`. The WebRTC control channel opened; no movement command was
+tested. A wrong gateway key was refused before `mediad` opened, and direct LAN access to port 8443
+was refused. The app's `robots.json` did not contain the setup code or key.
+
+Android's automatic GATT-triggered first bond timed out on the tested phone. Pairing in Android
+Bluetooth Settings first succeeded, after which the app's secure handshake and onboarding worked.
+The app PR fixes Android keyboard capitalization of `md1:` and explains the pairing recovery step;
+that follow-up build still needs a phone retest. iPhone, Wi-Fi password entry, unpaired writes,
+reconnection, and movement control remain unverified. The test key, phone bond, and runtime
+overrides were removed, and the robot was restored to its exact pre-test daemon release.
