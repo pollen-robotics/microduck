@@ -596,6 +596,32 @@ visible consent moment, a recovery path for a lost PIN, and defence in depth if 
 photographed — none needed for v1, each additive later, since an enclosure with a button can gate
 `set_pairable` without changing this design.
 
+### 5.4 Production credential proposal · **open decision**
+
+The six-digit PIN and the no-window decision above describe the development implementation, **not
+an approved production credential design**. A label-derived PIN is public to anyone who can read
+the label, and `000000` is public to everyone. Neither protects first pairing from an active radio
+attacker. The production proposal is a distinct, randomly generated secret of at least 128 bits per
+robot, delivered as a QR code and used in a reviewed mutual-authentication protocol that never
+sends the secret itself over the just-works BLE link. The current `system.authenticate` six-digit
+field and `configd` store cannot hold this credential; both protocol and mobile app need changes.
+
+On face-board-v1, the practical first storage candidate is a root-only file under
+`/var/lib/robot/config` on the eMMC `data` partition, provisioned **after** the common image is
+flashed. `configd` would read it; unprivileged `btd` would receive only the authentication result.
+That partition survives daemon releases and RAUC A/B switches, but a full `.wic` reflash erases it.
+The board-ID 24C32 EEPROM and Rockchip vendor storage hold readable identity data, not a
+non-exportable secret. The design must explicitly fail closed if the `data` mount or credential is
+missing: the current OS permits a missing `data` partition to fall back to rootfs directories so
+recovery services can start. Recovery, transfer of ownership, and replacement after a full flash
+need a factory procedure. Root or physical eMMC access can still extract a software-held key; a
+stronger physical-attacker requirement would need separate hardware and boot-chain review.
+
+**Decision required before implementation:** confirm manufacturing can generate, program, print,
+verify, and recover a distinct secret for each unit; confirm the mobile app can scan and protect
+it; agree on the physical-attacker threat model. Until then, this is a proposal in a draft PR, not
+a shipping claim or a reason to merge the BLE service default.
+
 ### 5.5 Encryption is currently off, and that is not settled  · **measured**
 
 The measurements below describe the original development setup. The production candidate now
@@ -603,8 +629,9 @@ defaults to encrypted pairing. On 2026-11-08 a real Android phone failed pairing
 `RequestConfirmation` to `bluer`'s empty agent, which rejected it. The candidate agent in `btd`
 advertises the board's real `NoInputNoOutput` capability while accepting that callback. This is
 still **unauthenticated** pairing: the robot cannot compare the displayed number, and an active
-attacker at pairing time remains in scope. A phone and board test must establish that the new
-agent actually yields an encrypted bond and that the application PIN gate still works.
+attacker at pairing time remains in scope. On 2026-11-08, the CI-built candidate did pair on an
+Android phone; the encrypted GATT read, pre-PIN refusal, and post-PIN `system.info` succeeded on a
+beta robot. iPhone, Wi-Fi provisioning, and the final production image remain untested.
 
 `encrypt_read` on the characteristic makes the read **hang** on macOS: CoreBluetooth issues the Read
 Request, BlueZ refuses it for insufficient encryption, and nothing resolves it — no prompt, no
