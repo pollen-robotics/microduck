@@ -6,6 +6,23 @@ normal PIN mode remains the installed default. The app branch is
 Do not install the secure mode until both matching builds are available. The development setup
 code is a bearer secret: anyone who sees it can authenticate to the robot.
 
+## Production roadmap and current scope
+
+The production goal is to protect camera/control access and Wi-Fi credentials, then qualify the
+exact shipping image. Work is ordered as follows:
+
+1. Reliable in-app Bluetooth onboarding, reconnects, wrong-key and unauthenticated-access tests
+   on Android and iPhone.
+2. Complete Wi-Fi provisioning, network rediscovery, camera/control and connection-loss tests.
+3. Factory provisioning of unique robot secrets, QR labels, protected app storage, ownership,
+   revocation and recovery.
+4. Triage and fix exploitable OS/kernel/bootloader/library findings on the actual shipping image.
+5. Qualify installation, update, rollback and recovery; independently review authentication.
+
+Steps 1 and 2 are the active scope. The beta board is a compatibility test device; results on it
+do not replace production-image qualification. Movement tests require a clear test area and a
+supported robot pose; read-only control-channel tests can run on the desk.
+
 ## Prepare one robot
 
 Choose a unique ASCII robot identifier. On a trusted computer, run this from the source checkout
