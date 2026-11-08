@@ -1,0 +1,184 @@
+//! Opt-in secure BLE session for development provisioning.
+//!
+//! A configured PSK replaces the PIN gate. There is no plaintext fallback in this mode.
+//! The key is supplied through a file at process startup; production provisioning and
+//! recovery are separate work and this module must not be enabled by default yet.
+
+use std::path::Path;
+
+use duck_auth::wire::{Frame, MAX_CLIENT_LINE, MAX_ROBOT_LINE};
+use duck_auth::{RobotConfirm, Session};
+use duck_ble::framing::{self, Reassembler};
+use tokio::sync::mpsc;
+
+use crate::link::{Link, QUEUE};
+use crate::session;
+use crate::upstream::{Pool, Sockets};
+
+#[derive(Clone)]
+pub struct Config {
+    key: [u8; 32],
+    robot_id: String,
+}
+
+impl Config {
+    /// Load a 64-character hex PSK. Neither the path nor the contents are logged.
+    pub fn load(path: &Path, robot_id: String) -> Result<Self, String> {
+        if robot_id.is_empty() || robot_id.len() > 128 || !robot_id.is_ascii() {
+            return Err("invalid robot identifier".into());
+        }
+        let text = std::fs::read_to_string(path).map_err(|_| "cannot read BLE credential")?;
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.len() != 64 || !text.is_ascii() {
+            return Err("BLE credential must be 64 hexadecimal characters".into());
+        }
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "BLE credential must be hexadecimal")?;
+        }
+        Ok(Self { key, robot_id })
+    }
+}
+
+enum State {
+    Start,
+    Confirm(RobotConfirm),
+    Ready(Session),
+}
+
+/// Serve one central; every inbound and outbound application line is Noise-protected.
+pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
+    let (replies_tx, mut replies) = mpsc::channel::<String>(QUEUE);
+    let config_socket = sockets.config.clone();
+    let mut pool = Pool::new(sockets, replies_tx);
+    let mut inbound = Reassembler::new();
+    let mut state = State::Start;
+    let mut authenticated = true;
+    let mut unused_attempts = 0;
+
+    loop {
+        tokio::select! {
+            chunk = link.inbound.recv() => {
+                let Some(chunk) = chunk else { break };
+                let Ok(lines) = inbound.push(&chunk) else { break };
+                for line in lines {
+                    let Ok(frame) = Frame::decode(&line, MAX_CLIENT_LINE) else { return };
+                    match (&mut state, frame) {
+                        (State::Start, Frame::Start(first)) => {
+                            let Ok((next, challenge)) = RobotConfirm::respond(&config.key, &config.robot_id, &first) else { return };
+                            state = State::Confirm(next);
+                            if send_frame(&link, Frame::Challenge(challenge)).await.is_err() { return }
+                        }
+                        (State::Confirm(_), Frame::Confirm(proof)) => {
+                            let State::Confirm(next) = std::mem::replace(&mut state, State::Start) else { unreachable!() };
+                            let Ok((ready, reply)) = next.receive(&proof) else { return };
+                            if send_frame(&link, Frame::Ready(reply)).await.is_err() { return }
+                            state = State::Ready(ready);
+                        }
+                        (State::Ready(secure), Frame::Data(ciphertext)) => {
+                            let Ok(plain) = secure.open(&ciphertext) else { return };
+                            let Ok(line) = std::str::from_utf8(&plain) else { return };
+                            if line.len() > framing::MAX_LINE { return }
+                            let outcome = session::dispatch(
+                                &mut pool, &config_socket, line, &mut authenticated, &mut unused_attempts,
+                            ).await;
+                            if let Some(reply) = outcome.response {
+                                let Ok(ciphertext) = secure.seal(reply.as_bytes()) else { return };
+                                if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
+                            }
+                            if outcome.close { return }
+                        }
+                        _ => return,
+                    }
+                }
+            }
+            line = replies.recv(), if matches!(state, State::Ready(_)) => {
+                let Some(line) = line else { break };
+                let State::Ready(secure) = &mut state else { return };
+                let Ok(ciphertext) = secure.seal(line.as_bytes()) else { return };
+                if send_frame(&link, Frame::Data(ciphertext)).await.is_err() { return }
+            }
+        }
+    }
+}
+
+async fn send_frame(link: &Link, frame: Frame) -> Result<(), ()> {
+    let line = frame.encode(MAX_ROBOT_LINE).map_err(|_| ())?;
+    session::send_line(link, &line).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duck_auth::ClientStart;
+    use tokio::sync::mpsc::{Receiver, Sender};
+
+    async fn send(tx: &Sender<Vec<u8>>, frame: Frame) {
+        let line = frame.encode(MAX_CLIENT_LINE).unwrap();
+        for chunk in framing::chunks(&line, 20) {
+            tx.send(chunk).await.unwrap();
+        }
+    }
+
+    async fn receive(rx: &mut Receiver<Vec<u8>>, assembly: &mut Reassembler) -> Frame {
+        loop {
+            let chunk = rx.recv().await.unwrap();
+            if let Some(line) = assembly.push(&chunk).unwrap().into_iter().next() {
+                return Frame::decode(&line, MAX_ROBOT_LINE).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_session_rejects_plaintext_and_decrypts_rpc() {
+        let key = [0x71; 32];
+        let config = Config {
+            key,
+            robot_id: "test-duck".into(),
+        };
+        let sockets = Sockets {
+            config: "/tmp/no-configd-secure-test.sock".into(),
+            robot: "/tmp/no-robotd-secure-test.sock".into(),
+            updater: "/tmp/no-updaterd-secure-test.sock".into(),
+        };
+        let (link, to_robot, mut from_robot) = Link::pair(20, "test phone");
+        let task = tokio::spawn(run(link, sockets.clone(), config.clone()));
+        to_robot
+            .send(b"{\"method\":\"net.connect\"}\n".to_vec())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(from_robot.recv().await.is_none());
+
+        let (link, to_robot, mut from_robot) = Link::pair(20, "test phone");
+        let task = tokio::spawn(run(link, sockets, config));
+        let (phone, first) = ClientStart::begin(&key, "test-duck").unwrap();
+        send(&to_robot, Frame::Start(first)).await;
+        let mut assembly = Reassembler::for_replies();
+        let Frame::Challenge(challenge) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("expected challenge")
+        };
+        let (phone, proof) = phone.receive(&challenge).unwrap();
+        send(&to_robot, Frame::Confirm(proof)).await;
+        let Frame::Ready(ready) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("expected ready")
+        };
+        let mut phone = phone.receive(&ready).unwrap();
+        let request = br#"{"jsonrpc":"2.0","id":1,"method":"hello","params":{"api_version":51}}"#;
+        send(&to_robot, Frame::Data(phone.seal(request).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("expected encrypted reply")
+        };
+        let plaintext = phone.open(&reply).unwrap();
+        assert!(
+            std::str::from_utf8(&plaintext)
+                .unwrap()
+                .contains("not answering")
+        );
+        task.abort();
+    }
+}

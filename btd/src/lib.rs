@@ -38,5 +38,6 @@ pub mod chorale;
 pub mod link;
 pub mod pairing;
 pub mod route;
+pub mod secure;
 pub mod session;
 pub mod upstream;

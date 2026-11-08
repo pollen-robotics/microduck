@@ -211,9 +211,14 @@ fn serving(session: &SessionSlot) -> bool {
 /// `require_pairing` controls whether writing a request needs an authenticated, encrypted link.
 /// It defaults on, because §7 requires it for anything carrying wifi credentials and
 /// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
-pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) -> bluer::Result<()> {
+pub async fn serve(
+    sockets: Sockets,
+    name: NameChoice,
+    require_pairing: bool,
+    secure: Option<crate::secure::Config>,
+) -> bluer::Result<()> {
     loop {
-        match serve_on_an_adapter(&sockets, &name, require_pairing).await {
+        match serve_on_an_adapter(&sockets, &name, require_pairing, secure.clone()).await {
             Ok(()) => tracing::warn!(
                 retry_in = ?ADAPTER_RETRY,
                 "the adapter is gone; waiting for it to come back"
@@ -238,6 +243,7 @@ async fn serve_on_an_adapter(
     sockets: &Sockets,
     name: &NameChoice,
     require_pairing: bool,
+    secure: Option<crate::secure::Config>,
 ) -> bluer::Result<()> {
     let sockets = sockets.clone();
     let name = name.clone();
@@ -496,6 +502,7 @@ async fn serve_on_an_adapter(
                     method: CharacteristicNotifyMethod::Fun(Box::new(move |mut notifier| {
                         let slot = for_notify.clone();
                         let sockets = sockets.clone();
+                        let secure = secure.clone();
                         let mtu = mtu.clone();
                         async move {
                             tokio::spawn(async move {
@@ -520,7 +527,13 @@ async fn serve_on_an_adapter(
                                     }
                                     *slot = Some(inbound);
                                 }
-                                let session = tokio::spawn(session::run(link, sockets));
+                                let session = tokio::spawn(async move {
+                                    if let Some(config) = secure {
+                                        crate::secure::run(link, sockets, config).await;
+                                    } else {
+                                        session::run(link, sockets).await;
+                                    }
+                                });
                                 tracing::info!("central subscribed");
 
                                 // Notifications queued since the last pause. See `NOTIFY_BURST`

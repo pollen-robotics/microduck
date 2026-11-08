@@ -568,6 +568,7 @@ dependencies = [
  "bluer",
  "clap",
  "dbus",
+ "duck-auth",
  "duck-ble",
  "duck-ipc-proto",
  "futures",
@@ -1288,6 +1289,9 @@ dependencies = [
 name = "duck-auth"
 version = "0.18.9"
 dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
  "snow",
 ]
 

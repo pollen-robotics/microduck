@@ -39,6 +39,18 @@ struct Args {
     #[arg(long, hide = true, conflicts_with = "require_pairing")]
     insecure_no_pairing: bool,
 
+    /// Development-only per-robot 32-byte key as 64 hex characters in a credential file.
+    #[arg(
+        long,
+        requires = "secure_robot_id",
+        conflicts_with = "insecure_no_pairing"
+    )]
+    secure_psk_file: Option<PathBuf>,
+
+    /// Identifier printed with the development credential, bound into the secure handshake.
+    #[arg(long, requires = "secure_psk_file")]
+    secure_robot_id: Option<String>,
+
     /// Pin the advertised name, instead of asking `configd` what the robot is called.
     ///
     /// Bench use. The name someone sees in a phone's Bluetooth list is `configd`'s — set with
@@ -100,6 +112,17 @@ async fn main() -> ExitCode {
     };
 
     let require_pairing = args.require_pairing || !args.insecure_no_pairing;
+    let secure = match (args.secure_psk_file, args.secure_robot_id) {
+        (Some(path), Some(id)) => match btd::secure::Config::load(&path, id) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::error!(%error, "cannot start secure BLE mode");
+                return ExitCode::FAILURE;
+            }
+        },
+        (None, None) => None,
+        _ => return ExitCode::FAILURE,
+    };
     if !require_pairing {
         // Loud, every start, because the whole point of choosing the usable default is that the
         // insecurity stays visible rather than becoming the thing nobody remembers.
@@ -109,18 +132,23 @@ async fn main() -> ExitCode {
         );
     }
 
-    run(sockets, name, require_pairing).await
+    run(sockets, name, require_pairing, secure).await
 }
 
 #[cfg(target_os = "linux")]
-async fn run(sockets: Sockets, name: NameChoice, require_pairing: bool) -> ExitCode {
+async fn run(
+    sockets: Sockets,
+    name: NameChoice,
+    require_pairing: bool,
+    secure: Option<btd::secure::Config>,
+) -> ExitCode {
     tokio::select! {
         // `serve` retries the radio in place and is not expected to return at all: an adapter that
         // is missing, unpowered or wedged is handled there rather than by dying and letting
         // `Restart=always` do it. Both arms are therefore a bug in `serve`, not a radio fault — kept
         // because the signature allows them, and non-zero because a `btd` that has stopped serving
         // BLE must not look healthy.
-        result = btd::bluez::serve(sockets, name, require_pairing) => match result {
+        result = btd::bluez::serve(sockets, name, require_pairing, secure) => match result {
             Ok(()) => {
                 tracing::error!("the BLE service returned; it is supposed to retry instead");
                 ExitCode::FAILURE
@@ -142,7 +170,12 @@ async fn run(sockets: Sockets, name: NameChoice, require_pairing: bool) -> ExitC
 /// The crate still builds and tests here, which is the point: `cargo test` on a laptop is the
 /// onboarding path, and only the radio is Linux-only.
 #[cfg(not(target_os = "linux"))]
-async fn run(_sockets: Sockets, _name: NameChoice, _require_pairing: bool) -> ExitCode {
+async fn run(
+    _sockets: Sockets,
+    _name: NameChoice,
+    _require_pairing: bool,
+    _secure: Option<btd::secure::Config>,
+) -> ExitCode {
     tracing::error!(
         "btd needs BlueZ, which is Linux-only. This binary exists here so the crate builds \
          and its tests run; it cannot serve BLE on this platform."

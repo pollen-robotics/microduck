@@ -18,6 +18,7 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # It used to live here, which made a phone app depend on a daemon to agree
 # about chunking — see that crate's manifest.
 duck-ble = { path = "../duck-ble" }
+duck-auth = { path = "../duck-auth" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 clap.workspace = true

@@ -6,6 +6,8 @@
 
 use snow::{Builder, HandshakeState, TransportState};
 
+pub mod wire;
+
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
 const CLIENT_CONFIRM: &[u8] = b"microduck client confirmed v1";
 const ROBOT_CONFIRM: &[u8] = b"microduck robot confirmed v1";
