@@ -13,6 +13,10 @@ use crate::link::{Link, QUEUE};
 use crate::session;
 use crate::upstream::{Pool, Sockets};
 
+/// iOS can retain the physical bond connection after its owning app exits.
+/// Only authenticated inbound requests renew the application session lease.
+const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub type Config = ProvisionedKey;
 
 enum State {
@@ -35,7 +39,7 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
 
     loop {
         tokio::select! {
-            () = &mut deadline, if !matches!(state, State::Ready(_)) => break,
+            () = &mut deadline => break,
             chunk = link.inbound.recv() => {
                 let Some(chunk) = chunk else { break };
                 let Ok(lines) = inbound.push(&chunk) else { break };
@@ -52,11 +56,13 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
                             let Ok((ready, reply)) = next.receive(&proof) else { return };
                             if send_frame(&link, Frame::Ready(reply)).await.is_err() { return }
                             state = State::Ready(ready);
+                            deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE);
                         }
                         (State::Ready(secure), Frame::Data(ciphertext)) => {
                             let Ok(plain) = secure.open(&ciphertext) else { return };
                             let Ok(line) = std::str::from_utf8(&plain) else { return };
                             if line.len() > framing::MAX_LINE { return }
+                            deadline.as_mut().reset(tokio::time::Instant::now() + SESSION_IDLE);
                             let outcome = session::dispatch(
                                 &mut pool, &config_socket, line, &mut authenticated, &mut unused_attempts,
                             ).await;
@@ -127,7 +133,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn secure_session_rejects_plaintext_and_decrypts_rpc() {
         let key = [0x71; 32];
         let temp = tempfile::tempdir().unwrap();
@@ -176,6 +182,19 @@ mod tests {
                 .unwrap()
                 .contains("not answering")
         );
-        task.abort();
+        // A bonded physical link may outlive the app on iOS. Expire its application state,
+        // but keep an actively used session alive beyond its original lease deadline.
+        tokio::time::advance(SESSION_IDLE - std::time::Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        send(&to_robot, Frame::Data(phone.seal(request).unwrap())).await;
+        let Frame::Data(reply) = receive(&mut from_robot, &mut assembly).await else {
+            panic!("expected encrypted reply")
+        };
+        phone.open(&reply).unwrap();
+        tokio::time::advance(SESSION_IDLE - std::time::Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(from_robot.recv().await.is_none());
     }
 }
