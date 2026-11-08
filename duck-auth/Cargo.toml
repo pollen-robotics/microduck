@@ -1,0 +1,9 @@
+[package]
+name = "duck-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared prototype of Microduck's BLE authenticated session"
+
+[dependencies]
+snow = "0.10"
