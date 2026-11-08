@@ -98,12 +98,16 @@ and the `6ca1d79` native ARM board-test `btd` artifact (SHA-256
 previously signed development release. This is a bench compatibility test, not a production image
 qualification. No secret, passphrase or raw Bluetooth capture belongs in the repository.
 
+iPhone follow-up used the app through `a5146a3`; a clean installation of `7455e2c` also completed
+BLE authentication. It used the `8d999f5` native ARM board-test `btd` artifact, SHA-256
+`98ed385c3921cb6078682b2c3c6377c519b79880e83a3797fca6be6b69a00c91`.
+
 | Check | Observed result |
 | --- | --- |
 | First Android bond | System pairing dialog opened from the app, before protected GATT access; no trip to Bluetooth Settings. |
 | Cancel and retry | Cancelling returned to the access-code form; retry could start pairing again. |
 | Wrong setup key | No application session opened. Correcting the key on the same form then succeeded without a `btd` restart. |
-| Fresh Wi-Fi provisioning | The saved profile was removed with a timed recovery plan in place. The password was entered through the app over authenticated BLE; a new NetworkManager profile joined and obtained IPv4. The capture contained 31 ATT writes and no plaintext password. |
+| Fresh Wi-Fi provisioning | The saved profile was removed with a timed recovery plan in place. The password was entered through the app over authenticated BLE; a new NetworkManager profile joined and obtained IPv4. Reassembling the 31 ATT writes produced four `data` envelopes, no plaintext RPCs, and no password in raw or base64-decoded payloads. |
 | Camera/control | Live 1280×720 video and an open WebRTC control channel after Wi-Fi provisioning. A 0.03-radian head-yaw request was accepted and appeared in robot state; no joint motion was measured in the held/fallen pose. |
 | App backgrounding | The app closed its WebRTC peer/control channel. Robot telemetry first reported `deadman` about 0.616 s after Home; applied forward intent fell below 0.001 m/s after 0.918 s. |
 | Phone Wi-Fi loss | Eight seconds without phone Wi-Fi closed the control session. `deadman` appeared after about 0.614 s; applied forward intent fell below 0.001 m/s after 0.918 s. Wi-Fi was re-enabled in a `finally` cleanup. |
@@ -111,14 +115,33 @@ qualification. No secret, passphrase or raw Bluetooth capture belongs in the rep
 | Forced app termination | `btd` detected the disconnected phone, discarded authentication/CCC state and registered again after its five-second retry delay. A relaunched app rediscovered the actual robot and could reauthenticate without a service restart. |
 | Busy broadcasts | The shared advertisement format marks non-connectable broadcasts; the app filters them rather than offering their random address as a pairing target. The matched app rediscovered the robot after rapid relaunch and rescan. |
 | iOS build | Full unsigned Xcode archive succeeded after explicitly linking AuthenticationServices. CI now links the complete iOS app too, rather than checking only its Rust library. |
+| iPhone BLE onboarding | After Apple account reauthentication, an isolated development app signed, installed and ran on the real iPhone. Discovery and secure authentication passed. A wrong key was refused; cancelling/reopening the form with the correct key succeeded without restarting `btd`. |
+| iPhone camera and backgrounding | The authenticated camera/control channel opened and camera frames were inspected privately. Home closed media; returning showed video paused. Explicit reconnect opened the authenticated channel again and displayed a new camera frame. No movement was requested in this test. |
+| iPhone fresh Wi-Fi provisioning | The original saved profile was removed with a five-minute recovery timer. App password entry created a new profile and obtained IPv4. All 37 captured ATT writes reassembled as encrypted `data` envelopes; no plaintext RPC/password was present, including after base64 decoding. A quiet foreground setup step lasted 65 seconds with lease renewal enabled. |
 
 The two stop tests used a 0.03 m/s command on a robot reporting `policy=held` and `fallen=true`.
 These timings measure the command gate, not physical stopping distance during walking. Actual
-walking and physical stop behaviour, an adversarial unpaired GATT test, and on-device iPhone
-onboarding remain open. iPhone installation was blocked by unavailable Apple account/provisioning
-credentials; a successful unsigned archive is not an iPhone runtime test.
+walking and physical stop behaviour, an adversarial unpaired GATT test, and iPhone phone-Wi-Fi-loss
+testing remain open. Apple signing is resolved; iPhone fresh password provisioning and
+camera/background reconnect now pass. Phone Wi-Fi loss is not tested while the iPhone's debug
+connection itself depends on Wi-Fi. On a clean iPhone install, the first LAN connection failed
+while iOS asked for local-network permission; after Allow, the app's explicit video retry is needed.
 
-The follow-up changes also cap unfinished secure handshakes at 15 seconds, explicitly unsubscribe
+After fresh provisioning, the original Wi-Fi profile was restored with its original UUID and
+verified byte-for-byte against the protected pre-test backup. No Wi-Fi password was logged here.
+
+The follow-up changes cap unfinished secure handshakes at 15 seconds, explicitly unsubscribe
 before a client disconnect, and clear joystick state/close media on backgrounding or connection
-failure. Production storage, ownership, manufacturing and independent review remain roadmap steps
-3–5, not claims made by these bench results.
+failure. Authenticated sessions expire after 60 seconds without inbound requests: iOS can retain
+the physical BLE link after an app exits. A visible app renews that lease with a read-only request
+every 20 seconds, including on quiet setup and update screens. Extended connectable broadcasts
+take priority over the board's legacy twins before remembered-device matching.
+
+The iPhone background test exposed a security downgrade: a lost BLE ready flag made
+`open_secure_media` return the legacy direct-LAN path. Secure mode now follows the selected
+in-memory credential across BLE loss. Every new LAN tunnel independently authenticates with the
+gateway; it never falls back to legacy signalling because BLE dropped. A regression test covers
+teardown retaining secure media mode and unbinding clearing it.
+
+Production storage, ownership, manufacturing and independent review remain roadmap steps 3–5,
+not claims made by these bench results.
