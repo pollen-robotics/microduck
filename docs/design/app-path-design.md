@@ -629,6 +629,58 @@ verify, and recover a distinct secret for each unit; confirm the mobile app can 
 it; agree on the physical-attacker threat model. Until then, this is a proposal in a draft PR, not
 a shipping claim or a reason to merge the BLE service default.
 
+#### Proposed app authentication flow
+
+This is the contract to implement after the credential decision, not a description of the current
+wire protocol. It applies to iOS and Android; the gamepad is a separate Bluetooth HID peer and
+never receives the robot's QR secret.
+
+1. Manufacturing generates a random 256-bit secret and a non-secret robot identifier. It writes
+   the secret to the robot after flashing the common image, prints a QR containing both values,
+   and verifies the printed QR against the programmed robot. The QR must not be derived from the
+   serial or Bluetooth address. The app stores it in the platform's protected credential store,
+   never in analytics, logs, a backup export, or a URL.
+2. The app discovers the advertised robot identifier and opens a BLE connection. Bluetooth pairing
+   may encrypt the radio link, but it is not treated as proof of robot identity. The app and robot
+   run a reviewed PSK-authenticated key exchange using the QR secret. The transcript binds the
+   protocol version, robot identifier, both fresh nonces and both ephemeral public keys. Both
+   sides confirm the derived key before any privileged RPC. The secret is never sent as a PIN or
+   as an RPC parameter. Select and review a standard protocol and maintained implementation before
+   assigning wire fields; do not implement a custom handshake from this sketch.
+3. All privileged BLE RPCs, including `net.connect`, are encrypted and integrity-protected with
+   distinct send/receive keys, sequence numbers and a session identifier. Reject replay, missing
+   sequence numbers, unknown versions, failed key confirmation and plaintext privileged requests.
+   Close the session on any authentication failure. Reconnects establish fresh keys; a remembered
+   BlueZ bond alone never reopens the RPC gate. Public discovery/version data stays separate.
+4. In that session, the app creates a device-bound signing key and submits its public key for
+   enrollment. The robot records the first owner key only during a factory-authorized claim
+   window, with a deliberate local action or equivalent manufacturing control; possession of a
+   photographed QR alone must not silently claim an unowned robot. Later owner changes require
+   the current owner or a physical recovery procedure. The app then sends Wi-Fi credentials in
+   the protected `net.connect` request. After
+   joining the LAN, the robot's local camera/control gateway proves its identity to the app and
+   requires a fresh challenge signed by the enrolled key. Bind the gateway identity to the same
+   robot identifier and pin its credential at enrollment; LAN discovery alone is not trust.
+5. An owner can authorize another phone or desktop key over the authenticated local gateway.
+   Enrollment grants explicit permissions, is logged locally, and supports revocation. Controller
+   pairing is a separate permission: the owner authorizes a short pairing window, while the
+   controller itself continues using the Bluetooth HID path without an app secret.
+
+There is no silent fallback to the current six-digit `system.authenticate` when a production
+credential or secure session cannot be loaded. Development images may keep a visibly distinct
+legacy mode. Factory reset and ownership transfer must revoke enrolled app keys and old BLE bonds,
+then provide a physical, documented way to install a new credential; a software-only reset must
+not expose an unauthenticated enrollment window. The robot must remain recoverable by the factory
+after a full `.wic` reflash, which erases the proposed eMMC secret.
+
+Acceptance tests need to cover first setup with no Wi-Fi; Android and iOS pairing; an active BLE
+relay/substitution attempt; wrong QR; replayed handshake and RPC frames; interrupted `net.connect`;
+robot reboot; adapter address change; stolen or revoked phone; desktop enrollment; and loss of the
+`data` mount. An active relay that simply forwards a live authenticated session cannot be ruled
+out by a QR secret alone; commands still need local authorization, timeouts and movement safety
+limits. The production gate is a reviewed protocol implementation plus tests on the actual
+face-board-v1 image, not just a green host unit-test suite.
+
 ### 5.5 Encryption is currently off, and that is not settled  · **measured**
 
 The measurements below describe the original development setup. The production candidate now
