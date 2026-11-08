@@ -15,7 +15,7 @@ pub const MAX_CLIENT_LINE: usize = 8 * 1024;
 pub const MAX_ROBOT_LINE: usize = 64 * 1024;
 
 /// The maximum ciphertext that fits in one client-to-robot envelope.
-pub const MAX_CLIENT_CIPHERTEXT: usize = 6 * 1024;
+pub const MAX_CLIENT_CIPHERTEXT: usize = 6000;
 
 /// One authenticated-session wire message.
 #[derive(Debug, Clone, PartialEq, Eq)]
