@@ -73,6 +73,9 @@ remain required.
 
 ## Beta board validation (8 November 2026)
 
+The paragraphs in this section describe the initial test. The follow-up results below supersede
+the Android system-settings workaround and the previously untested Wi-Fi/reconnection cases.
+
 The signed `0.18.9-dev.1646.c829879` daemon release passed this robot's update dry run and health
 gate on a face-board-v1 beta unit. With a temporary per-robot key and runtime-only service
 overrides, the Android debug app authenticated over BLE, read robot and Wi-Fi status, and displayed
@@ -86,3 +89,36 @@ The app PR fixes Android keyboard capitalization of `md1:` and explains the pair
 that follow-up build still needs a phone retest. iPhone, Wi-Fi password entry, unpaired writes,
 reconnection, and movement control remain unverified. The test key, phone bond, and runtime
 overrides were removed, and the robot was restored to its exact pre-test daemon release.
+
+## Follow-up: onboarding and connection loss
+
+Tested on the same beta robot and Nothing Phone (3), using the Android app through `88f4d50`
+and the `6ca1d79` native ARM board-test `btd` artifact (SHA-256
+`9c39a000781f6c30926bfb07b802694ee576e8e9d23308437edd2908690ee59e`). Other services used the
+previously signed development release. This is a bench compatibility test, not a production image
+qualification. No secret, passphrase or raw Bluetooth capture belongs in the repository.
+
+| Check | Observed result |
+| --- | --- |
+| First Android bond | System pairing dialog opened from the app, before protected GATT access; no trip to Bluetooth Settings. |
+| Cancel and retry | Cancelling returned to the access-code form; retry could start pairing again. |
+| Wrong setup key | No application session opened. Correcting the key on the same form then succeeded without a `btd` restart. |
+| Fresh Wi-Fi provisioning | The saved profile was removed with a timed recovery plan in place. The password was entered through the app over authenticated BLE; a new NetworkManager profile joined and obtained IPv4. The capture contained 31 ATT writes and no plaintext password. |
+| Camera/control | Live 1280×720 video and an open WebRTC control channel after Wi-Fi provisioning. A 0.03-radian head-yaw request was accepted and appeared in robot state; no joint motion was measured in the held/fallen pose. |
+| App backgrounding | The app closed its WebRTC peer/control channel. Robot telemetry first reported `deadman` about 0.616 s after Home; applied forward intent fell below 0.001 m/s after 0.918 s. |
+| Phone Wi-Fi loss | Eight seconds without phone Wi-Fi closed the control session. `deadman` appeared after about 0.614 s; applied forward intent fell below 0.001 m/s after 0.918 s. Wi-Fi was re-enabled in a `finally` cleanup. |
+| Explicit media reconnect | Video/control reopened; requested velocity was zero and the previous nonzero test intent did not resume. |
+| Forced app termination | `btd` detected the disconnected phone, discarded authentication/CCC state and registered again after its five-second retry delay. A relaunched app rediscovered the actual robot and could reauthenticate without a service restart. |
+| Busy broadcasts | The shared advertisement format marks non-connectable broadcasts; the app filters them rather than offering their random address as a pairing target. The matched app rediscovered the robot after rapid relaunch and rescan. |
+| iOS build | Full unsigned Xcode archive succeeded after explicitly linking AuthenticationServices. CI now links the complete iOS app too, rather than checking only its Rust library. |
+
+The two stop tests used a 0.03 m/s command on a robot reporting `policy=held` and `fallen=true`.
+These timings measure the command gate, not physical stopping distance during walking. Actual
+walking and physical stop behaviour, an adversarial unpaired GATT test, and on-device iPhone
+onboarding remain open. iPhone installation was blocked by unavailable Apple account/provisioning
+credentials; a successful unsigned archive is not an iPhone runtime test.
+
+The follow-up changes also cap unfinished secure handshakes at 15 seconds, explicitly unsubscribe
+before a client disconnect, and clear joystick state/close media on backgrounding or connection
+failure. Production storage, ownership, manufacturing and independent review remain roadmap steps
+3–5, not claims made by these bench results.
