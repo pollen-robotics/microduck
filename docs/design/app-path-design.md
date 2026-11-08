@@ -3,8 +3,9 @@
 > **Security update (production candidate):** `btd` now requires an encrypted
 > paired link by default. `--insecure-no-pairing` remains an explicit bench-only
 > override. The historical macOS CoreBluetooth hang described in §5.5 is not
-> resolved by this policy change; onboarding must be validated on real iPhone
-> and Android devices before shipment. A factory `000000` PIN still provides no
+> resolved by this policy change. A later Android trace showed BlueZ rejecting
+> an unexpected numeric confirmation; `btd` now has a candidate headless agent
+> fix, which still needs end-to-end Android and iPhone validation. A factory `000000` PIN provides no
 > meaningful per-device authorization and must be replaced in provisioning.
 
 Status: draft · Date: 2026-08-04 · Owner: pierre
@@ -550,7 +551,8 @@ So a fixed, printed-on-the-robot PIN is not expressible in BLE passkey entry. Th
 
 ### 5.2 How it works
 
-Pairing is just-works: every agent handler is `None`, which `bluer` publishes as `NoInputNoOutput`.
+Pairing is just-works: the agent declares `NoInputNoOutput`. Its confirmation callback accepts
+BlueZ's request without comparing the number, so it does not add MITM authentication.
 The read on the RPC characteristic requires `encrypt_read`, which is what makes a central bond at
 all — plain encryption, not `encrypt_authenticated_*`, because a just-works bond can never satisfy
 the authenticated variants and demanding them would refuse every client.
@@ -595,6 +597,14 @@ photographed — none needed for v1, each additive later, since an enclosure wit
 `set_pairable` without changing this design.
 
 ### 5.5 Encryption is currently off, and that is not settled  · **measured**
+
+The measurements below describe the original development setup. The production candidate now
+defaults to encrypted pairing. On 2026-11-08 a real Android phone failed pairing because BlueZ sent
+`RequestConfirmation` to `bluer`'s empty agent, which rejected it. The candidate agent in `btd`
+advertises the board's real `NoInputNoOutput` capability while accepting that callback. This is
+still **unauthenticated** pairing: the robot cannot compare the displayed number, and an active
+attacker at pairing time remains in scope. A phone and board test must establish that the new
+agent actually yields an encrypted bond and that the application PIN gate still works.
 
 `encrypt_read` on the characteristic makes the read **hang** on macOS: CoreBluetooth issues the Read
 Request, BlueZ refuses it for insufficient encryption, and nothing resolves it — no prompt, no
