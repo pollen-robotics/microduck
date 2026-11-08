@@ -184,6 +184,7 @@ const SESSION_POLL: Duration = Duration::from_secs(1);
 /// somewhere to put a chunk, and [`reconcile_advertisement`], which needs to know whether the robot
 /// is busy. The second is not a new signal — it is the same slot, asked a different question.
 type SessionSlot = Arc<StdMutex<Option<mpsc::Sender<Vec<u8>>>>>;
+type PeerSlot = Arc<StdMutex<Option<(bluer::Address, mpsc::Sender<Vec<u8>>)>>>;
 
 /// Whether a central is being served right now.
 ///
@@ -221,7 +222,7 @@ pub async fn serve(
         match serve_on_an_adapter(&sockets, &name, require_pairing, secure.clone()).await {
             Ok(()) => tracing::warn!(
                 retry_in = ?ADAPTER_RETRY,
-                "the adapter is gone; waiting for it to come back"
+                "BLE registration ended; registering again after the retry delay"
             ),
             // Not fatal, deliberately: every failure reachable here is a property of the radio or
             // of BlueZ, and none of them is fixed by dying. See this function's own doc comment.
@@ -375,6 +376,10 @@ async fn serve_on_an_adapter(
     let current: SessionSlot = Arc::new(StdMutex::new(None));
     let for_write = current.clone();
     let for_notify = current.clone();
+    let peer: PeerSlot = Arc::new(StdMutex::new(None));
+    let for_peer = peer.clone();
+    let reset_registration = Arc::new(tokio::sync::Notify::new());
+    let for_reset = reset_registration.clone();
 
     // The negotiated payload, written by the write callback and read by the session when it sizes
     // a reply. An atomic rather than a channel or the mutex above, because the write callback may
@@ -434,6 +439,10 @@ async fn serve_on_an_adapter(
                         let head =
                             String::from_utf8_lossy(&value[..value.len().min(8)]).to_string();
                         let sender = for_write.lock().expect("write slot poisoned").clone();
+                        if let Some(tx) = sender.as_ref() {
+                            *for_peer.lock().expect("peer slot poisoned") =
+                                Some((req.device_address, tx.clone()));
+                        }
 
                         // What BlueZ says this link negotiated, minus the three bytes of ATT
                         // header a notification cannot use. Stored on every write because it is
@@ -503,6 +512,7 @@ async fn serve_on_an_adapter(
                         let slot = for_notify.clone();
                         let sockets = sockets.clone();
                         let secure = secure.clone();
+                        let reset_registration = for_reset.clone();
                         let mtu = mtu.clone();
                         async move {
                             tokio::spawn(async move {
@@ -583,6 +593,7 @@ async fn serve_on_an_adapter(
                                         // its reassembly buffer and its upstream connections.
                                         slot.take();
                                         session.abort();
+                                        reset_registration.notify_one();
                                         // Which of the two it was, because they need different
                                         // next moves and the old line said "unsubscribed" for
                                         // both — including for a reply this pump could not
@@ -641,6 +652,12 @@ async fn serve_on_an_adapter(
     }
     tokio::select! {
         () = watch_adapter(&adapter) => {}
+        () = reset_registration.notified() => {
+            tracing::info!("session ended; resetting GATT registration and authentication");
+        }
+        () = watch_session_peer(&adapter, &current, &peer) => {
+            tracing::info!("central disconnected; resetting GATT registration and authentication");
+        }
         // Never completes on its own.
         () = reconcile_advertisement(
             &adapter,
@@ -652,6 +669,44 @@ async fn serve_on_an_adapter(
         ) => {}
     }
     Ok(())
+}
+
+/// BlueZ does not always call StopNotify when Android kills its GATT client. Re-register the
+/// application when the actual phone disconnects so its old CCC state cannot hold the robot busy.
+/// Track the writer's exact device and session, so a connected gamepad cannot mask a dead phone.
+async fn watch_session_peer(adapter: &bluer::Adapter, current: &SessionSlot, peer: &PeerSlot) {
+    let mut missing_since: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let active = current.lock().expect("write slot poisoned").clone();
+        let observed = peer.lock().expect("peer slot poisoned").clone();
+        let Some((address, tx)) = observed.filter(|(_, tx)| {
+            active
+                .as_ref()
+                .is_some_and(|active| active.same_channel(tx))
+        }) else {
+            missing_since = None;
+            continue;
+        };
+        let connected = tokio::time::timeout(Duration::from_secs(1), async {
+            adapter.device(address)?.is_connected().await
+        })
+        .await;
+        if matches!(connected, Ok(Ok(true))) {
+            missing_since = None;
+            continue;
+        }
+        let since = missing_since.get_or_insert_with(tokio::time::Instant::now);
+        if since.elapsed() >= Duration::from_secs(2)
+            && current
+                .lock()
+                .expect("write slot poisoned")
+                .as_ref()
+                .is_some_and(|active| active.same_channel(&tx))
+        {
+            return;
+        }
+    }
 }
 
 /// Send one chunk, retrying a queue that is momentarily full. `false` means give up on the session.
@@ -845,7 +900,12 @@ async fn advertise(adapter: &bluer::Adapter, advertised: &Advertised) -> bluer::
         ..Default::default()
     };
 
-    let with_address = advertisement(Some(duck_ble::adv::address_data(advertised.address)), None);
+    let data = if advertised.connectable {
+        duck_ble::adv::address_data(advertised.address)
+    } else {
+        duck_ble::adv::busy_address_data(advertised.address)
+    };
+    let with_address = advertisement(Some(data), None);
     let legacy = match adapter.advertise(with_address).await {
         Ok(handle) => handle,
         Err(e) => {

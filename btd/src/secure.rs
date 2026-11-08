@@ -30,9 +30,12 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
     let mut state = State::Start;
     let mut authenticated = true;
     let mut unused_attempts = 0;
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(15));
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
+            () = &mut deadline, if !matches!(state, State::Ready(_)) => break,
             chunk = link.inbound.recv() => {
                 let Some(chunk) = chunk else { break };
                 let Ok(lines) = inbound.push(&chunk) else { break };
@@ -87,6 +90,26 @@ mod tests {
     use super::*;
     use duck_auth::ClientStart;
     use tokio::sync::mpsc::{Receiver, Sender};
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_unauthenticated_subscriber_cannot_hold_the_robot_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "71".repeat(32)).unwrap();
+        let config = Config::load(&path, "test-duck".into()).unwrap();
+        let sockets = Sockets {
+            config: "/tmp/no-configd-secure-timeout.sock".into(),
+            robot: "/tmp/no-robotd-secure-timeout.sock".into(),
+            updater: "/tmp/no-updaterd-secure-timeout.sock".into(),
+        };
+        let (link, _to_robot, mut from_robot) = Link::pair(20, "silent phone");
+        let task = tokio::spawn(run(link, sockets, config));
+        tokio::time::timeout(std::time::Duration::from_secs(16), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(from_robot.recv().await.is_none());
+    }
 
     async fn send(tx: &Sender<Vec<u8>>, frame: Frame) {
         let line = frame.encode(MAX_CLIENT_LINE).unwrap();
