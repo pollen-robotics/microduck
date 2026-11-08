@@ -639,14 +639,25 @@ never receives the robot's QR secret.
    the secret to the robot after flashing the common image, prints a QR containing both values,
    and verifies the printed QR against the programmed robot. The QR must not be derived from the
    serial or Bluetooth address. The app stores it in the platform's protected credential store,
-   never in analytics, logs, a backup export, or a URL.
+   never in analytics, logs, a backup export, or a URL. This requires an app storage migration:
+   `microduck-app/src-tauri/src/remembered.rs` currently serializes the six-digit PIN in clear
+   into `robots.json`. The new secret must never enter `Remembered`, JSON or webview state.
 2. The app discovers the advertised robot identifier and opens a BLE connection. Bluetooth pairing
-   may encrypt the radio link, but it is not treated as proof of robot identity. The app and robot
-   run a reviewed PSK-authenticated key exchange using the QR secret. The transcript binds the
-   protocol version, robot identifier, both fresh nonces and both ephemeral public keys. Both
-   sides confirm the derived key before any privileged RPC. The secret is never sent as a PIN or
-   as an RPC parameter. Select and review a standard protocol and maintained implementation before
-   assigning wire fields; do not implement a custom handshake from this sketch.
+   may encrypt the radio link, but it is not treated as proof of robot identity. The candidate
+   exchange is `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, with the 32-byte QR secret as PSK. Both
+   sides use the exact versioned protocol label and robot identifier as the Noise prologue; Noise
+   binds both freshly generated ephemeral public keys in its handshake. The app sends the first
+   Noise message, the robot replies, and the app sends an encrypted key-confirmation message before
+   the robot opens its RPC gate. The app opens its gate only after decrypting the robot's encrypted
+   confirmation reply. No application payload is accepted before both confirmations. The secret
+   is never sent as a PIN or RPC parameter. This pattern and its library still require independent
+   security review and interoperable app/robot test vectors before shipping. The candidate follows
+   the Noise specification's PSK mode, which requires a 32-byte key and mixes fresh ephemeral
+   keys into the handshake; the Rust `snow` library documents this exact pattern. Its two Noise
+   handshake messages need the explicit encrypted confirmation exchange above so each side knows
+   the other holds the PSK before serving application requests.
+   References: [Noise specification §9](https://noiseprotocol.org/noise.html#pre-shared-symmetric-keys)
+   and [`snow` builder documentation](https://docs.rs/snow/latest/snow/struct.Builder.html).
 3. All privileged BLE RPCs, including `net.connect`, are encrypted and integrity-protected with
    distinct send/receive keys, sequence numbers and a session identifier. Reject replay, missing
    sequence numbers, unknown versions, failed key confirmation and plaintext privileged requests.
