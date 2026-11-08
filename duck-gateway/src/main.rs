@@ -102,4 +102,35 @@ mod tests {
         app.await.unwrap();
         robot.abort();
     }
+
+    #[tokio::test]
+    async fn wrong_secret_cannot_reach_mediad() {
+        let mediad = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = gateway.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "71".repeat(32)).unwrap();
+        let credential = ProvisionedKey::load(&path, "test-duck".into()).unwrap();
+        let app = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            assert!(
+                tcp::app_handshake(&mut stream, &[0x72; 32], "test-duck")
+                    .await
+                    .is_err()
+            );
+        });
+        let (remote, _) = gateway.accept().await.unwrap();
+        assert!(
+            serve_one(remote, credential, mediad.local_addr().unwrap())
+                .await
+                .is_err()
+        );
+        app.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), mediad.accept())
+                .await
+                .is_err()
+        );
+    }
 }
