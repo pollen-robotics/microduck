@@ -6,11 +6,15 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
 use duck_auth::{ProvisionedKey, tcp};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+const MAX_SESSIONS: usize = 8;
 
 #[derive(Parser)]
 struct Args {
@@ -36,12 +40,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credential =
         ProvisionedKey::load(&args.key_file, args.robot_id).map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(args.listen).await?;
+    let capacity = Arc::new(Semaphore::new(MAX_SESSIONS));
     tracing::info!(address = %listener.local_addr()?, "authenticated media gateway listening");
     loop {
         let (stream, peer) = listener.accept().await?;
+        let Ok(permit) = capacity.clone().try_acquire_owned() else {
+            tracing::debug!(%peer, "gateway capacity reached");
+            continue;
+        };
         let credential = credential.clone();
         let mediad = args.mediad;
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(error) = serve_one(stream, credential, mediad).await {
                 tracing::debug!(%peer, %error, "gateway session closed");
             }

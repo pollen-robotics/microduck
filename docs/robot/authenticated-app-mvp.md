@@ -8,7 +8,8 @@ code is a bearer secret: anyone who sees it can authenticate to the robot.
 
 ## Prepare one robot
 
-Choose a unique ASCII robot identifier. On a trusted computer, outside the source checkout:
+Choose a unique ASCII robot identifier. On a trusted computer, run this from the source checkout
+and write the credential **outside** it:
 
 ```bash
 scripts/generate-ble-dev-credential.sh test-duck-1 /tmp/test-duck-1-ble-psk

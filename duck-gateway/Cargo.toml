@@ -7,7 +7,7 @@ description = "Opt-in authenticated local tunnel to mediad for the development a
 
 [dependencies]
 duck-auth = { path = "../duck-auth" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

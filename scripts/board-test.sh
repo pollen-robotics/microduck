@@ -105,7 +105,7 @@ mkdir -p "$INSTALL_STAGED" "$INSTALL_RELEASE"
 # where it can name its own cause.
 PACKAGING_WORKFLOW=.github/workflows/_build-release.yml
 
-staged_binaries="$(grep -o -- 'release/[a-z]* staged/' "$PACKAGING_WORKFLOW" \
+staged_binaries="$(grep -oE -- 'release/[a-z][a-z0-9-]* staged/' "$PACKAGING_WORKFLOW" \
     | sed 's|release/||; s| staged/||' | sort -u)"
 if [ -z "$staged_binaries" ]; then
     echo "error: no staged binaries found in ${PACKAGING_WORKFLOW}." >&2
