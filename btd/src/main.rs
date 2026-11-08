@@ -48,22 +48,6 @@ struct Args {
     name: Option<String>,
 }
 
-#[cfg(test)]
-mod security_defaults {
-    use super::*;
-
-    #[test]
-    fn pairing_requires_explicit_insecure_override_to_disable() {
-        let normal = Args::try_parse_from(["btd"]).unwrap();
-        assert!(!normal.insecure_no_pairing);
-        let bench = Args::try_parse_from(["btd", "--insecure-no-pairing"]).unwrap();
-        assert!(bench.insecure_no_pairing);
-        assert!(
-            Args::try_parse_from(["btd", "--require-pairing", "--insecure-no-pairing"]).is_err()
-        );
-    }
-}
-
 fn hostname() -> String {
     // /etc/hostname rather than the `hostname` crate or a libc call: one file read, no
     // dependency, and it is what the board is actually configured with.
@@ -181,5 +165,21 @@ async fn shutdown() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn pairing_requires_explicit_insecure_override_to_disable() {
+        let normal = Args::try_parse_from(["btd"]).unwrap();
+        assert!(!normal.insecure_no_pairing);
+        let bench = Args::try_parse_from(["btd", "--insecure-no-pairing"]).unwrap();
+        assert!(bench.insecure_no_pairing);
+        assert!(
+            Args::try_parse_from(["btd", "--require-pairing", "--insecure-no-pairing"]).is_err()
+        );
     }
 }

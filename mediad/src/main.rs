@@ -169,17 +169,6 @@ struct Args {
     frame_socket: std::path::PathBuf,
 }
 
-#[cfg(test)]
-mod security_defaults {
-    use super::*;
-
-    #[test]
-    fn local_listeners_are_not_exposed_by_default() {
-        let args = Args::try_parse_from(["mediad"]).unwrap();
-        assert_eq!(args.host, "127.0.0.1");
-    }
-}
-
 // Gated with the `main` that calls it: without a pipeline there is nothing to point at a socket and
 // `-D warnings` would call this dead.
 #[cfg(any(target_os = "linux", feature = "gstreamer"))]
@@ -754,4 +743,15 @@ fn main() -> ExitCode {
          install gstreamer\n    cargo build -p mediad --features gstreamer\n"
     );
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn local_listeners_are_not_exposed_by_default() {
+        let args = Args::try_parse_from(["mediad"]).unwrap();
+        assert_eq!(args.host, "127.0.0.1");
+    }
 }
