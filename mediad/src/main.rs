@@ -1,16 +1,13 @@
 //! `mediad` — camera, mic, WebRTC, and the remote gateway.
 //!
-//! Runs the signalling server in this process, streams video to whoever connects, and gives each
-//! peer a `control` datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is
-//! the design.
+//! Runs the signalling server in this process and gives each admitted peer a `control`
+//! datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is the design.
 //!
 //! ## What it does not do
 //!
-//! **It does not authenticate.** Anyone who reaches the signalling port can drive the robot and
-//! see its camera. That is a decision, not an omission — §4 has the reasoning, and the short
-//! version is that the pairing PIN is a shared `000000`, so a gate would add a step to every
-//! connection and prove nothing. The bridge that makes a robot reachable from outside the LAN
-//! authenticates on both sides before a session arrives.
+//! **The local signalling server does not authenticate.** It therefore binds to loopback by
+//! default; the remote bridge authenticates before forwarding a session to it. Explicitly
+//! binding a LAN address exposes camera and control to every peer that can reach that address.
 //!
 //! **It is not on the recovery path.** If `mediad` will not start, the robot still walks, still
 //! takes an update, and is still reachable over Bluetooth. That is why it may depend on a plugin
@@ -26,10 +23,9 @@ use clap::Parser;
 struct Args {
     /// Where to bind the signalling server.
     ///
-    /// All interfaces by default, and that is the point: loopback-only would mean a peer on the
-    /// LAN cannot reach it at all and every session would have to go through a bridge, which
-    /// defeats having a local mode. See `remote-webrtc.md` §3.
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Also used for the unauthenticated console and snapshot endpoint. Keep loopback-only
+    /// until an authenticated local gateway is available. A LAN bind is for controlled benches.
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// The signalling server's port. 8443 is what `webrtcsink`'s own signaller defaults to, so a
@@ -171,6 +167,17 @@ struct Args {
     /// Local raw camera snapshot endpoint (not the control datachannel).
     #[arg(long, default_value = duck_ipc_proto::socket::MEDIA)]
     frame_socket: std::path::PathBuf,
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn local_listeners_are_not_exposed_by_default() {
+        let args = Args::try_parse_from(["mediad"]).unwrap();
+        assert_eq!(args.host, "127.0.0.1");
+    }
 }
 
 // Gated with the `main` that calls it: without a pipeline there is nothing to point at a socket and

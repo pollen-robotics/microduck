@@ -30,29 +30,13 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
     config_socket: PathBuf,
 
-    /// Require a paired, encrypted link.
-    ///
-    /// **Off by default, and that is not where this ends up.** Requiring pairing makes the version
-    /// read hang on macOS — CoreBluetooth issues the Read Request, BlueZ refuses it for insufficient
-    /// encryption, and nothing resolves it — so a robot serving the secure configuration cannot be
-    /// talked to at all (`docs/design/app-path-design.md` §5.5).
-    ///
-    /// Between a default that is secure and unusable and one that works and is insecure, this is
-    /// pre-shipping development tooling and the usable one wins. The cost is real and unhedged:
-    /// with pairing off, anyone in radio range can read the PIN as it crosses and write any allowed
-    /// request — including `net.connect`, which carries a wifi passphrase. Every robot running this
-    /// is a robot whose wifi credentials are readable by a bystander.
-    ///
-    /// This must flip before anything is handed to anyone. §8.1 is the blocker.
-    #[arg(long)]
+    /// Retained for compatibility with existing service overrides. Pairing is now required
+    /// unless `--insecure-no-pairing` is explicitly selected for a controlled bench.
+    #[arg(long, conflicts_with = "insecure_no_pairing")]
     require_pairing: bool,
 
-    /// Accepted and ignored: not requiring pairing is now the default.
-    ///
-    /// Kept only so a board carrying a `--insecure-no-pairing` drop-in — which is how the flag was
-    /// used while it existed — does not fail to start on the update that removes it. An unknown
-    /// argument would take BLE down on exactly the boards that were using it.
-    #[arg(long, hide = true)]
+    /// Disable BLE link encryption only on an isolated development bench.
+    #[arg(long, hide = true, conflicts_with = "require_pairing")]
     insecure_no_pairing: bool,
 
     /// Pin the advertised name, instead of asking `configd` what the robot is called.
@@ -62,6 +46,22 @@ struct Args {
     /// reconciled, so a rename no longer takes effect until the flag is removed.
     #[arg(long)]
     name: Option<String>,
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn pairing_requires_explicit_insecure_override_to_disable() {
+        let normal = Args::try_parse_from(["btd"]).unwrap();
+        assert!(!normal.insecure_no_pairing);
+        let bench = Args::try_parse_from(["btd", "--insecure-no-pairing"]).unwrap();
+        assert!(bench.insecure_no_pairing);
+        assert!(
+            Args::try_parse_from(["btd", "--require-pairing", "--insecure-no-pairing"]).is_err()
+        );
+    }
 }
 
 fn hostname() -> String {
@@ -115,12 +115,8 @@ async fn main() -> ExitCode {
         fallback: hostname(),
     };
 
-    if args.insecure_no_pairing {
-        tracing::warn!(
-            "--insecure-no-pairing is now the default and does nothing; remove it from the unit"
-        );
-    }
-    if !args.require_pairing {
+    let require_pairing = args.require_pairing || !args.insecure_no_pairing;
+    if !require_pairing {
         // Loud, every start, because the whole point of choosing the usable default is that the
         // insecurity stays visible rather than becoming the thing nobody remembers.
         tracing::warn!(
@@ -129,7 +125,7 @@ async fn main() -> ExitCode {
         );
     }
 
-    run(sockets, name, args.require_pairing).await
+    run(sockets, name, require_pairing).await
 }
 
 #[cfg(target_os = "linux")]

@@ -398,8 +398,9 @@ async fn serve_on_an_adapter(
                 // authentication" and starts pairing there and then, which a subscribe cannot do:
                 // `CharacteristicNotify` carries no encryption flags at all.
                 //
-                // NOTE: this is currently the *unencrypted* path in practice — see
-                // `docs/design/app-path-design.md` §5.5. Requiring encryption here hangs CoreBluetooth.
+                // The secure default requires encryption here. The historical macOS
+                // CoreBluetooth hang still needs phone-specific validation; see
+                // `docs/design/app-path-design.md` §5.5.
                 //
                 // The value matters less than the fact that reading it needs a bond; the API
                 // version is the most useful byte available, and a client that finds a version it

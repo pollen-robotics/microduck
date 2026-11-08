@@ -1,5 +1,12 @@
 # The App Path — `btd` and `configd`
 
+> **Security update (production candidate):** `btd` now requires an encrypted
+> paired link by default. `--insecure-no-pairing` remains an explicit bench-only
+> override. The historical macOS CoreBluetooth hang described in §5.5 is not
+> resolved by this policy change; onboarding must be validated on real iPhone
+> and Android devices before shipment. A factory `000000` PIN still provides no
+> meaningful per-device authorization and must be replaced in provisioning.
+
 Status: draft · Date: 2026-08-04 · Owner: pierre
 
 How a phone configures a robot: wifi, name, reboot, version, and triggering an update.
