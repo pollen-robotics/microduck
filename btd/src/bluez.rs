@@ -34,10 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bluer::adv::{Advertisement, AdvertisementHandle, SecondaryChannel, Type};
-use bluer::agent::Agent;
-// Aliased: `bluer` has two error types called `ReqError`, one for the pairing agent and one for a
-// characteristic. Naming this one makes a mix-up a name error rather than a puzzling type error,
-// which is how it first presented.
+// Keep GATT callback errors distinct from BlueZ and D-Bus errors.
 use bluer::gatt::local::ReqError as GattError;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotifier, CharacteristicNotify,
@@ -267,9 +264,10 @@ async fn serve_on_an_adapter(
         adapter.set_pairable(true).await?;
     }
 
-    // A **just-works** agent: every handler left `None`, which bluer publishes as
-    // `NoInputNoOutput`. So the bond needs no interaction and is encrypted but *not*
-    // authenticated.
+    // A **just-works** agent: it publishes `NoInputNoOutput`, so the bond is encrypted
+    // but *not* authenticated. Android still asks BlueZ for numeric confirmation on
+    // this board; bluer's empty agent rejects that request. Our agent answers it
+    // while keeping the honest hardware capability (see `crate::agent`).
     //
     // This is not the design that was intended. The first version answered BlueZ's passkey request
     // with the stored PIN, which cannot work on a headless robot: in LE passkey entry the roles
@@ -282,11 +280,9 @@ async fn serve_on_an_adapter(
     // client passes `system.authenticate`. See `crate::pairing` for the trade that involves.
     let _agent = if require_pairing {
         Some(
-            bt.register_agent(Agent {
-                request_default: true,
-                ..Default::default()
-            })
-            .await?,
+            crate::agent::PhoneAgent::register()
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
         )
     } else {
         tracing::warn!(

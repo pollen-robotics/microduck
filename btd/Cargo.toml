@@ -45,6 +45,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 bluer = { version = "=0.17.4", features = ["bluetoothd"] }
 dbus = { version = "0.9", features = ["vendored"] }
 futures = "0.3"
+zbus = "5"
 
 [dev-dependencies]
 # `every_call()`, shared rather than copied — see `src/route.rs`'s test module.
