@@ -605,6 +605,13 @@ attacker. The production proposal is a distinct, randomly generated secret of at
 robot, delivered as a QR code and used in a reviewed mutual-authentication protocol that never
 sends the secret itself over the just-works BLE link. The current `system.authenticate` six-digit
 field and `configd` store cannot hold this credential; both protocol and mobile app need changes.
+This authentication must finish **over BLE before `net.connect`**: the robot has no LAN address
+until that call succeeds. The handshake must derive a session key that protects the Wi-Fi
+passphrase and subsequent BLE RPCs against an active pairing-time intermediary, not merely return
+an `authenticated: true` boolean. The phone can register its own public key in this authenticated
+BLE session; once Wi-Fi joins, it uses that identity against the separate authenticated local
+camera/control gateway. Desktop clients can be enrolled later by an owner app over the local
+gateway, without requiring a desktop Bluetooth bootstrap path.
 
 On face-board-v1, the practical first storage candidate is a root-only file under
 `/var/lib/robot/config` on the eMMC `data` partition, provisioned **after** the common image is
