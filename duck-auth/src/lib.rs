@@ -5,13 +5,51 @@
 //! provisioned secret, protected phone storage, and an independent protocol review.
 
 use snow::{Builder, HandshakeState, TransportState};
+use std::path::Path;
 
+pub mod tcp;
 pub mod wire;
 
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_SHA256";
 const CLIENT_CONFIRM: &[u8] = b"microduck client confirmed v1";
 const ROBOT_CONFIRM: &[u8] = b"microduck robot confirmed v1";
 const MAX_MESSAGE: usize = 65_535;
+
+/// A per-robot development credential loaded from a protected file.
+#[derive(Clone)]
+pub struct ProvisionedKey {
+    robot_id: String,
+    key: [u8; 32],
+}
+
+impl ProvisionedKey {
+    /// Load a 64-character hexadecimal key. The caller must keep the source file private.
+    pub fn load(path: &Path, robot_id: String) -> Result<Self, &'static str> {
+        if robot_id.is_empty() || robot_id.len() > 128 || !robot_id.is_ascii() {
+            return Err("invalid robot identifier");
+        }
+        let text = std::fs::read_to_string(path).map_err(|_| "cannot read BLE credential")?;
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.len() != 64 || !text.is_ascii() {
+            return Err("BLE credential must be 64 hexadecimal characters");
+        }
+        let mut key = [0u8; 32];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+                .map_err(|_| "BLE credential must be hexadecimal")?;
+        }
+        Ok(Self { key, robot_id })
+    }
+
+    /// Borrow the secret for an authenticated handshake.
+    pub fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+    /// Borrow the public identifier bound into the handshake.
+    pub fn robot_id(&self) -> &str {
+        &self.robot_id
+    }
+}
 
 /// Authentication or frame validation failure. The caller must discard the BLE session.
 #[derive(Debug)]

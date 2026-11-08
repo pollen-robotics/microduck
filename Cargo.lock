@@ -1293,6 +1293,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snow",
+ "tokio",
 ]
 
 [[package]]
@@ -1340,6 +1341,18 @@ dependencies = [
  "duck-ipc-proto",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "duck-gateway"
+version = "0.18.9"
+dependencies = [
+ "clap",
+ "duck-auth",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

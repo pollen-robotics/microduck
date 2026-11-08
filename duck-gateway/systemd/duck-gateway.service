@@ -1,0 +1,27 @@
+[Unit]
+Description=Development authenticated media gateway
+After=network.target mediad.service
+Wants=mediad.service
+
+[Service]
+Type=exec
+User=btd
+Group=btd
+EnvironmentFile=/var/lib/robot/config/ble-gateway.env
+LoadCredential=ble-psk:/var/lib/robot/config/ble-psk
+ExecStart=/opt/robot/daemon/current/bin/duck-gateway --key-file %d/ble-psk --robot-id ${ROBOT_ID}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+# Intentionally no [Install]: provision and start this development service explicitly.

@@ -4,10 +4,8 @@
 //! The key is supplied through a file at process startup; production provisioning and
 //! recovery are separate work and this module must not be enabled by default yet.
 
-use std::path::Path;
-
 use duck_auth::wire::{Frame, MAX_CLIENT_LINE, MAX_ROBOT_LINE};
-use duck_auth::{RobotConfirm, Session};
+use duck_auth::{ProvisionedKey, RobotConfirm, Session};
 use duck_ble::framing::{self, Reassembler};
 use tokio::sync::mpsc;
 
@@ -15,31 +13,7 @@ use crate::link::{Link, QUEUE};
 use crate::session;
 use crate::upstream::{Pool, Sockets};
 
-#[derive(Clone)]
-pub struct Config {
-    key: [u8; 32],
-    robot_id: String,
-}
-
-impl Config {
-    /// Load a 64-character hex PSK. Neither the path nor the contents are logged.
-    pub fn load(path: &Path, robot_id: String) -> Result<Self, String> {
-        if robot_id.is_empty() || robot_id.len() > 128 || !robot_id.is_ascii() {
-            return Err("invalid robot identifier".into());
-        }
-        let text = std::fs::read_to_string(path).map_err(|_| "cannot read BLE credential")?;
-        let text = text.trim_end_matches(['\r', '\n']);
-        if text.len() != 64 || !text.is_ascii() {
-            return Err("BLE credential must be 64 hexadecimal characters".into());
-        }
-        let mut key = [0u8; 32];
-        for (index, byte) in key.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
-                .map_err(|_| "BLE credential must be hexadecimal")?;
-        }
-        Ok(Self { key, robot_id })
-    }
-}
+pub type Config = ProvisionedKey;
 
 enum State {
     Start,
@@ -66,7 +40,7 @@ pub async fn run(mut link: Link, sockets: Sockets, config: Config) {
                     let Ok(frame) = Frame::decode(&line, MAX_CLIENT_LINE) else { return };
                     match (&mut state, frame) {
                         (State::Start, Frame::Start(first)) => {
-                            let Ok((next, challenge)) = RobotConfirm::respond(&config.key, &config.robot_id, &first) else { return };
+                            let Ok((next, challenge)) = RobotConfirm::respond(config.key(), config.robot_id(), &first) else { return };
                             state = State::Confirm(next);
                             if send_frame(&link, Frame::Challenge(challenge)).await.is_err() { return }
                         }
@@ -133,10 +107,10 @@ mod tests {
     #[tokio::test]
     async fn secure_session_rejects_plaintext_and_decrypts_rpc() {
         let key = [0x71; 32];
-        let config = Config {
-            key,
-            robot_id: "test-duck".into(),
-        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "71".repeat(32)).unwrap();
+        let config = Config::load(&path, "test-duck".into()).unwrap();
         let sockets = Sockets {
             config: "/tmp/no-configd-secure-test.sock".into(),
             robot: "/tmp/no-robotd-secure-test.sock".into(),

@@ -31,6 +31,14 @@ unreadable key makes `btd` exit rather than serving a weaker protocol. The `Load
 is copied into a read-only per-service credential directory accessible to the service user.
 See [systemd credentials](https://systemd.io/CREDENTIALS/).
 
+For local camera and control, write `/var/lib/robot/config/ble-gateway.env` containing
+`ROBOT_ID=test-duck-1` (the same identifier), then start the packaged `duck-gateway.service`.
+It has no `[Install]` section and is never enabled automatically. It reads the same protected
+credential through systemd, listens on TCP 9443 for Noise-authenticated app connections, and
+forwards them only to `mediad` on `127.0.0.1:8443`. Keep `mediad` bound to loopback. The app's
+native Rust opens a one-use localhost listener for its webview, authenticates the robot over the
+network, then tunnels the WebSocket through the encrypted connection.
+
 ## App flow
 
 Paste the `md1:` code into the app's access-code field. This MVP does not yet scan QR codes or
@@ -39,8 +47,7 @@ app performs the Noise handshake before `hello`, then encrypts `net.connect` and
 requests and replies. A robot in secure mode rejects the six-digit PIN and plaintext RPCs. The
 app never writes the `md1:` code to `robots.json`.
 
-The app's normal LAN camera/control path is still unauthenticated. Treat this MVP as a protected
-BLE Wi-Fi setup and configuration path, not authorization for production camera or movement.
-Before production: owner enrollment, protected device storage, a secure local gateway, factory
-credential provisioning and recovery, independent protocol review, and iOS/Android tests on the
-face-board-v1 image remain required.
+The app's legacy PIN path still opens LAN media directly. Treat this as an opt-in development
+MVP, not a production security claim. Before production: QR scanning, owner enrollment and
+revocation, protected device storage, factory credential provisioning and recovery, independent
+protocol review, rate limiting, and iOS/Android tests on the face-board-v1 image remain required.
