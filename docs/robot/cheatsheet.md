@@ -946,6 +946,42 @@ Note that `robotctl monitor`'s ToF grid is stricter than the theremin — it mar
 outside 5/9 as `x`, *could not measure*. A grid full of `x` does not mean the sensor is
 broken; it means it is being pessimistic about numbers it does have.
 
+### Follow a laser dot
+
+```
+robotctl laser-track on      # and watch; Ctrl-C stops watching, tracking stays on
+robotctl laser-track         # just watch
+robotctl laser-track off
+```
+
+A red laser dot on the floor is looked at and walked to. It shares the robot rather than taking
+it: a pushed stick wins over the dot, and with no dot in sight the robot does what the pad says —
+so it can be left on while driving. The video stream is untouched; `mediad` scans the frames it
+already has, ~3 times a second while searching and ~15 once it sees a dot.
+
+`on`/`off` do not write the config. `[laser] enabled` in `robotctl configure` is whether it starts
+on at boot — and, like every `[laser]` key, an edit to it applies within a second, no restart.
+
+The readout is how the thresholds are tuned:
+
+```
+  DOT ( 412, 903) n=14     peak Y231 U112 V196  15Hz  → 0.84 m  -12°   walk 0.25 m/s -0.31 rad/s
+  no dot                   peak Y174 U121 V151   3Hz
+```
+
+`peak` is the reddest bright thing in the picture, **whether it passed or not**. Point the laser at
+the floor, read it, and set `y_min` and `v_min` a little below it and `u_max` a little above; then
+take the laser away and check that `peak` for the empty room sits clearly short of them. Chasing a
+red object: raise `v_min`, or lower `max_pixels`. `too small` / `too big` say which size bound
+rejected a candidate. Distances consistently off against a tape measure: `floor_offset_m`. Then
+`k_yaw`, `k_dist`, `vx_max`, `vyaw_max` and `stop_m` for how it walks; `head` and `walk` switch either
+half off.
+
+It uses the camera geometry `mediad` already publishes — the family calibration for the board's
+sensor (IMX219 on the Zero 3W, GC2093 on `beta` and `face-board-v1`), or this robot's own
+`[media.intrinsics]` — and the board's mount (a quarter turn on the Zero 3W, upright on the
+others). If neither is known, the readout says so instead of guessing.
+
 ### The ToF sensor (`tofd`)
 
 An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:

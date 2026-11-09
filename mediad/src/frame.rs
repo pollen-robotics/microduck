@@ -15,6 +15,10 @@
 //!
 //! The socket is group-readable like the other observation sockets: whoever may watch
 //! `robot.state` may ask for a picture.
+//!
+//! It also serves `media.laser` ([`crate::laser`]): a subscription rather than a request, so the
+//! connection that asks for it leaves the five-second bound every other request lives under and
+//! stays open for as long as the subscriber does.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -96,7 +100,15 @@ pub async fn bind(socket: &Path) -> Result<(std::fs::File, UnixListener)> {
 ///
 /// `rotate` is degrees clockwise the camera is mounted from upright, reported in every frame
 /// header. It is the caller's business whether the pipeline already applied it.
-pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Result<()> {
+///
+/// `laser` is the camera geometry `media.laser` needs, set once `main` knows it — after the
+/// pipeline has pinned a sensor mode. Unset is a refusal with a reason, not a guess.
+pub async fn serve(
+    listener: UnixListener,
+    frames: Frames,
+    rotate: u32,
+    laser: Arc<std::sync::OnceLock<crate::laser::Geometry>>,
+) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         match listener.accept().await {
@@ -105,13 +117,19 @@ pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Resul
                     continue;
                 };
                 let frames = frames.clone();
+                let laser = laser.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = tokio::time::timeout(
+                    let asked = tokio::time::timeout(
                         Duration::from_secs(5),
-                        handle(stream, frames, rotate),
+                        handle(stream, frames.clone(), rotate),
                     )
                     .await;
+                    if let Ok(Ok(Some(subscription))) = asked
+                        && let Err(error) = subscribe_laser(subscription, frames, &laser).await
+                    {
+                        tracing::info!(error = %format!("{error:#}"), "media.laser ended");
+                    }
                 });
             }
             Err(error) => tracing::warn!(error = %error, "media.frame accept failed"),
@@ -119,7 +137,50 @@ pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Resul
     }
 }
 
-async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
+/// A connection that asked for `media.laser`, handed back out of [`handle`] so the subscription
+/// can outlive the bound a request is served under.
+pub(crate) struct LaserSubscription {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: tokio::net::unix::OwnedWriteHalf,
+    id: Option<proto::Id>,
+    params: proto::LaserDetectParams,
+}
+
+async fn subscribe_laser(
+    LaserSubscription {
+        reader,
+        mut write,
+        id,
+        params,
+    }: LaserSubscription,
+    frames: Frames,
+    laser: &std::sync::OnceLock<crate::laser::Geometry>,
+) -> Result<()> {
+    let Some(geometry) = laser.get().cloned() else {
+        write_response(
+            &mut write,
+            proto::Response::err(
+                id,
+                proto::Error::new(
+                    proto::code::INTERNAL_ERROR,
+                    "no camera geometry: the sensor is not in a mode whose field of view is known, \
+                     and [media.intrinsics] carries no calibration — a dot cannot be turned into a \
+                     direction",
+                ),
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+    write_response(&mut write, proto::Response::ok(id, &())).await?;
+    crate::laser::serve(reader, write, frames, geometry, params).await
+}
+
+async fn handle(
+    stream: UnixStream,
+    frames: Frames,
+    rotate: u32,
+) -> Result<Option<LaserSubscription>> {
     let (read, mut write) = stream.into_split();
     // Bounded *before* the line is buffered. Checking the length afterwards would mean a client
     // could make this process hold an arbitrarily long line first, which is the thing the cap is
@@ -133,7 +194,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
             .read_until(b'\n', &mut line)
             .await?;
         if read == 0 {
-            return Ok(());
+            return Ok(None);
         }
         if line.len() > MAX_REQUEST_BYTES {
             write_response(
@@ -144,7 +205,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
         let request: proto::Request = match serde_json::from_slice(&line) {
             Ok(request) => request,
@@ -157,7 +218,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
                     ),
                 )
                 .await?;
-                return Ok(());
+                return Ok(None);
             }
         };
         if request.method == proto::method::HELLO {
@@ -175,6 +236,33 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
             )
             .await?;
             continue;
+        }
+        if request.method == proto::method::MEDIA_LASER {
+            let params = match request
+                .params
+                .clone()
+                .map(serde_json::from_value::<proto::LaserDetectParams>)
+                .transpose()
+            {
+                Ok(params) => params.unwrap_or_default(),
+                Err(error) => {
+                    write_response(
+                        &mut write,
+                        proto::Response::err(
+                            request.id,
+                            proto::Error::new(proto::code::INVALID_PARAMS, error.to_string()),
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
+            return Ok(Some(LaserSubscription {
+                reader,
+                write,
+                id: request.id,
+                params,
+            }));
         }
         if request.method != proto::method::MEDIA_FRAME {
             write_response(
@@ -205,7 +293,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         };
         let captured_at_unix_us = frame
             .captured_at
@@ -223,7 +311,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
         write_response(&mut write, proto::Response::ok(request.id, &header)).await?;
         write.write_all(&frame.data).await?;
         write.flush().await?;
-        return Ok(());
+        return Ok(None);
     }
 }
 
@@ -346,7 +434,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("media.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(serve(listener, Frames::default(), 90));
+        let server = tokio::spawn(serve(listener, Frames::default(), 90, Default::default()));
         let mut clients = Vec::new();
         for _ in 0..16 {
             let mut client = UnixStream::connect(&socket).await.unwrap();

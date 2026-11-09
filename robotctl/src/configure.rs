@@ -157,6 +157,10 @@ fn apply_for(key: &str) -> Option<Apply> {
         // `updaterd` reads it at the moment it would revert, the way it reads `allow_community`;
         // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
         "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
+        // `robotd`'s laser reader re-reads `[laser]` within a second of the file changing —
+        // tuning it is many small edits, and each must not drop the robot. `enabled` included:
+        // an edit to it switches tracking there and then.
+        "laser" => Apply::Live("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,

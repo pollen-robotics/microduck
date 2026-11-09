@@ -1027,6 +1027,7 @@ intents the loop already arbitrates.
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `laser.rs` | a laser dot from `mediad`'s `media.laser` (a ray, not a pixel) → a place on the floor through head FK, IMU and odometry → a head pose and a twist, each taken only while no client wants that half | the module header; the detector is `mediad/src/laser.rs` |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `emotion.rs` | an emotion = keyframes and a wav, shipped in the release with `[emotions] dir` on top, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
@@ -1039,11 +1040,13 @@ behind `RobotIo`, because it has to keep answering when the motor bus does not.
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[laser tracking].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[laser tracking]: ../robot/cheatsheet.md#follow-a-laser-dot
 
 ## 5. Why it exists, and where it came from
 

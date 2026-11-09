@@ -476,9 +476,14 @@ fn main() -> ExitCode {
         // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
         // upright already, and turning them twice is a picture on its side with nothing to say why.
         let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
+        // What `media.laser` turns a pixel into a direction with — filled in below, once the
+        // intrinsics are known, which is only after the pipeline has pinned a sensor mode.
+        let laser_geometry = std::sync::Arc::new(std::sync::OnceLock::new());
+        let frame_laser = laser_geometry.clone();
         tokio::spawn(async move {
             let _lock = frame_lock;
-            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_rotate).await
+            if let Err(error) =
+                mediad::frame::serve(frame_listener, frame_source, frame_rotate, frame_laser).await
             {
                 tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
             }
@@ -599,6 +604,19 @@ fn main() -> ExitCode {
                 "no camera geometry to publish: the sensor is not in a mode whose field of view \
                  is known, so a consumer is told nothing rather than something wrong"
             ),
+        }
+
+        // The laser detector's geometry: these intrinsics, and the same turn the duck detector's
+        // sampler gets — none when the pipeline already flipped the frames.
+        if let Some(geometry) = &intrinsics {
+            let _ = laser_geometry.set(mediad::laser::Geometry::from_intrinsics(
+                geometry,
+                if args.flip_in_pipeline {
+                    uyvy::Turn::None
+                } else {
+                    turn
+                },
+            ));
         }
 
         let video = mediad::session::Video {

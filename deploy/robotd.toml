@@ -432,6 +432,65 @@ mode = "walk"
 # withdrew keeps sounding.
 # hold_ms = 250
 
+[laser]
+# Laser tracking: a red laser dot on the floor is followed with the head and walked to. Switched
+# live with `robotctl laser-track on|off` (or `robot.laserTrack`), which does not write this file;
+# this key is whether it starts on — and changing it here switches it too. A deflected stick always
+# wins over the dot, and with no dot in sight the robot does whatever it was told — so it can be
+# left on while driving.
+#
+# The video stream is untouched: `mediad` scans the frames it already has, at the stream's own
+# auto-exposure, a few times a second while searching and faster once it sees a dot.
+#
+# **Everything in this section applies live** — save, and robotd picks it up within a second. Tune with `robotctl laser-track` running: it prints the colour of the best
+# candidate in each look, whether it passed or not.
+# enabled = false
+
+# mediad's local socket.
+# socket = "/run/mediad/media.sock"
+
+# What a dot pixel is, in the camera's YUV (0-255, chroma 128 = grey). At normal exposure a dot is
+# a white core with a red rim, and these gate on the rim: bright, red, not blue. Point the laser,
+# read `peak` in `robotctl laser-track`, and set each a little on the safe side of it. If it
+# chases red objects, raise y_min and v_min; if it misses the dot, lower them.
+# y_min = 150
+# v_min = 165
+# u_max = 140
+
+# How big a dot is, in sampled pixels (every other row and column of the frame) around the
+# brightest hit, within radius_px of it. Fewer than min_pixels is noise; more than max_pixels is
+# a red lamp or a jumper, not a laser.
+# min_pixels = 3
+# max_pixels = 600
+# radius_px = 24
+
+# Looks per second, searching and tracking. Each look copies one frame (~1.8 MB) and scans a
+# quarter of it — around 2 ms on the board — so 3 Hz idle is noise and 15 Hz is a few percent of
+# a core.
+# search_hz = 3.0
+# track_hz = 15.0
+
+# Which halves to drive. Both off is detection only: `robotctl laser-track` still shows the dot.
+# head = true
+# walk = true
+
+# How long a dot that left the picture is still followed, milliseconds — across a blink of the
+# detector or a dot that ran past the frame's edge.
+# memory_ms = 1000
+
+# Walking to it. Forward speed is k_dist × (distance − stop_m), capped at vx_max, and only while
+# roughly facing the dot; turning is k_yaw × bearing, capped at vyaw_max. Too much k_yaw wobbles.
+# stop_m = 0.25
+# max_range_m = 2.5
+# k_dist = 1.0
+# k_yaw = 1.5
+# vx_max = 0.25
+# vyaw_max = 0.8
+
+# The floor's height under the trunk comes from odometry. If distances in `robotctl laser-track`
+# are consistently long or short against a tape measure, nudge this: + raises the floor (nearer).
+# floor_offset_m = 0.0
+
 [duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because

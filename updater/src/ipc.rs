@@ -883,6 +883,7 @@ impl Server {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)

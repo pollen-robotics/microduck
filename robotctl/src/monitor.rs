@@ -4970,6 +4970,7 @@ mod tests {
             currents_ma: Vec::new(),
             odom: proto::OdomState::default(),
             theremin: None,
+            laser: None,
             chorale: None,
             t_ns: 0,
             imu: None,
