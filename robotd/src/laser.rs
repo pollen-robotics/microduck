@@ -46,8 +46,9 @@ const WAKE: Duration = Duration::from_millis(300);
 const RELOAD: Duration = Duration::from_secs(1);
 
 /// A dot older than this is not news: `mediad` says something every look, even "nothing", so a
-/// silence this long is a connection that has stalled.
-const DOT_STALE: Duration = Duration::from_millis(1500);
+/// silence this long is a connection that has stalled. Two and a half looks at the default
+/// `search_hz` of 1 — a look can wait up to half a second for its frame — not one.
+const DOT_STALE: Duration = Duration::from_millis(2500);
 
 /// Request id for the subscription. Any number; `mediad` echoes it.
 const SUBSCRIBE_ID: u64 = 1;

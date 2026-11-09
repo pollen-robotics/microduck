@@ -2712,7 +2712,7 @@ impl Default for LaserTrackResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaserTrackState {
-    /// The camera side, as a line: `looking at 3 Hz`, or why it is not — `mediad` not answering,
+    /// The camera side, as a line: `looking at 1–15 Hz`, or why it is not — `mediad` not answering,
     /// no camera geometry. The first thing to read when nothing happens.
     pub camera: String,
     /// The newest look's answer from `mediad`, if there has been one.
@@ -2775,7 +2775,10 @@ impl Default for LaserDetectParams {
             min_pixels: 3,
             max_pixels: 600,
             radius_px: 24,
-            search_hz: 3.0,
+            // Measured on a face-board-v1: 3 Hz cost 3.4% of a core in mediad, and each look costs
+            // the same, so 1 Hz is about a third of that — for half a second's wait, on average,
+            // before a dot is first noticed. Tracking itself is unaffected.
+            search_hz: 1.0,
             track_hz: 15.0,
         }
     }
@@ -7047,7 +7050,7 @@ mod tests {
         assert!(!off.contains("laser"), "{off}");
 
         state.laser = Some(LaserTrackState {
-            camera: "looking at 3 Hz".into(),
+            camera: "looking at 1–15 Hz".into(),
             dot: Some(LaserDot {
                 seen: true,
                 ray: Some([0.1, 0.3]),

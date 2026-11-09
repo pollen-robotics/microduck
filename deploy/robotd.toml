@@ -464,10 +464,11 @@ mode = "walk"
 # max_pixels = 600
 # radius_px = 24
 
-# Looks per second, searching and tracking. Each look copies one frame (~1.8 MB) and scans a
-# quarter of it — around 2 ms on the board — so 3 Hz idle is noise and 15 Hz is a few percent of
-# a core.
-# search_hz = 3.0
+# Looks per second, searching and tracking. Each look copies one frame (~1.8 MB) out of the camera
+# pipeline and scans a quarter of it — about 5 ms on a face-board-v1 — so the cost is the rate:
+# measured there, 3 Hz was 3.4% of one core and 15 Hz 15%. Searching at 1 Hz costs about 1%, and
+# means up to a second before a dot is first noticed; tracking starts at track_hz from that look.
+# search_hz = 1.0
 # track_hz = 15.0
 
 # Which halves to drive. Both off is detection only: `robotctl laser-track` still shows the dot.

@@ -1320,7 +1320,7 @@ function onControl(data) {
     // The duck detector, a couple of times a second. Not logged: it streams, and a line per
     // sighting would bury everything a person opened the drawer to read.
     if (msg.method === "media.detections") { onDetections(msg.params); return; }
-    // The laser detector, 3–15 times a second while laser tracking is on. Not logged either.
+    // The laser detector, 1–15 times a second while laser tracking is on. Not logged either.
     if (msg.method === "media.laserDot") { onLaserDot(msg.params); return; }
     log("in", "control ←", data.slice(0, 400));
     return;
@@ -1780,9 +1780,9 @@ function onDetections({ width, height, boxes, took_ms }) {
 // against. Coordinates are in the upright frame, like the duck boxes.
 let laserStale = null;
 
-// Looks come at 3 Hz at the slowest, so a second and a half of silence is tracking switched off,
-// and the ring must go rather than stay painted where the dot last was.
-const LASER_TIMEOUT_MS = 1500;
+// Looks come at 1 Hz at the slowest (by default), so two and a half seconds of silence is tracking
+// switched off, and the ring must go rather than stay painted where the dot last was.
+const LASER_TIMEOUT_MS = 2500;
 
 function clearLaser(reason) {
   $("laser").replaceChildren();

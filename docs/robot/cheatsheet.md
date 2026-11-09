@@ -957,7 +957,8 @@ robotctl laser-track off
 A red laser dot on the floor is looked at and walked to. It shares the robot rather than taking
 it: a pushed stick wins over the dot, and with no dot in sight the robot does what the pad says —
 so it can be left on while driving. The video stream is untouched; `mediad` scans the frames it
-already has, ~3 times a second while searching and ~15 once it sees a dot.
+already has, once a second while searching and ~15 times once it sees a dot. Measured on a
+face-board-v1: searching costs about 1% of one core, tracking about 15%.
 
 `on`/`off` do not write the config. `[laser] enabled` in `robotctl configure` is whether it starts
 on at boot — and, like every `[laser]` key, an edit to it applies within a second, no restart.
