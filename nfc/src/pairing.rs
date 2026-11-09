@@ -1,13 +1,16 @@
 //! What a pairing tag touched to the reader does: start the pairing, unless a pad is already
 //! driving.
 //!
-//! Every tag says the same thing, [`crate::ndef::PAIRING`], and none names a pad. A touch is
-//! `robotctl pad pair` with no address: the robot looks for a gamepad in pairing mode and takes the
-//! one it finds — and refuses, saying so, when it finds two.
+//! Every tag says [`crate::ndef::PAIRING`], and may follow it with a pad's address. Without one, a
+//! touch is `robotctl pad pair` with no address: the robot looks for a gamepad in pairing mode and
+//! takes the one it finds — and refuses, saying so, when it finds two. With one, it is
+//! `robotctl pad pair <mac>`: that pad and no other, which is what a room with several pads in
+//! pairing mode, or a pad the robot does not recognise as one, needs.
 //!
 //! The rule, in full:
 //!  - a pad already **connected** means nothing happens. The robot has a driver, and a tag brushed
-//!    against it must not hand the bond to whatever pad happens to be in pairing mode nearby;
+//!    against it must not hand the bond to whatever pad happens to be in pairing mode nearby. A
+//!    tag naming a pad is no exception, whether it names the connected one or another;
 //!  - otherwise the robot quacks to say it read the tag, pairs the pad it finds, and greets once it
 //!    has — two different sounds, so someone holding the pad hears the difference between "got your
 //!    tag, looking" and "done". A refusal gets no second sound.
@@ -71,8 +74,8 @@ impl Touches {
 /// The rest of the robot, as far as a tag is concerned.
 pub trait Robot {
     fn pads(&mut self) -> Result<Vec<proto::Pad>, String>;
-    /// `pad.pair` with no address: whichever pad is in pairing mode.
-    fn pair(&mut self) -> Result<proto::PadPairResult, String>;
+    /// `pad.pair`: the pad at `mac`, or with none whichever pad is in pairing mode.
+    fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String>;
     fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String>;
 }
 
@@ -90,7 +93,8 @@ pub enum Outcome {
     Failed(String),
 }
 
-pub fn on_touch(robot: &mut dyn Robot) -> Outcome {
+/// A pairing tag was touched; `mac` is the pad it names, if it names one.
+pub fn on_touch(robot: &mut dyn Robot, mac: Option<&str>) -> Outcome {
     let pads = match robot.pads() {
         Ok(pads) => pads,
         Err(e) => return Outcome::Failed(format!("pad.status: {e}")),
@@ -103,7 +107,7 @@ pub fn on_touch(robot: &mut dyn Robot) -> Outcome {
     if let Err(why) = robot.sound(HEARD) {
         tracing::info!(%why, "the robot would not quack for the tag");
     }
-    match robot.pair() {
+    match robot.pair(mac) {
         Err(e) => Outcome::Failed(format!("pad.pair: {e}")),
         Ok(proto::PadPairResult::Failed { reason, detail, .. }) => {
             Outcome::NotPaired(reason, detail)
@@ -141,8 +145,11 @@ mod tests {
             self.calls.push("status".into());
             Ok(self.pads.clone())
         }
-        fn pair(&mut self) -> Result<proto::PadPairResult, String> {
-            self.calls.push("pair".into());
+        fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String> {
+            self.calls.push(match mac {
+                Some(mac) => format!("pair {mac}"),
+                None => "pair".into(),
+            });
             Ok(match self.refuse {
                 Some(reason) => proto::PadPairResult::Failed {
                     reason,
@@ -150,7 +157,7 @@ mod tests {
                     candidates: Vec::new(),
                 },
                 None => proto::PadPairResult::Paired {
-                    pad: pad(MAC, true),
+                    pad: pad(mac.unwrap_or(MAC), true),
                 },
             })
         }
@@ -169,7 +176,7 @@ mod tests {
             pads: vec![pad("AA:BB:CC:DD:EE:FF", true)],
             ..Fake::default()
         };
-        let outcome = on_touch(&mut robot);
+        let outcome = on_touch(&mut robot, None);
         assert!(matches!(outcome, Outcome::AlreadyConnected(p) if p.mac == "AA:BB:CC:DD:EE:FF"));
         assert_eq!(robot.calls, ["status"]);
     }
@@ -181,7 +188,7 @@ mod tests {
             pads: vec![pad("AA:BB:CC:DD:EE:FF", false)],
             ..Fake::default()
         };
-        assert!(matches!(on_touch(&mut robot), Outcome::Paired(p) if p.mac == MAC));
+        assert!(matches!(on_touch(&mut robot, None), Outcome::Paired(p) if p.mac == MAC));
         assert_eq!(robot.calls, ["status", "chirp", "pair", "greet"]);
     }
 
@@ -192,10 +199,30 @@ mod tests {
             ..Fake::default()
         };
         assert_eq!(
-            on_touch(&mut robot),
+            on_touch(&mut robot, None),
             Outcome::NotPaired(proto::PadPairFailure::NotFound, None)
         );
         assert_eq!(robot.calls, ["status", "chirp", "pair"]);
+    }
+
+    #[test]
+    fn a_tag_naming_a_pad_pairs_that_pad() {
+        let mut robot = Fake::default();
+        let named = "78:86:2E:BB:13:28";
+        let outcome = on_touch(&mut robot, Some(named));
+        assert!(matches!(outcome, Outcome::Paired(p) if p.mac == named));
+        assert_eq!(robot.calls, ["status", "chirp", "pair 78:86:2E:BB:13:28", "greet"]);
+    }
+
+    #[test]
+    fn a_tag_naming_a_pad_still_does_nothing_while_one_is_connected() {
+        let mut robot = Fake {
+            pads: vec![pad("AA:BB:CC:DD:EE:FF", true)],
+            ..Fake::default()
+        };
+        let outcome = on_touch(&mut robot, Some("78:86:2E:BB:13:28"));
+        assert!(matches!(outcome, Outcome::AlreadyConnected(p) if p.mac == "AA:BB:CC:DD:EE:FF"));
+        assert_eq!(robot.calls, ["status"]);
     }
 
     #[test]

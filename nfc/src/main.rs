@@ -5,9 +5,9 @@
 //! Polls the reader five times a second, asking as ISO 14443A and then as ISO 15693, so a
 //! Type 2 tag (an NTAG) and a Type 5 one (an ST25TV, an ICODE) both answer. When a tag arrives
 //! whose NDEF says [`ndef::PAIRING`]: if a pad is already connected nothing happens, otherwise
-//! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
-//! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
-//! are in [`nfc::pairing`].
+//! `configd` is asked to pair the pad the tag names, or whichever is in pairing mode when it names
+//! none — with a quack from `robotd` when the tag is read and a different sound once the pad is
+//! paired. The rule and why it is that rule are in [`nfc::pairing`].
 //!
 //! ## Why its own daemon
 //!
@@ -53,7 +53,7 @@ const QUICK_ANSWER: Duration = Duration::from_secs(5);
 #[derive(Parser, Debug)]
 #[command(
     name = "nfcd",
-    about = "NFC reader daemon: touch a pairing tag, pair the gamepad in pairing mode",
+    about = "NFC reader daemon: touch a pairing tag, pair the gamepad it names or that is pairing",
     version
 )]
 struct Args {
@@ -255,18 +255,25 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
                     touches.unread();
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
-                Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
-                    tracing::warn!(tag = %id, ?records, "not a pairing tag")
-                }
-                Ok(Ok(_)) => {
-                    // Off while the pairing blocks: no reason to power the antenna for the
-                    // fifteen seconds nobody is reading it.
-                    if let Err(e) = chip.field_off() {
-                        return e;
+                Ok(Ok(records)) => match ndef::pairing(&records) {
+                    None => tracing::warn!(tag = %id, ?records, "not a pairing tag"),
+                    Some(asked) => {
+                        // Off while the pairing blocks: no reason to power the antenna for the
+                        // fifteen seconds nobody is reading it.
+                        if let Err(e) = chip.field_off() {
+                            return e;
+                        }
+                        match &asked.mac {
+                            Some(mac) => {
+                                tracing::warn!(tag = %id, %mac, "pairing tag touched — pairing that pad")
+                            }
+                            None => {
+                                tracing::warn!(tag = %id, "pairing tag touched — looking for a pad in pairing mode")
+                            }
+                        }
+                        report(pairing::on_touch(robot, asked.mac.as_deref()));
                     }
-                    tracing::warn!(tag = %id, "pairing tag touched — looking for a pad in pairing mode");
-                    report(pairing::on_touch(robot));
-                }
+                },
             }
         } else if touched.is_none() {
             touches.seen(None);
@@ -320,8 +327,11 @@ impl Robot for Sockets {
         Ok(status.pads)
     }
 
-    fn pair(&mut self) -> Result<proto::PadPairResult, String> {
-        let params = proto::PadPairParams::default();
+    fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String> {
+        let params = proto::PadPairParams {
+            mac: mac.map(str::to_owned),
+            ..proto::PadPairParams::default()
+        };
         call(&self.config, &proto::Call::PadPair(params), PAIR_ANSWER)
     }
 

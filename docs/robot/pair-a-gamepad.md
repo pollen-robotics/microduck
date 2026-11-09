@@ -64,11 +64,20 @@ always running and picks a reader up within thirty seconds of it being plugged i
 - **A pad already connected wins.** If one is driving, a touch does nothing, so a tag brushed against
   the robot never hands the bond to someone else's pad.
 - **One attempt per touch.** If it did not pair, lift the tag and touch again.
-- **Every pairing tag is the same.** It holds one text (or URI) record reading exactly
-  `microduck_gamepad_pairing`, and names no pad: the robot takes the one in pairing mode, and refuses
-  if it finds two, as `robotctl pad pair` does. From a laptop with the reader plugged in, winnie's
-  tool writes one: `ntag write --text microduck_gamepad_pairing`. A tag with an address on it, as
-  the first ones had, no longer pairs anything.
+- **A pairing tag holds one text (or URI) record**, in one of two forms:
+  - `microduck_gamepad_pairing` names no pad. The robot takes the one in pairing mode, and refuses
+    if it finds two, as `robotctl pad pair` does.
+  - `microduck_gamepad_pairing 78:86:2E:BB:13:28`, the pairing text, a space and the pad's address,
+    names that pad. The robot pairs that one and no other, as `robotctl pad pair 78:86:2E:BB:13:28`
+    does — the tag to stick on a pad when several are in pairing mode in the same room, or when the
+    robot does not recognise the hardware as a gamepad. An address that is not six hex octets
+    separated by `:` makes it not a pairing tag: nothing is paired, rather than whatever pad is in
+    range.
+
+  From a laptop with the reader plugged in, winnie's tool writes either:
+  `ntag write --text microduck_gamepad_pairing` or
+  `ntag write --text "microduck_gamepad_pairing 78:86:2E:BB:13:28"`. A tag holding an address and
+  nothing else, as the first ones had, does not pair anything.
 - It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
   15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
   *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's

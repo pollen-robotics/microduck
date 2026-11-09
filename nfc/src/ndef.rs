@@ -1,4 +1,5 @@
-//! NDEF, read-only and limited to text and URI records — and whether they ask to pair a gamepad.
+//! NDEF, read-only and limited to text and URI records — and whether they ask to pair a gamepad,
+//! and which one.
 //!
 //! Pure: no hardware, entirely testable off a board.
 
@@ -170,13 +171,54 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
-/// What a pairing tag holds: every one is written with this text, and none names a pad.
+/// What every pairing tag starts with. On its own it names no pad; followed by an address it names
+/// one — see [`pairing`].
 pub const PAIRING: &str = "microduck_gamepad_pairing";
 
-/// Does one of these records say "pair a gamepad"? The whole record, surrounding whitespace aside —
-/// a tag that merely mentions it in other text is not a pairing tag.
+/// A pairing tag, read: which pad it asks for, if it names one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pairing {
+    /// The pad's Bluetooth address, upper case and colon-separated, as BlueZ writes it. `None`
+    /// for a tag that names no pad: the robot takes the one in pairing mode.
+    pub mac: Option<String>,
+}
+
+/// Does one of these records ask to pair a gamepad, and which one?
+///
+/// A record is a pairing record when it is exactly [`PAIRING`], or [`PAIRING`], a space and a
+/// Bluetooth address — `microduck_gamepad_pairing 78:86:2E:BB:13:28`. Surrounding whitespace
+/// aside, nothing else counts: a tag that merely mentions it in other text is not a pairing tag,
+/// and neither is one whose address does not parse, because pairing whatever pad is in range is
+/// not what a tag naming a particular one asked for. An address on its own, as the first tags
+/// had, does not pair anything either.
+pub fn pairing(records: &[Record]) -> Option<Pairing> {
+    records.iter().find_map(|r| {
+        let rest = r.value().trim().strip_prefix(PAIRING)?;
+        if rest.is_empty() {
+            return Some(Pairing { mac: None });
+        }
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        Some(Pairing {
+            mac: Some(mac(rest.trim_start())?),
+        })
+    })
+}
+
+/// Does one of these records ask to pair a gamepad, named or not?
 pub fn asks_to_pair(records: &[Record]) -> bool {
-    records.iter().any(|r| r.value().trim() == PAIRING)
+    pairing(records).is_some()
+}
+
+/// Six hex octets separated by `:`, in BlueZ's form: upper case.
+fn mac(text: &str) -> Option<String> {
+    let octets: Vec<&str> = text.split(':').collect();
+    let valid = octets.len() == 6
+        && octets
+            .iter()
+            .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+    valid.then(|| text.to_ascii_uppercase())
 }
 
 #[cfg(test)]
@@ -244,5 +286,40 @@ mod tests {
         assert!(!asks(Record::Text(format!("not {PAIRING}"))));
         assert!(!asks(Record::Text("MICRODUCK_GAMEPAD_PAIRING".into())));
         assert!(!asks_to_pair(&[]));
+    }
+
+    #[test]
+    fn a_pairing_tag_may_name_its_pad() {
+        let read = |text: &str| pairing(&[Record::Text(text.into())]);
+        let named = |mac: &str| {
+            Some(Pairing {
+                mac: Some(mac.into()),
+            })
+        };
+        assert_eq!(read(PAIRING), Some(Pairing { mac: None }));
+        assert_eq!(
+            read(&format!("{PAIRING} 78:86:2E:BB:13:28")),
+            named("78:86:2E:BB:13:28")
+        );
+        // Typed on a phone: lower case, a trailing newline.
+        assert_eq!(
+            read(&format!("{PAIRING} 78:86:2e:bb:13:28\n")),
+            named("78:86:2E:BB:13:28")
+        );
+        assert_eq!(
+            pairing(&[Record::Uri(format!("{PAIRING} 98:B6:E9:28:06:09"))]),
+            named("98:B6:E9:28:06:09")
+        );
+    }
+
+    #[test]
+    fn an_address_that_does_not_parse_pairs_nothing() {
+        let read = |text: &str| pairing(&[Record::Text(text.into())]);
+        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13")), None);
+        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:2G")), None);
+        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:28:00")), None);
+        assert_eq!(read(&format!("{PAIRING} 788:6:2E:BB:13:28")), None);
+        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:28 extra")), None);
+        assert_eq!(read(&format!("{PAIRING}78:86:2E:BB:13:28")), None);
     }
 }
