@@ -396,9 +396,9 @@ robotctl pad bindings
 a           sit_toggle
 b           ground_pick
 x             (nothing)
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 
 `robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
 ```
@@ -410,9 +410,9 @@ sudo robotctl pad bind x polite-bow
 a           sit_toggle
 b           ground_pick
 x           polite-bow
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 ```
 
 That writes one line, and only the button you named:
@@ -435,13 +435,40 @@ silently doing nothing when you press it.
 
 Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
-`pad reset <button>` puts one back. X and Y ship empty, so they are the place for a new skill; X
-re-sends while held, which is what a chaining skill like the roulade wants.
+`pad reset <button>` puts one back. Three ship with emotions (see *Emotions*): LB yes, RB no, Y
+excited. X ships empty, so it is the place for a new skill; it re-sends while held, which is what a
+chaining skill like the roulade wants.
 
 The rest of the pad is not bindable: Start stands the robot up and toggles the policy, the D-pad
 picks what the sticks mean, and held Select cuts torque and powers the robot off — the button that stops a robot is the one worth not
 being able to lose to a config edit. A name is checked against what the robot actually has, so a
 typo is refused with the list rather than becoming a dead button.
+
+#### Emotions
+
+An emotion is a head, body and beak animation with its sound: a nod, a sigh, a laugh. Each is two
+files, `<name>.json` (keyframes) and `<name>.wav`, and its name is a skill like any other. **The
+set made for Microduck ships with every release** — `angry`, `curious`, `defiant`, `devastated`,
+`excited`, `impatient`, `laugh`, `mmh`, `mock`, `no`, `sad`, `yes`, `yes_fast`, from
+[microduck_emotions](https://github.com/pollen-robotics/microduck_emotions) — so there is nothing
+to install. Your own go in `/var/lib/robot/emotions/`, and one there with a shipped name replaces
+it:
+
+```
+sudo mkdir -p /var/lib/robot/emotions && sudo cp mine.json mine.wav /var/lib/robot/emotions/
+sudo systemctl restart robotd
+```
+
+```
+robotctl robot do sad
+sudo robotctl pad bind y sad
+```
+
+While one plays it has the head, the body pose and the beak, the sticks wait, and another request
+is dropped until it ends; on X, which re-sends while held, it plays again for as long as X is held.
+A keyframe with `"skill": "sit"` sits the robot down (devastated); it stays seated, and the sit
+toggle stands it up. The directory is read once at startup, so new files need the restart;
+`[emotions] dir` moves it, and in the simulator it is the checkout's `robotd/emotions/`.
 
 #### Putting it all back
 
@@ -722,7 +749,9 @@ the thumb:
 | --- | --- |
 | **A** / cross | sit ↔ stand |
 | **B** / circle | ground pick |
-| **X**, **Y**, **LB / RB** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `lb kick_left`) |
+| **LB / RB** | the yes / no emotions |
+| **Y** | the excited emotion |
+| **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
@@ -730,8 +759,8 @@ the thumb:
 | **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
 | **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
 | **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
-| **Select**, let go between 2 and 4 s | rest (`robot.rest`): a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
-| **Select**, held 4 s | power off (`robot.shutdown`): the same sit and rest pose, then the board switches off. The release afterwards does nothing more |
+| **Select**, held 2 s | rest (`robot.rest`), at once, without waiting for the release — the robot sitting down says the two seconds are up: a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
+| **Select**, held 4 s | power off (`robot.shutdown`): kept by the robot until the rest it started at 2 s has ended, then the board switches off. The release afterwards does nothing more |
 
 **One move at a time.** A kick, a pick or a sit is refused while another is running, and a
 seated robot only accepts A (stand up). Stopping the policy while it sits keeps it seated; cutting

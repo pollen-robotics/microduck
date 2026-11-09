@@ -158,7 +158,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
         "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
-        | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+        | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
     })
 }

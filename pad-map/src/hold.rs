@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 /// never reaches it, short enough to be the obvious thing to do when the robot is somewhere odd.
 pub const HOME_HOLD: Duration = Duration::from_millis(1500);
 
-/// Select let go after this long, and before [`SHUTDOWN_HOLD`], puts the robot down for a rest:
-/// `robot.rest` — it sits if it is driving, eases into the rest pose, then torque goes off and
-/// every servo reboots. Decided on the release, because until then the hold may still become a
-/// power-off, and both start the same way.
+/// Select held this long puts the robot down for a rest: `robot.rest` — it sits if it is driving,
+/// eases into the rest pose, then torque goes off and every servo reboots. Sent the moment the hold
+/// gets here, without waiting for the release, so the robot sitting down is how the person holding
+/// Select knows the two seconds are up. Held on to [`SHUTDOWN_HOLD`], it becomes a power-off.
 pub const REST_HOLD: Duration = Duration::from_secs(2);
 
-/// Select held this long powers the robot off: `robot.shutdown`, the same sit and rest pose ending
-/// in a power-off. Sent the moment the hold gets here; the release after it does nothing.
+/// Select held this long powers the robot off: `robot.shutdown`. Sent the moment the hold gets
+/// here, while the rest from [`REST_HOLD`] is under way; `robotd` keeps it until that rest has
+/// ended and then powers off. The release after it does nothing.
 pub const SHUTDOWN_HOLD: Duration = Duration::from_secs(4);
 
 /// A button that does different things depending on how long it is held.
@@ -106,9 +107,9 @@ mod tests {
     const SELECT: [Duration; 2] = [REST_HOLD, SHUTDOWN_HOLD];
     const START: [Duration; 1] = [HOME_HOLD];
 
-    /// Select: a tap does nothing to the robot. Let go between two and four seconds, a rest —
-    /// decided at the release, since the hold could still have become a power-off. Held to four,
-    /// the power-off goes out at four, and its release adds nothing.
+    /// Select's thresholds: a tap is reported as one; two seconds held reports the first threshold
+    /// on that tick (the mapper's rest), four the second (its power-off), and the release after
+    /// either is only reported, never a threshold again.
     #[test]
     fn select_rests_on_a_release_between_two_and_four_and_powers_off_at_four() {
         let t0 = Instant::now();
@@ -124,7 +125,7 @@ mod tests {
         assert_eq!(tick(true, false, 1_000), HoldAction::Nothing);
         assert_eq!(tick(false, true, 2_900), HoldAction::Tap);
 
-        // Let go at 3 s: two seconds reached, four not — a rest, at the release only.
+        // Let go at 3 s: two seconds reached at two, four not.
         assert_eq!(tick(true, false, 10_000), HoldAction::Nothing);
         assert_eq!(tick(true, false, 12_000), HoldAction::Reached(0));
         assert_eq!(tick(true, false, 12_500), HoldAction::Nothing);

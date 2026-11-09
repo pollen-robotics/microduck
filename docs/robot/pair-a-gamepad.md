@@ -50,6 +50,9 @@ robot prefers one in pairing mode; both stay paired afterwards and `padd` drives
 The cost is that re-running with nothing new in pairing mode waits out the whole search window
 before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
 
+**Nor does a pad paired here before.** Put it in pairing mode and run `pad pair`: the robot drops
+its old bond and pairs it again, so there is no `pad forget` or `bluetoothctl remove` to run first.
+
 ### With an NFC tag
 
 On a robot with an NFC reader — the beta board's own, or a CLRC663 board on USB (`/dev/ttyACM0`)

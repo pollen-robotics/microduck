@@ -517,12 +517,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
 /// `updaterd`'s question, refused to every client.
 ///
-/// # v51 — the impact guard
+/// # v51 — which pads were in pairing mode
+///
+/// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
+/// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
+/// reads as an empty list, and a client that does not know it ignores it.
+///
+/// # v52 — the impact guard
 ///
 /// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
-pub const API_VERSION: u32 = 51;
+pub const API_VERSION: u32 = 52;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3289,7 +3295,8 @@ pub struct SubscribeResult {
     pub ground_pick: Option<String>,
     /// The configurable one-shot skills this robot has, in priority order, and the names
     /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
-    /// has is now config: a client learns them here instead of assuming five.
+    /// has is now config: a client learns them here instead of assuming five. The emotions in
+    /// `[emotions] dir` come last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }
@@ -4326,7 +4333,7 @@ pub struct RobotState {
     ///
     /// Read after the tick's goal positions are written, and only on ticks with a subscriber, so
     /// a robot nobody is recording runs the bus it always did. Empty when no servo has the guard,
-    /// or the read failed. (v51)
+    /// or the read failed. (v52)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub impact_guard: Vec<Option<u8>>,
     /// Where contact odometry believes the robot is. `default` so a frame from
@@ -4890,6 +4897,15 @@ pub enum PadPairResult {
         reason: PadPairFailure,
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
+        /// For [`PadPairFailure::Ambiguous`]: the pads that were in pairing mode, so a client can
+        /// show them and retry with [`PadPairParams::mac`] set to the one meant. Empty for every
+        /// other reason.
+        ///
+        /// A list rather than `detail`'s prose because the next step needs the addresses: a
+        /// refusal that only said "two pads" left a phone with nothing to offer but "switch one
+        /// off", which is not an option when the other belongs to somebody across the room.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidates: Vec<Pad>,
     },
 }
 
@@ -5868,21 +5884,38 @@ pub fn read_webrtc_peers() -> Option<u32> {
 }
 
 fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
-    // A file from the future is a clock that stepped, not a fresh answer; either way it is not old.
-    if now
-        .duration_since(modified)
-        .is_ok_and(|age| age > CAMERA_STATS_MAX_AGE)
-    {
+    if camera_stats_age_at(path, now)? > CAMERA_STATS_MAX_AGE {
         return None;
     }
     let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     Some(stats.consumers)
 }
 
-/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+/// What `mediad` published about its camera, or `None` — not running, or no camera.
+///
+/// Not aged: the file is only rewritten while frames arrive, so a camera that has stopped leaves
+/// its last rate behind. [`camera_stats_age`] is how a reader tells the two apart.
 pub fn read_camera_stats() -> Option<CameraStats> {
     serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
+/// How long ago `mediad` last rewrote [`CameraStats`], or `None` when there is no file.
+///
+/// Past [`CAMERA_STATS_MAX_AGE`] the camera has stopped delivering frames, whatever the file's
+/// `fps` says. A file from the future — a clock that stepped — reads as fresh.
+pub fn camera_stats_age() -> Option<std::time::Duration> {
+    camera_stats_age_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+/// [`camera_stats_age`] for the file at `path`, as of `now`. The one place the clock-step rule
+/// lives: a file from the future is a clock that stepped, not a fresh answer, and either way it is
+/// not old — so it reads as age zero.
+fn camera_stats_age_at(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(now.duration_since(modified).unwrap_or_default())
 }
 
 /// What `mediad`'s relay is doing with the rendezvous service, published for `robotctl` to read.
@@ -6044,6 +6077,22 @@ mod tests {
     use super::test_support::every_call;
     use super::*;
 
+    /// `candidates` is v51's, so both directions of a mixed install must still parse: a refusal
+    /// from an older `configd` has no such key, and one that has nothing to list must not grow
+    /// one — an older client parses the same bytes it always did.
+    #[test]
+    fn a_pad_refusal_without_candidates_reads_and_writes_as_before() {
+        let old =
+            r#"{"outcome":"failed","reason":"ambiguous","detail":"2 pads are in pairing mode"}"#;
+        let parsed: PadPairResult = serde_json::from_str(old).expect("an older configd's refusal");
+        assert!(matches!(
+            &parsed,
+            PadPairResult::Failed { reason: PadPairFailure::Ambiguous, candidates, .. }
+                if candidates.is_empty()
+        ));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+    }
+
     fn camera_stats(consumers: u32) -> CameraStats {
         CameraStats {
             fps: 30.0,
@@ -6055,6 +6104,32 @@ mod tests {
             dropped: 0,
             consumers,
         }
+    }
+
+    /// How old the camera file is: nothing without one, measured from its mtime, and zero rather
+    /// than an error when the clock has stepped back past it.
+    #[test]
+    fn camera_stats_age_is_measured_from_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(camera_stats_age_at(&path, now), None, "no file, no age");
+
+        publish_camera_stats_at(&path, &camera_stats(0)).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let later = modified + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            camera_stats_age_at(&path, later),
+            Some(CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1)),
+        );
+
+        let earlier = modified - std::time::Duration::from_secs(60);
+        assert_eq!(
+            camera_stats_age_at(&path, earlier),
+            Some(std::time::Duration::ZERO),
+            "a clock that stepped back reads as fresh"
+        );
     }
 
     /// The count an OS update is gated on: read back as written, and only while it is fresh.

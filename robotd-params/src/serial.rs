@@ -49,7 +49,7 @@ pub fn soc_serial() -> Option<String> {
 pub fn soc_serial_at(board: Board, device_tree: &Path, cpuinfo: &Path) -> Option<String> {
     match board {
         Board::Zero3 => device_tree_serial(device_tree),
-        Board::Beta => cpuinfo_serial(cpuinfo),
+        Board::Beta | Board::FaceBoardV1 => cpuinfo_serial(cpuinfo),
     }
 }
 
@@ -102,6 +102,10 @@ mod tests {
         let (device_tree, cpuinfo) = beta_133(dir.path());
         assert_eq!(
             soc_serial_at(Board::Beta, &device_tree, &cpuinfo).as_deref(),
+            Some("62285dd716c88f0f")
+        );
+        assert_eq!(
+            soc_serial_at(Board::FaceBoardV1, &device_tree, &cpuinfo).as_deref(),
             Some("62285dd716c88f0f")
         );
     }
