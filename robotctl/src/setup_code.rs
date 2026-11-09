@@ -67,7 +67,7 @@ pub fn show() -> Result<(), Failure> {
         }
     };
     let code = code(&id, &key);
-    let modules = crate::vetbook::qr_modules(&code)
+    let modules = qr_modules(&code)
         .ok_or_else(|| Failure::new(exit::FAILED, "cannot encode the QR".to_owned()))?;
     print!("{}", terminal_qr(&modules));
     println!("robot  {id}");
@@ -198,19 +198,45 @@ fn is_mount_point(path: &Path) -> bool {
     here.dev() != parent.dev()
 }
 
-/// Two modules to a character with half blocks, black on white whatever the terminal's theme: a
-/// phone's camera reads dark-on-light, and a light-on-dark code fails on half of them.
+/// The modules of `text`'s QR, `true` for dark, with a two-module quiet zone.
+///
+/// **Error correction L**, which keeps every setup code at version 4: `md1:duck-xxxx:` and 64 hex
+/// characters is 78 bytes, exactly what 4-L holds. 33 modules and the quiet zone draw 74 columns
+/// wide (see [`terminal_qr`]), inside an 80-column terminal; level M needs version 5 and 82. A
+/// terminal is a clean, flat source, which is what the lower correction level gives up nothing
+/// on.
+fn qr_modules(text: &str) -> Option<Vec<Vec<bool>>> {
+    let code =
+        qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    const QUIET: usize = 2;
+    let side = width + 2 * QUIET;
+    let mut rows = vec![vec![false; side]; side];
+    for y in 0..width {
+        for x in 0..width {
+            rows[y + QUIET][x + QUIET] = colors[y * width + x] == qrcode::Color::Dark;
+        }
+    }
+    Some(rows)
+}
+
+/// One module per row, two spaces wide, painted with the **background** colour only.
+///
+/// Not half blocks (`▀`), which put two modules in one row: how tall that glyph is depends on the
+/// font, and on macOS Terminal it stops short of the cell's middle, so every dark module above a
+/// light one came out thinner than its neighbours and phones would not read the code. A
+/// background fills the whole cell, line spacing included, whatever the font. Black on white
+/// whatever the terminal's theme: a camera reads dark-on-light.
 fn terminal_qr(modules: &[Vec<bool>]) -> String {
-    let shade = |dark: bool| if dark { "0;0;0" } else { "255;255;255" };
     let mut out = String::new();
-    for pair in modules.chunks(2) {
-        for (x, &top) in pair[0].iter().enumerate() {
-            let bottom = pair.get(1).is_some_and(|row| row[x]);
-            out.push_str(&format!(
-                "\x1b[38;2;{}m\x1b[48;2;{}m▀",
-                shade(top),
-                shade(bottom)
-            ));
+    for row in modules {
+        for &dark in row {
+            out.push_str(if dark {
+                "\x1b[48;2;0;0;0m  "
+            } else {
+                "\x1b[48;2;255;255;255m  "
+            });
         }
         out.push_str("\x1b[0m\n");
     }
@@ -273,9 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_qr_is_one_line_per_two_rows_of_modules() {
-        let modules = crate::vetbook::qr_modules("md1:duck-ccf2:00").unwrap();
-        let text = terminal_qr(&modules);
-        assert_eq!(text.lines().count(), modules.len().div_ceil(2));
+    fn a_setup_code_draws_one_row_per_module_inside_eighty_columns() {
+        // Runs of digits in the hex encode more compactly, so the size depends on the key. A key
+        // with none is the largest: version 4, 33 modules, and the quiet zone on both sides.
+        let worst = qr_modules(&code("duck-ccf2", &"ab".repeat(32))).unwrap();
+        assert_eq!(worst.len(), 33 + 4);
+        for modules in [worst, qr_modules(&code("duck-ccf2", KEY)).unwrap()] {
+            let text = terminal_qr(&modules);
+            assert_eq!(text.lines().count(), modules.len());
+            let widest = text
+                .lines()
+                .map(|line| line.matches("  ").count() * 2)
+                .max()
+                .unwrap();
+            assert!(widest <= 80, "{widest} columns");
+        }
     }
 }
