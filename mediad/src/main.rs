@@ -477,9 +477,10 @@ fn main() -> ExitCode {
         // upright already, and turning them twice is a picture on its side with nothing to say why.
         let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
         // What `media.laser` turns a pixel into a direction with — filled in below, once the
-        // intrinsics are known, which is only after the pipeline has pinned a sensor mode.
-        let laser_geometry = std::sync::Arc::new(std::sync::OnceLock::new());
-        let frame_laser = laser_geometry.clone();
+        // intrinsics are known, which is only after the pipeline has pinned a sensor mode — and
+        // where every look is broadcast, for the console's overlay.
+        let laser_hub = std::sync::Arc::new(mediad::laser::Hub::default());
+        let frame_laser = laser_hub.clone();
         tokio::spawn(async move {
             let _lock = frame_lock;
             if let Err(error) =
@@ -609,7 +610,7 @@ fn main() -> ExitCode {
         // The laser detector's geometry: these intrinsics, and the same turn the duck detector's
         // sampler gets — none when the pipeline already flipped the frames.
         if let Some(geometry) = &intrinsics {
-            let _ = laser_geometry.set(mediad::laser::Geometry::from_intrinsics(
+            let _ = laser_hub.geometry.set(mediad::laser::Geometry::from_intrinsics(
                 geometry,
                 if args.flip_in_pipeline {
                     uyvy::Turn::None
@@ -725,6 +726,31 @@ fn main() -> ExitCode {
                             }
                             // Lagged: the peer is slower than the detector, and only the newest
                             // sighting is worth having. Skipping is what the bounded channel is for.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
+            // The laser detector's looks, for the console to draw over the video. Only while
+            // something has tracking on — the detector runs for robotd's subscription, never for
+            // a peer — and the newest look is all a slow peer needs, as with the ducks.
+            {
+                let mut dots = laser_hub.dots.subscribe();
+                let to_peer = channel.outbound.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match dots.recv().await {
+                            Ok(dot) => {
+                                if to_peer
+                                    .send(mediad::laser::notification(&dot))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }

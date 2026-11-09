@@ -111,6 +111,8 @@ impl Geometry {
 pub struct Found {
     /// The dot's centre, when one passed.
     pub at: Option<[f64; 2]>,
+    /// The brightest hit, passed or not — where a rejected candidate was.
+    pub candidate: Option<[f64; 2]>,
     /// Sampled pixels in the dot (or in the rejected candidate).
     pub pixels: u32,
     /// The reddest bright sample in the frame, `[Y, U, V]`, passed or not.
@@ -148,6 +150,7 @@ pub fn find(data: &[u8], width: usize, height: usize, p: &LaserDetectParams) -> 
     let stride = width * 2;
     let none = Found {
         at: None,
+        candidate: None,
         pixels: 0,
         peak: None,
         rejected: None,
@@ -210,6 +213,7 @@ pub fn find(data: &[u8], width: usize, height: usize, p: &LaserDetectParams) -> 
         .then(|| [sx as f64 / f64::from(n) - 0.5, sy as f64 / f64::from(n)]);
     Found {
         at,
+        candidate: Some([bx as f64 + 0.5, by as f64]),
         pixels: n,
         peak,
         rejected,
@@ -231,12 +235,52 @@ pub fn dot(
         px: found
             .at
             .map(|[u, v]| geometry.upright_px(u, v, width, height)),
+        frame: Some({
+            let (w, h) = geometry.turn.upright(width, height);
+            [w as u32, h as u32]
+        }),
+        candidate_px: found
+            .rejected
+            .and(found.candidate)
+            .map(|[u, v]| geometry.upright_px(u, v, width, height)),
         pixels: found.pixels,
         peak_yuv: found.peak,
         rejected: found.rejected.map(str::to_owned),
         hz,
         took_ms,
     }
+}
+
+/// Where the laser detector's answers are shared, beyond the subscriber that asked for them.
+///
+/// The geometry `main` fills in once the intrinsics are known, and a broadcast of every look, so a
+/// console watching the video can draw what the detector is seeing. A look is only ever taken for a
+/// subscriber — `robotd` while tracking is on — so with tracking off this carries nothing, and a
+/// console with nobody to listen costs the detector a failed `send`.
+pub struct Hub {
+    pub geometry: std::sync::OnceLock<Geometry>,
+    pub dots: tokio::sync::broadcast::Sender<std::sync::Arc<LaserDot>>,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            geometry: std::sync::OnceLock::new(),
+            // A handful: a console that falls behind wants the newest dot, not a queue of old ones.
+            dots: tokio::sync::broadcast::channel(4).0,
+        }
+    }
+}
+
+/// One look as the console reads it, a JSON-RPC notification with no id — the same shape
+/// `media.detections` already has on that channel.
+pub fn notification(dot: &LaserDot) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": duck_ipc_proto::method::MEDIA_LASER_DOT,
+        "params": dot,
+    })
+    .to_string()
 }
 
 /// The local subscription: answer, then one [`duck_ipc_proto::method::MEDIA_LASER_DOT`] per look
@@ -252,6 +296,7 @@ pub async fn serve<R>(
     frames: crate::pipeline::Frames,
     geometry: Geometry,
     params: LaserDetectParams,
+    watchers: tokio::sync::broadcast::Sender<std::sync::Arc<LaserDot>>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -302,6 +347,8 @@ where
                 if dot.seen {
                     last_seen = Some(Instant::now());
                 }
+                // Nobody watching is the ordinary case, and not an error.
+                let _ = watchers.send(std::sync::Arc::new(dot.clone()));
                 if tx.blocking_send(dot).is_err() {
                     tracing::info!("laser: subscriber gone, stopping");
                     return;
@@ -314,13 +361,9 @@ where
         tokio::select! {
             dot = rx.recv() => {
                 let Some(dot) = dot else { return Ok(()) };
-                let mut line = serde_json::to_vec(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": duck_ipc_proto::method::MEDIA_LASER_DOT,
-                    "params": dot,
-                }))?;
-                line.push(b'\n');
-                write.write_all(&line).await?;
+                let mut line = notification(&dot);
+                line.push('\n');
+                write.write_all(line.as_bytes()).await?;
             }
             // Anything the subscriber sends is ignored; end of stream is it hanging up.
             read = reader.read(&mut scratch) => {
@@ -368,6 +411,20 @@ mod tests {
         let [x, y] = found.at.expect("the dot");
         assert!((x - 200.0).abs() < 2.0 && (y - 60.0).abs() < 2.0, "{x},{y}");
         assert_eq!(found.peak, Some(RED_RIM));
+
+        // And as the console gets it: in the upright picture, with that picture's size, so the
+        // overlay needs to know nothing about the mount.
+        let dot = dot(&found, &geometry(Turn::Right), w, h, 15.0, 1.0);
+        assert_eq!(dot.frame, Some([240, 320]));
+        let [ux, uy] = dot.px.expect("upright");
+        assert!(
+            (ux - (239.0 - 60.0)).abs() < 2.0 && (uy - 200.0).abs() < 2.0,
+            "{ux},{uy}"
+        );
+        assert_eq!(
+            dot.candidate_px, None,
+            "a dot that passed is not a near miss"
+        );
     }
 
     /// **The tuning readout.** A lit room with nothing red in it finds no dot — but still says
@@ -396,6 +453,13 @@ mod tests {
         let found = find(&frame, w, h, &params);
         assert_eq!(found.at, None);
         assert_eq!(found.rejected, Some("too big"));
+        // The overlay draws the near miss where it was.
+        let dot = dot(&found, &geometry(Turn::None), w, h, 3.0, 1.0);
+        let [cx, cy] = dot.candidate_px.expect("a near miss");
+        assert!(
+            (cx - 160.0).abs() < 31.0 && (cy - 120.0).abs() < 31.0,
+            "{cx},{cy}"
+        );
     }
 
     /// A stray hit across the frame must not drag the centre: only the best hit's neighbourhood

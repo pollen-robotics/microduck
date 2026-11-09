@@ -969,6 +969,10 @@ The readout is how the thresholds are tuned:
   no dot                   peak Y174 U121 V151   3Hz
 ```
 
+The web console shows the same thing over the video while tracking is on: a red ring on a dot
+that passed, a dashed amber ring on a candidate rejected for its size, and the `laser` entry in the
+stats row with the peak colour.
+
 `peak` is the reddest bright thing in the picture, **whether it passed or not**. Point the laser at
 the floor, read it, and set `y_min` and `v_min` a little below it and `u_max` a little above; then
 take the laser away and check that `peak` for the empty room sits clearly short of them. Chasing a

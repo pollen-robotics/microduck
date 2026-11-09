@@ -101,13 +101,14 @@ pub async fn bind(socket: &Path) -> Result<(std::fs::File, UnixListener)> {
 /// `rotate` is degrees clockwise the camera is mounted from upright, reported in every frame
 /// header. It is the caller's business whether the pipeline already applied it.
 ///
-/// `laser` is the camera geometry `media.laser` needs, set once `main` knows it — after the
-/// pipeline has pinned a sensor mode. Unset is a refusal with a reason, not a guess.
+/// `laser` carries the camera geometry `media.laser` needs, set once `main` knows it — after the
+/// pipeline has pinned a sensor mode; unset is a refusal with a reason, not a guess — and the
+/// broadcast every look is also sent to, for the console's overlay.
 pub async fn serve(
     listener: UnixListener,
     frames: Frames,
     rotate: u32,
-    laser: Arc<std::sync::OnceLock<crate::laser::Geometry>>,
+    laser: Arc<crate::laser::Hub>,
 ) -> Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
@@ -154,9 +155,9 @@ async fn subscribe_laser(
         params,
     }: LaserSubscription,
     frames: Frames,
-    laser: &std::sync::OnceLock<crate::laser::Geometry>,
+    laser: &crate::laser::Hub,
 ) -> Result<()> {
-    let Some(geometry) = laser.get().cloned() else {
+    let Some(geometry) = laser.geometry.get().cloned() else {
         write_response(
             &mut write,
             proto::Response::err(
@@ -173,7 +174,7 @@ async fn subscribe_laser(
         return Ok(());
     };
     write_response(&mut write, proto::Response::ok(id, &())).await?;
-    crate::laser::serve(reader, write, frames, geometry, params).await
+    crate::laser::serve(reader, write, frames, geometry, params, laser.dots.clone()).await
 }
 
 async fn handle(

@@ -2795,6 +2795,14 @@ pub struct LaserDot {
     /// Where the dot is in the upright picture, pixels, for a readout. Present when `seen`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub px: Option<[f64; 2]>,
+    /// The upright picture's size, `[width, height]` — what `px` and `candidate_px` are in, so a
+    /// display can scale them without knowing the camera or its mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where a candidate that passed the colour thresholds but was then rejected by size sat, in
+    /// the upright picture's pixels — what an overlay draws to show a near miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
     /// Pixels counted in the dot (sampled, so a fraction of the real area), or 0.
     pub pixels: u32,
     /// The best candidate's colour, `[Y, U, V]` — the brightest red-leaning pixel in the frame,
