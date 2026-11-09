@@ -142,19 +142,29 @@ fetch() {
     fi
 
     for pkg in $PACKAGES; do
-        # `Filename:` for this exact package, from its own stanza. Matched on a whole-line
-        # `Package:` so `libgstreamer1.0-0` cannot be answered by `libgstreamer1.0-0-dbgsym`.
-        rel="$(awk -v want="$pkg" '
+        # `Filename:` and `Size:` for this exact package, from its own stanza. Matched on a
+        # whole-line `Package:` so `libgstreamer1.0-0` cannot be answered by
+        # `libgstreamer1.0-0-dbgsym`.
+        entry="$(awk -v want="$pkg" '
             /^Package: /   { cur = ($2 == want) }
-            cur && /^Filename: / { print $2; exit }
+            cur && /^Filename: / { rel = $2 }
+            cur && /^Size: /     { size = $2 }
+            cur && rel && size   { print rel, size; exit }
         ' "$index")"
+        rel="${entry% *}"
+        size="${entry##* }"
         [ -n "$rel" ] || die "no ${pkg} in ${SUITE}/${ARCH}.
   Debian renames packages between releases — trixie moved GLib's headers out of libglib2.0-dev
   and renamed libglib2.0-0 to libglib2.0-0t64. If this is a rename, fix PACKAGES above."
 
         deb="${CACHE}/$(basename "$rel")"
-        [ -s "$deb" ] || curl -fsSL -o "$deb" "${MIRROR}/${rel}" \
-            || die "cannot download ${MIRROR}/${rel}"
+        # The cache is trusted only at the size the index states, and a download reaches its final
+        # name only once complete: a file cut short would otherwise fail `ar` on every later run.
+        if [ "$(wc -c 2>/dev/null <"$deb" | tr -d ' ')" != "$size" ]; then
+            curl -fsSL -o "${deb}.part" "${MIRROR}/${rel}" \
+                || die "cannot download ${MIRROR}/${rel}"
+            mv "${deb}.part" "$deb"
+        fi
 
         # `ar x` writes into the working directory, so each unpack gets its own.
         tmp="$(mktemp -d)"

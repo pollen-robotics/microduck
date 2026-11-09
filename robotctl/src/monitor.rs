@@ -2441,6 +2441,21 @@ impl View {
             return vec![];
         };
 
+        // The file is only rewritten while frames arrive, so a camera that has stopped leaves its
+        // last rate in it. Shown as that rate, a dead camera read as a slow one.
+        if duck_ipc_proto::camera_stats_age()
+            .is_some_and(|age| age > duck_ipc_proto::CAMERA_STATS_MAX_AGE)
+        {
+            return vec![
+                Span::raw(" camera · ").dim(),
+                Span::styled(
+                    "stopped",
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ];
+        }
+
         let below_target = camera.fps < f64::from(camera.target_fps) * 0.9;
         let rate = Span::styled(
             format!("{:.1} fps", camera.fps),
@@ -4963,6 +4978,7 @@ mod tests {
             // Not reported, as from a daemon predating them; the monitor draws neither.
             velocities: Vec::new(),
             currents_ma: Vec::new(),
+            impact_guard: Vec::new(),
             odom: proto::OdomState::default(),
             theremin: None,
             chorale: None,

@@ -105,7 +105,9 @@ pub fn on_touch(robot: &mut dyn Robot) -> Outcome {
     }
     match robot.pair() {
         Err(e) => Outcome::Failed(format!("pad.pair: {e}")),
-        Ok(proto::PadPairResult::Failed { reason, detail }) => Outcome::NotPaired(reason, detail),
+        Ok(proto::PadPairResult::Failed { reason, detail, .. }) => {
+            Outcome::NotPaired(reason, detail)
+        }
         Ok(proto::PadPairResult::Paired { pad }) => match robot.sound(PAIRED) {
             Ok(()) => Outcome::Paired(pad),
             Err(e) => Outcome::PairedSilently(pad, e),
@@ -145,6 +147,7 @@ mod tests {
                 Some(reason) => proto::PadPairResult::Failed {
                     reason,
                     detail: None,
+                    candidates: Vec::new(),
                 },
                 None => proto::PadPairResult::Paired {
                     pad: pad(MAC, true),

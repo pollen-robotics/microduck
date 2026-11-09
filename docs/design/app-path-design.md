@@ -188,7 +188,7 @@ Refused, each for a reason:
 |---|---|
 | `update.pin` | A robot pinned by a mistap refuses every later update and reports itself as up to date — the one failure here that looks like correct behaviour. `robotctl`, and a person who meant it |
 | `update.resetToGolden` | Factory reset in all but name. Never over a radio |
-| `robot.safeToRestart`, `robot.modelApi`, `robot.remoteSessionActive` | `updaterd`'s private questions to `robotd`; a phone reading them learns nothing it can act on |
+| `robot.safeToRestart`, `robot.modelApi` | `updaterd`'s private questions to `robotd`; a phone reading them learns nothing it can act on |
 | `system.pairingPin`, `system.setPairingPin` | **The load-bearing one.** A passkey an unpaired peer could read — or overwrite — would make pairing theatre. `btd` reads it over the unix socket instead |
 
 **`update.rollback` and `update.select` were on that list and are not now.** They were refused on

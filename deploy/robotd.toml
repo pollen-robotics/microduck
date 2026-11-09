@@ -23,8 +23,9 @@
 
 [board]
 # Which electronic board this robot is built on: "zero3" (the Radxa Zero 3W with the prototype's
-# HAT) or "beta" (the custom board). Set when the robot is provisioned — `provision-board.sh
-# --board` — and not something to change on a robot that works. The updater reads it for the
+# HAT), "beta" (the custom board) or "face-board-v1" (the custom board with the V1.0 face board).
+# Set when the robot is provisioned — `provision-board.sh --board`, or the OS image built for the
+# board — and not something to change on a robot that works. The updater reads it for the
 # hardware revision a release is checked against, so declaring the wrong board can cost a robot
 # its updates; `robotctl health` says when this and the device tree disagree.
 # version = "zero3"
@@ -45,6 +46,35 @@ port = "/dev/ttyS2"
 # fails and the journal fills with `bus read failed`. That is the symptom to match against
 # this line. Needs a robotd restart.
 # fast_sync_read = true
+
+# The impact guard on servos running ROBOTIS's impact guard firmwares (V3 and V4,
+# firmware_version 3 and 4):
+# a servo that arrives faster than 6 rad/s and hits something brakes 20 ms, and its PWM limit
+# falls from 100 % at rest to 40 % at 7 rad/s, which keeps arrivals near 7 rad/s — what keeps
+# the gear teeth whole and still lets the policy walk and catch a push. OFF leaves the factory
+# firmware with only Current Limit (1000 mA either way): settings that never fire on V3, the
+# switch below on V4, which keeps its settings.
+# robotd writes them to every V3 and V4 servo when it starts with torque off; a robot standing
+# at the restart gets them at the next start. V4 also has an on/off switch that every power-up
+# turns off, and robotd sets it to this value with every torque on. Needs a robotd restart.
+# impact_guard = true
+
+# What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's
+# factory values, the gear bench's (V Min 1, brake 50, hold 500 mA, 50 % at 9 rad/s), tripped
+# the brake on nearly every step and their hold softened the stance leg, so the robot fell.
+# An impact is a deceleration past impact_guard_decel rad/s² while the servo moves toward its
+# goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for impact_guard_brake_ms
+# and the servo holds at impact_guard_i_hold_ma (32767: no hold) until its goal comes back past
+# it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at impact_guard_v_fast
+# rad/s (never 0). Change these with the robot relaxed: the servos run them from the next Start,
+# no reboot needed. A start that writes anything else says so in the journal, so a recording can
+# be matched to the settings it ran on.
+# impact_guard_v_min = 6
+# impact_guard_brake_ms = 20
+# impact_guard_decel = 400
+# impact_guard_i_hold_ma = 32767
+# impact_guard_v_fast = 7
+# impact_guard_pwm_fast = 40
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
@@ -205,6 +235,17 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+
+# How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s² in
+# yaw. It acts after [control] cmd_alpha, so a small stick move is the EMA as before, and only a
+# big jump — full forward to full back — becomes a ramp at this slope. Unset resolves per mode:
+# no limit walking; the roller limits accel_vx to 1.0 (about a second to reverse) and leaves
+# strafe and yaw free, so it still turns as quickly. 0 is no limit. A roller reversing in the
+# bare EMA's quarter second fell over; lowering cmd_alpha instead kept it up but made it hard to
+# steer, since that slows every axis.
+# accel_vx = 1.0
+# accel_vy = 0
+# accel_vyaw = 0
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5
@@ -491,7 +532,12 @@ mode = "walk"
 #
 # Angles are radians, durations seconds. All of it is taste: these are the knobs for how alive it
 # reads. Read once at startup, so a change needs robotd restarted.
-# enabled = true
+#
+# `enabled` unset resolves per mode: on walking, OFF on the roller. What it moves is the head
+# command, which the policy reads as an input — and roller.onnx was not trained with one moving:
+# left alone, the roller collapsed about three seconds after the stick was let go. Set it true
+# to have the roller look around anyway, once a roller policy is trained for it.
+# enabled = true      # unset: per mode, as above
 # after_s = 2.0
 # fade_s = 1.5
 

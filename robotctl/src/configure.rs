@@ -164,7 +164,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         // A running stress test re-reads the trip at every fall — the next fall is the change.
         "stress" => Apply::Live(STRESS_READER),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
-        | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+        | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
     })
 }

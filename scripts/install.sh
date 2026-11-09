@@ -1053,8 +1053,8 @@ install_token_dropin() {
 # The names are `robotd_params::board::BOARD_LABELS`.
 check_board_name() {
     case "$BOARD" in
-        ""|zero3|beta) ;;
-        *) die "DUCK_BOARD=${BOARD} is not a board: zero3 or beta" ;;
+        ""|zero3|beta|face-board-v1) ;;
+        *) die "DUCK_BOARD=${BOARD} is not a board: zero3, beta or face-board-v1" ;;
     esac
 }
 

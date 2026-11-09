@@ -58,6 +58,55 @@ pub fn default_name(serial: &str) -> String {
     format!("{NAME_PREFIX}-{:02x}{:02x}", digest[0], digest[1])
 }
 
+/// The beta board's ID EEPROM (FT24C32A on I2C1 at 0x50), as the at24 driver exposes it.
+///
+/// Root-only, which configd is. A Zero 3W has no such chip, so the file is absent there and the
+/// robot keeps the factory PIN.
+pub const LABEL_EEPROM_PATH: &str = "/sys/bus/i2c/devices/1-0050/eeprom";
+
+/// How many decimal digits the factory writes: SKU (9) + year (2) + week (2) + unit (5), e.g.
+/// `202004741` `26` `40` `00001`, which is also the serial printed on the label.
+const LABEL_SERIAL_DIGITS: usize = 18;
+
+/// The serial printed on the robot's label, as the factory wrote it into the ID EEPROM.
+///
+/// `None` where there is no EEPROM (a Zero 3W, a laptop) or nothing valid in it: a blank chip
+/// reads all 0xFF, which is not a digit, and an all-zero one is not a serial.
+pub fn label_serial() -> Option<String> {
+    let raw = std::fs::read(LABEL_EEPROM_PATH).ok()?;
+    decode_label_serial(&raw)
+}
+
+/// Decode the label serial from the start of the EEPROM.
+///
+/// **Assumed: 18 ASCII digits from address 0**, one byte per digit, exactly as on the label.
+/// Seeed (2026-10-29) gave only "starting at address 0" and the field order, not the encoding;
+/// this is pending their answer. If the first programmed board says otherwise, this function is
+/// the only thing to change; read one with `xxd /sys/bus/i2c/devices/1-0050/eeprom | head -2`.
+///
+/// Anything but 18 digits is rejected rather than guessed at, so a binary encoding shows up as
+/// "no label serial" and the factory PIN, never as a PIN that is not on the label.
+pub fn decode_label_serial(raw: &[u8]) -> Option<String> {
+    let text = raw.get(..LABEL_SERIAL_DIGITS)?;
+    let serial = text
+        .iter()
+        .all(u8::is_ascii_digit)
+        .then(|| String::from_utf8_lossy(text).into_owned())?;
+    serial.bytes().any(|b| b != b'0').then_some(serial)
+}
+
+/// The pairing PIN a robot ships with: the last six digits of its label serial, as on Reachy
+/// Mini, so the user reads it off the label.
+///
+/// Six because that is [`crate::store::PIN_DIGITS`]. Note what that covers: the last digit of the
+/// week and the five-digit unit number. If the unit number restarts every week, robots made ten
+/// weeks apart share a PIN. It still proves the user is holding *this* robot's label in a room of
+/// robots, which is what a default PIN is for; `set-pin` remains the way to a secret one.
+pub fn default_pin(label_serial: &str) -> Option<String> {
+    let start = label_serial.len().checked_sub(crate::store::PIN_DIGITS)?;
+    Some(label_serial[start..].to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +150,44 @@ mod tests {
         assert_eq!(suffix.len(), 4, "{name}");
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
         assert!(name.len() <= crate::store::MAX_NAME, "{name}");
+    }
+
+    /// Seeed's example, `202004741` `26` `40` `00001`.
+    const SEEED_EXAMPLE: &[u8] = b"202004741264000001";
+
+    #[test]
+    fn the_label_serial_is_read_as_text() {
+        // The rest of the 4 KiB chip follows, erased; only the first 18 bytes are the serial.
+        let mut eeprom = SEEED_EXAMPLE.to_vec();
+        eeprom.resize(4096, 0xff);
+        assert_eq!(
+            decode_label_serial(&eeprom).as_deref(),
+            Some("202004741264000001")
+        );
+    }
+
+    /// A blank chip, a zeroed one and a short read are all "no serial", never a PIN of `ffffff`.
+    #[test]
+    fn an_unprogrammed_eeprom_has_no_label_serial() {
+        assert_eq!(decode_label_serial(&[0xff; 4096]), None);
+        assert_eq!(decode_label_serial(&[0x00; 4096]), None);
+        assert_eq!(decode_label_serial(&SEEED_EXAMPLE[..17]), None);
+        assert_eq!(decode_label_serial(b"000000000000000000"), None);
+    }
+
+    /// The same serial in packed BCD is refused, not misread: if Seeed writes binary, the robot
+    /// falls back to the factory PIN instead of inventing one that is not on the label.
+    #[test]
+    fn a_binary_label_serial_is_refused() {
+        let mut eeprom = vec![0x20, 0x20, 0x04, 0x74, 0x12, 0x64, 0x00, 0x00, 0x01];
+        eeprom.resize(4096, 0xff);
+        assert_eq!(decode_label_serial(&eeprom), None);
+    }
+
+    /// Leading zeros are part of the PIN: `000001` is not `1`.
+    #[test]
+    fn the_default_pin_is_the_last_six_digits_of_the_label_serial() {
+        assert_eq!(default_pin("202004741264000001").as_deref(), Some("000001"));
+        assert_eq!(default_pin("12345"), None);
     }
 }

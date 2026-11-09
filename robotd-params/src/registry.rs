@@ -116,6 +116,41 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    entry(
+        "bus.impact_guard",
+        Kind::Bool,
+        "Impact guard on V3 and V4 servos; off = factory firmware with Current Limit only",
+    ),
+    entry(
+        "bus.impact_guard_v_min",
+        Kind::Integer,
+        "Impact guard: an impact counts only above this speed toward the goal, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_brake_ms",
+        Kind::Integer,
+        "Impact guard: brake time after an impact, ms",
+    ),
+    entry(
+        "bus.impact_guard_decel",
+        Kind::Integer,
+        "Impact guard: deceleration that counts as an impact, rad/s²",
+    ),
+    entry(
+        "bus.impact_guard_i_hold_ma",
+        Kind::Integer,
+        "Impact guard: current allowed after the brake until the goal comes back, mA",
+    ),
+    entry(
+        "bus.impact_guard_v_fast",
+        Kind::Integer,
+        "Impact guard: speed where the PWM limit reaches impact_guard_pwm_fast, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_pwm_fast",
+        Kind::Integer,
+        "Impact guard: PWM limit at speed, % of PWM Limit",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
@@ -244,6 +279,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Gain multiplier during the ground pick",
     ),
+    entry(
+        "policy.accel_vx",
+        Kind::OptionalFloat,
+        "Forward/back acceleration limit, m/s²; unset: none walking, 1.0 roller; 0 none",
+    ),
+    entry(
+        "policy.accel_vy",
+        Kind::OptionalFloat,
+        "Sideways acceleration limit, m/s²; unset or 0: none",
+    ),
+    entry(
+        "policy.accel_vyaw",
+        Kind::OptionalFloat,
+        "Yaw acceleration limit, rad/s²; unset or 0: none",
+    ),
     feature(
         "policy.voltage_adapt",
         Kind::Bool,
@@ -370,8 +420,8 @@ pub const REGISTRY: &[Entry] = &[
     // ── [idle] ───────────────────────────────────────────────────────────────
     feature(
         "idle.enabled",
-        Kind::Bool,
-        "Look around while nothing is happening",
+        Kind::TriBool,
+        "Look around while nothing is happening; unset: on walking, off on the roller",
     ),
     entry(
         "idle.after_s",
@@ -597,6 +647,12 @@ pub const REGISTRY: &[Entry] = &[
         "audio.pet_exit_threshold",
         Kind::Float,
         "…and ends below this one (hysteresis)",
+    ),
+    // ── [emotions] ───────────────────────────────────────────────────────────
+    entry(
+        "emotions.dir",
+        Kind::Text,
+        "Your own emotions, on top of the shipped set: <name>.json + <name>.wav",
     ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(

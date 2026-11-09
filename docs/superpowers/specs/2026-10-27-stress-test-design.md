@@ -68,7 +68,7 @@ The cut above never exercises `robotd`'s limp-fall: it makes `driving` false, th
 the fall predictor needs, and when the policy returns the robot is already past the arming gate.
 Every provoked fall landed stiff — the case limp-fall exists to prevent, so not a real fall.
 
-The default fall is now `robot.trip` (robotd API v50): the leg targets held where they were for
+The default fall is now `robot.trip` (robotd API v53): the leg targets held where they were for
 `[stress] trip_ms` (500 ms — 250 was caught too often) with `trip_legs` both, left or right,
 both in `robotctl configure` and re-read at every fall so a running test can be tuned;
 `--trip-ms` / `--trip-legs` pin them for one run. The legs are held while the policy keeps stepping and the walk

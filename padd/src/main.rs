@@ -30,7 +30,9 @@
 //! ```text
 //! A (South)       sit ↔ stand
 //! B (East)        ground pick
-//! X / Y, LB / RB  nothing, until a skill is bound there
+//! LB / RB        yes / no (emotions)
+//! Y (North)       excited (emotion)
+//! X (West)        nothing, until a skill is bound there
 //! RT / LT         mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! D-pad up        head mode — the sticks pose the head, the body holds still
 //! D-pad right     head + move — left stick walks and turns, right stick looks around
@@ -39,8 +41,8 @@
 //! Home            flashlight on / off (a board with one)
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
-//! Select, 2–4 s   let go: sit, rest pose, then torque off and every servo rebooted
-//! Select, 4 s     sit, rest pose, then power off
+//! Select, 2 s     still held: sit, rest pose, then torque off and every servo rebooted
+//! Select, 4 s     still held: power off once that rest has ended
 //! ```
 //!
 //! The D-pad *selects* a mode rather than toggling one, so a press always lands where its arrow
@@ -294,7 +296,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — A sit, B ground pick, triggers mouth; D-pad up head, \
          right head + move, left move, down body + head; Start stands up then toggles the policy, \
-         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
+         Start (1.5s) home pose; Select (2s) rest, Select (4s) power off"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);

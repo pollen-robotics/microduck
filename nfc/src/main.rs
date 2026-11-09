@@ -126,7 +126,7 @@ fn main() -> std::process::ExitCode {
 /// The reader this board has, when nobody named one.
 fn default_device() -> PathBuf {
     match robotd_params::board::Board::detected() {
-        Some(robotd_params::board::Board::Beta) => PathBuf::from("/dev/spidev1.0"),
+        Some(board) if board.is_beta_main_board() => PathBuf::from("/dev/spidev1.0"),
         _ => PathBuf::from("/dev/ttyACM0"),
     }
 }
