@@ -1221,7 +1221,7 @@ impl Page {
 // ── the pieces ───────────────────────────────────────────────────────────────
 
 /// A QR code for `text`, as rows of dark (`true`) and light modules with a two-module quiet zone.
-fn qr_modules(text: &str) -> Option<Vec<Vec<bool>>> {
+pub(crate) fn qr_modules(text: &str) -> Option<Vec<Vec<bool>>> {
     let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
     let width = code.width();
     let colors = code.to_colors();

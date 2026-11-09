@@ -21,13 +21,9 @@
 //! waiting the ~73 seconds it takes `hci0` to appear on this board. Which file depends on the board,
 //! and [`robotd_params::serial`] says why.
 
-use sha2::{Digest, Sha256};
-
-/// The prefix every derived name carries.
-///
-/// Hardcoded rather than built from the hostname, which would give `radxa-zero3-7f3a` — longer
-/// than what it replaces and no more meaningful. The robot is a duck.
-const NAME_PREFIX: &str = "duck";
+/// The name a robot answers to before anyone has renamed it: `duck-7f3a`. Derived in
+/// [`robotd_params::serial::first_name`], which `btd` and the setup-code tooling read too.
+pub use robotd_params::serial::first_name as default_name;
 
 /// The board's serial number, or `None` where there is not one to read.
 ///
@@ -36,26 +32,6 @@ const NAME_PREFIX: &str = "duck";
 /// name.
 pub fn serial() -> Option<String> {
     robotd_params::serial::soc_serial()
-}
-
-/// The name a robot answers to before anyone has renamed it: `duck-7f3a`.
-///
-/// **Hashed rather than sliced.** Taking the last four characters of the serial would assume that
-/// is where two chips differ, and nothing guarantees it — a vendor is free to make any part of the
-/// value sequential, or constant. A digest spreads whatever entropy the serial has across the
-/// whole output.
-///
-/// **SHA-256 rather than [`std::hash::DefaultHasher`]**, whose output is explicitly not stable
-/// across Rust releases. A `rustup update` would silently rename every robot in the field, and
-/// nobody would ever connect the two.
-///
-/// Four hex characters, so 65 536 possibilities: three robots in a room share a name about once in
-/// 22 000 times. This is a *default* meant to be distinguishable, not a unique key — `system.setName`
-/// from a phone and `robotctl system set-name` from provisioning both override it, and renaming is
-/// the escape hatch on the rare collision.
-pub fn default_name(serial: &str) -> String {
-    let digest = Sha256::digest(serial.as_bytes());
-    format!("{NAME_PREFIX}-{:02x}{:02x}", digest[0], digest[1])
 }
 
 /// The beta board's ID EEPROM (FT24C32A on I2C1 at 0x50), as the at24 driver exposes it.

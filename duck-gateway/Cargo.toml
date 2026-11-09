@@ -7,6 +7,8 @@ description = "Opt-in authenticated local tunnel to mediad for the development a
 
 [dependencies]
 duck-auth = { path = "../duck-auth" }
+# The robot id in the setup code is its first name, derived from the SoC serial.
+robotd-params = { path = "../robotd-params" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
 clap.workspace = true
 tracing.workspace = true

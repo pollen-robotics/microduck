@@ -28,37 +28,66 @@ hardware confirmations are documented in [factory provisioning](../design/factor
 
 ## Prepare one robot
 
-Choose a unique ASCII robot identifier. On a trusted computer, run this from the source checkout
-and write the credential **outside** it:
+The setup code is `md1:<first name>:<64 hex characters>`. The first name is the robot's
+`duck-xxxx` default name, derived from its SoC serial, so a rename does not change it; `btd` and
+`duck-gateway` derive the same one. The key is 32 random bytes, installed on stdin so it is in no
+command line or shell history. In the factory a provisioning station generates it
+([factory provisioning](../design/factory-provisioning.md)); on a dev board the robot's own
+`/dev/urandom` stands in.
+
+On the robot, generate and install the key:
 
 ```bash
-scripts/generate-ble-dev-credential.sh test-duck-1 /tmp/test-duck-1-ble-psk
+key=$(head -c 32 /dev/urandom | od -An -tx1 -v | tr -d ' \n')
 ```
 
-The script creates a 0600 file containing 64 hex characters and prints a
-`md1:test-duck-1:...` code for the app. Keep the code private. Install the file on the robot as
-`/var/lib/robot/config/ble-psk`, owned by root and mode 0600. It is then handed to unprivileged
-`btd` using systemd's `LoadCredential=`. A temporary service override can use:
+```bash
+echo "$key" | sudo robotctl system setup-code install
+```
 
-```ini
+```bash
+unset key
+```
+
+Turn on secure mode in `btd`:
+
+```bash
+sudo mkdir -p /etc/systemd/system/btd.service.d
+```
+
+```bash
+sudo tee /etc/systemd/system/btd.service.d/secure.conf <<'EOF'
 [Service]
 LoadCredential=ble-psk:/var/lib/robot/config/ble-psk
 ExecStart=
-ExecStart=/opt/robot/daemon/current/bin/btd --secure-psk-file %d/ble-psk --secure-robot-id test-duck-1
+ExecStart=/opt/robot/daemon/current/bin/btd --secure-psk-file %d/ble-psk
+EOF
 ```
 
-Set `--secure-robot-id` to the exact identifier in the setup code. A missing, malformed, or
-unreadable key makes `btd` exit rather than serving a weaker protocol. The `LoadCredential=` file
-is copied into a read-only per-service credential directory accessible to the service user.
-See [systemd credentials](https://systemd.io/CREDENTIALS/).
+```bash
+sudo systemctl daemon-reload
+```
 
-For local camera and control, write `/var/lib/robot/config/ble-gateway.env` containing
-`ROBOT_ID=test-duck-1` (the same identifier), then start the packaged `duck-gateway.service`.
-It has no `[Install]` section and is never enabled automatically. It reads the same protected
-credential through systemd, listens on TCP 9443 for Noise-authenticated app connections, and
-forwards them only to `mediad` on `127.0.0.1:8443`. Keep `mediad` bound to loopback. The app's
-native Rust opens a one-use localhost listener for its webview, authenticates the robot over the
-network, then tunnels the WebSocket through the encrypted connection.
+```bash
+sudo systemctl restart btd
+```
+
+For camera and control over the LAN, start the gateway (it has no `[Install]` section, so start it
+again after every reboot):
+
+```bash
+sudo systemctl start duck-gateway
+```
+
+Show the code, then scan the QR or paste the `md1:` line into the app:
+
+```bash
+sudo robotctl system setup-code
+```
+
+A missing or malformed key makes `btd` and `duck-gateway` exit rather than serve a weaker
+protocol, and so does a board with no SoC serial. `install` refuses to replace an existing key
+without `--force`, because that invalidates the printed QR and every phone holding the old code.
 
 ## App flow
 
