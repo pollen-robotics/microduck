@@ -40,16 +40,11 @@ struct Args {
     insecure_no_pairing: bool,
 
     /// Development-only per-robot 32-byte key as 64 hex characters in a credential file.
-    #[arg(
-        long,
-        requires = "secure_robot_id",
-        conflicts_with = "insecure_no_pairing"
-    )]
+    ///
+    /// The id bound into the handshake is the robot's first name, derived from the SoC serial —
+    /// not a flag, so it cannot drift from the one `robotctl system setup-code` prints.
+    #[arg(long, conflicts_with = "insecure_no_pairing")]
     secure_psk_file: Option<PathBuf>,
-
-    /// Identifier printed with the development credential, bound into the secure handshake.
-    #[arg(long, requires = "secure_psk_file")]
-    secure_robot_id: Option<String>,
 
     /// Pin the advertised name, instead of asking `configd` what the robot is called.
     ///
@@ -112,16 +107,29 @@ async fn main() -> ExitCode {
     };
 
     let require_pairing = args.require_pairing || !args.insecure_no_pairing;
-    let secure = match (args.secure_psk_file, args.secure_robot_id) {
-        (Some(path), Some(id)) => match btd::secure::Config::load(&path, id) {
-            Ok(config) => Some(config),
-            Err(error) => {
-                tracing::error!(%error, "cannot start secure BLE mode");
+    let secure = match args.secure_psk_file {
+        // The id is the robot's first name, the same one `robotctl system setup-code` prints into
+        // the QR. A board with no SoC serial has no first name, and refusing beats guessing an id
+        // that no printed code would carry.
+        Some(path) => {
+            let Some(id) = robotd_params::serial::this_first_name() else {
+                tracing::error!(
+                    "cannot start secure BLE mode: no SoC serial to derive the robot id from"
+                );
                 return ExitCode::FAILURE;
+            };
+            match btd::secure::Config::load(&path, id.clone()) {
+                Ok(config) => {
+                    tracing::info!(robot_id = %id, "secure BLE mode");
+                    Some(config)
+                }
+                Err(error) => {
+                    tracing::error!(%error, "cannot start secure BLE mode");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
-        (None, None) => None,
-        _ => return ExitCode::FAILURE,
+        }
+        None => None,
     };
     if !require_pairing {
         // Loud, every start, because the whole point of choosing the usable default is that the

@@ -7,9 +7,9 @@ Wants=mediad.service
 Type=exec
 User=btd
 Group=btd
-EnvironmentFile=/var/lib/robot/config/ble-gateway.env
 LoadCredential=ble-psk:/var/lib/robot/config/ble-psk
-ExecStart=/opt/robot/daemon/current/bin/duck-gateway --key-file %d/ble-psk --robot-id ${ROBOT_ID}
+# The robot id is its first name, derived from the SoC serial, so no flag carries it.
+ExecStart=/opt/robot/daemon/current/bin/duck-gateway --key-file %d/ble-psk
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes

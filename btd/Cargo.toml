@@ -19,6 +19,8 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # about chunking — see that crate's manifest.
 duck-ble = { path = "../duck-ble" }
 duck-auth = { path = "../duck-auth" }
+# The robot id in the setup code is its first name, derived from the SoC serial.
+robotd-params = { path = "../robotd-params" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 clap.workspace = true

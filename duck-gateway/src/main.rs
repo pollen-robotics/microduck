@@ -20,8 +20,6 @@ const MAX_SESSIONS: usize = 8;
 struct Args {
     #[arg(long)]
     key_file: PathBuf,
-    #[arg(long)]
-    robot_id: String,
     #[arg(long, default_value = "0.0.0.0:9443")]
     listen: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:8443")]
@@ -37,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args = Args::parse();
+    // The same id `btd` binds and the QR carries: the robot's first name, from the SoC serial.
+    let robot_id = robotd_params::serial::this_first_name()
+        .ok_or_else(|| std::io::Error::other("no SoC serial to derive the robot id from"))?;
     let credential =
-        ProvisionedKey::load(&args.key_file, args.robot_id).map_err(std::io::Error::other)?;
+        ProvisionedKey::load(&args.key_file, robot_id).map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(args.listen).await?;
     let capacity = Arc::new(Semaphore::new(MAX_SESSIONS));
     tracing::info!(address = %listener.local_addr()?, "authenticated media gateway listening");

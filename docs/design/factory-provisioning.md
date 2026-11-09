@@ -54,15 +54,16 @@ V0.1 observation as a qualified electrical specification.
    bootstrap credential. Isolate or explicitly bind interfaces when several robots share a
    workstation; they otherwise all use the same USB IP address.
 3. **Bind the job to the physical unit.** Read the hardware serial through that session, check
-   it against the connected unit, and allocate a unique public identifier such as
-   `MD-20261109-0042`. Refuse missing/invalid/duplicate identities. A date and sequence number
-   identify a unit; they are not its authentication secret.
+   it against the connected unit, and record the robot's first name — the `duck-xxxx` default
+   name derived from the SoC serial (`robotd_params::serial::first_name`), which is the public
+   identifier in its setup code. It is not allocated: the robot, `btd` and `duck-gateway` all
+   derive it, so it cannot drift from what the robot answers with. Refuse a unit with no SoC
+   serial. The identifier is not the authentication secret; a rename does not change it.
 4. **Generate the secret on the trusted station.** Generate 32 bytes with a cryptographic random
    source, independently of the identifier/serial. Pass it through the authorized session without
-   placing it in command arguments, shell tracing, CI output or manufacturing logs. The existing
-   `scripts/generate-ble-dev-credential.sh` creates a valid development key but prints its setup
-   code; it is not the production station tool.
-5. **Install and commit the credential on the robot.** A privileged provisioning helper must
+   placing it in command arguments, shell tracing, CI output or manufacturing logs.
+5. **Install and commit the credential on the robot.** The helper is
+   `robotctl system setup-code install`, run as root, the 64 hex characters on stdin. It must
    verify that the expected persistent `data` partition is actually mounted at `/var/lib/robot`,
    not a fallback rootfs directory. The current MVP key path is
    `/var/lib/robot/config/ble-psk` (64 hex characters, root-owned, mode `0600`); verify parent
@@ -75,7 +76,8 @@ V0.1 observation as a qualified electrical specification.
    return the secret in an acknowledgement. The common image must supply production service
    configuration; temporary MVP drop-ins are not the manufacturing implementation.
 6. **Print the QR from the same committed credential.** Encode
-   `md1:MD-20261109-0042:<64_HEX_CHARACTERS>` using the exact identifier and secret just programmed.
+   `md1:duck-xxxx:<64_HEX_CHARACTERS>` using the exact first name and secret just programmed;
+   `robotctl system setup-code` renders it on the robot.
    Render locally and print the public identifier beside it. Treat the QR, render files and
    printer spool as secrets; do not use a public QR-generation website. Control label access and
    remove temporary copies. Decide label placement and reprint handling before production.
