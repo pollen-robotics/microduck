@@ -382,8 +382,8 @@ mod tests {
     /// A grey room, `w × h`, as UYVY.
     fn room(w: usize, h: usize, luma: u8) -> Vec<u8> {
         let mut data = vec![0u8; w * h * 2];
-        for px in data.chunks_exact_mut(4) {
-            px.copy_from_slice(&[128, luma, 128, luma]);
+        for px in data.as_chunks_mut::<4>().0 {
+            *px = [128, luma, 128, luma];
         }
         data
     }
