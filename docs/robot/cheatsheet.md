@@ -1073,7 +1073,8 @@ camera 1280×720 · mount 90° · answered in 41 ms                    0.5 s ago
 ```
 
 The picture is drawn two pixels per character cell, the right way up whatever the mount angle is.
-It is small — after this robot's quarter turn the picture is portrait, about 16 pixels across —
+It is small — on the Zero 3W, after its camera's quarter turn, the picture is portrait, about 16
+pixels across; on the beta boards it is landscape —
 and that is enough for what a number cannot say: where the head is really pointing, whether the
 room is lit well enough to detect anything in, whether the lens is smeared or a thumb is over it.
 

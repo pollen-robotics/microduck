@@ -98,8 +98,8 @@ const TOF_HEIGHT: u16 = 10;
 
 /// Rows the camera block occupies while it is open: two borders and fourteen rows of picture.
 ///
-/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the quarter turn
-/// this camera is mounted at, is 16 wide. That is small, and it is enough for what the block is
+/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the Zero 3W camera's
+/// quarter turn, is 16 wide (on the beta boards' upright camera it is landscape, and wider). That is small, and it is enough for what the block is
 /// for: where the head is pointing, whether the room is lit, whether the lens is covered. Fewer
 /// rows and it stops answering those; more and it is the whole terminal.
 ///

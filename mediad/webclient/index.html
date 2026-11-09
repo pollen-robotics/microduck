@@ -141,8 +141,9 @@
   .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
 
-  /* 16/9 is the placeholder, held until the robot says what the video is. The camera is mounted a
-     quarter turn off and nothing on the robot rotates the picture — so this does, on the GPU.
+  /* 16/9 is the placeholder, held until the robot says what the video is. The Zero 3W's camera is
+     mounted a quarter turn off (the beta boards' is upright) and nothing on the robot rotates the
+     picture — so this does, on the GPU, by whatever angle the robot says.
 
      **The wrapper is the only box in flow.** A rotated element still takes up its *pre-transform*
      box, so the turned video — landscape, inside a portrait wrapper — used to be the widest thing in
@@ -1668,7 +1669,9 @@ const stopLooking = () => { looking = false; lookAt = null; $("gaze").hidden = t
 video.addEventListener("pointerup", stopLooking);
 video.addEventListener("pointercancel", stopLooking);
 
-// ── the camera is mounted sideways, and the robot does not rotate the pixels ───────────────────
+// ── the camera may be mounted sideways, and the robot does not rotate the pixels ───────────────
+//
+// A quarter turn on the Zero 3W, none on the beta boards: the robot says which in `media.video`.
 //
 // Rotating in the pipeline cost 145% of a core: `videoflip`'s buffers are ones the SoC's 2D engine
 // refuses, so the encoder converted every frame in software — 97 °C, the CPU throttled to 408 MHz,

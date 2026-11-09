@@ -83,7 +83,7 @@ async fn response(
 pub(crate) fn png(header: proto::MediaFrameHeader, data: Vec<u8>) -> Result<Vec<u8>> {
     use image::ImageEncoder;
     let turn = uyvy::Turn::from_degrees(header.rotate)
-        .context("camera reported a mount that is not a quarter turn")?;
+        .context("camera reported a mount that is not a multiple of 90°")?;
     let mut rgb = Vec::new();
     // The turned dimensions, not the header's: a quarter turn swaps the axes, and encoding the
     // capture geometry over rotated pixels is a diagonally sheared image rather than an error.
