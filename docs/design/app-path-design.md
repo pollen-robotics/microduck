@@ -557,6 +557,13 @@ The read on the RPC characteristic requires `encrypt_read`, which is what makes 
 all — plain encryption, not `encrypt_authenticated_*`, because a just-works bond can never satisfy
 the authenticated variants and demanding them would refuse every client.
 
+The bond is therefore encryption, never identity, and BlueZ is set to let a phone replace it:
+`JustWorksRepairing = always` in `/etc/bluetooth/main.conf`. Without it, a phone whose owner
+forgot the robot in Bluetooth settings starts a fresh just-works pairing, BlueZ's default `never`
+refuses to replace the bond it still holds, and the link fails with `PIN or Key Missing (0x06)`
+until that bond is removed on the robot. `scripts/setup-board.sh` sets it on provisioned boards and
+the `microduck_yocto` image's `bluez5` append sets it there.
+
 Then `btd` serves nothing until the client sends `system.authenticate`. That call is answered by the
 transport rather than forwarded, which is why the routing table has a third outcome (`Route::Local`)
 alongside "forward" and "refuse". `hello` is the one other call allowed through unauthenticated,
