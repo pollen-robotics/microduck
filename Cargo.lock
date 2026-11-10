@@ -1287,7 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "duck-auth"
-version = "0.18.9"
+version = "0.19.0"
 dependencies = [
  "base64",
  "serde",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "duck-gateway"
-version = "0.18.9"
+version = "0.19.0"
 dependencies = [
  "clap",
  "duck-auth",
