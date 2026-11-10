@@ -214,13 +214,29 @@ pub fn install(force: bool) -> Result<(), Failure> {
     need_root("installing the key (… | sudo robotctl system setup-code install)")?;
     // Before reading anything: a board that cannot answer with an id cannot use the key.
     let id = first_name()?;
-    if let Ok(Some(_)) = label::setup_code() {
-        return Err(Failure::new(
-            exit::REFUSED,
-            "this robot's ID EEPROM already holds its setup code, which is the one printed on it \
-             and the one it uses. `install` is for dev boards with nothing there"
-                .to_owned(),
-        ));
+    // Only a blank EEPROM leaves room for an installed key. One holding a code uses that code, and
+    // one holding something unreadable makes `export` refuse every key — a key installed here
+    // would be reported as installed and never used.
+    match label::setup_code() {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(Failure::new(
+                exit::REFUSED,
+                "this robot's ID EEPROM already holds its setup code, which is the one printed on \
+                 it and the one it uses. `install` is for dev boards with nothing there"
+                    .to_owned(),
+            ));
+        }
+        Err(why) => {
+            return Err(Failure::new(
+                exit::REFUSED,
+                format!(
+                    "the ID EEPROM holds no valid setup code ({why}), and while it does the robot \
+                     uses no key at all and serves the PIN path. Reprogram the EEPROM; an \
+                     installed key would not be used"
+                ),
+            ));
+        }
     }
     if DATA_MOUNT_UNITS.iter().any(|unit| Path::new(unit).exists())
         && !is_mount_point(Path::new(DATA_DIR))

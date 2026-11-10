@@ -92,7 +92,10 @@ printed on the robot.
 On every boot, `configd`'s unit runs `robotctl system setup-code export`, which checks the
 EEPROM's code and leaves the key in systemd's credential store in `/run`. `btd` and `duck-gateway`
 import it and serve secure mode; a robot with no code serves the PIN path, so a dev board or an
-unprovisioned unit still onboards. The station tooling (steps 2–5 and 7), session authorisation
+unprovisioned unit still onboards. So does a robot whose EEPROM code is unreadable or belongs to
+another unit: secure mode stays off, the error is in `configd`'s journal and in
+`robotctl system setup-code`, and the robot stays reachable over Bluetooth with the PIN from its
+label serial, which a bad code does not touch. The station tooling (steps 2–5 and 7), session authorisation
 and closing, and the printing workflow remain to be implemented.
 
 ## Hardware and image acceptance gates
