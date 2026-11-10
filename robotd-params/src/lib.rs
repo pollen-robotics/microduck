@@ -23,6 +23,7 @@
 
 pub mod board;
 pub mod edit;
+pub mod label;
 pub mod registry;
 pub mod serial;
 

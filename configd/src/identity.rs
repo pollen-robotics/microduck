@@ -34,15 +34,14 @@ pub fn serial() -> Option<String> {
     robotd_params::serial::soc_serial()
 }
 
-/// The beta board's ID EEPROM (FT24C32A on I2C1 at 0x50), as the at24 driver exposes it.
-///
-/// Root-only, which configd is. A Zero 3W has no such chip, so the file is absent there and the
-/// robot keeps the factory PIN.
-pub const LABEL_EEPROM_PATH: &str = "/sys/bus/i2c/devices/1-0050/eeprom";
+/// The ID EEPROM, which [`robotd_params::label`] owns along with its layout. Root-only, which
+/// configd is. A Zero 3W has no such chip, so the file is absent there and the robot keeps the
+/// factory PIN.
+pub use robotd_params::label::EEPROM_PATH as LABEL_EEPROM_PATH;
 
 /// How many decimal digits the factory writes: SKU (9) + year (2) + week (2) + unit (5), e.g.
 /// `202004741` `26` `40` `00001`, which is also the serial printed on the label.
-const LABEL_SERIAL_DIGITS: usize = 18;
+const LABEL_SERIAL_DIGITS: usize = robotd_params::label::SETUP_CODE_OFFSET;
 
 /// The serial printed on the robot's label, as the factory wrote it into the ID EEPROM.
 ///

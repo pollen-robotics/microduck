@@ -42,6 +42,12 @@ Type=exec
 #
 # Note what is NOT here: nothing grants the `robot` group as a whole. Being able to talk to
 # configd and being able to reconfigure the robot stay separate.
+# The robot's setup code, from its ID EEPROM (or a dev board's installed key), checked and left in
+# systemd's credential store in /run for `btd` and `duck-gateway` to import — both are ordered after
+# this unit, and so after this step. Here because configd is the root daemon that already reads the
+# EEPROM; a unit of its own would be one more for every image to install. `-`: a robot whose code
+# is missing or refused still gets its configd, and btd serves the PIN path.
+ExecStartPre=-/opt/robot/daemon/current/bin/robotctl system setup-code export
 ExecStart=/opt/robot/daemon/current/bin/configd --allow-user btd,nfcd
 
 # Root, and this is the one thing here that deserves justification rather than assumption.

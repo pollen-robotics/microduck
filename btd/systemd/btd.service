@@ -30,9 +30,18 @@ Wants=bluetooth.service
 # No network dependency: BLE is the transport that has to work when the network does not.
 After=local-fs.target
 
+# The setup-code key, when the robot has one: configd's ExecStartPre leaves it in /run/credstore
+# (`robotctl system setup-code export`). After, not Wants: btd still starts, on the PIN path,
+# if configd does not.
+After=configd.service
+
 [Service]
 Type=exec
 ExecStart=/opt/robot/daemon/current/bin/btd
+
+# Imported when present, ignored when absent: secure mode on a robot with a setup code, the PIN
+# path on one without, from the same unit.
+ImportCredential=ble-psk
 
 # Unprivileged, unlike robotd — btd touches no hardware directly, only D-Bus and two unix
 # sockets, so there is no excuse for root here.

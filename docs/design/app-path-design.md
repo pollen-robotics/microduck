@@ -683,8 +683,8 @@ There is no silent fallback to the current six-digit `system.authenticate` when 
 credential or secure session cannot be loaded. Development images may keep a visibly distinct
 legacy mode. Factory reset and ownership transfer must revoke enrolled app keys and old BLE bonds,
 then provide a physical, documented way to install a new credential; a software-only reset must
-not expose an unauthenticated enrollment window. The robot must remain recoverable by the factory
-after a full `.wic` reflash, which erases the proposed eMMC secret.
+not expose an unauthenticated enrollment window. The setup code lives in the ID EEPROM
+([factory provisioning](factory-provisioning.md)), so a full `.wic` reflash keeps it.
 
 Acceptance tests need to cover first setup with no Wi-Fi; Android and iOS pairing; an active BLE
 relay/substitution attempt; wrong QR; replayed handshake and RPC frames; interrupted `net.connect`;
