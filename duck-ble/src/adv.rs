@@ -54,6 +54,22 @@ pub const COMPANY_ID: u16 = 0xFFFF;
 
 /// The byte after the address that says "this is the extended twin of a legacy advertisement".
 pub const EXTENDED_MARK: u8 = 0x01;
+/// A non-connectable broadcast from a robot already serving another central.
+pub const BUSY_MARK: u8 = 0x02;
+
+/// Address payload for the non-connectable busy advertisement.
+pub fn busy_address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
+    let mut data = address_data(address);
+    data.push(BUSY_MARK);
+    data
+}
+
+/// True only for the explicitly marked non-connectable broadcast.
+pub fn is_busy(manufacturer_data: &HashMap<u16, Vec<u8>>) -> bool {
+    manufacturer_data
+        .get(&COMPANY_ID)
+        .is_some_and(|data| data.len() == 5 && data[4] == BUSY_MARK)
+}
 
 /// The robot's address as it goes into the advertisement.
 ///
@@ -73,7 +89,7 @@ pub fn extended_address_data(address: Option<Ipv4Addr>) -> Vec<u8> {
 /// The four address bytes of a field in either layout, or `None` for anything else.
 fn address_bytes(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<[u8; 4]> {
     match manufacturer_data.get(&COMPANY_ID)?.as_slice() {
-        [a, b, c, d] | [a, b, c, d, EXTENDED_MARK] => Some([*a, *b, *c, *d]),
+        [a, b, c, d] | [a, b, c, d, EXTENDED_MARK | BUSY_MARK] => Some([*a, *b, *c, *d]),
         _ => None,
     }
 }
@@ -107,6 +123,23 @@ pub fn has_address_field(manufacturer_data: &HashMap<u16, Vec<u8>>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_busy_broadcast_keeps_its_address_but_is_never_a_connectable_twin() {
+        use super::*;
+        let address = Ipv4Addr::new(192, 0, 2, 1);
+        let data = HashMap::from([(COMPANY_ID, busy_address_data(Some(address)))]);
+        assert!(is_busy(&data));
+        assert!(!is_extended(&data));
+        assert_eq!(address_in(&data), Some(address));
+        assert!(!is_busy(&HashMap::from([(
+            COMPANY_ID,
+            address_data(Some(address))
+        )])));
+        assert!(!is_busy(&HashMap::from([(
+            COMPANY_ID,
+            extended_address_data(Some(address))
+        )])));
+    }
     use super::*;
 
     /// The round trip both halves depend on.
@@ -148,7 +181,7 @@ mod tests {
     #[test]
     fn a_payload_of_the_wrong_length_is_not_an_address() {
         let mut five = vec![1; 4];
-        five.push(EXTENDED_MARK + 1);
+        five.push(0xff);
         let data = HashMap::from([(COMPANY_ID, five)]);
         assert_eq!(address_in(&data), None, "five bytes without the mark");
         assert!(!is_extended(&data));

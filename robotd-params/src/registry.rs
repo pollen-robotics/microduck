@@ -116,6 +116,41 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    entry(
+        "bus.impact_guard",
+        Kind::Bool,
+        "Impact guard on V3 and V4 servos; off = factory firmware with Current Limit only",
+    ),
+    entry(
+        "bus.impact_guard_v_min",
+        Kind::Integer,
+        "Impact guard: an impact counts only above this speed toward the goal, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_brake_ms",
+        Kind::Integer,
+        "Impact guard: brake time after an impact, ms",
+    ),
+    entry(
+        "bus.impact_guard_decel",
+        Kind::Integer,
+        "Impact guard: deceleration that counts as an impact, rad/s²",
+    ),
+    entry(
+        "bus.impact_guard_i_hold_ma",
+        Kind::Integer,
+        "Impact guard: current allowed after the brake until the goal comes back, mA",
+    ),
+    entry(
+        "bus.impact_guard_v_fast",
+        Kind::Integer,
+        "Impact guard: speed where the PWM limit reaches impact_guard_pwm_fast, rad/s",
+    ),
+    entry(
+        "bus.impact_guard_pwm_fast",
+        Kind::Integer,
+        "Impact guard: PWM limit at speed, % of PWM Limit",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
@@ -574,6 +609,91 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
     ),
+    // ── [laser] ──────────────────────────────────────────────────────────────
+    feature(
+        "laser.enabled",
+        Kind::Bool,
+        "Laser tracking is on from boot — robotctl laser-track on|off switches it live",
+    ),
+    entry(
+        "laser.socket",
+        Kind::Text,
+        "mediad's local socket (media.laser)",
+    ),
+    entry(
+        "laser.y_min",
+        Kind::Integer,
+        "Luma a dot pixel must reach, 0-255 — read peak Y in robotctl laser-track",
+    ),
+    entry(
+        "laser.v_min",
+        Kind::Integer,
+        "Red chroma (V) a dot pixel must reach, 0-255, 128 = grey",
+    ),
+    entry(
+        "laser.u_max",
+        Kind::Integer,
+        "Blue chroma (U) a dot pixel must stay below, 0-255, 128 = grey",
+    ),
+    entry(
+        "laser.min_pixels",
+        Kind::Integer,
+        "Fewest sampled pixels that make a dot — raise if it chases noise",
+    ),
+    entry(
+        "laser.max_pixels",
+        Kind::Integer,
+        "Most sampled pixels still a dot — lower if it chases red lamps",
+    ),
+    entry(
+        "laser.radius_px",
+        Kind::Integer,
+        "How far from the brightest hit is still the dot, pixels",
+    ),
+    entry(
+        "laser.search_hz",
+        Kind::Float,
+        "Looks per second with no dot in sight",
+    ),
+    entry(
+        "laser.track_hz",
+        Kind::Float,
+        "Looks per second while following a dot",
+    ),
+    entry("laser.head", Kind::Bool, "Point the head at the dot"),
+    entry("laser.walk", Kind::Bool, "Walk to the dot"),
+    entry(
+        "laser.memory_ms",
+        Kind::Integer,
+        "How long a dot out of sight is still followed, milliseconds",
+    ),
+    entry(
+        "laser.stop_m",
+        Kind::Float,
+        "Stop walking this close to the dot, metres",
+    ),
+    entry(
+        "laser.max_range_m",
+        Kind::Float,
+        "Ignore dots projected farther than this, metres",
+    ),
+    entry(
+        "laser.k_dist",
+        Kind::Float,
+        "Forward speed per metre of distance left — higher is keener",
+    ),
+    entry(
+        "laser.k_yaw",
+        Kind::Float,
+        "Turn rate per radian of bearing — higher turns harder, too high wobbles",
+    ),
+    entry("laser.vx_max", Kind::Float, "Fastest forward speed, m/s"),
+    entry("laser.vyaw_max", Kind::Float, "Fastest turn, rad/s"),
+    entry(
+        "laser.floor_offset_m",
+        Kind::Float,
+        "Raise (+) or lower (-) the floor if reported distances are off, metres",
+    ),
     // ── [head_imu] ───────────────────────────────────────────────────────────
     feature(
         "head_imu.enabled",
@@ -612,6 +732,12 @@ pub const REGISTRY: &[Entry] = &[
         "audio.pet_exit_threshold",
         Kind::Float,
         "…and ends below this one (hysteresis)",
+    ),
+    // ── [emotions] ───────────────────────────────────────────────────────────
+    entry(
+        "emotions.dir",
+        Kind::Text,
+        "Your own emotions, on top of the shipped set: <name>.json + <name>.wav",
     ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
@@ -1335,6 +1461,7 @@ mod tests {
                 "idle.enabled",
                 "pickup.enabled",
                 "theremin.enabled",
+                "laser.enabled",
                 "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",

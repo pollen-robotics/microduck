@@ -105,11 +105,11 @@ pub async fn run(mut link: Link, sockets: Sockets) {
 }
 
 /// What handling one line produced.
-struct Outcome {
+pub(crate) struct Outcome {
     /// A response `btd` must send itself. `None` means an upstream will answer — the ordinary path.
-    response: Option<String>,
+    pub(crate) response: Option<String>,
     /// End the session after sending. Only ever set by exhausting the PIN attempts.
-    close: bool,
+    pub(crate) close: bool,
 }
 
 impl Outcome {
@@ -128,7 +128,7 @@ impl Outcome {
 }
 
 /// Handle one complete line.
-async fn dispatch(
+pub(crate) async fn dispatch(
     pool: &mut Pool,
     config_socket: &std::path::Path,
     line: &str,
@@ -305,7 +305,7 @@ async fn authenticate(
 }
 
 /// Chunk one line out to the central.
-async fn send_line(link: &Link, line: &str) -> Result<(), ()> {
+pub(crate) async fn send_line(link: &Link, line: &str) -> Result<(), ()> {
     // Read once here, so one line is chunked one way even if a write reports a new MTU
     // meanwhile. See `Link::mtu`.
     for chunk in framing::chunks(line, link.mtu()) {

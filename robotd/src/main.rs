@@ -20,9 +20,11 @@
 
 mod chorale;
 mod control;
+mod emotion;
 mod head_imu;
 mod idle_head;
 mod intents;
+mod laser;
 mod leds;
 mod params;
 mod pickup;
@@ -105,6 +107,13 @@ const CENSUS_INTERVAL: Duration = Duration::from_secs(5);
 /// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
 /// between them on a 20 ms tick twitches rather than sings. This is roughly how fast a jaw moves.
 const CHORALE_MOUTH_TAU_S: f64 = 0.09;
+
+/// How recently a client must have sent a non-zero head pose for it to win over laser tracking.
+///
+/// The head slot is not a stream: `robot.look` sets it once and it stays. A client that set one a
+/// minute ago is not steering the head now, and the dot should have it; one whose stick is pushed
+/// re-sends every tick, well inside this.
+const LASER_CLIENT_HEAD: Duration = Duration::from_secs(1);
 
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
@@ -746,6 +755,9 @@ struct RobotState {
     /// accepting it into silence. Read once at startup, like the policies: the postinstall
     /// renders the bank and restarts robotd, so a bank cannot appear under a running one.
     has_voice: bool,
+    /// The emotions `robot.do` plays, from `[emotions] dir`. Read once at startup, like the voice
+    /// bank: adding one is copying its files and restarting this daemon.
+    emotions: emotion::Library,
     /// Whether a theremin can be picked up: the params allow one, and the depth stream is
     /// actually delivering frames. Published by the loop rather than read once at startup,
     /// because unlike a voice bank the sensor comes and goes — `tofd` restarts, the ToF
@@ -849,6 +861,7 @@ impl RobotState {
             policy_enabled: params.policy.enabled,
             config_path: config_path.to_owned(),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
+            emotions: emotion::Library::load_release(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
@@ -1595,6 +1608,22 @@ fn body_imu_mount(board: robotd_params::board::Board) -> [f64; 4] {
     }
 }
 
+/// What `[bus]` asks the servos' impact guard to be: its six settings, or off.
+fn impact_guard(bus: &params::Bus) -> duck_control::model::ImpactGuard {
+    use duck_control::model::ImpactGuard;
+    if !bus.impact_guard {
+        return ImpactGuard::OFF;
+    }
+    ImpactGuard {
+        v_min: bus.impact_guard_v_min,
+        brake_ms: bus.impact_guard_brake_ms,
+        decel: bus.impact_guard_decel,
+        i_hold_ma: bus.impact_guard_i_hold_ma,
+        v_fast: bus.impact_guard_v_fast,
+        pwm_fast: bus.impact_guard_pwm_fast,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn open_bus(
     bus: &params::Bus,
@@ -1622,6 +1651,14 @@ fn open_bus(
     // and "turned off in robotd.toml" is otherwise indistinguishable from "this board is slow".
     if !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
+    }
+    let guard = impact_guard(bus);
+    io.set_impact_guard(guard);
+    if !bus.impact_guard && loud {
+        tracing::info!("bus.impact_guard is off; guard servos run as the factory firmware");
+    } else if guard != duck_control::model::ImpactGuard::DEFAULT && loud {
+        // Said once a start so a recording can be matched to the settings it ran on.
+        tracing::warn!(?guard, "bus.impact_guard_* differ from the defaults");
     }
     if !adopt_missing_servo(&mut io, loud, missing, adopted) {
         return None;
@@ -2314,8 +2351,26 @@ async fn control_loop<T: RobotIo>(
     // The vet book's tally for this process, and what each servo says it is. Read once, here,
     // before the loop has a deadline to keep: a servo is not going to change model mid-run.
     let mut vettally = vetbook::Tracker::default();
+    // Which servos run ROBOTIS's impact guard firmware, from the same read. Any other firmware
+    // still drives the robot: it is named here, once a start, and left out of the guard state.
+    let mut guarded = [false; NUM_JOINTS];
     match safety.servo_identity() {
-        Ok(Some(ids)) => state.vetbook.identify(&ids),
+        Ok(Some(ids)) => {
+            state.vetbook.identify(&ids);
+            guarded =
+                ids.map(|s| duck_control::model::IMPACT_GUARD_FIRMWARES.contains(&s.firmware));
+            let unguarded: Vec<_> = (0..NUM_JOINTS)
+                .filter(|&j| !guarded[j])
+                .map(|j| format!("{}={}", duck_control::JOINT_NAMES[j], ids[j].firmware))
+                .collect();
+            if !unguarded.is_empty() {
+                tracing::warn!(
+                    servos = unguarded.join(" "),
+                    want = ?duck_control::model::IMPACT_GUARD_FIRMWARES,
+                    "servo firmware without the impact guard"
+                );
+            }
+        }
         Ok(None) => {}
         Err(e) => tracing::debug!(error = %e, "vet book: servo identity read failed"),
     }
@@ -2492,10 +2547,16 @@ async fn control_loop<T: RobotIo>(
     // reason.
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
+    // Laser tracking. The reader holds no connection to `mediad` while tracking is off, so on a
+    // duck that never switches it on this is one sleeping thread. `[laser]` is re-read by that
+    // thread while it is on — tuning it must not need a restart that drops the robot.
+    let mut laser = laser::Laser::spawn(params.laser.clone(), params_path.clone());
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
     let mut chorale_head = [0.0f64; 4];
+    // The emotion being played, if any — see `emotion`.
+    let mut playing: Option<emotion::Playing> = None;
     // The robot looking around while nothing is happening — see `idle_head`. Seeded from the
     // clock, so two robots side by side do not glance in step.
     let mut idle_head = idle_head::IdleHead::new(
@@ -2621,7 +2682,62 @@ async fn control_loop<T: RobotIo>(
         }
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
-        let snapshot = intents.snapshot();
+        let mut snapshot = intents.snapshot();
+
+        // Laser tracking takes what nobody else is asking for. Before the emotion, so a playing
+        // emotion still has the robot; and each half only when no client wants it: a fresh,
+        // non-zero twist is somebody driving, and a pad's stick always wins over a dot on the
+        // floor. A centred stick reads as zero, so the dot has the legs back the moment it is let
+        // go — and with no dot in sight `tick` asks for nothing, and the client's command stands.
+        if let Some(active) = intents.take_laser_request() {
+            laser.set_active(active);
+        }
+        let mut laser_state = None;
+        if let Some(sample) = sensors.as_ref() {
+            let pose = laser::Pose {
+                head: mapping::head_joints_of(&sample.positions),
+                imu: sample.imu.quat,
+                odom: odometry.position(),
+                yaw: odometry.yaw(),
+            };
+            if let Some(drive) = laser.tick(&pose, snapshot.command.head[0], tick_start) {
+                let mut block = drive.state;
+                let client_twist = snapshot.twist_age
+                    < Duration::from_millis(params.safety.deadman_ms)
+                    && snapshot.command.twist.iter().any(|v| *v != 0.0);
+                let client_head = snapshot.head_age < LASER_CLIENT_HEAD
+                    && snapshot.command.head.iter().any(|v| v.abs() > 1e-3);
+                if let Some(head) = drive.head
+                    && !client_head
+                {
+                    snapshot.command.head = head;
+                    // Somebody is steering the head, so the idle look-around keeps out.
+                    snapshot.head_age = Duration::ZERO;
+                    block.head = true;
+                }
+                if let Some(twist) = drive.twist
+                    && !client_twist
+                {
+                    snapshot.command.twist = twist;
+                    // A live driver for the deadman's purposes: the dot is as fresh as `[laser]
+                    // memory_ms` allows, and the reader drops it the moment `mediad` goes quiet.
+                    snapshot.twist_age = Duration::ZERO;
+                    block.walk = true;
+                }
+                laser_state = Some(block);
+            }
+        }
+
+        // An emotion in progress has the head, the body and the beak, and holds the robot still.
+        if let Some(p) = playing.as_ref() {
+            match p.frame(tick_start) {
+                Some(frame) => frame.apply(&mut snapshot),
+                None => {
+                    tracing::info!(emotion = %p.name, "emotion over");
+                    playing = None;
+                }
+            }
+        }
         let (gated, deadman) = safety.gate(snapshot.command, snapshot.twist_age);
         let mut limits: Vec<duck_control::safety::Limit> = deadman.into_iter().collect();
 
@@ -2786,6 +2902,47 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
+            }
+        }
+
+        // Emotions, like the skills above: started on a robot the policy drove last tick with no
+        // move in flight, and over the moment that stops being true, sound included. One at a
+        // time: a request while one plays is dropped. X re-sends while held, so an emotion on X
+        // plays again when it ends, the way a chaining skill would.
+        let can_emote = was_driving && shutdown_sit.is_none() && !safety.fallen();
+        if let Some(index) = intents.take_emotion()
+            && let Some((name, wanted)) = state.emotions.get(index)
+        {
+            if playing.is_some() {
+                tracing::debug!(emotion = name, "emotion dropped: one is playing");
+            } else if can_emote && controller.as_ref().is_some_and(|c| !c.busy()) {
+                tracing::warn!(emotion = name, "emotion started");
+                if let (Some(voice), Some(wav)) = (voice.as_mut(), wanted.sound()) {
+                    voice.play_file(wav);
+                }
+                playing = Some(emotion::Playing::start(
+                    name,
+                    Arc::clone(wanted),
+                    tick_start,
+                ));
+            } else {
+                tracing::debug!(emotion = name, "emotion refused: not driving, or busy");
+            }
+        }
+        if playing.is_some() && !can_emote {
+            playing = None;
+            if let Some(voice) = voice.as_mut() {
+                voice.stop();
+            }
+        }
+        if let Some(p) = playing.as_mut()
+            && p.sit_due(tick_start)
+            && let Some(c) = controller.as_mut()
+            && !c.is_sitting()
+        {
+            match c.sit_toggle() {
+                Ok(_) => tracing::info!(emotion = %p.name, "emotion: sitting down"),
+                Err(reason) => tracing::info!(emotion = %p.name, reason, "emotion: sit refused"),
             }
         }
 
@@ -4049,6 +4206,19 @@ async fn control_loop<T: RobotIo>(
         if state.state_tx.receiver_count() > 0
             && let Some(sensors) = sensors.as_ref()
         {
+            // A bus transaction of its own (~1 ms), so here: after the goal positions went out,
+            // where it cannot delay a read or a write the policy depends on, and only while
+            // someone is recording.
+            let impact_guard = match guarded.contains(&true).then(|| safety.impact_guard()) {
+                Some(Ok(Some(states))) => (0..NUM_JOINTS)
+                    .map(|j| guarded[j].then_some(states[j]))
+                    .collect(),
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "impact guard state read failed");
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
             let _ = state.state_tx.send(proto::RobotState {
                 t: state.started.elapsed().as_secs_f64(),
                 movement: proto::MoveState {
@@ -4089,11 +4259,13 @@ async fn control_loop<T: RobotIo>(
                 } else {
                     Vec::new()
                 },
+                impact_guard,
                 odom: proto::OdomState {
                     position: odometry.position(),
                     yaw: odometry.yaw(),
                 },
                 theremin: theremin_state.clone(),
+                laser: laser_state.clone(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -5062,7 +5234,7 @@ fn ramp_target(
 fn pad_bindings_report(config: &std::path::Path, state: &RobotState) -> proto::PadBindingsResult {
     let bindings = params::edit::pad_bindings(config).unwrap_or_default();
     let defaults = params::PadParams::default();
-    let known = do_names(&state.policies.load());
+    let known = do_names(&state.policies.load(), &state.emotions);
 
     proto::PadBindingsResult {
         bindings: params::PadParams::BUTTONS
@@ -5109,7 +5281,7 @@ fn bind_pad_request(p: &proto::PadBindParams, state: &RobotState) -> proto::Inte
     };
 
     if !wanted.is_empty() {
-        let known = do_names(&state.policies.load());
+        let known = do_names(&state.policies.load(), &state.emotions);
         if !known.iter().any(|s| s == wanted) {
             return proto::IntentResult::refused(format!(
                 "this robot has no skill called {wanted:?} — it has {}",
@@ -5271,7 +5443,10 @@ fn load_policy_request(
 ///
 /// Both are conditional on the policy behind them being loaded, because a robot whose `sitstand`
 /// slot is switched off genuinely cannot sit.
-fn do_names(policies: &PolicyNames) -> Vec<String> {
+///
+/// The emotions come last: a policy skill of the same name wins, because it is the one
+/// [`queue_skill`] finds first.
+fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if policies.ground_pick.is_some() {
         names.push("ground_pick".to_owned());
@@ -5280,6 +5455,7 @@ fn do_names(policies: &PolicyNames) -> Vec<String> {
         names.push("sit_toggle".to_owned());
     }
     names.extend(policies.skills.iter().cloned());
+    names.extend(emotions.names().map(str::to_owned));
     names
 }
 
@@ -5299,7 +5475,13 @@ fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
                 intents.request_skill(index);
                 true
             }
-            None => false,
+            None => match state.emotions.index(name) {
+                Some(index) => {
+                    intents.request_emotion(index);
+                    true
+                }
+                None => false,
+            },
         },
     }
 }
@@ -5368,7 +5550,7 @@ fn dispatch(
             } else if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
             } else {
-                let known = do_names(&state.policies.load());
+                let known = do_names(&state.policies.load(), &state.emotions);
                 proto::IntentResult::refused(if known.is_empty() {
                     "this robot has no skills configured".to_owned()
                 } else {
@@ -5423,6 +5605,14 @@ fn dispatch(
                 }
             };
             proto::Response::ok(Some(id), &result)
+        }
+
+        // Laser tracking on or off. Nothing to refuse at the door: whether `mediad` answers is a
+        // circumstance that changes under a running daemon, and the reader says what it is
+        // waiting for in `robot.state`'s laser block rather than here.
+        proto::Call::RobotLaserTrack(p) => {
+            intents.request_laser(p.active);
+            proto::Response::ok(Some(id), &proto::LaserTrackResult::default())
         }
 
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
@@ -5661,7 +5851,14 @@ fn dispatch(
                     stand: policies.stand.clone(),
                     sitstand: policies.sitstand.clone(),
                     ground_pick: policies.ground_pick.clone(),
-                    skills: policies.skills.clone(),
+                    // The emotions too: this list is the names `robot.do` answers to, and it is
+                    // what `robotctl pad bind` checks a name against.
+                    skills: policies
+                        .skills
+                        .iter()
+                        .cloned()
+                        .chain(state.emotions.names().map(str::to_owned))
+                        .collect(),
                     unavailable: state.policy_error.load_full().map_or_else(
                         || {
                             policies.walk.is_none().then(|| {
@@ -6202,21 +6399,27 @@ mod tests {
     /// config entries, so they are absent from `skills` while being perfectly good asks.
     #[test]
     fn the_daemon_driven_skills_count_as_skills() {
-        let names = do_names(&PolicyNames {
-            ground_pick: Some("alpha_ground_pick.onnx".to_owned()),
-            sitstand: Some("alpha_sitstand.onnx".to_owned()),
-            skills: vec!["roulade".to_owned()],
-            ..Default::default()
-        });
+        let names = do_names(
+            &PolicyNames {
+                ground_pick: Some("alpha_ground_pick.onnx".to_owned()),
+                sitstand: Some("alpha_sitstand.onnx".to_owned()),
+                skills: vec!["roulade".to_owned()],
+                ..Default::default()
+            },
+            &emotion::Library::default(),
+        );
         assert_eq!(names, ["ground_pick", "sit_toggle", "roulade"]);
 
         // And a slot switched off takes its name away, because that robot really cannot sit.
-        let without = do_names(&PolicyNames {
-            ground_pick: None,
-            sitstand: None,
-            skills: vec!["roulade".to_owned()],
-            ..Default::default()
-        });
+        let without = do_names(
+            &PolicyNames {
+                ground_pick: None,
+                sitstand: None,
+                skills: vec!["roulade".to_owned()],
+                ..Default::default()
+            },
+            &emotion::Library::default(),
+        );
         assert_eq!(without, ["roulade"]);
     }
 
@@ -7041,6 +7244,55 @@ mod tests {
         assert!(intents.take_skills().sit_toggle);
     }
 
+    /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the
+    /// names a button is bound against — on this side and in the subscribe answer `robotctl pad
+    /// bind` checks. Missing either is a button refused for an emotion the robot plays fine.
+    #[test]
+    fn robot_do_queues_an_emotion_and_lists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("yes.json"),
+            r#"{"keyframes": [{"t": 0.0}]}"#,
+        )
+        .unwrap();
+        let mut params = Params::default();
+        params.emotions.dir = dir.path().to_owned();
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Intents::new();
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
+
+        let accepted: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(1),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: "yes".into(),
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(accepted.accepted);
+        assert_eq!(intents.take_emotion(), Some(0));
+        assert_eq!(intents.take_skills().skills, 0, "not a policy skill");
+
+        assert!(do_names(&s.policies.load(), &s.emotions).contains(&"yes".to_owned()));
+        let ack: proto::SubscribeResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(2),
+            &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(1) }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(ack.skills.contains(&"yes".to_owned()), "{:?}", ack.skills);
+    }
+
     /// The pose and mouth intents land in their slots like move and head do — including via
     /// the notification path, which is how they actually arrive at 50 Hz.
     #[test]
@@ -7259,6 +7511,15 @@ mod tests {
         }
         fn census(&mut self) -> duck_control::io::Result<Option<duck_control::Census>> {
             self.0.census()
+        }
+        fn servo_identity(
+            &mut self,
+        ) -> duck_control::io::Result<Option<[duck_control::io::ServoIdentity; NUM_JOINTS]>>
+        {
+            self.0.servo_identity()
+        }
+        fn impact_guard(&mut self) -> duck_control::io::Result<Option<[u8; NUM_JOINTS]>> {
+            self.0.impact_guard()
         }
     }
 
@@ -7934,6 +8195,107 @@ mod tests {
 
         assert!(frame.velocities.is_empty(), "{:?}", frame.velocities);
         assert!(frame.currents_ma.is_empty(), "{:?}", frame.currents_ma);
+    }
+
+    /// Servos on ROBOTIS's impact guard firmwares, V3 and one on V4, every one but the mouth
+    /// here, with the guard holding after an impact.
+    fn guarded_io() -> FakeIo {
+        use duck_control::model::{IMPACT_GUARD_ENABLE_FIRMWARE, IMPACT_GUARD_FIRMWARES};
+        let mut io = FakeIo::at(DEFAULT_POSITION);
+        let mut identity = [duck_control::io::ServoIdentity {
+            model: 1200,
+            firmware: IMPACT_GUARD_FIRMWARES[0],
+        }; NUM_JOINTS];
+        identity[0].firmware = IMPACT_GUARD_ENABLE_FIRMWARE;
+        identity[duck_control::model::MOUTH_INDEX].firmware = 53;
+        io.identity = Some(identity);
+        io.impact_guard = Some([2; NUM_JOINTS]);
+        io
+    }
+
+    /// An untouched `[bus]` is off, `impact_guard = true` is setting R, a retuned one is written
+    /// as asked, and `impact_guard = false` is off whatever the six settings say.
+    #[test]
+    fn bus_params_pick_the_impact_guard() {
+        use duck_control::model::ImpactGuard;
+        let mut bus = params::Bus::default();
+        assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
+        bus.impact_guard = true;
+        assert_eq!(impact_guard(&bus), ImpactGuard::DEFAULT);
+        bus.impact_guard_decel = 1000;
+        bus.impact_guard_i_hold_ma = 800;
+        assert_eq!(
+            impact_guard(&bus),
+            ImpactGuard {
+                decel: 1000,
+                i_hold_ma: 800,
+                ..ImpactGuard::DEFAULT
+            }
+        );
+        bus.impact_guard = false;
+        assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
+    }
+
+    /// The guard's state reaches the stream for the servos that have one, and a servo on any
+    /// other firmware is `null` — what its unused register 66 holds is not a state, and a 0 there
+    /// would read as a guard that never fired.
+    #[tokio::test]
+    async fn the_frame_carries_the_impact_guard_of_the_servos_that_have_one() {
+        let frame = a_frame_from(guarded_io(), Params::default()).await;
+
+        let mouth = duck_control::model::MOUTH_INDEX;
+        assert_eq!(frame.impact_guard.len(), NUM_JOINTS);
+        assert_eq!(frame.impact_guard[mouth], None);
+        assert!(
+            (0..NUM_JOINTS)
+                .filter(|&j| j != mouth)
+                .all(|j| frame.impact_guard[j] == Some(2)),
+            "{:?}",
+            frame.impact_guard
+        );
+    }
+
+    /// The guard's state is a bus transaction of its own, so a robot nobody is recording must not
+    /// pay for it: the tick's bus traffic is what it was before the guard existed.
+    #[tokio::test]
+    async fn nobody_recording_means_no_impact_guard_read() {
+        let params = Params {
+            policy: params::PolicyParams {
+                enabled: false,
+                ..params::PolicyParams::default()
+            },
+            ..Params::default()
+        };
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = guarded_io();
+            control_loop(
+                Borrowed(&mut io),
+                loop_state,
+                Arc::new(Intents::new()),
+                params,
+                PathBuf::from("/nonexistent/robotd.toml"),
+                Duration::from_millis(2),
+                noop_poweroff(),
+            )
+            .await;
+            tx.send(io.impact_guard_reads).unwrap();
+        });
+        while s.ticks.load(Ordering::Relaxed) < 5 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+
+        assert_eq!(rx.recv().unwrap(), 0);
     }
 
     /// Run the loop over one backend until it publishes a frame, and stop it.

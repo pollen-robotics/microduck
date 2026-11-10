@@ -52,6 +52,7 @@ mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
+mod setup_code;
 mod show;
 mod vetbook;
 
@@ -240,6 +241,21 @@ enum Namespace {
         /// client that went away.
         #[arg(long)]
         off: bool,
+    },
+
+    /// Follow a laser dot: the head looks at it and the robot walks to it.
+    ///
+    /// `on` and `off` switch it, and it stays as set — a pad still drives normally, and wins over
+    /// the dot whenever a stick is pushed. With no argument, or after `on`, this watches what the
+    /// camera sees until Ctrl-C (which leaves tracking as it is).
+    ///
+    /// The readout is how `[laser]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// colour of the reddest bright thing in the picture whether it passed or not — point the
+    /// laser, read it, and set y_min / v_min a little below and u_max a little above.
+    LaserTrack {
+        /// `on` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
     },
 
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
@@ -529,6 +545,15 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
+    ///
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
+    SetupCode {
+        #[command(subcommand)]
+        action: Option<SetupCodeAction>,
+    },
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
@@ -537,6 +562,24 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCodeAction {
+    /// Install the 32-byte key, read on stdin as 64 hex characters. Needs root.
+    ///
+    /// On stdin so the key is in no command line or shell history. Refuses to replace an
+    /// existing key, which would invalidate the printed QR and every phone holding the old code.
+    Install {
+        /// Replace an existing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -807,6 +850,120 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         println!("theremin put down");
     }
     Ok(())
+}
+
+/// `robotctl laser-track` — switch laser tracking, and watch what the camera makes of the dot.
+///
+/// Unlike the theremin, Ctrl-C leaves the mode as it is: tracking is meant to be left on while
+/// the robot is driven, and this view is for tuning, not for holding the mode up.
+fn run_laser_track(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let active = state == "on";
+        let outcome: proto::LaserTrackResult = decode(&result_of(client.call(
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active }),
+        )?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        if !active {
+            println!("laser tracking off");
+            return Ok(());
+        }
+        println!("laser tracking on");
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (tracking stays as it is)");
+
+    let mut line = String::new();
+    let mut said_off = false;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(laser) = state.laser else {
+            if !said_off {
+                print!("\r\x1b[K  laser tracking is off — `robotctl laser-track on`");
+                let _ = std::io::stdout().flush();
+                said_off = true;
+            }
+            continue;
+        };
+        said_off = false;
+        print!("\r\x1b[K  {}", laser_line(&laser));
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_laser_track`]: the dot, the colour it was judged on, where it is,
+/// and what the robot is doing about it.
+fn laser_line(laser: &proto::LaserTrackState) -> String {
+    let dot = match &laser.dot {
+        None => format!("{:<26}", laser.camera),
+        Some(dot) => {
+            let seen = match (dot.seen, dot.px, &dot.rejected) {
+                (true, Some([x, y]), _) => format!("DOT ({x:4.0},{y:4.0}) n={:<3}", dot.pixels),
+                (_, _, Some(why)) => format!("{why} (n={})", dot.pixels),
+                _ => "no dot".to_owned(),
+            };
+            let peak = dot
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", dot.hz)
+        }
+    };
+    let target = match laser.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            laser
+                .age_ms
+                .filter(|age| *age > 150)
+                .map(|age| format!(" ({age} ms ago)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let doing = match (laser.head, laser.walk, laser.twist) {
+        (_, true, Some([vx, _, vyaw])) => format!("walk {vx:.2} m/s {vyaw:+.2} rad/s"),
+        (true, false, _) => "looking".to_owned(),
+        (false, false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!("{dot}  {target:<24} {doing}")
 }
 
 /// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
@@ -1846,6 +2003,11 @@ struct HealthReport {
     /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<proto::CameraStats>,
+    /// Seconds since `mediad` last rewrote [`HealthReport::camera`], set only when that is longer
+    /// than [`proto::CAMERA_STATS_MAX_AGE`]: the camera has stopped, and `camera.fps` is the rate
+    /// it had when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_stopped_secs: Option<u64>,
     /// What `mediad`'s relay last published about the rendezvous service. `None` for the camera's
     /// reasons, plus `--no-remote`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1994,6 +2156,9 @@ fn run_health(
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
+        camera_stopped_secs: proto::camera_stats_age()
+            .filter(|age| *age > proto::CAMERA_STATS_MAX_AGE)
+            .map(|age| age.as_secs()),
         remote: proto::read_remote_status(),
         account: Client::connect(socket)
             .ok()
@@ -2221,7 +2386,15 @@ fn render_health(report: &HealthReport) -> String {
     // rather than about which release is installed. Omitted entirely when `mediad` has published
     // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
     // running is already a line in the units block.
-    if let Some(camera) = &report.camera {
+    if let (Some(camera), Some(secs)) = (&report.camera, report.camera_stopped_secs) {
+        // A stopped camera first, in words: its file still holds the last rate it had, and
+        // printing that as current is how a dead camera read as "10.0 fps (target 30)".
+        let _ = writeln!(
+            out,
+            "camera    stopped — no frame for {secs}s (was {:.1} fps, {}x{} {})",
+            camera.fps, camera.width, camera.height, camera.format
+        );
+    } else if let Some(camera) = &report.camera {
         let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
             format!("{:.1} fps", camera.fps)
         } else {
@@ -3369,6 +3542,14 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
 }
 
 fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Local files only: no daemon is involved in showing or installing the key.
+    if let SystemCommand::SetupCode { action } = &command {
+        return match action {
+            None => setup_code::show(),
+            Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
+        };
+    }
     // Asked before connecting, so a robot is not disturbed by a command the operator then
     // aborts.
     if let SystemCommand::Reboot { yes: false, .. } = &command {
@@ -3393,6 +3574,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             *json,
         ),
         SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -3445,6 +3627,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             let reboot: proto::RebootResult = decode(&result)?;
             println!("rebooting in {}s", reboot.in_seconds);
         }
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -5043,7 +5226,7 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
             }
             Ok(())
         }
-        proto::PadPairResult::Failed { reason, detail } => {
+        proto::PadPairResult::Failed { reason, detail, .. } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
                     "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
@@ -5425,6 +5608,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
+        }
+        Namespace::LaserTrack { state } => {
+            return run_laser_track(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
@@ -6696,6 +6882,7 @@ mod tests {
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
             camera: None,
+            camera_stopped_secs: None,
             remote: None,
             account: None,
             board: BoardReport {
@@ -6927,6 +7114,22 @@ mod tests {
             out.contains("camera    19.6 fps (target 30), 1280x720 UYVY, 412 dropped — 2 viewers"),
             "{out}"
         );
+    }
+
+    /// A camera whose stats have gone stale has stopped, and says so rather than repeating the
+    /// last rate it had — which is what a camera that died three seconds after boot looked like.
+    #[test]
+    fn health_renders_a_stopped_camera() {
+        let mut report = health_report(None, None);
+        report.camera = Some(camera_stats(10.0, 48, 0));
+        report.camera_stopped_secs = Some(312);
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    stopped — no frame for 312s (was 10.0 fps, 1280x720 UYVY)"),
+            "{out}"
+        );
+        assert!(!out.contains("target"), "{out}");
     }
 
     /// No `mediad`, no line. A robot that has never started it should not read as having a fault.

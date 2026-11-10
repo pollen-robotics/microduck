@@ -105,6 +105,79 @@ behave, and those numbers stay radians whatever the screen is set to. The joint 
 robotctl monitor --json --hz 50 > run.jsonl
 ```
 
+On a robot whose servos run ROBOTIS's impact guard firmware (V3 or V4), each line also carries
+`impact_guard`: per joint, 0 armed, 1 braking after an impact, 2 holding softly until the goal
+comes back past the position, `null` for a servo on another firmware. Reading it costs the bus a
+millisecond per tick, after the goal positions go out and only while something is subscribed,
+and `loop.hz` and `loop.missed` on the same line say whether the loop kept its rate. `robotd`
+names any servo on neither in the journal once a start, and sets every servo's Current Limit to
+1000 mA, at the next start with torque off if the robot was standing. V4 hides the guard behind
+Impact Guard Enable (register 67), which every power-up turns off: `robotd` sets it to
+`bus.impact_guard` with every torque on, so with the guard on a V4 servo is guarded from the
+first Start.
+
+`bus.impact_guard` in `sudo robotctl configure` switches every guard servo between the guard (on)
+and settings that never fire (off, the default): the factory firmware with only Current Limit, to
+compare the two on the same robot. It is off until it is understood why the stress test robot on
+it, cream-dvt-antoine, fell on its own far more often than any other (2026-11-09): about half its
+falls, against 8-14 % elsewhere. On writes the six `bus.impact_guard_*` rows beside it, which
+default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
+V Fast (rad/s) and PWM Fast (%). Changing them is how to look for another guard; a start on
+anything but the defaults names them in the journal. They are written when `robotd` starts
+with torque off, so relax and restart it: the servos run them from the next Start, no reboot
+needed. On V4 the on/off switch needs none of this: it follows `bus.impact_guard` at the
+first Start after a restart, relaxed or not, and off leaves the six settings as they are.
+`impact_guard` staying at 0 in the recording is what off looks like.
+
+The levels a robot test steps through, gentlest first (V Min rad/s, Brake Time ms, Deceleration
+rad/s², i Hold mA, V Fast rad/s, PWM Fast %):
+
+| level | v_min | brake_ms | decel | i_hold_ma | v_fast | pwm_fast | what it is |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 off | | | | | | | `impact_guard = false`: Current Limit only |
+| 1 taper only | 1 | 50 | 32767 | 32767 | 9 | 80 | no brake, no hold, a gentle speed taper |
+| 2 light | 3 | 20 | 1500 | 1000 | 9 | 80 | hard impacts only, a short brake, a near-normal hold |
+| 3 medium | 2 | 30 | 1000 | 800 | 9 | 70 | |
+| 4 strong | 1 | 40 | 600 | 650 | 9 | 60 | close to the factory |
+| 5 factory | 1 | 50 | 400 | 500 | 9 | 50 | ROBOTIS's factory values, the gear bench's |
+| 5a factory, no taper | 1 | 50 | 400 | 500 | 9 | 100 | isolates the taper |
+| 5b factory, no hold | 1 | 50 | 400 | 32767 | 9 | 50 | the brake and the taper, no soft hold |
+| 6 factory taper only | 1 | 50 | 32767 | 32767 | 9 | 50 | never brakes |
+| 7 late short brake | 6 | 20 | 400 | 32767 | 9 | 50 | brakes on arrivals above 6 rad/s only |
+| 8 late brake | 6 | 50 | 400 | 32767 | 9 | 50 | 7 with the factory brake length |
+| 9 earlier short brake | 4 | 20 | 400 | 32767 | 9 | 50 | 7 from 4 rad/s |
+| R default | 6 | 20 | 400 | 32767 | 7 | 40 | 7 with a stronger taper: arrivals capped near 7 rad/s |
+
+With the same ONNX, 0 walks and 5, 5a and 5b keep falling. The taper is not the cause: in a
+guard-off walk the gait never needed more PWM than the factory taper leaves (one sample in 3,455).
+The brake is: at 5 it fired about 6 times a second across the legs while walking, on nearly every
+step of each knee, mostly from under 3 rad/s, and 50 ms of shorted bridge is close to limp for a
+knee in stance. The hold made it worse, since it lasts until the goal comes back past the position,
+which in stance it does not.
+
+On lavandiere (2026-11-05, same ONNX, a minute of walking and about ten pushes per setting), 6 and
+7 walked and recovered like 0: no fall in 20 pushes. Every hold (800, 650 or 500 mA, on 7 or 8)
+and the 50 ms brake weakened push recovery: 6 falls in 31 pushes. A recovery step trips the brake,
+and the hold then softens the stance leg; a hold reads about half its setting in Present Current.
+So the hold stays off until the firmware can end it on its own (after 100-150 ms, or once the servo
+is still). The taper costs nothing up to 40 % from 7 rad/s, which keeps arrivals near 7 rad/s
+(8.5 guard off). 30 % from 7 felt slightly less steady, so R is one notch inside that edge. R held
+over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is what
+`impact_guard = true` writes; a robot that should run ROBOTIS's factory values instead takes, in
+`/var/lib/robot/robotd.toml`:
+
+```toml
+[bus]
+impact_guard = true
+impact_guard_v_min = 1
+impact_guard_brake_ms = 50
+impact_guard_i_hold_ma = 500
+impact_guard_v_fast = 9
+impact_guard_pwm_fast = 50
+```
+
+Record every run: `impact_guard` says which joints braked or held.
+
 ### Configuring the robot
 
 ```
@@ -328,9 +401,9 @@ robotctl pad bindings
 a           sit_toggle
 b           ground_pick
 x             (nothing)
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 
 `robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
 ```
@@ -342,9 +415,9 @@ sudo robotctl pad bind x polite-bow
 a           sit_toggle
 b           ground_pick
 x           polite-bow
-y             (nothing)
-lb            (nothing)
-rb            (nothing)
+y           excited
+lb          yes
+rb          no
 ```
 
 That writes one line, and only the button you named:
@@ -367,13 +440,40 @@ silently doing nothing when you press it.
 
 Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
-`pad reset <button>` puts one back. X and Y ship empty, so they are the place for a new skill; X
-re-sends while held, which is what a chaining skill like the roulade wants.
+`pad reset <button>` puts one back. Three ship with emotions (see *Emotions*): LB yes, RB no, Y
+excited. X ships empty, so it is the place for a new skill; it re-sends while held, which is what a
+chaining skill like the roulade wants.
 
 The rest of the pad is not bindable: Start stands the robot up and toggles the policy, the D-pad
 picks what the sticks mean, and held Select cuts torque and powers the robot off — the button that stops a robot is the one worth not
 being able to lose to a config edit. A name is checked against what the robot actually has, so a
 typo is refused with the list rather than becoming a dead button.
+
+#### Emotions
+
+An emotion is a head, body and beak animation with its sound: a nod, a sigh, a laugh. Each is two
+files, `<name>.json` (keyframes) and `<name>.wav`, and its name is a skill like any other. **The
+set made for Microduck ships with every release** — `angry`, `curious`, `defiant`, `devastated`,
+`excited`, `impatient`, `laugh`, `mmh`, `mock`, `no`, `sad`, `yes`, `yes_fast`, from
+[microduck_emotions](https://github.com/pollen-robotics/microduck_emotions) — so there is nothing
+to install. Your own go in `/var/lib/robot/emotions/`, and one there with a shipped name replaces
+it:
+
+```
+sudo mkdir -p /var/lib/robot/emotions && sudo cp mine.json mine.wav /var/lib/robot/emotions/
+sudo systemctl restart robotd
+```
+
+```
+robotctl robot do sad
+sudo robotctl pad bind y sad
+```
+
+While one plays it has the head, the body pose and the beak, the sticks wait, and another request
+is dropped until it ends; on X, which re-sends while held, it plays again for as long as X is held.
+A keyframe with `"skill": "sit"` sits the robot down (devastated); it stays seated, and the sit
+toggle stands it up. The directory is read once at startup, so new files need the restart;
+`[emotions] dir` moves it, and in the simulator it is the checkout's `robotd/emotions/`.
 
 #### Putting it all back
 
@@ -654,7 +754,9 @@ the thumb:
 | --- | --- |
 | **A** / cross | sit ↔ stand |
 | **B** / circle | ground pick |
-| **X**, **Y**, **LB / RB** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `lb kick_left`) |
+| **LB / RB** | the yes / no emotions |
+| **Y** | the excited emotion |
+| **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
@@ -662,8 +764,8 @@ the thumb:
 | **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
 | **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
 | **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
-| **Select**, let go between 2 and 4 s | rest (`robot.rest`): a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
-| **Select**, held 4 s | power off (`robot.shutdown`): the same sit and rest pose, then the board switches off. The release afterwards does nothing more |
+| **Select**, held 2 s | rest (`robot.rest`), at once, without waiting for the release — the robot sitting down says the two seconds are up: a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
+| **Select**, held 4 s | power off (`robot.shutdown`): kept by the robot until the rest it started at 2 s has ended, then the board switches off. The release afterwards does nothing more |
 
 **One move at a time.** A kick, a pick or a sit is refused while another is running, and a
 seated robot only accepts A (stand up). Stopping the policy while it sits keeps it seated; cutting
@@ -917,6 +1019,47 @@ Note that `robotctl monitor`'s ToF grid is stricter than the theremin — it mar
 outside 5/9 as `x`, *could not measure*. A grid full of `x` does not mean the sensor is
 broken; it means it is being pessimistic about numbers it does have.
 
+### Follow a laser dot
+
+```
+robotctl laser-track on      # and watch; Ctrl-C stops watching, tracking stays on
+robotctl laser-track         # just watch
+robotctl laser-track off
+```
+
+A red laser dot on the floor is looked at and walked to. It shares the robot rather than taking
+it: a pushed stick wins over the dot, and with no dot in sight the robot does what the pad says —
+so it can be left on while driving. The video stream is untouched; `mediad` scans the frames it
+already has, once a second while searching and ~15 times once it sees a dot. Measured on a
+face-board-v1: searching costs about 1% of one core, tracking about 15%.
+
+`on`/`off` do not write the config. `[laser] enabled` in `robotctl configure` is whether it starts
+on at boot — and, like every `[laser]` key, an edit to it applies within a second, no restart.
+
+The readout is how the thresholds are tuned:
+
+```
+  DOT ( 412, 903) n=14     peak Y231 U112 V196  15Hz  → 0.84 m  -12°   walk 0.25 m/s -0.31 rad/s
+  no dot                   peak Y174 U121 V151   3Hz
+```
+
+The web console shows the same thing over the video while tracking is on: a red ring on a dot
+that passed, a dashed amber ring on a candidate rejected for its size, and the `laser` entry in the
+stats row with the peak colour.
+
+`peak` is the reddest bright thing in the picture, **whether it passed or not**. Point the laser at
+the floor, read it, and set `y_min` and `v_min` a little below it and `u_max` a little above; then
+take the laser away and check that `peak` for the empty room sits clearly short of them. Chasing a
+red object: raise `v_min`, or lower `max_pixels`. `too small` / `too big` say which size bound
+rejected a candidate. Distances consistently off against a tape measure: `floor_offset_m`. Then
+`k_yaw`, `k_dist`, `vx_max`, `vyaw_max` and `stop_m` for how it walks; `head` and `walk` switch either
+half off.
+
+It uses the camera geometry `mediad` already publishes — the family calibration for the board's
+sensor (IMX219 on the Zero 3W, GC2093 on `beta` and `face-board-v1`), or this robot's own
+`[media.intrinsics]` — and the board's mount (a quarter turn on the Zero 3W, upright on the
+others). If neither is known, the readout says so instead of guessing.
+
 ### The ToF sensor (`tofd`)
 
 An 8×8 depth matrix from the head sensor. `robotctl monitor`, then **`t`**:
@@ -1008,7 +1151,8 @@ camera 1280×720 · mount 90° · answered in 41 ms                    0.5 s ago
 ```
 
 The picture is drawn two pixels per character cell, the right way up whatever the mount angle is.
-It is small — after this robot's quarter turn the picture is portrait, about 16 pixels across —
+It is small — on the Zero 3W, after its camera's quarter turn, the picture is portrait, about 16
+pixels across; on the beta boards it is landscape —
 and that is enough for what a number cannot say: where the head is really pointing, whether the
 room is lit well enough to detect anything in, whether the lens is smeared or a thumb is over it.
 

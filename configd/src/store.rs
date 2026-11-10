@@ -30,9 +30,10 @@ pub const MAX_NAME: usize = 24;
 /// A known default rather than a random per-board value, deliberately, and it is the weakest
 /// link here: everyone in radio range knows it, so it proves physical presence and nothing more.
 /// It exists so the *process* is in place — the agent, the storage, the six-digit contract — and
-/// so a robot is provisionable out of the box. A per-device PIN printed under the robot is
-/// provisioning's job (`updater-design.md` §5.7), and `is_default` on the result exists so every
-/// client can say out loud that this one is not a secret.
+/// so a robot is provisionable out of the box. A robot whose ID EEPROM carries its label serial
+/// uses the PIN derived from that instead ([`crate::identity::default_pin`]); this one is for the
+/// rest, and `is_default` on the result exists so every client can say out loud that this one is
+/// not a secret.
 pub const DEFAULT_PIN: &str = "000000";
 
 /// How many digits a PIN has.
@@ -61,6 +62,9 @@ pub struct Store {
     /// [`crate::identity`] turns the SoC serial into `duck-7f3a` — and this type is a file, not a
     /// place that knows about hardware.
     fallback: String,
+    /// The PIN when none has been set: the label-derived one where the board has it, otherwise
+    /// [`DEFAULT_PIN`]. Supplied by the caller for the same reason as `fallback`.
+    default_pin: String,
 }
 
 impl Store {
@@ -68,7 +72,14 @@ impl Store {
         Self {
             path: path.into(),
             fallback: fallback.into(),
+            default_pin: DEFAULT_PIN.to_owned(),
         }
+    }
+
+    /// Use this PIN, rather than [`DEFAULT_PIN`], until one is set.
+    pub fn with_default_pin(mut self, pin: impl Into<String>) -> Self {
+        self.default_pin = pin.into();
+        self
     }
 
     /// The robot's name, or the fallback.
@@ -106,12 +117,12 @@ impl Store {
         Ok(name)
     }
 
-    /// The pairing PIN, or the factory default.
+    /// The pairing PIN, or the board's default.
     pub fn pairing_pin(&self) -> String {
         self.read()
             .ok()
             .and_then(|config| config.pairing_pin)
-            .unwrap_or_else(|| DEFAULT_PIN.to_owned())
+            .unwrap_or_else(|| self.default_pin.clone())
     }
 
     /// Store a PIN. Six digits, leading zeros kept.
@@ -212,6 +223,20 @@ mod tests {
 
     fn store(dir: &Path) -> Store {
         Store::new(dir.join("config.json"), "radxa-zero3")
+    }
+
+    /// A board with a label serial pairs with the PIN on its label, which is not the public one,
+    /// until someone sets another.
+    #[test]
+    fn a_label_pin_is_the_default_and_is_not_the_factory_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path()).with_default_pin("000001");
+        let result = store.name_and_pin_result();
+        assert_eq!(result.pin, "000001");
+        assert!(!result.is_default);
+
+        store.set_pairing_pin("424242").unwrap();
+        assert_eq!(store.pairing_pin(), "424242");
     }
 
     /// An unprovisioned robot still has a name.

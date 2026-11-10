@@ -236,6 +236,17 @@ jobs:
 
       - run: ./scripts/board-test.sh
 
+      # Hardware pairing still needs a real phone. Keep the tested board binary
+      # available briefly so a PR can be exercised on a bench robot without
+      # cutting a signed daemon release.
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: btd-board-pr-${{ github.run_id }}
+          path: target/aarch64-unknown-linux-gnu/release/btd
+          retention-days: 1
+          if-no-files-found: error
+
   coverage:
     # Its own job rather than another step in `check`: coverage needs a full
     # instrumented rebuild, which shares no artifacts with the ordinary one, so bolting it

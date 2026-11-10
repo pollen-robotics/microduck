@@ -23,6 +23,7 @@
 
 pub mod board;
 pub mod edit;
+pub mod label;
 pub mod registry;
 pub mod serial;
 
@@ -196,7 +197,11 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub emotions: EmotionsParams,
     pub theremin: ThereminParams,
+    /// Following a laser dot with the head and the legs. `robotd` reads it, and re-reads it while
+    /// tracking is on — see [`LaserParams`].
+    pub laser: LaserParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
@@ -270,13 +275,13 @@ pub struct PadDriveParams {
 }
 
 impl Default for PadDriveParams {
-    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Since the
-    /// v8 velstand, which tracks yaw commands, forward/back is 0.4 m/s and turning 1.0 rad/s —
-    /// what that policy follows well on the robot.
+    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward is
+    /// 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
+    /// velstand, and these still feel right on the robot. Back is 0.3 m/s.
     fn default() -> Self {
         Self {
             vx_max: 0.4,
-            vx_min: -0.4,
+            vx_min: -0.3,
             vy_max: 0.3,
             vy_min: -0.3,
             vyaw_max: 1.0,
@@ -383,9 +388,11 @@ impl Default for PadImuHeadControlParams {
 /// needs. It would also put "the button that stops the robot" behind a config key, which is the
 /// one binding worth not being able to lose.
 ///
-/// The defaults keep the pad sparse on purpose: A sits or stands, B picks up, and X, Y and the
-/// bumpers do nothing until somebody puts a skill there (the kicks are still in the set, unbound). A named button is rebound; the rest
-/// stay as they were.
+/// The defaults: A sits or stands, B picks up, the bumpers nod yes and shake no, Y is excited —
+/// three emotions (`robotd/src/emotion.rs`) — and X does nothing until somebody puts a skill there
+/// (the kicks are still in the set, unbound). An emotion whose files are missing is a skill the
+/// robot does not have, so its button does nothing. A named button is rebound; the rest stay as
+/// they were.
 ///
 /// A name here is not checked against anything at parse time: which skills exist is a property of
 /// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
@@ -400,12 +407,13 @@ pub struct PadParams {
     /// X (West). Free by default. Held, it is re-sent every tick, so a chaining skill such as
     /// the roulade keeps going for as long as it is held.
     pub x: String,
-    /// Y (North). Free by default.
+    /// Y (North). The excited emotion, by default.
     pub y: String,
     /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
-    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses. The yes
+    /// emotion, by default.
     pub lb: String,
-    /// The right bumper, likewise.
+    /// The right bumper, likewise. The no emotion, by default.
     pub rb: String,
 }
 
@@ -415,9 +423,9 @@ impl Default for PadParams {
             a: "sit_toggle".to_owned(),
             b: "ground_pick".to_owned(),
             x: String::new(),
-            y: String::new(),
-            lb: String::new(),
-            rb: String::new(),
+            y: "excited".to_owned(),
+            lb: "yes".to_owned(),
+            rb: "no".to_owned(),
         }
     }
 }
@@ -1262,6 +1270,147 @@ impl Default for ThereminParams {
     }
 }
 
+/// `[laser]` — laser tracking: a red laser dot on the floor is followed with the head and walked to.
+///
+/// Switched with `robotctl laser-track on|off` (`robot.laserTrack`), which does not write this
+/// file; `enabled` is whether it starts switched on. **Every key here applies live** — `robotd`
+/// re-reads this section within a second of the file changing, switches tracking if `enabled`
+/// moved, and hands the detection half to `mediad` by resubscribing — because tuning it means
+/// pointing a laser, reading `robotctl laser-track`, and changing a number, many times over, and a
+/// restart each time would drop the robot.
+///
+/// The camera keeps streaming exactly as it does without this: `mediad` scans the frames the tee
+/// already has at the stream's own auto-exposure, and nothing about the sensor changes. That is
+/// why the thresholds are here. A dot at normal exposure is a white core with a red rim, and the
+/// right numbers depend on the room and the laser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LaserParams {
+    /// Tracking is on from boot, and editing it switches tracking live. Off by default: the camera
+    /// is scanned for as long as tracking is on.
+    pub enabled: bool,
+    /// `mediad`'s local socket, where `media.laser` is served.
+    pub socket: PathBuf,
+    /// Luma a dot pixel must reach, 0–255.
+    pub y_min: u8,
+    /// Red chroma (V / Cr) a dot pixel must reach, 0–255; 128 is grey.
+    pub v_min: u8,
+    /// Blue chroma (U / Cb) a dot pixel must stay below, 0–255; 128 is grey.
+    pub u_max: u8,
+    /// Fewest sampled pixels that make a dot.
+    pub min_pixels: u32,
+    /// Most sampled pixels that are still a dot rather than something red and lit.
+    pub max_pixels: u32,
+    /// How far from the brightest hit still belongs to the dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second while nothing is in sight.
+    pub search_hz: f64,
+    /// Looks per second while following a dot.
+    pub track_hz: f64,
+    /// Point the head at the dot.
+    pub head: bool,
+    /// Walk to the dot.
+    pub walk: bool,
+    /// How long a dot that went out of sight is still followed, milliseconds.
+    pub memory_ms: u64,
+    /// Stop walking this close to the dot, metres — measured from the trunk, so this is about
+    /// where the beak ends up over it.
+    pub stop_m: f64,
+    /// Ignore a dot projected farther than this, metres. Far along a shallow ray, a pixel of
+    /// error is a lot of floor.
+    pub max_range_m: f64,
+    /// Forward speed per metre of distance left, 1/s.
+    pub k_dist: f64,
+    /// Turn rate per radian of bearing to the dot, 1/s.
+    pub k_yaw: f64,
+    /// Fastest forward speed, m/s.
+    pub vx_max: f64,
+    /// Fastest turn, rad/s.
+    pub vyaw_max: f64,
+    /// Added to the floor's height under the trunk, metres. Positive raises the floor, so dots
+    /// project nearer. For when `robotctl laser-track` reports a distance that is consistently off.
+    pub floor_offset_m: f64,
+}
+
+impl Default for LaserParams {
+    fn default() -> Self {
+        let detect = duck_ipc_proto::LaserDetectParams::default();
+        Self {
+            enabled: false,
+            socket: PathBuf::from(duck_ipc_proto::socket::MEDIA),
+            y_min: detect.y_min,
+            v_min: detect.v_min,
+            u_max: detect.u_max,
+            min_pixels: detect.min_pixels,
+            max_pixels: detect.max_pixels,
+            radius_px: detect.radius_px,
+            search_hz: detect.search_hz,
+            track_hz: detect.track_hz,
+            head: true,
+            walk: true,
+            memory_ms: 1000,
+            stop_m: 0.25,
+            max_range_m: 2.5,
+            k_dist: 1.0,
+            k_yaw: 1.5,
+            vx_max: 0.25,
+            vyaw_max: 0.8,
+            floor_offset_m: 0.0,
+        }
+    }
+}
+
+impl LaserParams {
+    /// The half of this section `mediad` needs, as the wire carries it.
+    pub fn detect(&self) -> duck_ipc_proto::LaserDetectParams {
+        duck_ipc_proto::LaserDetectParams {
+            y_min: self.y_min,
+            v_min: self.v_min,
+            u_max: self.u_max,
+            min_pixels: self.min_pixels,
+            max_pixels: self.max_pixels,
+            radius_px: self.radius_px,
+            search_hz: self.search_hz,
+            track_hz: self.track_hz,
+        }
+    }
+
+    fn check(&self) -> Option<(&'static str, &'static str)> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.search_hz) || self.search_hz > 30.0 {
+            return Some(("search_hz", "must be above 0 and at most 30"));
+        }
+        if !positive(self.track_hz) || self.track_hz > 30.0 {
+            return Some(("track_hz", "must be above 0 and at most 30"));
+        }
+        if self.min_pixels == 0 || self.max_pixels < self.min_pixels {
+            return Some((
+                "max_pixels",
+                "must be at least min_pixels, and min_pixels at least 1",
+            ));
+        }
+        if self.radius_px == 0 {
+            return Some(("radius_px", "must be at least 1"));
+        }
+        for (key, v) in [
+            ("stop_m", self.stop_m),
+            ("max_range_m", self.max_range_m),
+            ("k_dist", self.k_dist),
+            ("k_yaw", self.k_yaw),
+            ("vx_max", self.vx_max),
+            ("vyaw_max", self.vyaw_max),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Some((key, "must be zero or positive"));
+            }
+        }
+        if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
+            return Some(("floor_offset_m", "must be within ±0.2 m"));
+        }
+        None
+    }
+}
+
 /// `[pickup]`: pause the policy while somebody holds the robot, resume when it is put down.
 ///
 /// A classifier over the last second of what the loop already reads (`duck_control::pickup`,
@@ -1492,6 +1641,24 @@ impl AudioParams {
             Some(p) if is_none_sentinel(p) => None,
             Some(p) => Some(p.clone()),
             None => Some(PathBuf::from(RELEASE_DIR).join("models/pet_detect.onnx")),
+        }
+    }
+}
+
+/// `[emotions]` — the robot's own emotions, `<name>.json` keyframes and `<name>.wav` beside them,
+/// read once at startup on top of the set the release ships (`emotions/` in [`RELEASE_DIR`]): a
+/// file here adds one or replaces the shipped one of the same name. A directory that is not there
+/// is a robot with only the shipped set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmotionsParams {
+    pub dir: PathBuf,
+}
+
+impl Default for EmotionsParams {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/robot/emotions"),
         }
     }
 }
@@ -2552,6 +2719,52 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
+    /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
+    /// broken gear teeth. **Off by default** until it is understood why a stress test robot on it
+    /// fell on its own far more often than any other (2026-11-09); an update that turns this on is
+    /// how robots get it. Off leaves the factory firmware with only Current Limit: settings that
+    /// never fire on V3, the switch on V4, which keeps the settings it has. On writes the six
+    /// `impact_guard_*` settings below to every V3 and V4 servo at startup with torque off, and
+    /// V4's Impact Guard Enable follows this with every torque on; servos on any other firmware
+    /// have no guard to set. Their defaults are what a microduck walks with:
+    /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
+    /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
+    /// test looks for a guard that keeps the gears whole and still lets the policy walk.
+    pub impact_guard: bool,
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
+    pub impact_guard_v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub impact_guard_brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub impact_guard_decel: u16,
+    /// i Hold, mA: the current allowed after the brake, until the goal comes back past the
+    /// position.
+    pub impact_guard_i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `impact_guard_pwm_fast`. Not 0: the
+    /// firmware divides by it.
+    pub impact_guard_v_fast: u8,
+    /// PWM Fast, % of PWM Limit, at `impact_guard_v_fast` and above.
+    pub impact_guard_pwm_fast: u8,
+}
+
+impl Bus {
+    /// The first impact guard setting the firmware cannot take, and why.
+    fn invalid(&self) -> Option<(&'static str, &'static str)> {
+        if self.impact_guard_v_fast == 0 {
+            return Some((
+                "impact_guard_v_fast",
+                "must be above 0: the firmware divides by it",
+            ));
+        }
+        if !(1..=100).contains(&self.impact_guard_pwm_fast) {
+            return Some((
+                "impact_guard_pwm_fast",
+                "must be 1 to 100, a percentage of PWM Limit",
+            ));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2649,6 +2862,13 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            impact_guard: false,
+            impact_guard_v_min: 6,
+            impact_guard_brake_ms: 20,
+            impact_guard_decel: 400,
+            impact_guard_i_hold_ma: 32767,
+            impact_guard_v_fast: 7,
+            impact_guard_pwm_fast: 40,
         }
     }
 }
@@ -2749,8 +2969,20 @@ pub enum ParamsError {
         min: f64,
         max: f64,
     },
+    #[error("{path}: bus.{key} {reason}")]
+    Bus {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
     #[error("{path}: policy.{key} {reason}")]
     Policy {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: laser.{key} {reason}")]
+    Laser {
         path: String,
         key: &'static str,
         reason: &'static str,
@@ -2934,6 +3166,13 @@ impl Params {
                 got: self.control.hz,
             });
         }
+        if let Some((key, reason)) = self.laser.check() {
+            return Err(ParamsError::Laser {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
         // Checked here rather than in `mediad`, so `robotctl configure` refuses to write it:
         // the daemon that would choke on this one is not the daemon whose gate the editor runs.
         if let Some(bitrate) = self.media.bitrate
@@ -2959,6 +3198,13 @@ impl Params {
                     max,
                 });
             }
+        }
+        if let Some((key, reason)) = self.bus.invalid() {
+            return Err(ParamsError::Bus {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
         }
         for (key, accel) in [
             ("accel_vx", self.policy.accel_vx),
@@ -3548,16 +3794,16 @@ mod tests {
         );
     }
 
-    /// The shipped mapping: A sits, B picks up, X, Y and the bumpers are free.
+    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X is free.
     #[test]
     fn the_default_bindings() {
         let pad = super::PadParams::default();
         assert_eq!(pad.a, "sit_toggle");
         assert_eq!(pad.b, "ground_pick");
         assert_eq!(pad.x, "");
-        assert_eq!(pad.y, "");
-        assert_eq!(pad.lb, "");
-        assert_eq!(pad.rb, "");
+        assert_eq!(pad.y, "excited");
+        assert_eq!(pad.lb, "yes");
+        assert_eq!(pad.rb, "no");
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is
@@ -4516,6 +4762,40 @@ mod tests {
         assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
     }
 
+    /// Impact guard settings the firmware cannot take are refused by name, so `robotctl configure`
+    /// cannot write them; a retuned guard loads.
+    #[test]
+    fn an_impact_guard_the_firmware_cannot_take_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            (
+                "[bus]\nimpact_guard_v_fast = 0\n",
+                "bus.impact_guard_v_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 0\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 120\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(
+            dir.path(),
+            "[bus]\nimpact_guard_decel = 1000\nimpact_guard_i_hold_ma = 800\n",
+        );
+        let bus = Params::load(&path, true).unwrap().bus;
+        assert_eq!(
+            (bus.impact_guard_decel, bus.impact_guard_i_hold_ma),
+            (1000, 800)
+        );
+    }
+
     /// The look-around is on for walking and off for the roller unless the file says otherwise.
     /// Its head command is an observation input, and `roller.onnx` folds under one it was not
     /// trained with — seen on the robot as a collapse about three seconds after the stick was
@@ -4662,6 +4942,18 @@ mod tests {
 
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
+        assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
+        let guard = |b: &Bus| {
+            (
+                b.impact_guard_v_min,
+                b.impact_guard_brake_ms,
+                b.impact_guard_decel,
+                b.impact_guard_i_hold_ma,
+                b.impact_guard_v_fast,
+                b.impact_guard_pwm_fast,
+            )
+        };
+        assert_eq!(guard(&from_file.bus), guard(&built_in.bus));
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
