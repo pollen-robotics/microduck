@@ -61,7 +61,21 @@ jobs:
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
       # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+      #
+      # The downloaded .debs are kept in the Actions cache: plugins-bad drags in OpenCV, VTK and
+      # ffmpeg, ~250 MB, and a slow mirror has turned that download into 20+ minutes. apt still
+      # runs as normal — it only fetches what the cache lacks, so a package updated since the
+      # cache was saved is downloaded rather than missed. The cache is never rewritten once saved;
+      # bump the key's `-vN` when the runner image moves and the mirror traffic creeps back.
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-debs-${{ runner.os }}-${{ runner.arch }}-ubuntu-26.04-v1
+      - run: |
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+          sudo chown -R "$USER" ~/apt-archives
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
@@ -271,7 +285,16 @@ jobs:
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
       # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+      # Same packages and cache entry as `check`.
+      - uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-debs-${{ runner.os }}-${{ runner.arch }}-ubuntu-26.04-v1
+      - run: |
+          mkdir -p ~/apt-archives/partial
+          sudo apt-get update
+          sudo apt-get install -y -o Dir::Cache::Archives="$HOME/apt-archives" -o APT::Keep-Downloaded-Packages=true libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+          sudo chown -R "$USER" ~/apt-archives
 
       # `xtask` is excluded because it is build tooling that never ships. It is exercised
       # by CI actually packaging a release — the `check` job runs `xtask package` — not by
