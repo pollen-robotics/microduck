@@ -128,6 +128,94 @@ pub const EXPECTED_REGISTERS: &[(&str, u8)] = &[
     ("shutdown", 52),
 ];
 
+/// `current_limit`, mA, asserted alongside [`EXPECTED_REGISTERS`] and kept apart because it is a
+/// `u16`. The XL330 ships at 1750. 1000 is what a microduck walks the same ONNX with, and what the
+/// gear-breakage bench ran ROBOTIS's impact guard firmware at; that firmware is the one that
+/// enforces it in position control, the factory's only does so in the current-based modes.
+pub const CURRENT_LIMIT_MA: u16 = 1000;
+
+/// `firmware_version` of ROBOTIS's impact guard firmwares, V3 and V4: a servo that hits something
+/// brakes and then holds softly, which is what keeps the gear teeth whole. Their settings are
+/// [`ImpactGuard`], at the same addresses on both; register 66 says what the guard is doing
+/// ([`crate::io::RobotIo::impact_guard`]).
+pub const IMPACT_GUARD_FIRMWARES: [u8; 2] = [3, IMPACT_GUARD_ENABLE_FIRMWARE];
+
+/// `firmware_version` of V4, whose guard does nothing until Impact Guard Enable (register 67, RAM)
+/// is on. Every power-up and every start of the firmware turns it off: the gear bench lost two
+/// teeth in about 17 shots to a V4 servo left that way (2026-11-06).
+pub const IMPACT_GUARD_ENABLE_FIRMWARE: u8 = 4;
+
+/// The impact guard's six settings on [`IMPACT_GUARD_FIRMWARES`], in the registers' own units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImpactGuard {
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster than this.
+    pub v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub decel: u16,
+    /// i Hold, mA: the current the hold allows after the brake, until the goal comes back past
+    /// the position.
+    pub i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `pwm_fast`. Never 0: the firmware divides
+    /// by it.
+    pub v_fast: u8,
+    /// PWM Fast, % of PWM Limit: the limit at `v_fast` and above.
+    pub pwm_fast: u8,
+}
+
+impl ImpactGuard {
+    /// What a microduck walks with: brake 20 ms on a deceleration past 400 rad/s² toward the goal
+    /// faster than 6 rad/s, no hold, and a PWM limit falling from PWM Limit at rest to 40 % at
+    /// 7 rad/s, which keeps arrivals near 7 rad/s. Found on a robot with the walking ONNX
+    /// (2026-11-05). ROBOTIS's factory values, the gear bench's (V Min 1, brake 50 ms, hold
+    /// 0.5 A, 50 % at 9 rad/s), tripped the brake on nearly every step, and the hold, which
+    /// lasts until the goal comes back past the position, softened the stance leg: the robot
+    /// kept falling. The hold stays off until the firmware can end it on its own.
+    pub const DEFAULT: Self = Self {
+        v_min: 6,
+        brake_ms: 20,
+        decel: 400,
+        i_hold_ma: 32767,
+        v_fast: 7,
+        pwm_fast: 40,
+    };
+
+    /// The factory firmware with only Current Limit: a deceleration no impact reaches, a hold
+    /// current the motor never draws, and PWM Fast at the 100 % PWM Limit this robot keeps.
+    pub const OFF: Self = Self {
+        decel: 32767,
+        i_hold_ma: 32767,
+        pwm_fast: 100,
+        ..Self::DEFAULT
+    };
+
+    /// Whether the startup check writes these settings to a servo on `firmware`. Never to one
+    /// with no guard, and [`Self::OFF`] never to V4: its switch turns the guard off, so off leaves
+    /// in place the settings that switching it back on will run.
+    pub fn written_to(self, firmware: u8) -> bool {
+        IMPACT_GUARD_FIRMWARES.contains(&firmware)
+            && !(firmware == IMPACT_GUARD_ENABLE_FIRMWARE && self == Self::OFF)
+    }
+
+    /// What V4's Impact Guard Enable should hold: 0, the factory firmware's behaviour, for
+    /// [`Self::OFF`], and 1 for anything else.
+    pub fn enable(self) -> u8 {
+        u8::from(self != Self::OFF)
+    }
+
+    /// The two EEPROM blocks the settings fill, as (address, bytes): 40–43 (V Min, Brake Time,
+    /// Deceleration `u16`) and 56–59 (i Hold `u16`, V Fast, PWM Fast).
+    pub fn blocks(self) -> [(u8, [u8; 4]); 2] {
+        let [d0, d1] = self.decel.to_le_bytes();
+        let [h0, h1] = self.i_hold_ma.to_le_bytes();
+        [
+            (40, [self.v_min, self.brake_ms, d0, d1]),
+            (56, [h0, h1, self.v_fast, self.pwm_fast]),
+        ]
+    }
+}
+
 /// `homing_offset` on the knees, in raw position counts (0.088° each, so −45°).
 ///
 /// Every other joint is at 0. The value is `microduck_runtime`'s `setup_motor_rpi.py`, the
@@ -212,6 +300,57 @@ mod tests {
         seen.sort_unstable();
         seen.windows(2)
             .for_each(|w| assert_ne!(w[0], w[1], "duplicate Dynamixel ID {}", w[0]));
+    }
+
+    /// The default must be byte for byte the setting the robot test settled on; off must be
+    /// unreachable rather than merely high, and keep V Fast off zero, which the firmware divides
+    /// by.
+    #[test]
+    fn impact_guard_default_is_the_robot_setting_and_off_never_fires() {
+        assert_eq!(
+            ImpactGuard::DEFAULT.blocks(),
+            [(40, [6, 20, 0x90, 0x01]), (56, [0xFF, 0x7F, 7, 40])]
+        );
+        let [(_, low), (_, high)] = ImpactGuard::OFF.blocks();
+        assert_eq!(u16::from_le_bytes([low[2], low[3]]), 32767, "deceleration");
+        assert_eq!(u16::from_le_bytes([high[0], high[1]]), 32767, "i hold");
+        assert_eq!(high[3], 100, "pwm fast: no taper");
+        assert_ne!(high[2], 0, "v fast");
+    }
+
+    /// `bus.impact_guard = false` has to reach V4's switch: off settings behind a switch left on
+    /// are still the guard's code path.
+    #[test]
+    fn only_off_turns_the_v4_switch_off() {
+        assert_eq!(ImpactGuard::OFF.enable(), 0);
+        assert_eq!(ImpactGuard::DEFAULT.enable(), 1);
+    }
+
+    /// V3 has no switch, so off is its settings; V4 is switched off and keeps its own.
+    #[test]
+    fn off_writes_settings_only_to_the_firmware_without_a_switch() {
+        assert!(ImpactGuard::OFF.written_to(3));
+        assert!(!ImpactGuard::OFF.written_to(IMPACT_GUARD_ENABLE_FIRMWARE));
+        assert!(ImpactGuard::DEFAULT.written_to(3));
+        assert!(ImpactGuard::DEFAULT.written_to(IMPACT_GUARD_ENABLE_FIRMWARE));
+        assert!(!ImpactGuard::DEFAULT.written_to(53));
+    }
+
+    /// Every setting lands at its own address, the two `u16`s little-endian.
+    #[test]
+    fn impact_guard_settings_fill_their_registers() {
+        let guard = ImpactGuard {
+            v_min: 2,
+            brake_ms: 30,
+            decel: 1000,
+            i_hold_ma: 800,
+            v_fast: 8,
+            pwm_fast: 70,
+        };
+        assert_eq!(
+            guard.blocks(),
+            [(40, [2, 30, 0xE8, 0x03]), (56, [0x20, 0x03, 8, 70])]
+        );
     }
 
     /// The IMU board shares the bus with the servos, so its ID must not collide with one.

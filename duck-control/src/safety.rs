@@ -211,6 +211,10 @@ impl<T: RobotIo> Safety<T> {
         self.io.servo_identity()
     }
 
+    pub fn impact_guard(&mut self) -> Result<Option<[u8; crate::model::NUM_JOINTS]>, IoError> {
+        self.io.impact_guard()
+    }
+
     pub fn fallen(&self) -> bool {
         self.fallen
     }
