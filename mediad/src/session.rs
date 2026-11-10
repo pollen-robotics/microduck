@@ -151,8 +151,8 @@ fn exempt_if_alone(call: &proto::Call, line: &str, seat: &Seat) -> Option<String
 ///
 /// **The rotation is the whole point.** Nothing on the robot rotates pixels any more — a `videoflip`
 /// in the pipeline cost the encoder its zero-copy path and the board 22 fps — so the stream a
-/// browser receives is the picture the camera took, sideways on a robot whose camera is mounted a
-/// quarter turn off. The page cannot work out by how much: a 180° mount is indistinguishable from an
+/// browser receives is the picture the camera took — sideways on the Zero 3W, whose camera is
+/// mounted a quarter turn off, upright on the beta boards. The page cannot work out by how much: a 180° mount is indistinguishable from an
 /// upright one, and even a quarter turn is only a guess from the aspect ratio. So it is told.
 ///
 /// A notification, with no id, because the page already treats an id-less line as something that

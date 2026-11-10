@@ -522,7 +522,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
 /// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
 /// reads as an empty list, and a client that does not know it ignores it.
-pub const API_VERSION: u32 = 51;
+///
+/// # v52 — laser tracking
+///
+/// [`method::ROBOT_LASER_TRACK`] switches laser tracking on or off, and [`RobotState::laser`]
+/// carries what it sees while it is on — absent otherwise, so an older client reads the frame it
+/// always did. Underneath, `robotd` subscribes to `mediad`'s local [`method::MEDIA_LASER`] on
+/// [`socket::MEDIA`]: a `mediad` older than this refuses that method, and the answer to
+/// `robot.laserTrack` says so rather than tracking nothing.
+pub const API_VERSION: u32 = 52;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -680,6 +688,17 @@ pub mod method {
     /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
     pub const MEDIA_FRAME: &str = "media.frame";
 
+    /// Look for a laser dot in the camera frames, on `mediad`'s local socket. Answered with
+    /// `null`, then a stream of [`MEDIA_LASER_DOT`] notifications for as long as the connection
+    /// stays open — closing it is how a subscriber stops the detector.
+    ///
+    /// Local-only, like [`MEDIA_FRAME`], and not a `Call`: its only client is `robotd`, which
+    /// turns a direction into a place on the floor. Params are [`super::LaserDetectParams`].
+    pub const MEDIA_LASER: &str = "media.laser";
+    /// `mediad` → subscriber: one look's answer, [`super::LaserDot`]. Sent whether or not a dot
+    /// was found, because "nothing" is what lets a tracker let go.
+    pub const MEDIA_LASER_DOT: &str = "media.laserDot";
+
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
     pub const ROLLBACK: &str = "update.rollback";
@@ -817,6 +836,15 @@ pub mod method {
     /// what the sensor said about the frame — which is the field diagnostic for this whole
     /// feature.
     pub const ROBOT_THEREMIN: &str = "robot.theremin";
+    /// Switch laser tracking on or off: a laser dot on the floor in front of the camera is
+    /// followed with the head and walked to. Discrete; send as a request, idempotent both ways.
+    ///
+    /// It shares the robot with every other driver rather than taking it: a client stick that is
+    /// deflected wins over the dot, and with no dot in sight the robot does what it was asked
+    /// to. [`ROBOT_STATE`]'s `laser` block carries what the camera sees — including the colour
+    /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
+    /// `[laser]` needs.
+    pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1214,6 +1242,8 @@ pub enum Call {
     RobotFlashlight(FlashlightParams),
     /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
     RobotTheremin(ThereminParams),
+    /// Switch laser tracking on or off. Discrete; the answer is [`LaserTrackResult`].
+    RobotLaserTrack(LaserTrackParams),
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
@@ -1417,6 +1447,7 @@ impl Call {
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+            Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1639,6 +1670,7 @@ impl Call {
             | Call::RobotSound(_)
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
@@ -1762,6 +1794,7 @@ impl Call {
             Call::RobotVetbookNote(p) => encode(p),
             Call::RobotVetbookTally(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
+            Call::RobotLaserTrack(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1857,6 +1890,7 @@ impl Call {
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+            method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -2642,6 +2676,150 @@ pub struct ThereminState {
     /// "valid" codes and died at exactly that distance, invisibly, for want of this line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor: Option<String>,
+}
+
+/// See [`method::ROBOT_LASER_TRACK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaserTrackParams {
+    /// True switches tracking on, false off. Idempotent both ways.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotLaserTrack`].
+///
+/// Refused only for what the robot knows at the door — `[laser]` will not parse, say. Whether
+/// `mediad` is answering is *not* a refusal: it may be restarting, and the tracker reconnects by
+/// itself; [`LaserTrackState::camera`] says what it is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for LaserTrackResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What laser tracking is doing, in [`RobotState`]. Absent while tracking is off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackState {
+    /// The camera side, as a line: `looking at 1–15 Hz`, or why it is not — `mediad` not answering,
+    /// no camera geometry. The first thing to read when nothing happens.
+    pub camera: String,
+    /// The newest look's answer from `mediad`, if there has been one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dot: Option<LaserDot>,
+    /// Where the dot is on the floor, in the robot's own heading frame (+x ahead, +y left),
+    /// metres — the last sighting, carried by odometry while it is remembered. `None` when there
+    /// is nothing to follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_m: Option<[f64; 2]>,
+    /// How long since the dot was last seen, milliseconds. `None` before the first sighting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// The head is following the dot this tick.
+    #[serde(default, skip_serializing_if = "not")]
+    pub head: bool,
+    /// The legs are following the dot this tick — false while a client stick is deflected, the
+    /// policy is not driving, or the robot has parked on the dot.
+    #[serde(default, skip_serializing_if = "not")]
+    pub walk: bool,
+    /// The velocity tracking asked for this tick, `[vx, vy, vyaw]` — before the loop's own
+    /// smoothing and limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twist: Option<[f64; 3]>,
+}
+
+/// [`method::MEDIA_LASER`]'s params: what counts as a laser dot, and how often to look.
+///
+/// Thresholds are in the camera's own YUV (BT.601, 0–255; chroma 128 is grey). The stream runs
+/// at its normal auto-exposure — nothing here touches the sensor — so a dot's core saturates
+/// towards white and its *rim* is where the red is: bright and red both, which is what these
+/// gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaserDetectParams {
+    /// Luma a dot pixel must reach.
+    pub y_min: u8,
+    /// Red chroma (Cr / V) a dot pixel must reach.
+    pub v_min: u8,
+    /// Blue chroma (Cb / U) a dot pixel must stay under — rejects bright whites and pinks.
+    pub u_max: u8,
+    /// Fewest pixels around the brightest hit for it to be a dot rather than noise.
+    pub min_pixels: u32,
+    /// Most pixels around the brightest hit for it to still be a dot rather than a red lamp.
+    pub max_pixels: u32,
+    /// How far around the brightest hit belongs to the same dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second with no dot in sight.
+    pub search_hz: f64,
+    /// Looks per second while a dot is being seen, and for a second after.
+    pub track_hz: f64,
+}
+
+impl Default for LaserDetectParams {
+    fn default() -> Self {
+        Self {
+            y_min: 150,
+            v_min: 165,
+            u_max: 140,
+            min_pixels: 3,
+            max_pixels: 600,
+            radius_px: 24,
+            // Measured on a face-board-v1: 3 Hz cost 3.4% of a core in mediad, and each look costs
+            // the same, so 1 Hz is about a third of that — for half a second's wait, on average,
+            // before a dot is first noticed. Tracking itself is unaffected.
+            search_hz: 1.0,
+            track_hz: 15.0,
+        }
+    }
+}
+
+/// One look's answer, the params of [`method::MEDIA_LASER_DOT`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserDot {
+    /// A dot passed every threshold. False is still a message: the tracker needs to hear it.
+    pub seen: bool,
+    /// The dot's direction as a cv2 camera ray `[x, y, 1]` (+x right, +y down, +z out of the
+    /// lens) of the camera **upright** — the board's mount turn and the lens's intrinsics already
+    /// undone, so a consumer needs nothing but the head FK. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ray: Option<[f64; 2]>,
+    /// Where the dot is in the upright picture, pixels, for a readout. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<[f64; 2]>,
+    /// The upright picture's size, `[width, height]` — what `px` and `candidate_px` are in, so a
+    /// display can scale them without knowing the camera or its mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where a candidate that passed the colour thresholds but was then rejected by size sat, in
+    /// the upright picture's pixels — what an overlay draws to show a near miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
+    /// Pixels counted in the dot (sampled, so a fraction of the real area), or 0.
+    pub pixels: u32,
+    /// The best candidate's colour, `[Y, U, V]` — the brightest red-leaning pixel in the frame,
+    /// reported **whether or not it passed**. Point the laser, read this, set the thresholds a
+    /// little below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_yuv: Option<[u8; 3]>,
+    /// Why a candidate was rejected, when there was one and it was: `"too small"`, `"too big"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// The rate this look was taken at, looks per second.
+    pub hz: f64,
+    /// Scan time for this look, milliseconds.
+    pub took_ms: f64,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -4330,6 +4508,10 @@ pub struct RobotState {
     /// instrument is down — see [`ThereminState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theremin: Option<ThereminState>,
+    /// What laser tracking sees and does, while it is switched on. Absent otherwise — see
+    /// [`LaserTrackState`]. (v52)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub laser: Option<LaserTrackState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6862,6 +7044,43 @@ mod tests {
     /// a v12 client must see byte-for-byte the frame it saw before, and a v13 one must find
     /// the field where the docs say it is.
     #[test]
+    fn the_laser_block_is_absent_until_tracking_is_on() {
+        let mut state = a_state();
+        let off = serde_json::to_string(&state).unwrap();
+        assert!(!off.contains("laser"), "{off}");
+
+        state.laser = Some(LaserTrackState {
+            camera: "looking at 1–15 Hz".into(),
+            dot: Some(LaserDot {
+                seen: true,
+                ray: Some([0.1, 0.3]),
+                px: Some([400.0, 900.0]),
+                pixels: 12,
+                peak_yuv: Some([210, 110, 190]),
+                ..Default::default()
+            }),
+            target_m: Some([0.8, -0.1]),
+            walk: true,
+            ..Default::default()
+        });
+        let on = serde_json::to_string(&state).unwrap();
+        let back: RobotState = serde_json::from_str(&on).unwrap();
+        assert_eq!(back.laser, state.laser);
+        // Tracking that is not driving the head says nothing about it, rather than `false`.
+        let block = serde_json::to_value(&state.laser).unwrap();
+        assert!(block.get("head").is_none(), "{block}");
+    }
+
+    /// `media.laser` with no params is the defaults, and a misspelt threshold is refused rather
+    /// than silently ignored — the thresholds are the whole of tuning this.
+    #[test]
+    fn laser_detect_params_default_and_refuse_unknown_keys() {
+        let empty: LaserDetectParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, LaserDetectParams::default());
+        assert!(serde_json::from_str::<LaserDetectParams>(r#"{"y_mn": 10}"#).is_err());
+    }
+
+    #[test]
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = a_state();
         let down = serde_json::to_string(&state).unwrap();
@@ -7009,6 +7228,7 @@ mod tests {
             currents_ma: Vec::new(),
             odom: OdomState::default(),
             theremin: None,
+            laser: None,
             chorale: None,
             t_ns: 0,
             imu: None,
