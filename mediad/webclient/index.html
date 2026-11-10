@@ -141,8 +141,9 @@
   .row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; }
   .hint { margin: .5rem 0 0; font-size: 12px; opacity: .6; }
 
-  /* 16/9 is the placeholder, held until the robot says what the video is. The camera is mounted a
-     quarter turn off and nothing on the robot rotates the picture — so this does, on the GPU.
+  /* 16/9 is the placeholder, held until the robot says what the video is. The Zero 3W's camera is
+     mounted a quarter turn off (the beta boards' is upright) and nothing on the robot rotates the
+     picture — so this does, on the GPU, by whatever angle the robot says.
 
      **The wrapper is the only box in flow.** A rotated element still takes up its *pre-transform*
      box, so the turned video — landscape, inside a portrait wrapper — used to be the widest thing in
@@ -166,6 +167,11 @@
   #videobox > svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   #boxes rect { fill: none; stroke: #00e676; stroke-width: 2; vector-effect: non-scaling-stroke; }
   #boxes text { fill: #00e676; font: 600 11px ui-monospace, monospace; }
+  /* The laser dot: solid when it passed, dashed amber when a candidate was rejected by size. */
+  #laser circle, #laser line { fill: none; stroke: #ff1744; stroke-width: 2; vector-effect: non-scaling-stroke; }
+  #laser .miss { stroke: #ffab00; stroke-dasharray: 4 3; }
+  #laser text { fill: #ff1744; font: 600 11px ui-monospace, monospace; }
+  #laser text.miss { fill: #ffab00; stroke: none; }
   .stats { margin-top: .5rem; font: 12px/1.4 ui-monospace, monospace; gap: .75rem; }
   .stats b { font-weight: 600; opacity: .55; font-size: 11px; text-transform: uppercase; }
 
@@ -230,10 +236,14 @@
       <!-- The boxes, on an SVG whose viewBox is the *upright frame's* own pixels — so the browser
            does the scaling, and neither a resize nor a change of mount rotation needs any code. -->
       <svg id="boxes" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <!-- The laser detector's dot, the same way: the upright frame's pixels, scaled by the browser.
+           Only while laser tracking is on, since that is the only time anything looks. -->
+      <svg id="laser" preserveAspectRatio="none" aria-hidden="true"></svg>
     </div>
     <div class="row stats">
       <span><b>bitrate</b> <span id="bitrate">–</span></span>
       <span><b>ducks</b> <span id="detections">–</span></span>
+      <span><b>laser</b> <span id="laserdot">–</span></span>
       <span><b>fps</b> <span id="fps">–</span></span>
       <span><b>loss</b> <span id="loss">–</span></span>
       <span><b>rtt</b> <span id="rtt">–</span></span>
@@ -1310,6 +1320,8 @@ function onControl(data) {
     // The duck detector, a couple of times a second. Not logged: it streams, and a line per
     // sighting would bury everything a person opened the drawer to read.
     if (msg.method === "media.detections") { onDetections(msg.params); return; }
+    // The laser detector, 1–15 times a second while laser tracking is on. Not logged either.
+    if (msg.method === "media.laserDot") { onLaserDot(msg.params); return; }
     log("in", "control ←", data.slice(0, 400));
     return;
   }
@@ -1668,7 +1680,9 @@ const stopLooking = () => { looking = false; lookAt = null; $("gaze").hidden = t
 video.addEventListener("pointerup", stopLooking);
 video.addEventListener("pointercancel", stopLooking);
 
-// ── the camera is mounted sideways, and the robot does not rotate the pixels ───────────────────
+// ── the camera may be mounted sideways, and the robot does not rotate the pixels ───────────────
+//
+// A quarter turn on the Zero 3W, none on the beta boards: the robot says which in `media.video`.
 //
 // Rotating in the pipeline cost 145% of a core: `videoflip`'s buffers are ones the SoC's 2D engine
 // refuses, so the encoder converted every frame in software — 97 °C, the CPU throttled to 408 MHz,
@@ -1756,6 +1770,64 @@ function onDetections({ width, height, boxes, took_ms }) {
       ? `${boxes.length} (${took_ms.toFixed(0)} ms)`
       : `none (${took_ms.toFixed(0)} ms)`;
   }
+}
+
+// ── the laser dot ──────────────────────────────────────────────────────────────
+//
+// For tuning `[laser]`: what passed is a red ring with a crosshair, a candidate that was bright and
+// red enough but the wrong size is a dashed amber ring with the reason, and the stats row carries
+// the colour of the best candidate whether it passed or not — the number the thresholds are set
+// against. Coordinates are in the upright frame, like the duck boxes.
+let laserStale = null;
+
+// Looks come at 1 Hz at the slowest (by default), so two and a half seconds of silence is tracking
+// switched off, and the ring must go rather than stay painted where the dot last was.
+const LASER_TIMEOUT_MS = 2500;
+
+function clearLaser(reason) {
+  $("laser").replaceChildren();
+  $("laserdot").textContent = reason;
+}
+
+function svgEl(name, attrs, cls) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (cls) el.setAttribute("class", cls);
+  return el;
+}
+
+function onLaserDot(dot) {
+  clearTimeout(laserStale);
+  laserStale = setTimeout(() => clearLaser("–"), LASER_TIMEOUT_MS);
+
+  const svg = $("laser");
+  svg.replaceChildren();
+  if (dot.frame) {
+    const [w, h] = dot.frame;
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    const r = Math.max(w, h) / 40;
+    // A ring rather than a filled dot: the point is to see the laser *inside* it.
+    const ring = (x, y, cls, label) => {
+      svg.appendChild(svgEl("circle", { cx: x, cy: y, r }, cls));
+      if (!cls) {
+        svg.appendChild(svgEl("line", { x1: x - 2 * r, y1: y, x2: x - r, y2: y }));
+        svg.appendChild(svgEl("line", { x1: x + r, y1: y, x2: x + 2 * r, y2: y }));
+        svg.appendChild(svgEl("line", { x1: x, y1: y - 2 * r, x2: x, y2: y - r }));
+        svg.appendChild(svgEl("line", { x1: x, y1: y + r, x2: x, y2: y + 2 * r }));
+      }
+      const text = svgEl("text", { x: x + r + 4, y: y > 16 ? y - r : y + r + 12 }, cls);
+      text.textContent = label;
+      svg.appendChild(text);
+    };
+    if (dot.seen && dot.px) ring(dot.px[0], dot.px[1], null, `laser n=${dot.pixels}`);
+    else if (dot.candidate_px) {
+      ring(dot.candidate_px[0], dot.candidate_px[1], "miss", `${dot.rejected} n=${dot.pixels}`);
+    }
+  }
+
+  const peak = dot.peak_yuv ? ` · peak Y${dot.peak_yuv[0]} U${dot.peak_yuv[1]} V${dot.peak_yuv[2]}` : "";
+  const what = dot.seen ? `dot n=${dot.pixels}` : dot.rejected ? `${dot.rejected} n=${dot.pixels}` : "none";
+  $("laserdot").textContent = `${what}${peak} (${dot.hz.toFixed(0)} Hz, ${dot.took_ms.toFixed(1)} ms)`;
 }
 
 function aim(event) {

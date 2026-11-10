@@ -24,6 +24,7 @@ mod emotion;
 mod head_imu;
 mod idle_head;
 mod intents;
+mod laser;
 mod leds;
 mod params;
 mod pickup;
@@ -106,6 +107,13 @@ const CENSUS_INTERVAL: Duration = Duration::from_secs(5);
 /// A vowel is a step — `ah` opens the mouth to 0.90 and `mm` to 0.02 — and a servo asked to jump
 /// between them on a 20 ms tick twitches rather than sings. This is roughly how fast a jaw moves.
 const CHORALE_MOUTH_TAU_S: f64 = 0.09;
+
+/// How recently a client must have sent a non-zero head pose for it to win over laser tracking.
+///
+/// The head slot is not a stream: `robot.look` sets it once and it stays. A client that set one a
+/// minute ago is not steering the head now, and the dot should have it; one whose stick is pushed
+/// re-sends every tick, well inside this.
+const LASER_CLIENT_HEAD: Duration = Duration::from_secs(1);
 
 /// How far a subscriber may fall behind before it starts losing frames.
 ///
@@ -2539,6 +2547,10 @@ async fn control_loop<T: RobotIo>(
     // reason.
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
+    // Laser tracking. The reader holds no connection to `mediad` while tracking is off, so on a
+    // duck that never switches it on this is one sleeping thread. `[laser]` is re-read by that
+    // thread while it is on — tuning it must not need a restart that drops the robot.
+    let mut laser = laser::Laser::spawn(params.laser.clone(), params_path.clone());
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
@@ -2671,6 +2683,51 @@ async fn control_loop<T: RobotIo>(
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
         let mut snapshot = intents.snapshot();
+
+        // Laser tracking takes what nobody else is asking for. Before the emotion, so a playing
+        // emotion still has the robot; and each half only when no client wants it: a fresh,
+        // non-zero twist is somebody driving, and a pad's stick always wins over a dot on the
+        // floor. A centred stick reads as zero, so the dot has the legs back the moment it is let
+        // go — and with no dot in sight `tick` asks for nothing, and the client's command stands.
+        if let Some(active) = intents.take_laser_request() {
+            laser.set_active(active);
+        }
+        let mut laser_state = None;
+        if let Some(sample) = sensors.as_ref() {
+            let pose = laser::Pose {
+                head: mapping::head_joints_of(&sample.positions),
+                imu: sample.imu.quat,
+                odom: odometry.position(),
+                yaw: odometry.yaw(),
+            };
+            if let Some(drive) = laser.tick(&pose, snapshot.command.head[0], tick_start) {
+                let mut block = drive.state;
+                let client_twist = snapshot.twist_age
+                    < Duration::from_millis(params.safety.deadman_ms)
+                    && snapshot.command.twist.iter().any(|v| *v != 0.0);
+                let client_head = snapshot.head_age < LASER_CLIENT_HEAD
+                    && snapshot.command.head.iter().any(|v| v.abs() > 1e-3);
+                if let Some(head) = drive.head
+                    && !client_head
+                {
+                    snapshot.command.head = head;
+                    // Somebody is steering the head, so the idle look-around keeps out.
+                    snapshot.head_age = Duration::ZERO;
+                    block.head = true;
+                }
+                if let Some(twist) = drive.twist
+                    && !client_twist
+                {
+                    snapshot.command.twist = twist;
+                    // A live driver for the deadman's purposes: the dot is as fresh as `[laser]
+                    // memory_ms` allows, and the reader drops it the moment `mediad` goes quiet.
+                    snapshot.twist_age = Duration::ZERO;
+                    block.walk = true;
+                }
+                laser_state = Some(block);
+            }
+        }
+
         // An emotion in progress has the head, the body and the beak, and holds the robot still.
         if let Some(p) = playing.as_ref() {
             match p.frame(tick_start) {
@@ -4208,6 +4265,7 @@ async fn control_loop<T: RobotIo>(
                     yaw: odometry.yaw(),
                 },
                 theremin: theremin_state.clone(),
+                laser: laser_state.clone(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -5547,6 +5605,14 @@ fn dispatch(
                 }
             };
             proto::Response::ok(Some(id), &result)
+        }
+
+        // Laser tracking on or off. Nothing to refuse at the door: whether `mediad` answers is a
+        // circumstance that changes under a running daemon, and the reader says what it is
+        // waiting for in `robot.state`'s laser block rather than here.
+        proto::Call::RobotLaserTrack(p) => {
+            intents.request_laser(p.active);
+            proto::Response::ok(Some(id), &proto::LaserTrackResult::default())
         }
 
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
