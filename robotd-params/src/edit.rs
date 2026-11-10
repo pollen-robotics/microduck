@@ -1989,6 +1989,7 @@ mod tests {
                 "idle",
                 "pickup",
                 "theremin",
+                "laser",
                 "head_imu",
                 "audio",
                 "emotions",

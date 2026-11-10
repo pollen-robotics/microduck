@@ -160,6 +160,9 @@ pub struct Intents {
     power: AtomicU8,
     /// A pending pick-up or put-down for the ToF theremin. See [`THEREMIN_NONE`].
     theremin: AtomicU8,
+    /// A pending laser-tracking switch, with the theremin's encoding: an edge, so the loop's own
+    /// `[laser] enabled` at boot is not overridden by a level nobody wrote.
+    laser: AtomicU8,
     /// The same, for the chorale.
     chorale: AtomicU8,
     /// The piece pinned by the pending chorale request, 0 for none. Written before the
@@ -288,6 +291,7 @@ impl Intents {
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
+            laser: AtomicU8::new(THEREMIN_NONE),
             chorale: AtomicU8::new(THEREMIN_NONE),
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
@@ -592,6 +596,22 @@ impl Intents {
     /// The pending theremin request, cleared by the read.
     pub fn take_theremin_request(&self) -> Option<bool> {
         match self.theremin.swap(THEREMIN_NONE, Ordering::Relaxed) {
+            THEREMIN_UP => Some(true),
+            THEREMIN_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
+    pub fn request_laser(&self, active: bool) {
+        self.laser.store(
+            if active { THEREMIN_UP } else { THEREMIN_DOWN },
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The pending laser-tracking switch, cleared by the read.
+    pub fn take_laser_request(&self) -> Option<bool> {
+        match self.laser.swap(THEREMIN_NONE, Ordering::Relaxed) {
             THEREMIN_UP => Some(true),
             THEREMIN_DOWN => Some(false),
             _ => None,

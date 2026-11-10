@@ -300,6 +300,8 @@ fn permits(call: &proto::Call) -> bool {
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
         RobotTheremin(_) | RobotChorale(_) => false,
+        // Motor control by another name: the dot walks the robot, and the radio is not a control transport.
+        RobotLaserTrack(_) => false,
         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
         RobotFlashlight(_) => false,
 

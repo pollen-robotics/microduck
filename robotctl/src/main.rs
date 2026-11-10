@@ -242,6 +242,21 @@ enum Namespace {
         off: bool,
     },
 
+    /// Follow a laser dot: the head looks at it and the robot walks to it.
+    ///
+    /// `on` and `off` switch it, and it stays as set — a pad still drives normally, and wins over
+    /// the dot whenever a stick is pushed. With no argument, or after `on`, this watches what the
+    /// camera sees until Ctrl-C (which leaves tracking as it is).
+    ///
+    /// The readout is how `[laser]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// colour of the reddest bright thing in the picture whether it passed or not — point the
+    /// laser, read it, and set y_min / v_min a little below and u_max a little above.
+    LaserTrack {
+        /// `on` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
     ///
     /// Every key the daemon knows, feature switches first, current value against default, one
@@ -807,6 +822,120 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         println!("theremin put down");
     }
     Ok(())
+}
+
+/// `robotctl laser-track` — switch laser tracking, and watch what the camera makes of the dot.
+///
+/// Unlike the theremin, Ctrl-C leaves the mode as it is: tracking is meant to be left on while
+/// the robot is driven, and this view is for tuning, not for holding the mode up.
+fn run_laser_track(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let active = state == "on";
+        let outcome: proto::LaserTrackResult = decode(&result_of(client.call(
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active }),
+        )?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        if !active {
+            println!("laser tracking off");
+            return Ok(());
+        }
+        println!("laser tracking on");
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (tracking stays as it is)");
+
+    let mut line = String::new();
+    let mut said_off = false;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(laser) = state.laser else {
+            if !said_off {
+                print!("\r\x1b[K  laser tracking is off — `robotctl laser-track on`");
+                let _ = std::io::stdout().flush();
+                said_off = true;
+            }
+            continue;
+        };
+        said_off = false;
+        print!("\r\x1b[K  {}", laser_line(&laser));
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_laser_track`]: the dot, the colour it was judged on, where it is,
+/// and what the robot is doing about it.
+fn laser_line(laser: &proto::LaserTrackState) -> String {
+    let dot = match &laser.dot {
+        None => format!("{:<26}", laser.camera),
+        Some(dot) => {
+            let seen = match (dot.seen, dot.px, &dot.rejected) {
+                (true, Some([x, y]), _) => format!("DOT ({x:4.0},{y:4.0}) n={:<3}", dot.pixels),
+                (_, _, Some(why)) => format!("{why} (n={})", dot.pixels),
+                _ => "no dot".to_owned(),
+            };
+            let peak = dot
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", dot.hz)
+        }
+    };
+    let target = match laser.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            laser
+                .age_ms
+                .filter(|age| *age > 150)
+                .map(|age| format!(" ({age} ms ago)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let doing = match (laser.head, laser.walk, laser.twist) {
+        (_, true, Some([vx, _, vyaw])) => format!("walk {vx:.2} m/s {vyaw:+.2} rad/s"),
+        (true, false, _) => "looking".to_owned(),
+        (false, false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!("{dot}  {target:<24} {doing}")
 }
 
 /// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
@@ -5517,6 +5646,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
+        }
+        Namespace::LaserTrack { state } => {
+            return run_laser_track(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
