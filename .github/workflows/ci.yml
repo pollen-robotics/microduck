@@ -61,7 +61,14 @@ jobs:
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
       # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+      #
+      # Restored from the Actions cache rather than installed from the Ubuntu mirror: plugins-bad
+      # drags in OpenCV, VTK and ffmpeg, ~250 MB, and a slow mirror has turned that download into
+      # 20+ minutes. The key does not follow the runner image — bump `version` when it moves.
+      - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+          version: ubuntu-26.04-v1
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
@@ -271,7 +278,11 @@ jobs:
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
       # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
-      - run: sudo apt-get update && sudo apt-get install -y libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+      # Same packages and cache entry as `check`.
+      - uses: awalsh128/cache-apt-pkgs-action@v1.6.3
+        with:
+          packages: libudev-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+          version: ubuntu-26.04-v1
 
       # `xtask` is excluded because it is build tooling that never ships. It is exercised
       # by CI actually packaging a release — the `check` job runs `xtask package` — not by
