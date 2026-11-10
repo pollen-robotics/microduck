@@ -113,11 +113,14 @@ and `loop.hz` and `loop.missed` on the same line say whether the loop kept its r
 names any servo on neither in the journal once a start, and sets every servo's Current Limit to
 1000 mA, at the next start with torque off if the robot was standing. V4 hides the guard behind
 Impact Guard Enable (register 67), which every power-up turns off: `robotd` sets it to
-`bus.impact_guard` with every torque on, so a V4 servo is guarded from the first Start.
+`bus.impact_guard` with every torque on, so with the guard on a V4 servo is guarded from the
+first Start.
 
-`bus.impact_guard` in `sudo robotctl configure` switches every guard servo between the guard (on,
-the default) and settings that never fire (off): the factory firmware with only Current Limit, to
-compare the two on the same robot. On writes the six `bus.impact_guard_*` rows beside it, which
+`bus.impact_guard` in `sudo robotctl configure` switches every guard servo between the guard (on)
+and settings that never fire (off, the default): the factory firmware with only Current Limit, to
+compare the two on the same robot. It is off until it is understood why the stress test robot on
+it, cream-dvt-antoine, fell on its own far more often than any other (2026-11-09): about half its
+falls, against 8-14 % elsewhere. On writes the six `bus.impact_guard_*` rows beside it, which
 default to setting R below: V Min (rad/s), Brake Time (ms), Deceleration (rad/s²), i Hold (mA),
 V Fast (rad/s) and PWM Fast (%). Changing them is how to look for another guard; a start on
 anything but the defaults names them in the journal. They are written when `robotd` starts
@@ -159,11 +162,13 @@ and the hold then softens the stance leg; a hold reads about half its setting in
 So the hold stays off until the firmware can end it on its own (after 100-150 ms, or once the servo
 is still). The taper costs nothing up to 40 % from 7 rad/s, which keeps arrivals near 7 rad/s
 (8.5 guard off). 30 % from 7 felt slightly less steady, so R is one notch inside that edge. R held
-over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is the default;
-a robot that should run ROBOTIS's factory values instead takes, in `/var/lib/robot/robotd.toml`:
+over 13 minutes of walking and 32 pushes, its battery going from 7.7 to 7.5 V. R is what
+`impact_guard = true` writes; a robot that should run ROBOTIS's factory values instead takes, in
+`/var/lib/robot/robotd.toml`:
 
 ```toml
 [bus]
+impact_guard = true
 impact_guard_v_min = 1
 impact_guard_brake_ms = 50
 impact_guard_i_hold_ma = 500

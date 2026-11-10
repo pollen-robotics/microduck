@@ -316,8 +316,10 @@ servo is in. That is a transaction of its own (~1 ms), so it is read only on tic
 same with or without it — and only from a robot where at least one servo runs that firmware. The
 firmware is read once a start with the vet book's identity read, and every servo on another one is
 named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
-(40–43 and 56–59), asserted by the same startup check as the registers above: the six
-`bus.impact_guard_*` settings, by default what a microduck walks with (a short brake on fast
+(40–43 and 56–59), asserted by the same startup check as the registers above. `bus.impact_guard`
+is off by default, until it is understood why the stress test robot on it fell on its own far more
+often than any other (2026-11-09); on, it writes the six `bus.impact_guard_*` settings, by default
+what a microduck walks with (a short brake on fast
 arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
 with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
 draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard

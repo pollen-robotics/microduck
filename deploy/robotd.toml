@@ -57,7 +57,9 @@ port = "/dev/ttyS2"
 # robotd writes them to every V3 and V4 servo when it starts with torque off; a robot standing
 # at the restart gets them at the next start. V4 also has an on/off switch that every power-up
 # turns off, and robotd sets it to this value with every torque on. Needs a robotd restart.
-# impact_guard = true
+# OFF by default until it is understood why the stress test robot on it fell on its own far
+# more often than any other (2026-11-09).
+# impact_guard = false
 
 # What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's
 # factory values, the gear bench's (V Min 1, brake 50, hold 500 mA, 50 % at 9 rad/s), tripped

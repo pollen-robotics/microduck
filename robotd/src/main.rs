@@ -1655,7 +1655,7 @@ fn open_bus(
     let guard = impact_guard(bus);
     io.set_impact_guard(guard);
     if !bus.impact_guard && loud {
-        tracing::warn!("bus.impact_guard is off; guard servos run as the factory firmware");
+        tracing::info!("bus.impact_guard is off; guard servos run as the factory firmware");
     } else if guard != duck_control::model::ImpactGuard::DEFAULT && loud {
         // Said once a start so a recording can be matched to the settings it ran on.
         tracing::warn!(?guard, "bus.impact_guard_* differ from the defaults");
@@ -8213,12 +8213,14 @@ mod tests {
         io
     }
 
-    /// An untouched `[bus]` is setting R, `impact_guard = false` is off whatever the six settings
-    /// say, and a retuned one is written as asked.
+    /// An untouched `[bus]` is off, `impact_guard = true` is setting R, a retuned one is written
+    /// as asked, and `impact_guard = false` is off whatever the six settings say.
     #[test]
     fn bus_params_pick_the_impact_guard() {
         use duck_control::model::ImpactGuard;
         let mut bus = params::Bus::default();
+        assert_eq!(impact_guard(&bus), ImpactGuard::OFF);
+        bus.impact_guard = true;
         assert_eq!(impact_guard(&bus), ImpactGuard::DEFAULT);
         bus.impact_guard_decel = 1000;
         bus.impact_guard_i_hold_ma = 800;

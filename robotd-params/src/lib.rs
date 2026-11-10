@@ -2720,11 +2720,13 @@ pub struct Bus {
     pub fast_sync_read: bool,
     /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
     /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
-    /// broken gear teeth. Off leaves the factory firmware with only Current Limit, the comparison
-    /// a test on robots needs: settings that never fire on V3, the switch on V4, which keeps the
-    /// settings it has. On writes the six `impact_guard_*` settings below to every V3 and V4 servo
-    /// at startup with torque off, and V4's Impact Guard Enable follows this with every torque
-    /// on; servos on any other firmware have no guard to set. Their defaults are what a microduck walks with:
+    /// broken gear teeth. **Off by default** until it is understood why a stress test robot on it
+    /// fell on its own far more often than any other (2026-11-09); an update that turns this on is
+    /// how robots get it. Off leaves the factory firmware with only Current Limit: settings that
+    /// never fire on V3, the switch on V4, which keeps the settings it has. On writes the six
+    /// `impact_guard_*` settings below to every V3 and V4 servo at startup with torque off, and
+    /// V4's Impact Guard Enable follows this with every torque on; servos on any other firmware
+    /// have no guard to set. Their defaults are what a microduck walks with:
     /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
     /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
     /// test looks for a guard that keeps the gears whole and still lets the policy walk.
@@ -2859,7 +2861,7 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
-            impact_guard: true,
+            impact_guard: false,
             impact_guard_v_min: 6,
             impact_guard_brake_ms: 20,
             impact_guard_decel: 400,
