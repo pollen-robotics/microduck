@@ -49,8 +49,12 @@ replace it. [`robotd_params::label`](../../robotd-params/src/label.rs) owns the 
 
 ```text
 offset 0    18 ASCII digits            label serial: SKU (9) + year (2) + week (2) + unit (5)
-offset 18   md1:<first name>:<64 hex>  setup code, ended by a NUL or blank (0xFF) byte
+offset 18   :                          separator
+offset 19   md1:<first name>:<64 hex>  setup code, ended by a NUL or blank (0xFF) byte
 ```
+
+The whole line, `<label serial>:md1:<first name>:<64 hex>` (97 characters), is also the QR
+printed on the robot.
 
 `md1` is format 1 of a microduck setup code. The first name is the robot's `duck-xxxx` default name,
 `duck-` and the first four hex characters of the SHA-256 of its SoC serial
@@ -69,9 +73,9 @@ offset 18   md1:<first name>:<64 hex>  setup code, ended by a NUL or blank (0xFF
    **random, not derived from the serial, the first name or anything else printed on the robot**:
    the printed QR is what proves somebody has the robot in hand, and a derivable key would let
    anyone compute it. Keep it out of command arguments, shell tracing, CI output and logs.
-4. **Program the EEPROM** with the external programmer: the label serial from offset 0 and
-   `md1:<first name>:<64 hex>` from offset 18, exactly as above.
-5. **Print the QR from the same string.** Render it locally, never with a public QR-generation
+4. **Program the EEPROM** with the external programmer: the label serial from offset 0, `:` at
+   offset 18 and `md1:<first name>:<64 hex>` from offset 19, exactly as above.
+5. **Print the QR from the same line**, bytes 0 to 96 of the EEPROM. Render it locally, never with a public QR-generation
    website, and print the first name beside it. Treat the QR, render files and printer spool as
    secrets and remove temporary copies. Decide label placement and reprint handling before
    production.

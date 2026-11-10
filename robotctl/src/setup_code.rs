@@ -147,13 +147,19 @@ pub fn show() -> Result<(), Failure> {
             ),
         ));
     };
-    let text = code.text();
-    let modules = qr_modules(&text)
+    // The whole line, as printed on the robot: label serial, separator, code. A dev board with no
+    // label serial in its EEPROM shows the code alone; the app reads both.
+    let serial = label::read()
+        .ok()
+        .flatten()
+        .and_then(|raw| label::label_serial_in(&raw));
+    let line = label::qr_line(serial.as_deref(), &code);
+    let modules = qr_modules(&line)
         .ok_or_else(|| Failure::new(exit::FAILED, "cannot encode the QR".to_owned()))?;
     print!("{}", terminal_qr(&modules));
     println!("robot   {}", code.id);
     println!("from    {}", source.describe());
-    println!("code    {text}");
+    println!("code    {line}");
     println!("Anyone who sees this code can control this robot.");
     Ok(())
 }
@@ -324,10 +330,10 @@ fn is_mount_point(path: &Path) -> bool {
 
 /// The modules of `text`'s QR, `true` for dark, with a two-module quiet zone.
 ///
-/// **Error correction L**, which keeps every setup code at version 4: `md1:duck-xxxx:` and 64 hex
-/// characters is 78 bytes, exactly what 4-L holds. 33 modules and the quiet zone draw 74 columns
-/// wide (see [`terminal_qr`]), inside an 80-column terminal; level M needs version 5 and 82. A
-/// terminal is a clean, flat source, which is what the lower correction level gives up nothing
+/// **Error correction L**, the smallest code for a given text: the full line — 18 digits, `:`,
+/// `md1:duck-xxxx:` and 64 hex characters, 97 in all — is version 5 at worst, 37 modules and the
+/// quiet zone drawing 82 columns wide (see [`terminal_qr`]); level M would need version 6 and 90.
+/// A terminal is a clean, flat source, which is what the lower correction level gives up nothing
 /// on.
 fn qr_modules(text: &str) -> Option<Vec<Vec<bool>>> {
     let code =
@@ -447,12 +453,25 @@ mod tests {
     }
 
     #[test]
-    fn a_setup_code_draws_one_row_per_module_inside_eighty_columns() {
-        // Runs of digits in the hex encode more compactly, so the size depends on the key. A key
-        // with none is the largest: version 4, 33 modules, and the quiet zone on both sides.
-        let worst = qr_modules(&code("duck-ccf2", &"ab".repeat(32))).unwrap();
-        assert_eq!(worst.len(), 33 + 4);
-        for modules in [worst, qr_modules(&code("duck-ccf2", KEY)).unwrap()] {
+    fn a_full_line_draws_one_row_per_module_inside_eighty_two_columns() {
+        let line = |key: &str| {
+            label::qr_line(
+                Some("202004743264300098"),
+                &SetupCode {
+                    id: "duck-ccf2".to_owned(),
+                    key: key.to_owned(),
+                },
+            )
+        };
+        // Runs of digits encode more compactly, so the size depends on the key. A key with none is
+        // the largest: version 5, 37 modules, and the quiet zone on both sides.
+        let worst = qr_modules(&line(&"ab".repeat(32))).unwrap();
+        assert_eq!(worst.len(), 37 + 4);
+        for modules in [
+            worst,
+            qr_modules(&line(KEY)).unwrap(),
+            qr_modules(&code("duck-ccf2", KEY)).unwrap(),
+        ] {
             let text = terminal_qr(&modules);
             assert_eq!(text.lines().count(), modules.len());
             let widest = text
@@ -460,7 +479,7 @@ mod tests {
                 .map(|line| line.matches("  ").count() * 2)
                 .max()
                 .unwrap();
-            assert!(widest <= 80, "{widest} columns");
+            assert!(widest <= 82, "{widest} columns");
         }
     }
 }

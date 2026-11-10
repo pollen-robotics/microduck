@@ -41,7 +41,7 @@ pub use robotd_params::label::EEPROM_PATH as LABEL_EEPROM_PATH;
 
 /// How many decimal digits the factory writes: SKU (9) + year (2) + week (2) + unit (5), e.g.
 /// `202004741` `26` `40` `00001`, which is also the serial printed on the label.
-const LABEL_SERIAL_DIGITS: usize = robotd_params::label::SETUP_CODE_OFFSET;
+const LABEL_SERIAL_DIGITS: usize = robotd_params::label::LABEL_SERIAL_LEN;
 
 /// The serial printed on the robot's label, as the factory wrote it into the ID EEPROM.
 ///
