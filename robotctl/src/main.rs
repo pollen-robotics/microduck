@@ -532,8 +532,9 @@ enum SystemCommand {
     },
     /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
     ///
-    /// Needs root: the key is root's. Without a subcommand it only shows; it never generates a
-    /// key, which is the provisioning station's job (`factory-provisioning.md`).
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
     SetupCode {
         #[command(subcommand)]
         action: Option<SetupCodeAction>,
@@ -559,6 +560,11 @@ enum SetupCodeAction {
         #[arg(long)]
         force: bool,
     },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3412,6 +3418,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
         return match action {
             None => setup_code::show(),
             Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
         };
     }
     // Asked before connecting, so a robot is not disturbed by a command the operator then

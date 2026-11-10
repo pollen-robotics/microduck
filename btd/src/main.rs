@@ -39,10 +39,13 @@ struct Args {
     #[arg(long, hide = true, conflicts_with = "require_pairing")]
     insecure_no_pairing: bool,
 
-    /// Development-only per-robot 32-byte key as 64 hex characters in a credential file.
+    /// The robot's 32-byte setup-code key, as 64 hex characters in a file. Turns secure mode on.
     ///
-    /// The id bound into the handshake is the robot's first name, derived from the SoC serial —
-    /// not a flag, so it cannot drift from the one `robotctl system setup-code` prints.
+    /// Without it, the key systemd imported as the `ble-psk` credential is used when there is one:
+    /// `robotctl system setup-code export` leaves it from the ID EEPROM (or a dev board's
+    /// installed key) before this starts, so secure mode follows the robot with no flag. The id
+    /// bound into the handshake is the robot's first name, derived from the SoC serial — not a
+    /// flag, so it cannot drift from the one the QR carries.
     #[arg(long, conflicts_with = "insecure_no_pairing")]
     secure_psk_file: Option<PathBuf>,
 
@@ -107,7 +110,12 @@ async fn main() -> ExitCode {
     };
 
     let require_pairing = args.require_pairing || !args.insecure_no_pairing;
-    let secure = match args.secure_psk_file {
+    // `--insecure-no-pairing` is a bench without the robot's own security, so an imported key does
+    // not turn secure mode on behind its back.
+    let psk_file = args
+        .secure_psk_file
+        .or_else(|| (!args.insecure_no_pairing).then(imported_psk).flatten());
+    let secure = match psk_file {
         // The id is the robot's first name, the same one `robotctl system setup-code` prints into
         // the QR. A board with no SoC serial has no first name, and refusing beats guessing an id
         // that no printed code would carry.
@@ -141,6 +149,12 @@ async fn main() -> ExitCode {
     }
 
     run(sockets, name, require_pairing, secure).await
+}
+
+/// The setup-code key systemd imported for this service (`ImportCredential=ble-psk`), if any.
+fn imported_psk() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("CREDENTIALS_DIRECTORY")?).join("ble-psk");
+    path.is_file().then_some(path)
 }
 
 #[cfg(target_os = "linux")]

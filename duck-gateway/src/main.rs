@@ -1,8 +1,12 @@
-//! Authenticated local media gateway for development.
+//! Authenticated local media gateway.
 //!
 //! `mediad` stays on loopback. A remote phone must prove the per-robot secret through Noise
 //! before this process opens a connection to mediad. No WebSocket or robot command is parsed
 //! here; the tunnel only moves authenticated bytes.
+//!
+//! Enabled on every robot, and only serves one with a setup code: the key comes from the `ble-psk`
+//! credential `robotctl system setup-code export` leaves before this starts. Without one there is
+//! nothing to authenticate against, so it says so and exits cleanly rather than failing in a loop.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -18,8 +22,9 @@ const MAX_SESSIONS: usize = 8;
 
 #[derive(Parser)]
 struct Args {
+    /// The setup-code key, 64 hex characters. Defaults to the imported `ble-psk` credential.
     #[arg(long)]
-    key_file: PathBuf,
+    key_file: Option<PathBuf>,
     #[arg(long, default_value = "0.0.0.0:9443")]
     listen: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:8443")]
@@ -35,11 +40,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args = Args::parse();
+    let Some(key_file) = args.key_file.clone().or_else(imported_key) else {
+        tracing::info!(
+            "no setup code on this robot, so nothing to authenticate against; not serving"
+        );
+        return Ok(());
+    };
     // The same id `btd` binds and the QR carries: the robot's first name, from the SoC serial.
     let robot_id = robotd_params::serial::this_first_name()
         .ok_or_else(|| std::io::Error::other("no SoC serial to derive the robot id from"))?;
-    let credential =
-        ProvisionedKey::load(&args.key_file, robot_id).map_err(std::io::Error::other)?;
+    let credential = ProvisionedKey::load(&key_file, robot_id).map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(args.listen).await?;
     let capacity = Arc::new(Semaphore::new(MAX_SESSIONS));
     tracing::info!(address = %listener.local_addr()?, "authenticated media gateway listening");
@@ -58,6 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+/// The setup-code key systemd imported for this service (`ImportCredential=ble-psk`), if any.
+fn imported_key() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("CREDENTIALS_DIRECTORY")?).join("ble-psk");
+    path.is_file().then_some(path)
 }
 
 async fn serve_one(

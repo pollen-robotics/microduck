@@ -1,15 +1,18 @@
 [Unit]
-Description=Development authenticated media gateway
-After=network.target mediad.service
+Description=Authenticated local media gateway
+# After configd, whose ExecStartPre leaves the setup-code key this imports.
+After=network.target mediad.service configd.service
 Wants=mediad.service
 
 [Service]
 Type=exec
 User=btd
 Group=btd
-LoadCredential=ble-psk:/var/lib/robot/config/ble-psk
-# The robot id is its first name, derived from the SoC serial, so no flag carries it.
-ExecStart=/opt/robot/daemon/current/bin/duck-gateway --key-file %d/ble-psk
+# The setup-code key when the robot has one. Without it the gateway exits cleanly — there is
+# nothing to authenticate against — and Restart=on-failure leaves it stopped. The robot id is its
+# first name, derived from the SoC serial, so no flag carries it either.
+ImportCredential=ble-psk
+ExecStart=/opt/robot/daemon/current/bin/duck-gateway
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes
@@ -24,4 +27,5 @@ RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
 
-# Intentionally no [Install]: provision and start this development service explicitly.
+[Install]
+WantedBy=multi-user.target

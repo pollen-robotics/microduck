@@ -28,14 +28,13 @@ hardware confirmations are documented in [factory provisioning](../design/factor
 
 ## Prepare one robot
 
-The setup code is `md1:<first name>:<64 hex characters>`. The first name is the robot's
-`duck-xxxx` default name, derived from its SoC serial, so a rename does not change it; `btd` and
-`duck-gateway` derive the same one. The key is 32 random bytes, installed on stdin so it is in no
-command line or shell history. In the factory a provisioning station generates it
-([factory provisioning](../design/factory-provisioning.md)); on a dev board the robot's own
-`/dev/urandom` stands in.
+The setup code is `md1:<first name>:<64 hex characters>`: format 1 of a microduck setup code, the
+robot's `duck-xxxx` first name (derived from its SoC serial, so a rename does not change it), and
+its 32-byte key. A production robot carries it in its ID EEPROM, written by the factory, and printed
+as the QR on the robot ([factory provisioning](../design/factory-provisioning.md)). A robot with a
+code there needs nothing below: secure mode is on from its first boot.
 
-On the robot, generate and install the key:
+A dev board has nothing in its EEPROM. Generate a key on the robot and install it:
 
 ```bash
 key=$(head -c 32 /dev/urandom | od -An -tx1 -v | tr -d ' \n')
@@ -49,34 +48,10 @@ echo "$key" | sudo robotctl system setup-code install
 unset key
 ```
 
-Turn on secure mode in `btd`:
+Restart the services so they pick it up:
 
 ```bash
-sudo mkdir -p /etc/systemd/system/btd.service.d
-```
-
-```bash
-sudo tee /etc/systemd/system/btd.service.d/secure.conf <<'EOF'
-[Service]
-LoadCredential=ble-psk:/var/lib/robot/config/ble-psk
-ExecStart=
-ExecStart=/opt/robot/daemon/current/bin/btd --secure-psk-file %d/ble-psk
-EOF
-```
-
-```bash
-sudo systemctl daemon-reload
-```
-
-```bash
-sudo systemctl restart btd
-```
-
-For camera and control over the LAN, start the gateway (it has no `[Install]` section, so start it
-again after every reboot):
-
-```bash
-sudo systemctl start duck-gateway
+sudo systemctl restart configd btd duck-gateway
 ```
 
 Show the code, then scan the QR or paste the `md1:` line into the app:
@@ -85,9 +60,11 @@ Show the code, then scan the QR or paste the `md1:` line into the app:
 sudo robotctl system setup-code
 ```
 
-A missing or malformed key makes `btd` and `duck-gateway` exit rather than serve a weaker
-protocol, and so does a board with no SoC serial. `install` refuses to replace an existing key
-without `--force`, because that invalidates the printed QR and every phone holding the old code.
+`configd`'s unit hands the key to `btd` and `duck-gateway` at every start
+(`robotctl system setup-code export`). With a key, both serve secure mode; without one, `btd`
+serves the PIN path and the gateway stays stopped. An EEPROM code whose id is not this robot's
+first name is refused, and secure mode stays off. `install` refuses to replace an existing key
+without `--force`, because that invalidates every phone holding the old code.
 
 ## App flow
 

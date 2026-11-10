@@ -4,8 +4,8 @@ Provision a unique authentication secret after flashing the common face-board-v1
 then print and verify its matching QR label before the robot leaves the factory.
 
 **Status: proposed manufacturing process, not an implemented or qualified factory tool.**
-The current opt-in app/daemon MVP accepts provisioned secrets, but does not automate this process,
-scan QR codes in the phone app, or implement production ownership/recovery. Manufacturing must
+A robot with a setup code in its ID EEPROM serves secure mode, and the phone app scans the
+printed QR; the station tooling is not implemented, nor is production ownership/recovery. Manufacturing must
 confirm the fixture and workflow; hardware must confirm the actual board revisions; security
 must review the bootstrap access and exit policy. Keep the security PR draft until those gates
 and production-image tests pass. [App authentication](app-path-design.md)
@@ -42,63 +42,61 @@ V0.1 observation as a qualified electrical specification.
 
 ## Proposed factory sequence
 
+The secret lives in the robot's **ID EEPROM**, written with an external programmer, not on the data
+partition. A full `.wic` reflash or a factory reset keeps it, the printed QR stays valid for the
+robot's life, and the at24 driver exposes the chip read-only, so software on the robot cannot
+replace it. [`robotd_params::label`](../../robotd-params/src/label.rs) owns the layout:
+
+```text
+offset 0    18 ASCII digits            label serial: SKU (9) + year (2) + week (2) + unit (5)
+offset 18   :                          separator
+offset 19   md1:<first name>:<64 hex>  setup code, ended by a NUL or blank (0xFF) byte
+```
+
+The whole line, `<label serial>:md1:<first name>:<64 hex>` (97 characters), is also the QR
+printed on the robot.
+
+`md1` is format 1 of a microduck setup code. The first name is the robot's `duck-xxxx` default name,
+`duck-` and the first four hex characters of the SHA-256 of its SoC serial
+(`robotd_params::serial::first_name`). The 64 hex characters are its 32-byte key.
+
 1. **Flash the approved common image.** Select the correct board variant and approved signed
    image/loader, and record their build identifiers and hashes. Use the main-board Recovery USB
    connector with a data cable and the approved power fixture. No per-robot firmware build or
    secret embedded in the common image is required.
-2. **Boot and establish the factory session over the same cable.** Wait for the post-boot USB
-   device to appear, then open the authorized factory channel over NCM or ACM. Verify the
-   intended device/fixture rather than trusting the IP address alone. A physical USB cable is
-   not authentication: the temporary SSH-key or console authorization mechanism remains to be
-   implemented and approved. Do not use the documented shared bench password as the production
-   bootstrap credential. Isolate or explicitly bind interfaces when several robots share a
-   workstation; they otherwise all use the same USB IP address.
-3. **Bind the job to the physical unit.** Read the hardware serial through that session, check
-   it against the connected unit, and record the robot's first name — the `duck-xxxx` default
-   name derived from the SoC serial (`robotd_params::serial::first_name`), which is the public
-   identifier in its setup code. It is not allocated: the robot, `btd` and `duck-gateway` all
-   derive it, so it cannot drift from what the robot answers with. Refuse a unit with no SoC
-   serial. The identifier is not the authentication secret; a rename does not change it.
-4. **Generate the secret on the trusted station.** Generate 32 bytes with a cryptographic random
-   source, independently of the identifier/serial. Pass it through the authorized session without
-   placing it in command arguments, shell tracing, CI output or manufacturing logs.
-5. **Install and commit the credential on the robot.** The helper is
-   `robotctl system setup-code install`, run as root, the 64 hex characters on stdin. It must
-   verify that the expected persistent `data` partition is actually mounted at `/var/lib/robot`,
-   not a fallback rootfs directory. The current MVP key path is
-   `/var/lib/robot/config/ble-psk` (64 hex characters, root-owned, mode `0600`); verify parent
-   ownership/ACLs also prevent replacement by unauthorized users. Bind the same robot identifier
-   to BLE and the gateway. Atomically commit the key/identifier as one consistent provisioning
-   generation and validate the 32-byte key and exact identifier before marking the unit provisioned.
-   A power cut must leave either a valid committed generation or an unprovisioned unit.
-   Refuse silent overwrites; an interrupted
-   job may resume only after checking it is the same unit and credential generation. Do not
-   return the secret in an acknowledgement. The common image must supply production service
-   configuration; temporary MVP drop-ins are not the manufacturing implementation.
-6. **Print the QR from the same committed credential.** Encode
-   `md1:duck-xxxx:<64_HEX_CHARACTERS>` using the exact first name and secret just programmed;
-   `robotctl system setup-code` renders it on the robot.
-   Render locally and print the public identifier beside it. Treat the QR, render files and
-   printer spool as secrets; do not use a public QR-generation website. Control label access and
-   remove temporary copies. Decide label placement and reprint handling before production.
-7. **Scan the physical printed label and verify the robot.** Use a bench scanner to decode the
-   actual label, then complete authentication to that exact hardware serial. Verify a permitted
-   read, reject a wrong key/plaintext privileged request, and check that the gateway uses the same
-   identity. Reboot and repeat authentication to prove persistence. A digital preview or a matching
-   filename is not evidence that the correct label was attached to the correct robot. The phone
-   MVP currently accepts pasted `md1:` payloads; a production app QR reader is still required.
-8. **Exit factory mode and release the unit.** Remove temporary station credentials, provisioning
-   endpoints and any factory console auto-login according to the approved maintenance policy.
-   Verify unauthorized USB and LAN clients cannot regain provisioning/admin access, and that
-   missing/invalid production credentials fail closed instead of enabling the legacy PIN path.
-   Record public robot ID, hardware serial/revisions, firmware build, credential generation,
-   station/test result and exit-check result. Keep raw secrets/QR payloads out of ordinary records.
-   Only a completed scan/authentication/reboot/exit test permits shipment.
+2. **Boot and read the first name.** The SoC serial is only readable from the running robot:
+   `/proc/cpuinfo`'s `Serial` line on face-board-v1. Read it over the post-boot USB session and
+   compute the first name. Refuse a unit with no SoC serial: it cannot have a first name, so it
+   cannot have a setup code. The read needs no write access to the robot, but the session still
+   needs authorising (a physical cable is not authentication).
+3. **Generate the key on the trusted station.** 32 bytes from a cryptographic random source,
+   **random, not derived from the serial, the first name or anything else printed on the robot**:
+   the printed QR is what proves somebody has the robot in hand, and a derivable key would let
+   anyone compute it. Keep it out of command arguments, shell tracing, CI output and logs.
+4. **Program the EEPROM** with the external programmer: the label serial from offset 0, `:` at
+   offset 18 and `md1:<first name>:<64 hex>` from offset 19, exactly as above.
+5. **Print the QR from the same line**, bytes 0 to 96 of the EEPROM. Render it locally, never with a public QR-generation
+   website, and print the first name beside it. Treat the QR, render files and printer spool as
+   secrets and remove temporary copies. Decide label placement and reprint handling before
+   production.
+6. **Boot and verify the robot against the printed label.**
+   `sudo robotctl system setup-code` must say `from the ID EEPROM`, with the robot's own first
+   name. The robot refuses an EEPROM code whose id is not its first name (another unit's image),
+   and secure mode stays off. Then scan the **physical printed label** with the app and connect:
+   a digital preview or a matching filename is not evidence that the right label is on the right
+   robot. Reboot and connect again.
+7. **Close the session and release the unit.** Remove the station's access over USB, and verify
+   unauthorised USB and LAN clients cannot regain it. Record the first name, label serial, hardware
+   revisions, firmware build and test results — never the key or the QR payload.
 
-The station orchestrator, privileged helper, atomic commit/retry format, factory-mode bootstrap
-and exit controls, QR printing/scanning and traceability integration remain to be implemented.
-The current installed default is still legacy PIN mode: production fail-closed startup is a
-required change, not a property already demonstrated by this workflow.
+On every boot, `configd`'s unit runs `robotctl system setup-code export`, which checks the
+EEPROM's code and leaves the key in systemd's credential store in `/run`. `btd` and `duck-gateway`
+import it and serve secure mode; a robot with no code serves the PIN path, so a dev board or an
+unprovisioned unit still onboards. So does a robot whose EEPROM code is unreadable or belongs to
+another unit: secure mode stays off, the error is in `configd`'s journal and in
+`robotctl system setup-code`, and the robot stays reachable over Bluetooth with the PIN from its
+label serial, which a bad code does not touch. The station tooling (steps 2–5 and 7), session authorisation
+and closing, and the printing workflow remain to be implemented.
 
 ## Hardware and image acceptance gates
 
@@ -116,11 +114,13 @@ required change, not a property already demonstrated by this workflow.
 - Inject faults: unplug USB or cut power during provisioning, interrupt printing, swap labels,
   retry a completed job, remove/corrupt the data mount or key, and present an unauthorized
   station. Each incomplete/mismatched unit must remain unshippable without opening a legacy gate.
-- Verify a daemon update and RAUC A/B update/rollback preserve both the credential and the
-  access policy, including booting the recovery image. A full `.wic` reflash erases the proposed
-  data-backed secret: require an authorized reprovisioning/label replacement procedure.
+- Verify a daemon update, RAUC A/B update/rollback, booting the recovery image and a full `.wic`
+  reflash all leave the robot serving the EEPROM's setup code. None of them touches the EEPROM, so
+  the printed QR must keep working through all of them.
 
-Root access or a physical eMMC dump can expose a software-held secret. Closing the Linux factory
+Root on the robot can read the key, and anyone with the board in hand can read the EEPROM over
+I2C: the key is stored unencrypted. The at24 driver exposes the chip read-only, so neither can
+replace it through the kernel, but a direct I2C write could. Closing the Linux factory
 session does not prove that Rockchip recovery/boot-ROM access is locked. Confirm bootloader/USB
 recovery policy and the physical-attacker threat model separately with the hardware supplier.
 The board-ID EEPROM and Rockchip identity storage are not established non-exportable key stores.
