@@ -52,6 +52,7 @@ mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
+mod setup_code;
 mod show;
 mod vetbook;
 
@@ -544,6 +545,15 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
+    ///
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
+    SetupCode {
+        #[command(subcommand)]
+        action: Option<SetupCodeAction>,
+    },
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
@@ -552,6 +562,24 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCodeAction {
+    /// Install the 32-byte key, read on stdin as 64 hex characters. Needs root.
+    ///
+    /// On stdin so the key is in no command line or shell history. Refuses to replace an
+    /// existing key, which would invalidate the printed QR and every phone holding the old code.
+    Install {
+        /// Replace an existing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3514,6 +3542,14 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
 }
 
 fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Local files only: no daemon is involved in showing or installing the key.
+    if let SystemCommand::SetupCode { action } = &command {
+        return match action {
+            None => setup_code::show(),
+            Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
+        };
+    }
     // Asked before connecting, so a robot is not disturbed by a command the operator then
     // aborts.
     if let SystemCommand::Reboot { yes: false, .. } = &command {
@@ -3538,6 +3574,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             *json,
         ),
         SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -3590,6 +3627,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             let reboot: proto::RebootResult = decode(&result)?;
             println!("rebooting in {}s", reboot.in_seconds);
         }
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }
