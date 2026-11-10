@@ -35,6 +35,8 @@ pub mod bluez;
 pub mod chorale;
 pub mod link;
 pub mod pairing;
+#[cfg(target_os = "linux")]
+pub(crate) mod presence;
 pub mod route;
 pub mod session;
 pub mod upstream;

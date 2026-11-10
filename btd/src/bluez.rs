@@ -215,8 +215,11 @@ fn serving(session: &SessionSlot) -> bool {
 /// It defaults on, because §7 requires it for anything carrying wifi credentials and
 /// `net.connect` now does. The opt-out exists for bench work against a client that cannot pair.
 pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) -> bluer::Result<()> {
+    let (presence, publisher) = crate::presence::start();
+    let _publisher = AbortOnDrop(publisher);
     loop {
-        match serve_on_an_adapter(&sockets, &name, require_pairing).await {
+        let result = serve_on_an_adapter(&sockets, &name, require_pairing, &presence).await;
+        match &result {
             Ok(()) => tracing::warn!(
                 retry_in = ?ADAPTER_RETRY,
                 "the adapter is gone; waiting for it to come back"
@@ -229,6 +232,16 @@ pub async fn serve(sockets: Sockets, name: NameChoice, require_pairing: bool) ->
                 "BLE bring-up failed"
             ),
         }
+        presence.send_modify(|status| {
+            status.observed_at = crate::presence::now();
+            status.requested = None;
+            if let Err(error) = &result {
+                status.last_error = Some(crate::presence::bounded_error(error));
+            }
+            status.scan = duck_ipc_proto::BlePresenceScan::Unavailable {
+                reason: "Bluetooth adapter is unavailable; retrying bring-up".into(),
+            };
+        });
         tokio::time::sleep(ADAPTER_RETRY).await;
     }
 }
@@ -241,6 +254,7 @@ async fn serve_on_an_adapter(
     sockets: &Sockets,
     name: &NameChoice,
     require_pairing: bool,
+    presence: &crate::presence::Sender,
 ) -> bluer::Result<()> {
     let sockets = sockets.clone();
     let name = name.clone();
@@ -253,6 +267,12 @@ async fn serve_on_an_adapter(
         match bt.default_adapter().await {
             Ok(adapter) => break adapter,
             Err(e) => {
+                presence.send_modify(|status| {
+                    status.observed_at = crate::presence::now();
+                    status.scan = duck_ipc_proto::BlePresenceScan::Unavailable {
+                        reason: crate::presence::bounded_error(&e),
+                    };
+                });
                 tracing::warn!(error = %e, retry_in = ?ADAPTER_RETRY, "no Bluetooth adapter yet");
                 tokio::time::sleep(ADAPTER_RETRY).await;
             }
@@ -342,10 +362,25 @@ async fn serve_on_an_adapter(
     let chorale = {
         let adapter = adapter.clone();
         let robot_socket = sockets.robot.clone();
+        let presence = presence.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(e) = crate::chorale::run(&adapter, &robot_socket).await {
-                    tracing::debug!(error = %e, "chorale: robotd is not answering");
+                presence.send_replace(crate::presence::initial(
+                    duck_ipc_proto::BlePresenceScan::Disconnected,
+                ));
+                let result =
+                    crate::chorale::run_reported(&adapter, &robot_socket, Some(presence.clone()))
+                        .await;
+                presence.send_modify(|status| {
+                    status.observed_at = crate::presence::now();
+                    status.requested = None;
+                    status.scan = duck_ipc_proto::BlePresenceScan::Disconnected;
+                    if let Err(error) = &result {
+                        status.last_error = Some(crate::presence::bounded_error(error));
+                    }
+                });
+                if let Err(error) = result {
+                    tracing::debug!(%error, "chorale: robotd is not answering");
                 }
                 tokio::time::sleep(ADAPTER_RETRY).await;
             }
