@@ -910,6 +910,13 @@ mod tests {
                 );
                 let frame = calls(mode, &cfg, s);
                 let mut expected = expected.map(|v| v * direction);
+                // Walking back is slower than walking forward.
+                if matches!(mode, Mode::Drive | Mode::HeadDrive)
+                    && direction < 0.0
+                    && positive.left_y != 0.0
+                {
+                    expected[0] = -0.3;
+                }
                 // The crouch goes further down than the rise goes up.
                 if mode == Mode::BodyPose && direction < 0.0 && positive.left_y != 0.0 {
                     expected[7] = -0.025;
