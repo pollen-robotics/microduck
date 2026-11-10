@@ -271,13 +271,13 @@ pub struct PadDriveParams {
 }
 
 impl Default for PadDriveParams {
-    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward/back
-    /// is 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
-    /// velstand, and these still feel right on the robot.
+    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward is
+    /// 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
+    /// velstand, and these still feel right on the robot. Back is 0.3 m/s.
     fn default() -> Self {
         Self {
             vx_max: 0.4,
-            vx_min: -0.4,
+            vx_min: -0.3,
             vy_max: 0.3,
             vy_min: -0.3,
             vyaw_max: 1.0,
