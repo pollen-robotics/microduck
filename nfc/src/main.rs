@@ -344,7 +344,9 @@ fn report(outcome: Outcome) {
 fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
     let tag = tag.text();
     match outcome {
-        modes::Outcome::Switched(mode) => tracing::warn!(tag, mode, "mode switched"),
+        modes::Outcome::Switched(mode, laser) => {
+            tracing::warn!(tag, mode, laser_tracking = laser, "mode switched")
+        }
         modes::Outcome::Refused(mode, why) => {
             tracing::warn!(tag, mode, %why, "the robot refused the mode")
         }
@@ -403,6 +405,15 @@ impl Driver for Sockets {
         call(
             &self.robot,
             &proto::Call::RobotSetMode(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
+        let params = proto::LaserTrackParams { active };
+        call(
+            &self.robot,
+            &proto::Call::RobotLaserTrack(params),
             QUICK_ANSWER,
         )
     }

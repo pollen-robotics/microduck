@@ -81,9 +81,11 @@ always running and picks a reader up within thirty seconds of it being plugged i
 What it did is in `journalctl -u nfcd -b`.
 
 The same reader also takes **mode tags**, written the same way with one of `walk_mode`,
-`roller_skating_mode`, `soccer_mode`, `laser_mode` or `autonomous_mode`. The first two switch the
-robot as holding D-pad up does; the other three are read and quacked at, and do nothing yet. The
-table, and where a new mode's behaviour goes, are in `nfc/src/modes.rs`.
+`roller_skating_mode`, `soccer_mode`, `laser_mode` or `autonomous_mode`. `walk_mode` and
+`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking off;
+`laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track on`). The other
+two are read and quacked at, and do nothing yet. The table, and where a new mode's behaviour goes,
+are in `nfc/src/modes.rs`.
 
 ## Check it
 

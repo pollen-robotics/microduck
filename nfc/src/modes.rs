@@ -3,18 +3,23 @@
 //! A mode tag holds one text, the name of a mode, the way a pairing tag holds
 //! [`crate::ndef::PAIRING`]:
 //!
-//! | tag text              | what happens                         |
-//! |-----------------------|--------------------------------------|
-//! | `walk_mode`           | `robot.setMode` `walk`               |
-//! | `roller_skating_mode` | `robot.setMode` `roller`             |
-//! | `soccer_mode`         | read and logged — nothing to run yet |
-//! | `laser_mode`          | read and logged — nothing to run yet |
-//! | `autonomous_mode`     | read and logged — nothing to run yet |
+//! | tag text              | what happens                                              |
+//! |-----------------------|-----------------------------------------------------------|
+//! | `walk_mode`           | laser tracking off, `robot.setMode` `walk`                |
+//! | `roller_skating_mode` | laser tracking off, `robot.setMode` `roller`              |
+//! | `laser_mode`          | `robot.setMode` `walk`, then `robot.laserTrack` on        |
+//! | `soccer_mode`         | read and logged — nothing to run yet                      |
+//! | `autonomous_mode`     | read and logged — nothing to run yet                      |
 //!
-//! The last three are tags with no behaviour behind them yet. They are recognised here, so a tag
-//! written today keeps working, and [`ModeTag::robot_mode`] is the one line to change when one
-//! gets a behaviour. `robotd` is not asked about them: its modes pick policy sets, and it has
-//! none to load for these.
+//! Laser tracking is not one of `robotd`'s modes: it is a switch on top of whichever mode runs,
+//! following the dot with the head and walking to it. So the laser tag puts the robot in `walk`
+//! first, and the walk and roller tags switch the tracking off: a tag is the mode the robot is
+//! then in, not something added to the last one. A `robotd` too old to know `robot.laserTrack`
+//! refuses that call, which is logged and does not stop the mode switch.
+//!
+//! The last two are tags with no behaviour behind them yet. They are recognised here, so a tag
+//! written today keeps working, and [`ModeTag::robot_mode`] is the line to change when one gets a
+//! behaviour.
 //!
 //! The robot quacks when it reads any of them, so the person holding the tag knows it was read,
 //! whether or not anything follows.
@@ -58,9 +63,18 @@ impl ModeTag {
     /// The `robot.setMode` this tag asks for, or `None` for a mode with no behaviour yet.
     pub fn robot_mode(self) -> Option<&'static str> {
         match self {
-            ModeTag::Walk => Some("walk"),
+            ModeTag::Walk | ModeTag::Laser => Some("walk"),
             ModeTag::RollerSkating => Some("roller"),
-            ModeTag::Soccer | ModeTag::Laser | ModeTag::Autonomous => None,
+            ModeTag::Soccer | ModeTag::Autonomous => None,
+        }
+    }
+
+    /// Where this tag leaves laser tracking, `None` for a tag that does not touch it.
+    pub fn laser(self) -> Option<bool> {
+        match self {
+            ModeTag::Laser => Some(true),
+            ModeTag::Walk | ModeTag::RollerSkating => Some(false),
+            ModeTag::Soccer | ModeTag::Autonomous => None,
         }
     }
 
@@ -79,14 +93,17 @@ pub trait Driver {
     fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String>;
     /// `robot.setMode`.
     fn set_mode(&mut self, mode: &str) -> Result<proto::IntentResult, String>;
+    /// `robot.laserTrack`.
+    fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String>;
 }
 
 /// How a touch ended, for the journal and the tests.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// `robotd` took the switch — or was already in that mode, which it also accepts.
-    Switched(&'static str),
-    /// `robotd` said no, and why.
+    /// `robotd` took the switch — or was already in that mode, which it also accepts. The mode,
+    /// and whether laser tracking is now on.
+    Switched(&'static str, bool),
+    /// `robotd` said no — to the mode, or to `laser` for laser tracking — and why.
     Refused(&'static str, String),
     /// A mode with nothing behind it yet: read, quacked, nothing asked.
     NotYet,
@@ -101,10 +118,30 @@ pub fn on_touch(robot: &mut dyn Driver, tag: ModeTag) -> Outcome {
     let Some(mode) = tag.robot_mode() else {
         return Outcome::NotYet;
     };
+    let laser = tag.laser();
+    // Off before the switch, so the new mode does not start by walking to an old dot. Not
+    // stopping the switch when it fails: an older robotd has no laser to switch off.
+    if laser == Some(false) {
+        match robot.laser_track(false) {
+            Ok(r) if r.accepted => {}
+            Ok(r) => tracing::info!(reason = ?r.reason, "laser tracking not switched off"),
+            Err(why) => tracing::info!(%why, "laser tracking not switched off"),
+        }
+    }
     match robot.set_mode(mode) {
-        Err(e) => Outcome::Failed(format!("robot.setMode: {e}")),
-        Ok(r) if r.accepted => Outcome::Switched(mode),
-        Ok(r) => Outcome::Refused(mode, r.reason.unwrap_or_else(|| "refused".into())),
+        Err(e) => return Outcome::Failed(format!("robot.setMode: {e}")),
+        Ok(r) if !r.accepted => {
+            return Outcome::Refused(mode, r.reason.unwrap_or_else(|| "refused".into()));
+        }
+        Ok(_) => {}
+    }
+    if laser != Some(true) {
+        return Outcome::Switched(mode, false);
+    }
+    match robot.laser_track(true) {
+        Err(e) => Outcome::Failed(format!("robot.laserTrack: {e}")),
+        Ok(r) if r.accepted => Outcome::Switched(mode, true),
+        Ok(r) => Outcome::Refused("laser", r.reason.unwrap_or_else(|| "refused".into())),
     }
 }
 
@@ -115,6 +152,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         refuse: Option<String>,
+        /// A robotd from before laser tracking: it refuses the method.
+        no_laser: bool,
         calls: Vec<String>,
     }
 
@@ -129,6 +168,14 @@ mod tests {
                 Some(why) => proto::IntentResult::refused(why.clone()),
                 None => proto::IntentResult::accepted(),
             })
+        }
+        fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
+            self.calls
+                .push(format!("laser {}", if active { "on" } else { "off" }));
+            if self.no_laser {
+                return Err("unknown method robot.laserTrack".into());
+            }
+            Ok(proto::LaserTrackResult::default())
         }
     }
 
@@ -153,21 +200,70 @@ mod tests {
         let mut robot = Fake::default();
         assert_eq!(
             on_touch(&mut robot, ModeTag::Walk),
-            Outcome::Switched("walk")
+            Outcome::Switched("walk", false)
         );
         assert_eq!(
             on_touch(&mut robot, ModeTag::RollerSkating),
-            Outcome::Switched("roller")
+            Outcome::Switched("roller", false)
         );
         assert_eq!(
             robot.calls,
-            ["chirp", "setMode walk", "chirp", "setMode roller"]
+            [
+                "chirp",
+                "laser off",
+                "setMode walk",
+                "chirp",
+                "laser off",
+                "setMode roller"
+            ]
         );
     }
 
     #[test]
-    fn soccer_laser_and_autonomous_quack_and_ask_nothing() {
-        for m in [ModeTag::Soccer, ModeTag::Laser, ModeTag::Autonomous] {
+    fn the_laser_tag_walks_then_tracks() {
+        let mut robot = Fake::default();
+        assert_eq!(
+            on_touch(&mut robot, ModeTag::Laser),
+            Outcome::Switched("walk", true)
+        );
+        assert_eq!(robot.calls, ["chirp", "setMode walk", "laser on"]);
+    }
+
+    /// A robotd from before laser tracking still switches modes; only the laser tag says it could
+    /// not.
+    #[test]
+    fn a_robotd_without_laser_still_switches_modes() {
+        let mut robot = Fake {
+            no_laser: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            on_touch(&mut robot, ModeTag::RollerSkating),
+            Outcome::Switched("roller", false)
+        );
+        assert!(matches!(
+            on_touch(&mut robot, ModeTag::Laser),
+            Outcome::Failed(why) if why.contains("robot.laserTrack")
+        ));
+    }
+
+    /// A refused walk is not followed by tracking a dot nobody can walk to.
+    #[test]
+    fn a_refused_walk_does_not_start_the_laser() {
+        let mut robot = Fake {
+            refuse: Some("no policy".into()),
+            ..Fake::default()
+        };
+        assert_eq!(
+            on_touch(&mut robot, ModeTag::Laser),
+            Outcome::Refused("walk", "no policy".into())
+        );
+        assert_eq!(robot.calls, ["chirp", "setMode walk"]);
+    }
+
+    #[test]
+    fn soccer_and_autonomous_quack_and_ask_nothing() {
+        for m in [ModeTag::Soccer, ModeTag::Autonomous] {
             let mut robot = Fake::default();
             assert_eq!(on_touch(&mut robot, m), Outcome::NotYet);
             assert_eq!(robot.calls, ["chirp"]);
