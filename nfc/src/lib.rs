@@ -10,7 +10,8 @@
 //! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
 //! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`classic`] the MIFARE Classic
 //! authentication and reads over [`crypto1`], [`ndef`] is pure parsing.
-//! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
+//! [`pairing`], [`modes`] and [`photo`] are what `nfcd` does with a tag, and are the part worth
+//! testing on a laptop.
 
 pub mod classic;
 pub mod clrc663;
@@ -18,6 +19,7 @@ pub mod crypto1;
 pub mod modes;
 pub mod ndef;
 pub mod pairing;
+pub mod photo;
 pub mod reader;
 pub mod registers;
 pub mod serial;

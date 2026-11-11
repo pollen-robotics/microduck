@@ -11,7 +11,8 @@
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
 //! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
 //! asks `robotd` to switch to it; which names there are, and which do nothing yet, is
-//! [`nfc::modes`].
+//! [`nfc::modes`]. A `take_photo` tag poses the robot for a picture taken with `mediad`'s camera
+//! and kept in `/var/lib/robot/photos`; the sequence is [`nfc::photo`].
 //!
 //! ## Why its own daemon
 //!
@@ -37,6 +38,7 @@ use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
 use nfc::modes::{self, Driver, ModeTag};
 use nfc::pairing::{self, Outcome, Robot, Touches};
+use nfc::photo;
 use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
 use nfc::spi::Spidev;
@@ -78,6 +80,14 @@ struct Args {
 
     #[arg(long, default_value = proto::socket::ROBOT)]
     robot_socket: PathBuf,
+
+    /// `mediad`'s local frame socket, where the photo tag's picture comes from.
+    #[arg(long, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
+
+    /// Where the photo tag's pictures are kept, one JPEG each, named for the local time.
+    #[arg(long, default_value = "/var/lib/robot/photos")]
+    photo_dir: PathBuf,
 }
 
 fn main() -> std::process::ExitCode {
@@ -99,6 +109,8 @@ fn main() -> std::process::ExitCode {
     let mut robot = Sockets {
         config: args.config_socket.clone(),
         robot: args.robot_socket.clone(),
+        media: args.media_socket.clone(),
+        photos: args.photo_dir.clone(),
     };
 
     let device = args.device.clone().unwrap_or_else(default_device);
@@ -292,6 +304,10 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
                     touches.unread();
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
+                Ok(Ok(records)) if photo::in_records(&records) => {
+                    tracing::warn!(tag = %id, "photo tag touched — hold still");
+                    report_photo(photo::on_touch(robot));
+                }
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
                     match ModeTag::in_records(&records) {
                         Some(mode) => {
@@ -341,6 +357,22 @@ fn report(outcome: Outcome) {
     }
 }
 
+fn report_photo(outcome: photo::Outcome) {
+    match outcome {
+        photo::Outcome::Taken(path) => {
+            tracing::warn!(photo = %path.display(), "photo taken — sitting, beak open")
+        }
+        photo::Outcome::NoPhoto(why) => {
+            tracing::error!(%why, "no photo — sitting, beak open, all the same")
+        }
+        photo::Outcome::NotStanding(policy) => tracing::warn!(
+            policy,
+            "the robot is neither standing nor seated — no photo; start it first"
+        ),
+        photo::Outcome::Failed(why) => tracing::error!(%why, "the photo sequence stopped"),
+    }
+}
+
 fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
     let tag = tag.text();
     match outcome {
@@ -370,6 +402,8 @@ fn hex(bytes: &[u8]) -> String {
 struct Sockets {
     config: PathBuf,
     robot: PathBuf,
+    media: PathBuf,
+    photos: PathBuf,
 }
 
 impl Robot for Sockets {
@@ -417,6 +451,116 @@ impl Driver for Sockets {
             QUICK_ANSWER,
         )
     }
+}
+
+impl photo::Driver for Sockets {
+    fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
+        Robot::sound(self, tag)
+    }
+
+    fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
+        Driver::laser_track(self, active)
+    }
+
+    fn stop(&mut self) -> Result<proto::IntentResult, String> {
+        call(&self.robot, &proto::Call::RobotStop, QUICK_ANSWER)
+    }
+
+    fn policy(&mut self) -> Result<String, String> {
+        state_policy(&self.robot, QUICK_ANSWER)
+    }
+
+    fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
+        let params = proto::DoParams {
+            skill: "sit".into(),
+        };
+        call(&self.robot, &proto::Call::RobotDo(params), QUICK_ANSWER)
+    }
+
+    fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String> {
+        call(&self.robot, &proto::Call::RobotLook(at), QUICK_ANSWER)
+    }
+
+    fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
+        notify(&self.robot, &proto::Call::RobotHead(head))
+    }
+
+    fn flashlight(&mut self, on: bool) -> Result<proto::IntentResult, String> {
+        let params = proto::FlashlightParams {
+            on,
+            toggle: false,
+            color: proto::FlashlightColor::White,
+        };
+        call(
+            &self.robot,
+            &proto::Call::RobotFlashlight(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn mouth(&mut self, open: f64) -> Result<(), String> {
+        notify(
+            &self.robot,
+            &proto::Call::RobotMouth(proto::MouthParams { open }),
+        )
+    }
+
+    fn capture(&mut self) -> Result<Vec<u8>, String> {
+        photo::capture(&self.media, QUICK_ANSWER)
+    }
+
+    fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String> {
+        let name = photo::local_name(std::time::SystemTime::now());
+        photo::save(&self.photos, &name, jpeg)
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        sleep(d);
+    }
+}
+
+/// A continuous intent, sent as the notification it is: no answer to wait for.
+fn notify(socket: &Path, call: &proto::Call) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", socket.display());
+    let mut stream = UnixStream::connect(socket).map_err(fail)?;
+    let mut request = proto::Request::call(proto::Id::Number(1), call);
+    request.id = None;
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.write_all(&line).map_err(fail)
+}
+
+/// The `policy` of the first `robot.state` frame on a `robot.subscribe` connection. Read as a bare
+/// field rather than the whole `RobotState`, so a frame from another version still answers.
+fn state_policy(socket: &Path, answer_within: Duration) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", socket.display());
+    let mut stream = UnixStream::connect(socket).map_err(fail)?;
+    stream.set_read_timeout(Some(answer_within)).map_err(fail)?;
+    let subscribe = proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) });
+    let request = proto::Request::call(proto::Id::Number(1), &subscribe);
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.write_all(&line).map_err(fail)?;
+    let deadline = Instant::now() + answer_within;
+    let mut lines = BufReader::new(stream).lines();
+    while Instant::now() < deadline {
+        let line = lines
+            .next()
+            .ok_or("robotd closed the subscription")?
+            .map_err(fail)?;
+        let message: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("unparsable frame: {e}"))?;
+        if let Some(error) = message.get("error") {
+            return Err(error["message"].as_str().unwrap_or("refused").to_owned());
+        }
+        if message["method"] == proto::method::ROBOT_STATE {
+            return message["params"]["policy"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "a robot.state frame without a policy".into());
+        }
+    }
+    Err("no robot.state frame".into())
 }
 
 fn call<T: for<'de> serde::Deserialize<'de>>(

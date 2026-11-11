@@ -29,6 +29,9 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # Only for which board this is, so the reader is found without configuration.
 robotd-params = { path = "../robotd-params" }
 libc = "0.2"
+# The photo tag: a raw camera frame turned upright, and kept as a JPEG.
+uyvy = { path = "../uyvy" }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
