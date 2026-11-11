@@ -82,10 +82,11 @@ What it did is in `journalctl -u nfcd -b`.
 
 The same reader also takes **mode tags**, written the same way with one of `walk_mode`,
 `roller_skating_mode`, `soccer_mode`, `laser_mode` or `autonomous_mode`. `walk_mode` and
-`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking off;
-`laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track on`). The other
-two are read and quacked at, and do nothing yet. The table, and where a new mode's behaviour goes,
-are in `nfc/src/modes.rs`.
+`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking and
+soccer off; `laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track
+on`); `soccer_mode` puts it in walk and switches soccer mode on (`robotctl soccer on` — the
+cheat sheet's [Play soccer](cheatsheet.md#play-soccer)). `autonomous_mode` is read and quacked at,
+and does nothing yet. The table, and where a new mode's behaviour goes, are in `nfc/src/modes.rs`.
 
 ## Check it
 
