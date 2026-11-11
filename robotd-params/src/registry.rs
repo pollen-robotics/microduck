@@ -694,6 +694,137 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Raise (+) or lower (-) the floor if reported distances are off, metres",
     ),
+    // ── [soccer] ─────────────────────────────────────────────────────────────
+    entry(
+        "soccer.socket",
+        Kind::Text,
+        "mediad's local socket (media.ball)",
+    ),
+    entry(
+        "soccer.u_min",
+        Kind::Integer,
+        "Blue chroma (U) a ball pixel must reach, 0-255, 128 = grey — read peak in robotctl soccer",
+    ),
+    entry(
+        "soccer.v_min",
+        Kind::Integer,
+        "Red chroma (V) a ball pixel must reach, 0-255, 128 = grey",
+    ),
+    entry(
+        "soccer.y_min",
+        Kind::Integer,
+        "Luma a ball pixel must reach, 0-255",
+    ),
+    entry(
+        "soccer.min_cells",
+        Kind::Integer,
+        "Fewest 4x4-pixel cells that make a ball — raise if it chases specks",
+    ),
+    entry(
+        "soccer.min_fill",
+        Kind::Float,
+        "How much of its box the blob must fill, 0-1 (a disc is 0.79)",
+    ),
+    entry(
+        "soccer.max_aspect",
+        Kind::Float,
+        "Longest over shortest side of the blob, for a blob clear of the edge",
+    ),
+    entry(
+        "soccer.search_hz",
+        Kind::Float,
+        "Looks per second with no ball in sight",
+    ),
+    entry(
+        "soccer.track_hz",
+        Kind::Float,
+        "Looks per second while following the ball",
+    ),
+    entry("soccer.head", Kind::Bool, "Point the head at the ball"),
+    entry(
+        "soccer.walk",
+        Kind::Bool,
+        "Walk to the ball — off to tune the detector on a robot that stays put",
+    ),
+    entry("soccer.kick", Kind::Bool, "Kick once lined up"),
+    entry(
+        "soccer.ball_radius_m",
+        Kind::Float,
+        "The ball's radius, metres",
+    ),
+    entry(
+        "soccer.memory_ms",
+        Kind::Integer,
+        "How long a ball out of sight is still walked to, milliseconds",
+    ),
+    entry(
+        "soccer.max_range_m",
+        Kind::Float,
+        "Ignore balls projected farther than this, metres",
+    ),
+    entry(
+        "soccer.floor_offset_m",
+        Kind::Float,
+        "Raise (+) or lower (-) the floor if reported distances are off, metres",
+    ),
+    entry(
+        "soccer.search_vyaw",
+        Kind::Float,
+        "Turn rate while no ball is known, rad/s, + is left; 0 stands still",
+    ),
+    entry(
+        "soccer.approach_m",
+        Kind::Float,
+        "Nearer than this, line a foot up rather than walk at the ball, metres",
+    ),
+    entry(
+        "soccer.kick_x_m",
+        Kind::Float,
+        "Ball centre this far ahead of the trunk to kick, metres",
+    ),
+    entry(
+        "soccer.kick_y_m",
+        Kind::Float,
+        "Ball centre this far to the side to kick, metres (+ for kick_left)",
+    ),
+    entry(
+        "soccer.tol_x_m",
+        Kind::Float,
+        "How far off kick_x_m still kicks, metres",
+    ),
+    entry(
+        "soccer.tol_y_m",
+        Kind::Float,
+        "How far off kick_y_m still kicks, metres",
+    ),
+    entry(
+        "soccer.settle_ms",
+        Kind::Integer,
+        "How long the ball must sit in the kick spot first, milliseconds",
+    ),
+    entry(
+        "soccer.cooldown_ms",
+        Kind::Integer,
+        "After a kick, how long before looking again, milliseconds",
+    ),
+    entry("soccer.k_x", Kind::Float, "Forward speed per metre to go"),
+    entry(
+        "soccer.k_y",
+        Kind::Float,
+        "Sideways speed per metre to go while lining up",
+    ),
+    entry(
+        "soccer.k_yaw",
+        Kind::Float,
+        "Turn rate per radian of bearing",
+    ),
+    entry("soccer.vx_max", Kind::Float, "Fastest forward speed, m/s"),
+    entry(
+        "soccer.vy_max",
+        Kind::Float,
+        "Fastest sideways speed while lining up, m/s",
+    ),
+    entry("soccer.vyaw_max", Kind::Float, "Fastest turn, rad/s"),
     // ── [head_imu] ───────────────────────────────────────────────────────────
     feature(
         "head_imu.enabled",

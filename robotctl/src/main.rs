@@ -258,6 +258,22 @@ enum Namespace {
         state: Option<String>,
     },
 
+    /// Soccer mode: the pad's bumpers kick, and D-pad down sets the robot playing by itself —
+    /// finding the purple ball, walking to it and kicking it.
+    ///
+    /// `on` is soccer mode by hand (what an NFC `soccer_mode` tag does), `auto` plays by itself,
+    /// `off` ends both. Any button on the pad takes autonomous play back to manual. With no
+    /// argument, or after `on`/`auto`, this watches until Ctrl-C (which leaves the mode as it is).
+    ///
+    /// The readout is how `[soccer]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// most purple thing in the picture whether it passed or not — hold the ball up, read it, and
+    /// set u_min / v_min a little below. `[soccer] walk = false` tunes it on a robot that stays put.
+    Soccer {
+        /// `on`, `auto` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "auto", "off"])]
+        state: Option<String>,
+    },
+
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
     ///
     /// Every key the daemon knows, feature switches first, current value against default, one
@@ -964,6 +980,141 @@ fn laser_line(laser: &proto::LaserTrackState) -> String {
         _ => String::new(),
     };
     format!("{dot}  {target:<24} {doing}")
+}
+
+/// `robotctl soccer` — switch soccer mode, and watch what autonomous play makes of the ball.
+/// Ctrl-C leaves the mode as it is, as `laser-track`'s does.
+fn run_soccer(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let params = proto::SoccerParams {
+            active: state != "off",
+            autonomous: state == "auto",
+        };
+        let outcome: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotSoccer(params))?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        match state {
+            "off" => {
+                println!("soccer mode off");
+                return Ok(());
+            }
+            "auto" => println!("soccer: playing by itself"),
+            _ => println!("soccer mode on — LB/RB kick, D-pad down plays by itself"),
+        }
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (soccer stays as it is)");
+
+    let mut line = String::new();
+    let mut said: Option<&str> = None;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let quiet = match &state.soccer {
+            None => Some("soccer mode is off — `robotctl soccer on`"),
+            Some(s) if !s.autonomous => {
+                Some("soccer mode, by hand — D-pad down or `robotctl soccer auto` to play")
+            }
+            Some(_) => None,
+        };
+        match (quiet, &state.soccer) {
+            (Some(text), _) => {
+                if said != Some(text) {
+                    print!("\r\x1b[K  {text}");
+                    said = Some(text);
+                }
+            }
+            (None, Some(soccer)) => {
+                said = None;
+                print!("\r\x1b[K  {}", soccer_line(soccer));
+            }
+            (None, None) => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_soccer`]: the ball, the colour it was judged on, where it is by the
+/// floor and by its size, and what the robot is doing about it.
+fn soccer_line(soccer: &proto::SoccerState) -> String {
+    let ball = match &soccer.ball {
+        None => format!("{:<26}", soccer.camera),
+        Some(ball) => {
+            let seen = match (ball.seen, ball.px, ball.radius_px, &ball.rejected) {
+                (true, Some([x, y]), Some(r), _) => {
+                    format!("BALL ({x:4.0},{y:4.0}) r={r:<3.0}")
+                }
+                (_, _, _, Some(why)) => format!("{why} (n={})", ball.cells),
+                _ => "no ball".to_owned(),
+            };
+            let peak = ball
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", ball.hz)
+        }
+    };
+    let target = match soccer.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            soccer
+                .size_range_m
+                .map(|r| format!(" (size {r:.2} m)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let foot = soccer
+        .foot
+        .as_deref()
+        .map(|f| format!(" {f}"))
+        .unwrap_or_default();
+    let doing = match (soccer.walk, soccer.twist) {
+        (true, Some([vx, vy, vyaw])) => format!("{vx:+.2} {vy:+.2} m/s {vyaw:+.2} rad/s"),
+        (false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!(
+        "{ball}  {target:<34} {}{foot} {doing}  kicks {}",
+        soccer.phase, soccer.kicks
+    )
 }
 
 /// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
@@ -5611,6 +5762,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::LaserTrack { state } => {
             return run_laser_track(&cli.robot_socket, state.as_deref());
+        }
+        Namespace::Soccer { state } => {
+            return run_soccer(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);

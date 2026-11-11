@@ -202,6 +202,9 @@ pub struct Params {
     /// Following a laser dot with the head and the legs. `robotd` reads it, and re-reads it while
     /// tracking is on — see [`LaserParams`].
     pub laser: LaserParams,
+    /// Soccer mode's autonomous half: finding the purple ball, walking to it, kicking it. Re-read
+    /// live while autonomous soccer is on — see [`SoccerParams`].
+    pub soccer: SoccerParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
@@ -1403,6 +1406,191 @@ impl LaserParams {
             if !(v.is_finite() && v >= 0.0) {
                 return Some((key, "must be zero or positive"));
             }
+        }
+        if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
+            return Some(("floor_offset_m", "must be within ±0.2 m"));
+        }
+        None
+    }
+}
+
+/// `[soccer]` — autonomous soccer: find the purple ball, walk to it, kick it.
+///
+/// Soccer mode itself is switched with `robot.soccer` (an NFC `soccer_mode` tag, `robotctl
+/// soccer`), never from here: it is a game somebody starts, not a boot state, so this section
+/// holds only how autonomous soccer sees and moves. **Every key applies live**, for the laser's
+/// reason — tuning it is many small edits with a robot on the floor.
+///
+/// What it does, in order: no ball known, it turns in place at `search_vyaw` (0 to stand still)
+/// with the head on the idle look-around; a ball farther than `approach_m` is turned to and walked
+/// at, as the laser's dot is; nearer, it picks the foot on the ball's side and walks sideways and
+/// forwards until the ball sits at (`kick_x_m`, ±`kick_y_m`) in front of the trunk, within
+/// `tol_x_m`/`tol_y_m`, for `settle_ms`; then it kicks, waits `cooldown_ms`, and looks again.
+/// The ball's side: +y is left, and `kick_left` is the kick lined up with the ball at
+/// +`kick_y_m` — a robot whose kicks are mirrored wants `kick_y_m` negative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SoccerParams {
+    /// `mediad`'s local socket, where `media.ball` is served.
+    pub socket: PathBuf,
+    /// Blue chroma (U / Cb) a ball pixel must reach, 0–255; 128 is grey.
+    pub u_min: u8,
+    /// Red chroma (V / Cr) a ball pixel must reach, 0–255; 128 is grey.
+    pub v_min: u8,
+    /// Luma a ball pixel must reach, 0–255.
+    pub y_min: u8,
+    /// Fewest 4×4-pixel grid cells that make a ball.
+    pub min_cells: u32,
+    /// How much of its bounding box the blob must fill, 0–1; a disc fills 0.79.
+    pub min_fill: f64,
+    /// Longest over shortest side of the blob's box, for a blob clear of the frame's edge.
+    pub max_aspect: f64,
+    /// Looks per second while nothing is in sight.
+    pub search_hz: f64,
+    /// Looks per second while following the ball.
+    pub track_hz: f64,
+    /// Point the head at the ball.
+    pub head: bool,
+    /// Walk to the ball. Off, the robot only looks — for tuning the detector on a robot that
+    /// stays put.
+    pub walk: bool,
+    /// Kick once lined up. Off, it lines up and waits.
+    pub kick: bool,
+    /// The ball's radius, metres. Its centre is this far above the floor.
+    pub ball_radius_m: f64,
+    /// How long a ball out of sight is still walked to, milliseconds — long, because the last
+    /// steps to it are taken with the ball under the beak, where the camera may not see it.
+    pub memory_ms: u64,
+    /// Ignore a ball projected farther than this, metres.
+    pub max_range_m: f64,
+    /// Added to the floor's height under the trunk, metres, as `[laser] floor_offset_m`.
+    pub floor_offset_m: f64,
+    /// Turn rate while no ball is known, rad/s; positive is left. 0 stands still.
+    pub search_vyaw: f64,
+    /// Nearer than this, metres, the robot stops walking at the ball and lines its foot up.
+    pub approach_m: f64,
+    /// Where the ball's centre should be for a kick: this far ahead of the trunk, metres.
+    pub kick_x_m: f64,
+    /// And this far to the side of it, metres — +y for `kick_left`, −y for `kick_right`.
+    pub kick_y_m: f64,
+    /// How far off `kick_x_m` still kicks, metres.
+    pub tol_x_m: f64,
+    /// How far off `kick_y_m` still kicks, metres.
+    pub tol_y_m: f64,
+    /// How long the ball must sit in the kick spot before the kick, milliseconds.
+    pub settle_ms: u64,
+    /// After a kick, how long before looking for the ball again, milliseconds — the kick, and
+    /// the ball rolling away.
+    pub cooldown_ms: u64,
+    /// Forward speed per metre to go, 1/s.
+    pub k_x: f64,
+    /// Sideways speed per metre to go while lining up, 1/s.
+    pub k_y: f64,
+    /// Turn rate per radian of bearing, 1/s.
+    pub k_yaw: f64,
+    /// Fastest forward speed, m/s.
+    pub vx_max: f64,
+    /// Fastest sideways speed while lining up, m/s.
+    pub vy_max: f64,
+    /// Fastest turn, rad/s.
+    pub vyaw_max: f64,
+}
+
+impl Default for SoccerParams {
+    fn default() -> Self {
+        let detect = duck_ipc_proto::BallDetectParams::default();
+        Self {
+            socket: PathBuf::from(duck_ipc_proto::socket::MEDIA),
+            u_min: detect.u_min,
+            v_min: detect.v_min,
+            y_min: detect.y_min,
+            min_cells: detect.min_cells,
+            min_fill: detect.min_fill,
+            max_aspect: detect.max_aspect,
+            search_hz: detect.search_hz,
+            track_hz: detect.track_hz,
+            head: true,
+            walk: true,
+            kick: true,
+            ball_radius_m: 0.035,
+            memory_ms: 3000,
+            max_range_m: 3.0,
+            floor_offset_m: 0.0,
+            search_vyaw: 0.5,
+            approach_m: 0.45,
+            kick_x_m: 0.15,
+            kick_y_m: 0.05,
+            tol_x_m: 0.04,
+            tol_y_m: 0.025,
+            settle_ms: 300,
+            cooldown_ms: 2500,
+            k_x: 1.2,
+            k_y: 1.5,
+            k_yaw: 1.5,
+            vx_max: 0.2,
+            vy_max: 0.1,
+            vyaw_max: 0.8,
+        }
+    }
+}
+
+impl SoccerParams {
+    /// The half of this section `mediad` needs, as the wire carries it.
+    pub fn detect(&self) -> duck_ipc_proto::BallDetectParams {
+        duck_ipc_proto::BallDetectParams {
+            u_min: self.u_min,
+            v_min: self.v_min,
+            y_min: self.y_min,
+            min_cells: self.min_cells,
+            min_fill: self.min_fill,
+            max_aspect: self.max_aspect,
+            search_hz: self.search_hz,
+            track_hz: self.track_hz,
+        }
+    }
+
+    fn check(&self) -> Option<(&'static str, &'static str)> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.search_hz) || self.search_hz > 30.0 {
+            return Some(("search_hz", "must be above 0 and at most 30"));
+        }
+        if !positive(self.track_hz) || self.track_hz > 30.0 {
+            return Some(("track_hz", "must be above 0 and at most 30"));
+        }
+        if self.min_cells == 0 {
+            return Some(("min_cells", "must be at least 1"));
+        }
+        if !(self.min_fill.is_finite() && (0.0..=1.0).contains(&self.min_fill)) {
+            return Some(("min_fill", "must be between 0 and 1"));
+        }
+        if !(self.max_aspect.is_finite() && self.max_aspect >= 1.0) {
+            return Some(("max_aspect", "must be at least 1"));
+        }
+        if !positive(self.ball_radius_m) || self.ball_radius_m > 0.2 {
+            return Some(("ball_radius_m", "must be above 0 and at most 0.2 m"));
+        }
+        for (key, v) in [
+            ("max_range_m", self.max_range_m),
+            ("approach_m", self.approach_m),
+            ("kick_x_m", self.kick_x_m),
+            ("tol_x_m", self.tol_x_m),
+            ("tol_y_m", self.tol_y_m),
+            ("k_x", self.k_x),
+            ("k_y", self.k_y),
+            ("k_yaw", self.k_yaw),
+            ("vx_max", self.vx_max),
+            ("vy_max", self.vy_max),
+            ("vyaw_max", self.vyaw_max),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Some((key, "must be zero or positive"));
+            }
+        }
+        if !self.kick_y_m.is_finite() || self.kick_y_m.abs() > 0.3 {
+            return Some(("kick_y_m", "must be within ±0.3 m"));
+        }
+        if !self.search_vyaw.is_finite() || self.search_vyaw.abs() > 2.0 {
+            return Some(("search_vyaw", "must be within ±2 rad/s"));
         }
         if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
             return Some(("floor_offset_m", "must be within ±0.2 m"));
@@ -2987,6 +3175,12 @@ pub enum ParamsError {
         key: &'static str,
         reason: &'static str,
     },
+    #[error("{path}: soccer.{key} {reason}")]
+    Soccer {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
     #[error("{path}: idle.{key} {reason}")]
     Idle {
         path: String,
@@ -3168,6 +3362,13 @@ impl Params {
         }
         if let Some((key, reason)) = self.laser.check() {
             return Err(ParamsError::Laser {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
+        if let Some((key, reason)) = self.soccer.check() {
+            return Err(ParamsError::Soccer {
                 path: path.display().to_string(),
                 key,
                 reason,

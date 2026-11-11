@@ -536,7 +536,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
-pub const API_VERSION: u32 = 53;
+///
+/// # v54 — soccer mode
+///
+/// [`method::ROBOT_SOCCER`] switches soccer mode — the pad's bumpers kick — and, on top of it,
+/// autonomous soccer, where the robot finds a purple ball, walks to it and kicks it.
+/// [`RobotState::soccer`] carries what it is doing while soccer mode is on, and
+/// [`ModeResult::soccer`] says whether it is, so a pad daemon that already polls `robot.mode`
+/// learns of a switch made from elsewhere — an NFC tag. Underneath, `robotd` subscribes to
+/// `mediad`'s local [`method::MEDIA_BALL`]; a `mediad` older than this refuses it, and the soccer
+/// block's `camera` line says so. All additive.
+pub const API_VERSION: u32 = 54;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -705,6 +715,15 @@ pub mod method {
     /// was found, because "nothing" is what lets a tracker let go.
     pub const MEDIA_LASER_DOT: &str = "media.laserDot";
 
+    /// Look for the purple ball in the camera frames, on `mediad`'s local socket — the laser's
+    /// subscription, for a ball: answered with `null`, then one [`MEDIA_BALL_SEEN`] per look until
+    /// the connection closes. Local-only and not a `Call`; its client is `robotd`'s autonomous
+    /// soccer. Params are [`super::BallDetectParams`].
+    pub const MEDIA_BALL: &str = "media.ball";
+    /// `mediad` → subscriber: one look's answer, [`super::BallSeen`], sent whether or not a ball
+    /// was found.
+    pub const MEDIA_BALL_SEEN: &str = "media.ballSeen";
+
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
     pub const ROLLBACK: &str = "update.rollback";
@@ -851,6 +870,15 @@ pub mod method {
     /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
     /// `[laser]` needs.
     pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
+    /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
+    /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
+    ///
+    /// Soccer mode itself moves nothing: it is what a pad daemon reads (in [`ROBOT_MODE`]'s
+    /// answer) to put the kicks on the bumpers and autonomous soccer on D-pad down. Autonomous
+    /// soccer finds the purple ball with the camera, walks to it and kicks it with the nearer
+    /// foot, then looks for it again — sharing the robot the way laser tracking does: a deflected
+    /// client stick wins. Switching soccer on switches laser tracking off, and the other way round.
+    pub const ROBOT_SOCCER: &str = "robot.soccer";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1250,6 +1278,8 @@ pub enum Call {
     RobotTheremin(ThereminParams),
     /// Switch laser tracking on or off. Discrete; the answer is [`LaserTrackResult`].
     RobotLaserTrack(LaserTrackParams),
+    /// Soccer mode and autonomous soccer. Discrete; the answer is [`IntentResult`].
+    RobotSoccer(SoccerParams),
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
@@ -1454,6 +1484,7 @@ impl Call {
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
+            Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1677,6 +1708,7 @@ impl Call {
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
             | Call::RobotLaserTrack(_)
+            | Call::RobotSoccer(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
@@ -1801,6 +1833,7 @@ impl Call {
             Call::RobotVetbookTally(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
+            Call::RobotSoccer(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1897,6 +1930,7 @@ impl Call {
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
+            method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -2828,6 +2862,150 @@ pub struct LaserDot {
     pub took_ms: f64,
 }
 
+/// See [`method::ROBOT_SOCCER`].
+///
+/// | `active` | `autonomous` | |
+/// |---|---|---|
+/// | `false` | either | soccer mode off, and autonomous with it |
+/// | `true` | `false` | soccer mode, driven by hand: the bumpers kick |
+/// | `true` | `true` | autonomous soccer: find the ball, walk to it, kick it |
+///
+/// `autonomous` defaults to false, so `{"active": true}` is what an NFC tag sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoccerParams {
+    pub active: bool,
+    #[serde(default)]
+    pub autonomous: bool,
+}
+
+/// What soccer mode is doing, in [`RobotState`]. Absent while soccer mode is off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoccerState {
+    /// Autonomous soccer is on. False is soccer mode driven by hand, and then nothing below is
+    /// filled in: the camera is not being looked at.
+    pub autonomous: bool,
+    /// What autonomous soccer is doing, as a word: `manual`, `searching`, `approaching`,
+    /// `lining up`, `kicking`, `waiting for the policy`.
+    pub phase: String,
+    /// The camera side, as a line — `looking at 3 Hz`, or why it is not. The first thing to read
+    /// when nothing happens.
+    pub camera: String,
+    /// The newest look's answer from `mediad`, if there has been one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ball: Option<BallSeen>,
+    /// Where the ball is on the floor in the robot's own heading frame (+x ahead, +y left),
+    /// metres — the last sighting, carried by odometry while it is remembered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_m: Option<[f64; 2]>,
+    /// The ball's distance from its apparent size alone, metres — a cross-check on `target_m`,
+    /// which comes from the floor. Two numbers that disagree say `[soccer] floor_offset_m` or the
+    /// camera calibration is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_range_m: Option<f64>,
+    /// How long since the ball was last seen, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// The foot the robot is lining up to kick with, `left` or `right`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foot: Option<String>,
+    /// Kicks started since autonomous soccer was switched on.
+    pub kicks: u32,
+    /// The head is following the ball this tick.
+    #[serde(default, skip_serializing_if = "not")]
+    pub head: bool,
+    /// The legs are autonomous soccer's this tick — false while a client stick is deflected.
+    #[serde(default, skip_serializing_if = "not")]
+    pub walk: bool,
+    /// The velocity asked for this tick, `[vx, vy, vyaw]`, before the loop's smoothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twist: Option<[f64; 3]>,
+}
+
+/// [`method::MEDIA_BALL`]'s params: what counts as the ball, and how often to look.
+///
+/// Colour is in the camera's own YUV (BT.601, 0–255; chroma 128 is grey). Purple is the one
+/// colour with **both** chromas above grey — blue has V below, red and skin have U below — so a
+/// ball pixel is one whose U and V both reach their minimums. The shape gates reject a purple
+/// thing that is not round.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallDetectParams {
+    /// Blue chroma (Cb / U) a ball pixel must reach.
+    pub u_min: u8,
+    /// Red chroma (Cr / V) a ball pixel must reach.
+    pub v_min: u8,
+    /// Luma a ball pixel must reach — below it, chroma is sensor noise.
+    pub y_min: u8,
+    /// Fewest grid cells (one per 4×4 pixels) that make a ball.
+    pub min_cells: u32,
+    /// How much of its bounding box the blob must fill. A disc fills π/4 ≈ 0.79.
+    pub min_fill: f64,
+    /// Longest side over shortest side of the blob's box, for a blob clear of the frame's edge.
+    pub max_aspect: f64,
+    /// Looks per second with no ball in sight.
+    pub search_hz: f64,
+    /// Looks per second while the ball is seen, and for a second after.
+    pub track_hz: f64,
+}
+
+impl Default for BallDetectParams {
+    fn default() -> Self {
+        Self {
+            u_min: 145,
+            v_min: 134,
+            y_min: 20,
+            min_cells: 6,
+            min_fill: 0.45,
+            max_aspect: 1.8,
+            search_hz: 5.0,
+            track_hz: 15.0,
+        }
+    }
+}
+
+/// One look's answer, the params of [`method::MEDIA_BALL_SEEN`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BallSeen {
+    /// A ball passed every gate. False is still a message: the tracker needs to hear it.
+    pub seen: bool,
+    /// The ball centre's direction as a cv2 ray `[x, y, 1]` of the camera **upright** — mount and
+    /// intrinsics undone, as [`LaserDot::ray`]. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ray: Option<[f64; 2]>,
+    /// The ball's apparent diameter in the same normalised units as `ray` — so its distance is
+    /// about the ball's diameter over this. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// The ball's centre in the upright picture, pixels. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<[f64; 2]>,
+    /// The ball's radius in pixels, for an overlay. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius_px: Option<f64>,
+    /// The upright picture's size, `[width, height]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where the biggest purple blob sat when it was rejected, upright pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
+    /// Grid cells in the ball, or in the rejected blob.
+    pub cells: u32,
+    /// The most purple sample in the frame, `[Y, U, V]`, **whether or not it passed** — hold the
+    /// ball up, read this, set the thresholds a little below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_yuv: Option<[u8; 3]>,
+    /// Why the biggest blob was rejected: `"too small"`, `"not round"`, `"not filled"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// The rate this look was taken at, looks per second.
+    pub hz: f64,
+    /// Scan time for this look, milliseconds.
+    pub took_ms: f64,
+}
+
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
 ///
 /// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
@@ -2910,6 +3088,11 @@ pub struct ModeResult {
     /// `"walk"` or `"roller"`. A string rather than an enum so a client older than a new
     /// mode reports it instead of failing to parse the answer.
     pub mode: String,
+    /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
+    /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
+    /// the pad's buttons do. (v54)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soccer: Option<SoccerParams>,
 }
 
 /// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
@@ -4527,6 +4710,9 @@ pub struct RobotState {
     /// [`LaserTrackState`]. (v52)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laser: Option<LaserTrackState>,
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v54)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soccer: Option<SoccerState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7086,6 +7272,53 @@ mod tests {
         assert!(block.get("head").is_none(), "{block}");
     }
 
+    /// Soccer mode is absent from `robot.mode` and `robot.state` while it is off, so an older
+    /// client reads the frames it always did, and `{"active": true}` is manual soccer.
+    #[test]
+    fn soccer_is_absent_until_switched_on() {
+        let off = serde_json::to_string(&ModeResult {
+            mode: "walk".into(),
+            soccer: None,
+        })
+        .unwrap();
+        assert_eq!(off, r#"{"mode":"walk"}"#);
+        let manual: SoccerParams = serde_json::from_str(r#"{"active": true}"#).unwrap();
+        assert_eq!(
+            manual,
+            SoccerParams {
+                active: true,
+                autonomous: false
+            }
+        );
+        let call = Call::parse(
+            method::ROBOT_SOCCER,
+            Some(&serde_json::json!({"active": true, "autonomous": true})),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            Call::RobotSoccer(SoccerParams {
+                active: true,
+                autonomous: true
+            })
+        );
+
+        let mut state = a_state();
+        assert!(!serde_json::to_string(&state).unwrap().contains("soccer"));
+        state.soccer = Some(SoccerState {
+            autonomous: true,
+            phase: "approaching".into(),
+            target_m: Some([0.6, 0.1]),
+            ..Default::default()
+        });
+        let back: RobotState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.soccer, state.soccer);
+        let empty: BallDetectParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, BallDetectParams::default());
+        assert!(serde_json::from_str::<BallDetectParams>(r#"{"u_mn": 10}"#).is_err());
+    }
+
     /// `media.laser` with no params is the defaults, and a misspelt threshold is refused rather
     /// than silently ignored — the thresholds are the whole of tuning this.
     #[test]
@@ -7245,6 +7478,7 @@ mod tests {
             odom: OdomState::default(),
             theremin: None,
             laser: None,
+            soccer: None,
             chorale: None,
             t_ns: 0,
             imu: None,

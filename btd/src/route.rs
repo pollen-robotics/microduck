@@ -302,6 +302,8 @@ fn permits(call: &proto::Call) -> bool {
         RobotTheremin(_) | RobotChorale(_) => false,
         // Motor control by another name: the dot walks the robot, and the radio is not a control transport.
         RobotLaserTrack(_) => false,
+        // The same, for a ball: autonomous soccer walks the robot. An NFC tag is local, not the radio.
+        RobotSoccer(_) => false,
         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
         RobotFlashlight(_) => false,
 

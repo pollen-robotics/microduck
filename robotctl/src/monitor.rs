@@ -4972,6 +4972,7 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             laser: None,
+            soccer: None,
             chorale: None,
             t_ns: 0,
             imu: None,

@@ -142,8 +142,8 @@ async fn serve(
         let _ = tx.send(port);
     }
 
-    let roller = match robot.ask_roller().await {
-        Ok(r) => r.unwrap_or(false),
+    let mode = match robot.ask_mode().await {
+        Ok(mode) => mode.unwrap_or_default(),
         Err(e) => {
             tracing::error!(error = %e, "mode request failed");
             return std::process::ExitCode::FAILURE;
@@ -153,6 +153,7 @@ async fn serve(
         deadzone: args.deadzone,
         max_head: args.max_head,
     };
+    let roller = mode.mode == "roller";
     let mut config = Config::defaults(roller, &overrides);
     config.reload(&args.config, &overrides);
     tracing::warn!(
@@ -171,6 +172,7 @@ async fn serve(
         fallback: HEARTBEAT,
     });
     let (mut mapper, mut continuous) = (Mapper::new(), Continuous::default());
+    mapper.set_soccer(mode.soccer);
     let (mut out, mut frame) = (Vec::new(), Vec::new());
     let mut buf = [0u8; 512];
     let mut housekeeping = Instant::now() + pad_map::BINDINGS_POLL;
@@ -275,12 +277,17 @@ async fn serve(
                     tracing::warn!("controller settings reloaded");
                 }
             }
-            match robot.ask_roller().await {
-                Ok(Some(r)) if r != config.roller => {
-                    config.roller = r;
-                    tracing::warn!(roller = r, "drive mode changed — stick shaping follows");
+            match robot.ask_mode().await {
+                Ok(Some(mode)) => {
+                    let r = mode.mode == "roller";
+                    if r != config.roller {
+                        config.roller = r;
+                        tracing::warn!(roller = r, "drive mode changed — stick shaping follows");
+                    }
+                    // Soccer mode changes what the buttons do, and an NFC tag switches it.
+                    mapper.set_soccer(mode.soccer);
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "mode request failed");
                     return std::process::ExitCode::FAILURE;

@@ -523,6 +523,65 @@ mode = "walk"
 # are consistently long or short against a tape measure, nudge this: + raises the floor (nearer).
 # floor_offset_m = 0.0
 
+[soccer]
+# Autonomous soccer: find the purple ball, walk to it, kick it. Soccer mode itself is switched with
+# `robotctl soccer on|auto|off`, an NFC `soccer_mode` tag, or D-pad down on the pad once in it —
+# never from here; this section is only how autonomous play sees and moves. **Everything here
+# applies live.** Tune with `robotctl soccer` running; `walk = false` tunes on a robot that stays put.
+
+# mediad's local socket.
+# socket = "/run/mediad/media.sock"
+
+# What a ball pixel is, in the camera's YUV (0-255, chroma 128 = grey). Purple is the hue with both
+# chromas above grey. Hold the ball up, read `peak` in `robotctl soccer`, set each a little below.
+# u_min = 145
+# v_min = 134
+# y_min = 20
+
+# What a ball is, in 4x4-pixel cells: big enough, filling enough of its box (a disc is 0.79), and
+# about as tall as wide (skipped for a ball cut by the picture's edge).
+# min_cells = 6
+# min_fill = 0.45
+# max_aspect = 1.8
+
+# Looks per second, searching and tracking — the laser's costs, per look.
+# search_hz = 5.0
+# track_hz = 15.0
+
+# Which halves to drive, and whether to kick once lined up.
+# head = true
+# walk = true
+# kick = true
+
+# The ball: its centre is this far above the floor. Remembered this long out of sight — long,
+# because the last steps are taken with it under the beak.
+# ball_radius_m = 0.035
+# memory_ms = 3000
+# max_range_m = 3.0
+# floor_offset_m = 0.0
+
+# Turn rate while no ball is known (0 stands still), and where walking at the ball turns into
+# lining a foot up.
+# search_vyaw = 0.5
+# approach_m = 0.45
+
+# The kick spot: ball centre kick_x_m ahead of the trunk and kick_y_m to the side (+ is the left
+# foot, kick_left), within tol for settle_ms; then cooldown_ms before looking again.
+# kick_x_m = 0.15
+# kick_y_m = 0.05
+# tol_x_m = 0.04
+# tol_y_m = 0.025
+# settle_ms = 300
+# cooldown_ms = 2500
+
+# Gains and limits.
+# k_x = 1.2
+# k_y = 1.5
+# k_yaw = 1.5
+# vx_max = 0.2
+# vy_max = 0.1
+# vyaw_max = 0.8
+
 [duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because

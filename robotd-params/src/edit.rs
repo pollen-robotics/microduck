@@ -1981,6 +1981,7 @@ mod tests {
                 "pickup",
                 "theremin",
                 "laser",
+                "soccer",
                 "head_imu",
                 "audio",
                 "emotions",

@@ -212,52 +212,81 @@ impl Laser {
             // trunk origin in the world, rotated by the inverse attitude.
             let floor = self.floor(pose, &params);
             let rel = [wx, wy, floor - pose.odom[2]];
-            let in_trunk = imu_quat(pose.imu).conjugate().rotate(rel);
-            self.fk.look_at(in_trunk, neck_pitch).joints
+            self.fk.look_at(in_trunk(pose, rel), neck_pitch).joints
         });
         let twist = params.walk.then(|| walk_to(ahead, &params));
         state.twist = twist;
         Some(Drive { head, twist, state })
     }
 
-    /// Where the floor is, in the world's z.
-    ///
-    /// Odometry's z is the trunk's height above the plane its contact anchor defines, so the floor
-    /// is at zero — once odometry has a fix. Before it does (the IMU still converging) the trunk is
-    /// assumed at its trained standing height.
+    /// Where the floor is, in the world's z — [`floor_z`], plus `[laser] floor_offset_m`.
     fn floor(&self, pose: &Pose, params: &LaserParams) -> f64 {
-        let base = if pose.odom[2] > 0.05 {
-            0.0
-        } else {
-            pose.odom[2] - self.trunk_height
-        };
-        base + params.floor_offset_m
+        floor_z(pose, self.trunk_height) + params.floor_offset_m
     }
 
     /// The ray `[x, y, 1]` from the camera, through the head FK and the attitude, onto the
     /// floor — world x/y, or `None` when it does not meet the floor in front of the robot within
     /// `max_range_m`.
     fn project(&self, ray: [f64; 2], pose: &Pose, params: &LaserParams) -> Option<[f64; 2]> {
-        let camera = self.fk.camera_in_trunk_cv2(pose.head);
-        let attitude = imu_quat(pose.imu);
-        let dir = attitude.rotate(camera.quat.rotate([ray[0], ray[1], 1.0]));
-        let offset = attitude.rotate(camera.pos);
-        let origin = [
-            pose.odom[0] + offset[0],
-            pose.odom[1] + offset[1],
-            pose.odom[2] + offset[2],
-        ];
-        let drop = self.floor(pose, params) - origin[2];
-        // Looking down at all, and the floor below the lens: anything else is a dot on a wall, or
-        // a ray so shallow that a pixel of error is metres of floor.
-        if dir[2] > -1e-3 || drop >= 0.0 {
-            return None;
-        }
-        let t = drop / dir[2];
-        let at = [origin[0] + t * dir[0], origin[1] + t * dir[1]];
-        let range = (at[0] - pose.odom[0]).hypot(at[1] - pose.odom[1]);
-        (range <= params.max_range_m).then_some(at)
+        project(
+            &self.fk,
+            ray,
+            pose,
+            self.floor(pose, params),
+            params.max_range_m,
+        )
     }
+}
+
+/// The floor's height in the world's z, before any offset.
+///
+/// Odometry's z is the trunk's height above the plane its contact anchor defines, so the floor
+/// is at zero — once odometry has a fix. Before it does (the IMU still converging) the trunk is
+/// assumed at `trunk_height`, its trained standing height.
+pub(crate) fn floor_z(pose: &Pose, trunk_height: f64) -> f64 {
+    if pose.odom[2] > 0.05 {
+        0.0
+    } else {
+        pose.odom[2] - trunk_height
+    }
+}
+
+/// The camera ray `[x, y, 1]`, through the head FK and the attitude, onto the horizontal plane at
+/// world height `plane_z` — world x/y, or `None` when it does not meet that plane in front of the
+/// robot within `max_range`. The floor for a laser dot; the floor plus a radius for a ball's
+/// centre.
+pub(crate) fn project(
+    fk: &HeadFk,
+    ray: [f64; 2],
+    pose: &Pose,
+    plane_z: f64,
+    max_range: f64,
+) -> Option<[f64; 2]> {
+    let camera = fk.camera_in_trunk_cv2(pose.head);
+    let attitude = imu_quat(pose.imu);
+    let dir = attitude.rotate(camera.quat.rotate([ray[0], ray[1], 1.0]));
+    let offset = attitude.rotate(camera.pos);
+    let origin = [
+        pose.odom[0] + offset[0],
+        pose.odom[1] + offset[1],
+        pose.odom[2] + offset[2],
+    ];
+    let drop = plane_z - origin[2];
+    // Looking down at all, and the plane below the lens: anything else is a dot on a wall, or
+    // a ray so shallow that a pixel of error is metres of floor.
+    if dir[2] > -1e-3 || drop >= 0.0 {
+        return None;
+    }
+    let t = drop / dir[2];
+    let at = [origin[0] + t * dir[0], origin[1] + t * dir[1]];
+    let range = (at[0] - pose.odom[0]).hypot(at[1] - pose.odom[1]);
+    (range <= max_range).then_some(at)
+}
+
+/// A world point `[x, y, z]` relative to the trunk, as the head IK wants it: rotated into the
+/// trunk's frame by the inverse attitude, tilt and all.
+pub(crate) fn in_trunk(pose: &Pose, rel: [f64; 3]) -> [f64; 3] {
+    imu_quat(pose.imu).conjugate().rotate(rel)
 }
 
 /// The twist that takes the robot to a dot at `ahead` (+x ahead, +y left, metres).

@@ -283,13 +283,14 @@ fn main() -> std::process::ExitCode {
     // Which robot is this? A roller duck wants the roller stick shaping. Asked at startup and then
     // again with the config check below, so a `robot.setMode` from anywhere — the pad no longer
     // switches modes itself — changes the stick shaping within a second.
-    let roller = match ask_roller(&mut stream, &mut next_id) {
-        Ok(roller) => roller.unwrap_or(false),
+    let mode = match ask_mode(&mut stream, &mut next_id) {
+        Ok(mode) => mode.unwrap_or_default(),
         Err(e) => {
             tracing::error!(error = %e, "mode request failed");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let roller = mode.mode == "roller";
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
@@ -317,6 +318,7 @@ fn main() -> std::process::ExitCode {
     // What the pad means: the mode, the holds, the trigger edges and whether the robot is up.
     // `pad_map`, so that `netpadd` maps a pad exactly as this does.
     let mut mapper = Mapper::new();
+    mapper.set_soccer(mode.soccer);
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     // A driving pad that went away: the robot sits after a second — see `pad_map::loss`.
@@ -343,15 +345,20 @@ fn main() -> std::process::ExitCode {
                     tracing::warn!("controller settings reloaded");
                 }
             }
-            match ask_roller(&mut stream, &mut next_id) {
-                Ok(Some(now)) if now != config.roller => {
-                    config.roller = now;
-                    tracing::warn!(
-                        roller = config.roller,
-                        "drive mode changed — stick shaping follows"
-                    );
+            match ask_mode(&mut stream, &mut next_id) {
+                Ok(Some(mode)) => {
+                    let now = mode.mode == "roller";
+                    if now != config.roller {
+                        config.roller = now;
+                        tracing::warn!(
+                            roller = config.roller,
+                            "drive mode changed — stick shaping follows"
+                        );
+                    }
+                    // Soccer mode changes what the buttons do, and an NFC tag switches it.
+                    mapper.set_soccer(mode.soccer);
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "mode request failed");
                     return std::process::ExitCode::FAILURE;
@@ -521,13 +528,15 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Whether this robot is on wheels, by asking it. `None` for an answer that did not say.
-fn ask_roller(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<Option<bool>> {
+/// The robot's mode — on wheels or not, and soccer mode — by asking it. `None` for an answer
+/// that did not say.
+fn ask_mode(
+    stream: &mut UnixStream,
+    next_id: &mut u64,
+) -> std::io::Result<Option<proto::ModeResult>> {
     let answer = request(stream, next_id, &proto::Call::RobotMode)?;
     pad_map::report(&proto::Call::RobotMode, answer.as_ref());
-    Ok(answer
-        .and_then(|answer| answer.result_as::<proto::ModeResult>().ok())
-        .map(|mode| mode.mode == "roller"))
+    Ok(answer.and_then(|answer| answer.result_as::<proto::ModeResult>().ok()))
 }
 
 /// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.

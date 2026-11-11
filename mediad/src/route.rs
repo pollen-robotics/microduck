@@ -67,6 +67,8 @@ fn permits(call: &proto::Call) -> bool {
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
         // Somebody watching the camera is exactly who would want to wave a laser for it.
         RobotLaserTrack(_) => true,
+        // And somebody watching the camera is who would roll a ball for it.
+        RobotSoccer(_) => true,
         // Somebody watching through the camera is who wants the room lit.
         RobotFlashlight(_) => true,
 
