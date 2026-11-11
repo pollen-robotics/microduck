@@ -365,10 +365,9 @@ fn report_photo(outcome: photo::Outcome) {
         photo::Outcome::NoPhoto(why) => {
             tracing::error!(%why, "no photo — sitting, beak open, all the same")
         }
-        photo::Outcome::NotStanding(policy) => tracing::warn!(
-            policy,
-            "the robot is neither standing nor seated — no photo; start it first"
-        ),
+        photo::Outcome::NotStanding(policy) => {
+            tracing::warn!(policy, "the robot did not stand, or is busy — no photo")
+        }
         photo::Outcome::Failed(why) => tracing::error!(%why, "the photo sequence stopped"),
     }
 }
@@ -468,6 +467,14 @@ impl photo::Driver for Sockets {
 
     fn policy(&mut self) -> Result<String, String> {
         state_policy(&self.robot, QUICK_ANSWER)
+    }
+
+    fn start(&mut self) -> Result<proto::IntentResult, String> {
+        let params = proto::EnableParams {
+            on: true,
+            toggle: false,
+        };
+        call(&self.robot, &proto::Call::RobotEnable(params), QUICK_ANSWER)
     }
 
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {

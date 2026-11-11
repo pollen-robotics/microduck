@@ -7,8 +7,10 @@
 //! 1. A quack, so the person holding the tag knows it was read.
 //! 2. Standing, still: laser tracking off (it would walk the robot to a dot), `robot.stop`, and a
 //!    seated robot stood up with `robot.do sit` — a toggle, so the robot's `robot.state` policy is
-//!    read first. A robot that is neither standing nor seated (limp, homing, mid-skill) is left
-//!    alone and the touch ends there.
+//!    read first. A robot whose policy is not driving (`held`: limp, or stood up by `robot.init`
+//!    alone) is started with `robot.enable`, the pad's Start, so the tag works with no pad around;
+//!    the sequence waits up to [`START_WITHIN`] for it to stand. A robot busy with something else
+//!    (a skill, a ground pick, a rest) is left alone and the touch ends there.
 //! 3. The head lifts a little: `robot.look` at a point ahead and above, and the joints it answers
 //!    resent through `robot.head` for as long as the pose must hold, which keeps the idle
 //!    look-around from taking the head back after its two seconds.
@@ -55,6 +57,11 @@ pub const LOOK_UP: proto::LookParams = proto::LookParams {
 
 /// A seated robot standing up: `sitstand_rise_s` is 1 s by default, and the policy settles after.
 const RISE: Duration = Duration::from_millis(1500);
+/// How long a started robot has to come up standing: from limp it ramps torque on and goes to its
+/// home pose first.
+pub const START_WITHIN: Duration = Duration::from_secs(8);
+/// How often its policy is read meanwhile.
+const START_POLL: Duration = Duration::from_millis(250);
 /// After `robot.stop`, for the walk to wind down before the pose.
 const STILL: Duration = Duration::from_millis(500);
 /// For the head to reach the pose before the countdown starts.
@@ -103,6 +110,8 @@ pub trait Driver {
     fn stop(&mut self) -> Result<proto::IntentResult, String>;
     /// The `policy` of one `robot.state` frame: `walk`, `stand`, `sit`, `rise`, `held`, ...
     fn policy(&mut self) -> Result<String, String>;
+    /// `robot.enable` on: the pad's Start.
+    fn start(&mut self) -> Result<proto::IntentResult, String>;
     /// `robot.do sit`, which stands a seated robot up and sits a standing one.
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String>;
     /// `robot.look`.
@@ -128,7 +137,8 @@ pub enum Outcome {
     Taken(PathBuf),
     /// The pose ran, there is no picture, and why.
     NoPhoto(String),
-    /// The robot was not standing or seated, so nothing moved: its policy then.
+    /// The robot was busy with something else, or did not come up standing once started: its
+    /// policy then.
     NotStanding(String),
     /// `robotd` could not be asked, or refused a step the sequence needs.
     Failed(String),
@@ -148,10 +158,24 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     if let Err(why) = asked("robot.stop", robot.stop()) {
         return Outcome::Failed(why);
     }
-    let policy = match robot.policy() {
+    let mut policy = match robot.policy() {
         Ok(p) => p,
         Err(why) => return Outcome::Failed(format!("robot.state: {why}")),
     };
+    if matches!(policy.as_str(), "held" | "homing") {
+        if let Err(why) = asked("robot.enable", robot.start()) {
+            return Outcome::Failed(why);
+        }
+        let mut waited = Duration::ZERO;
+        while !matches!(policy.as_str(), "walk" | "stand") && waited < START_WITHIN {
+            robot.sleep(START_POLL);
+            waited += START_POLL;
+            policy = match robot.policy() {
+                Ok(p) => p,
+                Err(why) => return Outcome::Failed(format!("robot.state: {why}")),
+            };
+        }
+    }
     match policy.as_str() {
         "walk" | "stand" => robot.sleep(STILL),
         "sit" => {
@@ -386,6 +410,8 @@ mod tests {
 
     struct Fake {
         policy: String,
+        /// What the policy becomes once `robot.enable` is asked; `None` stays where it was.
+        started: Option<String>,
         camera: Result<Vec<u8>, String>,
         no_light: bool,
         calls: Vec<String>,
@@ -401,6 +427,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 policy: "stand".into(),
+                started: Some("stand".into()),
                 camera: Ok(b"jpeg".to_vec()),
                 no_light: false,
                 calls: Vec::new(),
@@ -428,6 +455,13 @@ mod tests {
         }
         fn policy(&mut self) -> Result<String, String> {
             Ok(self.policy.clone())
+        }
+        fn start(&mut self) -> Result<proto::IntentResult, String> {
+            self.calls.push("start".into());
+            if let Some(p) = &self.started {
+                self.policy = p.clone();
+            }
+            Ok(proto::IntentResult::accepted())
         }
         fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
             self.calls.push("sit".into());
@@ -545,13 +579,39 @@ mod tests {
         assert_eq!(shape.iter().filter(|c| *c == "sit").count(), 2);
     }
 
+    /// No pad needed: a robot whose policy is not driving is started, as Start would.
     #[test]
-    fn a_limp_robot_is_left_alone() {
+    fn a_robot_not_driving_is_started_first() {
         let mut robot = Fake {
             policy: "held".into(),
             ..Fake::default()
         };
+        assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
+        assert_eq!(
+            &shape(&robot.calls)[..5],
+            ["quack", "laser off", "stop", "start", "look"]
+        );
+    }
+
+    #[test]
+    fn a_robot_that_does_not_come_up_is_left_there() {
+        let mut robot = Fake {
+            policy: "held".into(),
+            started: None,
+            ..Fake::default()
+        };
         assert_eq!(on_touch(&mut robot), Outcome::NotStanding("held".into()));
+        assert_eq!(robot.calls, ["quack", "laser off", "stop", "start"]);
+        assert!(robot.slept >= START_WITHIN);
+    }
+
+    #[test]
+    fn a_robot_busy_with_a_skill_is_left_alone() {
+        let mut robot = Fake {
+            policy: "skill".into(),
+            ..Fake::default()
+        };
+        assert_eq!(on_touch(&mut robot), Outcome::NotStanding("skill".into()));
         assert_eq!(robot.calls, ["quack", "laser off", "stop"]);
     }
 
