@@ -25,7 +25,8 @@
 //! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
 //! *converts* anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
 //!
-//! **Nothing converts and nothing rotates.** The head camera is mounted a quarter turn off, and for
+//! **Nothing converts and nothing rotates.** The Zero 3W's head camera is mounted a quarter turn
+//! off (the beta boards' is upright — `robotd_params::board` owns the mount), and for
 //! one afternoon this pipeline fixed that with a `videoflip` before the tee — which broke
 //! `mpph264enc`'s zero-copy path to the 2D engine and had MPP converting every frame in software:
 //! 97 °C, the CPU throttled to 408 MHz, 8 fps out of a 30 fps camera. Rotation is now the
@@ -114,8 +115,8 @@ use tokio::sync::mpsc;
 /// lost by `v4l2src` in one session, and 8 fps out of a 30 fps camera. The boot before that change
 /// had zero RGA failures and zero lost frames.
 ///
-/// So the pipeline no longer rotates pixels. The camera is still mounted a quarter turn off, and the
-/// consumer that has to care rotates for itself, for free: the console does it with a CSS transform
+/// So the pipeline no longer rotates pixels. Where the camera is mounted off upright — a quarter
+/// turn on the Zero 3W — the consumer that has to care rotates for itself, for free: the console does it with a CSS transform
 /// on the GPU, and a perception consumer folds the turn into the resampling it already does.
 /// [`Settings::rotation`] stays for a consumer that genuinely needs an upright *encoded* stream —
 /// `--flip-in-pipeline` — and now that its cost is written down, that is a choice rather than a
@@ -124,7 +125,7 @@ use tokio::sync::mpsc;
 pub enum Rotation {
     /// Leave the frame as the sensor delivered it.
     None,
-    /// A quarter turn clockwise: what this robot's mount needs.
+    /// A quarter turn clockwise: what the Zero 3W's mount needs. The beta boards' is `None`.
     Cw90,
     Cw180,
     /// A quarter turn anticlockwise, for a head assembled the other way round.
@@ -431,6 +432,7 @@ pub fn start(
 
     // `GST_DEBUG` has to be in the environment before `init`, which is when GStreamer parses it.
     set_gstreamer_log_threshold();
+    cap_mpp_encoder_pending_frames();
 
     gst::init().context("gstreamer would not initialise")?;
 
@@ -1175,6 +1177,41 @@ fn set_gstreamer_log_threshold() {
         // SAFETY: single-threaded here — this runs before `gst::init` and before any task is
         // spawned, which is the only point at which setting an env var is sound.
         unsafe { std::env::set_var("GST_DEBUG", "*:WARNING") };
+    }
+}
+
+/// How many frames an `mpph264enc` may hold before it must hand one back. Upstream's default is
+/// sixteen.
+///
+/// **Sixteen starves the camera.** The capture pool is eight deep — `CAPTURE_BUFFERS` plus the
+/// four `v4l2src` adds on top (`raise_capture_buffers` has the arithmetic), and `bufcnt:8` in
+/// `/proc/rkisp-vir0` on an idle board — and since gstreamer-rockchip took DMABuf input on its
+/// encoders (JeffyCN/mirrors 048e72f) an encoder holds the capture buffers themselves rather than
+/// RGA copies of them. One allowed sixteen can hold all eight, `v4l2src` has nothing to queue, and
+/// capture stops for good — no error, no EOS, just
+/// `frameloss` climbing in `/proc/rkisp-vir0` with `bufcnt:0`. On microduck OS 1.1.0 that happened
+/// three seconds after start, on every boot and before anyone had connected: `webrtcsink`'s codec
+/// discovery pipeline encodes from the same buffers.
+///
+/// Two keeps the encoder pipelined, and an encoder then holds at most three — two in MPP and the
+/// one waiting in `handle_frame` for a slot. Two encoders at once, discovery and a viewer's
+/// session, hold six and leave the pool two. Measured on the beta board: capture held 30 fps where
+/// it had stopped dead, and a 30 s WebRTC session kept it there with `bufcnt` at 7–8.
+const MPP_ENC_MAX_PENDING: &str = "2";
+
+/// Cap every `mpph264enc` this process will create, before any exists. See
+/// [`MPP_ENC_MAX_PENDING`].
+///
+/// The environment rather than the `max-pending` property, because one of those encoders is not
+/// ours to configure: `webrtcsink` builds its discovery pipeline itself, and that is the one that
+/// stalled the camera. The plugin reads `GST_MPP_ENC_MAX_PENDING` once, when the element class is
+/// first initialised, so it reaches every instance including that one. Honoured if already set,
+/// so a board can still be tuned by hand.
+fn cap_mpp_encoder_pending_frames() {
+    if std::env::var_os("GST_MPP_ENC_MAX_PENDING").is_none() {
+        // SAFETY: as in `set_gstreamer_log_threshold`, which runs at the same point and for the
+        // same reason — before `gst::init`, and before any task is spawned.
+        unsafe { std::env::set_var("GST_MPP_ENC_MAX_PENDING", MPP_ENC_MAX_PENDING) };
     }
 }
 

@@ -111,10 +111,11 @@ impl IdleHead {
     }
 
     /// One tick. `still` says nothing is asking for motion right now — the caller decides what
-    /// counts.
+    /// counts, and that includes whether the look-around is switched on in the current mode
+    /// ([`IdleParams::enabled_in`]): the mode can change under a running loop, the tuning cannot.
     pub fn tick(&mut self, now: Instant, still: bool, dt: Duration) -> IdleOffset {
         let p = self.tuning;
-        self.still_since = if still && p.enabled {
+        self.still_since = if still {
             Some(self.still_since.unwrap_or(now))
         } else {
             None
@@ -532,18 +533,6 @@ mod tests {
         let mut idle = IdleHead::new(never, 17);
         let (_, all) = run(&mut idle, t0, 600.0, true);
         assert!(all.iter().all(|o| o.mouth == 0.0), "0 is never");
-    }
-
-    /// Off is off, however still the robot is.
-    #[test]
-    fn disabled_it_does_nothing() {
-        let p = IdleParams {
-            enabled: false,
-            ..IdleParams::default()
-        };
-        let mut idle = IdleHead::new(p, 9);
-        let (_, all) = run(&mut idle, Instant::now(), 30.0, true);
-        assert!(all.iter().all(|o| *o == IdleOffset::default()));
     }
 
     #[test]

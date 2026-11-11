@@ -1,7 +1,9 @@
 //! What a camera frame is, before anything decides what it means.
 //!
-//! The head camera hands out `UYVY` at 1280×720 and is mounted a quarter turn off, so every
-//! consumer of a frame does the same two things first: turn it the right way up, and sample it
+//! The head camera hands out `UYVY` at 1280×720, mounted however the board mounts it — a quarter
+//! turn off on the Zero 3W, upright on the beta boards (`robotd_params::board`'s
+//! `camera_mount_degrees` owns that) — so every consumer of a frame does the same two things
+//! first: turn it the right way up, whatever that takes, and sample it
 //! down to the size it actually wants. Three of them do — `mediad` encoding a JPEG or a PNG,
 //! `duck-detect` feeding a model, and `robotctl monitor` drawing one in a terminal — and this is
 //! the one copy of that arithmetic, so a picture cannot come out upright in one and sideways in
@@ -35,7 +37,7 @@ pub struct Letterbox {
 pub enum Turn {
     #[default]
     None,
-    /// A quarter turn clockwise: what this robot's camera mount needs.
+    /// A quarter turn clockwise: what the Zero 3W's camera mount needs.
     Right,
     Half,
     Left,

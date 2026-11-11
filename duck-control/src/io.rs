@@ -202,6 +202,45 @@ pub trait RobotIo {
     fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
         Ok(None)
     }
+
+    /// Each servo's impact guard state (register 66 on [`crate::model::IMPACT_GUARD_FIRMWARES`]),
+    /// in joint order: 0 armed, 1 braking after an impact, 2 holding softly until the goal comes
+    /// back past the position. A servo on any other firmware answers whatever its unused register
+    /// holds, so the caller masks those out. A transaction of its own, about a millisecond.
+    ///
+    /// `None` from a backend with no servos to ask, which is the default.
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        Ok(None)
+    }
+
+    /// Ping every expected servo and the IMU board: which of them are on the bus at all.
+    ///
+    /// For a running loop whose reads have started failing. A failed sync read says the bus
+    /// transaction failed, not why, and the two answers lead to different places: a servo that
+    /// no longer answers a ping is a cable or a connector, while everything answering and the
+    /// read still failing is the code that reads. Costs a transaction per device and a timeout
+    /// per silent one, so it is asked about a run of failures, never on a tick.
+    ///
+    /// `None` from a backend with no servos to ping, which is the default.
+    fn census(&mut self) -> Result<Option<Census>> {
+        Ok(None)
+    }
+}
+
+/// Who answered a ping — see [`RobotIo::census`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Census {
+    /// Expected servo IDs ([`crate::model::JOINT_IDS`]) that did not answer, in that order.
+    pub missing: Vec<u8>,
+    /// Whether the IMU board answered.
+    pub imu_answers: bool,
+}
+
+impl Census {
+    /// Something on the bus is silent.
+    pub fn anything_missing(&self) -> bool {
+        !self.missing.is_empty() || !self.imu_answers
+    }
 }
 
 /// What a servo can say about itself — see [`RobotIo::servo_identity`].
@@ -251,6 +290,18 @@ pub struct FakeIo {
     pub torque_writes: usize,
     /// Every servo id rebooted, in order.
     pub reboots: Vec<u8>,
+    /// What [`RobotIo::census`] reports. `None`, the default, is a backend with nothing to ping.
+    pub census: Option<Census>,
+    /// How many times [`RobotIo::census`] was asked, so a test can tell "asked about a run of
+    /// failures" from "asked every tick".
+    pub censuses: usize,
+    /// What [`RobotIo::servo_identity`] reports. `None`, the default, is a backend with no servos.
+    pub identity: Option<[ServoIdentity; NUM_JOINTS]>,
+    /// What [`RobotIo::impact_guard`] reports. `None`, the default, is a backend with no servos.
+    pub impact_guard: Option<[u8; NUM_JOINTS]>,
+    /// How many times [`RobotIo::impact_guard`] was asked: it is a bus transaction, and a test
+    /// has to be able to tell "while someone records" from "every tick".
+    pub impact_guard_reads: usize,
 }
 
 impl Default for FakeIo {
@@ -280,6 +331,11 @@ impl FakeIo {
             torque: None,
             torque_writes: 0,
             reboots: Vec::new(),
+            census: None,
+            censuses: 0,
+            identity: None,
+            impact_guard: None,
+            impact_guard_reads: 0,
         }
     }
 
@@ -383,6 +439,20 @@ impl RobotIo for FakeIo {
 
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         self.slow.ok_or(IoError::Simulated)
+    }
+
+    fn census(&mut self) -> Result<Option<Census>> {
+        self.censuses += 1;
+        Ok(self.census.clone())
+    }
+
+    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+        Ok(self.identity)
+    }
+
+    fn impact_guard(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+        self.impact_guard_reads += 1;
+        Ok(self.impact_guard)
     }
 }
 

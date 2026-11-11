@@ -133,9 +133,11 @@ anything an *owner* decides lives there, and anything the *image* decides stays 
   the bundle's install hook (`microduck_yocto`, `microduck-bundle-hook`) copies the running slot's
   base to `/var/lib/robot/robotd.toml.from-slot` while there is no user layer, and the edits are
   adopted from there; it does the same for `hf-token`.
-- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but two keys
-  are per-robot decisions — `allow_dev_keys` on a dev board, `auto_apply = "all"` on a canary —
-  and on an A/B robot an OS update currently puts both back to the image's values. Open.
+- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but one key
+  is a per-robot decision — `auto_apply = "all"` on a canary — and on an A/B robot an OS update
+  currently puts it back to the image's value. Open. Being a dev board was the other one, and
+  is no longer a key here: it is a marker under `/var/lib/robot`
+  ([`updater-design.md`](updater-design.md) §5.4).
 - On a robot installed by `install.sh`, which has no slots, `/etc` survives anyway; the layers
   change nothing there but where an edit lands.
 
@@ -380,8 +382,9 @@ update", "select model" are actions, dispatched as RPC to the owning service.
 
 ### 3.2 The face LEDs
 
-The beta board's face carries twelve LEDs on a GPIO expander, which its device tree names
-`face:<place>:<colour>` under `/sys/class/leds`. An LED shows a piece of state, so it follows
+The beta board's face carries twelve LEDs on a GPIO expander and face-board-v1's on PWM drivers;
+either device tree names them `face:<place>:<colour>` under `/sys/class/leds`, and on is the LED's
+`max_brightness`. An LED shows a piece of state, so it follows
 invariant 4: **each LED has one writer, the daemon that owns what it shows.** A Zero 3W has none of
 them, and every owner does nothing on a board without its LED.
 

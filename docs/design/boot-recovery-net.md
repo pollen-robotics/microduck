@@ -128,6 +128,15 @@ marks the slot good.
   enabled but never started for the same reason: an `OnBootSec=` timer started past its deadline fires
   immediately.
 
+### Off unless asked for
+
+The check hands over only when `[update_gate] auto_rollback = true` in `robotd.toml`, read like the
+deadline from both layers with the owner's winning, and off by default
+([`updater-design.md`](updater-design.md) §8 says why). Off, a boot that did not come up is named
+in the journal with the command that does the rescue by hand, `robot-rescue --reboot`. The check
+then exits 2, declined, and nothing moves. `--dry-run` answers the same either way, because the OS's
+slot gate asks with it and is not this setting's business.
+
 ## The membership rule
 
 The objection to "any daemon fails → roll back" is that a daemon may fail for reasons a rollback

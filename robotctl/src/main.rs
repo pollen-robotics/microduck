@@ -44,6 +44,7 @@ use robotd_params::board::Board;
 mod camera;
 mod cells;
 mod configure;
+mod dev_daemon;
 mod duck;
 mod endurance;
 mod frame;
@@ -51,6 +52,7 @@ mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
+mod setup_code;
 mod show;
 mod vetbook;
 
@@ -241,6 +243,21 @@ enum Namespace {
         off: bool,
     },
 
+    /// Follow a laser dot: the head looks at it and the robot walks to it.
+    ///
+    /// `on` and `off` switch it, and it stays as set — a pad still drives normally, and wins over
+    /// the dot whenever a stick is pushed. With no argument, or after `on`, this watches what the
+    /// camera sees until Ctrl-C (which leaves tracking as it is).
+    ///
+    /// The readout is how `[laser]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// colour of the reddest bright thing in the picture whether it passed or not — point the
+    /// laser, read it, and set y_min / v_min a little below and u_max a little above.
+    LaserTrack {
+        /// `on` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
     ///
     /// Every key the daemon knows, feature switches first, current value against default, one
@@ -248,6 +265,9 @@ enum Namespace {
     /// this build does not know survive untouched, and nothing is written that robotd's own
     /// validation would reject. The config is read once at robotd's startup, so saving offers
     /// a restart. The file is root-owned: run as `sudo robotctl configure` to write.
+    ///
+    /// One row is not robotd's: `allow_dev_daemon`, at the top, makes this robot a dev board
+    /// (the same as `--allow-dev-daemon`).
     Configure {
         /// The file to edit. The default is where a provisioned robot keeps it.
         #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
@@ -263,6 +283,20 @@ enum Namespace {
         /// With `--list`, emit JSON for a support bundle.
         #[arg(long, requires = "list")]
         json: bool,
+
+        /// Make this robot a dev board (`on`), so `robotctl update apply --ref <branch> daemon`
+        /// installs what CI built for that branch — or a robot that only takes releases (`off`).
+        ///
+        /// Nothing to copy: `updaterd` carries the team dev key and uses it only on a dev board.
+        /// The setting is kept under /var/lib/robot, so it survives an OS update, and changing it
+        /// restarts `updaterd`. Run with sudo.
+        #[arg(long, value_name = "on|off", value_parser = parse_on_off, conflicts_with = "list")]
+        allow_dev_daemon: Option<bool>,
+
+        /// `updaterd`'s config, for where it keeps its state: read by `--allow-dev-daemon` and by
+        /// the editor's dev-board row, which is absent when this file is.
+        #[arg(long, default_value = dev_daemon::UPDATER_CONFIG)]
+        updater_config: PathBuf,
     },
 
     /// The gamepad. Pair one, see what is paired, forget one.
@@ -511,6 +545,15 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
+    ///
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
+    SetupCode {
+        #[command(subcommand)]
+        action: Option<SetupCodeAction>,
+    },
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
@@ -519,6 +562,24 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCodeAction {
+    /// Install the 32-byte key, read on stdin as 64 hex characters. Needs root.
+    ///
+    /// On stdin so the key is in no command line or shell history. Refuses to replace an
+    /// existing key, which would invalidate the printed QR and every phone holding the old code.
+    Install {
+        /// Replace an existing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -789,6 +850,120 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         println!("theremin put down");
     }
     Ok(())
+}
+
+/// `robotctl laser-track` — switch laser tracking, and watch what the camera makes of the dot.
+///
+/// Unlike the theremin, Ctrl-C leaves the mode as it is: tracking is meant to be left on while
+/// the robot is driven, and this view is for tuning, not for holding the mode up.
+fn run_laser_track(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let active = state == "on";
+        let outcome: proto::LaserTrackResult = decode(&result_of(client.call(
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active }),
+        )?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        if !active {
+            println!("laser tracking off");
+            return Ok(());
+        }
+        println!("laser tracking on");
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (tracking stays as it is)");
+
+    let mut line = String::new();
+    let mut said_off = false;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(laser) = state.laser else {
+            if !said_off {
+                print!("\r\x1b[K  laser tracking is off — `robotctl laser-track on`");
+                let _ = std::io::stdout().flush();
+                said_off = true;
+            }
+            continue;
+        };
+        said_off = false;
+        print!("\r\x1b[K  {}", laser_line(&laser));
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_laser_track`]: the dot, the colour it was judged on, where it is,
+/// and what the robot is doing about it.
+fn laser_line(laser: &proto::LaserTrackState) -> String {
+    let dot = match &laser.dot {
+        None => format!("{:<26}", laser.camera),
+        Some(dot) => {
+            let seen = match (dot.seen, dot.px, &dot.rejected) {
+                (true, Some([x, y]), _) => format!("DOT ({x:4.0},{y:4.0}) n={:<3}", dot.pixels),
+                (_, _, Some(why)) => format!("{why} (n={})", dot.pixels),
+                _ => "no dot".to_owned(),
+            };
+            let peak = dot
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", dot.hz)
+        }
+    };
+    let target = match laser.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            laser
+                .age_ms
+                .filter(|age| *age > 150)
+                .map(|age| format!(" ({age} ms ago)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let doing = match (laser.head, laser.walk, laser.twist) {
+        (_, true, Some([vx, _, vyaw])) => format!("walk {vx:.2} m/s {vyaw:+.2} rad/s"),
+        (true, false, _) => "looking".to_owned(),
+        (false, false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!("{dot}  {target:<24} {doing}")
 }
 
 /// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
@@ -1207,8 +1382,8 @@ enum UpdateCommand {
         ///
         /// Resolves to the moving `daemon-dev-<ref>` tag CI publishes on every push, so the
         /// exact version — `0.2.0-dev.17.abc1234` — never has to be typed. Dev builds are
-        /// signed with the team key, so a robot only accepts one if `allow_dev_keys` is on
-        /// and that key is in its trusted set: a customer robot refuses them.
+        /// signed with the team key, so a robot only accepts one once it is a dev board
+        /// (`sudo robotctl configure --allow-dev-daemon on`): a customer robot refuses them.
         ///
         /// `conflicts_with` version rather than a silent precedence: asking for both a ref
         /// and a version is a mistake worth reporting, not one to resolve by guessing.
@@ -1241,9 +1416,9 @@ enum UpdateCommand {
         /// reverted. That is the whole difference from `updaterd install --from`, which
         /// forces the gate off and therefore refuses to touch a live release at all.
         ///
-        /// Being local relaxes nothing: a build installs because the dev key is in this
-        /// robot's trusted set and `allow_dev_keys` is on, so a customer robot refuses it
-        /// exactly as it refuses `--ref`.
+        /// Being local relaxes nothing: a build installs because this robot is a dev board
+        /// and so trusts the dev key, and a customer robot refuses it exactly as it refuses
+        /// `--ref`.
         ///
         /// **Not under /tmp or /var/tmp.** `updaterd.service` sets `PrivateTmp=yes`, so the
         /// daemon that reads this directory has its own pair of those and neither is the one
@@ -1828,6 +2003,11 @@ struct HealthReport {
     /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<proto::CameraStats>,
+    /// Seconds since `mediad` last rewrote [`HealthReport::camera`], set only when that is longer
+    /// than [`proto::CAMERA_STATS_MAX_AGE`]: the camera has stopped, and `camera.fps` is the rate
+    /// it had when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_stopped_secs: Option<u64>,
     /// What `mediad`'s relay last published about the rendezvous service. `None` for the camera's
     /// reasons, plus `--no-remote`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1976,6 +2156,9 @@ fn run_health(
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
+        camera_stopped_secs: proto::camera_stats_age()
+            .filter(|age| *age > proto::CAMERA_STATS_MAX_AGE)
+            .map(|age| age.as_secs()),
         remote: proto::read_remote_status(),
         account: Client::connect(socket)
             .ok()
@@ -2080,6 +2263,13 @@ fn render_health(report: &HealthReport) -> String {
                     format!("servos ok, waiting for the IMU board, {n} attempts")
                 }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
+                (n, _) if !health.bus.missing.is_empty() => format!(
+                    "{n} consecutive read failures, not answering: {}",
+                    health.bus.describe_missing()
+                ),
+                (n, _) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("{n} consecutive read failures, servos ok, the IMU board is silent")
+                }
                 (n, _) => format!("{n} consecutive read failures"),
             };
             let _ = writeln!(out, "  {:<9} {bus}", "bus");
@@ -2196,7 +2386,15 @@ fn render_health(report: &HealthReport) -> String {
     // rather than about which release is installed. Omitted entirely when `mediad` has published
     // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
     // running is already a line in the units block.
-    if let Some(camera) = &report.camera {
+    if let (Some(camera), Some(secs)) = (&report.camera, report.camera_stopped_secs) {
+        // A stopped camera first, in words: its file still holds the last rate it had, and
+        // printing that as current is how a dead camera read as "10.0 fps (target 30)".
+        let _ = writeln!(
+            out,
+            "camera    stopped — no frame for {secs}s (was {:.1} fps, {}x{} {})",
+            camera.fps, camera.width, camera.height, camera.format
+        );
+    } else if let Some(camera) = &report.camera {
         let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
             format!("{:.1} fps", camera.fps)
         } else {
@@ -2477,6 +2675,7 @@ fn describe_attempt(entry: &proto::LogEntry) -> String {
         proto::Outcome::Success => format!("{target}: applied"),
         proto::Outcome::RolledBack { reason } => format!("{target}: ROLLED BACK — {reason}"),
         proto::Outcome::Aborted { reason } => format!("{target}: refused — {reason}"),
+        proto::Outcome::Stuck { reason } => format!("{target}: STUCK — {reason}"),
     }
 }
 
@@ -3040,6 +3239,7 @@ impl Failure {
             code::BUSY => exit::BUSY,
             code::INCOMPATIBLE
             | code::PREFLIGHT_FAILED
+            | code::SESSIONS_CONNECTED
             | code::VERIFICATION_FAILED
             | code::WOULD_DOWNGRADE
             | code::NOT_INSTALLED
@@ -3342,6 +3542,14 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
 }
 
 fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Local files only: no daemon is involved in showing or installing the key.
+    if let SystemCommand::SetupCode { action } = &command {
+        return match action {
+            None => setup_code::show(),
+            Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
+        };
+    }
     // Asked before connecting, so a robot is not disturbed by a command the operator then
     // aborts.
     if let SystemCommand::Reboot { yes: false, .. } = &command {
@@ -3366,6 +3574,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             *json,
         ),
         SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -3418,6 +3627,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             let reboot: proto::RebootResult = decode(&result)?;
             println!("rebooting in {}s", reboot.in_seconds);
         }
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -5016,7 +5226,7 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
             }
             Ok(())
         }
-        proto::PadPairResult::Failed { reason, detail } => {
+        proto::PadPairResult::Failed { reason, detail, .. } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
                     "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
@@ -5399,14 +5609,25 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
         }
+        Namespace::LaserTrack { state } => {
+            return run_laser_track(&cli.robot_socket, state.as_deref());
+        }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
         }
-        Namespace::Configure { file, list, json } => {
-            let result = if list {
+        Namespace::Configure {
+            file,
+            list,
+            json,
+            allow_dev_daemon,
+            updater_config,
+        } => {
+            let result = if let Some(on) = allow_dev_daemon {
+                dev_daemon::run(&updater_config, on)
+            } else if list {
                 configure::list(&file, json)
             } else {
-                configure::run(&file, &cli.robot_socket)
+                configure::run(&file, &cli.robot_socket, &updater_config)
             };
             return result.map_err(|e| Failure::new(exit::FAILED, e));
         }
@@ -5675,6 +5896,15 @@ fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
 fn compact(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
+/// `on`/`off` for a flag that takes one, accepting the obvious spellings of each.
+fn parse_on_off(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(format!("`{other}` is not on or off")),
+    }
+}
+
 #[cfg(test)]
 mod head_imu_tests {
     use super::head_attitude;
@@ -6652,6 +6882,7 @@ mod tests {
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
             camera: None,
+            camera_stopped_secs: None,
             remote: None,
             account: None,
             board: BoardReport {
@@ -6883,6 +7114,22 @@ mod tests {
             out.contains("camera    19.6 fps (target 30), 1280x720 UYVY, 412 dropped — 2 viewers"),
             "{out}"
         );
+    }
+
+    /// A camera whose stats have gone stale has stopped, and says so rather than repeating the
+    /// last rate it had — which is what a camera that died three seconds after boot looked like.
+    #[test]
+    fn health_renders_a_stopped_camera() {
+        let mut report = health_report(None, None);
+        report.camera = Some(camera_stats(10.0, 48, 0));
+        report.camera_stopped_secs = Some(312);
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    stopped — no frame for 312s (was 10.0 fps, 1280x720 UYVY)"),
+            "{out}"
+        );
+        assert!(!out.contains("target"), "{out}");
     }
 
     /// No `mediad`, no line. A robot that has never started it should not read as having a fault.
@@ -7433,6 +7680,12 @@ mod tests {
         }));
         assert!(rolled.contains("ROLLED BACK"), "{rolled}");
         assert!(rolled.contains("not healthy within 30s"), "{rolled}");
+        // Left live after a failed gate: something changed, so not "refused".
+        let stuck = describe_attempt(&entry(proto::Outcome::Stuck {
+            reason: "not healthy within 30s; auto-rollback is off".into(),
+        }));
+        assert!(stuck.contains("STUCK"), "{stuck}");
+        assert!(!stuck.contains("refused"), "{stuck}");
 
         // A first install has no `from`, and must not render as "None → 1.0.0".
         let first = proto::LogEntry {

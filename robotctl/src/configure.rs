@@ -44,6 +44,14 @@
 //! set of keys — what to restart, what to reload, and what needs nothing at all.
 //!
 //! The file is root-owned; run as `sudo robotctl configure` to actually write.
+//!
+//! ## The one row that is not `robotd.toml`
+//!
+//! `allow_dev_daemon`, under `[dev board]` at the top: whether this robot takes branch builds.
+//! It is a marker in `updaterd`'s state directory, not a key in this file
+//! ([`crate::dev_daemon`]), so it is not a [`Row`] and the model never sees it. It saves with
+//! everything else and adds `updaterd` to the restart offer. Absent where there is no
+//! `updater.toml` to find that directory from.
 
 use std::path::Path;
 
@@ -146,8 +154,15 @@ fn apply_for(key: &str) -> Option<Apply> {
         // The boot check's, not robotd's: `scripts/robot-boot-check` reads it once per boot, and
         // offering a robotd restart for it would be an edit that appears to do something.
         "update_gate" if name == "boot_deadline_s" => Apply::NextBoot("robot-boot-check"),
+        // `updaterd` reads it at the moment it would revert, the way it reads `allow_community`;
+        // the boot check reads it once per boot, as it does `boot_deadline_s`. Neither is robotd.
+        "update_gate" if name == "auto_rollback" => Apply::Live("updaterd"),
+        // `robotd`'s laser reader re-reads `[laser]` within a second of the file changing —
+        // tuning it is many small edits, and each must not drop the robot. `enabled` included:
+        // an edit to it switches tracking there and then.
+        "laser" => Apply::Live("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
-        | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+        | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
     })
 }
@@ -359,11 +374,31 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-/// What the list shows at one line: a section header, or a key.
+/// What the list shows at one line: a section header, a key, or the dev-board switch — which is
+/// not in `robotd.toml` and so not a [`Row`] ([`crate::dev_daemon::Switch`]).
 #[derive(Debug)]
 enum Item {
     Header(&'static str),
     Key(usize),
+    DevDaemon,
+}
+
+/// The header the dev-board switch sits under, at the top of the list.
+const DEV_HEADER: &str = "dev board";
+
+/// Is the dev-board switch toggled and not yet saved?
+fn dev_pending(switch: Option<&crate::dev_daemon::Switch>) -> bool {
+    switch.is_some_and(|switch| switch.pending.is_some())
+}
+
+/// The list with the dev-board switch at the top, where there is one.
+fn with_dev_row(items: Vec<Item>, switch: Option<&crate::dev_daemon::Switch>) -> Vec<Item> {
+    if switch.is_none() {
+        return items;
+    }
+    let mut out = vec![Item::Header(DEV_HEADER), Item::DevDaemon];
+    out.extend(items);
+    out
 }
 
 /// Where input goes right now.
@@ -415,19 +450,26 @@ fn ignored_note(model: &Model) -> Option<String> {
 ///
 /// `robot_socket` is only reached for a `[policy]` change, and only if the operator accepts the
 /// reload — the editor is useful on a board where nothing is running.
-pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
+///
+/// `updater_config` is where the dev-board switch is read from; with no `updaterd` there, the
+/// editor simply has no such row.
+pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<(), String> {
     // An interactive editor and nothing else: piped in or out, there is no sensible
     // behaviour to fall back to, and ratatui would panic trying to open the terminal.
     if !crate::monitor::stdout_is_a_terminal() {
         return Err("configure is interactive — run it in a terminal".to_owned());
     }
     let mut model = Model::load(path)?;
-    let items = layout_items(&model);
+    let mut dev = crate::dev_daemon::Switch::load(updater_config);
+    let items = with_dev_row(layout_items(&model), dev.as_ref());
     // First key, not the first header.
     let mut cursor = items
         .iter()
-        .position(|item| matches!(item, Item::Key(_)))
+        .position(|item| !matches!(item, Item::Header(_)))
         .unwrap_or(0);
+    // Whether the save wrote the dev-board switch — the part of the exit flow `model.written()`
+    // cannot know about.
+    let mut dev_written = false;
     let mut focus = Focus::List;
     let mut saved = false;
     let mut status: Option<String> = None;
@@ -444,6 +486,7 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                 cursor,
                 &focus,
                 status.as_deref(),
+                dev.as_ref(),
             );
         }) {
             break Err(format!("terminal: {e}"));
@@ -460,13 +503,18 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
         match &mut focus {
             Focus::List => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    if model.pending.is_empty() {
+                    if model.pending.is_empty() && !dev_pending(dev.as_ref()) {
                         break Ok(saved);
                     }
                     focus = Focus::Confirm;
                 }
                 KeyCode::Up | KeyCode::Char('k') => cursor = step(&items, cursor, -1),
                 KeyCode::Down | KeyCode::Char('j') => cursor = step(&items, cursor, 1),
+                KeyCode::Char(' ') | KeyCode::Enter if matches!(items[cursor], Item::DevDaemon) => {
+                    if let Some(switch) = dev.as_mut() {
+                        switch.toggle();
+                    }
+                }
                 KeyCode::Char(' ') => {
                     if let Item::Key(index) = items[cursor] {
                         let row = &rows[index];
@@ -501,11 +549,17 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                         hit: 0,
                     };
                 }
-                KeyCode::Char('u') | KeyCode::Char('d') => {
-                    if let Item::Key(index) = items[cursor] {
+                KeyCode::Char('u') | KeyCode::Char('d') => match items[cursor] {
+                    Item::Key(index) => {
                         model.pending.insert(rows[index].entry.key, Edit::Clear);
                     }
-                }
+                    Item::DevDaemon => {
+                        if let Some(switch) = dev.as_mut() {
+                            switch.revert();
+                        }
+                    }
+                    Item::Header(_) => {}
+                },
                 _ => {}
             },
             Focus::Editing { buffer, error } => match key.code {
@@ -566,8 +620,22 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     // Read before the save, which clears `pending` — after it there is nothing
                     // left to say which daemons were affected.
-                    let plan = plan_for(&model);
-                    match model.save() {
+                    let mut plan = plan_for(&model);
+                    if dev_pending(dev.as_ref()) {
+                        plan.restart.push("updaterd");
+                    }
+                    let result = if model.pending.is_empty() {
+                        Ok(())
+                    } else {
+                        model.save()
+                    };
+                    // The marker after the file: a rejected `robotd.toml` leaves the switch
+                    // pending too, so a retry writes both or neither.
+                    let result = result.and_then(|()| match dev.as_mut() {
+                        Some(switch) => switch.save().map(|changed| dev_written |= changed),
+                        None => Ok(()),
+                    });
+                    match result {
                         Ok(()) => {
                             saved = true;
                             if plan.is_quiet() {
@@ -616,6 +684,18 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
         return Ok(());
     }
 
+    if dev_written {
+        if dev.as_ref().is_some_and(|switch| switch.on) {
+            println!(
+                "this robot is now a dev board — install a branch build with\n  \
+                 sudo robotctl update apply --ref <branch> daemon\n\
+                 (without --ref or --version, `update apply` installs the latest stable release)"
+            );
+        } else {
+            println!("this robot is no longer a dev board");
+        }
+    }
+
     if !agreed.restart.is_empty() {
         let names = agreed.restart.join(" and ");
         println!("restarting {names}…");
@@ -642,8 +722,14 @@ pub fn run(path: &Path, robot_socket: &Path) -> Result<(), String> {
     if agreed.is_quiet() {
         // Declined, or never asked. Say where the change is and what it is waiting on, since
         // the two answers are different and only one of them is a thing to do.
-        let plan = plan_for_written(&edited);
-        println!("written to {}", path.display());
+        let mut plan = plan_for_written(&edited);
+        if dev_written {
+            plan.restart.push("updaterd");
+        }
+        if !edited.is_empty() {
+            println!("written to {}", path.display());
+        }
+
         if !plan.restart.is_empty() {
             println!(
                 "  applies on:  sudo systemctl restart {}",
@@ -741,6 +827,7 @@ fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
         .enumerate()
         .filter_map(|(at, item)| match item {
             Item::Key(index) => Some((row_score(&rows[*index], query)?, at)),
+            Item::DevDaemon => Some((dev_score(query)?, at)),
             Item::Header(_) => None,
         })
         .collect();
@@ -767,6 +854,25 @@ fn row_score(row: &Row, query: &str) -> Option<i32> {
         } else {
             let at = text.find(&lower)?;
             50 - (at / 10) as i32
+        };
+    }
+    Some(total)
+}
+
+/// [`row_score`] for the dev-board switch: typed into its name, or verbatim in its header or doc.
+fn dev_score(query: &str) -> Option<i32> {
+    use crate::dev_daemon::Switch;
+    let text = format!("{DEV_HEADER} {}", Switch::DOC).to_lowercase();
+    let mut total = 0;
+    for word in query.split_whitespace() {
+        let lower = word.to_lowercase();
+        total += if let Some(at) = Switch::NAME.find(&lower) {
+            let word_start = at == 0 || !Switch::NAME.as_bytes()[at - 1].is_ascii_alphanumeric();
+            300 + if word_start { 20 } else { 0 } - at as i32
+        } else if let Some(score) = fuzzy_score(word, Switch::NAME) {
+            100 + score
+        } else {
+            50 - (text.find(&lower)? / 10) as i32
         };
     }
     Some(total)
@@ -808,7 +914,7 @@ fn step(items: &[Item], cursor: usize, direction: isize) -> usize {
         if at < 0 || at as usize >= items.len() {
             return cursor;
         }
-        if matches!(items[at as usize], Item::Key(_)) {
+        if !matches!(items[at as usize], Item::Header(_)) {
             return at as usize;
         }
     }
@@ -823,6 +929,7 @@ fn draw(
     cursor: usize,
     focus: &Focus,
     status: Option<&str>,
+    dev: Option<&crate::dev_daemon::Switch>,
 ) {
     // Ignored keys stay on screen in a line of their own, in yellow: they are not an error to
     // clear with a keypress, and not something this editor can fix.
@@ -846,7 +953,7 @@ fn draw(
             .rev()
             .find_map(|item| match item {
                 Item::Header(section) => Some(*section == "features"),
-                Item::Key(_) => None,
+                Item::Key(_) | Item::DevDaemon => None,
             })
             .unwrap_or(false)
     };
@@ -858,6 +965,32 @@ fn draw(
                     format!("[{section}]"),
                     Style::new().add_modifier(Modifier::BOLD).cyan(),
                 )));
+            }
+            Item::DevDaemon => {
+                let Some(switch) = dev else { continue };
+                // The same two markers and colour as a key: `*` toggled and unsaved, `•` and
+                // yellow this robot is not at the default, which is off.
+                let marker = if switch.pending.is_some() {
+                    "*"
+                } else if switch.on {
+                    "•"
+                } else {
+                    " "
+                };
+                let value = if switch.shown() {
+                    Span::styled("on (default off)", Style::new().yellow())
+                } else {
+                    Span::styled("off", Style::new().dim())
+                };
+                let mut line = Line::from(vec![
+                    Span::raw(format!(" {marker} ")),
+                    Span::raw(format!("{:<30}", crate::dev_daemon::Switch::NAME)),
+                    value,
+                ]);
+                if at == cursor {
+                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+                lines.push(line);
             }
             Item::Key(index) => {
                 let row = &rows[*index];
@@ -923,9 +1056,20 @@ fn draw(
             }),
         ],
         Focus::Confirm => {
-            let changes = summary(model).join(", ");
+            let mut changes = summary(model);
+            if let Some(on) = dev.and_then(|switch| switch.pending) {
+                changes.push(format!(
+                    "{} = {}",
+                    crate::dev_daemon::Switch::NAME,
+                    if on { "on" } else { "off" }
+                ));
+            }
             vec![
-                Line::from(format!("save {} change(s)? {changes}", model.pending.len())),
+                Line::from(format!(
+                    "save {} change(s)? {}",
+                    changes.len(),
+                    changes.join(", ")
+                )),
                 Line::from("y save · n discard · ESC back"),
             ]
         }
@@ -956,6 +1100,7 @@ fn draw(
         Focus::Search { .. } => {
             let doc = match items.get(cursor) {
                 Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
                 _ => "",
             };
             vec![
@@ -966,6 +1111,7 @@ fn draw(
         Focus::List => {
             let doc = match items.get(cursor) {
                 Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
                 _ => "",
             };
             vec![
@@ -1080,7 +1226,7 @@ mod tests {
         let items = layout_items(&m);
         let name_of = |at: usize| match items[at] {
             Item::Key(index) => rows[index].entry.key,
-            Item::Header(_) => unreachable!("headers are never hits"),
+            Item::Header(_) | Item::DevDaemon => unreachable!("headers are never hits"),
         };
         let hits = search(&items, &rows, "nominal_volt");
         assert_eq!(name_of(hits[0]), "policy.nominal_voltage");
@@ -1359,7 +1505,7 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
                 .expect("terminal");
             terminal
-                .draw(|frame| draw(frame, &m, &rows, &items, 1, focus, None))
+                .draw(|frame| draw(frame, &m, &rows, &items, 1, focus, None, None))
                 .expect("draws");
             format!("{:?}", terminal.backend().buffer())
         };
@@ -1404,7 +1550,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).expect("terminal");
         terminal
-            .draw(|frame| draw(frame, &m, &rows, &items, cursor, &Focus::List, None))
+            .draw(|frame| draw(frame, &m, &rows, &items, cursor, &Focus::List, None, None))
             .expect("draws");
         let screen = format!("{:?}", terminal.backend().buffer());
         assert!(screen.contains("[features]"), "features head the list");
@@ -1414,6 +1560,63 @@ mod tests {
         assert!(screen.contains("audio.enabled"), "{screen}");
         // The divergence annotation: mode is set away from default.
         assert!(screen.contains("roller (default walk)"), "{screen}");
+    }
+
+    /// The dev-board switch heads the list where there is an `updaterd` to configure, the cursor
+    /// starts on it, toggling it shows as an unsaved change, and search finds it.
+    #[test]
+    fn the_dev_board_switch_is_the_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("updater.toml");
+        std::fs::write(
+            &config,
+            format!("state_dir = \"{}\"\n", dir.path().display()),
+        )
+        .unwrap();
+        let mut switch = crate::dev_daemon::Switch::load(&config).expect("a switch");
+
+        let m = model("");
+        let rows = m.rows();
+        let items = with_dev_row(layout_items(&m), Some(&switch));
+        assert!(matches!(items[0], Item::Header(DEV_HEADER)));
+        assert!(matches!(items[1], Item::DevDaemon));
+        assert_eq!(step(&items, 1, -1), 1, "the header above it is not a stop");
+        assert!(matches!(
+            items[search(&items, &rows, "dev daemon")[0]],
+            Item::DevDaemon
+        ));
+
+        let screen = |switch: &crate::dev_daemon::Switch, focus: &Focus| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 30))
+                .expect("terminal");
+            terminal
+                .draw(|frame| draw(frame, &m, &rows, &items, 1, focus, None, Some(switch)))
+                .expect("draws");
+            format!("{:?}", terminal.backend().buffer())
+        };
+        let off = screen(&switch, &Focus::List);
+        assert!(off.contains("[dev board]"), "{off}");
+        assert!(off.contains("allow_dev_daemon"), "{off}");
+        assert!(
+            off.contains("restarts updaterd"),
+            "the doc is in the footer: {off}"
+        );
+
+        switch.toggle();
+        let on = screen(&switch, &Focus::List);
+        assert!(on.contains(" * allow_dev_daemon"), "{on}");
+        assert!(on.contains("on (default off)"), "{on}");
+        let confirm = screen(&switch, &Focus::Confirm);
+        assert!(
+            confirm.contains("save 1 change(s)? allow_dev_daemon = on"),
+            "{confirm}"
+        );
+
+        // No `updaterd` here: no row, and nothing else moves.
+        assert_eq!(
+            with_dev_row(layout_items(&m), None).len(),
+            layout_items(&m).len()
+        );
     }
 
     /// A section whose only key is a feature switch draws no header.
@@ -1429,7 +1632,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 Item::Header(h) => Some(*h),
-                Item::Key(_) => None,
+                Item::Key(_) | Item::DevDaemon => None,
             })
             .collect();
         assert!(
@@ -1450,7 +1653,7 @@ mod tests {
         assert!(
             items.iter().any(|item| match item {
                 Item::Key(index) => rows[*index].entry.key == "chorale.accept",
-                Item::Header(_) => false,
+                Item::Header(_) | Item::DevDaemon => false,
             }),
             "chorale.accept must still be editable"
         );

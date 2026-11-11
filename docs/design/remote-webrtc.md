@@ -1,5 +1,12 @@
 # WebRTC: sessions, signalling, and the control channel
 
+> **Security update (production candidate):** `mediad` now binds its signalling,
+> control and HTTP console/snapshot listeners to `127.0.0.1` by default. The
+> authenticated remote relay still connects to that local signaller. Direct LAN
+> WebRTC and `http://<robot>:8080/` no longer work with the secure default; the
+> local-mode design below describes the previous behavior. Do not bind a LAN
+> address until an authenticated local gateway is implemented and tested.
+
 How a phone, a browser or a server-side program drives and observes the robot over WebRTC.
 [`architecture.md`](architecture.md) §5 states the requirement; this owns the mechanism.
 
@@ -450,16 +457,11 @@ Two things have to change for the mutations, and both are small and specific:
   as a JSON-RPC *notification*, which `duck-ipc-proto` documents precisely so a client that
   reconnects mid-update can resubscribe and keep receiving them. So the work is a client that
   reconnects and re-subscribes, not a change to the wire format.
-- **`RobotRemoteSessionActive` has to get more specific.**
-  `updater/src/preflight.rs::check_no_remote_session` refuses an update while a remote session is
-  up, which is right when the session is a *bystander* — someone is on a telepresence call and
-  should not have the robot restarted under them. It is wrong when the session is the *requester*.
-  Nothing sets that flag true yet, so the distinction can be designed in rather than retrofitted:
-  the check needs to know whether this update was asked for over the session it is about to drop.
-
-Worth writing down now precisely because nothing sets the flag yet. The moment `mediad` reports
-honestly, an update requested over WebRTC would refuse itself, and that would look like a bug in
-the update path rather than a missing distinction here.
+- **The requesting session must not refuse itself.** The preflight refuses an update while a
+  WebRTC peer is connected, which is right when the peer is a *bystander* and wrong when it is the
+  *requester*. `os.apply` and `os.switch` already solve this: `mediad` answers the check for a
+  session that is alone (`updater-design.md` §7.2). `update.apply` needs the same arm in
+  `mediad/src/session.rs::exempt_if_alone`, and nothing else.
 
 ## 9. Authority: the premise this feature breaks, noted and not acted on
 

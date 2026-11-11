@@ -831,6 +831,7 @@ install_units() {
             # Enabled by postinstall beside padd; its ExecCondition decides which of the two runs.
             netpadd.service) ;;
             mediad.service) ;;
+            duck-gateway.service) ;;
             # No `enable_unit` of its own, unlike the three above: `postinstall` enabled every
             # unit carrying an `[Install]` section a step earlier, and nothing depends on this
             # one — `robotd` does not read depth and `monitor` says "no depth stream" and
@@ -1043,8 +1044,8 @@ install_token_dropin() {
 # The names are `robotd_params::board::BOARD_LABELS`.
 check_board_name() {
     case "$BOARD" in
-        ""|zero3|beta) ;;
-        *) die "DUCK_BOARD=${BOARD} is not a board: zero3 or beta" ;;
+        ""|zero3|beta|face-board-v1) ;;
+        *) die "DUCK_BOARD=${BOARD} is not a board: zero3, beta or face-board-v1" ;;
     esac
 }
 

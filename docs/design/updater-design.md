@@ -28,7 +28,8 @@ document is the update system only.
   (§5.5).
 - Trigger + monitor updates from the mobile app.
 - **Force-upgrade off known-bad releases** via a minimum-version floor.
-- Never brick a robot: atomic apply, automatic rollback, signed artifacts.
+- Never brick a robot: atomic apply, signed artifacts. Automatic rollback exists but is off by
+  default (§8).
 - Keep it simple; no fleet backend.
 - Be **reusable across the team's other robots** with minimal adaptation.
 - Support a per-component **post-install hook** for migrations / one-off steps.
@@ -310,7 +311,7 @@ writes secret keys `0600`.
 | `release-1.pub/.key` | yes | password manager **and** CI secrets | every robot |
 | `release-2.pub/.key` | yes, **different passphrase** | password manager only — **never CI** | every robot |
 | `release-3.pub/.key` | yes, **different passphrase** | offline; ideally never on a networked machine | every robot |
-| `team.dev.pub/.key` | no | team store + CI | developer boards only |
+| `team.dev.pub/.key` | no | team store + CI | built into every `updaterd`, usable on dev boards only |
 
 Three things this table encodes, each easy to get wrong:
 
@@ -329,8 +330,31 @@ Releases are signed **in CI**, not locally — a deliberate choice, with the app
 that compensates for it documented in [`ci-setup.md`](../project/ci-setup.md).
 
 The dev key is deliberately unencrypted: CI signs non-interactively, and a passphrase
-stored beside the key it protects adds little. Its real protection is structural — it is
-absent from customer robots' trusted sets, and gated there by `allow_dev_keys = false`.
+stored beside the key it protects adds little. Its real protection is structural: it counts
+only on a robot that has been made a dev board.
+
+#### Dev boards
+
+Every `updaterd` carries the dev public key built in (`deploy/dev-key/team.dev.pub`, compiled
+into `updater::verify::BUILTIN_DEV_KEY`), always marked dev-only. A dev-only key is usable only
+when dev keys are allowed, and they are allowed when either of these holds:
+
+- the file `allow-dev-builds` (`duck_ipc_proto::DEV_BUILDS_MARKER`) exists in `state_dir` —
+  written by `sudo robotctl configure --allow-dev-daemon on`, removed by `off`, and toggled by
+  the `allow_dev_daemon` row of the `robotctl configure` editor; or
+- `allow_dev_keys = true` in `updater.toml` — what boards provisioned by `install.sh` with
+  `DUCK_DEV_KEY` carry, alongside a `team.dev.pub` copied into `trusted_keys_dir`.
+
+The marker is the supported way. It lives in `state_dir`, under `/var/lib/robot`, because on an
+A/B robot `/etc` belongs to the image and an OS update replaces it: a flag in `updater.toml` or a
+key file in `/etc/robot/trusted_keys` would quietly stop being there after the next OS update.
+And built in, rather than a file, because the file had to be copied by hand under exactly the
+right name — a copy not ending `.dev.pub` would have been trusted as a *release* key.
+
+So there is one barrier, not two: a root-only switch on the robot. That is what it is worth
+anyway — root on a robot can already install anything. Both are read at `updaterd` startup;
+the command restarts it. The shipped `updater.toml` keeps `allow_dev_keys = false`, and nothing
+ships the marker.
 
 ### 5.5 Models: one component each
 
@@ -425,7 +449,7 @@ What the container cannot cover, and hardware must: a real `systemctl restart`
 against the real filesystem, and whether the health-gate timeouts suit a robot that
 takes tens of seconds to stand up.
 
-**Two boards, one build.** The Zero 3W and the beta are both RK3566, so one aarch64 release
+**Every board, one build.** The Zero 3W and the beta (with either face board) are all RK3566, so one aarch64 release
 runs on either. No variant / IMU / camera matrix, no per-device hardware profile, no artifact
 selection logic: what differs between the boards is the daemon's business, keyed on the board
 the robot declares, not the updater's.
@@ -433,7 +457,7 @@ the robot declares, not the updater's.
 What the updater keeps is deliberately minimal:
 - **`min_hw_rev`** in the manifest (§5.3): one integer, refused when it is above the robot's.
 - **The robot's revision is its declared board**: `[board] version` in `robotd.toml`
-  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2), read before every check.
+  (`robotd_params::board::Board::hw_rev`: zero3 is 1, beta is 2, face-board-v1 is 3), read before every check.
   `hw_rev` in `updater.toml` applies only when no board is declared — every robot installed
   before the board was a setting carries `hw_rev = 1`, and a board provisioned against a
   release that still shipped it does too, so it cannot be allowed to outrank the board.
@@ -622,9 +646,19 @@ side effects:
   stopped/parked (motors safe). `updaterd` still does a light "safe to restart?"
   query to `robotd` and refuses if not — cheap insurance against restarting
   motor control mid-motion.
-- **No active remote session.** Restarting `robotd`/`mediad` mid-telepresence is a
-  bad surprise; refuse, or warn and require explicit confirmation. See
-  [`architecture.md`](architecture.md) §5.
+- **No active remote session.** Restarting `robotd`/`mediad` mid-call is a bad
+  surprise, so the check refuses while any WebRTC peer is connected, with
+  `SESSIONS_CONNECTED` (16) rather than `PREFLIGHT_FAILED` so a client can
+  tell it apart, and `interrupt_sessions` is the explicit confirmation. The count is `mediad`'s:
+  the `consumers` it writes to `/run/mediad/camera.json` every second, read
+  through `duck_ipc_proto::read_webrtc_peers`. A missing or stale file (over
+  5 s) passes, because the check is a courtesy and must never be what refuses
+  a recovery update. A request made over WebRTC by the only peer connected is
+  not refused for its own presence: `mediad` sets `interrupt_sessions` on it
+  before forwarding (`mediad/src/session.rs`, `Seat`). The rendezvous control
+  lane carries no media, so it is counted as its client's peer only while the
+  same remote session also holds the bridged video. A browser still
+  negotiating counts from the moment `webrtcsink` adds it, until it gives up.
 - **Disk space.** Storage is eMMC (finite, wear less of a concern than SD, but
   space still is). Verify free space for download + extract + `keep_previous`
   before starting.
@@ -676,6 +710,24 @@ daemon; it makes the situation true rather than overriding a check that says it 
 and the next update that ships the unit reinstalls it.
 
 ## 8. Health gate & rollback
+
+**Automatic rollback is off by default.** `[update_gate] auto_rollback` in `robotd.toml` turns it
+on; `robotctl configure` has the row. Every path below that reverts without being asked — the gate
+after `update apply`, `select` or `rollback`, the boot counter, and the boot check
+([`boot-recovery-net.md`](boot-recovery-net.md)) — reads it at the moment it would act.
+
+Off is the default because releases now reach robots as tested Yocto images. A separate daemon
+update is the dev-board case, where someone is holding the robot. There, a revert nobody asked
+for does more damage than a broken release left in place: it replaces the code under whoever is
+looking at the robot, as the boot-counter incident below shows. This is a soft deprecation. The
+code stays, tested and one setting away.
+
+With it off, the gate still runs and still decides. A release that fails stays live, and the
+outcome is `Stuck` with a reason that names the command that reverts it
+(`robotctl update rollback <component>`). The trial is cleared, so the boot counter does not ask
+again. The update log records it as `Stuck`, not rolled back, so `known_bad` does not blacklist a
+release nobody reverted. `updaterd` reads the key through `Config::robotd_config`, both layers,
+on every decision. Missing, unreadable or not a bool reads as off.
 
 - After apply, the new `robotd` must clear a **healthy flag** within a
   per-component timeout (motors ack, model loads, media pipeline inits).
@@ -1238,8 +1290,14 @@ The rest is the client's to follow: poll `os.status`, expect the link to drop
 at `rebooting`, and read `last_result` after the reboot.
 
 Routing: `btd` permits all four (§4.1's argument for `update.apply`, and the
-switch is the rollback); `mediad` permits only the reads, because `mediad` is in
-`allow_users` and its transport has no authorisation of its own. A board with
+switch is the rollback), and so does `mediad`. Its transport has no
+authorisation of its own, but neither does the image's page on port 8090, which
+takes the same two mutations from the same LAN; through `mediad` they at least
+pass `updaterd`'s lock and preflight. The reboot drops a WebRTC session as it
+drops a BLE link, and the client rides it out the same way. Another peer's call
+is what the session check (§7.2) protects: with anyone else connected the
+update is refused, and the client asks again with `interrupt_sessions` once its
+user has agreed to drop them. A board with
 no script answers `NOT_SUPPORTED` (15). Nothing applies an OS update unattended:
 the periodic check does not look at the channel.
 
@@ -1329,7 +1387,7 @@ Cheap additions that slot into the same IPC / engine and pay off:
   sign, copy, apply. Two things it does *not* do, both deliberate: it is not
   `updaterd install --from`, which forces `on_apply` and the gate off and therefore
   cannot be used on a live release; and it does not relax verification, which is why
-  it needs a dev key on the board rather than a flag that skips a check. The
+  it needs a dev board (§5.4) rather than a flag that skips a check. The
   downgrade guard stands aside for `--from` for the reason it stands aside for
   `--version` — an operator naming a directory is not a mirror that has gone
   backwards, and a local build is a prerelease that sorts below whatever the board is

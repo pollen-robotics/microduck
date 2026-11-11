@@ -239,10 +239,10 @@ fn permits(call: &proto::Call) -> bool {
         ResetToGolden(_) => false,
 
         // `updaterd`'s private questions to `robotd` — may I restart the control loop, which
-        // model API is this, is a telepresence session live. Internal plumbing of the update
+        // model API is this. Internal plumbing of the update
         // decision, of no use to a client and misleading if exposed: a phone reading
         // `safeToRestart` would learn nothing it could act on.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi => false,
 
         // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
         // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
@@ -300,6 +300,8 @@ fn permits(call: &proto::Call) -> bool {
         // mouth, because what it is is a sound: the mouth is following the note. Same
         // refusal either way, and the same reason to lift it — an app that can play the duck.
         RobotTheremin(_) | RobotChorale(_) => false,
+        // Motor control by another name: the dot walks the robot, and the radio is not a control transport.
+        RobotLaserTrack(_) => false,
         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
         RobotFlashlight(_) => false,
 
@@ -734,7 +736,6 @@ mod tests {
             }),
             proto::Call::RobotSafeToRestart,
             proto::Call::RobotModelApi,
-            proto::Call::RobotRemoteSessionActive,
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());
         }

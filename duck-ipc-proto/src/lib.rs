@@ -491,7 +491,52 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::TELEMETRY_STATUS`] and [`method::TELEMETRY_SET`]: whether the robot shares anonymous
 /// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
 /// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
-pub const API_VERSION: u32 = 47;
+///
+/// # v48 — hardware that goes quiet on a running robot
+///
+/// [`BusHealth::missing`] and [`ImuHealth::missing`] are no longer only about the bus coming up.
+/// During a run of failed reads `robotd` pings every servo and the IMU board and fills them the
+/// same way, and `robot.health` reports **degraded** naming what went silent — the verdict the
+/// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
+/// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
+/// shapes: an older reader prints the read failures and does not see the names.
+///
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+///
+/// # v50 — the remote-session check sees WebRTC peers
+///
+/// `os.apply` and `os.switch` are permitted over WebRTC. The preflight's remote-session check,
+/// which `robotd` used to answer with a constant `false`, now counts `mediad`'s WebRTC peers
+/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with the new
+/// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
+/// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
+/// `updaterd`'s question, refused to every client.
+///
+/// # v51 — which pads were in pairing mode
+///
+/// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
+/// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
+/// reads as an empty list, and a client that does not know it ignores it.
+///
+/// # v52 — laser tracking
+///
+/// [`method::ROBOT_LASER_TRACK`] switches laser tracking on or off, and [`RobotState::laser`]
+/// carries what it sees while it is on — absent otherwise, so an older client reads the frame it
+/// always did. Underneath, `robotd` subscribes to `mediad`'s local [`method::MEDIA_LASER`] on
+/// [`socket::MEDIA`]: a `mediad` older than this refuses that method, and the answer to
+/// `robot.laserTrack` says so rather than tracking nothing.
+///
+/// # v53 — the impact guard
+///
+/// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
+/// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
+/// servos have no guard.
+pub const API_VERSION: u32 = 53;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -525,6 +570,16 @@ pub const ROBOT_MODEL: &str = "microduck";
 pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
+
+/// The file in `updaterd`'s `state_dir` whose presence makes this robot a dev board: it trusts
+/// the team dev key `updaterd` carries built in, so `robotctl update apply --ref <branch>`
+/// installs what CI built for that branch.
+///
+/// `robotctl configure --allow-dev-daemon on|off` writes and removes it; `updaterd` reads it at
+/// startup. A file in `state_dir` rather than a key in `updater.toml` because `/etc` is the
+/// image's on an A/B robot and an OS update replaces it, while `state_dir` is under
+/// `/var/lib/robot`, which survives. `docs/design/updater-design.md` §5.4 owns the mechanism.
+pub const DEV_BUILDS_MARKER: &str = "allow-dev-builds";
 
 pub mod led;
 pub mod vetbook;
@@ -639,6 +694,17 @@ pub mod method {
     /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
     pub const MEDIA_FRAME: &str = "media.frame";
 
+    /// Look for a laser dot in the camera frames, on `mediad`'s local socket. Answered with
+    /// `null`, then a stream of [`MEDIA_LASER_DOT`] notifications for as long as the connection
+    /// stays open — closing it is how a subscriber stops the detector.
+    ///
+    /// Local-only, like [`MEDIA_FRAME`], and not a `Call`: its only client is `robotd`, which
+    /// turns a direction into a place on the floor. Params are [`super::LaserDetectParams`].
+    pub const MEDIA_LASER: &str = "media.laser";
+    /// `mediad` → subscriber: one look's answer, [`super::LaserDot`]. Sent whether or not a dot
+    /// was found, because "nothing" is what lets a tracker let go.
+    pub const MEDIA_LASER_DOT: &str = "media.laserDot";
+
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
     pub const ROLLBACK: &str = "update.rollback";
@@ -665,8 +731,6 @@ pub mod method {
     pub const ROBOT_HEALTH: &str = "robot.health";
     /// Which model API version does this build implement?
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
-    /// Is a telepresence session live?
-    pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
 
     // ── intents ──────────────────────────────────────────────────────────────
     //
@@ -778,6 +842,15 @@ pub mod method {
     /// what the sensor said about the frame — which is the field diagnostic for this whole
     /// feature.
     pub const ROBOT_THEREMIN: &str = "robot.theremin";
+    /// Switch laser tracking on or off: a laser dot on the floor in front of the camera is
+    /// followed with the head and walked to. Discrete; send as a request, idempotent both ways.
+    ///
+    /// It shares the robot with every other driver rather than taking it: a client stick that is
+    /// deflected wins over the dot, and with no dot in sight the robot does what it was asked
+    /// to. [`ROBOT_STATE`]'s `laser` block carries what the camera sees — including the colour
+    /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
+    /// `[laser]` needs.
+    pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1100,6 +1173,11 @@ pub mod code {
     /// board whose image has no A/B slots. Not [`METHOD_NOT_FOUND`]: the daemon has the route,
     /// and upgrading the app would not change the answer.
     pub const NOT_SUPPORTED: i32 = 15;
+    /// An update refused only because a WebRTC peer is connected and it would drop them. Its own
+    /// code, not [`PREFLIGHT_FAILED`], because a client answers it differently from every other
+    /// refusal: it asks its user whether to drop them, and on yes sends the same call again with
+    /// `interrupt_sessions`. Matching a message would break the first time it was reworded.
+    pub const SESSIONS_CONNECTED: i32 = 16;
 }
 
 /// Request identifier. `None` on a [`Request`] makes it a notification.
@@ -1140,7 +1218,6 @@ pub enum Call {
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
-    RobotRemoteSessionActive,
 
     // ── intents ──────────────────────────────────────────────────────────────
     /// Continuous. Send as a notification.
@@ -1171,6 +1248,8 @@ pub enum Call {
     RobotFlashlight(FlashlightParams),
     /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
     RobotTheremin(ThereminParams),
+    /// Switch laser tracking on or off. Discrete; the answer is [`LaserTrackResult`].
+    RobotLaserTrack(LaserTrackParams),
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
@@ -1359,7 +1438,6 @@ impl Call {
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
-            Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotLook(_) => method::ROBOT_LOOK,
@@ -1375,6 +1453,7 @@ impl Call {
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+            Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1572,7 +1651,6 @@ impl Call {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
@@ -1598,6 +1676,7 @@ impl Call {
             | Call::RobotSound(_)
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
@@ -1721,6 +1800,7 @@ impl Call {
             Call::RobotVetbookNote(p) => encode(p),
             Call::RobotVetbookTally(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
+            Call::RobotLaserTrack(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1741,7 +1821,6 @@ impl Call {
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
@@ -1802,7 +1881,6 @@ impl Call {
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
-            method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
@@ -1818,6 +1896,7 @@ impl Call {
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+            method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -1963,7 +2042,6 @@ pub mod test_support {
             Call::RobotSafeToRestart,
             Call::RobotHealth,
             Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
             Call::RobotMove(MoveParams {
                 vx: 0.2,
                 vy: -0.1,
@@ -2604,6 +2682,150 @@ pub struct ThereminState {
     /// "valid" codes and died at exactly that distance, invisibly, for want of this line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor: Option<String>,
+}
+
+/// See [`method::ROBOT_LASER_TRACK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaserTrackParams {
+    /// True switches tracking on, false off. Idempotent both ways.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotLaserTrack`].
+///
+/// Refused only for what the robot knows at the door — `[laser]` will not parse, say. Whether
+/// `mediad` is answering is *not* a refusal: it may be restarting, and the tracker reconnects by
+/// itself; [`LaserTrackState::camera`] says what it is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for LaserTrackResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// What laser tracking is doing, in [`RobotState`]. Absent while tracking is off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackState {
+    /// The camera side, as a line: `looking at 1–15 Hz`, or why it is not — `mediad` not answering,
+    /// no camera geometry. The first thing to read when nothing happens.
+    pub camera: String,
+    /// The newest look's answer from `mediad`, if there has been one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dot: Option<LaserDot>,
+    /// Where the dot is on the floor, in the robot's own heading frame (+x ahead, +y left),
+    /// metres — the last sighting, carried by odometry while it is remembered. `None` when there
+    /// is nothing to follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_m: Option<[f64; 2]>,
+    /// How long since the dot was last seen, milliseconds. `None` before the first sighting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// The head is following the dot this tick.
+    #[serde(default, skip_serializing_if = "not")]
+    pub head: bool,
+    /// The legs are following the dot this tick — false while a client stick is deflected, the
+    /// policy is not driving, or the robot has parked on the dot.
+    #[serde(default, skip_serializing_if = "not")]
+    pub walk: bool,
+    /// The velocity tracking asked for this tick, `[vx, vy, vyaw]` — before the loop's own
+    /// smoothing and limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twist: Option<[f64; 3]>,
+}
+
+/// [`method::MEDIA_LASER`]'s params: what counts as a laser dot, and how often to look.
+///
+/// Thresholds are in the camera's own YUV (BT.601, 0–255; chroma 128 is grey). The stream runs
+/// at its normal auto-exposure — nothing here touches the sensor — so a dot's core saturates
+/// towards white and its *rim* is where the red is: bright and red both, which is what these
+/// gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaserDetectParams {
+    /// Luma a dot pixel must reach.
+    pub y_min: u8,
+    /// Red chroma (Cr / V) a dot pixel must reach.
+    pub v_min: u8,
+    /// Blue chroma (Cb / U) a dot pixel must stay under — rejects bright whites and pinks.
+    pub u_max: u8,
+    /// Fewest pixels around the brightest hit for it to be a dot rather than noise.
+    pub min_pixels: u32,
+    /// Most pixels around the brightest hit for it to still be a dot rather than a red lamp.
+    pub max_pixels: u32,
+    /// How far around the brightest hit belongs to the same dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second with no dot in sight.
+    pub search_hz: f64,
+    /// Looks per second while a dot is being seen, and for a second after.
+    pub track_hz: f64,
+}
+
+impl Default for LaserDetectParams {
+    fn default() -> Self {
+        Self {
+            y_min: 150,
+            v_min: 165,
+            u_max: 140,
+            min_pixels: 3,
+            max_pixels: 600,
+            radius_px: 24,
+            // Measured on a face-board-v1: 3 Hz cost 3.4% of a core in mediad, and each look costs
+            // the same, so 1 Hz is about a third of that — for half a second's wait, on average,
+            // before a dot is first noticed. Tracking itself is unaffected.
+            search_hz: 1.0,
+            track_hz: 15.0,
+        }
+    }
+}
+
+/// One look's answer, the params of [`method::MEDIA_LASER_DOT`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserDot {
+    /// A dot passed every threshold. False is still a message: the tracker needs to hear it.
+    pub seen: bool,
+    /// The dot's direction as a cv2 camera ray `[x, y, 1]` (+x right, +y down, +z out of the
+    /// lens) of the camera **upright** — the board's mount turn and the lens's intrinsics already
+    /// undone, so a consumer needs nothing but the head FK. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ray: Option<[f64; 2]>,
+    /// Where the dot is in the upright picture, pixels, for a readout. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<[f64; 2]>,
+    /// The upright picture's size, `[width, height]` — what `px` and `candidate_px` are in, so a
+    /// display can scale them without knowing the camera or its mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where a candidate that passed the colour thresholds but was then rejected by size sat, in
+    /// the upright picture's pixels — what an overlay draws to show a near miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
+    /// Pixels counted in the dot (sampled, so a fraction of the real area), or 0.
+    pub pixels: u32,
+    /// The best candidate's colour, `[Y, U, V]` — the brightest red-leaning pixel in the frame,
+    /// reported **whether or not it passed**. Point the laser, read this, set the thresholds a
+    /// little below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_yuv: Option<[u8; 3]>,
+    /// Why a candidate was rejected, when there was one and it was: `"too small"`, `"too big"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// The rate this look was taken at, looks per second.
+    pub hz: f64,
+    /// Scan time for this look, milliseconds.
+    pub took_ms: f64,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -3251,7 +3473,8 @@ pub struct SubscribeResult {
     pub ground_pick: Option<String>,
     /// The configurable one-shot skills this robot has, in priority order, and the names
     /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
-    /// has is now config: a client learns them here instead of assuming five.
+    /// has is now config: a client learns them here instead of assuming five. The emotions in
+    /// `[emotions] dir` come last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }
@@ -3760,6 +3983,11 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
+        reason: String,
+    },
 }
 
 /// One line of an update's transcript.
@@ -4004,10 +4232,11 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
-    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
-    /// round, in that table's order. Empty once the bus is up, before the first round, and when
-    /// the port itself would not open. All fifteen is servo power off; some of them is servos
-    /// unplugged, and naming them is the point.
+    /// The expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping round, in that
+    /// table's order. Rounds run while `robotd` waits for the bus, and on a running loop during a
+    /// run of failed reads (non-zero `consecutive_errors`). Empty on a working bus, before the
+    /// first round, and when the port would not open or the ping itself failed. All fifteen is
+    /// servo power off; some of them is servos unplugged, and naming them is the point.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<u8>,
 }
@@ -4067,10 +4296,10 @@ pub struct ImuHealth {
     /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
     /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
     pub consecutive_stale_blocks: u64,
-    /// While the bus is coming up: every servo answered its ping and the IMU board did not.
-    /// `robotd` waits rather than run without orientation, so this is also why it is not
-    /// ticking. Cleared once the bus is up; never set at runtime, where a board that stops
-    /// answering shows as consecutive bus read failures instead.
+    /// Every servo answered its ping and the IMU board did not — the same rounds as
+    /// [`BusHealth::missing`]. While the bus is coming up `robotd` waits rather than run without
+    /// orientation, so this is also why it is not ticking; on a running loop it is why the reads
+    /// are failing. Cleared once a read succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }
@@ -4276,6 +4505,15 @@ pub struct RobotState {
     /// empty is *not reported*, never zero load. (v36)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub currents_ma: Vec<f64>,
+    /// Each joint's impact guard, indexed as [`JOINT_NAMES`]: 0 armed, 1 braking after an
+    /// impact, 2 holding softly until the goal comes back past the position. `null` for a servo
+    /// whose firmware has no guard — anything but ROBOTIS's V3 and V4.
+    ///
+    /// Read after the tick's goal positions are written, and only on ticks with a subscriber, so
+    /// a robot nobody is recording runs the bus it always did. Empty when no servo has the guard,
+    /// or the read failed. (v53)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impact_guard: Vec<Option<u8>>,
     /// Where contact odometry believes the robot is. `default` so a frame from
     /// a `robotd` predating the estimator still parses — zeros, like a robot
     /// that has not moved.
@@ -4285,6 +4523,10 @@ pub struct RobotState {
     /// instrument is down — see [`ThereminState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theremin: Option<ThereminState>,
+    /// What laser tracking sees and does, while it is switched on. Absent otherwise — see
+    /// [`LaserTrackState`]. (v52)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub laser: Option<LaserTrackState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4479,12 +4721,6 @@ pub struct ModelApiResult {
     /// Sensor-input / actuator-output contract this build implements
     /// (`updater-design.md` §5.5).
     pub model_api: u32,
-}
-
-/// Answer to [`Call::RobotRemoteSessionActive`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionActiveResult {
-    pub active: bool,
 }
 
 // ── net.* results ────────────────────────────────────────────────────────────
@@ -4843,6 +5079,15 @@ pub enum PadPairResult {
         reason: PadPairFailure,
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
+        /// For [`PadPairFailure::Ambiguous`]: the pads that were in pairing mode, so a client can
+        /// show them and retry with [`PadPairParams::mac`] set to the one meant. Empty for every
+        /// other reason.
+        ///
+        /// A list rather than `detail`'s prose because the next step needs the addresses: a
+        /// refusal that only said "two pads" left a phone with nothing to offer but "switch one
+        /// off", which is not an option when the other belongs to somebody across the room.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidates: Vec<Pad>,
     },
 }
 
@@ -5785,18 +6030,74 @@ fn camera_stats_path() -> std::path::PathBuf {
 
 /// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
 pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
-    let path = camera_stats_path();
+    publish_camera_stats_at(&camera_stats_path(), stats)
+}
+
+/// [`publish_camera_stats`] at `path`.
+///
+/// Written aside and renamed into place, because [`read_webrtc_peers`] gates an OS update on this
+/// file and a reader catching it half-written would read "nobody is connected".
+fn publish_camera_stats_at(path: &std::path::Path, stats: &CameraStats) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
     json.push(b'\n');
-    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+    let aside = path.with_extension("json.new");
+    std::fs::write(&aside, json).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+/// How old [`CameraStats`] may be and still count as `mediad`'s answer. It is rewritten every
+/// second while the camera delivers frames, so this is several missed rewrites.
+pub const CAMERA_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many WebRTC peers `mediad` is serving right now, or `None` when it is not saying.
+///
+/// The one answer to "is someone on a call with this robot?". `updaterd`'s preflight asks it
+/// before an update that would drop the call, and `mediad` asks it to tell a session that is
+/// alone from one with company (`updater-design.md` §7.2).
+///
+/// `None` — `mediad` stopped, no camera, a file older than [`CAMERA_STATS_MAX_AGE`] — is for the
+/// caller to read, and the updater reads it as nobody: its check is a courtesy and must never be
+/// the reason a recovery update is refused.
+pub fn read_webrtc_peers() -> Option<u32> {
+    webrtc_peers_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
+    if camera_stats_age_at(path, now)? > CAMERA_STATS_MAX_AGE {
+        return None;
+    }
+    let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(stats.consumers)
+}
+
+/// What `mediad` published about its camera, or `None` — not running, or no camera.
+///
+/// Not aged: the file is only rewritten while frames arrive, so a camera that has stopped leaves
+/// its last rate behind. [`camera_stats_age`] is how a reader tells the two apart.
 pub fn read_camera_stats() -> Option<CameraStats> {
     serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
+/// How long ago `mediad` last rewrote [`CameraStats`], or `None` when there is no file.
+///
+/// Past [`CAMERA_STATS_MAX_AGE`] the camera has stopped delivering frames, whatever the file's
+/// `fps` says. A file from the future — a clock that stepped — reads as fresh.
+pub fn camera_stats_age() -> Option<std::time::Duration> {
+    camera_stats_age_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+/// [`camera_stats_age`] for the file at `path`, as of `now`. The one place the clock-step rule
+/// lives: a file from the future is a clock that stepped, not a fresh answer, and either way it is
+/// not old — so it reads as age zero.
+fn camera_stats_age_at(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(now.duration_since(modified).unwrap_or_default())
 }
 
 /// What `mediad`'s relay is doing with the rendezvous service, published for `robotctl` to read.
@@ -5958,6 +6259,91 @@ mod tests {
     use super::test_support::every_call;
     use super::*;
 
+    /// `candidates` is v51's, so both directions of a mixed install must still parse: a refusal
+    /// from an older `configd` has no such key, and one that has nothing to list must not grow
+    /// one — an older client parses the same bytes it always did.
+    #[test]
+    fn a_pad_refusal_without_candidates_reads_and_writes_as_before() {
+        let old =
+            r#"{"outcome":"failed","reason":"ambiguous","detail":"2 pads are in pairing mode"}"#;
+        let parsed: PadPairResult = serde_json::from_str(old).expect("an older configd's refusal");
+        assert!(matches!(
+            &parsed,
+            PadPairResult::Failed { reason: PadPairFailure::Ambiguous, candidates, .. }
+                if candidates.is_empty()
+        ));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+    }
+
+    fn camera_stats(consumers: u32) -> CameraStats {
+        CameraStats {
+            fps: 30.0,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 1,
+            dropped: 0,
+            consumers,
+        }
+    }
+
+    /// How old the camera file is: nothing without one, measured from its mtime, and zero rather
+    /// than an error when the clock has stepped back past it.
+    #[test]
+    fn camera_stats_age_is_measured_from_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(camera_stats_age_at(&path, now), None, "no file, no age");
+
+        publish_camera_stats_at(&path, &camera_stats(0)).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let later = modified + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            camera_stats_age_at(&path, later),
+            Some(CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1)),
+        );
+
+        let earlier = modified - std::time::Duration::from_secs(60);
+        assert_eq!(
+            camera_stats_age_at(&path, earlier),
+            Some(std::time::Duration::ZERO),
+            "a clock that stepped back reads as fresh"
+        );
+    }
+
+    /// The count an OS update is gated on: read back as written, and only while it is fresh.
+    #[test]
+    fn webrtc_peers_are_read_only_while_fresh() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(webrtc_peers_at(&path, now), None, "no file is no answer");
+
+        publish_camera_stats_at(&path, &camera_stats(2)).unwrap();
+        assert_eq!(webrtc_peers_at(&path, now), Some(2));
+        assert!(
+            !path.with_extension("json.new").exists(),
+            "renamed into place"
+        );
+
+        let later = now + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            webrtc_peers_at(&path, later),
+            None,
+            "a stopped writer is no answer"
+        );
+
+        std::fs::write(&path, b"{\"fps\":").unwrap();
+        assert_eq!(
+            webrtc_peers_at(&path, now),
+            None,
+            "a torn file is no answer"
+        );
+    }
+
     /// The path a release actually installs to, which is what makes "which version is running"
     /// answerable at all.
     #[test]
@@ -6088,7 +6474,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            79,
+            78,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6673,6 +7059,43 @@ mod tests {
     /// a v12 client must see byte-for-byte the frame it saw before, and a v13 one must find
     /// the field where the docs say it is.
     #[test]
+    fn the_laser_block_is_absent_until_tracking_is_on() {
+        let mut state = a_state();
+        let off = serde_json::to_string(&state).unwrap();
+        assert!(!off.contains("laser"), "{off}");
+
+        state.laser = Some(LaserTrackState {
+            camera: "looking at 1–15 Hz".into(),
+            dot: Some(LaserDot {
+                seen: true,
+                ray: Some([0.1, 0.3]),
+                px: Some([400.0, 900.0]),
+                pixels: 12,
+                peak_yuv: Some([210, 110, 190]),
+                ..Default::default()
+            }),
+            target_m: Some([0.8, -0.1]),
+            walk: true,
+            ..Default::default()
+        });
+        let on = serde_json::to_string(&state).unwrap();
+        let back: RobotState = serde_json::from_str(&on).unwrap();
+        assert_eq!(back.laser, state.laser);
+        // Tracking that is not driving the head says nothing about it, rather than `false`.
+        let block = serde_json::to_value(&state.laser).unwrap();
+        assert!(block.get("head").is_none(), "{block}");
+    }
+
+    /// `media.laser` with no params is the defaults, and a misspelt threshold is refused rather
+    /// than silently ignored — the thresholds are the whole of tuning this.
+    #[test]
+    fn laser_detect_params_default_and_refuse_unknown_keys() {
+        let empty: LaserDetectParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, LaserDetectParams::default());
+        assert!(serde_json::from_str::<LaserDetectParams>(r#"{"y_mn": 10}"#).is_err());
+    }
+
+    #[test]
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = a_state();
         let down = serde_json::to_string(&state).unwrap();
@@ -6818,8 +7241,10 @@ mod tests {
             targets: vec![0.0; 15],
             velocities: Vec::new(),
             currents_ma: Vec::new(),
+            impact_guard: Vec::new(),
             odom: OdomState::default(),
             theremin: None,
+            laser: None,
             chorale: None,
             t_ns: 0,
             imu: None,

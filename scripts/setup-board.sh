@@ -859,6 +859,42 @@ configure_classic_hid() {
     needs_reboot=1
 }
 
+# A phone that forgot the robot can pair with it again.
+#
+# `btd` requires an encrypted link, so a phone bonds with the robot. When the owner then forgets the
+# robot in the phone's Bluetooth settings — the usual first move with any Bluetooth trouble — the
+# phone drops its keys and the robot keeps its own. On the next connect the phone starts a fresh
+# just-works pairing, and BlueZ's default `JustWorksRepairing = never` refuses to replace an existing
+# bond that way: the link fails with `PIN or Key Missing (0x06)` and the phone never reaches the RPC
+# characteristic. Only removing the bond on the robot, over ssh, recovered it.
+#
+# `always` loses nothing: the bond is encryption, never identity — the PIN or the secure-mode key is
+# what authenticates a phone (`app-path-design.md` §5.2). `confirm` would only route the same yes
+# through `btd`'s agent. Measured on a face-board-v1 beta with an iPhone, 2026-11-09: refused twice
+# under `never`; under `always`, forget-then-reconnect paired with no robot-side step.
+#
+# Every board, no flag. Applies at the next bluetoothd start, which on this board means a reboot —
+# see the note on `needs_reboot` above `configure_bluetooth`.
+configure_phone_repairing() {
+    if [ ! -f "$BT_CONF" ]; then
+        warn "no ${BT_CONF}; a phone that forgets this robot will not pair again until its bond is removed here"
+        return 0
+    fi
+    if grep -Eq '^[[:space:]]*JustWorksRepairing[[:space:]]*=[[:space:]]*always' "$BT_CONF"; then
+        say "bluetooth JustWorksRepairing already always (a phone can re-pair after forgetting)"
+        return 0
+    fi
+    say "setting JustWorksRepairing = always in ${BT_CONF} (a phone can re-pair after forgetting)"
+    if grep -Eq '^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=' "$BT_CONF"; then
+        sed -i -E 's|^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=.*|JustWorksRepairing = always|' "$BT_CONF"
+    elif grep -q '^\[General\]' "$BT_CONF"; then
+        sed -i '/^\[General\]/a JustWorksRepairing = always' "$BT_CONF"
+    else
+        printf '\n[General]\nJustWorksRepairing = always\n' >> "$BT_CONF"
+    fi
+    needs_reboot=1
+}
+
 # The marker `robotctl` reads to decide whether to pause `btd` for a pairing.
 #
 # Its own function because both flags write it and only one of them touches `Privacy` — which is the
@@ -1106,6 +1142,7 @@ main() {
     check_network
     free_motor_port
     configure_bluetooth
+    configure_phone_repairing
     configure_classic_hid
     configure_audio
     configure_tof

@@ -3,7 +3,9 @@
 //! ## What it does
 //!
 //! Polls the reader five times a second, asking as ISO 14443A and then as ISO 15693, so a
-//! Type 2 tag (an NTAG) and a Type 5 one (an ST25TV, an ICODE) both answer. When a tag arrives
+//! Type 2 tag (an NTAG) and a Type 5 one (an ST25TV, an ICODE) both answer — and on the
+//! ST25R100 an NDEF-formatted MIFARE Classic, which selects as ISO 14443A and is told apart by
+//! its SAK. When a tag arrives
 //! whose NDEF says [`ndef::PAIRING`]: if a pad is already connected nothing happens, otherwise
 //! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
@@ -39,7 +41,7 @@ use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
 use nfc::spi::Spidev;
 use nfc::st25r100::{Antenna, Proto, St25r100};
-use nfc::{Error, ndef, tag, vtag};
+use nfc::{Error, classic, ndef, tag, vtag};
 
 /// Between attempts to open a reader that is not there, doubling to the cap.
 ///
@@ -129,7 +131,7 @@ fn main() -> std::process::ExitCode {
 /// The reader this board has, when nobody named one.
 fn default_device() -> PathBuf {
     match robotd_params::board::Board::detected() {
-        Some(robotd_params::board::Board::Beta) => PathBuf::from("/dev/spidev1.0"),
+        Some(board) if board.is_beta_main_board() => PathBuf::from("/dev/spidev1.0"),
         _ => PathBuf::from("/dev/ttyACM0"),
     }
 }
@@ -147,8 +149,23 @@ enum Chip {
 enum Tech {
     /// ISO 14443A: a Type 2 tag (NTAG), read a page at a time.
     A,
+    /// ISO 14443A, a MIFARE Classic by its SAK: authenticated sector by sector, then read a block
+    /// at a time.
+    Classic,
     /// ISO 15693: a Type 5 tag (ST25TV, ICODE), read a block at a time.
     V,
+}
+
+impl Tech {
+    /// What an ISO 14443A tag is, from the SAK it selected with.
+    fn of(found: tag::Selected) -> (Vec<u8>, Tech) {
+        let tech = if classic::is_classic(found.sak) {
+            Tech::Classic
+        } else {
+            Tech::A
+        };
+        (found.uid, tech)
+    }
 }
 
 impl Chip {
@@ -171,15 +188,15 @@ impl Chip {
     /// next.
     fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech)> {
         let Chip::Spi(c) = self else {
-            return tag::select(self).map(|uid| (uid, Tech::A));
+            return tag::select_tag(self).map(Tech::of);
         };
         // Whatever the last touch left the chip framing, the 14443A ask starts from its own.
         c.set_proto(Proto::A)?;
         let mut last = Error::NoTag;
         for antenna in [Antenna::One, Antenna::Two] {
             c.set_antenna(antenna)?;
-            match tag::select(c) {
-                Ok(uid) => return Ok((uid, Tech::A)),
+            match tag::select_tag(c) {
+                Ok(found) => return Ok(Tech::of(found)),
                 Err(e) if !e.is_tag() => return Err(e),
                 _ => {}
             }
@@ -210,6 +227,18 @@ impl Reader for Chip {
         match self {
             Chip::Usb(c) => Reader::transceive(c, data, exchange),
             Chip::Spi(c) => c.transceive(data, exchange),
+        }
+    }
+
+    fn transceive_bits(
+        &mut self,
+        data: &[u8],
+        bits: usize,
+        timeout_ms: u64,
+    ) -> nfc::Result<(Vec<u8>, usize)> {
+        match self {
+            Chip::Usb(c) => Reader::transceive_bits(c, data, bits, timeout_ms),
+            Chip::Spi(c) => c.transceive_bits(data, bits, timeout_ms),
         }
     }
 }
@@ -249,10 +278,15 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
             let id = hex(uid);
             let read = match tech {
                 Tech::A => tag::read_ndef_area(chip),
+                Tech::Classic => classic::read_ndef_area(chip, uid),
                 Tech::V => vtag::read_ndef_area(chip, uid),
             };
             match read.map(|data| ndef::parse(&data)) {
                 Err(e) if !e.is_tag() => return e,
+                // The same answer every time it is asked: said once, until the tag is lifted.
+                Err(Error::Unreadable(why)) => {
+                    tracing::warn!(tag = %id, ?tech, %why, "tag cannot be read")
+                }
                 Err(e) => {
                     tracing::info!(tag = %id, error = %e, "tag not read; trying again");
                     touches.unread();

@@ -18,7 +18,7 @@
 //!
 //! ## So: just-works pairing, plus a PIN the transport checks
 //!
-//! Pairing is just-works (all agent handlers `None`, which BlueZ reads as `NoInputNoOutput`), so
+//! Pairing is just-works (the agent declares `NoInputNoOutput`), so
 //! the link is encrypted but **not** authenticated. The read on the RPC characteristic requires
 //! encryption, which is what triggers the bond. Then `btd` serves nothing until the client proves
 //! the PIN via `system.authenticate`, which is why that call is answered by the transport rather
