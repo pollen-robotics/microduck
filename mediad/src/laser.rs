@@ -16,9 +16,17 @@
 //!
 //! **Cost.** A look is one frame copied out of the tee (the rendezvous in
 //! [`crate::pipeline::Frames`] — read in place, never cloned again) and one scan of every other row
-//! and column of it: about 230 k samples at 720p, a couple of milliseconds on the board. Paced at
+//! and column of it: about 230 k samples at 720p, about 5 ms on a face-board-v1. Paced at
 //! `search_hz` until something is seen and `track_hz` while it is — so a tracker left on all day
 //! costs a few looks a second.
+//!
+//! While tracking, a look scans only a window around the last dot ([`WINDOW_RADII`] times
+//! `radius_px` each way, about 4% of a 720p frame at the defaults), and the whole frame when the
+//! dot is not found near where it was ([`FOLLOW_RADII`]), and once every [`FULL_SCAN_EVERY`]. What
+//! that changes: a higher-scoring dot outside the window, or a red thing within `FOLLOW_RADII` of a
+//! dot that jumped away, holds until the next whole-frame scan, a second at most, where the old scan
+//! settled it on the next look; and `peak` outside the window is as of that scan. [`Scope`]
+//! decides.
 
 use duck_ipc_proto::{LaserDetectParams, LaserDot};
 use uyvy::Turn;
@@ -30,6 +38,22 @@ const STEP: usize = 2;
 /// How long after the last sighting the detector stays at its tracking rate. Long enough to ride
 /// over a dot that blinks out for a frame or two, short enough that a laser put away stops costing.
 pub const TRACK_HOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How far around the last dot a tracking look scans, in `radius_px` each way: 96 px at the
+/// default 24, a 193 px square counting both edges.
+pub const WINDOW_RADII: usize = 4;
+
+/// How far from the last dot the window's answer may be and still count as that dot, in
+/// `radius_px`: 48 px at the default 24. Further, the laser may have jumped away and left a red
+/// thing behind in the window, so the same look scans the whole frame and takes its answer, as
+/// every look did before the window. A dot that moves this far between two looks costs a whole
+/// scan, nothing more.
+pub const FOLLOW_RADII: usize = 2;
+
+/// How often a look scans the whole frame while tracking, window or not (the first look after it
+/// has passed): how long a higher-scoring dot elsewhere can wait to take over, and how old `peak`
+/// outside the window can be. A second, as long as `search_hz` takes to notice a dot by default.
+pub const FULL_SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What turns a pixel of the frame the camera delivered into a direction.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,7 +139,9 @@ pub struct Found {
     pub candidate: Option<[f64; 2]>,
     /// Sampled pixels in the dot (or in the rejected candidate).
     pub pixels: u32,
-    /// The reddest bright sample in the frame, `[Y, U, V]`, passed or not.
+    /// The reddest bright sample in the frame, `[Y, U, V]`, passed or not. [`find_near`]'s is its
+    /// window's; a tracking look's is the window's and, outside it, the last whole-frame scan's
+    /// ([`Scope`]).
     pub peak: Option<[u8; 3]>,
     pub rejected: Option<&'static str>,
 }
@@ -147,42 +173,132 @@ fn hit(y: u8, u: u8, v: u8, p: &LaserDetectParams) -> bool {
 /// `radius_px` of that best one — so a stray hit across the room neither moves the centre nor
 /// inflates the count, which a frame-wide centroid would let it do.
 pub fn find(data: &[u8], width: usize, height: usize, p: &LaserDetectParams) -> Found {
-    let stride = width * 2;
-    let none = Found {
-        at: None,
-        candidate: None,
-        pixels: 0,
-        peak: None,
-        rejected: None,
-    };
-    if width < 2 || height == 0 || data.len() < stride * height {
-        return none;
-    }
-    let macros = width / 2;
+    whole(data, width, height, p).0
+}
 
-    let mut peak: Option<(i32, [u8; 3])> = None;
-    let mut best: Option<(i32, usize, usize)> = None;
-    for py in (0..height).step_by(STEP) {
+/// [`find`], and where its peak is.
+fn whole(data: &[u8], width: usize, height: usize, p: &LaserDetectParams) -> (Found, Option<Peak>) {
+    if !fits(data, width, height) {
+        return (NONE, None);
+    }
+    let (peak, best) = first_pass(data, width, [0, last_column(width)], [0, height - 1], p);
+    let found = second_pass(data, width, height, p, peak.map(|(_, yuv, _)| yuv), best);
+    (found, peak)
+}
+
+/// [`find`], scanning only the window around `near` (a dot's centre from an earlier look, in the
+/// same frame's pixels). `None` unless a dot passed in it: a miss or a rejected candidate there is
+/// for the whole-frame scan to report.
+pub fn find_near(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    p: &LaserDetectParams,
+    near: [f64; 2],
+) -> Option<Found> {
+    windowed(data, width, height, p, near).map(|(found, _)| found)
+}
+
+/// [`find_near`], and the window it scanned: pixel columns and rows, both inclusive.
+fn windowed(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    p: &LaserDetectParams,
+    near: [f64; 2],
+) -> Option<(Found, [[usize; 2]; 2])> {
+    if !fits(data, width, height) {
+        return None;
+    }
+    let r = (p.radius_px as usize * WINDOW_RADII).max(STEP);
+    // `as` saturates: a negative or NaN centre is 0, and the `min` keeps a stale one in the frame.
+    let cx = (near[0] as usize).min(width - 1);
+    let cy = (near[1] as usize).min(height - 1);
+    let xs = [cx.saturating_sub(r), (cx + r).min(last_column(width))];
+    let ys = [cy.saturating_sub(r), (cy + r).min(height - 1)];
+    let (peak, best) = first_pass(data, width, xs, ys, p);
+    let found = second_pass(data, width, height, p, peak.map(|(_, yuv, _)| yuv), best);
+    found.at.is_some().then_some((found, [xs, ys]))
+}
+
+const NONE: Found = Found {
+    at: None,
+    candidate: None,
+    pixels: 0,
+    peak: None,
+    rejected: None,
+};
+
+fn fits(data: &[u8], width: usize, height: usize) -> bool {
+    width >= 2 && height > 0 && data.len() >= width * 2 * height
+}
+
+/// The last pixel column a scan samples: the second pixel of the last whole macropixel.
+fn last_column(width: usize) -> usize {
+    width / 2 * 2 - 1
+}
+
+/// The rows (`STEP` apart, from 0, so every scan samples the same grid) and macropixels between
+/// two pixel columns and two rows, both inclusive.
+fn grid(
+    xs: [usize; 2],
+    ys: [usize; 2],
+) -> (impl Iterator<Item = usize>, std::ops::RangeInclusive<usize>) {
+    let first_row = ys[0].div_ceil(STEP) * STEP;
+    ((first_row..=ys[1]).step_by(STEP), xs[0] / 2..=xs[1] / 2)
+}
+
+/// A sample that passed the thresholds: its score, and where it is in pixels.
+type Hit = (i32, usize, usize);
+
+/// The reddest bright sample: its score, its `[Y, U, V]`, and where it is in pixels.
+type Peak = (i32, [u8; 3], [usize; 2]);
+
+/// The reddest bright sample and the highest-scoring hit within `xs × ys`.
+fn first_pass(
+    data: &[u8],
+    width: usize,
+    xs: [usize; 2],
+    ys: [usize; 2],
+    p: &LaserDetectParams,
+) -> (Option<Peak>, Option<Hit>) {
+    let stride = width * 2;
+    let mut peak: Option<Peak> = None;
+    let mut best: Option<Hit> = None;
+    let (rows, macros) = grid(xs, ys);
+    for py in rows {
         let row = &data[py * stride..(py + 1) * stride];
         // One sample per macropixel is every other pixel, which is the column step.
-        for m in 0..macros {
+        for m in macros.clone() {
             let (y, u, v) = sample(row, m);
             let s = score(y, u, v);
-            if peak.is_none_or(|(ps, _)| s > ps) {
-                peak = Some((s, [y, u, v]));
+            if peak.is_none_or(|(ps, _, _)| s > ps) {
+                peak = Some((s, [y, u, v], [m * 2, py]));
             }
             if hit(y, u, v, p) && best.is_none_or(|(bs, _, _)| s > bs) {
                 best = Some((s, m * 2, py));
             }
         }
     }
-    let peak = peak.map(|(_, yuv)| yuv);
+    (peak, best)
+}
+
+/// Count and average the hits within `radius_px` of the best one, and judge their number.
+fn second_pass(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    p: &LaserDetectParams,
+    peak: Option<[u8; 3]>,
+    best: Option<Hit>,
+) -> Found {
+    let stride = width * 2;
     let Some((_, bx, by)) = best else {
-        return Found { peak, ..none };
+        return Found { peak, ..NONE };
     };
 
     let r = p.radius_px as usize;
-    let (x0, x1) = (bx.saturating_sub(r), (bx + r).min(width - 1));
+    let (x0, x1) = (bx.saturating_sub(r), (bx + r).min(last_column(width)));
     let (y0, y1) = (by.saturating_sub(r), (by + r).min(height - 1));
     let (mut n, mut sx, mut sy) = (0u32, 0u64, 0u64);
     // Rows on the same grid as the first pass, so the count means the same thing in both.
@@ -217,6 +333,67 @@ pub fn find(data: &[u8], width: usize, height: usize, p: &LaserDetectParams) -> 
         pixels: n,
         peak,
         rejected,
+    }
+}
+
+/// Where each look scans, from what the looks before it found: around the last dot while there is
+/// one and it is still there, the whole frame otherwise and once every [`FULL_SCAN_EVERY`].
+#[derive(Debug, Default)]
+pub struct Scope {
+    /// The last look's dot, if it had one.
+    last: Option<[f64; 2]>,
+    /// When a look last scanned the whole frame.
+    full: Option<std::time::Instant>,
+    /// That scan's peak, which stands for the part of the frame a window look does not read, so
+    /// the readout does not swap to the window's every look and back every second.
+    full_peak: Option<Peak>,
+}
+
+impl Scope {
+    /// One look at a frame, taken at `now`.
+    pub fn look(
+        &mut self,
+        data: &[u8],
+        width: usize,
+        height: usize,
+        p: &LaserDetectParams,
+        now: std::time::Instant,
+    ) -> Found {
+        let full_due = self
+            .full
+            .is_none_or(|at| now.saturating_duration_since(at) >= FULL_SCAN_EVERY);
+        let follow = (p.radius_px as usize * FOLLOW_RADII) as f64;
+        let near = self.last.filter(|_| !full_due).and_then(|[lx, ly]| {
+            windowed(data, width, height, p, [lx, ly])
+                .filter(|(f, _)| f.at.is_some_and(|[x, y]| (x - lx).hypot(y - ly) <= follow))
+        });
+        let found = match near {
+            Some((mut found, [xs, ys])) => {
+                // Inside the window this look is the fresh one; outside it, the last whole scan.
+                let outside = self.full_peak.filter(|(_, _, [x, y])| {
+                    !(xs[0]..=xs[1]).contains(x) || !(ys[0]..=ys[1]).contains(y)
+                });
+                found.peak = redder(found.peak, outside.map(|(_, yuv, _)| yuv));
+                found
+            }
+            None => {
+                let (found, peak) = whole(data, width, height, p);
+                self.full = Some(now);
+                self.full_peak = peak;
+                found
+            }
+        };
+        self.last = found.at;
+        found
+    }
+}
+
+/// The higher-scoring of two peaks.
+fn redder(a: Option<[u8; 3]>, b: Option<[u8; 3]>) -> Option<[u8; 3]> {
+    let s = |[y, u, v]: [u8; 3]| score(y, u, v);
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if s(b) > s(a) { b } else { a }),
+        _ => a.or(b),
     }
 }
 
@@ -310,6 +487,7 @@ where
         .name("laser".into())
         .spawn(move || {
             let mut last_seen: Option<Instant> = None;
+            let mut scope = Scope::default();
             let mut next = Instant::now();
             loop {
                 let tracking = last_seen.is_some_and(|at| at.elapsed() < TRACK_HOLD);
@@ -332,7 +510,7 @@ where
                     }
                     let started = Instant::now();
                     let (w, h) = (frame.width as usize, frame.height as usize);
-                    let found = find(&frame.data, w, h, &params);
+                    let found = scope.look(&frame.data, w, h, &params, started);
                     let took_ms = started.elapsed().as_secs_f64() * 1e3;
                     Some(dot(&found, &geometry, w, h, hz, took_ms))
                 });
@@ -474,6 +652,233 @@ mod tests {
             .at
             .expect("the dot");
         assert!((x - 60.0).abs() < 2.0 && (y - 60.0).abs() < 2.0, "{x},{y}");
+    }
+
+    const BRIGHTER: [u8; 3] = [255, 100, 230];
+
+    fn near(found: &Found, x: f64, y: f64) -> bool {
+        found
+            .at
+            .is_some_and(|[fx, fy]| (fx - x).abs() < 2.0 && (fy - y).abs() < 2.0)
+    }
+
+    /// Around a dot it already knows, a tracking look gives the answer a whole-frame scan gives,
+    /// up to the frame's edge.
+    #[test]
+    fn the_window_finds_what_the_whole_frame_scan_finds() {
+        let (w, h) = (1280, 720);
+        for (x, y) in [(900, 500), (8, 8), (1272, 712)] {
+            let mut frame = room(w, h, 90);
+            paint(&mut frame, w, x, y, 8, RED_RIM);
+            let whole = find(&frame, w, h, &LaserDetectParams::default());
+            assert!(near(&whole, x as f64, y as f64), "{whole:?}");
+            let window = [x as f64 + 30.0, y as f64 - 30.0];
+            assert_eq!(
+                find_near(&frame, w, h, &LaserDetectParams::default(), window),
+                Some(whole.clone())
+            );
+        }
+        // A centre off the frame, or not a number, is its nearest corner.
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 8, 8, 8, RED_RIM);
+        let p = LaserDetectParams::default();
+        let whole = find(&frame, w, h, &p);
+        assert_eq!(find_near(&frame, w, h, &p, [f64::NAN, -5.0]), Some(whole));
+    }
+
+    /// A frame an odd number of pixels wide has a half macropixel at its right edge, which neither
+    /// scan reads past.
+    #[test]
+    fn an_odd_width_is_scanned_up_to_its_last_whole_macropixel() {
+        let (w, h) = (321, 240);
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 310, 120, 8, RED_RIM);
+        let p = LaserDetectParams::default();
+        let whole = find(&frame, w, h, &p);
+        assert!(near(&whole, 310.0, 120.0), "{whole:?}");
+        assert_eq!(find_near(&frame, w, h, &p, [310.0, 120.0]), Some(whole));
+    }
+
+    /// A candidate the window rejects is not its answer: what the whole frame says about it is.
+    #[test]
+    fn a_rejected_candidate_in_the_window_is_left_to_the_whole_frame() {
+        let (w, h) = (1280, 720);
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 60, RED_RIM);
+        let p = LaserDetectParams {
+            max_pixels: 100,
+            ..Default::default()
+        };
+        assert_eq!(find(&frame, w, h, &p).rejected, Some("too big"));
+        assert_eq!(find_near(&frame, w, h, &p, [200.0, 200.0]), None);
+    }
+
+    /// **The saving.** The window is all a tracking look reads: a brighter dot outside it is
+    /// not seen, and a dot that left it is not found there but left to the whole-frame scan.
+    #[test]
+    fn the_window_does_not_look_past_its_edge() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, RED_RIM);
+        paint(&mut frame, w, 1000, 600, 8, BRIGHTER);
+        assert!(near(&find(&frame, w, h, &p), 1000.0, 600.0));
+        let tracked = find_near(&frame, w, h, &p, [200.0, 200.0]).expect("the tracked dot");
+        assert!(near(&tracked, 200.0, 200.0), "{tracked:?}");
+        assert_eq!(tracked.peak, Some(RED_RIM), "the window's peak");
+
+        let edge = (WINDOW_RADII * p.radius_px as usize) as f64;
+        assert_eq!(
+            find_near(&frame, w, h, &p, [200.0 + edge + 20.0, 200.0]),
+            None
+        );
+    }
+
+    /// Tracking reads the window, and the whole frame once a second: so a brighter dot elsewhere
+    /// takes over within that second, as it would have on the next search look.
+    #[test]
+    fn a_brighter_dot_elsewhere_takes_over_within_a_second() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, RED_RIM);
+        assert!(near(&scope.look(&frame, w, h, &p, t0), 200.0, 200.0));
+
+        paint(&mut frame, w, 1000, 600, 8, BRIGHTER);
+        let ms = std::time::Duration::from_millis;
+        for t in [ms(66), ms(500), ms(933)] {
+            let found = scope.look(&frame, w, h, &p, t0 + t);
+            assert!(near(&found, 200.0, 200.0), "at {t:?}: {found:?}");
+        }
+        let found = scope.look(&frame, w, h, &p, t0 + FULL_SCAN_EVERY);
+        assert!(near(&found, 1000.0, 600.0), "{found:?}");
+    }
+
+    /// A dot that jumped out of the window between two looks is found by the same look.
+    #[test]
+    fn a_dot_that_jumps_is_found_in_the_same_look() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, RED_RIM);
+        scope.look(&frame, w, h, &p, t0);
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 1000, 600, 8, RED_RIM);
+        let found = scope.look(&frame, w, h, &p, t0 + std::time::Duration::from_millis(66));
+        assert!(near(&found, 1000.0, 600.0), "{found:?}");
+    }
+
+    /// The laser jumps away and leaves a red thing inside the window, further than
+    /// [`FOLLOW_RADII`] from where the dot was: too far to be the dot having moved, so the whole
+    /// frame decides, in the same look. (One closer than that is indistinguishable from the dot
+    /// moving, and holds until the next whole-frame scan.)
+    #[test]
+    fn a_red_thing_left_in_the_window_away_from_the_dot_does_not_take_over() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, BRIGHTER);
+        paint(&mut frame, w, 260, 200, 8, RED_RIM);
+        assert!(near(&scope.look(&frame, w, h, &p, t0), 200.0, 200.0));
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 260, 200, 8, RED_RIM);
+        paint(&mut frame, w, 1000, 600, 8, BRIGHTER);
+        let found = scope.look(&frame, w, h, &p, t0 + std::time::Duration::from_millis(66));
+        assert!(near(&found, 1000.0, 600.0), "{found:?}");
+    }
+
+    /// `peak` is the frame's between whole-frame scans too: a redder light away from the dot that
+    /// fails the thresholds stays in the readout, instead of showing once a second.
+    #[test]
+    fn the_readout_keeps_the_whole_frame_peak_between_scans() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+        let pink = [255, 150, 255]; // redder than the dot, too blue to pass `u_max`
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, RED_RIM);
+        paint(&mut frame, w, 1000, 600, 8, pink);
+        let ms = std::time::Duration::from_millis;
+        for t in [ms(0), ms(66), ms(500), ms(1000), ms(1066)] {
+            let found = scope.look(&frame, w, h, &p, t0 + t);
+            assert!(near(&found, 200.0, 200.0), "at {t:?}: {found:?}");
+            assert_eq!(found.peak, Some(pink), "at {t:?}");
+        }
+    }
+
+    /// **The saving, in the ordinary case.** A dot that moves a little between looks is followed in
+    /// the window, with no whole-frame scan until the second is up.
+    #[test]
+    fn a_dot_moving_inside_the_window_costs_no_whole_frame_scan() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+        let ms = std::time::Duration::from_millis;
+
+        for (i, (x, y)) in [(200, 200), (230, 210), (260, 220), (290, 230)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut frame = room(w, h, 90);
+            paint(&mut frame, w, x, y, 8, RED_RIM);
+            let found = scope.look(&frame, w, h, &p, t0 + ms(66 * i as u64));
+            assert!(near(&found, x as f64, y as f64), "look {i}: {found:?}");
+            assert_eq!(scope.full, Some(t0), "look {i} scanned the whole frame");
+        }
+    }
+
+    /// Inside the window the readout is this look's: the dot's colour from the last whole scan does
+    /// not outlive the dot, whatever it changed to.
+    #[test]
+    fn the_readout_inside_the_window_is_the_current_look() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, BRIGHTER);
+        assert_eq!(scope.look(&frame, w, h, &p, t0).peak, Some(BRIGHTER));
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 210, 200, 8, RED_RIM);
+        let found = scope.look(&frame, w, h, &p, t0 + std::time::Duration::from_millis(66));
+        assert!(near(&found, 210.0, 200.0), "{found:?}");
+        assert_eq!(found.peak, Some(RED_RIM));
+    }
+
+    /// **The tuning readout keeps working.** A tracking look that loses the dot reports what a
+    /// whole-frame scan would: the peak anywhere in the picture, not just in the window.
+    #[test]
+    fn a_miss_while_tracking_reports_the_whole_frame() {
+        let (w, h) = (1280, 720);
+        let p = LaserDetectParams::default();
+        let t0 = std::time::Instant::now();
+        let mut scope = Scope::default();
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 200, 200, 8, RED_RIM);
+        scope.look(&frame, w, h, &p, t0);
+
+        let mut frame = room(w, h, 90);
+        paint(&mut frame, w, 1000, 600, 8, [250, 128, 128]); // a white lamp, far off
+        let found = scope.look(&frame, w, h, &p, t0 + std::time::Duration::from_millis(66));
+        assert_eq!(found.at, None);
+        assert_eq!(found.peak, Some([250, 128, 128]));
     }
 
     fn geometry(turn: Turn) -> Geometry {
