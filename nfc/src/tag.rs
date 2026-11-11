@@ -15,12 +15,24 @@ const CMD_FAST_READ: u8 = 0x3A;
 pub const PAGE_USER_START: u8 = 4;
 pub const PAGE_USER_END: u8 = 129;
 
+/// A selected tag: its UID, and the SAK its last cascade level answered — which says what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selected {
+    pub uid: Vec<u8>,
+    pub sak: u8,
+}
+
+/// Wake whatever tag is in the field and select it, returning only its UID. See [`select_tag`].
+pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
+    select_tag(chip).map(|tag| tag.uid)
+}
+
 /// Wake whatever tag is in the field — WUPA rather than REQA, since it also wakes one in HALT —
-/// and select it. Returns its UID.
+/// and select it.
 ///
 /// Resets the field first: see [`crate::clrc663::Clrc663::reset_field`] for why that is what makes a second read
 /// in a session work.
-pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
+pub fn select_tag<R: Reader>(chip: &mut R) -> Result<Selected> {
     chip.reset_field()?;
     let atqa = chip.transceive(&[CMD_WUPA], Exchange::bare(5, 7))?;
     if atqa.len() != 2 {
@@ -64,7 +76,7 @@ pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
             uid.extend([a, b, c, d]);
         }
         if sak & 0x04 == 0 {
-            return Ok(uid);
+            return Ok(Selected { uid, sak });
         }
     }
     Err(Error::Tag(
