@@ -16,6 +16,7 @@
 pub mod classic;
 pub mod clrc663;
 pub mod crypto1;
+pub mod eink;
 pub mod modes;
 pub mod ndef;
 pub mod pairing;

@@ -87,11 +87,13 @@ The same reader also takes **mode tags**, written the same way with one of `walk
 two are read and quacked at, and do nothing yet. The table, and where a new mode's behaviour goes,
 are in `nfc/src/modes.rs`.
 
-A tag written `take_photo` poses the robot for a picture: it starts the robot if Start was not
-pressed, stands still, lifts its head, counts down five seconds with the flashlight blinking dimly
-and faster and faster, flashes at 15 % with a quack as it takes the photo, then sits with its beak
-open. The picture is kept in `/var/lib/robot/photos`, named for the local time. The
-sequence is in `nfc/src/photo.rs`.
+An e-ink display touched to the reader, or a tag written `take_photo`, poses the robot for a
+picture: it starts the robot if Start was not pressed, stands still, lifts its head, counts down
+five seconds with the flashlight blinking dimly and faster and faster, flashes at 15 % with a quack
+as it takes the photo, then sits with its beak open. The picture is kept in
+`/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how a
+display is recognised (any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. Every touch logs which
+of the board's two antennas saw it (`tag in the field`, `antenna=Some(One)`).
 
 ## Check it
 

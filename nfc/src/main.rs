@@ -11,8 +11,9 @@
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
 //! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
 //! asks `robotd` to switch to it; which names there are, and which do nothing yet, is
-//! [`nfc::modes`]. A `take_photo` tag poses the robot for a picture taken with `mediad`'s camera
-//! and kept in `/var/lib/robot/photos`; the sequence is [`nfc::photo`].
+//! [`nfc::modes`]. An e-ink display ([`nfc::eink`]), or a `take_photo` tag, poses the robot for
+//! a picture taken with `mediad`'s camera and kept in `/var/lib/robot/photos`; the sequence is
+//! [`nfc::photo`].
 //!
 //! ## Why its own daemon
 //!
@@ -43,7 +44,7 @@ use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
 use nfc::spi::Spidev;
 use nfc::st25r100::{Antenna, Proto, St25r100};
-use nfc::{Error, classic, ndef, tag, vtag};
+use nfc::{Error, classic, eink, ndef, tag, vtag};
 
 /// Between attempts to open a reader that is not there, doubling to the cap.
 ///
@@ -166,12 +167,16 @@ enum Tech {
     Classic,
     /// ISO 15693: a Type 5 tag (ST25TV, ICODE), read a block at a time.
     V,
+    /// ISO 14443-4 by its SAK: an e-ink display, as far as [`nfc::eink`] can tell. Not read.
+    Eink,
 }
 
 impl Tech {
     /// What an ISO 14443A tag is, from the SAK it selected with.
     fn of(found: tag::Selected) -> (Vec<u8>, Tech) {
-        let tech = if classic::is_classic(found.sak) {
+        let tech = if eink::is_eink(found.sak) {
+            Tech::Eink
+        } else if classic::is_classic(found.sak) {
             Tech::Classic
         } else {
             Tech::A
@@ -197,10 +202,13 @@ impl Chip {
 
     /// Look for a tag on every antenna in turn, asking as ISO 14443A first and then as ISO
     /// 15693; the first one seen wins, and the field stays on that antenna for whatever is read
-    /// next.
-    fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech)> {
+    /// next. Which antenna saw it, on the board that has two.
+    fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech, Option<Antenna>)> {
         let Chip::Spi(c) = self else {
-            return tag::select_tag(self).map(Tech::of);
+            return tag::select_tag(self).map(|found| {
+                let (uid, tech) = Tech::of(found);
+                (uid, tech, None)
+            });
         };
         // Whatever the last touch left the chip framing, the 14443A ask starts from its own.
         c.set_proto(Proto::A)?;
@@ -208,7 +216,10 @@ impl Chip {
         for antenna in [Antenna::One, Antenna::Two] {
             c.set_antenna(antenna)?;
             match tag::select_tag(c) {
-                Ok(found) => return Ok(Tech::of(found)),
+                Ok(found) => {
+                    let (uid, tech) = Tech::of(found);
+                    return Ok((uid, tech, Some(antenna)));
+                }
                 Err(e) if !e.is_tag() => return Err(e),
                 _ => {}
             }
@@ -217,7 +228,7 @@ impl Chip {
             c.set_proto(Proto::V)?;
             c.reset_field()?;
             match vtag::inventory(c) {
-                Ok(uid) => return Ok((uid, Tech::V)),
+                Ok(uid) => return Ok((uid, Tech::V, Some(antenna))),
                 Err(e) if e.is_tag() => last = e,
                 Err(e) => return Err(e),
             }
@@ -284,14 +295,24 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
             }
         };
 
-        if let Some((uid, tech)) = touched.as_ref().map(|(uid, tech)| (uid.as_slice(), *tech))
+        if let Some((uid, tech, antenna)) = touched
+            .as_ref()
+            .map(|(uid, tech, antenna)| (uid.as_slice(), *tech, *antenna))
             && touches.seen(Some(uid))
         {
             let id = hex(uid);
+            // Which antenna, for finding out which is where on a board: touch a tag to each.
+            tracing::warn!(tag = %id, ?tech, ?antenna, "tag in the field");
             let read = match tech {
                 Tech::A => tag::read_ndef_area(chip),
                 Tech::Classic => classic::read_ndef_area(chip, uid),
                 Tech::V => vtag::read_ndef_area(chip, uid),
+                Tech::Eink => {
+                    tracing::warn!(tag = %id, "e-ink touched — hold still");
+                    report_photo(photo::on_touch(robot));
+                    continue_after(period, start);
+                    continue;
+                }
             };
             match read.map(|data| ndef::parse(&data)) {
                 Err(e) if !e.is_tag() => return e,
@@ -333,9 +354,14 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
             touches.seen(None);
         }
 
-        if let Some(rest) = period.checked_sub(start.elapsed()) {
-            sleep(rest);
-        }
+        continue_after(period, start);
+    }
+}
+
+/// The rest of this poll's period.
+fn continue_after(period: Duration, start: Instant) {
+    if let Some(rest) = period.checked_sub(start.elapsed()) {
+        sleep(rest);
     }
 }
 

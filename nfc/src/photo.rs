@@ -1,8 +1,9 @@
 //! What the photo tag does: the robot poses, counts down with its flashlight, takes a picture and
 //! sits with its beak open.
 //!
-//! A photo tag holds one text, [`TAG`], the way a mode tag holds its mode's name. Touched, it runs
-//! this sequence, start to end, while the reader waits:
+//! An e-ink display touched to the reader starts it ([`crate::eink`] says how one is recognised),
+//! and so does a tag holding the text [`TAG`], the way a mode tag holds its mode's name. Either
+//! runs this sequence, start to end, while the reader waits:
 //!
 //! 1. A quack, so the person holding the tag knows it was read.
 //! 2. Standing, still: laser tracking off (it would walk the robot to a dot), `robot.stop`, and a
