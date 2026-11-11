@@ -39,8 +39,10 @@ pub const KEY_NDEF: [u8; 6] = [0xD3, 0xF7, 0xD3, 0xF7, 0xD3, 0xF7];
 
 const CMD_AUTH_A: u8 = 0x60;
 const CMD_READ: u8 = 0x30;
-/// The application identifier the MAD gives an NDEF sector, `E1 03` on the card.
-const NDEF_AID: u16 = 0x03E1;
+/// The application identifier the MAD gives an NDEF sector, as its two bytes sit on the card: the
+/// function cluster `03`, then the application code `E1`. A card a phone formatted has a MAD
+/// block 1 of `14 01 03 E1 03 E1 …`, and its CRC (`14`) only checks out in this order.
+const NDEF_AID: [u8; 2] = [0x03, 0xE1];
 /// Sectors the MAD of a 1K describes. A 4K's sectors beyond 15 are in a second MAD this does not
 /// read: a pairing message fits in two sectors.
 const MAD_SECTORS: u8 = 15;
@@ -260,15 +262,13 @@ fn read_ndef_area_with<R: Reader>(
     Ok(data)
 }
 
-/// The sectors the MAD (blocks 1 and 2: a CRC, an info byte, then one little-endian AID per
-/// sector 1 to 15) gives to NDEF, in order.
+/// The sectors the MAD (blocks 1 and 2: a CRC, an info byte, then a two-byte AID per sector 1 to
+/// 15) gives to NDEF, in order.
 fn ndef_sectors(directory: &[u8]) -> Vec<u8> {
     (1..=MAD_SECTORS)
         .filter(|&s| {
             let at = 2 * usize::from(s);
-            directory
-                .get(at..at + 2)
-                .is_some_and(|aid| u16::from_le_bytes([aid[0], aid[1]]) == NDEF_AID)
+            directory.get(at..at + 2).is_some_and(|aid| aid == NDEF_AID)
         })
         .collect()
 }
@@ -378,8 +378,11 @@ mod tests {
             let mut card = Self::new(keys);
             let mut mad = vec![0u8, 0x01];
             for s in 1..=15 {
-                let aid: u16 = if sectors.contains(&s) { NDEF_AID } else { 0 };
-                mad.extend(aid.to_le_bytes());
+                mad.extend(if sectors.contains(&s) {
+                    NDEF_AID
+                } else {
+                    [0; 2]
+                });
             }
             card.blocks[1].copy_from_slice(&mad[..16]);
             card.blocks[2].copy_from_slice(&mad[16..]);
@@ -535,6 +538,30 @@ mod tests {
         let data = read(&mut card).unwrap();
         assert_eq!(data.len(), 48);
         assert!(ndef::asks_to_pair(&ndef::parse(&data).unwrap()));
+    }
+
+    /// The MAD of a card a phone formatted, every sector NDEF, as dumped from one. Its CRC is
+    /// what pins the byte order: `14` is the MAD CRC (CRC-8, polynomial 1D, preset C7) of these
+    /// bytes and not of the AIDs swapped.
+    #[test]
+    fn a_phone_formatted_mad_lists_every_sector() {
+        let mut directory = vec![0x14, 0x01];
+        directory.extend([0x03, 0xE1].repeat(15));
+        let crc = directory[1..].iter().fold(0xC7u8, |mut c, &b| {
+            c ^= b;
+            for _ in 0..8 {
+                c = if c & 0x80 != 0 { c << 1 ^ 0x1D } else { c << 1 };
+            }
+            c
+        });
+        assert_eq!(crc, directory[0]);
+        assert_eq!(ndef_sectors(&directory), (1..=15).collect::<Vec<u8>>());
+        directory[2..4].copy_from_slice(&[0xE1, 0x03]);
+        assert_eq!(
+            ndef_sectors(&directory)[0],
+            2,
+            "the swapped AID is not NDEF"
+        );
     }
 
     /// NDEF sectors need not start at 1: the MAD says where they are.
