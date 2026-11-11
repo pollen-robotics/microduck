@@ -88,9 +88,9 @@ two are read and quacked at, and do nothing yet. The table, and where a new mode
 are in `nfc/src/modes.rs`.
 
 A tag written `take_photo` poses the robot for a picture: it starts the robot if Start was not
-pressed, stands still, lifts its head, counts
-down five seconds with the flashlight blinking faster and faster, takes the photo, then sits with
-its beak open. The picture is kept in `/var/lib/robot/photos`, named for the local time. The
+pressed, stands still, lifts its head, counts down five seconds with the flashlight blinking dimly
+and faster and faster, flashes at 15 % with a quack as it takes the photo, then sits with its beak
+open. The picture is kept in `/var/lib/robot/photos`, named for the local time. The
 sequence is in `nfc/src/photo.rs`.
 
 ## Check it

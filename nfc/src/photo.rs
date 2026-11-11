@@ -14,8 +14,10 @@
 //! 3. The head lifts a little: `robot.look` at a point ahead and above, and the joints it answers
 //!    resent through `robot.head` for as long as the pose must hold, which keeps the idle
 //!    look-around from taking the head back after its two seconds.
-//! 4. [`COUNTDOWN`] of flashlight blinks, each shorter than the last ([`blinks`]), then the light
-//!    on, a frame from `mediad`, the light off.
+//! 4. [`COUNTDOWN`] of flashlight blinks at [`BLINK`] brightness, each shorter than the last
+//!    ([`blinks`]), then the flash at [`FLASH_AT`] with a quack, a frame from `mediad`, the light
+//!    off. Dim on purpose: the light points at the eyes of the person posing, and one LED does
+//!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
 //! 6. The robot sits and opens its beak.
@@ -46,12 +48,19 @@ pub const HEARD: proto::SoundTag = crate::pairing::HEARD;
 /// From the first blink to the picture.
 pub const COUNTDOWN: Duration = Duration::from_secs(5);
 
-/// Where the robot looks for the picture, trunk frame: a metre ahead, and high enough to lift the
-/// head a little without throwing it back.
+/// The countdown's blinks, and the flash, as shares of the flashlight's full brightness.
+pub const BLINK: f64 = 0.10;
+pub const FLASH_AT: f64 = 0.15;
+
+/// The shutter: a quack as the flash goes on, so the person posing hears the picture taken.
+pub const SHUTTER: proto::SoundTag = proto::SoundTag::Chirp;
+
+/// Where the robot looks for the picture, trunk frame: a metre ahead and about half a metre up,
+/// which lifts the head towards a face without throwing it back.
 pub const LOOK_UP: proto::LookParams = proto::LookParams {
     x: 1.0,
     y: 0.0,
-    z: 0.35,
+    z: 0.55,
     neck_pitch: 0.0,
 };
 
@@ -118,8 +127,8 @@ pub trait Driver {
     fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String>;
     /// `robot.head`, a notification.
     fn head(&mut self, head: proto::HeadParams) -> Result<(), String>;
-    /// `robot.flashlight`, white.
-    fn flashlight(&mut self, on: bool) -> Result<proto::IntentResult, String>;
+    /// `robot.flashlight`, white, at `brightness` of full; 0 switches it off.
+    fn flashlight(&mut self, brightness: f64) -> Result<proto::IntentResult, String>;
     /// `robot.mouth`, a notification. It holds until the next one.
     fn mouth(&mut self, open: f64) -> Result<(), String>;
     /// A frame from the camera, upright, as a JPEG.
@@ -194,21 +203,22 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
         Err(why) => return Outcome::Failed(format!("robot.look: {why}")),
     };
     hold(robot, head, LIFT);
-    let mut lit = true;
     for period in blinks(COUNTDOWN) {
-        for _ in 0..2 {
-            if let Err(why) = asked("robot.flashlight", robot.flashlight(lit)) {
+        for brightness in [BLINK, 0.0] {
+            if let Err(why) = asked("robot.flashlight", robot.flashlight(brightness)) {
                 // A board without a light still takes the picture, only without the countdown.
                 tracing::info!(%why, "no flashlight for the countdown");
             }
-            lit = !lit;
             hold(robot, head, period / 2);
         }
     }
-    let _ = robot.flashlight(true);
+    let _ = robot.flashlight(FLASH_AT);
+    if let Err(why) = robot.sound(SHUTTER) {
+        tracing::info!(%why, "no shutter quack");
+    }
     hold(robot, head, FLASH);
     let shot = robot.capture();
-    let _ = robot.flashlight(false);
+    let _ = robot.flashlight(0.0);
 
     let outcome = match shot.and_then(|jpeg| robot.save(&jpeg)) {
         Ok(path) => Outcome::Taken(path),
@@ -480,9 +490,8 @@ mod tests {
             self.since_head = Duration::ZERO;
             Ok(())
         }
-        fn flashlight(&mut self, on: bool) -> Result<proto::IntentResult, String> {
-            self.calls
-                .push(format!("light {}", if on { "on" } else { "off" }));
+        fn flashlight(&mut self, brightness: f64) -> Result<proto::IntentResult, String> {
+            self.calls.push(format!("light {brightness}"));
             Ok(if self.no_light {
                 proto::IntentResult::refused("this board has no flashlight")
             } else {
@@ -520,8 +529,10 @@ mod tests {
             if c == "head" {
                 continue;
             }
-            // Every light switch before the last `light on` ahead of the capture is a blink.
-            let last_on = calls[..capture].iter().rposition(|c| c == "light on");
+            // Every light switch before the flash, the last one ahead of the capture, is a blink.
+            let last_on = calls[..capture]
+                .iter()
+                .rposition(|c| c.starts_with("light"));
             if c.starts_with("light") && Some(i) < last_on {
                 if out.last().map(String::as_str) != Some("blinks") {
                     out.push("blinks".into());
@@ -557,9 +568,10 @@ mod tests {
                 "stop",
                 "look",
                 "blinks",
-                "light on",
+                "light 0.15",
+                "quack",
                 "capture",
-                "light off",
+                "light 0",
                 "save",
                 "sit",
                 "mouth 1"
@@ -646,6 +658,25 @@ mod tests {
         on_touch(&mut robot);
         assert!(robot.calls.iter().filter(|c| *c == "head").count() > 10);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    /// Dim, so it does not hurt: the blinks at a tenth, the flash at 15 %.
+    #[test]
+    fn the_light_is_dim() {
+        let mut robot = Fake::default();
+        on_touch(&mut robot);
+        let lit: Vec<&str> = robot
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("light") && *c != "light 0")
+            .map(String::as_str)
+            .collect();
+        let (flash, blinks) = lit.split_last().unwrap();
+        assert_eq!(*flash, "light 0.15");
+        assert!(
+            blinks.len() > 8 && blinks.iter().all(|c| *c == "light 0.1"),
+            "{blinks:?}"
+        );
     }
 
     #[test]

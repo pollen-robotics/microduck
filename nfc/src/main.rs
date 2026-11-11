@@ -492,11 +492,12 @@ impl photo::Driver for Sockets {
         notify(&self.robot, &proto::Call::RobotHead(head))
     }
 
-    fn flashlight(&mut self, on: bool) -> Result<proto::IntentResult, String> {
+    fn flashlight(&mut self, brightness: f64) -> Result<proto::IntentResult, String> {
         let params = proto::FlashlightParams {
-            on,
+            on: brightness > 0.0,
             toggle: false,
             color: proto::FlashlightColor::White,
+            brightness: (brightness > 0.0).then_some(brightness),
         };
         call(
             &self.robot,

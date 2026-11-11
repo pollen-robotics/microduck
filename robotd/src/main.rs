@@ -679,6 +679,8 @@ struct RobotState {
     shutdown: AtomicBool,
     /// What `robot.flashlight` last asked for, as [`leds::Flashlight`] stores it.
     flashlight: AtomicU8,
+    /// How bright, in thousandths of full: [`leds::flashlight_level`] of the last call that lit it.
+    flashlight_level: std::sync::atomic::AtomicU16,
     /// Whether this board has a flashlight, so `robot.flashlight` refuses on one that does not
     /// rather than accepting into the dark. Read once: an LED does not appear on a running board.
     has_flashlight: bool,
@@ -842,6 +844,7 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             flashlight: AtomicU8::new(0),
+            flashlight_level: std::sync::atomic::AtomicU16::new(leds::FULL),
             has_flashlight: leds::flashlight_fitted(),
             leds_changed: tokio::sync::Notify::new(),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
@@ -5640,9 +5643,13 @@ fn dispatch(
         proto::Call::RobotFlashlight(p) => {
             let result = if state.has_flashlight {
                 let current = state.flashlight.load(Ordering::Relaxed);
-                state
-                    .flashlight
-                    .store(leds::flashlight_after(current, p), Ordering::Relaxed);
+                let after = leds::flashlight_after(current, p);
+                if after != 0 {
+                    state
+                        .flashlight_level
+                        .store(leds::flashlight_level(p), Ordering::Relaxed);
+                }
+                state.flashlight.store(after, Ordering::Relaxed);
                 state.leds_changed.notify_one();
                 proto::IntentResult::accepted()
             } else {

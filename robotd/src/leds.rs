@@ -154,14 +154,29 @@ pub fn flashlight_after(current: Flashlight, p: &proto::FlashlightParams) -> Fla
     }
 }
 
-fn flashlight_lights(stored: Flashlight) -> [Light; 3] {
+/// How bright the flashlight is, in thousandths of full: what `robot.flashlight` asked, or full.
+pub fn flashlight_level(p: &proto::FlashlightParams) -> u16 {
+    p.brightness.map_or(FULL, |b| {
+        (b.clamp(0.0, 1.0) * f64::from(FULL)).round() as u16
+    })
+}
+
+/// [`flashlight_level`] of a call that names no brightness.
+pub const FULL: u16 = 1000;
+
+fn flashlight_lights(stored: Flashlight, level: u16) -> [Light; 3] {
     let channels = match stored {
         0 => [false; 3],
         n => COLORS
             .get(usize::from(n) - 1)
             .map_or([false; 3], |c| c.channels()),
     };
-    channels.map(Light::from)
+    let lit = match level {
+        0 => Light::Off,
+        FULL.. => Light::On,
+        n => Light::Dim(n),
+    };
+    channels.map(|on| if on { lit } else { Light::Off })
 }
 
 /// Whether this board has a flashlight. Read once at startup: an LED does not appear on a
@@ -246,7 +261,10 @@ pub async fn run(state: Arc<RobotState>) {
         face.show(
             Status::of(&health, starting).lights(),
             gauge.lights(),
-            flashlight_lights(state.flashlight.load(Ordering::Relaxed)),
+            flashlight_lights(
+                state.flashlight.load(Ordering::Relaxed),
+                state.flashlight_level.load(Ordering::Relaxed),
+            ),
         );
         let _ = tokio::time::timeout(PERIOD, state.leds_changed.notified()).await;
     }
@@ -313,7 +331,10 @@ mod tests {
             ..Default::default()
         };
         let on = flashlight_after(0, &toggle(proto::FlashlightColor::Cyan));
-        assert_eq!(flashlight_lights(on), [Light::Off, Light::On, Light::On]);
+        assert_eq!(
+            flashlight_lights(on, FULL),
+            [Light::Off, Light::On, Light::On]
+        );
         assert_eq!(
             flashlight_after(on, &toggle(proto::FlashlightColor::Cyan)),
             0
@@ -325,10 +346,37 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(flashlight_lights(white), [Light::On; 3]);
+        assert_eq!(flashlight_lights(white, FULL), [Light::On; 3]);
         assert_eq!(
             flashlight_after(white, &proto::FlashlightParams::default()),
             0
+        );
+    }
+
+    #[test]
+    fn the_flashlight_is_as_bright_as_asked_and_full_when_not_said() {
+        let at = |brightness| proto::FlashlightParams {
+            on: true,
+            brightness,
+            ..Default::default()
+        };
+        assert_eq!(flashlight_level(&at(None)), FULL);
+        assert_eq!(flashlight_level(&at(Some(0.1))), 100);
+        assert_eq!(flashlight_level(&at(Some(7.0))), FULL);
+        assert_eq!(flashlight_level(&at(Some(-1.0))), 0);
+        let white = flashlight_after(0, &at(Some(0.1)));
+        assert_eq!(flashlight_lights(white, 100), [Light::Dim(100); 3]);
+        assert_eq!(flashlight_lights(white, 0), [Light::Off; 3]);
+        let red = flashlight_after(
+            0,
+            &proto::FlashlightParams {
+                color: proto::FlashlightColor::Red,
+                ..at(Some(0.5))
+            },
+        );
+        assert_eq!(
+            flashlight_lights(red, 500),
+            [Light::Dim(500), Light::Off, Light::Off]
         );
     }
 }

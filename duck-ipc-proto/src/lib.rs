@@ -536,7 +536,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
-pub const API_VERSION: u32 = 53;
+///
+/// # v54 — the flashlight's brightness
+///
+/// [`FlashlightParams::brightness`]: how bright, 0 to 1 of the LED's full brightness, so the light
+/// can be on without dazzling the person it points at. Absent is full, as before, and is not sent:
+/// a client that does not set it still works against an older `robotd`, which refuses the field by
+/// name when one does. A board whose LEDs are on/off only (the beta's GPIO expander) lights any
+/// brightness above zero fully.
+pub const API_VERSION: u32 = 54;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2086,6 +2094,7 @@ pub mod test_support {
                 on: true,
                 toggle: false,
                 color: FlashlightColor::Cyan,
+                brightness: Some(0.25),
             }),
             Call::RobotShutdown,
             Call::RobotMode,
@@ -2605,13 +2614,17 @@ impl FlashlightColor {
 
 /// See [`method::ROBOT_FLASHLIGHT`]. Shaped like [`EnableParams`]: `toggle` wins over `on`, so a
 /// button that does not know the light's state can still flip it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlashlightParams {
     pub on: bool,
     pub toggle: bool,
     /// The colour it lights in. Ignored when the call switches it off.
     pub color: FlashlightColor,
+    /// How bright, 0 to 1 of the LED's full brightness, clamped by the robot. Absent is full.
+    /// Ignored when the call switches it off. (v54)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<f64>,
 }
 
 /// See [`method::ROBOT_THEREMIN`].

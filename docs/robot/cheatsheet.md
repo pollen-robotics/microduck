@@ -1132,6 +1132,7 @@ robotctl led blink cam:red
 robotctl led trigger green1:green heartbeat
 robotctl flashlight on --color cyan
 robotctl flashlight toggle
+robotctl flashlight on --brightness 0.1   # a tenth of full; PWM boards only, a beta is on/off
 ```
 
 The beta board's face has twelve LEDs (`face:<place>:<colour>`, on a GPIO expander), and `led`

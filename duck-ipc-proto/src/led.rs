@@ -4,7 +4,8 @@
 //! the mechanism they share: an LED is a directory under `/sys/class/leds`, from `gpio-leds` on the
 //! beta board's expander and from the Awinic PWM drivers on face-board-v1, and switching it is a
 //! write to `brightness` or `trigger`. On is the LED's own `max_brightness`, not `1`: that is the
-//! same thing on an on/off LED, and one step in 255 on a PWM one.
+//! same thing on an on/off LED, and one step in 255 on a PWM one. [`Light::Dim`] is a share of it,
+//! which only a PWM LED can show.
 //!
 //! Here rather than in each daemon because three of them write LEDs and they must agree on two
 //! things that are easy to get subtly wrong: that a blinking LED is switched on by dropping its
@@ -47,6 +48,9 @@ pub mod name {
 pub enum Light {
     Off,
     On,
+    /// Lit at this many thousandths of `max_brightness`, rounded up so a dim LED is never dark: on
+    /// an LED whose `max_brightness` is 1 (a GPIO), anything above zero is fully on.
+    Dim(u16),
     /// The kernel's `timer` trigger at its default 500/500 ms. Another rate needs root
     /// (`delay_on` is root's), and one rate is all the LEDs need.
     Blink,
@@ -66,7 +70,7 @@ impl From<bool> for Light {
 pub struct Led {
     path: PathBuf,
     /// What [`Light::On`] writes: the LED's `max_brightness`.
-    full: String,
+    full: u32,
     shown: Option<Light>,
 }
 
@@ -87,8 +91,7 @@ impl Led {
             .ok()
             .and_then(|max| max.trim().parse::<u32>().ok())
             .filter(|&max| max > 0)
-            .unwrap_or(1)
-            .to_string();
+            .unwrap_or(1);
         Some(Led {
             path,
             full,
@@ -111,7 +114,13 @@ impl Led {
             Light::Off => self.write("brightness", "0"),
             Light::On => {
                 self.write("trigger", "none")?;
-                self.write("brightness", &self.full)
+                self.write("brightness", &self.full.to_string())
+            }
+            Light::Dim(thousandths) => {
+                self.write("trigger", "none")?;
+                let level =
+                    (u64::from(self.full) * u64::from(thousandths.min(1000))).div_ceil(1000);
+                self.write("brightness", &level.to_string())
             }
             Light::Blink => self.write("trigger", "timer"),
         }
@@ -172,6 +181,22 @@ mod tests {
         let mut led = Led::open_in(dir.path(), name::FLASHLIGHT_RED).unwrap();
         led.set(Light::On).unwrap();
         assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "255");
+    }
+
+    #[test]
+    fn dim_is_a_share_of_full_and_never_dark() {
+        let dir = fake(&[name::FLASHLIGHT_RED, name::CAMERA]);
+        let max = dir.path().join(name::FLASHLIGHT_RED).join("max_brightness");
+        std::fs::write(&max, "255\n").unwrap();
+        let mut pwm = Led::open_in(dir.path(), name::FLASHLIGHT_RED).unwrap();
+        pwm.set(Light::Dim(100)).unwrap();
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "26");
+        pwm.set(Light::Dim(1)).unwrap();
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "1");
+        // An on/off LED has no half: dim is on.
+        let mut gpio = Led::open_in(dir.path(), name::CAMERA).unwrap();
+        gpio.set(Light::Dim(100)).unwrap();
+        assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
     }
 
     #[test]
