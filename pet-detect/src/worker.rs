@@ -5,10 +5,16 @@
 //! The capture device is single-client, so everything that analyses the mic shares this one
 //! stream.
 //!
+//! It can also read a recording instead of the mic ([`AudioSource::File`]). That is what makes
+//! the sentry and the classifier testable away from a robot: the same PCM the robot would hear
+//! goes in, and the events come out unchanged. A file is read once and stops at EOF — there is
+//! nothing to restart, so the mic's retry loop does not apply to it.
+//!
 //! Ported from the prototype's `pet_worker.rs`; `println!` diagnostics became `tracing`.
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,9 +201,21 @@ impl SoundSentry {
     }
 }
 
+/// Where the worker's audio comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioSource {
+    /// ALSA capture device name, read through an `arecord` subprocess.
+    Alsa(String),
+    /// 16-bit signed LE mono 16 kHz PCM, read to EOF and then stop.
+    ///
+    /// A recording rather than the mic: the format is the one `arecord -t raw` writes, so
+    /// `arecord -f S16_LE -r 16000 -c 1 -t raw > take.pcm` is all it takes to produce one.
+    File(PathBuf),
+}
+
 pub struct PetConfig {
-    /// ALSA capture device passed to arecord.
-    pub alsa_device: String,
+    /// Where to read the audio from.
+    pub source: AudioSource,
     /// Path to the trained ONNX model.
     pub model_path: PathBuf,
     /// Probability above which petting starts.
@@ -210,7 +228,7 @@ impl Default for PetConfig {
     fn default() -> Self {
         let lib = PettingDetectorConfig::default();
         Self {
-            alsa_device: "plughw:aic3104,0".into(),
+            source: AudioSource::Alsa("plughw:aic3104,0".into()),
             model_path: PathBuf::from("/opt/robot/daemon/current/models/pet_detect.onnx"),
             enter_threshold: lib.enter_threshold,
             exit_threshold: lib.exit_threshold,
@@ -248,11 +266,11 @@ impl PetHandle {
         let (tx, rx) = mpsc::channel();
         let (tx_sound, rx_sound) = mpsc::channel();
         let sd = shutdown.clone();
-        let dev = config.alsa_device.clone();
+        let source = config.source.clone();
 
         let join = thread::Builder::new()
             .name("pet-worker".into())
-            .spawn(move || worker_loop(&dev, detector, &tx, &tx_sound, &sd))
+            .spawn(move || worker_loop(&source, detector, &tx, &tx_sound, &sd))
             .expect("spawn pet worker");
 
         Ok(Self {
@@ -298,9 +316,68 @@ const RESTART_HEALTHY: Duration = Duration::from_secs(5);
 /// trying (a codec that comes back should be heard) but stops narrating it.
 const RESTART_QUIET_AFTER: u32 = 5;
 
+/// How a read ended. EOF is a failure for the mic — `arecord` should run until we stop it —
+/// and the natural end for a recording, so the two callers read the same value differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpEnd {
+    Eof,
+    Shutdown,
+}
+
 fn worker_loop(
-    alsa_device: &str,
+    source: &AudioSource,
     mut detector: PettingDetector,
+    tx: &Sender<PettingEvent>,
+    tx_sound: &Sender<SoundEvent>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    match source {
+        // A recording is read once. There is no device to lose, so the retry loop below would
+        // only re-read the same bytes — or, at 30 s of backoff, sleep on a file that is already
+        // finished.
+        AudioSource::File(path) => read_recording(path, &mut detector, tx, tx_sound, shutdown),
+        AudioSource::Alsa(device) => mic_loop(device, &mut detector, tx, tx_sound, shutdown),
+    }
+}
+
+/// Read a recording to EOF, emitting exactly the events the mic would have produced.
+fn read_recording(
+    path: &Path,
+    detector: &mut PettingDetector,
+    tx: &Sender<PettingEvent>,
+    tx_sound: &Sender<SoundEvent>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Not a restart: a missing or unreadable file will not appear on the next attempt.
+            tracing::warn!(path = %path.display(), error = %e, "pet worker: cannot open recording");
+            return;
+        }
+    };
+    let mut sentry = SoundSentry::new();
+    let mut reader = BufReader::new(file);
+    // `Eof` and `Shutdown` are both clean ends but mean different things: one is the take
+    // finishing, the other is the daemon going away mid-take. Reporting "played to the end"
+    // for a shutdown would put a completion in the log that did not happen.
+    match pump(&mut reader, detector, &mut sentry, tx, tx_sound, shutdown) {
+        Ok(PumpEnd::Eof) => {
+            tracing::info!(path = %path.display(), "pet worker: recording played to the end")
+        }
+        Ok(PumpEnd::Shutdown) => tracing::debug!(
+            path = %path.display(),
+            "pet worker: stopped before the end of the recording"
+        ),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "pet worker: recording failed")
+        }
+    }
+}
+
+fn mic_loop(
+    alsa_device: &str,
+    detector: &mut PettingDetector,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
     shutdown: &Arc<AtomicBool>,
@@ -311,8 +388,21 @@ fn worker_loop(
         let started = Instant::now();
         match spawn_arecord(alsa_device) {
             Ok(mut c) => {
-                if let Err(e) = pump(&mut c, &mut detector, &mut sentry, tx, tx_sound, shutdown) {
-                    log_restart(failures, &e.to_string());
+                // `pump` reports EOF rather than erroring, because the file source needs it to
+                // mean success; for `arecord` it still means the stream died, so it is logged
+                // the way it was before.
+                let outcome = match c.stdout.take() {
+                    Some(mut stdout) => {
+                        pump(&mut stdout, detector, &mut sentry, tx, tx_sound, shutdown)
+                    }
+                    None => Err(anyhow::anyhow!("arecord stdout missing")),
+                };
+                match outcome {
+                    Ok(PumpEnd::Eof) => {
+                        log_restart(failures, "arecord stdout closed (EOF)");
+                    }
+                    Ok(PumpEnd::Shutdown) => {}
+                    Err(e) => log_restart(failures, &e.to_string()),
                 }
                 let _ = c.kill();
                 let _ = c.wait();
@@ -373,34 +463,46 @@ fn spawn_arecord(device: &str) -> Result<Child> {
         .spawn()?)
 }
 
+/// One read from the PCM stream: `None` at end of stream, otherwise the samples in it.
+///
+/// Split out of [`pump`] so the decode-and-terminate half can be exercised without a model:
+/// everything downstream of this needs a [`PettingDetector`], and constructing one means
+/// loading an ONNX file that the tests do not ship.
+fn read_block(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    i16_buf: &mut Vec<i16>,
+) -> Result<Option<Vec<f32>>> {
+    let n = reader.read(buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if !n.is_multiple_of(2) {
+        return Err(anyhow::anyhow!("odd byte count in the PCM stream"));
+    }
+    i16_buf.clear();
+    for chunk in buf[..n].as_chunks::<2>().0 {
+        i16_buf.push(i16::from_le_bytes(*chunk));
+    }
+    Ok(Some(i16_to_f32(i16_buf)))
+}
+
 fn pump(
-    child: &mut Child,
+    reader: &mut impl Read,
     detector: &mut PettingDetector,
     sentry: &mut SoundSentry,
     tx: &Sender<PettingEvent>,
     tx_sound: &Sender<SoundEvent>,
     shutdown: &Arc<AtomicBool>,
-) -> Result<()> {
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("arecord stdout missing"))?;
+) -> Result<PumpEnd> {
     let mut buf = [0u8; 4096];
     let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
 
     while !shutdown.load(Ordering::Acquire) {
-        let n = stdout.read(&mut buf)?;
-        if n == 0 {
-            return Err(anyhow::anyhow!("arecord stdout closed (EOF)"));
-        }
-        if !n.is_multiple_of(2) {
-            return Err(anyhow::anyhow!("odd byte count from arecord"));
-        }
-        i16_buf.clear();
-        for chunk in buf[..n].as_chunks::<2>().0 {
-            i16_buf.push(i16::from_le_bytes(*chunk));
-        }
-        let samples = i16_to_f32(&i16_buf);
+        let samples = match read_block(reader, &mut buf, &mut i16_buf)? {
+            Some(samples) => samples,
+            None => return Ok(PumpEnd::Eof),
+        };
         // Read before the sentry sees this batch, deliberately: the answer is a one-second
         // hangover rather than a verdict on these 128 ms, so it spans batches and reading it
         // one batch early costs nothing. Reading it after would mean pushing to the sentry
@@ -412,7 +514,7 @@ fn pump(
         for ev in events {
             if tx.send(ev).is_err() {
                 // Receiver dropped — the daemon is shutting down.
-                return Ok(());
+                return Ok(PumpEnd::Shutdown);
             }
         }
         // Ambient sound events off the same stream, muted while petting (head scratches
@@ -428,12 +530,129 @@ fn pump(
             let _ = tx_sound.send(sev);
         }
     }
-    Ok(())
+    Ok(PumpEnd::Shutdown)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw S16_LE mono 16 kHz recording, the format `arecord -t raw` writes and the one
+    /// `AudioSource::File` promises to read. `frames` counts sentry frames, not samples.
+    fn write_recording(dir: &Path, loud: usize, quiet: usize) -> PathBuf {
+        fn push(bytes: &mut Vec<u8>, sample: i16, frames: usize) {
+            for _ in 0..frames * SENTRY_FRAME as usize {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        // 0.05 is the amplitude the sentry tests below use for "a sound": above the 0.018
+        // on-threshold at the default floor, so it opens an event.
+        let mut bytes = Vec::new();
+        push(&mut bytes, (0.05 * f32::from(i16::MAX)) as i16, loud);
+        push(&mut bytes, 0, quiet);
+        let path = dir.join("take.pcm");
+        std::fs::write(&path, bytes).expect("write recording");
+        path
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pet-detect-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+    /// A recording is read to its last sample and then reports end of stream — the value
+    /// `read_recording` turns into a clean stop rather than a restart.
+    ///
+    /// This goes through `read_block`, the same function `pump` uses, so a regression that
+    /// makes the reader swallow the tail or spin at EOF is caught here.
+    #[test]
+    fn a_recording_is_read_to_eof_and_stops() {
+        let dir = temp_dir("eof");
+        let path = write_recording(&dir, 0, 4);
+        let mut reader = BufReader::new(File::open(&path).expect("open"));
+        let mut buf = [0u8; 4096];
+        let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
+
+        // Bounded on purpose: if `read_block` ever stops reporting end of stream, the failure
+        // should be an assertion here rather than a test that hangs until the harness kills it.
+        let mut blocks = 0usize;
+        let mut samples = 0usize;
+        for _ in 0..64 {
+            match read_block(&mut reader, &mut buf, &mut i16_buf).expect("read") {
+                Some(block) => {
+                    blocks += 1;
+                    samples += block.len();
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            samples,
+            SENTRY_FRAME as usize * 4,
+            "every sample of the take"
+        );
+        assert!(blocks >= 1, "the take is not empty");
+        assert!(blocks < 64, "the reader never reported end of stream");
+
+        // The next call after EOF keeps saying EOF rather than turning into data.
+        assert!(
+            read_block(&mut reader, &mut buf, &mut i16_buf)
+                .expect("EOF is not an error")
+                .is_none(),
+            "end of stream must be reported again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An odd byte count is a malformed stream, not an end of stream. One is a clean stop and
+    /// the other is a bug in whatever produced the file, so they must not be conflated.
+    #[test]
+    fn an_odd_byte_count_is_an_error_not_an_end() {
+        let dir = temp_dir("odd");
+        let path = dir.join("odd.pcm");
+        std::fs::write(&path, [1u8, 2, 3]).expect("write");
+        let mut reader = BufReader::new(File::open(&path).expect("open"));
+        let mut buf = [0u8; 4096];
+        let mut i16_buf: Vec<i16> = Vec::new();
+        let err = read_block(&mut reader, &mut buf, &mut i16_buf)
+            .expect_err("three bytes is not a whole sample");
+        assert!(err.to_string().contains("odd byte count"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud take produces the event the mic would have produced: 16 loud frames then 3
+    /// quiet ones, past the 12-frame transient boundary that separates `Noise` from `Voice`
+    /// and then below the off-threshold long enough to close the event.
+    #[test]
+    fn a_loud_recording_produces_the_event_the_mic_would() {
+        let dir = temp_dir("loud");
+        let path = write_recording(&dir, 16, 3);
+
+        let mut sentry = SoundSentry::new();
+        let mut out = Vec::new();
+        let mut reader = BufReader::new(File::open(&path).expect("open"));
+        let mut buf = [0u8; 4096];
+        let mut i16_buf: Vec<i16> = Vec::with_capacity(2048);
+        while let Some(samples) = read_block(&mut reader, &mut buf, &mut i16_buf).expect("read") {
+            sentry.push(&samples, false, &mut out);
+        }
+        assert!(
+            out.contains(&SoundEvent::Voice),
+            "a loud recording must be heard, got {out:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that is not there fails once and says so; it must not be retried as if the mic
+    /// had dropped out.
+    #[test]
+    fn a_missing_recording_is_a_warning_not_a_restart_loop() {
+        let dir = temp_dir("missing");
+        let path = dir.join("not-there.pcm");
+        assert!(File::open(&path).is_err(), "the fixture must not exist");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// One sentry frame of a constant amplitude, pushed through as the mic would deliver it.
     fn frames(sentry: &mut SoundSentry, amplitude: f32, count: u32) {
