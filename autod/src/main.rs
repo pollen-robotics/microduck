@@ -440,6 +440,8 @@ fn map_stream(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
                     None => continue,
                 }
             }
+            // A nearby search: the robot is most likely where it was.
+            (None, Some(why)) if matches!(why.as_str(), "sat" | "bumped") => brain::MapFix::Unsure,
             (None, Some(_)) => brain::MapFix::Lost,
             // Neither a pose nor a reason: `mapd` is not mapping.
             (None, None) => brain::MapFix::Off,

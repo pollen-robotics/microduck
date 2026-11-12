@@ -269,6 +269,22 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    | hit under `STOP_M` (0.15 m) | spin away |
    | three hard stops within the heat window | a boxed-in break-out spin |
 
+**Nothing sees behind, so the duck must not go there.** The brain never asks for a backward twist.
+The robot backs up anyway: the walking policy drifts backwards when it turns in place (to be fixed
+in the policy), autonomous soccer steps back to line up a kick, and the gait may step back to hold
+a body pose that leans. Three things keep that off the walls, all needing the map's grid (§6) —
+without it nothing knows what is behind, and backing up is only logged:
+
+- **Turns creep forward by a wall.** With a wall the map knows (or a spot where the ToF stopped the
+  duck) within 45 cm behind, and fresh clear floor ahead, a turn in place or a wander pivot walks
+  forward at the slowest speed the gait walks at instead of pivoting on the spot.
+- **No leaning by a wall.** Stretch and Dance are not picked with a wall within 40 cm behind.
+- **Backing up is stopped.** Odometry's forward speed, smoothed over 0.4 s, below −4 cm/s is
+  walking backwards: logged once per stretch with what was moving the robot (`walking backwards`,
+  with the brain's state, its command, the body pose and the ball). With a wall within 35 cm
+  behind, the duck braces: whatever it was doing ends (a ball game with it), the body pose is let
+  go, and it steps forward for a second if the ToF shows clear floor ahead, or stands.
+
 ## 6. The map
 
 `mapd`'s map does two things for the brain, and the brain does one for the map. `autod/src/map.rs`
@@ -289,8 +305,13 @@ correction moves the goal, never the duck's footing.
 
 - **A wander bout that reaches its goal ends in a survey**: 4–6 s standing still, the head
   sweeping ±0.9 rad, level. The ToF's 45° wedge covers ~150° of the place.
-- **Lost, it stays put.** When `map.state` says lost (carried, sat, fell, booted), a walking duck
-  stops into a survey, and from then on it alternates surveys with short turns in place — the
+- **Checked after a sit, one survey.** Standing up from a sit, `mapd` reports `sat` until a stop
+  or two confirm the robot is where it sat: a carry while seated looks the same to it
+  (`mapping-design.md` §4). `bumped` is the same nearby check. The brain answers both with one
+  survey at its next change of state and otherwise carries on — a duck that sat by itself is not
+  lost.
+- **Lost, it stays put.** When `map.state` says lost for real (carried, fell, booted, or what it
+  sees stopped matching), a walking duck stops into a survey, and from then on it alternates surveys with short turns in place — the
   stops the map's search needs, made where it lost itself rather than metres away. It walks again
   as soon as the map finds itself, or after 90 s regardless: a place the map never recognises
   becomes an island the map may join later, and the duck has a life to live. Nothing else

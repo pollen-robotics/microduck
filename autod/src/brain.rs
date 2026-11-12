@@ -59,8 +59,14 @@ pub enum MapFix {
     /// No map: `mapd` is not running, not mapping, or not answering. The brain walks on odometry
     /// alone, as it did before there was a map.
     Off,
-    /// The map does not know where the robot is: it was carried, sat, fell, or has just booted.
+    /// The map does not know where the robot is: it was carried, fell, has just booted, or what
+    /// it sees stopped matching.
     Lost,
+    /// The map is checking the robot is where it was (`sat`: it stood up from a sit, which a
+    /// carry while seated would look like too; `bumped`): it searches nearby, and a stop or two
+    /// settles it. One survey, then life as usual — a duck that sat by itself must not spend a
+    /// minute and a half looking around as if it had been carried off.
+    Unsure,
     /// Where the odometry frame sits in the map (see [`map::offset`]).
     Known(Se2),
 }
@@ -291,6 +297,23 @@ const MAP_WALL_M: f64 = 0.15;
 const DISCOVER_M: f64 = 0.5;
 const DISCOVER_WEIGHT: f64 = 1.0;
 
+/// Walking backwards, by odometry: forward speed below this (m/s, smoothed over `BACK_TAU`). The
+/// brain never asks for it — the head ToF looks ahead only, and nothing sees behind — so backing up
+/// is something else moving the robot: autonomous soccer lining up a kick, or the gait stepping to
+/// keep its balance under a body pose.
+const BACK_V: f64 = -0.04;
+const BACK_TAU: f64 = 0.4;
+/// Backing up with a wall the map knows (or a spot where the ToF stopped the duck) this close
+/// behind is stopped at once: whatever was moving the robot is ended, and it steps away.
+const REAR_M: f64 = 0.35;
+/// No body pose that leans the robot (Stretch, Dance) with a wall this close behind.
+const REAR_POSE_M: f64 = 0.40;
+/// How long the step away from a wall behind lasts.
+const BRACE_S: f64 = 1.0;
+/// The walking policy drifts backwards when it turns in place. With a wall this close behind, a
+/// turn creeps forward instead of pivoting, when the way ahead is clear.
+const CREEP_REAR_M: f64 = 0.45;
+
 /// Wrap an angle to (-π, π].
 pub fn wrap_angle(a: f64) -> f64 {
     (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
@@ -364,6 +387,9 @@ pub enum State {
     BallPlay,
     /// Stand still and sweep the head side to side: a wide look at this place, for the map.
     Survey,
+    /// Backing into a wall: everything stopped, body pose off, and a short step forward if the way
+    /// ahead is clear.
+    Brace,
 }
 
 pub struct Brain {
@@ -475,6 +501,13 @@ pub struct Brain {
     saved_visits: Vec<((i32, i32), f32)>,
     /// The wander bout just ended at its goal: survey there.
     survey_next: bool,
+    /// Forward speed by odometry, smoothed (m/s, negative is backwards), from the pose of the last
+    /// tick the brain saw; and whether this stretch of backing up has been logged.
+    back_prev: Option<[f64; 3]>,
+    back_v: f64,
+    backing_logged: bool,
+    /// Last tick's body pose was active — for the log line that says why the duck backed up.
+    was_posing: bool,
 }
 
 impl Brain {
@@ -543,7 +576,46 @@ impl Brain {
             grid: None,
             saved_visits: Vec::new(),
             survey_next: false,
+            back_prev: None,
+            back_v: 0.0,
+            backing_logged: false,
+            was_posing: false,
         }
+    }
+
+    /// A turn's forward speed: zero, except with a wall close behind and clear floor ahead, where
+    /// the slowest walk keeps the policy's backward drift off the wall.
+    fn creep(&mut self, obstacle: &Option<Obstacle>, dt: f64) -> f64 {
+        let clear = obstacle.is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > REACT_M);
+        if clear && self.wall_behind(CREEP_REAR_M) {
+            self.walkable(MIN_WALK_VX.min(self.max_speed), dt)
+        } else {
+            0.0
+        }
+    }
+
+    /// A wall the map knows, or a spot where the ToF stopped the duck, within `d` behind it. Never
+    /// without the map's grid: nothing else knows what is behind.
+    fn wall_behind(&self, d: f64) -> bool {
+        let Some(grid) = self.grid.as_ref().filter(|g| self.in_map && g.has_floor()) else {
+            return false;
+        };
+        let [x, y, yaw] = self.here();
+        let (s, c) = yaw.sin_cos();
+        let mut r = 0.10;
+        while r <= d + 1e-9 {
+            let p = [x - r * c, y - r * s];
+            if grid.wall_near(p, 0.08)
+                || self
+                    .blocked
+                    .iter()
+                    .any(|(b, _)| (b[0] - p[0]).hypot(b[1] - p[1]) < 0.15)
+            {
+                return true;
+            }
+            r += 0.05;
+        }
+        false
     }
 
     /// The newest grid from `mapd`.
@@ -623,6 +695,13 @@ impl Brain {
                     self.lost_since = Some(self.clock);
                 }
             }
+            MapFix::Unsure => {
+                if self.fix != MapFix::Unsure {
+                    tracing::info!("the map is checking where the duck is — one survey");
+                    self.survey_next = true;
+                }
+                self.lost_since = None;
+            }
             // Gone away: carry on with the last offset, as if lost forever but without waiting.
             MapFix::Off => self.lost_since = None,
         }
@@ -645,6 +724,8 @@ impl Brain {
         self.droop = 0.0;
         self.reply_in = -1.0;
         self.perk_until = -1.0;
+        self.back_prev = None;
+        self.back_v = 0.0;
     }
 
     /// Advance by `dt` seconds.
@@ -664,6 +745,8 @@ impl Brain {
         self.quack_t += dt;
 
         if world.busy {
+            // A skill moving the robot is not walking backwards; the speed restarts after it.
+            self.back_prev = None;
             // Somebody else is driving — our own ground pick included. Freeze, neutral.
             if self.pick_pending {
                 self.pick_seen_busy = true;
@@ -732,10 +815,36 @@ impl Brain {
                 (world.pose[0] - self.last_pose[0]).hypot(world.pose[1] - self.last_pose[1]);
             self.bout.asked_m += self.cmd[0] * dt;
         }
+        if let Some(prev) = self.back_prev {
+            let (dx, dy) = (world.pose[0] - prev[0], world.pose[1] - prev[1]);
+            let forward = (dx * world.pose[2].cos() + dy * world.pose[2].sin()) / dt.max(1e-3);
+            self.back_v += (dt / BACK_TAU).min(1.0) * (forward - self.back_v);
+        }
+        self.back_prev = Some(world.pose);
         self.last_pose = world.pose;
         self.take_fix(world.map);
+        // Backing up: said once per stretch, with what was moving the robot, and stopped at once
+        // with a wall behind.
+        let backing = self.back_v < BACK_V;
+        if backing && !self.backing_logged {
+            self.backing_logged = true;
+            tracing::warn!(
+                state = ?self.state,
+                speed = format!("{:.2}", self.back_v),
+                asked = ?self.cmd,
+                body_pose = self.was_posing,
+                ball = world.ball.on,
+                "walking backwards"
+            );
+        } else if self.back_v > BACK_V / 2.0 {
+            self.backing_logged = false;
+        }
+        if backing && self.state != State::Brace && self.wall_behind(REAR_M) {
+            tracing::warn!(state = ?self.state, "backing into a wall — stopping, stepping away");
+            self.enter(State::Brace);
+        }
         // Not while lost: where the robot is in the map is exactly what is not known.
-        if self.fix != MapFix::Lost {
+        if !matches!(self.fix, MapFix::Lost | MapFix::Unsure) {
             let [x, y, _] = self.here();
             let w = self.visits.entry(Self::cell_of(x, y)).or_insert(0.0);
             *w = (*w + dt as f32).min(60.0);
@@ -951,7 +1060,7 @@ impl Brain {
                 // Slow into the goal rather than overshoot it and circle back.
                 let approach = (distance / GOAL_SLOW_M).clamp(0.3, 1.0);
                 let base_vx = if pivoting {
-                    0.0
+                    self.creep(&world.obstacle, dt)
                 } else {
                     self.wander_vx * approach
                 };
@@ -964,7 +1073,8 @@ impl Brain {
                 self.cmd = [vx, 0.0, wz];
             }
             State::TurnInPlace => {
-                self.cmd = [0.0, 0.0, self.turn_rate];
+                let vx = self.creep(&world.obstacle, dt);
+                self.cmd = [vx, 0.0, self.turn_rate];
                 // Lead the turn with the whole head, as if it cannot wait to see what is there.
                 let side = self.turn_rate.signum();
                 self.head = [0.0, 0.10, 0.7 * side, 0.15 * side];
@@ -1322,6 +1432,19 @@ impl Brain {
                     }
                 }
             }
+            State::Brace => {
+                self.head = [0.0; 4];
+                // Forward only onto floor the ToF has just seen clear; otherwise stand.
+                let clear = world
+                    .obstacle
+                    .is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > REACT_M);
+                let vx = if clear {
+                    self.walkable(MIN_WALK_VX.min(self.max_speed), dt)
+                } else {
+                    0.0
+                };
+                self.cmd = [vx, 0.0, 0.0];
+            }
             State::Survey => {
                 self.cmd = [0.0; 3];
                 // One slow sweep, left then right then back, over the survey: the ToF's 45° wedge
@@ -1469,6 +1592,7 @@ impl Brain {
             self.enter(next);
         }
 
+        self.was_posing = body_active;
         Step {
             cmd: self.cmd,
             head: self.head_out(),
@@ -1792,6 +1916,7 @@ impl Brain {
                 600.0
             }
             State::Survey => self.rng.range(SURVEY_S.0, SURVEY_S.1),
+            State::Brace => BRACE_S,
             State::BallPlay => {
                 self.ball_seen_at = None;
                 self.ball_kicks_from = None;
@@ -1873,6 +1998,7 @@ impl Brain {
             // go; a tired one parks, grooms, naps.
             _ => {
                 let e = self.energy;
+                let lean_ok = !self.wall_behind(REAR_POSE_M);
                 let weights: [(State, f64); 10] = [
                     (State::Wander, 0.16 + 0.28 * e),
                     (State::TurnInPlace, 0.06),
@@ -1885,10 +2011,12 @@ impl Brain {
                             0.0
                         },
                     ),
-                    (State::Stretch, 0.05),
+                    // Both lean the body, and the gait may step back to hold it: never with a wall
+                    // close behind.
+                    (State::Stretch, if lean_ok { 0.05 } else { 0.0 }),
                     (State::GroundPick, if can_ground_pick { 0.05 } else { 0.0 }),
                     (State::Ruffle, 0.06),
-                    (State::Dance, if e > 0.4 { 0.05 } else { 0.0 }),
+                    (State::Dance, if e > 0.4 && lean_ok { 0.05 } else { 0.0 }),
                     (State::Sneeze, 0.03),
                     // A fresh, unbored duck goes looking for the ball fairly often; a bored one
                     // hardly ever.
@@ -2542,5 +2670,109 @@ mod tests {
         }
         assert!(chased, "standing, it went after the dot");
         assert!(!bench.sitting);
+    }
+
+    /// A grid with a wall along x = 0 (one 10 cm column), seen floor east of it: a duck at x > 0
+    /// facing +x has the wall behind it.
+    fn wall_to_the_west() -> std::sync::Arc<Grid> {
+        let rows: Vec<String> = (0..40)
+            .map(|_| (0..40).map(|i| if i == 0 { '#' } else { '.' }).collect())
+            .collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        std::sync::Arc::new(map::tests::grid(&rows, 0.1))
+    }
+
+    /// A brain in the map, standing at `x` facing away from the wall to the west.
+    fn by_the_wall(x: f64) -> (Brain, World) {
+        let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 13);
+        let mut w = world([x, 2.0, 0.0]);
+        w.map = MapFix::Known(map::IDENTITY);
+        brain.step(0.02, &w);
+        brain.set_grid(wall_to_the_west());
+        brain.enter(State::Chill);
+        (brain, w)
+    }
+
+    /// Drifting backwards towards a wall the map knows stops at once: whatever it was doing, the
+    /// duck braces and steps forward onto floor the ToF sees clear — and never commands reverse.
+    #[test]
+    fn backing_into_a_known_wall_is_stopped() {
+        let (mut brain, mut w) = by_the_wall(1.0);
+        brain.enter(State::TurnInPlace);
+        let mut braced_at = None;
+        for i in 0..500 {
+            // The gait drifting back at 10 cm/s, whatever was asked.
+            w.pose[0] = 1.0 - 0.1 * 0.02 * f64::from(i);
+            let out = brain.step(0.02, &w);
+            assert!(out.cmd[0] >= 0.0, "never asks for reverse");
+            if brain.state() == State::Brace {
+                braced_at = Some(w.pose[0]);
+                assert!(out.cmd[0] > 0.0, "steps forward onto clear floor");
+                break;
+            }
+        }
+        let at = braced_at.expect("braced before the wall");
+        assert!(at > 0.1 + 0.2, "with room to spare: stopped at x = {at:.2}");
+    }
+
+    /// Without a map nothing knows what is behind, so backing up is only logged.
+    #[test]
+    fn without_a_map_backing_up_is_only_logged() {
+        let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 14);
+        let mut w = world([1.0, 2.0, 0.0]);
+        brain.enter(State::Chill);
+        for i in 0..200 {
+            w.pose[0] = 1.0 - 0.1 * 0.02 * f64::from(i);
+            brain.step(0.02, &w);
+            assert_ne!(brain.state(), State::Brace);
+        }
+        assert!(brain.backing_logged);
+    }
+
+    /// With a wall close behind: no body pose that leans, and a turn creeps forward rather than
+    /// pivoting where the policy would drift back into it.
+    #[test]
+    fn by_a_wall_no_leaning_and_turns_creep_forward() {
+        let (mut brain, w) = by_the_wall(0.35);
+        brain.energy = 0.9;
+        for _ in 0..5000 {
+            let next = brain.pick_next_state(true, true, true, false);
+            assert!(!matches!(next, State::Stretch | State::Dance), "{next:?}");
+        }
+        brain.enter(State::TurnInPlace);
+        let out = brain.step(0.02, &w);
+        assert!(
+            out.cmd[0] > 0.0 && out.cmd[2] != 0.0,
+            "creeping turn: {:?}",
+            out.cmd
+        );
+
+        // Far from it, a turn is a pivot again.
+        let (mut brain, w) = by_the_wall(2.5);
+        brain.enter(State::TurnInPlace);
+        assert_eq!(brain.step(0.02, &w).cmd[0], 0.0);
+    }
+
+    /// The map checking the duck after it sat by itself is one survey, not the stay-put of a duck
+    /// that was carried off.
+    #[test]
+    fn a_check_after_a_sit_is_one_survey() {
+        let mut bench = Bench::new(15);
+        bench.brain.energy = 1.0;
+        bench.tick(|w| w.map = MapFix::Known(map::IDENTITY));
+        bench.brain.enter(State::Chill);
+        let mut surveys = 0;
+        let mut walked = false;
+        let mut last = bench.brain.state();
+        for _ in 0..50 * 60 {
+            bench.tick(|w| w.map = MapFix::Unsure);
+            let state = bench.brain.state();
+            surveys += usize::from(state == State::Survey && last != State::Survey);
+            walked |= state == State::Wander;
+            last = state;
+        }
+        assert!(!bench.brain.lost_mode());
+        assert!(surveys >= 1, "surveyed to settle it");
+        assert!(walked, "and got on with its life");
     }
 }
