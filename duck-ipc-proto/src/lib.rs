@@ -2776,7 +2776,7 @@ pub struct NfcWriteParams {
 }
 
 impl NfcWriteParams {
-    pub const DEFAULT_TIMEOUT_S: u32 = 30;
+    pub const DEFAULT_TIMEOUT_S: u32 = 20;
     /// The longest wait asked for that is honoured; more is cut to this.
     pub const MAX_TIMEOUT_S: u32 = 120;
 

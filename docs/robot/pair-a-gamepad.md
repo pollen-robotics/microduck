@@ -85,8 +85,9 @@ robotctl nfc-flash microduck_gamepad_pairing
 duckctl nfc-flash microduck_gamepad_pairing
 ```
 
-then touch an NTAG to the head within 30 seconds (`--timeout` changes that, up to 120). A tag
-already on the reader is written too. The robot quacks when the tag took, and the command says so
+The robot asks for a tag with the sound it makes when it loses its pad, the questioning quack;
+touch an NTAG to the head within 20 seconds (`--timeout` changes that, up to 120). A tag already on
+the reader is written too. The robot quacks when the tag took, and the command says so
 once it has read it back; the tag then holds that one text record, exactly as a phone app writes
 it. While a write is waiting, a touched tag is written rather than acted on, and the tag just
 written is not then read as a touch — writing a pairing tag does not pair.
