@@ -351,10 +351,10 @@ fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
         let side = (2.0 * turns + 0.5).floor() as u32;
         if side > sides {
             sides = side;
-            if (side - 1) % QUACK_EVERY_SIDES == 0 {
-                if let Err(why) = robot.sound(ROLL_QUACK) {
-                    tracing::info!(%why, "robot.sound");
-                }
+            if (side - 1).is_multiple_of(QUACK_EVERY_SIDES)
+                && let Err(why) = robot.sound(ROLL_QUACK)
+            {
+                tracing::info!(%why, "robot.sound");
             }
         }
         let phase = std::f64::consts::TAU * turns;
