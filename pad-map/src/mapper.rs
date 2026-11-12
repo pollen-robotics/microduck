@@ -147,6 +147,8 @@ pub struct Mapper {
     /// starts the wheee ride. The prototype's threshold.
     prev_rt: f64,
     prev_lt: f64,
+    /// The mouth last sent, `None` before the first: it is sent when it changes, not every tick.
+    mouth_sent: Option<f64>,
     /// Does this pad think the robot is up (torque on, at the home pose)? When not, Start sends
     /// `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
     /// Starts false: padd starts with the robot, and a robotd restart restarts padd too.
@@ -169,6 +171,7 @@ impl Mapper {
             home: HoldButton::default(),
             prev_rt: 0.0,
             prev_lt: 0.0,
+            mouth_sent: None,
             up: false,
         }
     }
@@ -402,10 +405,17 @@ impl Mapper {
         // also chirps and LT rides the wheee, which they now do here too.
         let rt = pad.rt;
         let lt = pad.lt;
+        //
+        // Sent when it changes, not every tick: the robot holds the mouth where it was last put,
+        // and a pad at rest saying "closed" fifty times a second closed it on anything else that
+        // opened it — the NFC photo sequence opens the beak for a display and waits.
         let mouth = rt.max(lt);
-        out.push(Out::Notify(proto::Call::RobotMouth(proto::MouthParams {
-            open: mouth,
-        })));
+        if self.mouth_sent != Some(mouth) {
+            self.mouth_sent = Some(mouth);
+            out.push(Out::Notify(proto::Call::RobotMouth(proto::MouthParams {
+                open: mouth,
+            })));
+        }
 
         // Chirp on the right trigger's rising edge; the robot cuts off a still-playing
         // sound, so rapid pulses quack rapidly. The wheee rides the left trigger: start on
@@ -700,6 +710,32 @@ mod tests {
         m.tick(&up, &cfg, ms(13_000), &mut out, &mut frame);
         m.tick(&PadFrame::default(), &cfg, ms(15_000), &mut out, &mut frame);
         assert!(asked(&out).is_empty());
+    }
+
+    /// The mouth is sent when the triggers move it, not every tick: a pad at rest must not keep
+    /// closing a beak something else opened.
+    #[test]
+    fn the_mouth_is_sent_when_it_changes() {
+        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+        let mouths = |m: &mut Mapper, rt: f64| {
+            let (mut out, mut frame) = (Vec::new(), Vec::new());
+            let pad = PadFrame {
+                rt,
+                ..Default::default()
+            };
+            m.tick(&pad, &cfg, t, &mut out, &mut frame);
+            out.iter()
+                .filter_map(|o| match o {
+                    Out::Notify(proto::Call::RobotMouth(p)) => Some(p.open),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(mouths(&mut m, 0.0), [0.0]);
+        assert!(mouths(&mut m, 0.0).is_empty());
+        assert_eq!(mouths(&mut m, 0.5), [0.5]);
+        assert!(mouths(&mut m, 0.5).is_empty());
+        assert_eq!(mouths(&mut m, 0.0), [0.0]);
     }
 
     #[test]
