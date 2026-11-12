@@ -149,9 +149,11 @@ standing aside while one drives: it then sends a zero twist and a centred head, 
 reads as nobody asking, rather than going silent and leaving its last command winning until it
 goes stale. `robotd` runs one of the two at a time, and switching soccer on switches the laser off.
 
-- **The laser is on whenever the duck could chase**: not tired, not napping, not being petted (a
-  dot would walk it out from under the hand), not playing ball. A dot being followed interrupts
-  any standing or walking state with an excited quack. The chase ends 2 s after the dot goes, into
+- **The laser is on whenever the duck could chase**: not tired, not being petted (a dot would walk
+  it out from under the hand), not playing ball. A dot being followed interrupts any standing or
+  walking state with an excited quack, and **wakes a napping duck**: it stands up at once, no
+  stretch, and goes after the dot (or looks for it, if it went). The nap that follows a chase is
+  the exception: the duck is tired then, the laser is off, and no dot is seen. The chase ends 2 s after the dot goes, into
   a look around for it. Chasing burns energy at twice a walk's rate (one unit per 50 s). Below 0.2
   the duck has had enough: the laser goes off and it naps (or chills, with no sit/stand policy).
   It comes back on only above 0.45, which a nap gets to.
