@@ -27,7 +27,7 @@
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
 //! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves with a short
-//!    quack at each side ([`wiggle`]): where the photo will be written to it, which is not done
+//!    quack now and then ([`wiggle`]): where the photo will be written to it, which is not done
 //!    yet.
 //! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch,
 //!    closes it [`DROP`] later, and brings its head back up to the centre.
@@ -86,8 +86,11 @@ pub const KEEP: Duration = Duration::from_secs(5);
 const ROLL: f64 = 0.14;
 /// One roll left and back right.
 const ROLL_PERIOD: Duration = Duration::from_millis(500);
-/// The quack at each side of the roll: the short mouth-trigger one.
+/// The quack now and then as the head rolls: the short mouth-trigger one.
 const ROLL_QUACK: proto::SoundTag = proto::SoundTag::Chirp;
+/// One quack every this many sides the head reaches: four over [`KEEP`] rather than twenty. Odd,
+/// so they alternate left and right.
+const QUACK_EVERY_SIDES: u32 = 5;
 /// The sound as the beak lets the display go: a tiny cute retch.
 const LET_GO: proto::SoundTag = proto::SoundTag::Bwep;
 /// How far the beak opens for the display to go in: a share of wide open.
@@ -337,7 +340,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
 }
 
 /// Roll the head side to side around `head` for `d`, [`ROLL`] each way every [`ROLL_PERIOD`],
-/// then settle it back on `head`, with a [`ROLL_QUACK`] each time the head reaches a side. Sent
+/// then settle it back on `head`, with a [`ROLL_QUACK`] every [`QUACK_EVERY_SIDES`] sides. Sent
 /// every [`ROLL_STEP`], so the look-around stays off too.
 fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
     let mut t = Duration::ZERO;
@@ -348,8 +351,10 @@ fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
         let side = (2.0 * turns + 0.5).floor() as u32;
         if side > sides {
             sides = side;
-            if let Err(why) = robot.sound(ROLL_QUACK) {
-                tracing::info!(%why, "robot.sound");
+            if (side - 1) % QUACK_EVERY_SIDES == 0 {
+                if let Err(why) = robot.sound(ROLL_QUACK) {
+                    tracing::info!(%why, "robot.sound");
+                }
             }
         }
         let phase = std::f64::consts::TAU * turns;
@@ -844,10 +849,9 @@ mod tests {
         assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
         assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
         assert_eq!(*robot.rolls.last().unwrap(), 0.0);
-        // A quack at each side: two a roll, besides the first quack, the shutter's and the retch.
+        // A few quacks, besides the first quack, the shutter's and the retch.
         let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 3;
-        let rolls = (KEEP.as_secs_f64() / ROLL_PERIOD.as_secs_f64()) as usize;
-        assert_eq!(quacks, 2 * rolls);
+        assert_eq!(quacks, 4);
         // No display, no rolling.
         let mut robot = Fake {
             eink_after: None,
