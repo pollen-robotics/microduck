@@ -275,6 +275,10 @@ fn permits(call: &proto::Call) -> bool {
         // Drops this session, and unlike an update leaves nothing mid-transition: the robot comes
         // back and the client reconnects. It is what you offer a confused robot.
         SystemReboot => true,
+        // Refused: a WebRTC peer need not be in the room — the relay exists so it can be
+        // anywhere — and opening a root-capable login to the network is a decision for whoever
+        // holds the robot. BLE carries it, behind the setup code.
+        SystemOpenWifiSsh => false,
         // Read-only network state. Useful for showing a remote operator why the link is poor.
         NetStatus | NetScan => true,
         PadStatus | PadForget(_) => true,

@@ -918,6 +918,7 @@ impl Server {
             | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
+            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             // `pad.*` is `configd`'s for the same reason: pairing a gamepad is a root-only question
