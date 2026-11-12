@@ -23,7 +23,7 @@ use duck_ipc_proto as proto;
 /// How long a call holds a connection. Defined once, in the protocol crate.
 pub use proto::Lane;
 
-/// The service that owns the answer to a call, restricted to the three `btd` holds sockets to.
+/// The service that owns the answer to a call, restricted to the four `btd` holds sockets to.
 ///
 /// Narrower than [`proto::Service`] on purpose. `padd` and `tofd` answer calls too, and `btd` has
 /// no connection to either: `padd` is the unprivileged client whose whole value is having no
@@ -38,6 +38,8 @@ pub enum Upstream {
     Robot,
     /// `configd` — wifi and the robot's identity.
     Config,
+    /// `nfcd` — writing a tag.
+    Nfc,
 }
 
 impl TryFrom<proto::Service> for Upstream {
@@ -48,6 +50,7 @@ impl TryFrom<proto::Service> for Upstream {
             proto::Service::Updater => Ok(Upstream::Updater),
             proto::Service::Robot => Ok(Upstream::Robot),
             proto::Service::Config => Ok(Upstream::Config),
+            proto::Service::Nfc => Ok(Upstream::Nfc),
             // Not sockets `btd` holds. Unreachable in practice, because `permits` refuses every
             // call these answer — and an error rather than a panic so that staying true is not
             // something this file has to be careful about.
@@ -539,6 +542,12 @@ fn permits(call: &proto::Call) -> bool {
         TofStream => false,
         // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
         HeadImuStream => false,
+
+        // **Writing a tag is asked from the room by construction**: nothing is written until
+        // somebody touches a tag to the robot's head, which is where a phone in BLE range is.
+        // `duckctl nfc-flash` is the client. It changes the tag, never the robot — the tag's
+        // text does whatever it does only when touched again, like one a phone app wrote.
+        NfcWrite(_) => true,
     }
 }
 
