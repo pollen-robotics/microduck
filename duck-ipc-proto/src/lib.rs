@@ -572,7 +572,29 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::MAP_GRID`] and [`method::MAP_WIPE`] — where the robot is in its own map, and the map.
 /// New routes: a release predating `mapd` has no socket to answer them, and a transport that
 /// forwards them says so by name.
-pub const API_VERSION: u32 = 58;
+///
+/// # v59 — the autonomous brain: who is driving, what the duck hears, a head that moves fast
+///
+/// Four additions, all for `autod` (`docs/design/autonomous.md`), all optional on the wire:
+///
+/// - [`HelloParams::client`]: a client may name itself. `robotd` remembers the name for that
+///   connection.
+/// - [`MoveState::source`]: the name of the client whose `robot.move` is in the twist slot. It is
+///   how the brain sees a pad that has taken over, since `robotd` arbitrates nothing.
+/// - [`RobotState::hearing`]: petting, and counters of the noises and voices the microphone heard.
+///   These never left `robotd` before.
+/// - [`HeadParams::alpha`]: a per-intent head smoothing rate, for motion faster than
+///   `[control] head_alpha` lets through.
+///
+/// Install consequences, both directions:
+///
+/// - **A v58 `robotd` refuses** a `hello` carrying `client`, and a `robot.head` carrying `alpha`,
+///   with `INVALID_PARAMS`. `padd` logs the refused hello and drives on, and `autod` sends `alpha`
+///   only to a robot that answered its hello with 59 or later. On such a robot, a brain cannot see
+///   a pad take over, so it would fight the pad. That is the consequence of a half-updated robot:
+///   updating moves every daemon together.
+/// - **A v58 client reading a v59 robot** ignores the new fields; nothing it reads changed.
+pub const API_VERSION: u32 = 59;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2144,6 +2166,7 @@ pub mod test_support {
         vec![
             Call::Hello(HelloParams {
                 api_version: API_VERSION,
+                client: Some("autod".into()),
             }),
             Call::Check(ComponentParams {
                 component: component.clone(),
@@ -2189,6 +2212,7 @@ pub mod test_support {
                 head_pitch: -0.1,
                 head_yaw: 0.2,
                 head_roll: 0.0,
+                alpha: Some(0.8),
             }),
             Call::RobotLook(LookParams {
                 x: 1.0,
@@ -2612,6 +2636,9 @@ impl From<&str> for ComponentId {
 #[serde(deny_unknown_fields)]
 pub struct HelloParams {
     pub api_version: u32,
+    /// Who is calling, for [`MoveState::source`]. A short stable name, `padd` or `autod`. (v59)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2656,6 +2683,15 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+    /// How fast the head glides to this target: the per-tick EMA rate, 0..1, where 1 means
+    /// "arrive at once". Absent means `[control] head_alpha`, the shared feel every other client
+    /// gets.
+    ///
+    /// It exists for motion faster than that rate lets through. At 0.2 and 50 Hz, a 4.5 Hz feather
+    /// shake arrives at about a third of its amplitude. It applies to this target only: the next
+    /// `robot.head` without it goes back to the shared rate. Clamped to 0..1. (v59)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
 }
 
 /// A point to look at, trunk frame, metres — see [`method::ROBOT_LOOK`]. The gaze form
@@ -4905,6 +4941,30 @@ pub struct RobotState {
     /// for real. `frames` is a few leaves of this. Empty from a daemon predating it. (v25)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skeleton: Vec<PoseState>,
+    /// What the microphone makes of the room. Absent while nothing is listening:
+    /// `[audio] pet_detect` off, no microphone, or a daemon predating v59.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hearing: Option<HearingState>,
+}
+
+/// What the microphone hears, in [`RobotState::hearing`]. (v59)
+///
+/// Petting is a level: someone is scratching the head now. Noises and voices are events, so they
+/// are **counters** rather than flags. A subscriber decimated to 5 Hz, or one that missed a frame,
+/// still sees that something happened, by the counter having moved. Both start at zero when
+/// `robotd` starts.
+///
+/// They count everything the microphone heard, including the duck's own voice. Telling the duck
+/// apart from the room is the consumer's job, because only the consumer knows what it asked the
+/// duck to say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HearingState {
+    pub petting: bool,
+    /// Sharp transients: a clap, a bang, a dropped object.
+    pub noises: u32,
+    /// Sustained utterances: someone talking to the duck, or quacking at it.
+    pub voices: u32,
 }
 
 /// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
@@ -5027,6 +5087,11 @@ pub struct OdomState {
 pub struct MoveState {
     pub requested: [f64; 3],
     pub applied: [f64; 3],
+    /// The [`HelloParams::client`] name of the connection whose `robot.move` filled the twist
+    /// slot. Absent if that client never named itself, if nothing has driven yet, or if the
+    /// daemon predates v59. With `limited_by` free of `deadman`, it says who is driving now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Empty when the command went through untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limited_by: Vec<String>,
@@ -7622,6 +7687,38 @@ mod tests {
         assert_eq!(back.theremin, None);
     }
 
+    /// The brain reads petting and noises off the state stream, and a frame from a v37 daemon has
+    /// no `hearing` at all. It must parse as "nothing is listening", not fail, or `autod` against
+    /// a half-updated robot would drop every frame.
+    #[test]
+    fn hearing_is_absent_until_something_listens_and_counts_when_it_does() {
+        let quiet = serde_json::to_string(&a_state()).unwrap();
+        assert!(!quiet.contains("hearing"), "{quiet}");
+        assert!(!quiet.contains("source"), "{quiet}");
+        let back: RobotState = serde_json::from_str(&quiet).unwrap();
+        assert_eq!(back.hearing, None);
+        assert_eq!(back.movement.source, None);
+
+        let mut state = a_state();
+        state.hearing = Some(HearingState {
+            petting: true,
+            noises: 3,
+            voices: 1,
+        });
+        let line = serde_json::to_string(&state).unwrap();
+        let back: RobotState = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.hearing, state.hearing);
+    }
+
+    /// A v37 client's hello carries no name, and must keep being served.
+    #[test]
+    fn a_hello_without_a_name_still_parses() {
+        let hello: HelloParams = serde_json::from_str(r#"{"api_version":37}"#).unwrap();
+        assert_eq!(hello.client, None);
+        let head: HeadParams = serde_json::from_str(r#"{"head_yaw":0.3}"#).unwrap();
+        assert_eq!(head.alpha, None, "absent means the shared rate");
+    }
+
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
     /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
     #[test]
@@ -7632,6 +7729,7 @@ mod tests {
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],
+                source: Some("padd".into()),
                 limited_by: vec!["deadman".into()],
             },
             policy: "walk".into(),
@@ -7718,6 +7816,7 @@ mod tests {
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
+                source: None,
                 limited_by: Vec::new(),
             },
             head: [0.0; 4],
@@ -7747,6 +7846,7 @@ mod tests {
             imu: None,
             frames: None,
             skeleton: Vec::new(),
+            hearing: None,
         }
     }
 
@@ -7757,6 +7857,7 @@ mod tests {
         let movement = MoveState {
             requested: [0.0; 3],
             applied: [0.0; 3],
+            source: None,
             limited_by: Vec::new(),
         };
         let line = serde_json::to_string(&movement).unwrap();

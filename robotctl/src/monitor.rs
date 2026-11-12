@@ -5120,6 +5120,7 @@ mod tests {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
                 limited_by: vec![],
+                source: None,
             },
             head: [0.0; 4],
             policy: "stand".to_owned(),
@@ -5149,6 +5150,7 @@ mod tests {
             imu: None,
             frames: None,
             skeleton: Vec::new(),
+            hearing: None,
         }
     }
 }

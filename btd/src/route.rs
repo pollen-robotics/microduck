@@ -764,6 +764,7 @@ mod tests {
             (
                 proto::Call::Hello(proto::HelloParams {
                     api_version: proto::API_VERSION,
+                    client: None,
                 }),
                 Upstream::Updater,
             ),
@@ -894,6 +895,7 @@ mod tests {
                 head_pitch: 0.0,
                 head_yaw: 0.0,
                 head_roll: 0.0,
+                alpha: None,
             }),
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());

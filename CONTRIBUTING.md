@@ -81,6 +81,7 @@ the daemons — one crate each, one unit each, all in the same release artifact
   configd/        wifi · robot name · pairing PIN · reboot · gamepad pairing
   btd/            the BLE front door
   padd/           gamepad → intents — an ordinary socket client, no privileged access
+  autod/          the autonomous brain — another such client, idle unless switched on
   mediad/         camera, mic, WebRTC, the remote gateway, and the console it serves
   tof/            tofd: the head's 8×8 depth sensor. Publishes frames, reads nothing
   mapd/           the onboard map: a client of robotd and tofd, keeps the map, answers map.*

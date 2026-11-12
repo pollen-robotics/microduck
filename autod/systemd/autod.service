@@ -1,0 +1,71 @@
+# autod — the autonomous brain, as an intent client.
+#
+# Install to /etc/systemd/system/autod.service. docs/design/autonomous.md is the design.
+#
+# Shipped and enabled on every robot, and idle on almost all of them: autonomy is
+# `[autonomous] enabled` in robotd.toml, off by default, and `autod` checks it itself and parks when
+# it is off. No unit in this release is started or stopped by a setting — a condition-skipped unit
+# reads as "stopped", which is a lie about a unit that is fine — and `robotctl configure` restarts
+# this one when the switch changes.
+#
+# Switched on, it stands the robot up at boot with no pad (once per boot — see RuntimeDirectory
+# below), and drives it whenever the pad is not.
+
+[Unit]
+Description=Robot autonomous brain
+Documentation=file:///opt/robot/daemon/current/docs/design/autonomous.md
+
+# `After`, not `Requires` and not `Wants`, for padd's reasons (see padd.service): robotd is where the
+# intents go, and a stopped robotd must stay stopped. A socket that is not there yet makes `autod`
+# exit, and systemd retries in five seconds.
+After=robotd.service tofd.service local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/opt/robot/daemon/current/bin/autod
+
+# Unprivileged, like padd, and for the same reason: an ordinary intent client, with no access a
+# pad or the app does not have. Its one group reaches robotd's and tofd's 0660 sockets. The user
+# comes from sysusers.d/autod.conf, installed alongside.
+User=autod
+Group=autod
+SupplementaryGroups=robot
+
+Restart=always
+RestartSec=5s
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+# `autod` logs at `warn` when it stands the robot up, when the pad takes over and lets go, and when
+# the policy stops driving; at `info` every state change of the brain, which is the line to read to
+# know what the duck thinks it is doing.
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+
+# /run/autod/: identity.json for `robotctl health`, removed with the unit like every daemon's.
+RuntimeDirectory=autod
+
+# /var/lib/autod/started: the boot (the kernel's boot_id) on which the robot was stood up. Compared
+# against the running boot's id, so a crash, an update or a `configure` restart of this unit does not
+# stand back up a robot somebody stopped — and the next boot does. Not /run: that directory has to go
+# with the unit, or a stopped autod would leave an identity behind claiming to be running.
+StateDirectory=autod
+
+[Install]
+WantedBy=multi-user.target

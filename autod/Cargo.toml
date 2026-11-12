@@ -1,0 +1,20 @@
+[package]
+name = "autod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The robot's own brain: what the duck does when nobody is driving it"
+
+# An intent client like `padd`, and no more privileged. See docs/design/autonomous.md.
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+# `[autonomous]`, and the pad's speed limits, from the same `robotd.toml` everything else reads.
+robotd-params = { path = "../robotd-params" }
+# The head ToF's beams, levelled by the IMU — the same reprojection `robotctl monitor` draws. Pure
+# Rust: the `tof` crate, with its vendored C driver, is never linked here.
+kinematics = { path = "../kinematics" }
+clap = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

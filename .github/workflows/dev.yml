@@ -141,6 +141,9 @@ jobs:
           # netpadd is the same intent client fed by UDP instead of Bluetooth. Its unit is enabled
           # beside padd's and an ExecCondition on `[netpad] enabled` picks which of the two runs.
           cp target/aarch64-unknown-linux-gnu/release/netpadd staged/
+          # autod is the autonomous brain. Shipped and enabled everywhere, idle unless
+          # `[autonomous] enabled` (docs/design/autonomous.md).
+          cp target/aarch64-unknown-linux-gnu/release/autod staged/
           # mediad is the WebRTC gateway. Shipped so a board *can* run it; its unit has no
           # [Install], so nothing starts it until someone does. See mediad/systemd/mediad.service.
           cp target/aarch64-unknown-linux-gnu/release/mediad staged/
@@ -192,6 +195,8 @@ jobs:
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
             --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
             --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
+            --include "autod/systemd/autod.service=systemd/autod.service" \
+            --include "autod/systemd/sysusers.d/autod.conf=systemd/sysusers.d/autod.conf" \
             --include "mediad/systemd/mediad.service=systemd/mediad.service" \
             --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \

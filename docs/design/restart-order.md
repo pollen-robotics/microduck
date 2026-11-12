@@ -7,9 +7,9 @@ three different documents, and the answer decides how a skew is diagnosed.
 Everything here is read from the code, and each step names the function that owns it. Where a
 narrative comment elsewhere disagrees with this page, the comment is the bug.
 
-## 1. The ten daemons, and the unit that is not one
+## 1. The eleven daemons, and the unit that is not one
 
-A release ships ten daemons — `robotd`, `configd`, `btd`, `padd`, `netpadd`, `mediad`, `tofd`, `nfcd`,
+A release ships eleven daemons — `robotd`, `configd`, `btd`, `padd`, `netpadd`, `autod`, `mediad`, `tofd`, `nfcd`,
 `mapd`, `updaterd` —
 each `ExecStart`ing a path under `/opt/robot/daemon/current/bin/`, so each is stale the instant the
 symlink moves, and each is either restarted by the update or restarted after it.
@@ -25,6 +25,7 @@ no `[Install]` section, and that is what keeps it out — see §1.1.
 | `configd` | yes | — |
 | `padd` | yes | — |
 | `netpadd` | yes | — |
+| `autod` | yes | — |
 | `mediad` | yes | — |
 | `tofd` | yes | — |
 | `nfcd` | yes | — |

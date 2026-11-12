@@ -219,7 +219,7 @@ Three properties worth trusting:
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
 for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s on a zero3 and `robotd`'s on a beta), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]`,
-`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `sudo`, because the file
+`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `[autonomous]` restarts `autod`. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -1118,6 +1118,30 @@ robot that stays put):
 
 The kicks are the `kick_left` / `kick_right` skills, which ship in the policy set; a robot without
 them says so in the journal when it tries.
+
+### The duck on its own (`autod`)
+
+Off by default. Switch it on in **features** → `autonomous.enabled`:
+
+```bash
+sudo robotctl configure        # features → autonomous.enabled, save, restart autod
+```
+
+From then on the robot stands itself up at boot with no pad, and wanders, looks around, grooms,
+naps, answers when spoken to, and turns away from what the head ToF sees ahead. It stands up
+**once per boot**. If you stop it (Start, Select), it stays stopped until you press Start again or
+reboot, even if `autod` restarts.
+
+A connected pad stays silent until you touch it. Touching it takes over at once, and
+`autonomous.pad_idle_s` (30 s) after your last touch the duck takes back over. What it thinks it is
+doing, one line per change of mind:
+
+```bash
+journalctl -u autod -f
+```
+
+With no depth frames it still looks around and grooms, but it never walks: it only advances along a
+path it has seen. [`autonomous.md`](../design/autonomous.md) is the design.
 
 ### The ToF sensor (`tofd`)
 

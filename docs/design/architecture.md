@@ -15,7 +15,7 @@ rewritten). v1 targets a **single, well-specified hardware configuration**.
 
 ## The shape of it
 
-Seven daemons on one board, talking over unix sockets. One of them drives the robot; three
+Eight daemons on one board, talking over unix sockets. One of them drives the robot; three
 of the others exist so that the first one can be broken without the board becoming unreachable,
 and the rest are transports and sensors that own nothing.
 
@@ -87,6 +87,7 @@ counter ([`updater-design.md`](updater-design.md)).
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
 | `netpadd` | nothing — gamepad transport over UDP on the LAN, instead of `padd` ([`udp-pad.md`](../robot/udp-pad.md)) | UDP `[netpad] port` | `/run/robotd.sock` |
+| `autod` | nothing — the autonomous brain, an intent client like `padd`, idle unless `[autonomous] enabled` ([`autonomous.md`](autonomous.md)) | — | `/run/robotd.sock`, `/run/tofd/tof.sock` |
 | `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
 | `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus, or SPI on the beta board (`tof::link`) |
 | `mapd` | the onboard map and where the robot is in it ([`mapping-design.md`](mapping-design.md)) | `/run/mapd/map.sock` (`map.*`) | `robotd` and `tofd`, as a subscriber — it commands nothing |

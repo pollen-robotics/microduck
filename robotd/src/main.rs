@@ -2546,6 +2546,9 @@ async fn control_loop<T: RobotIo>(
     // connection as well as for frames — a second of silence that reads as a broken feature.
     // Also off when audio is off, since a theremin with no voice is a mouth opening for no
     // reason.
+    // What the microphone heard, for `robot.state.hearing`: petting as a level, noises and voices
+    // as counters, so a subscriber that missed a frame still sees that something happened.
+    let mut hearing = proto::HearingState::default();
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // Laser tracking. The reader holds no connection to `mediad` while tracking is off, so on a
@@ -3056,11 +3059,20 @@ async fn control_loop<T: RobotIo>(
                         }
                         pet_detect::PettingEvent::End => tracing::debug!("petting ended"),
                     }
+                    hearing.petting = matches!(ev, pet_detect::PettingEvent::Start);
                 }
-                // Ambient sound events have no consumer until the autonomous brain arrives;
-                // surfaced at debug so mic tuning on a bench has data to look at.
+                // Counted for `robot.state.hearing`, where the autonomous brain reads them, and
+                // still logged at debug so mic tuning on a bench has data to look at.
                 while let Some(ev) = pet.try_recv_sound() {
                     tracing::debug!(event = ?ev, "ambient sound");
+                    match ev {
+                        pet_detect::worker::SoundEvent::Noise => {
+                            hearing.noises = hearing.noises.wrapping_add(1);
+                        }
+                        pet_detect::worker::SoundEvent::Voice => {
+                            hearing.voices = hearing.voices.wrapping_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -3569,8 +3581,9 @@ async fn control_loop<T: RobotIo>(
         {
             ramp(ema, target, cmd_alpha, accel, period.as_secs_f64());
         }
+        let head_rate = snapshot.head_alpha.unwrap_or(head_alpha);
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            slew(ema, target, head_alpha);
+            slew(ema, target, head_rate);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
@@ -4298,6 +4311,7 @@ async fn control_loop<T: RobotIo>(
                 movement: proto::MoveState {
                     requested: snapshot.command.twist,
                     applied: command.twist,
+                    source: intents.twist_source(),
                     limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
                 },
                 head: command.head,
@@ -4351,6 +4365,7 @@ async fn control_loop<T: RobotIo>(
                     &sensors.positions,
                 ))),
                 skeleton: mapping::skeleton_at(&sensors.positions),
+                hearing: pet.as_ref().map(|_| hearing),
             });
         }
 
@@ -4787,6 +4802,9 @@ async fn handle(
     let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
+    // What the client called itself in `hello`, for `move.source`: the brain's only way to see a
+    // pad that has taken over, since nothing here arbitrates between drivers.
+    let mut client: Option<Arc<str>> = None;
 
     loop {
         // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
@@ -4898,6 +4916,20 @@ async fn handle(
 
         let call = request.as_call();
 
+        if let Ok(proto::Call::Hello(hello)) = &call {
+            client = hello.client.as_deref().map(Arc::from);
+        }
+        // The twist is stamped with who sent it, so it is set here, where the connection is known,
+        // rather than in `apply_intent`, which serves every connection alike.
+        if let Ok(proto::Call::RobotMove(p)) = &call {
+            intents.set_twist_from([p.vx, p.vy, p.vyaw], client.clone());
+            if let Some(id) = request.id.clone() {
+                let response = proto::Response::ok(Some(id), &proto::IntentResult::accepted());
+                write_line(&mut write_half, &response).await?;
+            }
+            continue;
+        }
+
         // Notifications get no reply, per the spec. Continuous intents arrive this way —
         // at 50 Hz a response per message would be pure overhead, and there is nothing
         // useful to say about a velocity that is superseded 20 ms later.
@@ -4954,7 +4986,10 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
             true
         }
         proto::Call::RobotHead(p) => {
-            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            intents.set_head_at(
+                [p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll],
+                p.alpha,
+            );
             true
         }
         proto::Call::RobotPose(p) => {
@@ -5595,6 +5630,7 @@ fn dispatch(
                         head_pitch,
                         head_yaw,
                         head_roll,
+                        alpha: None,
                     },
                     clamped: gaze.clamped,
                 },
@@ -8079,6 +8115,90 @@ mod tests {
             written.positions, resting,
             "the loop moved the robot instead of holding where it found it"
         );
+    }
+
+    /// `move.source` is how the autonomous brain sees a pad that has taken over, and nothing else
+    /// tells it. So a client that named itself in `hello` must be the name on its twist, on both
+    /// framings of `robot.move`, and an unnamed client must not inherit the previous driver's name.
+    #[tokio::test]
+    async fn a_named_client_is_the_source_of_its_twist() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let s = Arc::new(RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let intents = Arc::new(Intents::new());
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+
+        let hello = proto::Request::call(
+            proto::Id::Number(1),
+            &proto::Call::Hello(proto::HelloParams {
+                api_version: proto::API_VERSION,
+                client: Some("padd".into()),
+            }),
+        );
+        let twist = proto::Call::RobotMove(proto::MoveParams {
+            vx: 0.2,
+            vy: 0.0,
+            vyaw: 0.0,
+        });
+        for line in [
+            serde_json::to_string(&hello).unwrap(),
+            serde_json::to_string(&proto::Request::notify(&twist)).unwrap(),
+        ] {
+            write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        replies.next_line().await.unwrap().expect("hello answered");
+        // A request after the notification: once it is answered, the notification before it has
+        // been applied too, since one connection is served in order.
+        let request = proto::Request::call(proto::Id::Number(2), &twist);
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let reply: proto::Response =
+            serde_json::from_str(&replies.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(reply.result_as::<proto::IntentResult>().unwrap().accepted);
+        assert_eq!(intents.twist_source().as_deref(), Some("padd"));
+        assert_eq!(intents.snapshot().command.twist, [0.2, 0.0, 0.0]);
+
+        drop(write);
+        served.await.unwrap().unwrap();
+
+        // A second, anonymous connection drives: the name goes with it.
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        replies.next_line().await.unwrap().expect("move answered");
+        assert_eq!(intents.twist_source(), None);
+        drop(write);
+        served.await.unwrap().unwrap();
+    }
+
+    /// A head target may carry its own smoothing rate; the next one without it goes back to the
+    /// shared rate rather than keeping the last client's.
+    #[test]
+    fn a_head_rate_applies_to_its_own_target_only() {
+        let intents = Intents::new();
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(0.9));
+        assert_eq!(intents.snapshot().head_alpha, Some(0.9));
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(7.0));
+        assert_eq!(intents.snapshot().head_alpha, Some(1.0), "clamped");
+        intents.set_head([0.0; 4]);
+        assert_eq!(intents.snapshot().head_alpha, None);
     }
 
     /// **The policy-failure contract.** A policy that cannot load must not stop the robot

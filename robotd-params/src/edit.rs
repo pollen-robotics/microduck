@@ -1996,7 +1996,8 @@ mod tests {
                 "pad_head",
                 "pad_body",
                 "pad_roller",
-                "netpad"
+                "netpad",
+                "autonomous"
             ]
         );
     }

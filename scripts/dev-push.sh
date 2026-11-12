@@ -346,6 +346,7 @@ cp "$BIN"/duck-gateway staged/
 cp "$BIN"/padd staged/
 # netpadd is padd fed by UDP; an ExecCondition on `[netpad] enabled` picks which of the two runs.
 cp "$BIN"/netpadd staged/
+cp "$BIN"/autod staged/
 # The WebRTC gateway. Its unit ships with an `[Install]` section, so postinstall enables and starts
 # it and `on_apply` restarts it, exactly as for every other daemon here.
 cp "$BIN"/mediad staged/
@@ -399,6 +400,8 @@ cargo run -p xtask -- package \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
     --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
     --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
+    --include "autod/systemd/autod.service=systemd/autod.service" \
+    --include "autod/systemd/sysusers.d/autod.conf=systemd/sysusers.d/autod.conf" \
     --include "mediad/systemd/mediad.service=systemd/mediad.service" \
     --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
     --include "tof/systemd/tofd.service=systemd/tofd.service" \
@@ -515,6 +518,7 @@ echo "    current -> $want"
 deadline=$(($(date +%s) + 30))
 stale=""
 for svc in robotd configd padd updaterd btd mediad tofd nfcd mapd; do
+for svc in robotd configd padd autod updaterd btd mediad tofd; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
             state="silent"

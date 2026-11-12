@@ -1417,6 +1417,19 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Silence after which the UDP client counts as gone — at least stale_ms",
     ),
+    // ── [autonomous] ─────────────────────────────────────────────────────────
+    //
+    // Read by `autod`, and by `padd`, which stays silent until the pad is touched while it is on.
+    feature(
+        "autonomous.enabled",
+        Kind::Bool,
+        "The duck on its own: stands up at boot with no pad, wanders, naps; touching the pad takes over",
+    ),
+    entry(
+        "autonomous.pad_idle_s",
+        Kind::Float,
+        "Seconds of an untouched pad before the duck takes back over",
+    ),
 ];
 
 /// Sections that changed name: `(old, new)`.
@@ -1651,6 +1664,7 @@ mod tests {
                 "pad.lb",
                 "pad.rb",
                 "pad_imu_head_control.enabled",
+                "autonomous.enabled",
             ]
         );
     }
