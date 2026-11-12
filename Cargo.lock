@@ -344,6 +344,7 @@ dependencies = [
  "duck-ipc-proto",
  "kinematics",
  "robotd-params",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

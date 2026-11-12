@@ -21,6 +21,7 @@
 //! A broken connection to `robotd` ends the process and systemd starts it again, as with `padd`.
 
 mod brain;
+mod map;
 mod obstacle;
 
 use std::io::{BufRead, BufReader, Write};
@@ -42,6 +43,10 @@ struct Args {
     /// `tofd`'s socket.
     #[arg(long, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
+
+    /// `mapd`'s socket. No `mapd`, or one not mapping, and the brain walks on odometry alone.
+    #[arg(long, default_value = proto::socket::MAP)]
+    map_socket: PathBuf,
 
     /// The robot's configuration, for `[pad_drive]`'s speeds.
     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
@@ -69,6 +74,19 @@ const STAND_UP: Duration = Duration::from_secs(20);
 
 /// A laser or soccer switch `robotd` did not take is asked again after this, not every tick.
 const SWITCH_RETRY: Duration = Duration::from_secs(3);
+
+/// `map.stream` says something four times a second; silence this long is no map.
+const MAP_STALE: Duration = Duration::from_secs(2);
+/// A map pose is paired with the odometry sample nearest its `t_ns`, if one is this close.
+const MAP_PAIR_NS: u64 = 60_000_000;
+/// How often the grid is fetched while the map knows where the robot is. A few milliseconds of
+/// `mapd`'s time and tens of kilobytes; the room does not change faster than this.
+const GRID_EVERY: Duration = Duration::from_secs(20);
+/// The grid's cell size for the brain: goals are judged at 15 cm from a wall, so finer buys
+/// nothing.
+const GRID_RES_M: f64 = 0.1;
+/// How often the novelty grid is written to the state directory, while it is in the map's frame.
+const VISITS_EVERY: Duration = Duration::from_secs(60);
 
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
@@ -106,6 +124,10 @@ struct Shared {
     latest: Option<Latest>,
     /// The state stream ended: `robotd` is gone.
     lost: bool,
+    /// What `mapd` last said, and when.
+    map: Option<(brain::MapFix, Instant)>,
+    /// The newest grid, and a counter bumped with each, so the loop hands each one over once.
+    grid: Option<(Arc<map::Grid>, u64)>,
 }
 
 /// The fields of a `robot.state` frame the tick loop reads.
@@ -158,6 +180,7 @@ fn run(args: &Args, params: &robotd_params::Params) -> std::io::Result<()> {
     let abilities = subscribe(&args.socket, &shared, api >= 59)?;
     tracing::warn!(?abilities, "autonomous — the duck is on its own");
     spawn_depth(args.tof_socket.clone(), Arc::clone(&shared));
+    spawn_map(args.map_socket.clone(), Arc::clone(&shared));
 
     drive(
         args,
@@ -316,6 +339,153 @@ fn depth(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
     }
 }
 
+/// Read `map.stream` into what the brain needs, forever, reconnecting while `mapd` is away; and
+/// fetch the grid every [`GRID_EVERY`] while the map knows where the robot is.
+fn spawn_map(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
+    let stream_socket = socket.clone();
+    let stream_shared = Arc::clone(&shared);
+    std::thread::spawn(move || {
+        let mut warned = false;
+        loop {
+            if let Err(e) = map_stream(&stream_socket, &stream_shared)
+                && !warned
+            {
+                tracing::info!(error = %e, "no map — walking on odometry alone");
+                warned = true;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    std::thread::spawn(move || {
+        let mut seq = 0u64;
+        loop {
+            std::thread::sleep(GRID_EVERY);
+            let known = shared
+                .lock()
+                .map(|s| matches!(s.map, Some((brain::MapFix::Known(_), _))))
+                .unwrap_or(false);
+            if !known {
+                continue;
+            }
+            match fetch_grid(&socket) {
+                Ok(Some(grid)) => {
+                    seq += 1;
+                    if let Ok(mut s) = shared.lock() {
+                        s.grid = Some((Arc::new(grid), seq));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(error = %e, "no grid from mapd"),
+            }
+        }
+    });
+}
+
+fn map_stream(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.write_all(&line_of(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::MapStream,
+    ))?)?;
+    let mut reader = BufReader::new(stream);
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        if reader.read_line(&mut raw)? == 0 {
+            if let Ok(mut s) = shared.lock() {
+                s.map = None;
+            }
+            return Err(std::io::Error::other("mapd closed the map stream"));
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&raw)
+            .ok()
+            .and_then(|r| r.as_map_state())
+        else {
+            continue;
+        };
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+        let fix = match (state.pose, state.lost) {
+            (Some(pose), _) => {
+                // Paired with the odometry of the same instant; a pose that cannot be paired is
+                // skipped rather than paired with the wrong one — the next comes in 250 ms.
+                match s
+                    .history
+                    .nearest(state.t_ns)
+                    .filter(|o| o.t_ns.abs_diff(state.t_ns) <= MAP_PAIR_NS)
+                {
+                    Some(odom) => {
+                        brain::MapFix::Known(map::offset([pose.x, pose.y, pose.yaw], odom.pose))
+                    }
+                    None => continue,
+                }
+            }
+            (None, Some(_)) => brain::MapFix::Lost,
+            // Neither a pose nor a reason: `mapd` is not mapping.
+            (None, None) => brain::MapFix::Off,
+        };
+        s.map = Some((fix, Instant::now()));
+    }
+}
+
+fn fetch_grid(socket: &Path) -> std::io::Result<Option<map::Grid>> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut next_id = 1;
+    let call = proto::Call::MapGrid(proto::MapGridParams {
+        res_m: Some(GRID_RES_M),
+    });
+    Ok(request(&mut stream, &mut next_id, &call)?
+        .and_then(|r| r.result_as::<proto::MapGridResult>().ok())
+        .and_then(|g| map::Grid::of(&g)))
+}
+
+/// The novelty grid as it is kept on disk: map-frame cells, and when it was written.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedVisits {
+    saved_at: u64,
+    cells: Vec<(i32, i32, f32)>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn save_visits(path: &Path, visits: Vec<((i32, i32), f32)>) {
+    let saved = SavedVisits {
+        saved_at: unix_now(),
+        cells: visits.into_iter().map(|((i, j), w)| (i, j, w)).collect(),
+    };
+    let tmp = path.with_extension("tmp");
+    let result = serde_json::to_vec(&saved)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&tmp, bytes))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = result {
+        tracing::debug!(error = %e, path = %path.display(), "visits not saved");
+    }
+}
+
+/// The novelty grid from an earlier run, faded by the time since — the same 3 % per 30 s the brain
+/// fades it by while running, so a place visited yesterday is new again.
+fn load_visits(path: &Path) -> Vec<((i32, i32), f32)> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(saved) = serde_json::from_slice::<SavedVisits>(&bytes) else {
+        tracing::warn!(path = %path.display(), "unreadable visits — starting afresh");
+        return Vec::new();
+    };
+    let fade = 0.97f32.powf(unix_now().saturating_sub(saved.saved_at) as f32 / 30.0);
+    saved
+        .cells
+        .into_iter()
+        .map(|(i, j, w)| ((i, j), w * fade))
+        .filter(|(_, w)| *w > 0.05)
+        .collect()
+}
+
 fn latest(shared: &Mutex<Shared>) -> (Option<Latest>, bool) {
     let shared = shared.lock().unwrap_or_else(|p| p.into_inner());
     (shared.latest.clone(), shared.lost)
@@ -469,6 +639,18 @@ fn drive(
     // When each switch was last asked for, so a refusal is not asked again fifty times a second.
     let mut laser_asked: Option<Instant> = None;
     let mut soccer_asked: Option<Instant> = None;
+    // The map: the last grid handed to the brain, and the novelty grid kept across reboots.
+    let mut grid_seq = 0u64;
+    let visits_path = args.state_dir.join("visits.json");
+    let restored = load_visits(&visits_path);
+    if !restored.is_empty() {
+        tracing::info!(
+            cells = restored.len(),
+            "remembering where the duck has been"
+        );
+        brain.restore_visits(restored);
+    }
+    let mut visits_saved = Instant::now();
 
     loop {
         let tick = Instant::now();
@@ -620,6 +802,29 @@ fn drive(
             let shared = shared.lock().unwrap_or_else(|p| p.into_inner());
             shared.model.summary(&state.sample)
         };
+        let fix = {
+            let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((grid, seq)) = s.grid.as_ref()
+                && *seq != grid_seq
+            {
+                grid_seq = *seq;
+                brain.set_grid(Arc::clone(grid));
+            }
+            match s.map {
+                Some((fix, at)) if tick.duration_since(at) < MAP_STALE => fix,
+                Some(_) => {
+                    s.map = None;
+                    brain::MapFix::Off
+                }
+                None => brain::MapFix::Off,
+            }
+        };
+        if tick.duration_since(visits_saved) >= VISITS_EVERY {
+            visits_saved = tick;
+            if let Some(visits) = brain.visits_in_map() {
+                save_visits(&visits_path, visits);
+            }
+        }
         let world = brain::World {
             busy,
             petting: state.hearing.is_some_and(|h| h.petting),
@@ -631,6 +836,7 @@ fn drive(
             pose: state.sample.pose,
             laser: state.laser,
             ball: state.ball,
+            map: fix,
         };
         let step = brain.step(dt, &world);
 

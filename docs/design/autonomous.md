@@ -45,8 +45,7 @@ robot is left standing: switching the duck off is not a reason to sit it down.
 
 **The map comes with it.** `mapd` maps whenever `[map] enabled` is set, and otherwise from the first
 time it sees the duck on its own switched on, until it restarts
-([`mapping-design.md`](mapping-design.md) owns the map). The brain does not read the map yet: Wander
-still walks to goals in the odometry frame (§4).
+([`mapping-design.md`](mapping-design.md) owns the map). §6 is what the brain does with it.
 
 The brain itself (`autod/src/brain.rs`) is pure: it reads a snapshot of the world each tick and
 returns targets and one-shot events. It never touches a socket, which is what lets the ten-minute
@@ -182,9 +181,10 @@ brain's, and the brain is standing aside. Both are games somebody is watching.
 takes body pose again, so `autod` sends it whenever a state poses, and once with `active: false`
 when the state ends.
 
-**Wander walks to goals, on odometry believed perfect.** The brain does not read the map yet
-(§6), and a goal a few metres away is reached before drift matters. The runtime's version, holding a random heading for a
-few seconds at a time, stayed within half a metre of its start on a robot.
+**Wander walks to goals.** A goal is picked in the brain's frame — the map's when there is one
+(§6), odometry's otherwise — and walked to on odometry, which is smooth and good over a few metres.
+The runtime's version, holding a random heading for a few seconds at a time, stayed within half a
+metre of its start on a robot.
 
 - **Picking a goal.** Each bout tries 16 directions at 1, 2 and 3 m. It takes the point whose
   straight path crosses the least-visited ground of the novelty grid, preferring far over near,
@@ -252,13 +252,52 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    | hit under `STOP_M` (0.15 m) | spin away |
    | three hard stops within the heat window | a boxed-in break-out spin |
 
-## 6. What is not here yet
+## 6. The map
 
-- **Using the map.** `mapd` runs with the duck (§1), so the novelty grid and Wander's goals could
-  live in the map's frame instead of odometry's, and survive a reboot with it. Not done: the brain
-  still believes odometry, which is right for a bout but not for a day.
-- **Persisting memories across boots.** The novelty grid lives in an odometry frame that resets
-  at boot, so it would mean nothing tomorrow — the map is the way to fix that.
+`mapd`'s map does two things for the brain, and the brain does one for the map. `autod/src/map.rs`
+holds the pure part; `main.rs` reads `map.stream` and fetches `map.grid`. With no `mapd`, or one
+that is not mapping, none of this happens and the duck walks on odometry as it always has.
+
+**The map is an offset, not a pose.** The brain keeps reading odometry at 50 Hz: it is smooth, and
+it is what the obstacle model and the gait live in. `map.stream`'s pose (4 Hz, and jumping when a
+stop is matched or a loop closes) is paired with the odometry sample of the same `t_ns` to give
+where the odometry frame sits in the map. Everything the brain remembers — the novelty grid, where
+the way was shut, the current goal — is kept in the **brain's frame**: the map's from the first fix
+of the session, odometry's until then. At the first fix, what was kept in odometry's frame is
+carried into the map's. A goal is converted back through the latest offset every tick, so a
+correction moves the goal, never the duck's footing.
+
+**The duck makes stops worth mapping.** The map grows only where the robot stands still and looks
+(`mapping-design.md` §2), and wider views match better. So with a map:
+
+- **A wander bout that reaches its goal ends in a survey**: 4–6 s standing still, the head
+  sweeping ±0.9 rad, level. The ToF's 45° wedge covers ~150° of the place.
+- **Lost, it stays put.** When `map.state` says lost (carried, sat, fell, booted), a walking duck
+  stops into a survey, and from then on it alternates surveys with short turns in place — the
+  stops the map's search needs, made where it lost itself rather than metres away. It walks again
+  as soon as the map finds itself, or after 90 s regardless: a place the map never recognises
+  becomes an island the map may join later, and the duck has a life to live. Nothing else
+  changes while lost — the laser, the ball, naps and petting carry on. The novelty grid is not
+  written while lost, since where the robot is is exactly what is not known.
+
+**Goals know the room.** Every 20 s while the map knows where the robot is, `autod` fetches the
+grid at 10 cm. A goal whose straight path passes within 15 cm of a wall the map knows is shut, like
+one behind a spot where the ToF stopped the duck; and a goal with unseen floor within 50 cm of it
+scores better, one unit per share of unknown cells against the novelty grid's dwell. So the duck
+explores where there is something to discover. The ToF's obstacle gate is unchanged: the map
+chooses where to go, never whether the way ahead is clear.
+
+**The novelty grid outlives a reboot.** Once it is in the map's frame, it is written to
+`/var/lib/autod/visits.json` every minute, and read back at start, faded by the time since at the
+running rate (3 % per 30 s): yesterday's haunts are new again, the last hour's are not. It is merged
+at the first fix, when the map's frame is known to be the same one.
+
+## 7. What is not here yet
+
+- **Going somewhere on purpose.** Planning a path on the grid around what the map knows — back to a
+  favourite nap spot, to where the ball was last seen. Goals are still straight lines.
+- **A wiped map leaves the saved novelty grid behind**, in a frame that no longer exists. It fades
+  like any other memory; nothing yet notices the wipe.
 - **The social and musical ideas.** See the holding pen; they land as inputs and states of this
   brain, not as modes beside it.
 - **A real arbitration layer in `robotd`.** That would let the app or a remote peer preempt as

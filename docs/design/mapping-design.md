@@ -284,7 +284,9 @@ stop to stop the real robot measured a few centimetres and ~1°, mostly from tur
   → 4.9° in the simulator). It belongs in the drawn grid, not in the keyframes the matcher reads.
 
 - **A deliberate head sweep** at each stop, asked of `robotd` as a behaviour rather than commanded
-  by `mapd` — wider stops are better matches and faster relocalization.
+  by `mapd` — wider stops are better matches and faster relocalization. The duck on its own does
+  one at each goal it reaches and while lost ([`autonomous.md`](autonomous.md) §6); a robot driven
+  by hand still gets only `robotd`'s idle glance.
 - **`tofd` configured for range**: integration time, closest-target order and sharpener are left at
   ST's defaults, and σ/signal are compiled out; the sensor was arguably never asked for good data.
 - **Camera place fingerprints** — a few frames per stop, a small descriptor on the idle NPU, to

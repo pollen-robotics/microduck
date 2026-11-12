@@ -14,6 +14,7 @@
 //! **Head pitch is "positive = look up"** here, the runtime's v1.5 convention. The alpha's
 //! `+head_pitch` looks down, and `main.rs` flips it on the way out.
 
+use crate::map::{self, Grid, Se2};
 use crate::obstacle::{FRESH_S, Obstacle, REACT_M, STALE_S, STOP_M};
 
 /// What the microphone heard this tick, already cleared of the duck's own voice.
@@ -52,6 +53,18 @@ pub struct Ball {
     pub kicks: u32,
 }
 
+/// What `mapd` says about where the robot is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MapFix {
+    /// No map: `mapd` is not running, not mapping, or not answering. The brain walks on odometry
+    /// alone, as it did before there was a map.
+    Off,
+    /// The map does not know where the robot is: it was carried, sat, fell, or has just booted.
+    Lost,
+    /// Where the odometry frame sits in the map (see [`map::offset`]).
+    Known(Se2),
+}
+
 /// Everything the brain reads, once a tick.
 #[derive(Debug, Clone, Copy)]
 pub struct World {
@@ -73,6 +86,7 @@ pub struct World {
     pub pose: [f64; 3],
     pub laser: Laser,
     pub ball: Ball,
+    pub map: MapFix,
 }
 
 /// One tick's output. Targets are smoothed by `robotd` (and by `head_alpha`); events are edges.
@@ -261,6 +275,22 @@ const BALL_RETRY_MAX_S: f64 = 1800.0;
 const BALL_BORED_S: f64 = 300.0;
 const BALL_FORGET_S: f64 = 1200.0;
 
+/// A survey: standing still with the head sweeping side to side, so the map gets a wide view of
+/// this place (`mapping-design.md` §2: the map grows only where the robot stops and looks).
+const SURVEY_S: (f64, f64) = (4.0, 6.0);
+const SURVEY_YAW: f64 = 0.9;
+/// Lost, the duck stays put and surveys — turning a little between surveys — rather than walking
+/// off and making the search harder. For this long at most: a map that never recognises the place
+/// is not a reason to stop living, and stops made while lost still become an island the map can
+/// join later.
+const LOST_PATIENCE_S: f64 = 90.0;
+/// Goals keep this far from a wall the map knows, along the whole path.
+const MAP_WALL_M: f64 = 0.15;
+/// How far around a goal counts towards "what is there to discover", and how much that weighs
+/// against the novelty grid's dwell.
+const DISCOVER_M: f64 = 0.5;
+const DISCOVER_WEIGHT: f64 = 1.0;
+
 /// Wrap an angle to (-π, π].
 pub fn wrap_angle(a: f64) -> f64 {
     (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
@@ -332,6 +362,8 @@ pub enum State {
     /// Playing with the ball: autonomous soccer on, `robotd` driving. Ends when there is no ball
     /// around, when it got away, or when the duck has had enough.
     BallPlay,
+    /// Stand still and sweep the head side to side: a wide look at this place, for the map.
+    Survey,
 }
 
 pub struct Brain {
@@ -425,6 +457,22 @@ pub struct Brain {
     ball_kicks_from: Option<u32>,
     ball_kick_goal: u32,
     ball_play_s: f64,
+    /// The brain's frame: the map's once `mapd` has had a fix this session, odometry's until then.
+    /// `offset` carries odometry into it (identity in odometry's). The novelty grid, goals and
+    /// where the way was shut are all kept in it, so they line up with the map and outlive a
+    /// reboot with it.
+    in_map: bool,
+    offset: Se2,
+    /// What `mapd` said this tick.
+    fix: MapFix,
+    /// When (behaviour clock) the map last went lost, while it is.
+    lost_since: Option<f64>,
+    /// The map's grid, the newest `main.rs` fetched; read in the brain's frame once `in_map`.
+    grid: Option<std::sync::Arc<Grid>>,
+    /// Visits saved from an earlier boot, in the map's frame, waiting for the first fix.
+    saved_visits: Vec<((i32, i32), f32)>,
+    /// The wander bout just ended at its goal: survey there.
+    survey_next: bool,
 }
 
 impl Brain {
@@ -485,7 +533,97 @@ impl Brain {
             ball_kicks_from: None,
             ball_kick_goal: 0,
             ball_play_s: 0.0,
+            in_map: false,
+            offset: map::IDENTITY,
+            fix: MapFix::Off,
+            lost_since: None,
+            grid: None,
+            saved_visits: Vec::new(),
+            survey_next: false,
         }
+    }
+
+    /// The newest grid from `mapd`.
+    pub fn set_grid(&mut self, grid: std::sync::Arc<Grid>) {
+        self.grid = Some(grid);
+    }
+
+    /// The novelty grid, for keeping across a reboot — only once it is in the map's frame, since
+    /// odometry's frame means nothing after a restart.
+    pub fn visits_in_map(&self) -> Option<Vec<((i32, i32), f32)>> {
+        self.in_map
+            .then(|| self.visits.iter().map(|(k, v)| (*k, *v)).collect())
+    }
+
+    /// Visits kept from before, in the map's frame. Merged at the first fix this session.
+    pub fn restore_visits(&mut self, visits: Vec<((i32, i32), f32)>) {
+        if self.in_map {
+            self.merge_visits(visits);
+        } else {
+            self.saved_visits = visits;
+        }
+    }
+
+    fn merge_visits(&mut self, visits: Vec<((i32, i32), f32)>) {
+        for (cell, w) in visits {
+            let slot = self.visits.entry(cell).or_insert(0.0);
+            *slot = slot.max(w);
+        }
+    }
+
+    /// The robot's pose in the brain's frame.
+    fn here(&self) -> [f64; 3] {
+        map::apply_pose(self.offset, self.last_pose)
+    }
+
+    /// Lost, and still patient about it: survey in place rather than walk.
+    fn lost_mode(&self) -> bool {
+        self.lost_since
+            .is_some_and(|since| self.clock - since < LOST_PATIENCE_S)
+    }
+
+    /// Take this tick's map fix. The first fix moves everything kept in odometry's frame into the
+    /// map's; later ones follow the map's corrections.
+    fn take_fix(&mut self, fix: MapFix) {
+        match fix {
+            MapFix::Known(t) => {
+                if !self.in_map {
+                    let carry = |p: [f64; 2]| map::apply(t, p);
+                    let old = std::mem::take(&mut self.visits);
+                    for ((i, j), w) in old {
+                        let c =
+                            carry([(f64::from(i) + 0.5) * CELL_M, (f64::from(j) + 0.5) * CELL_M]);
+                        let slot = self.visits.entry(Self::cell_of(c[0], c[1])).or_insert(0.0);
+                        *slot = slot.max(w);
+                    }
+                    for (p, _) in &mut self.blocked {
+                        *p = carry(*p);
+                    }
+                    if let Some(goal) = self.goal.as_mut() {
+                        *goal = carry(*goal);
+                    }
+                    self.bout.start = map::apply_pose(t, self.bout.start);
+                    self.bout.goal = carry(self.bout.goal);
+                    let saved = std::mem::take(&mut self.saved_visits);
+                    self.merge_visits(saved);
+                    self.in_map = true;
+                    tracing::info!("the map knows where the duck is — exploring in its frame");
+                } else if self.lost_since.is_some() {
+                    tracing::info!("found in the map again");
+                }
+                self.offset = t;
+                self.lost_since = None;
+            }
+            MapFix::Lost => {
+                if self.lost_since.is_none() {
+                    tracing::info!("lost in the map — surveying where it stands");
+                    self.lost_since = Some(self.clock);
+                }
+            }
+            // Gone away: carry on with the last offset, as if lost forever but without waiting.
+            MapFix::Off => self.lost_since = None,
+        }
+        self.fix = fix;
     }
 
     #[cfg(test)]
@@ -592,9 +730,17 @@ impl Brain {
             self.bout.asked_m += self.cmd[0] * dt;
         }
         self.last_pose = world.pose;
-        let cell = Self::cell_of(world.pose[0], world.pose[1]);
-        let w = self.visits.entry(cell).or_insert(0.0);
-        *w = (*w + dt as f32).min(60.0);
+        self.take_fix(world.map);
+        // Not while lost: where the robot is in the map is exactly what is not known.
+        if self.fix != MapFix::Lost {
+            let [x, y, _] = self.here();
+            let w = self.visits.entry(Self::cell_of(x, y)).or_insert(0.0);
+            *w = (*w + dt as f32).min(60.0);
+        }
+        // Lost while walking: stop and look instead.
+        if self.lost_mode() && matches!(self.state, State::Wander | State::Zoomies) {
+            self.enter(State::Survey);
+        }
         self.decay_tick += 1;
         if self.decay_tick.is_multiple_of(1500) {
             self.visits.retain(|_, w| {
@@ -747,7 +893,8 @@ impl Brain {
                         goal
                     }
                 };
-                let (dx, dy) = (goal[0] - self.last_pose[0], goal[1] - self.last_pose[1]);
+                let here = self.here();
+                let (dx, dy) = (goal[0] - here[0], goal[1] - here[1]);
                 let distance = dx.hypot(dy);
                 if distance < self.bout.best_left_m - GOAL_PROGRESS_M {
                     self.bout.best_left_m = distance;
@@ -755,13 +902,14 @@ impl Brain {
                 }
                 if distance < GOAL_REACHED_M {
                     self.bout.reached = true;
+                    self.survey_next = self.fix != MapFix::Off;
                     // The bout is over; the transition below picks what comes next.
                     self.t_state = self.state_dur;
                 } else if self.t_state - self.bout.progress_at > GOAL_PATIENCE_S {
                     tracing::info!(left_m = distance, "no closer to the goal — giving up on it");
                     self.t_state = self.state_dur;
                 }
-                let heading_delta = wrap_angle(dy.atan2(dx) - self.last_pose[2]);
+                let heading_delta = wrap_angle(dy.atan2(dx) - here[2]);
                 let pivoting = heading_delta.abs() > 0.7;
                 self.wander_wz = if pivoting {
                     // Far off the goal's bearing: pivot first, walk after. Crawling the turn at
@@ -824,7 +972,7 @@ impl Brain {
                 if self.retarget_in <= 0.0 {
                     self.retarget_in = self.rng.range(0.5, 1.1);
                     let target = self.pick_heading(1.0);
-                    let delta = wrap_angle(target - self.last_pose[2]);
+                    let delta = wrap_angle(target - self.here()[2]);
                     self.wander_wz = (delta + self.rng.sym(0.3)).clamp(-0.7, 0.7);
                     self.head = [
                         0.0,
@@ -1151,6 +1299,14 @@ impl Brain {
                     }
                 }
             }
+            State::Survey => {
+                self.cmd = [0.0; 3];
+                // One slow sweep, left then right then back, over the survey: the ToF's 45° wedge
+                // swept across ~150°, the head level so its rows stay on the floor and the walls.
+                let phase = std::f64::consts::TAU * self.t_state / self.state_dur;
+                self.head = [0.0, -0.05, SURVEY_YAW * phase.sin(), 0.0];
+                mouth_extra = 0.0;
+            }
             State::Laser => {
                 self.cmd = [0.0; 3];
                 self.head = [0.0; 4];
@@ -1275,7 +1431,18 @@ impl Brain {
                 .is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > 1.2);
             let can_nap = world.can_sit_stand && !world.sitting;
             let can_ball = self.clock >= self.ball_next_try && self.energy > BALL_MIN_E;
-            let next = self.pick_next_state(world.can_ground_pick, can_zoom, can_nap, can_ball);
+            let next = if std::mem::take(&mut self.survey_next) {
+                State::Survey
+            } else if self.lost_mode() {
+                // Lost: survey, turn a little, survey again — never walk off.
+                if self.state == State::Survey {
+                    State::TurnInPlace
+                } else {
+                    State::Survey
+                }
+            } else {
+                self.pick_next_state(world.can_ground_pick, can_zoom, can_nap, can_ball)
+            };
             self.enter(next);
         }
 
@@ -1333,7 +1500,7 @@ impl Brain {
     /// ±`spread` of the current yaw, scored by dwell time along a short ray (near cells weigh
     /// more), with jitter so ties break randomly. Fresh space scores zero and wins.
     fn pick_heading(&mut self, spread: f64) -> f64 {
-        let [x, y, yaw] = self.last_pose;
+        let [x, y, yaw] = self.here();
         let mut best = (f64::MAX, yaw);
         for k in 0..9 {
             let h = yaw + spread * (k as f64 - 4.0) / 4.0;
@@ -1350,12 +1517,15 @@ impl Brain {
         best.1
     }
 
-    /// A goal for the next wander bout, in the odometry frame: the candidate point (in
+    /// A goal for the next wander bout, in the brain's frame: the candidate point (in
     /// `GOAL_DIRECTIONS` directions at `GOAL_DISTANCES`) whose straight path crosses the least
     /// visited ground, keeps clear of where obstacles stopped the duck, and is far rather than
-    /// near — with a small cost for turning, and jitter so ties break randomly.
+    /// near — with a small cost for turning, and jitter so ties break randomly. With the map's
+    /// grid, a path that passes a known wall is shut too, and a goal with unseen floor around it
+    /// is worth more: the duck goes where there is something to discover.
     fn pick_goal(&mut self) -> [f64; 2] {
-        let [x, y, yaw] = self.last_pose;
+        let [x, y, yaw] = self.here();
+        let grid = self.grid.clone().filter(|g| self.in_map && g.has_floor());
         let now = self.clock;
         self.blocked.retain(|(_, at)| now - at <= BLOCKED_S);
         let offset = self.rng.range(0.0, std::f64::consts::TAU);
@@ -1377,10 +1547,18 @@ impl Brain {
                         .blocked
                         .iter()
                         .any(|(b, _)| (b[0] - px).hypot(b[1] - py) < BLOCKED_M);
+                    shut |= grid
+                        .as_ref()
+                        .is_some_and(|g| g.wall_near([px, py], MAP_WALL_M));
                 }
+                let end = [x + d * c, y + d * s];
+                let discover = grid
+                    .as_ref()
+                    .map_or(0.0, |g| g.unknown_near(end, DISCOVER_M));
                 let turn = wrap_angle(heading - yaw).abs() / std::f64::consts::PI;
                 let score = dwell / steps as f64 + if shut { 100.0 } else { 0.0 } - 0.5 * d
                     + 0.6 * turn
+                    - DISCOVER_WEIGHT * discover
                     + self.rng.range(0.0, 0.5);
                 if score < best.0 {
                     best = (score, [x + d * c, y + d * s]);
@@ -1436,7 +1614,7 @@ impl Brain {
                     if self.state == State::Wander {
                         // Remember where the way was shut, so the next goal is not behind the same
                         // wall. Just past the beak, along the heading the duck was walking.
-                        let [x, y, yaw] = self.last_pose;
+                        let [x, y, yaw] = self.here();
                         let reach = crate::obstacle::BEAK_M + o.ahead_m + 0.1;
                         self.blocked
                             .push(([x + reach * yaw.cos(), y + reach * yaw.sin()], self.clock));
@@ -1501,7 +1679,7 @@ impl Brain {
 
     fn enter(&mut self, next: State) {
         if self.state == State::Wander {
-            self.bout.log(self.last_pose);
+            self.bout.log(self.here());
         }
         self.state = next;
         self.t_state = 0.0;
@@ -1519,7 +1697,7 @@ impl Brain {
                 self.glance_in = 0.0;
                 let goal = self.pick_goal();
                 self.goal = Some(goal);
-                self.bout = Bout::starting(self.last_pose, goal);
+                self.bout = Bout::starting(self.here(), goal);
                 // Ends on arrival, or when it stops getting closer (see `GOAL_PATIENCE_S`).
                 BOUT_MAX_S
             }
@@ -1531,7 +1709,7 @@ impl Brain {
                 let mut dur = self.rng.range(0.8, 2.0);
                 if self.rng.chance(0.7) {
                     let target = self.pick_heading(std::f64::consts::PI);
-                    let delta = wrap_angle(target - self.last_pose[2]);
+                    let delta = wrap_angle(target - self.here()[2]);
                     if delta.abs() > 0.3 {
                         self.turn_rate = rate * delta.signum();
                         dur = (delta.abs() / rate.max(1e-3)).clamp(0.5, 2.2);
@@ -1583,6 +1761,7 @@ impl Brain {
                 self.laser_seen_at = 0.0;
                 600.0
             }
+            State::Survey => self.rng.range(SURVEY_S.0, SURVEY_S.1),
             State::BallPlay => {
                 self.ball_seen_at = None;
                 self.ball_kicks_from = None;
@@ -1734,6 +1913,7 @@ mod tests {
             pose,
             laser: Laser::default(),
             ball: Ball::default(),
+            map: MapFix::Off,
         }
     }
 
@@ -2167,5 +2347,134 @@ mod tests {
         let (fresh, bored) = (count(0.0), count(0.95));
         assert!(fresh > 500, "a fresh duck plays: {fresh}");
         assert!(bored * 10 < fresh, "a bored one hardly: {bored} vs {fresh}");
+    }
+
+    /// The first fix carries what was kept in odometry's frame into the map's: a place the duck
+    /// dwelt in before the map knew it is the same place after.
+    #[test]
+    fn the_first_fix_moves_the_novelty_grid_into_the_map() {
+        let mut bench = Bench::new(8);
+        bench.brain.enter(State::Chill);
+        for _ in 0..50 * 5 {
+            bench.tick(|_| {});
+        }
+        assert!(bench.brain.visit_at(0.1, 0.1) > 4.0, "dwelt at the start");
+        // The odometry origin sits at (10, -3) in the map, turned a quarter.
+        let t = [10.0, -3.0, std::f64::consts::FRAC_PI_2];
+        bench.tick(|w| w.map = MapFix::Known(t));
+        assert!(bench.brain.in_map);
+        let here = map::apply(t, [0.1, 0.1]);
+        assert!(
+            bench.brain.visit_at(here[0], here[1]) > 4.0,
+            "the dwell moved with it"
+        );
+        assert!(
+            bench.brain.visit_at(0.1, 0.1) < 1.0,
+            "and left odometry's origin"
+        );
+        assert!(bench.brain.visits_in_map().is_some());
+    }
+
+    /// With a map, a wander bout that reaches its goal ends in a survey: standing still, the head
+    /// sweeping both ways.
+    #[test]
+    fn a_goal_reached_is_surveyed() {
+        let mut bench = Bench::new(9);
+        bench.brain.next_quack_in = 1e9;
+        let fix = |w: &mut World| w.map = MapFix::Known(map::IDENTITY);
+        bench.tick(fix);
+        bench.brain.enter(State::Wander);
+        let mut ticks = 0;
+        while bench.brain.state() == State::Wander {
+            bench.tick(fix);
+            ticks += 1;
+            assert!(ticks < 50 * 60, "never arrived");
+        }
+        assert!(bench.brain.bout.reached, "the bout ended at its goal");
+        assert_eq!(bench.brain.state(), State::Survey);
+        let (mut left, mut right) = (false, false);
+        while bench.brain.state() == State::Survey {
+            let out = bench.tick(fix);
+            assert_eq!(out.cmd, [0.0; 3], "a survey stands still");
+            left |= out.head[2] > 0.5;
+            right |= out.head[2] < -0.5;
+        }
+        assert!(left && right, "the head swept both ways");
+    }
+
+    /// Lost, the duck does not walk off: it surveys and turns, for a while — then lives again.
+    #[test]
+    fn a_lost_duck_surveys_in_place_then_gives_up_waiting() {
+        let mut bench = Bench::new(10);
+        bench.brain.energy = 1.0;
+        bench.tick(|w| w.map = MapFix::Known(map::IDENTITY));
+        bench.brain.enter(State::Wander);
+        bench.tick(|w| w.map = MapFix::Lost);
+        assert_eq!(
+            bench.brain.state(),
+            State::Survey,
+            "stopped walking at once"
+        );
+        let start = bench.pose;
+        let mut surveys = 0;
+        let mut last = State::Survey;
+        for _ in 0..(50.0 * (LOST_PATIENCE_S - 5.0)) as usize {
+            bench.tick(|w| w.map = MapFix::Lost);
+            let state = bench.brain.state();
+            assert!(
+                !matches!(state, State::Wander | State::Zoomies),
+                "walked while lost"
+            );
+            if state == State::Survey && last != State::Survey {
+                surveys += 1;
+            }
+            last = state;
+        }
+        assert!(surveys >= 5, "surveyed {surveys} times");
+        let moved = (bench.pose[0] - start[0]).hypot(bench.pose[1] - start[1]);
+        assert!(moved < 0.3, "stayed where it was lost: {moved:.2} m");
+        let mut walked = false;
+        for _ in 0..50 * 120 {
+            bench.tick(|w| w.map = MapFix::Lost);
+            walked |= bench.brain.state() == State::Wander;
+        }
+        assert!(walked, "past its patience, the duck walks again");
+    }
+
+    /// With a grid, goals keep off the walls it knows, and lean to where there is floor nobody has
+    /// seen.
+    #[test]
+    fn goals_keep_off_known_walls_and_go_where_the_map_is_blank() {
+        // 0.1 m cells, 8 m square, the robot in the middle. A wall runs north-south 1 m east of
+        // it; west of it is all unknown; the rest is seen floor.
+        let n = 80;
+        let rows: Vec<String> = (0..n)
+            .map(|_| {
+                (0..n)
+                    .map(|i| match i {
+                        50 => '#',
+                        0..30 => '?',
+                        _ => '.',
+                    })
+                    .collect()
+            })
+            .collect();
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let grid = map::tests::grid(&rows, 0.1);
+        let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 11);
+        let mut w = world([4.0, 4.0, 0.0]);
+        w.map = MapFix::Known(map::IDENTITY);
+        brain.step(0.02, &w);
+        brain.set_grid(std::sync::Arc::new(grid));
+        let mut west = 0;
+        for _ in 0..200 {
+            let g = brain.pick_goal();
+            assert!(g[0] < 4.9, "a goal through or past the wall: {g:?}");
+            west += usize::from(g[0] < 3.5);
+        }
+        assert!(
+            west > 120,
+            "the blank side wins most of the time: {west}/200"
+        );
     }
 }
