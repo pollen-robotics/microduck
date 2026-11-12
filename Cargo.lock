@@ -1384,6 +1384,7 @@ dependencies = [
  "duck-ble",
  "duck-ipc-proto",
  "futures",
+ "getrandom 0.3.4",
  "gilrs",
  "libdbus-sys",
  "libloading 0.9.0",

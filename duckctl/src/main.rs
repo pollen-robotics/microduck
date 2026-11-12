@@ -41,6 +41,7 @@
 
 #[cfg(target_os = "linux")]
 mod agent;
+mod console;
 mod setup_code;
 mod udp_pad;
 
@@ -476,13 +477,18 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
 /// **`ip` prints the address and nothing else**, because the tool's split is diagnostics on stderr
 /// and data on stdout: `ssh microduck@$(duckctl ip)` only works if that is the whole of what
 /// stdout carries. Every note this command emits goes to stderr for the same reason.
-fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn deliver(
+    command: &Command,
+    address: &str,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Ip => {
             println!("{address}");
             Ok(())
         }
         Command::Ssh { user, command } => {
+            ssh_refusal(address)?;
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
             become_program("ssh", &ssh_argv(&user, address, command))
         }
@@ -490,20 +496,27 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
             become_program("scp", &scp_argv(&user, address, paths))
         }
-        Command::Open { print, port } => {
-            let url = console_url(address, *port);
-            if *print {
-                println!("{url}");
-                return Ok(());
-            }
-            eprintln!("opening {url}");
-            webbrowser::open(&url).map_err(|e| {
+        Command::Open { print } => {
+            let robot: std::net::IpAddr = address
+                .parse()
+                .map_err(|_| format!("{address} is not an IP address"))?;
+            let code = setup_code::lookup(&setup_code::read(), name).ok_or_else(|| {
                 format!(
-                    "could not open a browser: {e}\nThe robot is at {url} — `duckctl open --print` \
-                     gives the URL without launching anything."
+                    "no setup code for {name} on this machine. The console goes through the \
+                     robot's authenticated gateway, which needs it: `duckctl setup-code add` with \
+                     the code from the robot's QR (or `sudo robotctl system setup-code` on it)."
                 )
-                .into()
+            })?;
+            let print = *print;
+            console::serve(robot, code, |url| {
+                eprintln!("console for {name} at {url} — Ctrl-C to close it");
+                if print {
+                    println!("{url}");
+                } else if let Err(e) = webbrowser::open(url) {
+                    eprintln!("could not open a browser ({e}); open {url} yourself");
+                }
             })
+            .await
         }
         Command::UdpPad {
             hz,
@@ -536,6 +549,27 @@ fn ssh_user(flag: Option<&str>, env: Option<String>) -> String {
     flag.map(str::to_owned)
         .or_else(|| env.filter(|user| !user.trim().is_empty()))
         .unwrap_or_else(|| "microduck".to_owned())
+}
+
+/// Say why ssh will fail, before `ssh` says it less helpfully.
+///
+/// A shipping image refuses port 22 on wifi by design (microduck_yocto#110), and `ssh`'s own
+/// "Connection refused" reads as a dead robot. A refusal is cheap to detect and has one fix, so it
+/// is named here; anything else — a timeout, a network that cannot route — is left to `ssh`, which
+/// reports those as well as anything could.
+fn ssh_refusal(address: &str) -> Result<(), String> {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return Ok(());
+    };
+    let target = std::net::SocketAddr::new(ip, 22);
+    match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
+            "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
+             (microduck@192.168.42.1). `duckctl ssh-wifi` opens it on wifi until the robot next \
+             reboots; then run this again."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `ssh`'s arguments: `user@address`, then whatever is to run there.
@@ -707,15 +741,6 @@ fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
             None
         }
     }
-}
-
-/// Where the console is, given where the robot is.
-///
-/// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
-/// page is blocked outright as mixed content. `webrtc-console.md` §1.3 says what that costs — a
-/// microphone, and on some browsers a gamepad, both being secure-context APIs — and when it changes.
-fn console_url(address: &str, port: u16) -> String {
-    format!("http://{address}:{port}/")
 }
 
 /// What to say when the robot is right there and has no address.
@@ -1145,21 +1170,23 @@ enum Command {
         )]
         paths: Vec<String>,
     },
-    /// Open the robot's console in a browser.
+    /// Open the robot's console in a browser, through its authenticated gateway.
     ///
-    /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
-    /// Finds the robot the way `ip` above does.
+    /// The robot serves its console on its own loopback only; the one door a LAN has is the media
+    /// gateway, which admits a peer that proves the robot's setup code. So this runs a small bridge
+    /// on this machine — the page on 127.0.0.1, and a tunnel that authenticates to the gateway with
+    /// the code `duckctl setup-code add` stored — and stays running until Ctrl-C. Finds the robot
+    /// the way `ip` above does.
+    ///
+    /// The page is this duckctl's copy of the console, so keep duckctl current; the page's banner
+    /// says when its API version and the robot's differ. Snapshots (`/frame`) are not available
+    /// through the gateway.
     Open {
-        /// Print the URL instead of opening it — for a machine with no browser, or a script.
+        /// Print the URL instead of opening a browser — for a script, or a browser on this machine
+        /// that is not the default. The bridge still runs until Ctrl-C: the URL is only good while
+        /// it does.
         #[arg(long)]
         print: bool,
-        /// The console's port, for a robot started with a non-default `--web-port`.
-        //
-        // The same default as `mediad --web-port`, and the reason this command exists rather than a
-        // documented `open "http://$(duckctl ip):8080"`: the port belongs in one place that nobody
-        // has to read.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
     },
     /// The tail of one daemon's journal.
     ///
@@ -1313,6 +1340,14 @@ enum Command {
     },
     /// Reboot it.
     Reboot,
+    /// Open ssh on wifi until the robot next reboots.
+    ///
+    /// A shipping image answers ssh on the head's USB-C link only, so `duckctl ssh` over wifi is
+    /// refused there. This asks `configd`, over the same authenticated Bluetooth session every
+    /// other command uses, to open port 22 on every interface until the next reboot. Then
+    /// `duckctl ssh` works. On the dev image it reports `switched: false`: ssh is open there
+    /// already.
+    SshWifi,
     /// Send any method, for whatever is not wrapped above.
     Call {
         method: String,
@@ -1691,7 +1726,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         && let Some((address, name)) = recall_reachable(&target)
     {
         eprintln!("{name} at {address}, remembered from the last run");
-        return deliver(&cli.command, &address.to_string());
+        return deliver(&cli.command, &address.to_string(), &name).await;
     }
 
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
@@ -1777,6 +1812,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let Some(properties) = peripheral.properties().await? else {
                 continue;
             };
+            // **Not heard during this scan: a cache entry, not a robot.** BlueZ keeps every device
+            // it has bonded with, and hands btleplug its *last* advertisement — name, services, and
+            // the address in it — with no RSSI until it hears the device again. A robot that was
+            // reflashed, renamed or moved network still shows up that way under its old identity:
+            // on cream-dvt that was a second "cream-dvt" at an address it had left days before,
+            // listed beside the real one, and the one `--name` then picked and could not connect
+            // to. CoreBluetooth only reports what it heard, so this changes nothing on a Mac.
+            if properties.rssi.is_none() {
+                if cli.verbose && properties.services.contains(&SERVICE_UUID) {
+                    eprintln!(
+                        "ignoring {} ({}): known to this machine's Bluetooth but not heard in \
+                         this scan",
+                        properties.local_name.as_deref().unwrap_or("?"),
+                        properties.address,
+                    );
+                }
+                continue;
+            }
             let name = properties
                 .local_name
                 .clone()
@@ -1869,7 +1922,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok((Address::At(address), name)) => {
                 let address = address.to_string();
                 remember(&name, &address);
-                return deliver(&cli.command, &address);
+                return deliver(&cli.command, &address, &name).await;
             }
             // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
             // that did not say. Asking `net.status` over a connection would return the same nothing
@@ -1953,15 +2006,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let bd_addr = peripheral.address();
     step(
         "connecting",
-        "The robot advertised but would not accept a connection. The usual reason is that \
-         something else already holds it — the phone app, or another `duckctl` — because a robot \
-         serving one central advertises non-connectably and is listed without being reachable. \
-         Otherwise: if macOS shows it as paired, forget it there and retry; `sudo pkill \
-         bluetoothd` also clears a half-finished bond. On Linux, a robot whose release predates its \
-         extended advertisement fails here every time against most Intel controllers \
-         (`le-connection-abort-by-local`); update it from a Mac.",
+        &format!(
+            "The robot advertised but would not accept a connection. The usual reason is that \
+             something else already holds it — the phone app, or another `duckctl` — because a \
+             robot serving one central advertises non-connectably and is listed without being \
+             reachable.\n\
+             The next most likely: this machine is still bonded to it from before the robot was \
+             reflashed or reset. A reflash wipes the robot's half of the bond, and this side keeps \
+             offering keys the robot no longer has. On Linux, `bluetoothctl info {bd_addr}` shows \
+             `Paired: yes`; `bluetoothctl remove {bd_addr}` clears it. On macOS, forget it in \
+             System Settings → Bluetooth. Then retry.\n\
+             Otherwise: `sudo pkill bluetoothd` clears a half-finished bond. On Linux, a robot \
+             whose release predates its extended advertisement fails here every time against most \
+             Intel controllers (`le-connection-abort-by-local`); update it from a Mac."
+        ),
         CONNECT_TIMEOUT,
         peripheral.connect(),
     )
@@ -2146,7 +2207,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
                     Some(address) => {
                         remember(&name, address);
-                        deliver(&cli.command, address)
+                        deliver(&cli.command, address, &name).await
                     }
                     None => Err(no_address(&name).into()),
                 };
@@ -2733,6 +2794,11 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::SshWifi => (
+            proto::method::SYSTEM_OPEN_WIFI_SSH,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
         Command::Do { skill } => (
             proto::method::ROBOT_DO,
             serde_json::json!({ "skill": skill }),
@@ -3669,21 +3735,6 @@ mod tests {
         )
     }
 
-    /// The whole point of the change: a listing says where to reach the robot, with no connection.
-    /// The one thing `open` adds over `ip`, and the reason it is a command rather than a documented
-    /// `open "http://$(duckctl ip):8080"`: the port has one home.
-    #[test]
-    fn the_console_url_is_the_address_and_the_port() {
-        assert_eq!(
-            console_url("192.168.1.42", 8080),
-            "http://192.168.1.42:8080/"
-        );
-        assert_eq!(
-            console_url("192.168.1.42", 9000),
-            "http://192.168.1.42:9000/"
-        );
-    }
-
     /// `ip` picks a robot the same way every other command does. Two robots on one bench, one of
     /// them named — the address that comes back has to be that robot's, not whichever advertisement
     /// arrived first.
@@ -3713,27 +3764,15 @@ mod tests {
         assert!(message.contains("wifi connect"));
     }
 
-    /// `--print` and `--port` are the two things `open` takes, and neither is positional.
+    /// `--print` is the one thing `open` takes. `--port` is gone: the robot's console port is not
+    /// reachable from a LAN any more, and the local bridge picks its own.
     #[test]
-    fn open_takes_a_port_and_can_print_instead() {
-        let cli = Cli::try_parse_from(["duckctl", "open", "--print", "--port", "9000"])
-            .expect("open --print --port parses");
-        assert!(matches!(
-            cli.command,
-            Command::Open {
-                print: true,
-                port: 9000
-            }
-        ));
-
+    fn open_can_print_instead() {
+        let cli = Cli::try_parse_from(["duckctl", "open", "--print"]).expect("open --print parses");
+        assert!(matches!(cli.command, Command::Open { print: true }));
         let cli = Cli::try_parse_from(["duckctl", "open"]).expect("open parses on its own");
-        assert!(matches!(
-            cli.command,
-            Command::Open {
-                print: false,
-                port: 8080
-            }
-        ));
+        assert!(matches!(cli.command, Command::Open { print: false }));
+        assert!(Cli::try_parse_from(["duckctl", "open", "--port", "9000"]).is_err());
     }
 
     /// `ssh` takes a user and a trailing command, and the user falls back the documented way: the
