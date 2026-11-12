@@ -2159,7 +2159,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Command::NfcFlash { timeout, .. } = &cli.command {
         eprintln!(
-            "Touch an NTAG to the duck's head (waiting {} s)…",
+            "Touch a tag to the duck's head (waiting {} s)…",
             (*timeout).clamp(1, duck_ipc_proto::NfcWriteParams::MAX_TIMEOUT_S)
         );
     }

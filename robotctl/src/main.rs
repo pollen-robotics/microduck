@@ -737,7 +737,7 @@ fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failur
         timeout_s: Some(timeout),
     };
     eprintln!(
-        "Touch an NTAG to the duck's head (waiting {} s)…",
+        "Touch a tag to the duck's head (waiting {} s)…",
         params.timeout().as_secs()
     );
     let text = params.text.clone();
