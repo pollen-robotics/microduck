@@ -737,6 +737,15 @@ fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
     let socket = std::net::SocketAddr::from((address, 22));
     match std::net::TcpStream::connect_timeout(&socket, REMEMBERED_PROBE) {
         Ok(_) => Some((address, name)),
+        // **A refusal is somebody there saying no**, not an empty address: on a shipping image
+        // that is usually the robot itself, which answers ssh on its USB-C link only. Saying it
+        // "is no longer at" the address it is at sent people looking for a robot that had not
+        // moved (cream-dvt, 2026-11-12). It still scans — a refusal cannot tell the robot from
+        // another machine that took its lease — and the scan's own answer says which.
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            eprintln!("{address} refused ssh; scanning to check it is still {name}");
+            None
+        }
         Err(_) => {
             eprintln!("{name} is no longer at {address}; scanning instead");
             None
