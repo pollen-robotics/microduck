@@ -12,12 +12,13 @@
 //! ## Writing a tag
 //!
 //! `nfc.write` on [`proto::socket::NFC`] — `robotctl nfc-flash <text>`, or `duckctl nfc-flash`
-//! over Bluetooth — writes a text onto the next NTAG touched, or onto one already lying on the
+//! over Bluetooth — writes a text onto the next tag touched, or onto one already lying on the
 //! reader, then reads it back. The robot asks for a tag with the pad-lost sound, the questioning
 //! quack, when a write starts waiting. While a write waits, a touched tag is written rather than acted
 //! on, and the tag just written is not then read as a touch: writing a pairing tag does not pair.
-//! The quack says it took. Only Type 2 is written; see [`tag::write_ndef_area`] for what is
-//! never touched.
+//! The quack says it took. An NTAG and, on the beta board's reader, a Type 5 tag are written —
+//! a blank Type 5 one formatted first; see [`tag::write_ndef_area`] and [`vtag::write_ndef_area`]
+//! for what is never touched.
 //!
 //! ## Why its own daemon
 //!
@@ -387,14 +388,12 @@ fn write_touched(
     job: Job,
 ) -> Option<Error> {
     let id = hex(uid);
-    let written = match tech {
-        Tech::V => Err(Error::Tag(
-            "a Type 5 tag: only an NTAG (Type 2) is written".into(),
-        )),
-        Tech::A => ndef::text_tlv(&job.text)
-            .map_err(Error::Tag)
-            .and_then(|data| tag::write_ndef_area(chip, &data)),
-    };
+    let written = ndef::text_tlv(&job.text)
+        .map_err(Error::Tag)
+        .and_then(|data| match tech {
+            Tech::A => tag::write_ndef_area(chip, &data),
+            Tech::V => vtag::write_ndef_area(chip, uid, &data),
+        });
     match written {
         Ok(()) => {
             tracing::warn!(tag = %id, text = %job.text, "tag written");

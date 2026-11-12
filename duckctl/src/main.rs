@@ -1253,11 +1253,11 @@ enum Command {
     /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
     /// that answers, in a voice that is only its own, is the one `--name` reached.
     Quack,
-    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    /// Write a text onto an NFC tag: run this, then touch a tag to the duck's head.
     ///
     /// `robotctl nfc-flash` on the robot. The tag then reads as that text — `walk_mode`,
-    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. Only an NTAG
-    /// (Type 2) is written; anything else is refused with why, and left as it was.
+    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. An NTAG or an
+    /// ISO 15693 tag is written; anything else is refused with why, and left as it was.
     NfcFlash {
         /// What the tag will read.
         text: String,
