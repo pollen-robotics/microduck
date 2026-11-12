@@ -102,7 +102,19 @@ pub struct SkillTuning {
     /// The one-shot skills, in priority order — name, duration, whether holding chains, and
     /// what each changes about the robot while it runs. Config, resolved over the built-ins.
     pub skills: Vec<robotd_params::SkillDef>,
+    /// Where the seat is the ground-pick network held mid-cycle rather than the sitstand
+    /// network: the ground-pick phase it stops at. Roller mode — the sitstand network cannot
+    /// sit a robot on wheels, and the roller crouch is the lowest pose that one has.
+    /// See [`ROLLER_SEAT_PHASE`].
+    pub crouch_seat: Option<f64>,
 }
+
+/// Where a roller robot's seat holds the crouch: the middle of its crouched plateau. The roller
+/// crouch is trained as one cycle — down by phase 0.10, crouched to 0.50, up by 0.60
+/// (`microduck_roller_crouch_env_cfg.py` in `microduck_rl`) — and this is a phase every episode
+/// passes through, held rather than passed. Standing up resumes the cycle from here, so the rise
+/// is the one the network was trained on.
+pub const ROLLER_SEAT_PHASE: f64 = 0.3;
 
 impl Default for SkillTuning {
     fn default() -> Self {
@@ -114,6 +126,7 @@ impl Default for SkillTuning {
             sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
             sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
             skills: Vec::new(),
+            crouch_seat: None,
         }
     }
 }
@@ -350,7 +363,7 @@ impl Controller {
     /// throws it over, and one move started inside another hands the second network a robot
     /// mid-pose it was never trained from.
     fn move_blocked(&self) -> Option<&'static str> {
-        if self.ground_pick.is_some() {
+        if self.ground_pick.is_some() && self.sit == Sit::Up {
             return Some("a ground pick is running");
         }
         if self.active.is_some() {
@@ -363,14 +376,33 @@ impl Controller {
         }
     }
 
-    pub fn has_sitstand(&self) -> bool {
-        self.policy.has_sitstand()
+    /// The phase a crouch seat holds at, when the seat is a crouch and the crouch is loaded.
+    fn crouch_seat(&self) -> Option<f64> {
+        self.skills
+            .crouch_seat
+            .filter(|_| self.policy.has_ground_pick())
+    }
+
+    /// Whether this robot can sit at all: the sitstand network, or on wheels the held crouch.
+    pub fn has_seat(&self) -> bool {
+        match self.skills.crouch_seat {
+            Some(_) => self.policy.has_ground_pick(),
+            None => self.policy.has_sitstand(),
+        }
+    }
+
+    /// How long the seat takes to reach: the sitstand glide, or the crouch's way down.
+    fn seat_settle_secs(&self) -> f64 {
+        match self.crouch_seat() {
+            Some(hold) => hold * self.skills.ground_pick_period,
+            None => self.skills.sitstand_ramp_s,
+        }
     }
 
     /// How long the policy holds the shutdown sit before the joints ease into the rest pose:
     /// the seat's settle time, then a second sitting still.
     pub fn shutdown_sit_secs(&self) -> f64 {
-        self.skills.sitstand_ramp_s + 1.0
+        self.seat_settle_secs() + 1.0
     }
 
     pub fn is_sitting(&self) -> bool {
@@ -378,9 +410,9 @@ impl Controller {
     }
 
     /// A scripted move is mid-flight. Sitting itself is not busy — a seated robot is
-    /// parked, not travelling.
+    /// parked, not travelling, and that includes one parked in a held crouch.
     pub fn busy(&self) -> bool {
-        self.ground_pick.is_some()
+        (self.ground_pick.is_some() && self.sit == Sit::Up)
             || self.active.is_some()
             || matches!(self.sit, Sit::Rising { .. })
     }
@@ -445,8 +477,11 @@ impl Controller {
 
     /// Sit if standing, stand if sitting. Refused while any other move runs, mid-rise as the
     /// prototype refuses it, and on the way down into the seat.
+    ///
+    /// On wheels the seat is the crouch held at [`ROLLER_SEAT_PHASE`]: sitting runs the crouch
+    /// down to it and stops there, and standing lets the crouch finish its cycle.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
-        if self.ground_pick.is_some() {
+        if self.ground_pick.is_some() && self.sit == Sit::Up {
             return Err("a ground pick is running");
         }
         if self.active.is_some() {
@@ -454,14 +489,26 @@ impl Controller {
         }
         match self.sit {
             Sit::Up => {
-                if !self.policy.has_sitstand() {
-                    return Err("no sitstand policy loaded");
+                if !self.has_seat() {
+                    return Err(if self.skills.crouch_seat.is_some() {
+                        "no crouch policy loaded to sit with"
+                    } else {
+                        "no sitstand policy loaded"
+                    });
                 }
                 self.sit = Sit::Sitting;
-                self.sit_settle = self.skills.sitstand_ramp_s;
+                self.sit_settle = self.seat_settle_secs();
+                if self.crouch_seat().is_some() {
+                    self.ground_pick = Some(0.0);
+                }
                 Ok("sit")
             }
             Sit::Sitting if self.sit_settle > 0.0 => Err("still sitting down"),
+            // The crouch stands up by finishing its own cycle, as a ground pick.
+            Sit::Sitting if self.crouch_seat().is_some() => {
+                self.sit = Sit::Up;
+                Ok("stand")
+            }
             Sit::Sitting => {
                 self.sit = Sit::Rising {
                     remaining: self.skills.sitstand_rise_s,
@@ -475,7 +522,14 @@ impl Controller {
     /// Engage the sit for the shutdown sequence. The caller owns the timing (sit for a few
     /// seconds, then cut torque and power off); this just puts the sitstand network in
     /// charge with the posture flag at 1.
+    ///
+    /// On wheels that is the crouch, from the top unless one is already on its way down.
     pub fn begin_shutdown_sit(&mut self) {
+        if let Some(hold) = self.crouch_seat()
+            && self.sit == Sit::Up
+        {
+            self.ground_pick = Some(self.ground_pick.filter(|&p| p <= hold).unwrap_or(0.0));
+        }
         self.sit = Sit::Sitting;
     }
 
@@ -505,7 +559,7 @@ impl Controller {
     /// on the first tick instead started it cold, from a seat it had not chosen.
     pub fn settle_then_rise(&mut self) {
         self.sit = Sit::Sitting;
-        self.sit_settle = self.skills.sitstand_ramp_s;
+        self.sit_settle = self.seat_settle_secs();
         self.auto_rise = true;
     }
 
@@ -587,6 +641,21 @@ impl Controller {
             self.sit = Sit::Rising {
                 remaining: self.skills.sitstand_rise_s,
             };
+        }
+        // On wheels the seat is the crouch, whichever way the robot came to it. A seat with no
+        // crouch phase is one the robot is already in — kept across a stop, or found at
+        // bring-up — so it resumes at the hold; and a rise is the crouch finishing its cycle.
+        if let Some(hold) = self.crouch_seat() {
+            match self.sit {
+                Sit::Sitting => {
+                    self.ground_pick.get_or_insert(hold);
+                }
+                Sit::Rising { .. } => {
+                    self.sit = Sit::Up;
+                    self.ground_pick = Some(self.ground_pick.map_or(hold, |p| p.max(hold)));
+                }
+                Sit::Up => {}
+            }
         }
 
         // Re-encode the command for the active skill and pick the network. The priority chain
@@ -740,9 +809,12 @@ impl Controller {
 
         // Advance the windows, after the tick that used them — the prototype advances its
         // phase after the motor write.
+        let seat_hold = self.crouch_seat().filter(|_| self.sit == Sit::Sitting);
         if let Some(phase) = self.ground_pick.as_mut() {
             *phase += dt / self.skills.ground_pick_period;
-            if *phase >= self.skills.ground_pick_end_phase {
+            if let Some(hold) = seat_hold {
+                *phase = phase.min(hold);
+            } else if *phase >= self.skills.ground_pick_end_phase {
                 self.ground_pick = None;
             }
         }
@@ -918,6 +990,66 @@ mod tests {
         assert!(c.start_ground_pick().is_err(), "not while it rises");
         tick(&mut c, 1.1);
         assert_eq!(c.start_ground_pick(), Ok(()), "standing again, it may");
+    }
+
+    /// **On wheels the seat is the crouch, held.** Sitting runs the crouch down to
+    /// [`ROLLER_SEAT_PHASE`] and stays there for as long as it is seated; standing lets the
+    /// crouch finish its cycle and hands back to the gait. The rest and shutdown sits take the
+    /// same seat, and a stop keeps it.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn on_wheels_the_seat_is_the_crouch_held() {
+        let mut c = full_controller();
+        c.skills.crouch_seat = Some(ROLLER_SEAT_PHASE);
+        c.skills.ground_pick_period = 5.0;
+        assert!(c.has_seat());
+        assert_eq!(c.shutdown_sit_secs(), 0.3 * 5.0 + 1.0);
+
+        assert_eq!(c.sit_toggle(), Ok("sit"));
+        assert_eq!(c.sit_toggle(), Err("still sitting down"));
+        tick(&mut c, 10.0);
+        assert!(c.is_sitting() && !c.busy(), "parked in the crouch");
+        assert_eq!(
+            c.driving(),
+            Some(Driving::GroundPick),
+            "the crouch holds it"
+        );
+        assert_eq!(
+            c.ground_pick,
+            Some(ROLLER_SEAT_PHASE),
+            "at the hold, however long"
+        );
+        assert!(c.start_ground_pick().is_err(), "no pick from the seat");
+
+        c.stop_moves();
+        assert!(c.is_sitting(), "a stop keeps the seat");
+        tick(&mut c, 0.02);
+        assert_eq!(
+            c.ground_pick,
+            Some(ROLLER_SEAT_PHASE),
+            "and resumes it at the hold"
+        );
+
+        assert_eq!(c.sit_toggle(), Ok("stand"));
+        assert!(
+            !c.is_sitting() && c.busy(),
+            "rising: the crouch finishes its cycle"
+        );
+        tick(&mut c, (0.7 - ROLLER_SEAT_PHASE) * 5.0 + 0.1);
+        assert!(
+            !c.busy() && c.ground_pick.is_none(),
+            "standing: the gait has it"
+        );
+        assert_eq!(c.driving(), Some(Driving::Walk));
+
+        c.begin_shutdown_sit();
+        tick(&mut c, 3.0);
+        assert!(c.is_sitting());
+        assert_eq!(
+            c.ground_pick,
+            Some(ROLLER_SEAT_PHASE),
+            "the shutdown sit is the crouch"
+        );
     }
 
     /// The glide down into the seat is a move too: standing up halfway down is refused.

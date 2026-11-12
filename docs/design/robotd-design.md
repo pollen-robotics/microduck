@@ -508,6 +508,16 @@ pose, which a sitting robot can only reach by going over backwards; `robot.init`
 robot holds it too. A relax or a servo reboot forgets the seat and every move with it, so the
 next bring-up starts from a standing robot's state, as after a boot.
 
+**On wheels the seat is the crouch, held.** The sitstand network cannot sit a robot on rollers,
+so in roller mode every sit — `sit_toggle`, the pad-loss sit, the rest and shutdown sits, an
+emotion's — runs the crouch in the ground-pick slot down to the middle of its crouched plateau
+(phase 0.3, `ROLLER_SEAT_PHASE`) and stops the phase there for as long as the robot is seated.
+Standing up resumes the cycle from that point, so the rise is the one the crouch was trained on,
+and the gait takes over where a ground pick would hand back. The held phase is a pose every
+training episode passes through, held rather than passed: what that does over minutes is a
+robot question, not a test-suite one. The seat rules above apply unchanged — parked, not busy;
+kept across a stop, resumed at the hold.
+
 **The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
 reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of
 straight-legged to the standing home pose, which pulls it out of the seat and over backwards.

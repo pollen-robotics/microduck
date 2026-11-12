@@ -2175,6 +2175,8 @@ fn try_controller(
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
+            // On wheels the sitstand network cannot sit the robot: the seat is the held crouch.
+            crouch_seat: (policy_cfg.mode == Mode::Roller).then_some(control::ROLLER_SEAT_PHASE),
         };
         let paths = PolicyPaths {
             walk: policy_cfg.walk.clone(),
@@ -3230,7 +3232,7 @@ async fn control_loop<T: RobotIo>(
             let can_sit = snapshot.enabled
                 && bringup == Bringup::Ready
                 && !safety.fallen()
-                && controller.as_ref().is_some_and(|c| c.has_sitstand());
+                && controller.as_ref().is_some_and(|c| c.has_seat());
             if can_sit {
                 tracing::warn!("rest: sitting down, then easing into the rest pose");
                 controller
@@ -3250,7 +3252,7 @@ async fn control_loop<T: RobotIo>(
             let can_sit = snapshot.enabled
                 && bringup == Bringup::Ready
                 && !safety.fallen()
-                && controller.as_ref().is_some_and(|c| c.has_sitstand());
+                && controller.as_ref().is_some_and(|c| c.has_seat());
             if can_sit {
                 tracing::warn!(battery_empty, "shutdown: sitting down before power off");
                 // Goodbye peck; non-blocking — it plays out during the sit.
@@ -3796,7 +3798,7 @@ async fn control_loop<T: RobotIo>(
                 let height = format!("{:.0}%", 100.0 * reading.height_ratio);
                 let tilt = format!("{:.0}°", reading.tilt_deg);
                 match reading.posture {
-                    posture::Posture::Seated if controller.has_sitstand() => {
+                    posture::Posture::Seated if controller.has_seat() => {
                         tracing::warn!(
                             %height,
                             %tilt,
@@ -5206,7 +5208,7 @@ fn ramp_target(
     imu_ready: bool,
     controller: Option<&mut Controller>,
 ) -> [f64; NUM_JOINTS] {
-    let Some(controller) = controller.filter(|c| c.has_sitstand()) else {
+    let Some(controller) = controller.filter(|c| c.has_seat()) else {
         return DEFAULT_POSITION;
     };
     if !imu_ready {
