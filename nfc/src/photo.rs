@@ -6,13 +6,14 @@
 //! runs this sequence, start to end, while the reader waits:
 //!
 //! 1. A quack, so the person holding the tag knows it was read.
-//! 2. Standing, still: laser tracking off (it would walk the robot to a dot), `robot.stop`, and a
-//!    seated robot stood up with `robot.do sit_toggle` — a toggle, so the robot's `robot.state` policy is
-//!    read first. A robot whose policy is not driving (`held`: limp, or stood up by `robot.init`
+//! 2. Still: laser tracking off (it would walk the robot to a dot) and `robot.stop`. A robot
+//!    standing stays standing and a seated one stays seated, which the robot's `robot.state` policy
+//!    says. A robot whose policy is not driving (`held`: limp, or stood up by `robot.init`
 //!    alone) is started with `robot.enable`, the pad's Start, so the tag works with no pad around;
 //!    the sequence waits up to [`START_WITHIN`] for it to stand. A robot busy with something else
 //!    (a skill, a ground pick, a rest) is left alone and the touch ends there.
-//! 3. The head lifts a little: `robot.look` at a point ahead and above, and the joints it answers
+//! 3. The head lifts: `robot.look` at a point ahead and above ([`LOOK_UP`], or [`LOOK_UP_SEATED`]
+//!    higher still, the seated robot being lower than the face it looks at), and the joints it answers
 //!    resent through `robot.head` for as long as the pose must hold, which keeps the idle
 //!    look-around from taking the head back after its two seconds.
 //! 4. [`COUNTDOWN`] of flashlight blinks at [`BLINK`] brightness, each shorter than the last
@@ -21,7 +22,7 @@
 //!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
-//! 6. [`BEFORE_SIT`] later the robot sits, and once seated opens its beak wide.
+//! 6. [`BEFORE_SIT`] later a standing robot sits; once seated, it opens its beak wide.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
 //! 8. It holds it [`KEEP`]: where the photo will be written to it, which is not done yet.
@@ -88,12 +89,19 @@ const BACK_UP: Duration = Duration::from_millis(800);
 /// For the head to go down before the beak opens.
 const LOWER: Duration = Duration::from_millis(800);
 
-/// Where the robot looks for the picture, trunk frame: a metre ahead and about half a metre up,
-/// which lifts the head towards a face without throwing it back.
+/// Where a standing robot looks for the picture, trunk frame: a metre ahead and 0.75 m up.
 pub const LOOK_UP: proto::LookParams = proto::LookParams {
     x: 1.0,
     y: 0.0,
-    z: 0.55,
+    z: 0.75,
+    neck_pitch: 0.0,
+};
+
+/// Where a seated robot looks: higher than [`LOOK_UP`], for the same face from lower down.
+pub const LOOK_UP_SEATED: proto::LookParams = proto::LookParams {
+    x: 1.0,
+    y: 0.0,
+    z: 0.95,
     neck_pitch: 0.0,
 };
 
@@ -154,7 +162,7 @@ pub trait Driver {
     fn policy(&mut self) -> Result<String, String>;
     /// `robot.enable` on: the pad's Start.
     fn start(&mut self) -> Result<proto::IntentResult, String>;
-    /// `robot.do sit_toggle`, which stands a seated robot up and sits a standing one.
+    /// `robot.do sit_toggle`, which sits a standing robot (and stands a seated one).
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String>;
     /// `robot.look`.
     fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String>;
@@ -220,20 +228,19 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
             };
         }
     }
-    match policy.as_str() {
-        "walk" | "stand" => robot.sleep(STILL),
-        "sit" => {
-            if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
-                return Outcome::Failed(why);
-            }
+    let seated = match policy.as_str() {
+        "walk" | "stand" => false,
+        "sit" => true,
+        "rise" => {
             robot.sleep(RISE);
+            false
         }
-        "rise" => robot.sleep(RISE),
         _ => return Outcome::NotStanding(policy),
-    }
+    };
+    robot.sleep(STILL);
 
     // The head up, held through the countdown.
-    let head = match robot.look(LOOK_UP) {
+    let head = match robot.look(if seated { LOOK_UP_SEATED } else { LOOK_UP }) {
         Ok(r) => r.head,
         Err(why) => return Outcome::Failed(format!("robot.look: {why}")),
     };
@@ -263,10 +270,12 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     // Sit, then the beak wide open. The head is held throughout, so the look-around stays off.
     // Not stopping when it will not sit: the display is taken standing just as well.
     hold(robot, head, BEFORE_SIT);
-    if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
-        tracing::warn!(%why, "not sitting down — waiting for the e-ink standing");
+    if !seated {
+        if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
+            tracing::warn!(%why, "not sitting down — waiting for the e-ink standing");
+        }
+        hold(robot, head, SIT);
     }
-    hold(robot, head, SIT);
     if let Err(why) = robot.mouth(1.0) {
         return Outcome::Failed(format!("robot.mouth: {why}"));
     }
@@ -508,6 +517,8 @@ mod tests {
         eink_after: Option<usize>,
         asked_beak: usize,
         sit_refused: Option<String>,
+        /// The height of every `robot.look`.
+        looks: Vec<f64>,
     }
 
     impl Default for Fake {
@@ -525,6 +536,7 @@ mod tests {
                 eink_after: Some(3),
                 asked_beak: 0,
                 sit_refused: None,
+                looks: Vec::new(),
             }
         }
     }
@@ -560,8 +572,9 @@ mod tests {
                 None => proto::IntentResult::accepted(),
             })
         }
-        fn look(&mut self, _: proto::LookParams) -> Result<proto::LookResult, String> {
+        fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String> {
             self.calls.push("look".into());
+            self.looks.push(at.z);
             self.holding = true;
             Ok(proto::LookResult {
                 head: proto::HeadParams::default(),
@@ -675,15 +688,17 @@ mod tests {
     }
 
     #[test]
-    fn a_seated_robot_stands_up_first() {
+    fn a_seated_robot_stays_seated_and_looks_higher() {
         let mut robot = Fake {
             policy: "sit".into(),
             ..Fake::default()
         };
         assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
-        let shape = shape(&robot.calls);
-        assert_eq!(&shape[..5], ["quack", "laser off", "stop", "sit", "look"]);
-        assert_eq!(shape.iter().filter(|c| *c == "sit").count(), 2);
+        assert!(!robot.calls.contains(&"sit".to_string()));
+        assert_eq!(robot.looks[0], LOOK_UP_SEATED.z);
+        let mut standing = Fake::default();
+        on_touch(&mut standing);
+        assert_eq!(standing.looks[0], LOOK_UP.z);
     }
 
     /// No pad needed: a robot whose policy is not driving is started, as Start would.
