@@ -1,10 +1,12 @@
 //! `autod` — the autonomous brain, as an intent client.
 //!
-//! `docs/design/autonomous.md` is the design. In one paragraph: with `[autonomous] enabled`, this
-//! stands the robot up at boot with no pad, then reads `robot.state` and the head ToF and sends
-//! ordinary intents, driven by a state machine (`brain.rs`) and an obstacle model
-//! (`obstacle.rs`). It steps aside whenever `robot.state.move.source` says the pad is driving.
-//! Switched off, it parks and touches nothing.
+//! `docs/design/autonomous.md` is the design. In one paragraph: while `robotd`'s autonomy switch
+//! is on (`robot.state.autonomous` — `[autonomous] enabled` at boot, `robot.autonomous` or an NFC
+//! tag after), this stands the robot up with no pad, then reads `robot.state` and the head ToF and
+//! sends ordinary intents, driven by a state machine (`brain.rs`) and an obstacle model
+//! (`obstacle.rs`). It switches laser tracking and autonomous soccer on and off as the brain
+//! wants, and stands aside while `robotd` drives the dot or the ball. It steps aside entirely
+//! whenever `robot.state.move.source` says the pad is driving. Switched off, it touches nothing.
 //!
 //! Like `padd`, it holds no privileged access: it is a socket client in group `robot`, and the
 //! deadman stops the robot within `[safety] deadman_ms` of this process dying.
@@ -41,7 +43,7 @@ struct Args {
     #[arg(long, default_value = proto::socket::TOF)]
     tof_socket: PathBuf,
 
-    /// The robot's configuration: `[autonomous]` decides whether this runs at all.
+    /// The robot's configuration, for `[pad_drive]`'s speeds.
     #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
     config: PathBuf,
 
@@ -65,6 +67,9 @@ const SELF_AUDIO: Duration = Duration::from_millis(1500);
 /// How long to wait at boot for the robot to come up after `robot.enable`.
 const STAND_UP: Duration = Duration::from_secs(20);
 
+/// A laser or soccer switch `robotd` did not take is asked again after this, not every tick.
+const SWITCH_RETRY: Duration = Duration::from_secs(3);
+
 fn main() -> std::process::ExitCode {
     let args = Args::parse();
     tracing_subscriber::fmt()
@@ -84,16 +89,6 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    if !params.autonomous.enabled {
-        // Parked rather than exited: the unit is `Restart=always`, so an exit would be a restart
-        // loop, and an idle process costs nothing. `robotctl configure` restarts this unit when
-        // the switch changes.
-        tracing::info!("autonomy is off ([autonomous] enabled = false) — idle");
-        loop {
-            std::thread::park();
-        }
-    }
-
     match run(&args, &params) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -122,6 +117,12 @@ struct Latest {
     source: Option<String>,
     deadman: bool,
     hearing: Option<proto::HearingState>,
+    /// `robotd`'s autonomy switch: whether this process should be doing anything at all.
+    autonomous: bool,
+    laser: brain::Laser,
+    ball: brain::Ball,
+    /// Soccer mode is on at all — by hand or playing by itself.
+    soccer_mode: bool,
 }
 
 /// What the robot has, from the subscribe ack.
@@ -158,7 +159,6 @@ fn run(args: &Args, params: &robotd_params::Params) -> std::io::Result<()> {
     tracing::warn!(?abilities, "autonomous — the duck is on its own");
     spawn_depth(args.tof_socket.clone(), Arc::clone(&shared));
 
-    stand_up_once(&mut commands, &mut next_id, &shared, &args.state_dir)?;
     drive(
         args,
         params,
@@ -231,6 +231,20 @@ fn subscribe(
                 source: state.movement.source,
                 deadman: state.movement.limited_by.iter().any(|l| l == "deadman"),
                 hearing: state.hearing,
+                autonomous: state.autonomous,
+                laser: brain::Laser {
+                    on: state.laser.is_some(),
+                    dot: state.laser.as_ref().is_some_and(|l| l.target_m.is_some()),
+                },
+                ball: state.soccer.as_ref().filter(|s| s.autonomous).map_or_else(
+                    brain::Ball::default,
+                    |s| brain::Ball {
+                        on: true,
+                        seen: s.target_m.is_some(),
+                        kicks: s.kicks,
+                    },
+                ),
+                soccer_mode: state.soccer.is_some(),
             };
             let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
             shared.history.push(latest.sample);
@@ -340,62 +354,83 @@ fn stood_up_on(marker: &Path, boot: Option<&str>) -> bool {
     }
 }
 
-/// Stand the robot up, once per boot. `docs/design/autonomous.md` §2: a restart of this unit
-/// later in the same boot must not stand back up a robot somebody stopped.
-fn stand_up_once(
+/// Stand the robot up: `robot.enable`, then wait until it is driving. `Ok(false)` when
+/// `robotd` would not.
+fn stand_up(
     commands: &mut UnixStream,
     next_id: &mut u64,
     shared: &Mutex<Shared>,
-    state_dir: &Path,
-) -> std::io::Result<()> {
-    let marker = state_dir.join("started");
-    let boot = boot_id();
-    if stood_up_on(&marker, boot.as_deref()) {
-        tracing::info!("already stood up on this boot — leaving the policy as it is");
-        return Ok(());
+    policy: &str,
+) -> std::io::Result<bool> {
+    if !off(policy) {
+        return Ok(true);
+    }
+    tracing::warn!("standing up — no pad needed (robot.enable)");
+    let call = proto::Call::RobotEnable(proto::EnableParams {
+        on: true,
+        toggle: false,
+    });
+    let accepted = request(commands, next_id, &call)?
+        .and_then(|r| r.result_as::<proto::IntentResult>().ok())
+        .is_some_and(|r| r.accepted);
+    if !accepted {
+        return Ok(false);
     }
     let deadline = Instant::now() + STAND_UP;
-    let first = loop {
+    while Instant::now() < deadline {
         let (state, lost) = latest(shared);
         if lost {
             return Err(std::io::Error::other("robotd closed the state stream"));
         }
-        if let Some(state) = state {
-            break state;
+        if state.is_some_and(|s| !off(&s.policy)) {
+            break;
         }
-        if Instant::now() > deadline {
-            return Err(std::io::Error::other("no robot.state from robotd"));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    if off(&first.policy) {
-        tracing::warn!("standing up — no pad needed (robot.enable)");
-        let call = proto::Call::RobotEnable(proto::EnableParams {
-            on: true,
-            toggle: false,
-        });
-        let accepted = request(commands, next_id, &call)?
-            .and_then(|r| r.result_as::<proto::IntentResult>().ok())
-            .is_some_and(|r| r.accepted);
-        if !accepted {
-            // Not marked: the next start of this unit tries again.
-            return Ok(());
-        }
-        while Instant::now() < deadline {
-            let (state, lost) = latest(shared);
-            if lost {
-                return Err(std::io::Error::other("robotd closed the state stream"));
-            }
-            if state.is_some_and(|s| !off(&s.policy)) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(e) = std::fs::write(&marker, boot.unwrap_or_default()) {
+    Ok(true)
+}
+
+/// The duck on its own was just switched on. Stands the robot up — except the first time this
+/// process sees the switch on, on a boot it already stood the robot up on: that is this unit
+/// restarting (an update, a crash), and somebody may have stopped the robot since.
+/// `docs/design/autonomous.md` §2.
+fn switched_on(
+    commands: &mut UnixStream,
+    next_id: &mut u64,
+    shared: &Mutex<Shared>,
+    state_dir: &Path,
+    policy: &str,
+    first_sight: bool,
+) -> std::io::Result<()> {
+    let marker = state_dir.join("started");
+    let boot = boot_id();
+    if first_sight && stood_up_on(&marker, boot.as_deref()) {
+        tracing::info!("already stood up on this boot — leaving the policy as it is");
+        return Ok(());
+    }
+    // Not marked when refused: the next switch-on, or the next start of this unit, tries again.
+    if stand_up(commands, next_id, shared, policy)?
+        && let Err(e) = std::fs::write(&marker, boot.unwrap_or_default())
+    {
         tracing::warn!(error = %e, path = %marker.display(), "cannot remember the stand-up");
     }
     Ok(())
+}
+
+/// Ask `robotd` for a switch, answered. A refusal is logged by [`request`].
+fn switch(commands: &mut UnixStream, next_id: &mut u64, call: proto::Call) -> std::io::Result<()> {
+    request(commands, next_id, &call).map(|_| ())
+}
+
+fn laser_switch(active: bool) -> proto::Call {
+    proto::Call::RobotLaserTrack(proto::LaserTrackParams { active })
+}
+
+fn soccer_switch(on: bool) -> proto::Call {
+    proto::Call::RobotSoccer(proto::SoccerParams {
+        active: on,
+        autonomous: on,
+    })
 }
 
 /// The tick loop.
@@ -425,6 +460,15 @@ fn drive(
     let mut posing = false;
     let mut idle_reason: Option<&'static str> = None;
     let mut frame: Vec<u8> = Vec::with_capacity(512);
+    // The autonomy switch as last seen; `None` before the first state frame.
+    let mut was_on: Option<bool> = None;
+    // Autonomous soccer was switched on by the brain, so it is the brain's to switch off. A game
+    // somebody else started (the pad's D-pad down) is theirs, and the brain stands aside for it.
+    let mut soccer_mine = false;
+    let mut external_soccer = false;
+    // When each switch was last asked for, so a refusal is not asked again fifty times a second.
+    let mut laser_asked: Option<Instant> = None;
+    let mut soccer_asked: Option<Instant> = None;
 
     loop {
         let tick = Instant::now();
@@ -456,6 +500,64 @@ fn drive(
         };
         heard_before = state.hearing;
 
+        // The switch. Edges only: switched on stands the robot up, switched off stops it and
+        // hands back the camera; in between, off is silence.
+        if was_on.is_none() && state.ball.on {
+            // A game already running when this process starts is most likely its own, from before
+            // a restart — nobody would know to switch it off otherwise. Adopted, so the brain
+            // (not in BallPlay) switches it off.
+            soccer_mine = true;
+        }
+        if was_on != Some(state.autonomous) {
+            if state.autonomous {
+                tracing::warn!("the duck is on its own");
+                switched_on(
+                    commands,
+                    next_id,
+                    shared,
+                    &args.state_dir,
+                    &state.policy,
+                    was_on.is_none(),
+                )?;
+                brain.reset();
+            } else if was_on.is_some() {
+                tracing::warn!("the duck on its own is switched off — standing still");
+                for call in [
+                    proto::Call::RobotMove(proto::MoveParams::default()),
+                    proto::Call::RobotMouth(proto::MouthParams { open: 0.0 }),
+                ] {
+                    commands.write_all(&line_of(&proto::Request::notify(&call))?)?;
+                }
+                if posing {
+                    let rest = proto::Call::RobotPose(proto::PoseParams {
+                        active: false,
+                        ..Default::default()
+                    });
+                    commands.write_all(&line_of(&proto::Request::notify(&rest))?)?;
+                }
+                commands.flush()?;
+                if soccer_mine && state.soccer_mode {
+                    switch(commands, next_id, soccer_switch(false))?;
+                }
+                if state.laser.on {
+                    switch(commands, next_id, laser_switch(false))?;
+                }
+                soccer_mine = false;
+                posing = false;
+                wheee_on = false;
+            } else {
+                tracing::info!(
+                    "the duck on its own is off — waiting for it to be switched on \
+                     (robotctl autonomous on, or an autonomous_mode tag)"
+                );
+            }
+            was_on = Some(state.autonomous);
+        }
+        if !state.autonomous {
+            sleep_rest(period, tick);
+            continue;
+        }
+
         // The pad is driving: say nothing at all, so it has the head, mouth and voice too.
         let pad_live = state.source.as_deref() == Some("padd") && !state.deadman;
         if pad_live {
@@ -467,6 +569,12 @@ fn drive(
                 yielded = true;
                 wheee_on = false;
                 posing = false;
+                // A game the brain started would take the legs back the moment the stick is
+                // centred: the pad's person did not ask for it.
+                if soccer_mine {
+                    switch(commands, next_id, soccer_switch(false))?;
+                    soccer_mine = false;
+                }
             }
             sleep_rest(period, tick);
             continue;
@@ -474,6 +582,22 @@ fn drive(
         if yielded {
             tracing::warn!("the pad let go — the duck takes back over");
             yielded = false;
+            brain.reset();
+        }
+        // Somebody else's ball game — the pad's D-pad down — is theirs until it ends.
+        if state.ball.on && !soccer_mine {
+            if !external_soccer {
+                tracing::warn!("playing soccer by somebody else's say — standing aside");
+                external_soccer = true;
+                wheee_on = false;
+                posing = false;
+            }
+            sleep_rest(period, tick);
+            continue;
+        }
+        if external_soccer {
+            tracing::warn!("the game is over — the duck takes back over");
+            external_soccer = false;
             brain.reset();
         }
 
@@ -505,6 +629,8 @@ fn drive(
             sitting,
             obstacle,
             pose: state.sample.pose,
+            laser: state.laser,
+            ball: state.ball,
         };
         let step = brain.step(dt, &world);
 
@@ -514,6 +640,27 @@ fn drive(
             continue;
         }
 
+        // The camera's two jobs, held to what the brain wants. Soccer first: switching it off is
+        // what lets the laser come back on (`robotd` runs one at a time).
+        let retry =
+            |asked: Option<Instant>| asked.is_none_or(|at| tick.duration_since(at) > SWITCH_RETRY);
+        if step.soccer && !state.ball.on && retry(soccer_asked) {
+            tracing::info!("looking for the ball (autonomous soccer on)");
+            switch(commands, next_id, soccer_switch(true))?;
+            soccer_mine = true;
+            soccer_asked = Some(tick);
+        } else if !step.soccer && soccer_mine {
+            if state.soccer_mode {
+                switch(commands, next_id, soccer_switch(false))?;
+            }
+            soccer_mine = false;
+        }
+        if step.laser != state.laser.on && !step.soccer && retry(laser_asked) {
+            tracing::info!(on = step.laser, "laser tracking");
+            switch(commands, next_id, laser_switch(step.laser))?;
+            laser_asked = Some(tick);
+        }
+
         // One write for the tick's continuous intents: they describe one instant.
         frame.clear();
         let mut push = |call: &proto::Call| -> std::io::Result<()> {
@@ -521,18 +668,23 @@ fn drive(
             frame.push(b'\n');
             Ok(())
         };
+        // While `robotd` chases the dot or the ball, the twist and the head go out as exact zeros:
+        // `robotd` reads a zero twist and a centred head as nobody asking, and gives both to the
+        // chase at once — where staying silent would leave the last nonzero command winning until
+        // it went stale. The quack's head toss stays out of it for the same reason.
+        let head = if step.hands_off { [0.0; 4] } else { step.head };
         push(&proto::Call::RobotMove(proto::MoveParams {
             vx: step.cmd[0],
             vy: step.cmd[1],
             vyaw: step.cmd[2],
         }))?;
         push(&proto::Call::RobotHead(proto::HeadParams {
-            neck_pitch: step.head[0],
+            neck_pitch: head[0],
             // The brain's pitch is "positive = up"; the alpha's +head_pitch looks down.
-            head_pitch: -step.head[1],
-            head_yaw: step.head[2],
-            head_roll: step.head[3],
-            alpha: abilities.head_alpha.then_some(step.head_alpha),
+            head_pitch: -head[1],
+            head_yaw: head[2],
+            head_roll: head[3],
+            alpha: (abilities.head_alpha && !step.hands_off).then_some(step.head_alpha),
         }))?;
         push(&proto::Call::RobotMouth(proto::MouthParams {
             open: step.mouth,
@@ -580,6 +732,13 @@ fn drive(
 
         sleep_rest(period, tick);
     }
+}
+
+/// One notification or request as the line it goes out as.
+fn line_of(request: &proto::Request) -> std::io::Result<Vec<u8>> {
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 fn sleep_rest(period: Duration, tick: Instant) {

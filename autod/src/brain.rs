@@ -1,8 +1,9 @@
 //! The behaviour: a randomised state machine on an energy model.
 //!
-//! Ported from the runtime's `autonomous.rs` (`docs/design/autonomous.md` §4), minus BallPlay,
-//! Held, Startle and Preen, and with Wander walking to goal points in the odometry frame rather
-//! than holding random headings. **Pure decision-making**: it never touches a socket. Every tick it
+//! Ported from the runtime's `autonomous.rs` (`docs/design/autonomous.md` §4), minus Held,
+//! Startle and Preen, and with Wander walking to goal points in the odometry frame rather than
+//! holding random headings. Chasing a laser dot and playing with the ball are `robotd`'s to drive
+//! (`laser.rs`, `soccer.rs`); here is only when the duck feels like it, and when it has had enough. **Pure decision-making**: it never touches a socket. Every tick it
 //! takes a [`World`] and returns a [`Step`] of targets and one-shot events, and `main.rs` turns
 //! those into intents. That is what lets the soak test below run ten minutes of duck in a
 //! millisecond.
@@ -31,6 +32,26 @@ pub enum Sound {
     Coo,
 }
 
+/// Laser tracking, as `robot.state` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Laser {
+    /// Tracking is switched on.
+    pub on: bool,
+    /// A dot is being followed (seen, or remembered for `[laser] memory_ms`).
+    pub dot: bool,
+}
+
+/// Autonomous soccer, as `robot.state` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ball {
+    /// Autonomous soccer is switched on.
+    pub on: bool,
+    /// A ball is being played with (seen, or remembered).
+    pub seen: bool,
+    /// Kicks started since autonomous soccer was switched on.
+    pub kicks: u32,
+}
+
 /// Everything the brain reads, once a tick.
 #[derive(Debug, Clone, Copy)]
 pub struct World {
@@ -50,6 +71,8 @@ pub struct World {
     pub obstacle: Option<Obstacle>,
     /// Odometry `[x, y, yaw]`, for the novelty grid and wander headings.
     pub pose: [f64; 3],
+    pub laser: Laser,
+    pub ball: Ball,
 }
 
 /// One tick's output. Targets are smoothed by `robotd` (and by `head_alpha`); events are edges.
@@ -72,6 +95,14 @@ pub struct Step {
     pub sit_toggle: bool,
     /// The wheee ride plays while this is held (zoomies).
     pub wheee: bool,
+    /// Laser tracking should be switched on: a level, which `main.rs` holds `robotd` to.
+    pub laser: bool,
+    /// Autonomous soccer should be switched on: a level, likewise.
+    pub soccer: bool,
+    /// `robotd` is driving — a dot or the ball — so the legs and the head are not the brain's:
+    /// `cmd` and `head` are zero, and `main.rs` sends them as zero, which `robotd` reads as nobody
+    /// asking.
+    pub hands_off: bool,
 }
 
 /// What the obstacle gate did to a walking command, one tick.
@@ -207,6 +238,29 @@ const CELL_M: f64 = 0.5;
 /// that was going to run is visibly busy well inside this.
 const PICK_ACK_S: f64 = 1.5;
 
+/// Below this energy the duck stops chasing the dot (laser tracking off) and rests; above
+/// `LASER_RESTED_E` it plays again. The gap is what keeps it from flicking on and off.
+const LASER_TIRED_E: f64 = 0.2;
+const LASER_RESTED_E: f64 = 0.45;
+/// A chase ends once no dot has been followed for this long: whoever held the laser stopped.
+const LASER_LOST_S: f64 = 2.0;
+
+/// Ball play needs this much energy to start, and ends below `BALL_TIRED_E`.
+const BALL_MIN_E: f64 = 0.35;
+const BALL_TIRED_E: f64 = 0.2;
+/// How long to look for a ball before deciding there is none around.
+const BALL_SEARCH_S: f64 = 20.0;
+/// A ball not seen for this long, once found, has rolled away for good — or been picked up.
+const BALL_LOST_S: f64 = 15.0;
+/// After a search that found nothing, how long before looking again; doubled for every miss in
+/// a row, up to `BALL_RETRY_MAX_S`. A room with no ball in it stops costing a spin every minute.
+const BALL_RETRY_S: f64 = 180.0;
+const BALL_RETRY_MAX_S: f64 = 1800.0;
+/// Seconds of play that make the duck fully bored of the ball. Boredom shortens the next game and
+/// makes one less likely; it wears off over `BALL_FORGET_S`.
+const BALL_BORED_S: f64 = 300.0;
+const BALL_FORGET_S: f64 = 1200.0;
+
 /// Wrap an angle to (-π, π].
 pub fn wrap_angle(a: f64) -> f64 {
     (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
@@ -272,6 +326,12 @@ pub enum State {
     /// Being petted: melt into the hand, an excited wiggle, or a sleepy melt that can end in a
     /// nap. Exits a moment after the hand leaves.
     Petted,
+    /// Chasing a laser dot. `robotd` drives the head and legs; the brain stands aside, quacks,
+    /// and gets tired faster than walking.
+    Laser,
+    /// Playing with the ball: autonomous soccer on, `robotd` driving. Ends when there is no ball
+    /// around, when it got away, or when the duck has had enough.
+    BallPlay,
 }
 
 pub struct Brain {
@@ -349,6 +409,22 @@ pub struct Brain {
     visits: std::collections::HashMap<(i32, i32), f32>,
     last_pose: [f64; 3],
     decay_tick: u64,
+    /// Too tired for the laser: tracking stays off until energy is back above `LASER_RESTED_E`.
+    laser_tired: bool,
+    /// Laser: when (state time) a dot was last followed.
+    laser_seen_at: f64,
+    /// Ball: 0..1, how much of the ball the duck has had lately.
+    ball_boredom: f64,
+    /// Ball: no new game before this, on the behaviour clock.
+    ball_next_try: f64,
+    /// Ball: searches in a row that found nothing.
+    ball_misses: u32,
+    /// This game: when (state time) the ball was last seen, the kick counter it started from, how
+    /// many kicks will do, and how long it may last.
+    ball_seen_at: Option<f64>,
+    ball_kicks_from: Option<u32>,
+    ball_kick_goal: u32,
+    ball_play_s: f64,
 }
 
 impl Brain {
@@ -399,6 +475,16 @@ impl Brain {
             visits: std::collections::HashMap::new(),
             last_pose: [0.0; 3],
             decay_tick: 0,
+            laser_tired: false,
+            laser_seen_at: 0.0,
+            ball_boredom: 0.0,
+            // Not in the first minute: a duck just switched on looks around first.
+            ball_next_try: 60.0,
+            ball_misses: 0,
+            ball_seen_at: None,
+            ball_kicks_from: None,
+            ball_kick_goal: 0,
+            ball_play_s: 0.0,
         }
     }
 
@@ -452,6 +538,10 @@ impl Brain {
                 ground_pick: false,
                 sit_toggle: false,
                 wheee: false,
+                // Held as they are: a skill running is no reason to switch the camera's work.
+                laser: self.wants_laser(),
+                soccer: self.state == State::BallPlay,
+                hands_off: false,
             };
         }
 
@@ -478,9 +568,21 @@ impl Brain {
             State::Petted => dt / 60.0,
             State::Dance => -dt / 45.0,
             State::Chill => dt / 120.0,
+            // Chasing is running: twice the cost of a walk, so a long laser session ends in a nap.
+            State::Laser => -dt / 50.0,
+            State::BallPlay => -dt / 70.0,
             _ => dt / 240.0,
         };
         self.energy = (self.energy + de).clamp(0.05, 1.0);
+        if self.energy < LASER_TIRED_E {
+            self.laser_tired = true;
+        } else if self.energy > LASER_RESTED_E {
+            self.laser_tired = false;
+        }
+        // Boredom of the ball wears off while not playing.
+        if self.state != State::BallPlay {
+            self.ball_boredom = (self.ball_boredom - dt / BALL_FORGET_S).max(0.0);
+        }
 
         // Novelty grid: dwell time in the current cell, capped so old haunts are not infinitely
         // repulsive, and decayed slowly so places become fresh again.
@@ -565,6 +667,30 @@ impl Brain {
             // rather than doubling it.
             self.pet_coo_in = 3.0;
             self.enter(State::Petted);
+        }
+
+        // A dot on the floor is the second-best interrupt: whatever the duck was doing, it goes.
+        // Not from a nap, a pick, a petting or the ball — the laser is off for those anyway, and
+        // a dot still remembered from before is not a reason to jump.
+        if world.laser.dot
+            && self.wants_laser()
+            && matches!(
+                self.state,
+                State::Chill
+                    | State::LookAround
+                    | State::Wander
+                    | State::TurnInPlace
+                    | State::Zoomies
+                    | State::Stretch
+                    | State::Ruffle
+                    | State::Dance
+                    | State::Sneeze
+            )
+        {
+            tracing::info!(energy = self.energy, "a dot! chasing it");
+            self.enter(State::Laser);
+            self.start_quack_burst();
+            sound = Some(Sound::Chirp);
         }
 
         match self.state {
@@ -1025,6 +1151,87 @@ impl Brain {
                     }
                 }
             }
+            State::Laser => {
+                self.cmd = [0.0; 3];
+                self.head = [0.0; 4];
+                if world.laser.dot {
+                    self.laser_seen_at = self.t_state;
+                }
+                if self.laser_tired {
+                    tracing::info!(energy = self.energy, "too tired to chase — resting");
+                    let can_nap = world.can_sit_stand && !world.sitting;
+                    self.enter(if can_nap { State::Nap } else { State::Chill });
+                } else if self.t_state - self.laser_seen_at > LASER_LOST_S {
+                    // Gone: look around for where it went.
+                    self.enter(State::LookAround);
+                }
+            }
+            State::BallPlay => {
+                self.cmd = [0.0; 3];
+                self.head = [0.0; 4];
+                if world.ball.on && self.ball_kicks_from.is_none() {
+                    self.ball_kicks_from = Some(world.ball.kicks);
+                }
+                if world.ball.seen {
+                    if self.ball_seen_at.is_none() {
+                        tracing::info!("found the ball");
+                        self.ball_misses = 0;
+                        self.start_quack_burst();
+                        sound = Some(Sound::Chirp);
+                    }
+                    self.ball_seen_at = Some(self.t_state);
+                }
+                let kicks = world
+                    .ball
+                    .kicks
+                    .saturating_sub(self.ball_kicks_from.unwrap_or(world.ball.kicks));
+                match self.ball_seen_at {
+                    None => {
+                        self.ball_boredom = (self.ball_boredom + 0.5 * dt / BALL_BORED_S).min(1.0);
+                        if self.t_state > BALL_SEARCH_S {
+                            self.ball_misses += 1;
+                            let wait = (BALL_RETRY_S * f64::from(1u32 << self.ball_misses.min(5))
+                                / 2.0)
+                                .min(BALL_RETRY_MAX_S);
+                            tracing::info!(
+                                misses = self.ball_misses,
+                                retry_s = wait,
+                                "no ball around — maybe later"
+                            );
+                            self.ball_next_try = self.clock + wait;
+                            self.enter(State::LookAround);
+                        }
+                    }
+                    Some(seen_at) => {
+                        self.ball_boredom = (self.ball_boredom + dt / BALL_BORED_S).min(1.0);
+                        let done = if self.t_state - seen_at > BALL_LOST_S {
+                            Some("the ball got away")
+                        } else if kicks >= self.ball_kick_goal {
+                            Some("enough kicks")
+                        } else if self.t_state > self.ball_play_s {
+                            Some("bored of the ball")
+                        } else if self.energy < BALL_TIRED_E {
+                            Some("too tired to play")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = done {
+                            let rest = self.rng.range(240.0, 480.0) * (1.0 + self.ball_boredom);
+                            tracing::info!(
+                                why,
+                                kicks,
+                                boredom = self.ball_boredom,
+                                retry_s = rest,
+                                "done with the ball"
+                            );
+                            self.ball_next_try = self.clock + rest;
+                            self.start_quack_burst();
+                            sound = Some(Sound::Chirp);
+                            self.enter(State::Ruffle);
+                        }
+                    }
+                }
+            }
             State::GroundPick => {
                 self.cmd = [0.0; 3];
                 self.head = [0.0; 4];
@@ -1057,12 +1264,18 @@ impl Brain {
         }
 
         // The current state's time is up (GroundPick and Nap manage their own exits).
-        if self.t_state >= self.state_dur && !matches!(self.state, State::GroundPick | State::Nap) {
+        if self.t_state >= self.state_dur
+            && !matches!(
+                self.state,
+                State::GroundPick | State::Nap | State::Laser | State::BallPlay
+            )
+        {
             let can_zoom = world
                 .obstacle
                 .is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > 1.2);
             let can_nap = world.can_sit_stand && !world.sitting;
-            let next = self.pick_next_state(world.can_ground_pick, can_zoom, can_nap);
+            let can_ball = self.clock >= self.ball_next_try && self.energy > BALL_MIN_E;
+            let next = self.pick_next_state(world.can_ground_pick, can_zoom, can_nap, can_ball);
             self.enter(next);
         }
 
@@ -1077,7 +1290,21 @@ impl Brain {
             ground_pick,
             sit_toggle,
             wheee: self.state == State::Zoomies,
+            laser: self.wants_laser(),
+            soccer: self.state == State::BallPlay,
+            hands_off: matches!(self.state, State::Laser | State::BallPlay),
         }
+    }
+
+    /// Laser tracking is on whenever the duck could chase: not too tired, not resting, not being
+    /// petted (a dot would walk it out from under the hand), and not playing with the ball, which
+    /// `robotd` would not run beside it anyway.
+    fn wants_laser(&self) -> bool {
+        !self.laser_tired
+            && !matches!(
+                self.state,
+                State::Nap | State::Petted | State::BallPlay | State::GroundPick
+            )
     }
 
     /// The head target with its animation overlays: each quack throws the head up with the open
@@ -1351,6 +1578,18 @@ impl Brain {
             }
             // Effectively "until the pick completes".
             State::GroundPick => 60.0,
+            // Both end by themselves (see `step`); the cap is a safety net.
+            State::Laser => {
+                self.laser_seen_at = 0.0;
+                600.0
+            }
+            State::BallPlay => {
+                self.ball_seen_at = None;
+                self.ball_kicks_from = None;
+                self.ball_kick_goal = self.rng.range(3.0, 9.0) as u32;
+                self.ball_play_s = self.rng.range(60.0, 180.0) * (1.0 - 0.7 * self.ball_boredom);
+                self.ball_play_s + BALL_SEARCH_S + BALL_LOST_S
+            }
         };
         tracing::info!(state = ?next, dur_s = self.state_dur, energy = self.energy, "→");
     }
@@ -1358,7 +1597,13 @@ impl Brain {
     /// The next state, conditioned on where we are coming from. Wander chains into turns, more
     /// wandering or zoomies so exploration reads as purposeful; picks and stretches only start
     /// from standing, never mid-stride.
-    fn pick_next_state(&mut self, can_ground_pick: bool, can_zoom: bool, can_nap: bool) -> State {
+    fn pick_next_state(
+        &mut self,
+        can_ground_pick: bool,
+        can_zoom: bool,
+        can_nap: bool,
+        can_ball: bool,
+    ) -> State {
         let r = self.rng.unit();
         match self.state {
             State::Wander => {
@@ -1419,7 +1664,7 @@ impl Brain {
             // go; a tired one parks, grooms, naps.
             _ => {
                 let e = self.energy;
-                let weights: [(State, f64); 9] = [
+                let weights: [(State, f64); 10] = [
                     (State::Wander, 0.16 + 0.28 * e),
                     (State::TurnInPlace, 0.06),
                     (State::Zoomies, if can_zoom && e > 0.5 { 0.07 } else { 0.0 }),
@@ -1436,6 +1681,16 @@ impl Brain {
                     (State::Ruffle, 0.06),
                     (State::Dance, if e > 0.4 { 0.05 } else { 0.0 }),
                     (State::Sneeze, 0.03),
+                    // A fresh, unbored duck goes looking for the ball fairly often; a bored one
+                    // hardly ever.
+                    (
+                        State::BallPlay,
+                        if can_ball {
+                            0.08 * (1.0 - self.ball_boredom) * self.energy
+                        } else {
+                            0.0
+                        },
+                    ),
                 ];
                 let look = (State::LookAround, 0.12 + 0.06 * (1.0 - e));
                 let total: f64 = weights.iter().map(|(_, w)| w).sum::<f64>() + look.1 + 0.10;
@@ -1477,6 +1732,8 @@ mod tests {
             sitting: false,
             obstacle: clear_ahead(),
             pose,
+            laser: Laser::default(),
+            ball: Ball::default(),
         }
     }
 
@@ -1743,5 +2000,172 @@ mod tests {
         w.heard = None;
         let answered = (0..100).any(|_| brain.step(0.02, &w).sound == Some(Sound::Chirp));
         assert!(answered);
+    }
+
+    /// A dot interrupts a wandering duck: laser on, hands off so `robotd` has the legs and head,
+    /// and a chase that ends a couple of seconds after the dot goes.
+    #[test]
+    fn a_dot_is_chased_and_let_go_of() {
+        let mut bench = Bench::new(3);
+        bench.brain.enter(State::Wander);
+        let out = bench.tick(|_| {});
+        assert!(out.laser, "the laser is on while the duck could chase");
+        let out = bench.tick(|w| {
+            w.laser = Laser {
+                on: true,
+                dot: true,
+            }
+        });
+        assert_eq!(bench.brain.state(), State::Laser);
+        assert!(out.hands_off && out.cmd == [0.0; 3] && out.head == [0.0; 4]);
+        for _ in 0..50 * 5 {
+            bench.tick(|w| {
+                w.laser = Laser {
+                    on: true,
+                    dot: true,
+                }
+            });
+        }
+        assert_eq!(
+            bench.brain.state(),
+            State::Laser,
+            "still chasing a dot in sight"
+        );
+        for _ in 0..(50.0 * (LASER_LOST_S + 0.5)) as usize {
+            bench.tick(|w| {
+                w.laser = Laser {
+                    on: true,
+                    dot: false,
+                }
+            });
+        }
+        assert_eq!(
+            bench.brain.state(),
+            State::LookAround,
+            "looking for where it went"
+        );
+    }
+
+    /// Chasing tires the duck faster than walking. Tired, it switches the laser off and rests, and
+    /// switches it back on only once it has rested.
+    #[test]
+    fn a_tired_duck_stops_chasing_and_plays_again_once_rested() {
+        let mut bench = Bench::new(4);
+        bench.brain.energy = 0.5;
+        bench.brain.enter(State::Laser);
+        let mut chased_s = 0.0;
+        while bench.brain.state() == State::Laser {
+            bench.tick(|w| {
+                w.laser = Laser {
+                    on: true,
+                    dot: true,
+                }
+            });
+            chased_s += 0.02;
+            assert!(chased_s < 60.0, "never tired of the dot");
+        }
+        // From 0.5 to the tired line at one unit per 50 s.
+        assert!(
+            (10.0..20.0).contains(&chased_s),
+            "tired after {chased_s:.1} s"
+        );
+        assert_eq!(bench.brain.state(), State::Nap);
+        let out = bench.tick(|w| {
+            w.laser = Laser {
+                on: true,
+                dot: true,
+            }
+        });
+        assert!(!out.laser, "the laser goes off for the nap");
+        assert_ne!(
+            bench.brain.state(),
+            State::Laser,
+            "a dot does not wake a napping duck"
+        );
+        // Rested and standing again (the bench's sit is cut short: a busy tick moves no energy).
+        bench.busy_ticks = 0;
+        bench.sit_flip_pending = false;
+        bench.sitting = false;
+        bench.brain.energy = LASER_RESTED_E + 0.05;
+        bench.brain.enter(State::Chill);
+        assert!(bench.tick(|_| {}).laser, "rested: the laser is back on");
+    }
+
+    /// A ball game with no ball around gives up after the search, and does not try again for a
+    /// while — longer after every miss in a row.
+    #[test]
+    fn no_ball_around_backs_off() {
+        let mut bench = Bench::new(5);
+        bench.brain.enter(State::BallPlay);
+        let out = bench.tick(|w| w.ball.on = true);
+        assert!(out.soccer && !out.laser && out.hands_off);
+        for _ in 0..(50.0 * (BALL_SEARCH_S + 1.0)) as usize {
+            bench.tick(|w| w.ball.on = true);
+        }
+        assert_eq!(bench.brain.state(), State::LookAround);
+        let first = bench.brain.ball_next_try - bench.brain.clock;
+        assert!(
+            (BALL_RETRY_S - 1.0..=BALL_RETRY_S).contains(&first),
+            "{first}"
+        );
+        bench.brain.enter(State::BallPlay);
+        for _ in 0..(50.0 * (BALL_SEARCH_S + 1.0)) as usize {
+            bench.tick(|w| w.ball.on = true);
+        }
+        let second = bench.brain.ball_next_try - bench.brain.clock;
+        assert!(
+            second > 1.9 * first,
+            "the second miss waits longer: {second} vs {first}"
+        );
+    }
+
+    /// A game ends on enough kicks, with a cooldown before the next one, and leaves the duck a
+    /// little bored of the ball.
+    #[test]
+    fn a_game_ends_and_the_ball_waits() {
+        let mut bench = Bench::new(6);
+        bench.brain.energy = 0.9;
+        bench.brain.enter(State::BallPlay);
+        let goal = bench.brain.ball_kick_goal;
+        assert!((3..=8).contains(&goal));
+        let mut kicks = 0;
+        for i in 0..50 * 120 {
+            if bench.brain.state() != State::BallPlay {
+                break;
+            }
+            if i % (50 * 5) == 0 && i > 0 {
+                kicks += 1;
+            }
+            let out = bench.tick(|w| {
+                w.ball = Ball {
+                    on: true,
+                    seen: true,
+                    kicks,
+                }
+            });
+            if bench.brain.state() == State::BallPlay {
+                assert!(out.soccer && out.hands_off);
+            }
+        }
+        assert_ne!(bench.brain.state(), State::BallPlay, "the game ended");
+        assert!(bench.brain.ball_boredom > 0.0);
+        assert!(bench.brain.ball_next_try - bench.brain.clock >= 240.0);
+        assert!(!bench.tick(|_| {}).soccer, "and soccer goes off");
+    }
+
+    /// Bored of the ball, the duck almost never picks it: the weight falls with boredom.
+    #[test]
+    fn a_bored_duck_rarely_picks_the_ball() {
+        let count = |boredom: f64| {
+            let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 7);
+            brain.energy = 0.9;
+            brain.ball_boredom = boredom;
+            (0..20_000)
+                .filter(|_| brain.pick_next_state(true, true, true, true) == State::BallPlay)
+                .count()
+        };
+        let (fresh, bored) = (count(0.0), count(0.95));
+        assert!(fresh > 500, "a fresh duck plays: {fresh}");
+        assert!(bored * 10 < fresh, "a bored one hardly: {bored} vs {fresh}");
     }
 }

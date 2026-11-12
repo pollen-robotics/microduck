@@ -138,11 +138,10 @@ fn apply_for(key: &str) -> Option<Apply> {
         "head_imu" => Apply::Restart(robotd_params::HeadImuParams::reader(
             robotd_params::board::Board::detected().unwrap_or_default(),
         )),
-        // Two readers, and only one of them needs anything: `autod` reads `[autonomous]` once at
-        // startup (and parks when it is off), while `padd` re-reads it with `[pad]` a second after
-        // the file changes. So the offer is `autod`'s restart, which is also what stands the robot
-        // up when the switch goes on.
-        "autonomous" => Apply::Restart("autod"),
+        // `enabled` is only where `robotd`'s switch starts at boot — `robotctl autonomous on`, or
+        // an NFC tag, switches it now — and `padd` re-reads `pad_idle_s` with `[pad]`.
+        "autonomous" if name == "pad_idle_s" => Apply::Live("padd"),
+        "autonomous" => Apply::NextBoot("robotd"),
         // `[policy]` is the one section a running daemon takes back: `PolicyChange::Reload`
         // re-reads it whole and rebuilds the controller from it, which is how `robotctl policy
         // add` lands a skill without a restart. Two keys are not in that promise:
@@ -1357,15 +1356,18 @@ mod tests {
         assert!(plan.restart.is_empty(), "and it needs no restart");
     }
 
-    /// Switching autonomy on restarts the brain — the one reader that needs it — and not `padd`,
-    /// whose pad session a restart would take down for a key it re-reads by itself.
+    /// The autonomy switch in the file is where it starts at boot — `robotctl autonomous` is the
+    /// switch for now — so nothing is restarted for it, and the idle time is `padd`'s, live.
     #[test]
-    fn the_autonomy_switch_restarts_autod_only() {
+    fn the_autonomy_switch_is_a_boot_default() {
         let mut m = model("");
         m.edit(entry("autonomous.enabled"), "true").expect("valid");
         let plan = plan_for(&m);
-        assert_eq!(plan.restart, vec!["autod"]);
-        assert!(plan.live.is_empty());
+        assert!(plan.restart.is_empty());
+        assert_eq!(plan.next_boot, vec!["robotd"]);
+        let mut m = model("");
+        m.edit(entry("autonomous.pad_idle_s"), "10").expect("valid");
+        assert_eq!(plan_for(&m).live, vec!["padd"]);
     }
 
     /// Controller sections are live: padd re-reads them, so there is nothing to offer.

@@ -1216,6 +1216,9 @@ async fn main() -> ExitCode {
     }
 
     let intents = Arc::new(Intents::new());
+    // Where the duck on its own starts; `robot.autonomous` (an NFC tag, `robotctl autonomous`)
+    // changes it until the next boot.
+    intents.set_autonomous(params.autonomous.enabled);
 
     start_head_imu(&state, &params, args.fake || args.sim.is_some());
 
@@ -4355,6 +4358,7 @@ async fn control_loop<T: RobotIo>(
                 theremin: theremin_state.clone(),
                 laser: laser_state.clone(),
                 soccer: soccer_state.clone(),
+                autonomous: intents.autonomous(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -5741,6 +5745,16 @@ fn dispatch(
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
+        // The duck on its own. A switch `autod` reads in `robot.state`; it moves nothing here, so
+        // there is nothing to refuse. Whether `autod` is running is `systemctl`'s to say.
+        proto::Call::RobotAutonomous(p) => {
+            if intents.autonomous() != p.active {
+                tracing::warn!(on = p.active, "the duck on its own switched");
+            }
+            intents.set_autonomous(p.active);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
         // unlike a skill it moves nothing, and a chirp out of a fallen robot is
         // diagnostics, not danger — but refused when this robot has no voice at all, the
@@ -5910,6 +5924,7 @@ fn dispatch(
                     .as_str()
                     .to_owned(),
                 soccer: Some(intents.soccer()).filter(|s| s.active),
+                autonomous: intents.autonomous(),
             },
         ),
 
@@ -7202,6 +7217,45 @@ mod tests {
             &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
         );
         assert_eq!(mode(&intents), None, "the laser switches soccer off");
+    }
+
+    /// The duck on its own is a level `robot.autonomous` sets and `robot.mode` reads back — the
+    /// pad daemons' way to learn an NFC tag switched it — and it touches no other switch: the
+    /// brain manages the laser and the ball itself.
+    #[test]
+    fn autonomy_is_a_switch_answered_in_robot_mode() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let on = |intents: &Intents| -> bool {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .autonomous
+        };
+        assert!(!on(&intents));
+        let answer: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: true }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(answer.accepted);
+        assert!(on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            None,
+            "the laser is left alone"
+        );
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert!(!on(&intents));
     }
 
     /// `robot.look` is a promise with two halves: the head actually moves (the intent is

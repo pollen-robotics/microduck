@@ -304,6 +304,9 @@ fn main() -> std::process::ExitCode {
         }
     };
     let roller = mode.mode == "roller";
+    // The duck on its own: while it is on, the pad keeps quiet until touched. `robot.mode` says,
+    // so an NFC tag switching it is heard within a second, like soccer mode.
+    let mut autonomy_on = mode.autonomous;
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
@@ -372,6 +375,13 @@ fn main() -> std::process::ExitCode {
                     }
                     // Soccer mode changes what the buttons do, and an NFC tag switches it.
                     mapper.set_soccer(mode.soccer);
+                    if mode.autonomous != autonomy_on {
+                        tracing::warn!(
+                            on = mode.autonomous,
+                            "the duck on its own switched — the pad keeps quiet until touched while it is on"
+                        );
+                        autonomy_on = mode.autonomous;
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -423,7 +433,7 @@ fn main() -> std::process::ExitCode {
                 driving = false;
                 // A pad nobody was touching was not holding the robot — the duck's own brain was.
                 // Losing it is no reason to sit the robot down.
-                if engagement.engaged() || !config.autonomy.enabled {
+                if engagement.engaged() || !autonomy_on {
                     pad_loss.lost(tick);
                 }
                 engagement.reset();
@@ -517,7 +527,7 @@ fn main() -> std::process::ExitCode {
         // `pad_idle_s` after the last touch. A press is a touch, so it engages the pad in the same
         // tick it is mapped.
         let touch = pad_map::engage::touched(&frame_in, config.axes.deadzone);
-        match engagement.tick(touch, tick, &config.autonomy) {
+        match engagement.tick(touch, tick, autonomy_on, &config.autonomy) {
             Engage::Drive => {}
             Engage::LetGo => {
                 // Stop on the pad's word rather than the deadman, and close the beak; then the

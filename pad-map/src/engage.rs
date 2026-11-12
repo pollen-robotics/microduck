@@ -1,4 +1,5 @@
-//! Whether the pad is driving, when the duck has a brain of its own (`[autonomous] enabled`).
+//! Whether the pad is driving, while the duck on its own is switched on (`robot.mode`'s
+//! `autonomous`, which `robotd` starts from `[autonomous] enabled` and an NFC tag can change).
 //!
 //! Nothing in `robotd` arbitrates between drivers, so the handoff is the pad daemon keeping quiet.
 //! A pad that is merely connected sends nothing: its heartbeat would hold `move.source` at the
@@ -49,13 +50,15 @@ pub fn touched(frame: &PadFrame, deadzone: f64) -> bool {
 }
 
 impl Engagement {
+    /// `on` is whether the duck on its own is switched on; `autonomy` gives the idle time.
     pub fn tick(
         &mut self,
         touched: bool,
         now: Instant,
+        on: bool,
         autonomy: &robotd_params::AutonomousParams,
     ) -> Engage {
-        if !autonomy.enabled {
+        if !on {
             self.engaged = true;
             return Engage::Drive;
         }
@@ -115,9 +118,14 @@ mod tests {
     fn without_autonomy_the_pad_always_drives() {
         let mut e = Engagement::default();
         let t0 = Instant::now();
-        assert_eq!(e.tick(false, t0, &autonomy(false)), Engage::Drive);
+        assert_eq!(e.tick(false, t0, false, &autonomy(false)), Engage::Drive);
         assert_eq!(
-            e.tick(false, t0 + Duration::from_secs(3600), &autonomy(false)),
+            e.tick(
+                false,
+                t0 + Duration::from_secs(3600),
+                false,
+                &autonomy(false)
+            ),
             Engage::Drive
         );
     }
@@ -131,19 +139,23 @@ mod tests {
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         assert_eq!(
-            e.tick(false, t0, &on),
+            e.tick(false, t0, true, &on),
             Engage::Silent,
             "connected, untouched"
         );
-        assert_eq!(e.tick(true, at(1), &on), Engage::Drive);
+        assert_eq!(e.tick(true, at(1), true, &on), Engage::Drive);
         assert_eq!(
-            e.tick(false, at(20), &on),
+            e.tick(false, at(20), true, &on),
             Engage::Drive,
             "inside the idle time"
         );
-        assert_eq!(e.tick(false, at(31), &on), Engage::LetGo, "exactly once");
-        assert_eq!(e.tick(false, at(32), &on), Engage::Silent);
-        assert_eq!(e.tick(true, at(40), &on), Engage::Drive);
+        assert_eq!(
+            e.tick(false, at(31), true, &on),
+            Engage::LetGo,
+            "exactly once"
+        );
+        assert_eq!(e.tick(false, at(32), true, &on), Engage::Silent);
+        assert_eq!(e.tick(true, at(40), true, &on), Engage::Drive);
     }
 
     /// A pad that drops and comes back must not resume driving on the strength of a touch made
@@ -153,11 +165,11 @@ mod tests {
         let on = autonomy(true);
         let mut e = Engagement::default();
         let t0 = Instant::now();
-        assert_eq!(e.tick(true, t0, &on), Engage::Drive);
+        assert_eq!(e.tick(true, t0, true, &on), Engage::Drive);
         e.reset();
         assert!(!e.engaged());
         assert_eq!(
-            e.tick(false, t0 + Duration::from_secs(1), &on),
+            e.tick(false, t0 + Duration::from_secs(1), true, &on),
             Engage::Silent
         );
     }

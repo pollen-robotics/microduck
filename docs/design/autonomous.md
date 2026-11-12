@@ -1,10 +1,10 @@
 # `autod` — the autonomous brain
 
-Status: draft · Date: 2026-10-01 · Owner: antoine
+Status: draft · Date: 2026-11-12 · Owner: antoine
 
-The runtime's `autonomous.rs`, ported as a daemon of its own. It owns three things: what the duck
-does when nobody is driving it, how it gets out of the way of a pad that is, and how it avoids
-walking into things with the head ToF. [`ideas/autonomous_behavior.md`](../ideas/autonomous_behavior.md)
+The runtime's `autonomous.rs`, ported as a daemon of its own. It owns four things: what the duck
+does when nobody is driving it, when it chases a laser dot or plays with the ball, how it gets out
+of the way of a pad that is driving, and how it avoids walking into things with the head ToF. [`ideas/autonomous_behavior.md`](../ideas/autonomous_behavior.md)
 stays the holding pen for what comes after the port (the social and musical behaviours); this
 page is what exists.
 
@@ -19,32 +19,56 @@ does not have, and it is safe to kill: the deadman stops the robot within `[safe
                               ▼
   robotd ── robot.state ──▶ autod ──▶ robot.move · robot.head · robot.mouth · robot.sound
      ▲          (50 Hz)       │        robot.do (ground_pick, sit_toggle) · robot.enable
+     │                        │        robot.laserTrack · robot.soccer
      └────────────────────────┘
 ```
 
-**It is off by default and runs only when switched on.** `[autonomous] enabled = true` in
-`robotd.toml` (`robotctl configure`, "features"). The unit ships and is enabled like every other
-daemon, because no unit in this repository is started or stopped by a setting
-([`tof-on-demand.md`](../project/tof-on-demand.md) §"Why not start and stop the unit"). Switched
-off, `autod` parks: it connects nothing and sends nothing. `configure` restarts it when the key
-changes.
+**It is off by default and runs only when switched on.** The switch is `robotd`'s:
+`robot.autonomous {active}` sets it, and `robot.state.autonomous` and `robot.mode`'s `autonomous`
+read it back (v59). It starts every boot from `[autonomous] enabled` in `robotd.toml`
+(`robotctl configure`, "features"), and three things change it until the next boot:
+
+- `robotctl autonomous on|off`;
+- an NFC `autonomous_mode` tag, which switches it on, after the laser and soccer off and the robot
+  into walk. Every other mode tag switches it off (`nfc/src/modes.rs`);
+- nothing else. In particular a pad does not: touching one only takes over for a while (§3).
+
+The switch lives in `robotd` rather than in the file because nothing that reads an NFC tag may
+write `robotd.toml`, and because a switch made with a tag is a decision for now, not for every
+boot. The unit ships and is enabled like every other daemon, because no unit in this repository is
+started or stopped by a setting ([`tof-on-demand.md`](../project/tof-on-demand.md) §"Why not start
+and stop the unit"). Switched off, `autod` stays connected and sends nothing.
+
+Switching it off from on stops the robot where it stands (one zero twist, beak closed, body pose
+released) and switches laser tracking off, and autonomous soccer if the brain had started it. The
+robot is left standing: switching the duck off is not a reason to sit it down.
+
+**The map comes with it.** `mapd` maps whenever `[map] enabled` is set, and otherwise from the first
+time it sees the duck on its own switched on, until it restarts
+([`mapping-design.md`](mapping-design.md) owns the map). The brain does not read the map yet: Wander
+still walks to goals in the odometry frame (§4).
 
 The brain itself (`autod/src/brain.rs`) is pure: it reads a snapshot of the world each tick and
 returns targets and one-shot events. It never touches a socket, which is what lets the ten-minute
 soak test run it in a loop without a robot.
 
-## 2. Boot without a pad
+## 2. Standing up without a pad
 
-A robot boots limp with its policy off, and until now only the pad's Start brought it up. With
-`autod` enabled, `autod` does it: `robot.init`, wait until homed, then `robot.enable {on: true}`.
-A robot booted sitting rises through `sitstand`, the same way Start does it.
+A robot boots limp with its policy off, and until now only the pad's Start brought it up. With the
+duck on its own switched on, `autod` does it: `robot.enable {on: true}`, then waits until the
+policy drives. A robot booted sitting rises through `sitstand`, the same way Start does it.
 
-**It does this once per boot.** Once the robot is up, `autod` writes the kernel's `boot_id` to
-`/var/lib/autod/started`, its `StateDirectory`, and checks it against the running boot on every
-start. (It is not under `/run/autod`: that directory goes away with the unit, so that a stopped
-daemon leaves no identity behind.) When `autod` restarts later (it crashed, `robotd` restarted under an update, `configure` restarted it), it
-does not bring the robot back up on its own. Someone stopped it, and standing it up behind their
-back is the bug this rule exists to prevent. To bring it back up, press Start, or reboot.
+**It does this when the switch goes on, and once per boot for the switch at boot.** Switching it
+on — a tag, `robotctl autonomous on` — is somebody asking for it now, so the robot stands up. The
+switch already on when `autod` starts is different: that is either the boot, or `autod` restarting
+later in a boot (it crashed, an update restarted it). So the first time `autod` sees the switch
+on, it stands the robot up only if it has not already done so on this boot. Once the robot is up,
+it writes the kernel's `boot_id` to `/var/lib/autod/started`, its `StateDirectory`, and checks it
+against the running boot. (It is not under `/run/autod`: that directory goes away with the unit,
+so that a stopped daemon leaves no identity behind.) A restarted `autod` therefore does not bring
+the robot back up on its own. Someone stopped it, and standing it up behind their back is the bug
+this rule exists to prevent. To bring it back up, press Start, switch the duck off and on, or
+reboot.
 
 In the same spirit, `autod` **never re-enables a policy somebody else disabled.** It drives only
 while the policy is driving (the `policy` label is `walk` or `stand`). In any other state it holds
@@ -59,18 +83,27 @@ its clock and sends nothing:
 There is no arbitration inside `robotd`: every intent slot is last-writer-wins. So the handoff is
 two cooperating clients and one fact `robotd` reports.
 
-- **`padd` is silent until the pad is touched** while `[autonomous] enabled`. A button press, or a
-  stick or trigger past the deadzone, *engages* it. From then on it drives exactly as it always
-  has, heartbeat included. After `[autonomous] pad_idle_s` (default 30 s) with no touch, it sends
-  one zero twist and goes silent again. With autonomy off, `padd` is unchanged.
+- **`padd` is silent until the pad is touched** while the duck on its own is on, which it learns
+  from `robot.mode`, polled once a second (so a tag switching it is heard within a second). A
+  button press, or a stick or trigger past the deadzone, *engages* it. From then on it drives
+  exactly as it always has, heartbeat included. After `[autonomous] pad_idle_s` (default 30 s) with
+  no touch, it sends one zero twist and goes silent again. A pad that disconnects while it is not
+  engaged does not sit the robot down: it was not the one driving. With autonomy off, `padd` is
+  unchanged. `pad_map::engage` is the rule. `netpadd` does not take part: a UDP pad is a program
+  somebody is running on purpose, and it drives as it always has.
 - **`robotd` says whose twist it is.** Clients name themselves in `hello {client}`, and
   `robot.state.move.source` carries the name of the client whose `robot.move` filled the twist
   slot (v59).
 - **`autod` yields while the pad is driving:** `move.source == "padd"` and the twist is not stale
   (`limited_by` has no `deadman`). While it yields it sends nothing at all, so the pad also gets
   the head, mouth and sounds to itself. Its brain is reset on resume, but its memories (energy,
-  the novelty grid) are kept. It takes back over 1 s after the pad's twist goes stale. A pad that
-  disables the policy (Start) leaves it disabled, per §2.
+  the novelty grid, how bored it is of the ball) are kept. It takes back over 1 s after the pad's
+  twist goes stale. A pad that disables the policy (Start) leaves it disabled, per §2. A ball
+  game the brain had started is switched off when the pad takes over: it would otherwise take
+  the legs back the moment the stick is centred.
+- **A ball game somebody else started is theirs.** Autonomous soccer switched on by anyone but
+  `autod` (the pad's D-pad down in soccer mode) makes `autod` stand aside exactly as for the pad,
+  until it is switched off.
 
 A pad that is merely connected therefore costs `autod` nothing, and touching it is all it takes
 to drive.
@@ -94,6 +127,8 @@ states come over:
 | GroundPick | `robot.do ground_pick`, then a happy quack |
 | Nap | `sit_toggle`: either a doze (head droops, snaps up, dream twitches) or a seated relax |
 | Petted | melt, excited wiggle, or sleepy melt that can fall asleep into a nap |
+| Laser | chasing a dot: `robotd` drives (below), the duck quacks and tires |
+| BallPlay | playing with the ball: autonomous soccer on, `robotd` drives (below) |
 
 Across all states:
 
@@ -107,9 +142,37 @@ Across all states:
   stirs a dozing duck without waking it. The duck's own sounds never count: anything heard within
   1.5 s of the brain asking for a sound, or while the wheee plays, is dropped.
 
+**The laser and the ball are `robotd`'s to drive, and the brain's to want.** Following a dot and
+playing soccer already exist in `robotd` (`laser.rs`, `soccer.rs`), each taking the legs and the
+head only while no client asks for them. So the brain's part is the switches (`robot.laserTrack`,
+`robot.soccer`, held as levels by `main.rs` and asked again at most every 3 s when refused) and
+standing aside while one drives: it then sends a zero twist and a centred head, which `robotd`
+reads as nobody asking, rather than going silent and leaving its last command winning until it
+goes stale. `robotd` runs one of the two at a time, and switching soccer on switches the laser off.
+
+- **The laser is on whenever the duck could chase**: not tired, not napping, not being petted (a
+  dot would walk it out from under the hand), not playing ball. A dot being followed interrupts
+  any standing or walking state with an excited quack. The chase ends 2 s after the dot goes, into
+  a look around for it. Chasing burns energy at twice a walk's rate (one unit per 50 s). Below 0.2
+  the duck has had enough: the laser goes off and it naps (or chills, with no sit/stand policy).
+  It comes back on only above 0.45, which a nap gets to.
+- **The ball is something the duck goes looking for**, picked from the standing pool like any other
+  state when its energy is above 0.35 and no cooldown is running, with a weight that falls with
+  energy and with boredom. It switches autonomous soccer on and stands aside.
+  - **No ball in 20 s** is no ball around: it gives up, and does not look again for 3 minutes,
+    doubling with every miss in a row up to 30. A room with no ball stops costing a spin.
+  - **A game** ends on a kick goal of 3 to 8, after a play time of 1 to 3 minutes that shrinks with
+    boredom, when the ball has not been seen for 15 s, or below 0.2 energy. Then a ruffle, and no
+    new game for 4 to 8 minutes, longer the more bored it is. Playing costs one unit of energy per
+    70 s.
+  - **Boredom**, 0 to 1, fills over 5 minutes of play (half as fast while only searching) and
+    wears off over 20 minutes of not playing.
+
+There is no obstacle avoidance while `robotd` drives the dot or the ball: the ToF gate is the
+brain's, and the brain is standing aside. Both are games somebody is watching.
+
 **Left behind on purpose:**
 
-- **BallPlay.** There is no ball detector in the daemon.
 - **Held.** Pickup detection was shelved as unreliable.
 - **Startle, and the curiosity glance built on the same per-bin change memory.** Neither worked
   well enough.
@@ -119,8 +182,8 @@ Across all states:
 takes body pose again, so `autod` sends it whenever a state poses, and once with `active: false`
 when the state ends.
 
-**Wander walks to goals, on odometry believed perfect.** There is no SLAM yet, and a goal a few
-metres away is reached before drift matters. The runtime's version, holding a random heading for a
+**Wander walks to goals, on odometry believed perfect.** The brain does not read the map yet
+(§6), and a goal a few metres away is reached before drift matters. The runtime's version, holding a random heading for a
 few seconds at a time, stayed within half a metre of its start on a robot.
 
 - **Picking a goal.** Each bout tries 16 directions at 1, 2 and 3 m. It takes the point whose
@@ -191,8 +254,11 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
 
 ## 6. What is not here yet
 
+- **Using the map.** `mapd` runs with the duck (§1), so the novelty grid and Wander's goals could
+  live in the map's frame instead of odometry's, and survive a reboot with it. Not done: the brain
+  still believes odometry, which is right for a bout but not for a day.
 - **Persisting memories across boots.** The novelty grid lives in an odometry frame that resets
-  at boot, so it would mean nothing tomorrow.
+  at boot, so it would mean nothing tomorrow — the map is the way to fix that.
 - **The social and musical ideas.** See the holding pen; they land as inputs and states of this
   brain, not as modes beside it.
 - **A real arbitration layer in `robotd`.** That would let the app or a remote peer preempt as

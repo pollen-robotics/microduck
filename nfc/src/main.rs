@@ -8,8 +8,7 @@
 //! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
 //! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
-//! asks `robotd` to switch to it; which names there are, and which do nothing yet, is
-//! [`nfc::modes`].
+//! asks `robotd` to switch to it; which names there are is [`nfc::modes`].
 //!
 //! ## Writing a tag
 //!
@@ -637,7 +636,6 @@ fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
         modes::Outcome::Refused(mode, why) => {
             tracing::warn!(tag, mode, %why, "the robot refused the mode")
         }
-        modes::Outcome::NotYet => tracing::warn!(tag, "this mode does nothing yet"),
         modes::Outcome::Failed(why) => tracing::error!(tag, %why, "could not ask the robot"),
     }
 }
@@ -712,6 +710,15 @@ impl Driver for Sockets {
             autonomous: false,
         };
         call(&self.robot, &proto::Call::RobotSoccer(params), QUICK_ANSWER)
+    }
+
+    fn autonomous(&mut self, active: bool) -> Result<proto::IntentResult, String> {
+        let params = proto::AutonomyParams { active };
+        call(
+            &self.robot,
+            &proto::Call::RobotAutonomous(params),
+            QUICK_ANSWER,
+        )
     }
 }
 

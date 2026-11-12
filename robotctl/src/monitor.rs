@@ -5145,6 +5145,7 @@ mod tests {
             theremin: None,
             laser: None,
             soccer: None,
+            autonomous: false,
             chorale: None,
             t_ns: 0,
             imu: None,

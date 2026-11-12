@@ -28,8 +28,9 @@ const MAX_RES_M: f64 = 0.5;
 #[derive(Clone)]
 pub struct Ctx {
     pub shared: Arc<Mutex<Shared>>,
-    /// `None` when mapping is off: there is no worker to ask.
-    pub worker: Option<SyncSender<Input>>,
+    /// `None` while mapping is off: there is no worker to ask. Filled late when the duck on its
+    /// own switches on, which starts mapping (`main.rs`).
+    pub worker: Arc<Mutex<Option<SyncSender<Input>>>>,
 }
 
 impl Ctx {
@@ -42,7 +43,8 @@ impl Ctx {
         &self,
         make: impl FnOnce(SyncSender<T>) -> Input + Send + 'static,
     ) -> Result<T, String> {
-        let Some(tx) = self.worker.clone() else {
+        let worker = self.worker.lock().ok().and_then(|w| w.clone());
+        let Some(tx) = worker else {
             return Err("mapping is off ([map] enabled = false in robotd.toml)".to_owned());
         };
         tokio::task::spawn_blocking(move || {
@@ -207,7 +209,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let ctx = Ctx {
             shared,
-            worker: Some(tx.clone()),
+            worker: Arc::new(Mutex::new(Some(tx.clone()))),
         };
         tokio::spawn(async move {
             loop {

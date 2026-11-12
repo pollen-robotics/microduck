@@ -304,6 +304,18 @@ enum Namespace {
         state: Option<String>,
     },
 
+    /// The duck on its own (`autod`): it wanders, naps, chases a laser dot and plays with the
+    /// ball, and a touched pad takes over.
+    ///
+    /// Until the next boot, which starts from `[autonomous] enabled` again. What an NFC
+    /// `autonomous_mode` tag does. With no argument, says whether it is on.
+    /// `journalctl -u autod -f` is what it is thinking.
+    Autonomous {
+        /// `on` or `off`. Absent: just say.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
     ///
     /// Every key the daemon knows, feature switches first, current value against default, one
@@ -1034,6 +1046,33 @@ fn laser_line(laser: &proto::LaserTrackState) -> String {
         _ => String::new(),
     };
     format!("{dot}  {target:<24} {doing}")
+}
+
+/// `robotctl autonomous` — switch the duck on its own, or say whether it is on.
+fn run_autonomous(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let params = proto::AutonomyParams {
+            active: state == "on",
+        };
+        let outcome: proto::IntentResult = decode(&result_of(
+            client.call(&proto::Call::RobotAutonomous(params))?,
+        )?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+    }
+    let mode: proto::ModeResult = decode(&result_of(client.call(&proto::Call::RobotMode)?)?)?;
+    if mode.autonomous {
+        println!(
+            "the duck is on its own — touch the pad to take over; `journalctl -u autod -f` says what it is doing"
+        );
+    } else {
+        println!("the duck on its own is off");
+    }
+    Ok(())
 }
 
 /// `robotctl soccer` — switch soccer mode, and watch what autonomous play makes of the ball.
@@ -5831,6 +5870,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Soccer { state } => {
             return run_soccer(&cli.robot_socket, state.as_deref());
+        }
+        Namespace::Autonomous { state } => {
+            return run_autonomous(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);

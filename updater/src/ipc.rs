@@ -885,6 +885,7 @@ impl Server {
             | Call::RobotTheremin(_)
             | Call::RobotLaserTrack(_)
             | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)

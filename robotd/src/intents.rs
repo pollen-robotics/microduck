@@ -179,6 +179,9 @@ pub struct Intents {
     /// edges like the laser's: nothing in the config file starts soccer, so there is no boot
     /// state for a level to override, and `robot.mode` reads them back to the pad daemons.
     soccer: AtomicU8,
+    /// The duck on its own (`robot.autonomous`): a level `autod` obeys. Set at boot from
+    /// `[autonomous] enabled`, so the file is only where it starts.
+    autonomous: AtomicBool,
     /// The same, for the chorale.
     chorale: AtomicU8,
     /// The piece pinned by the pending chorale request, 0 for none. Written before the
@@ -313,6 +316,7 @@ impl Intents {
             theremin: AtomicU8::new(THEREMIN_NONE),
             laser: AtomicU8::new(THEREMIN_NONE),
             soccer: AtomicU8::new(0),
+            autonomous: AtomicBool::new(false),
             chorale: AtomicU8::new(THEREMIN_NONE),
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
@@ -680,6 +684,16 @@ impl Intents {
             active: bits & SOCCER_ACTIVE != 0,
             autonomous: bits & SOCCER_AUTONOMOUS != 0,
         }
+    }
+
+    /// Switch the duck on its own on or off — `docs/design/autonomous.md`.
+    pub fn set_autonomous(&self, on: bool) {
+        self.autonomous.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the duck on its own is switched on.
+    pub fn autonomous(&self) -> bool {
+        self.autonomous.load(Ordering::Relaxed)
     }
 
     pub fn take_power_request(&self) -> Option<PowerRequest> {

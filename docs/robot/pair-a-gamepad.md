@@ -100,13 +100,16 @@ A tag lifted half way through reads as no NDEF; write it again.
 
 It is `nfc.write` on `nfcd`'s socket, `/run/nfcd/nfc.sock`, so a robot whose `nfcd` predates it has
 nothing listening there: update the daemon.
+
 The same reader also takes **mode tags**, written the same way with one of `walk_mode`,
 `roller_skating_mode`, `soccer_mode`, `laser_mode` or `autonomous_mode`. `walk_mode` and
-`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking and
-soccer off; `laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track
+`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking, soccer
+and the duck on its own off; `laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track
 on`); `soccer_mode` puts it in walk and switches soccer mode on (`robotctl soccer on` — the
-cheat sheet's [Play soccer](cheatsheet.md#play-soccer)). `autonomous_mode` is read and quacked at,
-and does nothing yet. The table, and where a new mode's behaviour goes, are in `nfc/src/modes.rs`.
+cheat sheet's [Play soccer](cheatsheet.md#play-soccer)); `autonomous_mode` puts it in walk and
+switches the duck on its own on (`robotctl autonomous on` — the cheat sheet's
+[The duck on its own](cheatsheet.md#the-duck-on-its-own-autod)). The table, and where a new mode's
+behaviour goes, are in `nfc/src/modes.rs`.
 
 ## Check it
 

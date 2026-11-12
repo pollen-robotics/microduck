@@ -307,6 +307,8 @@ fn permits(call: &proto::Call) -> bool {
         RobotLaserTrack(_) => false,
         // The same, for a ball: autonomous soccer walks the robot. An NFC tag is local, not the radio.
         RobotSoccer(_) => false,
+        // The same again: the duck on its own walks the robot. An NFC tag switches it locally.
+        RobotAutonomous(_) => false,
         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
         RobotFlashlight(_) => false,
 

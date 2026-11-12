@@ -4,8 +4,8 @@
 # mostly a change needs a restart — of the daemon that reads the section, which is not
 # always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
 # exceptions: padd re-reads [pad], [pad_imu_head_control] and [pad_drive] a second after the
-# file changes, and robotd re-reads [policy] when asked. [autonomous] is autod's, which restarts for it, and padd's, which
-# re-reads it like [pad]. `robotctl configure` knows which is
+# file changes, and robotd re-reads [policy] when asked. [autonomous] enabled is where robotd's
+# switch starts at boot (`robotctl autonomous` changes it now), and padd re-reads pad_idle_s. `robotctl configure` knows which is
 # which and offers it (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
@@ -646,7 +646,8 @@ mode = "walk"
 # does not know where it is until a stop or two recognise somewhere it has been.
 #
 # **Off by default** until its cost on the board has been measured: mapd parses the robot state
-# stream at state_hz while it runs. Turn it on, then `sudo systemctl restart mapd`.
+# stream at state_hz while it runs. Turn it on, then `sudo systemctl restart mapd`. The duck on its
+# own ([autonomous]) maps whatever this says.
 # enabled = false
 # path = "/var/lib/mapd/map.json"
 # Seconds between saves while the map changes, and so what a power cut can lose. Also saved when
@@ -893,11 +894,13 @@ mode = "walk"
 # timeout_ms = 1000    # silence that counts as the client gone; at least stale_ms
 # ── The duck on its own ──────────────────────────────────────────────────────────────────────
 #
-# Read by `autod`, and by `padd` (docs/design/autonomous.md). With `enabled` on, the robot stands
-# itself up at boot with no pad connected, then wanders, looks around, grooms, naps and answers
-# when spoken to, avoiding obstacles with the head's depth sensor. A pad stays silent until it is
-# touched; touching it takes over, and `pad_idle_s` untouched seconds later the duck takes back
-# over. Off by default: a duck that walks off by itself is something somebody chooses.
+# docs/design/autonomous.md. With `enabled` on, the robot stands itself up at boot with no pad
+# connected, then wanders, looks around, grooms, naps, chases a laser dot, plays with the ball and
+# answers when spoken to, avoiding obstacles with the head's depth sensor, and maps as it goes. A
+# pad stays silent until it is touched; touching it takes over, and `pad_idle_s` untouched seconds
+# later the duck takes back over. Off by default: a duck that walks off by itself is something
+# somebody chooses. `enabled` is only how each boot starts: `robotctl autonomous on|off`, or an
+# `autonomous_mode` NFC tag, switches it until the next one.
 # [autonomous]
 # enabled = false
 

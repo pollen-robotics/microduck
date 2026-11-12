@@ -69,6 +69,8 @@ fn permits(call: &proto::Call) -> bool {
         RobotLaserTrack(_) => true,
         // And somebody watching the camera is who would roll a ball for it.
         RobotSoccer(_) => true,
+        // The duck on its own walks the robot like the ball does, and from the same person.
+        RobotAutonomous(_) => true,
         // Somebody watching through the camera is who wants the room lit.
         RobotFlashlight(_) => true,
 

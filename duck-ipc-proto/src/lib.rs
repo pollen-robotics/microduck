@@ -575,7 +575,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///
 /// # v59 — the autonomous brain: who is driving, what the duck hears, a head that moves fast
 ///
-/// Four additions, all for `autod` (`docs/design/autonomous.md`), all optional on the wire:
+/// Five additions, all for `autod` (`docs/design/autonomous.md`), all optional on the wire:
 ///
 /// - [`HelloParams::client`]: a client may name itself. `robotd` remembers the name for that
 ///   connection.
@@ -585,6 +585,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///   These never left `robotd` before.
 /// - [`HeadParams::alpha`]: a per-intent head smoothing rate, for motion faster than
 ///   `[control] head_alpha` lets through.
+/// - [`method::ROBOT_AUTONOMOUS`]: the switch the brain obeys, held by `robotd` and read back in
+///   [`ModeResult::autonomous`] and [`RobotState::autonomous`]. `[autonomous] enabled` is only
+///   its value at boot, so an NFC tag can switch the duck on without writing the config. A v58
+///   `robotd` answers it METHOD_NOT_FOUND, by name.
 ///
 /// Install consequences, both directions:
 ///
@@ -943,6 +947,14 @@ pub mod method {
     /// foot, then looks for it again — sharing the robot the way laser tracking does: a deflected
     /// client stick wins. Switching soccer on switches laser tracking off, and the other way round.
     pub const ROBOT_SOCCER: &str = "robot.soccer";
+    /// The duck on its own (`autod`), on or off. Discrete; send as a request, idempotent; the
+    /// answer is [`super::IntentResult`]. Params are [`super::AutonomyParams`].
+    ///
+    /// A switch `robotd` holds and `autod` obeys, read back in [`ROBOT_MODE`]'s answer and in
+    /// [`ROBOT_STATE`]'s `autonomous`. It starts at boot from `[autonomous] enabled`; this changes
+    /// it until the next boot. An NFC `autonomous_mode` tag sends it, and every other mode tag
+    /// switches it off. `docs/design/autonomous.md` owns what the duck then does.
+    pub const ROBOT_AUTONOMOUS: &str = "robot.autonomous";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1361,6 +1373,8 @@ pub enum Call {
     RobotLaserTrack(LaserTrackParams),
     /// Soccer mode and autonomous soccer. Discrete; the answer is [`IntentResult`].
     RobotSoccer(SoccerParams),
+    /// The duck on its own, on or off. Discrete; the answer is [`IntentResult`].
+    RobotAutonomous(AutonomyParams),
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
@@ -1578,6 +1592,7 @@ impl Call {
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::NfcWrite(_) => method::NFC_WRITE,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
+            Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1809,6 +1824,7 @@ impl Call {
             | Call::RobotTheremin(_)
             | Call::RobotLaserTrack(_)
             | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
@@ -1947,6 +1963,7 @@ impl Call {
             Call::RobotLaserTrack(p) => encode(p),
             Call::NfcWrite(p) => encode(p),
             Call::RobotSoccer(p) => encode(p),
+            Call::RobotAutonomous(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -2049,6 +2066,7 @@ impl Call {
             method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
             method::NFC_WRITE => Call::NfcWrite(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
+            method::ROBOT_AUTONOMOUS => Call::RobotAutonomous(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -2249,6 +2267,7 @@ pub mod test_support {
                 color: FlashlightColor::Cyan,
             }),
             Call::RobotShutdown,
+            Call::RobotAutonomous(AutonomyParams { active: true }),
             Call::RobotMode,
             Call::RobotPolicies,
             Call::RobotModel,
@@ -3079,6 +3098,13 @@ pub struct SoccerParams {
     pub autonomous: bool,
 }
 
+/// See [`method::ROBOT_AUTONOMOUS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomyParams {
+    pub active: bool,
+}
+
 /// What soccer mode is doing, in [`RobotState`]. Absent while soccer mode is off.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -3295,9 +3321,13 @@ pub struct ModeResult {
     pub mode: String,
     /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
     /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
-    /// the pad's buttons do. (v55)
+    /// the pad's buttons do. (v57)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerParams>,
+    /// The duck on its own is switched on ([`method::ROBOT_AUTONOMOUS`]): a pad daemon then keeps
+    /// quiet until its pad is touched. Absent while off. (v59)
+    #[serde(default, skip_serializing_if = "not")]
+    pub autonomous: bool,
 }
 
 /// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
@@ -4915,9 +4945,13 @@ pub struct RobotState {
     /// [`LaserTrackState`]. (v52)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laser: Option<LaserTrackState>,
-    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v55)
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v57)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerState>,
+    /// The duck on its own is switched on ([`method::ROBOT_AUTONOMOUS`]) — what `autod` obeys.
+    /// Absent while off. (v59)
+    #[serde(default, skip_serializing_if = "not")]
+    pub autonomous: bool,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6985,7 +7019,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            82,
+            83,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -7607,6 +7641,7 @@ mod tests {
         let off = serde_json::to_string(&ModeResult {
             mode: "walk".into(),
             soccer: None,
+            autonomous: false,
         })
         .unwrap();
         assert_eq!(off, r#"{"mode":"walk"}"#);
@@ -7841,6 +7876,7 @@ mod tests {
             theremin: None,
             laser: None,
             soccer: None,
+            autonomous: false,
             chorale: None,
             t_ns: 0,
             imu: None,

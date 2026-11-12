@@ -219,7 +219,7 @@ Three properties worth trusting:
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
 for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s on a zero3 and `robotd`'s on a beta), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]`,
-`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `[autonomous]` restarts `autod`. `sudo`, because the file
+`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `[autonomous] enabled` is read at the next boot. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -1121,16 +1121,22 @@ them says so in the journal when it tries.
 
 ### The duck on its own (`autod`)
 
-Off by default. Switch it on in **features** → `autonomous.enabled`:
+Off by default. Switch it on now — or touch an `autonomous_mode` NFC tag to the head:
 
 ```bash
-sudo robotctl configure        # features → autonomous.enabled, save, restart autod
+robotctl autonomous on         # until the next boot; `off` stops it, no argument says
+sudo robotctl configure        # features → autonomous.enabled: on at every boot
 ```
 
-From then on the robot stands itself up at boot with no pad, and wanders, looks around, grooms,
-naps, answers when spoken to, and turns away from what the head ToF sees ahead. It stands up
-**once per boot**. If you stop it (Start, Select), it stays stopped until you press Start again or
-reboot, even if `autod` restarts.
+The robot stands itself up with no pad, and wanders, looks around, grooms, naps, answers when
+spoken to, and turns away from what the head ToF sees ahead. It chases a laser dot whenever one
+shows up, until it is tired and naps. Now and then it goes looking for the purple ball and plays
+with it for a while, until it has had enough; if there is no ball around, it stops looking for a
+while. It maps the room as it goes (`robotctl map`).
+
+At boot it stands up **once**: if you stop it (Start, Select), it stays stopped until you press
+Start again, switch it off and on, or reboot, even if `autod` restarts. Any other mode tag (walk,
+roller, laser, soccer) switches it off, and it then stands still where it is.
 
 A connected pad stays silent until you touch it. Touching it takes over at once, and
 `autonomous.pad_idle_s` (30 s) after your last touch the duck takes back over. What it thinks it is

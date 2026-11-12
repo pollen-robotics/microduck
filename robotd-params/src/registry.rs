@@ -1423,7 +1423,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "autonomous.enabled",
         Kind::Bool,
-        "The duck on its own: stands up at boot with no pad, wanders, naps; touching the pad takes over",
+        "The duck on its own at boot: stands up with no pad, wanders, plays; touching the pad takes over — `robotctl autonomous on` switches it now",
     ),
     entry(
         "autonomous.pad_idle_s",

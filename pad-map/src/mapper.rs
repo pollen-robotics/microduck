@@ -122,7 +122,8 @@ pub struct Config {
     pub body: robotd_params::PadBodyParams,
     /// `[pad_roller]`: full deflection on wheels, in place of `drive`.
     pub roller_limits: robotd_params::PadRollerParams,
-    /// `[autonomous]`: whether the pad keeps quiet until touched — see [`crate::engage`].
+    /// `[autonomous]`: how long an untouched pad drives before it lets go — see [`crate::engage`].
+    /// Whether it keeps quiet at all is `robot.mode`'s `autonomous`, not this file's `enabled`.
     pub autonomy: robotd_params::AutonomousParams,
     pub roller: bool,
 }
