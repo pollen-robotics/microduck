@@ -1,5 +1,13 @@
 # The App Path — `btd` and `configd`
 
+> **Security update (production candidate):** `btd` now requires an encrypted
+> paired link by default. `--insecure-no-pairing` remains an explicit bench-only
+> override. The historical macOS CoreBluetooth hang described in §5.5 is not
+> resolved by this policy change. A later Android trace showed BlueZ rejecting
+> an unexpected numeric confirmation; `btd` now has a candidate headless agent
+> fix, which still needs end-to-end Android and iPhone validation. A factory `000000` PIN provides no
+> meaningful per-device authorization and must be replaced in provisioning.
+
 Status: draft · Date: 2026-08-04 · Owner: pierre
 
 How a phone configures a robot: wifi, name, reboot, version, and triggering an update.
@@ -543,10 +551,18 @@ So a fixed, printed-on-the-robot PIN is not expressible in BLE passkey entry. Th
 
 ### 5.2 How it works
 
-Pairing is just-works: every agent handler is `None`, which `bluer` publishes as `NoInputNoOutput`.
+Pairing is just-works: the agent declares `NoInputNoOutput`. Its confirmation callback accepts
+BlueZ's request without comparing the number, so it does not add MITM authentication.
 The read on the RPC characteristic requires `encrypt_read`, which is what makes a central bond at
 all — plain encryption, not `encrypt_authenticated_*`, because a just-works bond can never satisfy
 the authenticated variants and demanding them would refuse every client.
+
+The bond is therefore encryption, never identity, and BlueZ is set to let a phone replace it:
+`JustWorksRepairing = always` in `/etc/bluetooth/main.conf`. Without it, a phone whose owner
+forgot the robot in Bluetooth settings starts a fresh just-works pairing, BlueZ's default `never`
+refuses to replace the bond it still holds, and the link fails with `PIN or Key Missing (0x06)`
+until that bond is removed on the robot. `scripts/setup-board.sh` sets it on provisioned boards and
+the `microduck_yocto` image's `bluez5` append sets it there.
 
 Then `btd` serves nothing until the client sends `system.authenticate`. That call is answered by the
 transport rather than forwarded, which is why the routing table has a third outcome (`Route::Local`)
@@ -587,7 +603,107 @@ visible consent moment, a recovery path for a lost PIN, and defence in depth if 
 photographed — none needed for v1, each additive later, since an enclosure with a button can gate
 `set_pairable` without changing this design.
 
+### 5.4 Production credential proposal · **open decision**
+
+The six-digit PIN and the no-window decision above describe the development implementation, **not
+an approved production credential design**. A label-derived PIN is public to anyone who can read
+the label, and `000000` is public to everyone. Neither protects first pairing from an active radio
+attacker. The production proposal is a distinct, randomly generated secret of at least 128 bits per
+robot, delivered as a QR code and used in a reviewed mutual-authentication protocol that never
+sends the secret itself over the just-works BLE link. The current `system.authenticate` six-digit
+field and `configd` store cannot hold this credential; both protocol and mobile app need changes.
+This authentication must finish **over BLE before `net.connect`**: the robot has no LAN address
+until that call succeeds. The handshake must derive a session key that protects the Wi-Fi
+passphrase and subsequent BLE RPCs against an active pairing-time intermediary, not merely return
+an `authenticated: true` boolean. The phone can register its own public key in this authenticated
+BLE session; once Wi-Fi joins, it uses that identity against the separate authenticated local
+camera/control gateway. Desktop clients can be enrolled later by an owner app over the local
+gateway, without requiring a desktop Bluetooth bootstrap path.
+
+The proposed post-flash storage, Recovery USB factory sequence, QR verification, recovery and
+hardware acceptance gates are owned by [factory provisioning](factory-provisioning.md).
+
+**Decision required before implementation:** confirm manufacturing can generate, program, print,
+verify, and recover a distinct secret for each unit; confirm the mobile app can scan and protect
+it; agree on the physical-attacker threat model. Until then, this is a proposal in a draft PR, not
+a shipping claim or a reason to merge the BLE service default.
+
+#### Proposed app authentication flow
+
+This is the contract to implement after the credential decision, not a description of the current
+wire protocol. It applies to iOS and Android; the gamepad is a separate Bluetooth HID peer and
+never receives the robot's QR secret.
+
+1. Manufacturing provisions the random 256-bit secret and public robot identifier through the
+   proposed [factory workflow](factory-provisioning.md), including printed-QR verification.
+   The app stores the secret in the platform's protected credential store,
+   never in analytics, logs, a backup export, or a URL. This requires an app storage migration:
+   `microduck-app/src-tauri/src/remembered.rs` currently serializes the six-digit PIN in clear
+   into `robots.json`. The new secret must never enter `Remembered`, JSON or webview state.
+2. The app discovers the advertised robot identifier and opens a BLE connection. Bluetooth pairing
+   may encrypt the radio link, but it is not treated as proof of robot identity. The candidate
+   exchange is `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, with the 32-byte QR secret as PSK. Both
+   sides use the exact versioned protocol label and robot identifier as the Noise prologue; Noise
+   binds both freshly generated ephemeral public keys in its handshake. The app sends the first
+   Noise message, the robot replies, and the app sends an encrypted key-confirmation message before
+   the robot opens its RPC gate. The app opens its gate only after decrypting the robot's encrypted
+   confirmation reply. No application payload is accepted before both confirmations. The secret
+   is never sent as a PIN or RPC parameter. This pattern and its library still require independent
+   security review and interoperable app/robot test vectors before shipping. The candidate follows
+   the Noise specification's PSK mode, which requires a 32-byte key and mixes fresh ephemeral
+   keys into the handshake; the Rust `snow` library documents this exact pattern. Its two Noise
+   handshake messages need the explicit encrypted confirmation exchange above so each side knows
+   the other holds the PSK before serving application requests.
+   References: [Noise specification §9](https://noiseprotocol.org/noise.html#pre-shared-symmetric-keys)
+   and [`snow` builder documentation](https://docs.rs/snow/latest/snow/struct.Builder.html).
+   `duck-auth` now contains the shared, host-tested exchange and protected message state
+   machine. `btd --secure-psk-file` serves it as an opt-in development mode; the matching app
+   branch is documented in [`authenticated-app-mvp.md`](../robot/authenticated-app-mvp.md).
+   Neither the installed service default nor production credential provisioning has changed.
+3. All privileged BLE RPCs, including `net.connect`, are encrypted and integrity-protected with
+   distinct send/receive keys, sequence numbers and a session identifier. Reject replay, missing
+   sequence numbers, unknown versions, failed key confirmation and plaintext privileged requests.
+   Close the session on any authentication failure. Reconnects establish fresh keys; a remembered
+   BlueZ bond alone never reopens the RPC gate. Public discovery/version data stays separate.
+4. In that session, the app creates a device-bound signing key and submits its public key for
+   enrollment. The robot records the first owner key only during a factory-authorized claim
+   window, with a deliberate local action or equivalent manufacturing control; possession of a
+   photographed QR alone must not silently claim an unowned robot. Later owner changes require
+   the current owner or a physical recovery procedure. The app then sends Wi-Fi credentials in
+   the protected `net.connect` request. After
+   joining the LAN, the robot's local camera/control gateway proves its identity to the app and
+   requires a fresh challenge signed by the enrolled key. Bind the gateway identity to the same
+   robot identifier and pin its credential at enrollment; LAN discovery alone is not trust.
+5. An owner can authorize another phone or desktop key over the authenticated local gateway.
+   Enrollment grants explicit permissions, is logged locally, and supports revocation. Controller
+   pairing is a separate permission: the owner authorizes a short pairing window, while the
+   controller itself continues using the Bluetooth HID path without an app secret.
+
+There is no silent fallback to the current six-digit `system.authenticate` when a production
+credential or secure session cannot be loaded. Development images may keep a visibly distinct
+legacy mode. Factory reset and ownership transfer must revoke enrolled app keys and old BLE bonds,
+then provide a physical, documented way to install a new credential; a software-only reset must
+not expose an unauthenticated enrollment window. The setup code lives in the ID EEPROM
+([factory provisioning](factory-provisioning.md)), so a full `.wic` reflash keeps it.
+
+Acceptance tests need to cover first setup with no Wi-Fi; Android and iOS pairing; an active BLE
+relay/substitution attempt; wrong QR; replayed handshake and RPC frames; interrupted `net.connect`;
+robot reboot; adapter address change; stolen or revoked phone; desktop enrollment; and loss of the
+`data` mount. An active relay that simply forwards a live authenticated session cannot be ruled
+out by a QR secret alone; commands still need local authorization, timeouts and movement safety
+limits. The production gate is a reviewed protocol implementation plus tests on the actual
+face-board-v1 image, not just a green host unit-test suite.
+
 ### 5.5 Encryption is currently off, and that is not settled  · **measured**
+
+The measurements below describe the original development setup. The production candidate now
+defaults to encrypted pairing. On 2026-11-08 a real Android phone failed pairing because BlueZ sent
+`RequestConfirmation` to `bluer`'s empty agent, which rejected it. The candidate agent in `btd`
+advertises the board's real `NoInputNoOutput` capability while accepting that callback. This is
+still **unauthenticated** pairing: the robot cannot compare the displayed number, and an active
+attacker at pairing time remains in scope. On 2026-11-08, the CI-built candidate did pair on an
+Android phone; the encrypted GATT read, pre-PIN refusal, and post-PIN `system.info` succeeded on a
+beta robot. iPhone, Wi-Fi provisioning, and the final production image remain untested.
 
 `encrypt_read` on the characteristic makes the read **hang** on macOS: CoreBluetooth issues the Read
 Request, BlueZ refuses it for insufficient encryption, and nothing resolves it — no prompt, no

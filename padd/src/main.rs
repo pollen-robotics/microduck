@@ -38,7 +38,7 @@
 //! D-pad right     head + move — left stick walks and turns, right stick looks around
 //! D-pad left      move — the sticks walk, strafe and turn
 //! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
-//! Home            flashlight on / off (a board with one)
+//! Home            tap: flashlight on / off (a board with one); held does nothing
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
 //! Select, 2 s     still held: sit, rest pose, then torque off and every servo rebooted
@@ -57,9 +57,10 @@
 //!
 //! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
 //! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
-//! heading — and B triggers the crouch that lives in the ground-pick slot. The other
-//! skills ride along on wheels, as the rebased roller line has them. Switching between walk and
-//! roller is `robot.setMode`; it is no longer on the pad.
+//! heading — and B triggers the crouch that lives in the ground-pick slot. A and X run nothing
+//! on wheels, whatever `[pad]` binds to them; the other skills ride along, as the rebased roller
+//! line has them. Switching between walk and roller is `robot.setMode`; it is no longer on the
+//! pad.
 //!
 //! ## On the robot, this runs itself
 //!

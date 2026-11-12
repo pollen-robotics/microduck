@@ -130,9 +130,9 @@ impl CameraView {
     /// Draw the frame into `area`, centred, as large as the block allows.
     ///
     /// Half-block cells hold two pixels each, so the pixel grid is as wide as the area and twice
-    /// as tall. After the quarter turn this robot's camera needs, the picture is portrait —
-    /// 720×1280 — so it is height-bound and leaves room either side, which is why it is centred
-    /// rather than pinned to the left edge.
+    /// as tall. On the Zero 3W, after its camera's quarter turn, the picture is portrait —
+    /// 720×1280 — and height-bound, leaving room either side; on the beta boards it is landscape
+    /// and width-bound. Either way it is centred rather than pinned to an edge.
     pub(crate) fn draw(&self, area: Rect, buf: &mut Buffer) {
         let Some(shot) = self.shot.as_ref() else {
             return;
@@ -141,7 +141,7 @@ impl CameraView {
         if box_w == 0 || box_h == 0 {
             return;
         }
-        // A mount that is not a quarter turn cannot reach here: the header is rejected on the way
+        // A mount that is not a multiple of 90° cannot reach here: the header is rejected on the way
         // in by `valid_uyvy`, which is also what guarantees the geometry below matches the bytes.
         let turn = uyvy::Turn::from_degrees(shot.header.rotate).unwrap_or_default();
         let (width, height) = (shot.header.width as usize, shot.header.height as usize);
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn the_picture_fits_the_block_and_keeps_its_shape() {
         let mut view = CameraView::default();
-        // The real thing: 1280×720 off the sensor, a quarter turn of mount, so 720×1280 upright.
+        // The Zero 3W: 1280×720 off the sensor, a quarter turn of mount, so 720×1280 upright.
         view.absorb(shot(1280, 720, 90));
         let area = Rect::new(0, 0, 60, 14);
         let mut buf = Buffer::empty(area);

@@ -1108,6 +1108,7 @@ impl Pads for BlueZ {
                     "no Bluetooth adapter. On this board hci0 appears about 73s after power-on."
                         .to_owned(),
                 ),
+                candidates: Vec::new(),
             });
         };
 
@@ -1175,6 +1176,7 @@ impl Pads for BlueZ {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
                     detail: Some(detail),
+                    candidates: Vec::new(),
                 });
             }
             [only] => only.clone(),
@@ -1208,6 +1210,9 @@ impl Pads for BlueZ {
                                 "more than one pad is in pairing mode: {}",
                                 names.join(", ")
                             )),
+                            // One face per pad, as above: these are what pairing by `mac` would
+                            // choose between, not every advertisement the sweep heard.
+                            candidates: fresh.iter().map(|d| d.as_pad()).collect(),
                         });
                     }
                 }
@@ -1281,6 +1286,7 @@ impl Pads for BlueZ {
             return Ok(proto::PadPairResult::Failed {
                 reason,
                 detail: Some(detail),
+                candidates: Vec::new(),
             });
         }
 

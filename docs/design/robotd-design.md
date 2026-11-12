@@ -154,6 +154,8 @@ write()         one sync_write     · goal positions
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
 every 1 s       slow_sensors()     · registers 144–146 · voltage + temperature (§2.1)
+
+while subscribed, after write()   impact_guard() · register 66 · servos on the guard firmware (§2.1)
 ```
 
 Where the data goes, once per period:
@@ -279,7 +281,11 @@ saying so:
   "latches on input-voltage faults" it says the opposite of what it does. Alongside them,
   `homing_offset` is −512 on the knees (13, 23) and 0 everywhere else, the values from the
   runtime's `setup_motor_rpi.py` flashing rig. Every pose and policy assumes the knees carry that
-  offset, and a servo straight from the box does not.
+  offset, and a servo straight from the box does not. And `current_limit = 1000` mA, against the
+  factory's 1750, with Goal Current written alongside because position control caps at Goal
+  Current, which takes Current Limit only at boot. A servo refuses an EEPROM write with torque on,
+  which is how a standing robot is when an update restarts `robotd`, so then the check says so
+  and leaves the write to the next start rather than cutting torque or holding the loop off.
 - **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
   57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
   the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
@@ -301,6 +307,29 @@ eight bytes past its end, with twelve bytes of trajectory registers nothing want
 so they are sampled together once a second in their own transaction (~1 ms) rather than
 widening the tick's read to 22 bytes per servo at 50 Hz. The sampling interval is the same
 window the achieved rate is measured over, so one clock drives both.
+
+**The impact guard's state is a fourth read, and only while someone records.** ROBOTIS's impact
+guard firmwares (`firmware_version` 3, 4) brake a servo that hits something and hold it softly,
+which is what keeps gear teeth whole; their register 66 says which of armed, braking or holding each
+servo is in. That is a transaction of its own (~1 ms), so it is read only on ticks with a
+`robot.state` subscriber, after the goal positions are written — the read→decide→write path is the
+same with or without it — and only from a robot where at least one servo runs that firmware. The
+firmware is read once a start with the vet book's identity read, and every servo on another one is
+named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
+(40–43 and 56–59), asserted by the same startup check as the registers above. `bus.impact_guard`
+is off by default, until it is understood why the stress test robot on it fell on its own far more
+often than any other (2026-11-09); on, it writes the six `bus.impact_guard_*` settings, by default
+what a microduck walks with (a short brake on fast
+arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
+with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
+draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
+Enable (67, RAM), off after every power-up and with it the whole guard, and off there writes no
+settings: the switch does it, so the toggle cannot leave stale settings behind. The torque-on write
+sets it to what `bus.impact_guard` asks first; that one moment follows every way a servo can lose
+RAM (power-up, reboot, a latched error), each of which leaves it limp, and a servo still stiff after
+a `robotd` restart takes the write too. New settings are written with torque off and run from the
+next torque on, without a reboot: on V3, each restart's hold current and taper showed in the very
+next walk on lavandiere (2026-11-05); on V4, the gear bench's first shot after the write ran them.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
@@ -1027,6 +1056,7 @@ intents the loop already arbitrates.
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `laser.rs` | a laser dot from `mediad`'s `media.laser` (a ray, not a pixel) → a place on the floor through head FK, IMU and odometry → a head pose and a twist, each taken only while no client wants that half | the module header; the detector is `mediad/src/laser.rs` |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `emotion.rs` | an emotion = keyframes and a wav, shipped in the release with `[emotions] dir` on top, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
@@ -1039,11 +1069,13 @@ behind `RobotIo`, because it has to keep answering when the motor bus does not.
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[laser tracking].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[laser tracking]: ../robot/cheatsheet.md#follow-a-laser-dot
 
 ## 5. Why it exists, and where it came from
 

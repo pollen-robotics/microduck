@@ -97,12 +97,27 @@ install_name_prompt() {
 # the SoC serial's SHA-256 (configd/src/identity.rs says why it is not the Bluetooth address).
 # Read from the file rather than asked of configd, so the prompt works while daemons are down
 # — which is much of what anyone is ssh'd in to deal with.
+#
+# The serial's source depends on the board, as in robotd-params/src/serial.rs: a zero3 reads
+# U-Boot's (the device tree), a beta or face-board-v1 the kernel's (/proc/cpuinfo), because the
+# beta U-Boot reads the OTP three bytes early. Reading the device tree on every board made a fresh
+# beta's prompt say one duck-xxxx and its BLE another, until a rename hid it. The board is
+# robotd.toml's [board] version, the owner's layer first; unset means zero3, as Board's default.
 _robot_name="$(sed -n 's/.*"name": *"\(.*\)".*/\1/p' /var/lib/robot/config/config.json 2>/dev/null)"
-if [ -z "$_robot_name" ] && [ -r /proc/device-tree/serial-number ]; then
-    _robot_serial="$(tr '\0' '\n' < /proc/device-tree/serial-number 2>/dev/null | head -n 1)"
+if [ -z "$_robot_name" ]; then
+    _robot_board="$(cat /var/lib/robot/robotd.toml /etc/robot/robotd.toml 2>/dev/null \
+        | awk '/^\[/ { b = ($0 == "[board]") } b && /^version *=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }')"
+    case "$_robot_board" in
+        beta|face-board-v1)
+            _robot_serial="$(awk -F: '$1 ~ /^[ \t]*Serial[ \t]*$/ { gsub(/[ \t]/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+            # All zeros is the kernel finding no OTP: no serial, as serial.rs rejects it.
+            [ -n "${_robot_serial//0/}" ] || _robot_serial= ;;
+        *)
+            _robot_serial="$(tr '\0' '\n' < /proc/device-tree/serial-number 2>/dev/null | head -n 1)" ;;
+    esac
     [ -n "$_robot_serial" ] && _robot_name="duck-$(printf '%s' "$_robot_serial" | sha256sum | cut -c1-4)"
 fi
-unset _robot_serial
+unset _robot_serial _robot_board
 
 # A name reaches prompt expansion, where $(...) and backticks *execute*. configd only strips
 # control characters, so strip the rest here.

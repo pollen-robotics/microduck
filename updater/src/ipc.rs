@@ -883,6 +883,7 @@ impl Server {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)
@@ -958,6 +959,14 @@ impl Server {
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "tof.stream is served by tofd, on /run/tofd/tof.sock; head_imu.stream by tofd on a zero3 and by robotd (/run/robotd.sock) on a beta",
+                ),
+            ),
+
+            Call::NfcWrite(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write is served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

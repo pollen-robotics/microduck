@@ -299,6 +299,7 @@ impl Pads for FakePads {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::NotFound,
                     detail: None,
+                    candidates: Vec::new(),
                 });
             }
             // Nothing new in pairing mode, so the answer is the pad already bonded: an idempotent
@@ -312,6 +313,7 @@ impl Pads for FakePads {
                 return Ok(proto::PadPairResult::Failed {
                     reason: proto::PadPairFailure::Ambiguous,
                     detail: Some(format!("{} pads are in pairing mode", several.len())),
+                    candidates: several.iter().map(|pad| (*pad).clone()).collect(),
                 });
             }
         };
@@ -524,13 +526,20 @@ mod tests {
             unpaired("A4:AE:11:00:22:33", "DualSense Wireless Controller"),
         ]);
 
-        assert!(matches!(
-            pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap(),
-            proto::PadPairResult::Failed {
-                reason: proto::PadPairFailure::Ambiguous,
-                ..
-            }
-        ));
+        let refused = pads.pair(None, DEFAULT_PAIR_TIMEOUT).await.unwrap();
+        let proto::PadPairResult::Failed {
+            reason: proto::PadPairFailure::Ambiguous,
+            candidates,
+            ..
+        } = refused
+        else {
+            panic!("{refused:?}");
+        };
+        // The refusal names both, so a client can offer them — the addresses are what the retry
+        // below needs, and a count alone left a phone nothing to ask.
+        let mut macs: Vec<&str> = candidates.iter().map(|pad| pad.mac.as_str()).collect();
+        macs.sort_unstable();
+        assert_eq!(macs, ["78:86:2E:BB:13:28", "A4:AE:11:00:22:33"]);
 
         // And naming one resolves it, which is what the refusal tells the caller to do.
         let result = pads

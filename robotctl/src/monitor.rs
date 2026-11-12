@@ -98,8 +98,8 @@ const TOF_HEIGHT: u16 = 10;
 
 /// Rows the camera block occupies while it is open: two borders and fourteen rows of picture.
 ///
-/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the quarter turn
-/// this camera is mounted at, is 16 wide. That is small, and it is enough for what the block is
+/// Sixteen rows is a lot, and it buys a picture 28 pixels tall — which, after the Zero 3W camera's
+/// quarter turn, is 16 wide (on the beta boards' upright camera it is landscape, and wider). That is small, and it is enough for what the block is
 /// for: where the head is pointing, whether the room is lit, whether the lens is covered. Fewer
 /// rows and it stops answering those; more and it is the whole terminal.
 ///
@@ -2568,7 +2568,7 @@ impl View {
     /// the frame is stale, because points hanging where the sensor no longer
     /// looks would be a lie.
     fn tof_markers(&self) -> Vec<duck::Marker> {
-        if !self.tof_arrived.is_some_and(|at| at.elapsed() <= TOF_STALE) {
+        if self.tof_arrived.is_none_or(|at| at.elapsed() > TOF_STALE) {
             return Vec::new();
         }
         let Some(zones) = self.classified_tof() else {
@@ -4968,8 +4968,10 @@ mod tests {
             // Not reported, as from a daemon predating them; the monitor draws neither.
             velocities: Vec::new(),
             currents_ma: Vec::new(),
+            impact_guard: Vec::new(),
             odom: proto::OdomState::default(),
             theremin: None,
+            laser: None,
             chorale: None,
             t_ns: 0,
             imu: None,

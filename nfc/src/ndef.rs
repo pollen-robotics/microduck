@@ -1,4 +1,5 @@
-//! NDEF, read-only and limited to text and URI records — and whether they ask to pair a gamepad.
+//! NDEF, limited to text and URI records — and whether they ask to pair a gamepad. Read, and
+//! written only as one text record ([`text_tlv`]), which is all `nfc.write` puts on a tag.
 //!
 //! Pure: no hardware, entirely testable off a board.
 
@@ -6,9 +7,15 @@ const TLV_NULL: u8 = 0x00;
 const TLV_NDEF: u8 = 0x03;
 const TLV_TERMINATOR: u8 = 0xFE;
 
+const FLAG_MB: u8 = 0x80;
 const FLAG_ME: u8 = 0x40;
 const FLAG_SR: u8 = 0x10;
 const FLAG_IL: u8 = 0x08;
+const TNF_WELL_KNOWN: u8 = 0x01;
+
+/// The language a written text record says it is in. Readers ignore it — [`parse`] does — and
+/// `en` is what phone apps write by default.
+const LANG: &[u8] = b"en";
 
 /// The NFC Forum abbreviation table: a URI record's first byte indexes it.
 const URI_PREFIXES: [&str; 36] = [
@@ -170,6 +177,47 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
+/// A tag's user memory holding `text` as its one record: the NDEF TLV, then the terminator —
+/// what a phone app writes for a text, and what [`parse`] reads back as [`Record::Text`].
+///
+/// Refused only for a text whose message no TLV length can say (64 KiB); whether it fits the tag
+/// is the tag's question, asked by [`crate::tag::write_ndef_area`].
+pub fn text_tlv(text: &str) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(1 + LANG.len() + text.len());
+    payload.push(LANG.len() as u8); // UTF-8, and the language's length
+    payload.extend(LANG);
+    payload.extend(text.as_bytes());
+
+    let mut record = Vec::with_capacity(payload.len() + 7);
+    match u8::try_from(payload.len()) {
+        Ok(len) => record.extend([FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN, 1, len]),
+        Err(_) => {
+            record.extend([FLAG_MB | FLAG_ME | TNF_WELL_KNOWN, 1]);
+            record.extend((payload.len() as u32).to_be_bytes());
+        }
+    }
+    record.push(b'T');
+    record.extend(payload);
+
+    let mut tlv = vec![TLV_NDEF];
+    match u16::try_from(record.len()) {
+        Ok(len) if len < 0xFF => tlv.push(len as u8),
+        Ok(len) if len < 0xFFFF => {
+            tlv.push(0xFF);
+            tlv.extend(len.to_be_bytes());
+        }
+        _ => {
+            return Err(format!(
+                "a text of {} bytes is too long for any tag",
+                text.len()
+            ));
+        }
+    }
+    tlv.extend(record);
+    tlv.push(TLV_TERMINATOR);
+    Ok(tlv)
+}
+
 /// What a pairing tag holds: every one is written with this text, and none names a pad.
 pub const PAIRING: &str = "microduck_gamepad_pairing";
 
@@ -194,6 +242,31 @@ mod tests {
         tag.push(TLV_TERMINATOR);
         tag.resize(64, 0);
         tag
+    }
+
+    #[test]
+    fn a_written_text_reads_back_as_itself() {
+        for text in ["walk_mode", PAIRING, "é🦆", ""] {
+            let tlv = text_tlv(text).unwrap();
+            assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+            assert_eq!(parse(&tlv).unwrap(), [Record::Text(text.into())]);
+        }
+        // What `text_tag` above — a phone app's layout — holds, byte for byte but the language.
+        let short = text_tlv("walk_mode").unwrap();
+        assert_eq!(&short[..7], [TLV_NDEF, 16, 0xD1, 1, 12, b'T', 2]);
+    }
+
+    /// Past 255 bytes the record takes a four-byte length and the TLV a three-byte one; both
+    /// still read back.
+    #[test]
+    fn a_long_text_takes_the_long_lengths() {
+        let text = "a".repeat(300);
+        let tlv = text_tlv(&text).unwrap();
+        assert_eq!(&tlv[..2], [TLV_NDEF, 0xFF]);
+        assert_eq!(tlv[4] & FLAG_SR, 0);
+        assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+        assert_eq!(parse(&tlv).unwrap(), [Record::Text(text)]);
+        assert!(text_tlv(&"a".repeat(70_000)).is_err());
     }
 
     #[test]
