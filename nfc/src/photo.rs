@@ -21,7 +21,7 @@
 //!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
-//! 6. The beak opens wide, and [`BEFORE_SIT`] later the robot sits.
+//! 6. [`BEFORE_SIT`] later the robot sits, and once seated opens its beak wide.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
 //! 8. It holds it [`KEEP`]: where the photo will be written to it, which is not done yet.
@@ -79,8 +79,8 @@ const EINK_POLL: Duration = Duration::from_millis(300);
 /// The display held in the closed beak: where the photo will be written.
 pub const KEEP: Duration = Duration::from_secs(5);
 /// Head down and beak open, for the display to fall, before the beak closes again.
-pub const DROP: Duration = Duration::from_secs(2);
-/// After the picture, beak open, before the robot sits.
+pub const DROP: Duration = Duration::from_millis(1200);
+/// After the picture, before the robot sits.
 pub const BEFORE_SIT: Duration = Duration::from_secs(1);
 /// The head brought back to the centre at the end, before it is let go: sent rather than left to
 /// the look-around, which would wait two seconds and then fade in slowly.
@@ -260,17 +260,16 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
         Err(why) => Outcome::NoPhoto(why),
     };
 
-    // Beak wide open, then sit. The head is held throughout, so the look-around stays off.
-    if let Err(why) = robot.mouth(1.0) {
-        return Outcome::Failed(format!("robot.mouth: {why}"));
-    }
-    // Not stopping when it will not sit: the display is taken standing just as well, and stopping
-    // here would leave the beak open with nothing to close it.
+    // Sit, then the beak wide open. The head is held throughout, so the look-around stays off.
+    // Not stopping when it will not sit: the display is taken standing just as well.
     hold(robot, head, BEFORE_SIT);
     if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
         tracing::warn!(%why, "not sitting down — waiting for the e-ink standing");
     }
     hold(robot, head, SIT);
+    if let Err(why) = robot.mouth(1.0) {
+        return Outcome::Failed(format!("robot.mouth: {why}"));
+    }
 
     // The display in the beak.
     let mut waited = Duration::ZERO;
@@ -664,8 +663,8 @@ mod tests {
                 "capture",
                 "light 0",
                 "save",
-                "mouth 1",
                 "sit",
+                "mouth 1",
                 "eink",
                 "mouth 0",
                 "look",
@@ -781,7 +780,7 @@ mod tests {
         };
         assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
         let shape = shape(&robot.calls);
-        assert_eq!(&shape[shape.len() - 3..], ["mouth 1", "sit", "mouth 0"]);
+        assert_eq!(&shape[shape.len() - 3..], ["sit", "mouth 1", "mouth 0"]);
         assert!(robot.slept >= EINK_WITHIN);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }

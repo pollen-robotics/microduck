@@ -87,7 +87,7 @@ are in `nfc/src/modes.rs`.
 An e-ink display touched to the reader, or a tag written `take_photo`, poses the robot for a
 picture: it starts the robot if Start was not pressed, stands still, lifts its head, counts down
 five seconds with the flashlight blinking dimly (3 %) and faster and faster, flashes at 20 % with a quack
-as it takes the photo, then opens its beak wide and sits. It waits up to a minute for a display in
+as it takes the photo, then sits and, once seated, opens its beak wide. It waits up to a minute for a display in
 its beak, closes it on it for five seconds, then lowers its head and opens its beak to let it fall, and brings its head back up.
 The idle look-around is held off throughout. The picture is kept in `/var/lib/robot/photos`, named
 for the local time. The sequence is in `nfc/src/photo.rs`, and how a display is recognised (any
