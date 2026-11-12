@@ -21,10 +21,17 @@
 //!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
-//! 6. The robot sits and opens its beak.
+//! 6. The beak opens wide, and the robot sits.
+//! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
+//!    beak's antenna alone — and closes the beak on it.
+//! 8. It holds it [`KEEP`]: where the photo will be written to it, which is not done yet.
+//! 9. It lowers its head, opens its beak to let the display go, and closes it [`DROP`] later.
+//!    No display in time, and it just closes its beak.
 //!
-//! It stops there for now. What comes next is the e-ink tag: the robot waits for it in its beak,
-//! writes the photo to it, then lowers its head and opens its beak to let it go.
+//! **The idle look-around is kept off from the first look to the end.** It starts after two
+//! seconds without a `robot.head`, and it is what yawns: a yawn opens the beak, and a glance moves
+//! it. So the head is resent every [`HOLD_EVERY`] through every wait, the sitting and the waiting
+//! for the display included, which is the only thing that keeps the look-around away.
 //!
 //! The camera is `mediad`'s local frame socket, the one its console snapshot reads: a raw frame and
 //! the angle the camera is mounted at, turned upright here. A robot without a camera running still
@@ -55,6 +62,25 @@ pub const FLASH_AT: f64 = 0.15;
 
 /// The shutter: a quack as the flash goes on, so the person posing hears the picture taken.
 pub const SHUTTER: proto::SoundTag = proto::SoundTag::Chirp;
+
+/// Where the robot looks to let the display fall: down, just ahead of its feet.
+pub const LOOK_DOWN: proto::LookParams = proto::LookParams {
+    x: 0.4,
+    y: 0.0,
+    z: -0.4,
+    neck_pitch: 0.0,
+};
+
+/// How long the robot waits, beak open, for a display in it.
+pub const EINK_WITHIN: Duration = Duration::from_secs(60);
+/// How often the beak's antenna is asked meanwhile.
+const EINK_POLL: Duration = Duration::from_millis(300);
+/// The display held in the closed beak: where the photo will be written.
+pub const KEEP: Duration = Duration::from_secs(5);
+/// Head down and beak open, for the display to fall, before the beak closes again.
+pub const DROP: Duration = Duration::from_secs(3);
+/// For the head to go down before the beak opens.
+const LOWER: Duration = Duration::from_millis(800);
 
 /// Where the robot looks for the picture, trunk frame: a metre ahead and about half a metre up,
 /// which lifts the head towards a face without throwing it back.
@@ -134,6 +160,8 @@ pub trait Driver {
     fn mouth(&mut self, open: f64) -> Result<(), String>;
     /// A frame from the camera, upright, as a JPEG.
     fn capture(&mut self) -> Result<Vec<u8>, String>;
+    /// Whether an e-ink display is in the beak: the reader asked on the beak's antenna alone.
+    fn eink_in_beak(&mut self) -> Result<bool, String>;
     /// Keep the picture; where it went.
     fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String>;
     /// Wait. A method so a test can run the sequence without waiting through it.
@@ -226,14 +254,47 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
         Err(why) => Outcome::NoPhoto(why),
     };
 
-    // Sit, beak open.
-    if let Err(why) = asked("robot.do sit", robot.sit_toggle()) {
-        return Outcome::Failed(why);
-    }
-    robot.sleep(SIT);
+    // Beak wide open, then sit. The head is held throughout, so the look-around stays off.
     if let Err(why) = robot.mouth(1.0) {
         return Outcome::Failed(format!("robot.mouth: {why}"));
     }
+    if let Err(why) = asked("robot.do sit", robot.sit_toggle()) {
+        return Outcome::Failed(why);
+    }
+    hold(robot, head, SIT);
+
+    // The display in the beak.
+    let mut waited = Duration::ZERO;
+    let came = loop {
+        match robot.eink_in_beak() {
+            Ok(true) => break true,
+            Ok(false) => {}
+            Err(why) => tracing::info!(%why, "the beak's antenna did not answer"),
+        }
+        if waited >= EINK_WITHIN {
+            break false;
+        }
+        hold(robot, head, EINK_POLL);
+        waited += EINK_POLL;
+    };
+    if !came {
+        tracing::warn!("no e-ink in the beak — closing it");
+        let _ = robot.mouth(0.0);
+        return outcome;
+    }
+    tracing::warn!("e-ink in the beak");
+    let _ = robot.mouth(0.0);
+    hold(robot, head, KEEP);
+
+    // Head down, beak open: the display falls. Then the beak closes, and the head is let go.
+    let down = match robot.look(LOOK_DOWN) {
+        Ok(r) => r.head,
+        Err(why) => return Outcome::Failed(format!("robot.look: {why}")),
+    };
+    hold(robot, down, LOWER);
+    let _ = robot.mouth(1.0);
+    hold(robot, down, DROP);
+    let _ = robot.mouth(0.0);
     outcome
 }
 
@@ -430,8 +491,11 @@ mod tests {
         /// The longest the head went without being resent.
         head_gap: Duration,
         since_head: Duration,
-        /// Between `look` and `capture`, when the head must be held.
+        /// From the first `look` to the end, when the head must be held.
         holding: bool,
+        /// After how many asks a display is in the beak; `None` never.
+        eink_after: Option<usize>,
+        asked_beak: usize,
     }
 
     impl Default for Fake {
@@ -446,6 +510,8 @@ mod tests {
                 head_gap: Duration::ZERO,
                 since_head: Duration::ZERO,
                 holding: false,
+                eink_after: Some(3),
+                asked_beak: 0,
             }
         }
     }
@@ -505,8 +571,15 @@ mod tests {
         }
         fn capture(&mut self) -> Result<Vec<u8>, String> {
             self.calls.push("capture".into());
-            self.holding = false;
             self.camera.clone()
+        }
+        fn eink_in_beak(&mut self) -> Result<bool, String> {
+            self.asked_beak += 1;
+            let there = self.eink_after.is_some_and(|n| self.asked_beak > n);
+            if there {
+                self.calls.push("eink".into());
+            }
+            Ok(there)
         }
         fn save(&mut self, _: &[u8]) -> Result<PathBuf, String> {
             self.calls.push("save".into());
@@ -574,8 +647,13 @@ mod tests {
                 "capture",
                 "light 0",
                 "save",
+                "mouth 1",
                 "sit",
-                "mouth 1"
+                "eink",
+                "mouth 0",
+                "look",
+                "mouth 1",
+                "mouth 0"
             ]
         );
     }
@@ -640,7 +718,7 @@ mod tests {
             Outcome::NoPhoto("no such socket".into())
         );
         assert!(!robot.calls.contains(&"save".to_string()));
-        assert_eq!(robot.calls.last().unwrap(), "mouth 1");
+        assert_eq!(robot.calls.last().unwrap(), "mouth 0");
     }
 
     #[test]
@@ -652,12 +730,27 @@ mod tests {
         assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
     }
 
-    /// Never two seconds without a head, or the idle look-around takes it back mid-countdown.
+    /// Never two seconds without a head from the first look to the end, or the idle look-around
+    /// takes it back — and yawns, opening the beak on the display.
     #[test]
-    fn the_head_is_held_through_the_countdown() {
+    fn the_head_is_held_to_the_end() {
         let mut robot = Fake::default();
         on_touch(&mut robot);
         assert!(robot.calls.iter().filter(|c| *c == "head").count() > 10);
+        assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    /// No display in the beak: it waits, then closes its beak, the head held all along.
+    #[test]
+    fn no_display_closes_the_beak_after_the_wait() {
+        let mut robot = Fake {
+            eink_after: None,
+            ..Fake::default()
+        };
+        assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
+        let shape = shape(&robot.calls);
+        assert_eq!(&shape[shape.len() - 3..], ["mouth 1", "sit", "mouth 0"]);
+        assert!(robot.slept >= EINK_WITHIN);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }
 

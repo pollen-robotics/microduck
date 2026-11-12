@@ -90,11 +90,13 @@ are in `nfc/src/modes.rs`.
 An e-ink display touched to the reader, or a tag written `take_photo`, poses the robot for a
 picture: it starts the robot if Start was not pressed, stands still, lifts its head, counts down
 five seconds with the flashlight blinking dimly and faster and faster, flashes at 15 % with a quack
-as it takes the photo, then sits with its beak open. The picture is kept in
-`/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how a
-display is recognised (any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. A display starts it
-from the top of the head only; in the beak, where the photo will be written to it, it is logged
-and nothing else yet. Every touch logs where it was seen (`tag in the field`, `place="head"`).
+as it takes the photo, then opens its beak wide and sits. It waits up to a minute for a display in
+its beak, closes it on it for five seconds, then lowers its head and opens its beak to let it fall.
+The idle look-around is held off throughout. The picture is kept in `/var/lib/robot/photos`, named
+for the local time. The sequence is in `nfc/src/photo.rs`, and how a display is recognised (any
+ISO 14443-4 card, for now) in `nfc/src/eink.rs`. A display starts it from the top of the head only;
+in the beak it starts nothing, and is what the sequence waits for. Every touch logs where it was
+seen (`tag in the field`, `place="head"`).
 
 ## Check it
 

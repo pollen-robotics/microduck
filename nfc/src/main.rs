@@ -243,6 +243,22 @@ impl Chip {
     }
 }
 
+impl Chip {
+    /// Whether an e-ink display ([`eink::is_eink`]) answers on `antenna` alone. The bench reader
+    /// has one antenna, so it is asked there whatever `antenna` says.
+    fn eink_at(&mut self, antenna: Antenna) -> nfc::Result<bool> {
+        if let Chip::Spi(c) = self {
+            c.set_proto(Proto::A)?;
+            c.set_antenna(antenna)?;
+        }
+        match tag::select_tag(self) {
+            Ok(found) => Ok(eink::is_eink(found.sak)),
+            Err(e) if e.is_tag() => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Reader for Chip {
     fn reset_field(&mut self) -> nfc::Result<()> {
         match self {
@@ -319,13 +335,16 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
                 // On the head, it starts the photo; in the beak, it is where the photo will be
                 // written, which is not done yet. The bench reader has one antenna, the head's.
                 Tech::Eink if antenna == Some(BEAK) => {
-                    tracing::warn!(tag = %id, "e-ink in the beak — writing the photo to it is not done yet");
+                    tracing::warn!(tag = %id, "e-ink in the beak — it starts nothing there");
                     continue_after(period, start);
                     continue;
                 }
                 Tech::Eink => {
                     tracing::warn!(tag = %id, "e-ink on the head — hold still");
-                    report_photo(photo::on_touch(robot));
+                    report_photo(photo::on_touch(&mut Session {
+                        sockets: &mut *robot,
+                        chip: &mut *chip,
+                    }));
                     continue_after(period, start);
                     continue;
                 }
@@ -343,7 +362,10 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
                 Ok(Ok(records)) if photo::in_records(&records) => {
                     tracing::warn!(tag = %id, "photo tag touched — hold still");
-                    report_photo(photo::on_touch(robot));
+                    report_photo(photo::on_touch(&mut Session {
+                        sockets: &mut *robot,
+                        chip: &mut *chip,
+                    }));
                 }
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
                     match ModeTag::in_records(&records) {
@@ -494,21 +516,28 @@ impl Driver for Sockets {
     }
 }
 
-impl photo::Driver for Sockets {
+/// A photo sequence's view of the robot: the sockets, and the reader, which it asks for the display
+/// in the beak.
+struct Session<'a> {
+    sockets: &'a mut Sockets,
+    chip: &'a mut Chip,
+}
+
+impl photo::Driver for Session<'_> {
     fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
-        Robot::sound(self, tag)
+        Robot::sound(&mut *self.sockets, tag)
     }
 
     fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
-        Driver::laser_track(self, active)
+        Driver::laser_track(&mut *self.sockets, active)
     }
 
     fn stop(&mut self) -> Result<proto::IntentResult, String> {
-        call(&self.robot, &proto::Call::RobotStop, QUICK_ANSWER)
+        call(&self.sockets.robot, &proto::Call::RobotStop, QUICK_ANSWER)
     }
 
     fn policy(&mut self) -> Result<String, String> {
-        state_policy(&self.robot, QUICK_ANSWER)
+        state_policy(&self.sockets.robot, QUICK_ANSWER)
     }
 
     fn start(&mut self) -> Result<proto::IntentResult, String> {
@@ -516,22 +545,34 @@ impl photo::Driver for Sockets {
             on: true,
             toggle: false,
         };
-        call(&self.robot, &proto::Call::RobotEnable(params), QUICK_ANSWER)
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotEnable(params),
+            QUICK_ANSWER,
+        )
     }
 
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
         let params = proto::DoParams {
             skill: "sit".into(),
         };
-        call(&self.robot, &proto::Call::RobotDo(params), QUICK_ANSWER)
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotDo(params),
+            QUICK_ANSWER,
+        )
     }
 
     fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String> {
-        call(&self.robot, &proto::Call::RobotLook(at), QUICK_ANSWER)
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotLook(at),
+            QUICK_ANSWER,
+        )
     }
 
     fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
-        notify(&self.robot, &proto::Call::RobotHead(head))
+        notify(&self.sockets.robot, &proto::Call::RobotHead(head))
     }
 
     fn flashlight(&mut self, brightness: f64) -> Result<proto::IntentResult, String> {
@@ -542,7 +583,7 @@ impl photo::Driver for Sockets {
             brightness: (brightness > 0.0).then_some(brightness),
         };
         call(
-            &self.robot,
+            &self.sockets.robot,
             &proto::Call::RobotFlashlight(params),
             QUICK_ANSWER,
         )
@@ -550,18 +591,22 @@ impl photo::Driver for Sockets {
 
     fn mouth(&mut self, open: f64) -> Result<(), String> {
         notify(
-            &self.robot,
+            &self.sockets.robot,
             &proto::Call::RobotMouth(proto::MouthParams { open }),
         )
     }
 
     fn capture(&mut self) -> Result<Vec<u8>, String> {
-        photo::capture(&self.media, QUICK_ANSWER)
+        photo::capture(&self.sockets.media, QUICK_ANSWER)
+    }
+
+    fn eink_in_beak(&mut self) -> Result<bool, String> {
+        self.chip.eink_at(BEAK).map_err(|e| e.to_string())
     }
 
     fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String> {
         let name = photo::local_name(std::time::SystemTime::now());
-        photo::save(&self.photos, &name, jpeg)
+        photo::save(&self.sockets.photos, &name, jpeg)
     }
 
     fn sleep(&mut self, d: Duration) {
