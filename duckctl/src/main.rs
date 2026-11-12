@@ -39,6 +39,10 @@
 //! `DUCK_ROBOT` and `DUCK_PIN` in the environment are the defaults for `--name` and `--pin`, for
 //! the machine that talks to the same robot every day. See [`Target`].
 
+#[cfg(target_os = "linux")]
+mod agent;
+mod console;
+mod setup_code;
 mod udp_pad;
 
 use std::net::Ipv4Addr;
@@ -50,6 +54,7 @@ use btleplug::api::{
 };
 use btleplug::platform::{Manager, Peripheral};
 use clap::{Parser, Subcommand};
+use duck_auth::wire::{Frame, MAX_CLIENT_LINE, MAX_ROBOT_LINE};
 use duck_ble::adv;
 use duck_ble::framing::{self, Reassembler};
 use duck_ble::gatt::{RPC_UUID, SERVICE_UUID};
@@ -134,6 +139,11 @@ const LINK_POLL: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long each step of the secure handshake gets. The robot answers in milliseconds, and answers a
+/// wrong key by closing its session without a word — so a short budget is what turns that silence
+/// into a message promptly. Generous next to the robot's own work; one notification each way.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many devices a failure lists before summarising the rest.
 ///
@@ -467,13 +477,18 @@ fn choose<T>(found: Vec<(T, String)>, target: &Target) -> Result<(T, String), St
 /// **`ip` prints the address and nothing else**, because the tool's split is diagnostics on stderr
 /// and data on stdout: `ssh microduck@$(duckctl ip)` only works if that is the whole of what
 /// stdout carries. Every note this command emits goes to stderr for the same reason.
-fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn deliver(
+    command: &Command,
+    address: &str,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Ip => {
             println!("{address}");
             Ok(())
         }
         Command::Ssh { user, command } => {
+            ssh_refusal(address)?;
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
             become_program("ssh", &ssh_argv(&user, address, command))
         }
@@ -481,20 +496,27 @@ fn deliver(command: &Command, address: &str) -> Result<(), Box<dyn std::error::E
             let user = ssh_user(user.as_deref(), std::env::var("DUCK_BOARD_USER").ok());
             become_program("scp", &scp_argv(&user, address, paths))
         }
-        Command::Open { print, port } => {
-            let url = console_url(address, *port);
-            if *print {
-                println!("{url}");
-                return Ok(());
-            }
-            eprintln!("opening {url}");
-            webbrowser::open(&url).map_err(|e| {
+        Command::Open { print } => {
+            let robot: std::net::IpAddr = address
+                .parse()
+                .map_err(|_| format!("{address} is not an IP address"))?;
+            let code = setup_code::lookup(&setup_code::read(), name).ok_or_else(|| {
                 format!(
-                    "could not open a browser: {e}\nThe robot is at {url} — `duckctl open --print` \
-                     gives the URL without launching anything."
+                    "no setup code for {name} on this machine. The console goes through the \
+                     robot's authenticated gateway, which needs it: `duckctl setup-code add` with \
+                     the code from the robot's QR (or `sudo robotctl system setup-code` on it)."
                 )
-                .into()
+            })?;
+            let print = *print;
+            console::serve(robot, code, |url| {
+                eprintln!("console for {name} at {url} — Ctrl-C to close it");
+                if print {
+                    println!("{url}");
+                } else if let Err(e) = webbrowser::open(url) {
+                    eprintln!("could not open a browser ({e}); open {url} yourself");
+                }
             })
+            .await
         }
         Command::UdpPad {
             hz,
@@ -527,6 +549,27 @@ fn ssh_user(flag: Option<&str>, env: Option<String>) -> String {
     flag.map(str::to_owned)
         .or_else(|| env.filter(|user| !user.trim().is_empty()))
         .unwrap_or_else(|| "microduck".to_owned())
+}
+
+/// Say why ssh will fail, before `ssh` says it less helpfully.
+///
+/// A shipping image refuses port 22 on wifi by design (microduck_yocto#110), and `ssh`'s own
+/// "Connection refused" reads as a dead robot. A refusal is cheap to detect and has one fix, so it
+/// is named here; anything else — a timeout, a network that cannot route — is left to `ssh`, which
+/// reports those as well as anything could.
+fn ssh_refusal(address: &str) -> Result<(), String> {
+    let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+        return Ok(());
+    };
+    let target = std::net::SocketAddr::new(ip, 22);
+    match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
+            "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
+             (microduck@192.168.42.1). `duckctl ssh-wifi` opens it on wifi until the robot next \
+             reboots; then run this again."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `ssh`'s arguments: `user@address`, then whatever is to run there.
@@ -698,15 +741,6 @@ fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
             None
         }
     }
-}
-
-/// Where the console is, given where the robot is.
-///
-/// Plain `http`, because a robot on a LAN has no certificate to offer and `ws://` from an `https`
-/// page is blocked outright as mixed content. `webrtc-console.md` §1.3 says what that costs — a
-/// microphone, and on some browsers a gamepad, both being secure-context APIs — and when it changes.
-fn console_url(address: &str, port: u16) -> String {
-    format!("http://{address}:{port}/")
 }
 
 /// What to say when the robot is right there and has no address.
@@ -1059,6 +1093,23 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum SetupCodeCmd {
+    /// Store a robot's setup code, read on stdin: paste `md1:<robot id>:<key>`, or the QR's text.
+    ///
+    /// `duckctl ssh -- sudo robotctl system setup-code` prints it. On stdin so the key is in no
+    /// command line or shell history. Filed under the robot id in the code, and under `--name` (or
+    /// `DUCK_ROBOT`) as well when that names the robot differently — a renamed one.
+    Add,
+    /// The robots this laptop holds a code for, by name and id. Never the keys.
+    List,
+    /// Forget a robot's code, under every name it was filed under.
+    Remove {
+        #[arg(value_name = "ROBOT_NAME")]
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// List robots in range with the address each one broadcast, and stop.
     Scan,
@@ -1119,21 +1170,23 @@ enum Command {
         )]
         paths: Vec<String>,
     },
-    /// Open the robot's console in a browser.
+    /// Open the robot's console in a browser, through its authenticated gateway.
     ///
-    /// The page `mediad` serves: the camera, and the controls a WebRTC peer is allowed to drive.
-    /// Finds the robot the way `ip` above does.
+    /// The robot serves its console on its own loopback only; the one door a LAN has is the media
+    /// gateway, which admits a peer that proves the robot's setup code. So this runs a small bridge
+    /// on this machine — the page on 127.0.0.1, and a tunnel that authenticates to the gateway with
+    /// the code `duckctl setup-code add` stored — and stays running until Ctrl-C. Finds the robot
+    /// the way `ip` above does.
+    ///
+    /// The page is this duckctl's copy of the console, so keep duckctl current; the page's banner
+    /// says when its API version and the robot's differ. Snapshots (`/frame`) are not available
+    /// through the gateway.
     Open {
-        /// Print the URL instead of opening it — for a machine with no browser, or a script.
+        /// Print the URL instead of opening a browser — for a script, or a browser on this machine
+        /// that is not the default. The bridge still runs until Ctrl-C: the URL is only good while
+        /// it does.
         #[arg(long)]
         print: bool,
-        /// The console's port, for a robot started with a non-default `--web-port`.
-        //
-        // The same default as `mediad --web-port`, and the reason this command exists rather than a
-        // documented `open "http://$(duckctl ip):8080"`: the port belongs in one place that nobody
-        // has to read.
-        #[arg(long, default_value_t = 8080)]
-        port: u16,
     },
     /// The tail of one daemon's journal.
     ///
@@ -1175,6 +1228,13 @@ enum Command {
     /// and the first one to ask of a robot that is behaving unexpectedly — a `revision` of `null`
     /// means the release was built on somebody's laptop rather than by CI.
     Version,
+    /// The setup codes this laptop holds, for robots in secure mode. Touches no robot.
+    ///
+    /// A robot with a setup code (`robotctl system setup-code` on it) refuses the PIN and serves
+    /// only a client that proves its key. Add the code once and every command finds it by the
+    /// robot's name. The file holding them is a credential: whoever copies it can talk to the robot.
+    #[command(subcommand)]
+    SetupCode(SetupCodeCmd),
     /// Updates: what is available, installing it, and going back.
     #[command(subcommand)]
     Update(Update),
@@ -1280,6 +1340,13 @@ enum Command {
     },
     /// Reboot it.
     Reboot,
+    /// Open ssh on wifi until the robot next reboots.
+    ///
+    /// A shipping image answers ssh on the head's USB-C link only, so `duckctl ssh` over wifi is
+    /// refused there. This asks `configd`, over the same authenticated Bluetooth session every
+    /// other command uses, to open port 22 on every interface until the next reboot. Then
+    /// `duckctl ssh` works. The dev image listens on wifi already, so there it changes nothing.
+    SshWifi,
     /// Send any method, for whatever is not wrapped above.
     Call {
         method: String,
@@ -1641,6 +1708,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let target = Target::new(cli.name.clone(), std::env::var("DUCK_ROBOT").ok());
     let pin = resolve_pin(cli.pin.clone(), std::env::var("DUCK_PIN").ok());
 
+    // Local bookkeeping, before anything Bluetooth.
+    if let Command::SetupCode(action) = &cli.command {
+        return setup_code_command(action, &target);
+    }
+
     // Before the scan rather than after it: a copy that names no path on the robot is wrong on its
     // own terms, and finding the robot first would charge eight seconds for the privilege.
     if let Command::Scp { paths, .. } = &cli.command {
@@ -1653,7 +1725,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         && let Some((address, name)) = recall_reachable(&target)
     {
         eprintln!("{name} at {address}, remembered from the last run");
-        return deliver(&cli.command, &address.to_string());
+        return deliver(&cli.command, &address.to_string(), &name).await;
     }
 
     // `scan` shares the discovery below and then stops, because a listing and a search look for the
@@ -1739,6 +1811,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let Some(properties) = peripheral.properties().await? else {
                 continue;
             };
+            // **Not heard during this scan: a cache entry, not a robot.** BlueZ keeps every device
+            // it has bonded with, and hands btleplug its *last* advertisement — name, services, and
+            // the address in it — with no RSSI until it hears the device again. A robot that was
+            // reflashed, renamed or moved network still shows up that way under its old identity:
+            // on cream-dvt that was a second "cream-dvt" at an address it had left days before,
+            // listed beside the real one, and the one `--name` then picked and could not connect
+            // to. CoreBluetooth only reports what it heard, so this changes nothing on a Mac.
+            if properties.rssi.is_none() {
+                if cli.verbose && properties.services.contains(&SERVICE_UUID) {
+                    eprintln!(
+                        "ignoring {} ({}): known to this machine's Bluetooth but not heard in \
+                         this scan",
+                        properties.local_name.as_deref().unwrap_or("?"),
+                        properties.address,
+                    );
+                }
+                continue;
+            }
             let name = properties
                 .local_name
                 .clone()
@@ -1831,7 +1921,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok((Address::At(address), name)) => {
                 let address = address.to_string();
                 remember(&name, &address);
-                return deliver(&cli.command, &address);
+                return deliver(&cli.command, &address, &name).await;
             }
             // The robot broadcast `0.0.0.0`, which is a robot with no network rather than a robot
             // that did not say. Asking `net.status` over a connection would return the same nothing
@@ -1901,15 +1991,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("connecting to {name}…");
 
+    // Before connecting, so it is in place when the first encrypted read starts pairing. Held to
+    // the end of the command. A failure costs only a first pairing — a laptop already bonded to
+    // the robot never asks — so it is reported, not fatal.
+    #[cfg(target_os = "linux")]
+    let _agent = match agent::register(&peripheral.address().to_string()).await {
+        Ok(agent) => Some(agent),
+        Err(why) => {
+            if cli.verbose {
+                eprintln!("could not register a pairing agent ({why}); a first pairing may stall");
+            }
+            None
+        }
+    };
+
+    let bd_addr = peripheral.address();
     step(
         "connecting",
-        "The robot advertised but would not accept a connection. The usual reason is that \
-         something else already holds it — the phone app, or another `duckctl` — because a robot \
-         serving one central advertises non-connectably and is listed without being reachable. \
-         Otherwise: if macOS shows it as paired, forget it there and retry; `sudo pkill \
-         bluetoothd` also clears a half-finished bond. On Linux, a robot whose release predates its \
-         extended advertisement fails here every time against most Intel controllers \
-         (`le-connection-abort-by-local`); update it from a Mac.",
+        &format!(
+            "The robot advertised but would not accept a connection. The usual reason is that \
+             something else already holds it — the phone app, or another `duckctl` — because a \
+             robot serving one central advertises non-connectably and is listed without being \
+             reachable.\n\
+             The next most likely: this machine is still bonded to it from before the robot was \
+             reflashed or reset. A reflash wipes the robot's half of the bond, and this side keeps \
+             offering keys the robot no longer has. On Linux, `bluetoothctl info {bd_addr}` shows \
+             `Paired: yes`; `bluetoothctl remove {bd_addr}` clears it. On macOS, forget it in \
+             System Settings → Bluetooth. Then retry.\n\
+             Otherwise: `sudo pkill bluetoothd` clears a half-finished bond. On Linux, a robot \
+             whose release predates its extended advertisement fails here every time against most \
+             Intel controllers (`le-connection-abort-by-local`); update it from a Mac."
+        ),
         CONNECT_TIMEOUT,
         peripheral.connect(),
     )
@@ -1941,8 +2053,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let read = step(
         "reading the API version",
         "This read requires an encrypted link, so it is what triggers pairing. A hang here usually \
-         means the bond did not complete: forget the robot in macOS Bluetooth settings, or run \
-         `sudo pkill bluetoothd`, and retry.",
+         means the bond did not complete. On macOS: forget the robot in Bluetooth settings, or run \
+         `sudo pkill bluetoothd`, and retry. On Linux: `journalctl -u bluetooth -b` names what \
+         BlueZ refused, and `bluetoothctl remove <robot address>` clears a half-finished bond.",
         READ_TIMEOUT,
         peripheral.read(&response),
     )
@@ -1967,40 +2080,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     peripheral.subscribe(&response).await?;
     let mut notifications = peripheral.notifications().await?;
 
-    // Prove the PIN before anything else. The bond is just-works, so it encrypts the link and
-    // authenticates nobody; the robot serves nothing until this succeeds. See
-    // `btd/src/pairing.rs` for why the check is here rather than in the pairing.
-    let auth = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "system.authenticate",
-        "params": { "pin": pin },
-    });
-    let auth = serde_json::to_string(&auth)?;
-    if cli.verbose {
-        // The PIN is deliberately not printed, even here: a terminal is a log too.
-        eprintln!("→ system.authenticate (pin redacted)");
-    }
-    write_line(&peripheral, &request, &auth).await?;
+    // A robot this laptop holds a setup code for is in secure mode: it serves nothing in plaintext,
+    // the PIN included, until the key is proved in a Noise handshake (`btd/src/secure.rs`). Every
+    // line after that, both ways, is one encrypted `Data` frame.
+    let held = setup_code::lookup(&setup_code::read(), &name);
+    let mut secure = match &held {
+        Some(code) => Some(
+            secure_handshake(&peripheral, &request, &mut notifications, code, cli.verbose).await?,
+        ),
+        None => None,
+    };
 
-    let reply = read_line(&mut notifications, REPLY_TIMEOUT).await?;
-    if cli.verbose {
-        eprintln!("← {reply}");
-    }
-    let parsed: serde_json::Value = serde_json::from_str(&reply)?;
-    if parsed["result"]["authenticated"] != serde_json::json!(true) {
-        let left = parsed["result"]["attempts_remaining"].as_u64();
-        return Err(match left {
-            Some(0) => "wrong PIN, and no attempts left — the robot closed the session. \
-                        Check it with `robotctl system pin` on the robot."
-                .to_owned()
-                .into(),
-            Some(n) => format!(
-                "wrong PIN ({n} attempt(s) left). Check it with `robotctl system pin` on the robot."
-            )
-            .into(),
-            None => format!("authentication failed: {reply}").into(),
+    if secure.is_none() {
+        // Prove the PIN before anything else. The bond is just-works, so it encrypts the link and
+        // authenticates nobody; the robot serves nothing until this succeeds. See
+        // `btd/src/pairing.rs` for why the check is here rather than in the pairing.
+        let auth = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "system.authenticate",
+            "params": { "pin": pin },
         });
+        let auth = serde_json::to_string(&auth)?;
+        if cli.verbose {
+            // The PIN is deliberately not printed, even here: a terminal is a log too.
+            eprintln!("→ system.authenticate (pin redacted)");
+        }
+        write_line(&peripheral, &request, &auth).await?;
+
+        let reply = read_line(&mut notifications, REPLY_TIMEOUT)
+            .await
+            .map_err(|e| format!("{e}\n{NO_PIN_PATH}"))?;
+        if cli.verbose {
+            eprintln!("← {reply}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&reply)?;
+        if parsed["result"]["authenticated"] != serde_json::json!(true) {
+            let left = parsed["result"]["attempts_remaining"].as_u64();
+            return Err(match left {
+                Some(0) => "wrong PIN, and no attempts left — the robot closed the session. \
+                            Check it with `robotctl system pin` on the robot."
+                    .to_owned()
+                    .into(),
+                Some(n) => format!(
+                    "wrong PIN ({n} attempt(s) left). Check it with `robotctl system pin` on the robot."
+                )
+                .into(),
+                None => format!("authentication failed: {reply}").into(),
+            });
+        }
     }
 
     let (line, timeout) = request_line(&cli.command)?;
@@ -2011,6 +2139,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Chunked by the same code the robot uses. btleplug does not expose the negotiated MTU, so
     // 20 bytes — the floor every BLE link guarantees — is the safe assumption. Slower than
     // necessary on a good link, and correct on every link.
+    let line = match &mut secure {
+        Some(session) => Frame::Data(session.seal(line.as_bytes()).map_err(|_| SEAL_FAILED)?)
+            .encode(MAX_CLIENT_LINE)
+            .map_err(|_| "the request is too long to send encrypted")?,
+        None => line,
+    };
     for chunk in framing::chunks(&line, 20) {
         peripheral
             .write(&request, &chunk, WriteType::WithoutResponse)
@@ -2034,6 +2168,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deadline = tokio::time::Instant::now() + timeout;
 
         for line in reassembler.push(&notification.value)? {
+            let line = match &mut secure {
+                Some(session) => open_line(session, &line)?,
+                None => line,
+            };
             if cli.verbose {
                 eprintln!("← {line}");
             }
@@ -2068,7 +2206,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return match value["result"]["ip4"].as_str().filter(|ip| !ip.is_empty()) {
                     Some(address) => {
                         remember(&name, address);
-                        deliver(&cli.command, address)
+                        deliver(&cli.command, address, &name).await
                     }
                     None => Err(no_address(&name).into()),
                 };
@@ -2107,6 +2245,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 // After the reply, and only for one that succeeded: a rename that the robot
                 // refused leaves nothing stale.
+                // A renamed robot advertises the new name, so the code is filed under it too, or
+                // the next command would find nothing and try the PIN the robot no longer serves.
+                if let (Some(code), Command::Name { name: new }) = (&held, &cli.command) {
+                    setup_code::alias(code, new);
+                }
                 if let Some(note) = target.stale_after_rename(&cli.command) {
                     eprintln!("{note}");
                 }
@@ -2305,6 +2448,173 @@ fn silence(idle: Duration) -> String {
     )
 }
 
+/// What a PIN path that hears nothing back most likely means.
+const NO_PIN_PATH: &str = "If this robot has a setup code it refuses the PIN and closes the link \
+     instead: store the code with `duckctl setup-code add` (`duckctl ssh -- sudo robotctl system \
+     setup-code` prints it).";
+
+/// Sealing fails only on a session already closed by an earlier failure, or a line over 64 KiB.
+const SEAL_FAILED: &str = "could not encrypt the request for the robot";
+
+/// Prove this laptop holds the robot's setup code, and open the encrypted session.
+///
+/// The phone app's half of `btd/src/secure.rs`, built from the same `duck-auth` the robot answers
+/// with: `Start`, the robot's `Challenge`, `Confirm`, the robot's `Ready`. **A wrong key is a
+/// silence**, not a refusal — the robot drops the link without a word, by design, so the failure
+/// below has to say what the likely causes are rather than relay one.
+async fn secure_handshake(
+    peripheral: &Peripheral,
+    request: &Characteristic,
+    notifications: &mut (impl futures::Stream<Item = btleplug::api::ValueNotification> + Unpin),
+    code: &setup_code::SetupCode,
+    verbose: bool,
+) -> Result<duck_auth::Session, Box<dyn std::error::Error>> {
+    let refused = |what: &str| -> Box<dyn std::error::Error> {
+        format!(
+            "the robot did not accept the setup code stored for {id}: {what}. A wrong key is \
+             answered with silence, so this is almost always the key — run `sudo robotctl system \
+             setup-code` on the robot and `duckctl setup-code add` what it prints. A robot with no \
+             setup code at all wants the PIN instead: `duckctl setup-code remove {id}`.",
+            id = code.id
+        )
+        .into()
+    };
+    // `next_chunk` rather than `read_line`, so a link that goes is reported when it goes. The
+    // robot answers each handshake step in milliseconds, so the budget is short: a wrong key
+    // closes the robot's session at once, and waiting out a call-sized budget for an answer that
+    // will never come only delays saying so.
+    let receive = async |notifications: &mut _| -> Result<Frame, String> {
+        let mut reassembler = Reassembler::for_replies();
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+        loop {
+            let notification = match next_chunk(peripheral, notifications, deadline).await {
+                Waited::Chunk(notification) => notification,
+                Waited::Dropped => return Err("it closed the link".to_owned()),
+                Waited::Silent => {
+                    return Err(format!("it said nothing for {HANDSHAKE_TIMEOUT:?}"));
+                }
+            };
+            let lines = reassembler
+                .push(&notification.value)
+                .map_err(|e| e.to_string())?;
+            if let Some(line) = lines.into_iter().next() {
+                return Frame::decode(&line, MAX_ROBOT_LINE)
+                    .map_err(|_| "it answered something that is not a handshake frame".to_owned());
+            }
+        }
+    };
+
+    if verbose {
+        // The key is not printed, even here: a terminal is a log too.
+        eprintln!("→ secure handshake as {} (key redacted)", code.id);
+    }
+    let (client, first) = duck_auth::ClientStart::begin(&code.key, &code.id)
+        .map_err(|_| refused("could not start"))?;
+    write_line(
+        peripheral,
+        request,
+        &Frame::Start(first)
+            .encode(MAX_CLIENT_LINE)
+            .map_err(|_| refused("could not encode"))?,
+    )
+    .await?;
+    let Frame::Challenge(challenge) = receive(notifications).await.map_err(|e| refused(&e))? else {
+        return Err(refused("the robot did not answer with a challenge"));
+    };
+    let (client, proof) = client
+        .receive(&challenge)
+        .map_err(|_| refused("the robot's challenge did not verify"))?;
+    write_line(
+        peripheral,
+        request,
+        &Frame::Confirm(proof)
+            .encode(MAX_CLIENT_LINE)
+            .map_err(|_| refused("could not encode"))?,
+    )
+    .await?;
+    let Frame::Ready(ready) = receive(notifications).await.map_err(|e| refused(&e))? else {
+        return Err(refused("the robot did not confirm"));
+    };
+    let session = client
+        .receive(&ready)
+        .map_err(|_| refused("the robot's confirmation did not verify"))?;
+    if verbose {
+        eprintln!("← secure session open");
+    }
+    Ok(session)
+}
+
+/// One line from a secure robot, decrypted: every line it sends is a `Data` frame.
+fn open_line(
+    session: &mut duck_auth::Session,
+    line: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Frame::Data(ciphertext) = Frame::decode(line, MAX_ROBOT_LINE)
+        .map_err(|_| "the robot sent a line that is not an encrypted frame")?
+    else {
+        return Err("the robot sent a handshake frame inside the session".into());
+    };
+    let plain = session.open(&ciphertext).map_err(
+        |_| "a reply from the robot did not decrypt — the session is no longer trustworthy",
+    )?;
+    Ok(String::from_utf8(plain)?)
+}
+
+/// `duckctl setup-code …`: the file of codes, and nothing on the radio.
+fn setup_code_command(
+    action: &SetupCodeCmd,
+    target: &Target,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        SetupCodeCmd::Add => {
+            use std::io::IsTerminal as _;
+            if std::io::stdin().is_terminal() {
+                eprintln!(
+                    "Paste the setup code (md1:<robot id>:<key>, or the QR's text) and press Enter:"
+                );
+            }
+            let mut text = String::new();
+            std::io::stdin().read_line(&mut text)?;
+            let code = setup_code::SetupCode::parse(&text)?;
+            let mut names = vec![code.id.as_str()];
+            if let Some(wanted) = target.wanted().filter(|wanted| *wanted != code.id) {
+                names.push(wanted);
+            }
+            let path = setup_code::write(&setup_code::with(&setup_code::read(), &code, &names))?;
+            eprintln!(
+                "stored the setup code for {} under {} in {}",
+                code.id,
+                names.join(", "),
+                path.display()
+            );
+            Ok(())
+        }
+        SetupCodeCmd::List => {
+            let entries = setup_code::entries(&setup_code::read());
+            if entries.is_empty() {
+                eprintln!("no setup codes stored — `duckctl setup-code add` stores one");
+            }
+            for (name, code) in entries {
+                if name == code.id {
+                    println!("{name}");
+                } else {
+                    println!("{name} ({})", code.id);
+                }
+            }
+            Ok(())
+        }
+        SetupCodeCmd::Remove { name } => {
+            let (left, removed) = setup_code::without(&setup_code::read(), name);
+            if removed == 0 {
+                return Err(format!("no setup code stored for {name:?}").into());
+            }
+            setup_code::write(&left)?;
+            eprintln!("forgot {name}'s setup code ({removed} name(s))");
+            Ok(())
+        }
+    }
+}
+
 /// Write one NDJSON line, chunked.
 ///
 /// Chunked by the same code the robot uses. btleplug does not expose the negotiated MTU, so 20
@@ -2438,6 +2748,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         // `scan` returns from `run` as soon as the discovery loop ends, so it never reaches a
         // request: there is no method to send, and connecting is the thing it exists not to do.
         Command::Scan => unreachable!("scan returns before anything connects"),
+        Command::SetupCode(_) => unreachable!("setup-code returns before anything connects"),
         Command::Status => ("update.status", serde_json::json!({}), REPLY_TIMEOUT),
         // The fallback, reached only when no advertisement carried an address. `net.status` is what
         // the advertisement is made of — `btd` re-reads it every five seconds — so this asks the
@@ -2482,6 +2793,11 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::SshWifi => (
+            proto::method::SYSTEM_OPEN_WIFI_SSH,
+            serde_json::json!({}),
+            REPLY_TIMEOUT,
+        ),
         Command::Do { skill } => (
             proto::method::ROBOT_DO,
             serde_json::json!({ "skill": skill }),
@@ -3418,21 +3734,6 @@ mod tests {
         )
     }
 
-    /// The whole point of the change: a listing says where to reach the robot, with no connection.
-    /// The one thing `open` adds over `ip`, and the reason it is a command rather than a documented
-    /// `open "http://$(duckctl ip):8080"`: the port has one home.
-    #[test]
-    fn the_console_url_is_the_address_and_the_port() {
-        assert_eq!(
-            console_url("192.168.1.42", 8080),
-            "http://192.168.1.42:8080/"
-        );
-        assert_eq!(
-            console_url("192.168.1.42", 9000),
-            "http://192.168.1.42:9000/"
-        );
-    }
-
     /// `ip` picks a robot the same way every other command does. Two robots on one bench, one of
     /// them named — the address that comes back has to be that robot's, not whichever advertisement
     /// arrived first.
@@ -3462,27 +3763,15 @@ mod tests {
         assert!(message.contains("wifi connect"));
     }
 
-    /// `--print` and `--port` are the two things `open` takes, and neither is positional.
+    /// `--print` is the one thing `open` takes. `--port` is gone: the robot's console port is not
+    /// reachable from a LAN any more, and the local bridge picks its own.
     #[test]
-    fn open_takes_a_port_and_can_print_instead() {
-        let cli = Cli::try_parse_from(["duckctl", "open", "--print", "--port", "9000"])
-            .expect("open --print --port parses");
-        assert!(matches!(
-            cli.command,
-            Command::Open {
-                print: true,
-                port: 9000
-            }
-        ));
-
+    fn open_can_print_instead() {
+        let cli = Cli::try_parse_from(["duckctl", "open", "--print"]).expect("open --print parses");
+        assert!(matches!(cli.command, Command::Open { print: true }));
         let cli = Cli::try_parse_from(["duckctl", "open"]).expect("open parses on its own");
-        assert!(matches!(
-            cli.command,
-            Command::Open {
-                print: false,
-                port: 8080
-            }
-        ));
+        assert!(matches!(cli.command, Command::Open { print: false }));
+        assert!(Cli::try_parse_from(["duckctl", "open", "--port", "9000"]).is_err());
     }
 
     /// `ssh` takes a user and a trailing command, and the user falls back the documented way: the

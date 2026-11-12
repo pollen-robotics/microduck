@@ -40,6 +40,13 @@ WebRTC.
 An HTTP listener in `mediad`, one route, returning the page. `http://<robot>:8080/` and there is
 nothing else to run.
 
+> **Since daemon 0.19 that address is the robot's loopback, not the LAN** (`b23644e5`, "Default
+> media and BLE listeners to secure access"). The page and its signalling were unauthenticated, so
+> `mediad` binds `127.0.0.1` and the only door a LAN has is `duck-gateway` on 9443, which admits a
+> peer that proves the robot's setup code through a Noise handshake. A browser cannot do that, so
+> from a laptop the page now arrives through `duckctl open`'s local bridge (§2.2). The rest of this
+> section is the page's design, which is unchanged; only where it is served from moved.
+
 This deletes four problems at once rather than one:
 
 - **No `python3`.** The instruction becomes an address.
@@ -166,13 +173,32 @@ Its third caller is neither of the two above: `install-dev.md` opens by asking f
 
 ### 2.2 `duckctl open`
 
-Resolve, then open `http://<address>:8080/` in the browser. `--print` prints the URL instead, for
-a machine with no browser or a script; `--port` for a robot started with a non-default
-`--web-port`.
+Resolve, then run a bridge on this machine and open it in the browser (`duckctl/src/console.rs`).
+`--print` prints the URL instead. The bridge runs until Ctrl-C, because the URL is only good while
+it does.
 
-A command rather than a documented shell substitution, for one reason: **the port default should
-live in exactly one place that a person never has to read.** `open "http://$(duckctl ip):8080"`
-works, and it is the kind of line someone writes once and then looks up forever.
+**Why a bridge.** `mediad` serves on the robot's loopback (§1); the LAN reaches only `duck-gateway`,
+which wants the setup code proven over Noise before it opens a byte to `mediad`'s signalling. So
+`duckctl` does what the phone app's `media_proxy.rs` does: it serves the console page on
+`127.0.0.1`, points the page's signalling at a second `127.0.0.1` listener, and tunnels each
+WebSocket through an authenticated gateway session using the code `duckctl setup-code add` stored.
+The key never reaches the browser.
+
+**Loopback is not private, so the listener checks two things.** Browsers apply no same-origin
+policy to WebSockets: any page in any tab could connect to the bridge's port and drive the robot
+through a session this process had already authenticated, and so could any local process or user.
+The port is scannable. So each run makes a 128-bit token that only the page served here carries, in
+the WebSocket path, and a connection is tunnelled only with that token **and** this page's
+`Origin`. Anything else gets a 403 and never reaches the robot.
+
+**What it costs.** The page is this duckctl's copy (`include_str!` of `mediad/webclient/index.html`),
+not the robot's: the gateway reaches signalling only, so the robot's own page is out of reach. Keep
+duckctl current; the page's API version banner says when the two differ. `/frame` snapshots and the
+OS-update link on 8090 are not reachable through it either. Serving the robot's own page would mean
+teaching the gateway a second destination, which is the change to make if the copy ever hurts.
+
+`--port` is gone: the robot's console port is not reachable from a LAN, and the bridge picks its
+own.
 
 ### 2.3 Not these
 

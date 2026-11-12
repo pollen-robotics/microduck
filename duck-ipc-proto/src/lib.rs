@@ -537,7 +537,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
 ///
-/// # v54 — soccer mode
+/// # v54 — ssh on wifi, on request
+///
+/// [`method::SYSTEM_OPEN_WIFI_SSH`]: a shipping image answers ssh on the head's USB-C link only
+/// (microduck_yocto#110), and this is the request that image was built to accept instead of
+/// opening the robot. An older `configd` refuses it by name.
+///
+/// # v55 — soccer mode
 ///
 /// [`method::ROBOT_SOCCER`] switches soccer mode — the pad's bumpers kick — and, on top of it,
 /// autonomous soccer, where the robot finds a purple ball, walks to it and kicks it.
@@ -546,7 +552,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// learns of a switch made from elsewhere — an NFC tag. Underneath, `robotd` subscribes to
 /// `mediad`'s local [`method::MEDIA_BALL`]; a `mediad` older than this refuses it, and the soccer
 /// block's `camera` line says so. All additive.
-pub const API_VERSION: u32 = 54;
+pub const API_VERSION: u32 = 55;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1068,6 +1074,9 @@ pub mod method {
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
     pub const SYSTEM_REBOOT: &str = "system.reboot";
+    /// Open ssh on wifi until the next reboot. A shipping image listens on the head's USB-C link
+    /// only, so without this a shell over wifi means opening the robot.
+    pub const SYSTEM_OPEN_WIFI_SSH: &str = "system.openWifiSsh";
     /// The Bluetooth pairing PIN. Never reachable over Bluetooth itself.
     pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
     /// Set the Bluetooth pairing PIN.
@@ -1366,6 +1375,8 @@ pub enum Call {
     SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
+    /// See [`method::SYSTEM_OPEN_WIFI_SSH`].
+    SystemOpenWifiSsh,
     /// Read the pairing PIN.
     ///
     /// Exists so `btd` can answer a BLE passkey request without owning config. It must never be
@@ -1525,6 +1536,7 @@ impl Call {
             Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
+            Call::SystemOpenWifiSsh => method::SYSTEM_OPEN_WIFI_SSH,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
@@ -1560,6 +1572,9 @@ impl Call {
                 | Call::NetForget(_)
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
+                // A root shell reachable from the network is at least as consequential as a
+                // reboot, even with the password still required.
+                | Call::SystemOpenWifiSsh
                 | Call::SystemSetPairingPin(_)
                 // Powering the machine off is at least as disruptive as rebooting it.
                 | Call::RobotShutdown
@@ -1727,6 +1742,7 @@ impl Call {
             | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
+            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
@@ -1876,6 +1892,7 @@ impl Call {
             | Call::SystemInfo
             | Call::SystemServices
             | Call::SystemReboot
+            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadBindings
@@ -1984,6 +2001,7 @@ impl Call {
             method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
+            method::SYSTEM_OPEN_WIFI_SSH => Call::SystemOpenWifiSsh,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
@@ -2190,6 +2208,7 @@ pub mod test_support {
                 name: "duck-01".into(),
             }),
             Call::SystemReboot,
+            Call::SystemOpenWifiSsh,
             Call::SystemPairingPin,
             Call::SystemSetPairingPin(SetPairingPinParams {
                 pin: "042042".into(),
@@ -3090,7 +3109,7 @@ pub struct ModeResult {
     pub mode: String,
     /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
     /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
-    /// the pad's buttons do. (v54)
+    /// the pad's buttons do. (v55)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerParams>,
 }
@@ -4710,7 +4729,7 @@ pub struct RobotState {
     /// [`LaserTrackState`]. (v52)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laser: Option<LaserTrackState>,
-    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v54)
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v55)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
@@ -5083,6 +5102,19 @@ pub struct PairingPinResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebootResult {
     pub in_seconds: u64,
+}
+
+/// Answer to [`Call::SystemOpenWifiSsh`].
+///
+/// The opening lasts until the next reboot and no longer: the image's switch is a file in `/run`,
+/// a tmpfs. There is no call to close it early, because a reboot already does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenWifiSshResult {
+    /// False on an image with no such switch — a board with no USB link, which keeps ssh on wifi
+    /// anyway. Nothing was done, and ssh on wifi is whatever the image makes it. True on the dev
+    /// image too: it ships the switch, but listens on wifi permanently, so pressing it changes
+    /// nothing there.
+    pub switched: bool,
 }
 
 // ── pad.* results ────────────────────────────────────────────────────────────
@@ -6660,7 +6692,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            78,
+            79,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6892,6 +6924,7 @@ mod tests {
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
+                method::SYSTEM_OPEN_WIFI_SSH,
                 method::SYSTEM_SET_PAIRING_PIN,
                 // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
                 // list: reading which pads are paired is exactly the kind of inspection support
