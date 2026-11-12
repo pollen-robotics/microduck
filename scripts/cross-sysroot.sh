@@ -49,7 +49,7 @@ TRIPLE=aarch64-linux-gnu
 # pkg-config answering with the *host's* library and producing a binary that cannot run on the
 # robot. So this sysroot serves the whole workspace rather than one crate of it.
 MODULES="gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0 gstreamer-audio-1.0
-gstreamer-webrtc-1.0 gstreamer-sdp-1.0 libudev"
+gstreamer-webrtc-1.0 gstreamer-sdp-1.0 gstreamer-rtp-1.0 libudev"
 
 # The packages that satisfy those modules, and nothing more.
 #
