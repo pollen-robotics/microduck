@@ -207,13 +207,6 @@ fn permits(call: &proto::Call) -> bool {
         // Unlike `resetToGolden` it discards nothing.
         SystemReboot => true,
 
-        // ssh on wifi until the next reboot. The shipping image listens on the head's USB-C link
-        // only (microduck_yocto#110), so without this a shell over wifi means opening the robot.
-        // BLE is where it belongs for the same reason as `net.connect`: whoever asks is in the
-        // room, holding a phone that proved the setup code, and the login it opens still needs
-        // the operator password on top.
-        SystemOpenWifiSsh => true,
-
         // ── the gamepad ─────────────────────────────────────────────────────
         //
         // Pairing a controller from the phone, which is where it belongs: whoever is holding the
@@ -657,7 +650,6 @@ mod tests {
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
                 proto::method::SYSTEM_REBOOT,
-                proto::method::SYSTEM_OPEN_WIFI_SSH,
                 // Bonding a gamepad, which afterwards can enable the walking policy. Allowed for
                 // the same reason as provisioning: it takes a pad held in pairing mode next to the
                 // robot, so BLE's physical-presence claim (§4.2) is not being stretched — and the
@@ -724,7 +716,6 @@ mod tests {
                 name: "duck".into(),
             }),
             proto::Call::SystemReboot,
-            proto::Call::SystemOpenWifiSsh,
         ] {
             assert_eq!(
                 upstream_for(&call),

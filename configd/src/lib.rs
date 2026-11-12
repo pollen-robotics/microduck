@@ -35,6 +35,5 @@ pub mod net;
 pub mod nm;
 pub mod pad;
 pub mod power;
-pub mod ssh;
 pub mod store;
 pub mod units;

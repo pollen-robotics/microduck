@@ -143,15 +143,10 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
 A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
-wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would. To
-open it until the robot next reboots, without opening the robot:
-
-```bash
-duckctl ssh-wifi
-```
-
-That asks `configd` over the same authenticated Bluetooth session every other command uses, so it
-needs the setup code. On the dev image it changes nothing: ssh is open on wifi there already.
+wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
+That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi means opening
+the robot. Over the USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot;
+or flash the dev image, which keeps ssh open on wifi.
 
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a

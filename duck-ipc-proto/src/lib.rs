@@ -537,18 +537,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
 ///
-/// # v54 — ssh on wifi, on request
+/// # v54 — ssh on wifi over BLE (daemon 0.20.0 only)
 ///
-/// [`method::SYSTEM_OPEN_WIFI_SSH`]: a shipping image answers ssh on the head's USB-C link only
-/// (microduck_yocto#110), and this is the request that image was built to accept instead of
-/// opening the robot. An older `configd` refuses it by name.
+/// `system.openWifiSsh`: configd opened ssh on wifi until reboot when asked over the secure BLE
+/// session. Shipped in daemon 0.20.0 and withdrawn in the next release (v55 below).
 ///
-/// # v55 — writing a tag
+/// # v55 — `system.openWifiSsh` withdrawn
+///
+/// ssh on wifi stays a decision made with the robot open: over the head's USB-C link
+/// (`sudo touch /run/microduck-ssh-wifi`, microduck_yocto#110) or by flashing the dev image. Once
+/// opened, the login is the shared operator password, so an opening from a phone in Bluetooth range
+/// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
+/// refused by name; nothing else on the wire changed.
+///
+/// # v56 — writing a tag
 ///
 /// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
 /// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
 /// has no socket, so the call fails to connect rather than being refused by name.
-pub const API_VERSION: u32 = 55;
+pub const API_VERSION: u32 = 56;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1064,9 +1071,6 @@ pub mod method {
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
     pub const SYSTEM_REBOOT: &str = "system.reboot";
-    /// Open ssh on wifi until the next reboot. A shipping image listens on the head's USB-C link
-    /// only, so without this a shell over wifi means opening the robot.
-    pub const SYSTEM_OPEN_WIFI_SSH: &str = "system.openWifiSsh";
     /// The Bluetooth pairing PIN. Never reachable over Bluetooth itself.
     pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
     /// Set the Bluetooth pairing PIN.
@@ -1363,8 +1367,6 @@ pub enum Call {
     SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
-    /// See [`method::SYSTEM_OPEN_WIFI_SSH`].
-    SystemOpenWifiSsh,
     /// Read the pairing PIN.
     ///
     /// Exists so `btd` can answer a BLE passkey request without owning config. It must never be
@@ -1528,7 +1530,6 @@ impl Call {
             Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
-            Call::SystemOpenWifiSsh => method::SYSTEM_OPEN_WIFI_SSH,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
@@ -1564,9 +1565,6 @@ impl Call {
                 | Call::NetForget(_)
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
-                // A root shell reachable from the network is at least as consequential as a
-                // reboot, even with the password still required.
-                | Call::SystemOpenWifiSsh
                 | Call::SystemSetPairingPin(_)
                 // Powering the machine off is at least as disruptive as rebooting it.
                 | Call::RobotShutdown
@@ -1733,7 +1731,6 @@ impl Call {
             | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
-            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
@@ -1889,7 +1886,6 @@ impl Call {
             | Call::SystemInfo
             | Call::SystemServices
             | Call::SystemReboot
-            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadBindings
@@ -1998,7 +1994,6 @@ impl Call {
             method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
-            method::SYSTEM_OPEN_WIFI_SSH => Call::SystemOpenWifiSsh,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
@@ -2205,7 +2200,6 @@ pub mod test_support {
                 name: "duck-01".into(),
             }),
             Call::SystemReboot,
-            Call::SystemOpenWifiSsh,
             Call::SystemPairingPin,
             Call::SystemSetPairingPin(SetPairingPinParams {
                 pin: "042042".into(),
@@ -4988,19 +4982,6 @@ pub struct RebootResult {
     pub in_seconds: u64,
 }
 
-/// Answer to [`Call::SystemOpenWifiSsh`].
-///
-/// The opening lasts until the next reboot and no longer: the image's switch is a file in `/run`,
-/// a tmpfs. There is no call to close it early, because a reboot already does.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenWifiSshResult {
-    /// False on an image with no such switch — a board with no USB link, which keeps ssh on wifi
-    /// anyway. Nothing was done, and ssh on wifi is whatever the image makes it. True on the dev
-    /// image too: it ships the switch, but listens on wifi permanently, so pressing it changes
-    /// nothing there.
-    pub switched: bool,
-}
-
 // ── pad.* results ────────────────────────────────────────────────────────────
 
 /// A gamepad this robot knows about.
@@ -6576,7 +6557,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            79,
+            78,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6808,7 +6789,6 @@ mod tests {
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
-                method::SYSTEM_OPEN_WIFI_SSH,
                 method::SYSTEM_SET_PAIRING_PIN,
                 // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
                 // list: reading which pads are paired is exactly the kind of inspection support

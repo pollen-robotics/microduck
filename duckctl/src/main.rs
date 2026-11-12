@@ -565,8 +565,9 @@ fn ssh_refusal(address: &str) -> Result<(), String> {
     match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
             "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
-             (microduck@192.168.42.1). `duckctl ssh-wifi` opens it on wifi until the robot next \
-             reboots; then run this again."
+             (microduck@192.168.42.1), on purpose: reaching it means opening the robot. Over that \
+             link, `sudo touch /run/microduck-ssh-wifi` opens wifi ssh until the next reboot; the \
+             dev image has it open always."
         )),
         _ => Ok(()),
     }
@@ -1352,13 +1353,6 @@ enum Command {
     },
     /// Reboot it.
     Reboot,
-    /// Open ssh on wifi until the robot next reboots.
-    ///
-    /// A shipping image answers ssh on the head's USB-C link only, so `duckctl ssh` over wifi is
-    /// refused there. This asks `configd`, over the same authenticated Bluetooth session every
-    /// other command uses, to open port 22 on every interface until the next reboot. Then
-    /// `duckctl ssh` works. The dev image listens on wifi already, so there it changes nothing.
-    SshWifi,
     /// Send any method, for whatever is not wrapped above.
     Call {
         method: String,
@@ -2826,11 +2820,6 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
-        Command::SshWifi => (
-            proto::method::SYSTEM_OPEN_WIFI_SSH,
-            serde_json::json!({}),
-            REPLY_TIMEOUT,
-        ),
         Command::Do { skill } => (
             proto::method::ROBOT_DO,
             serde_json::json!({ "skill": skill }),
