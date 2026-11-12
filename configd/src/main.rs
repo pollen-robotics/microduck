@@ -620,29 +620,6 @@ async fn dispatch(
             )
         }
 
-        proto::Call::SystemOpenWifiSsh => {
-            let switch = std::path::Path::new(configd::ssh::SWITCH);
-            let installed = std::path::Path::new(configd::ssh::INSTALLED);
-            match configd::ssh::open(switch, installed) {
-                Ok(result) => {
-                    // Warn, not info: a root-capable login just became reachable from the
-                    // network, and the journal is where anyone auditing that will look.
-                    tracing::warn!(
-                        switched = result.switched,
-                        "ssh on wifi requested; open until reboot"
-                    );
-                    proto::Response::ok(Some(id), &result)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not open ssh on wifi");
-                    proto::Response::err(
-                        Some(id),
-                        proto::Error::new(proto::code::INTERNAL_ERROR, e.to_string()),
-                    )
-                }
-            }
-        }
-
         // `update.*` is `updaterd`'s and `robot.*` is `robotd`'s. A client reaching here aimed at
         // the wrong socket, so say that rather than report a generic failure.
         other => proto::Response::err(
