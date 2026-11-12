@@ -72,3 +72,7 @@ pub mod detect;
 /// camera-sized replies. `npu-bringup.md` §"media.frame".
 #[cfg(any(target_os = "linux", feature = "gstreamer"))]
 pub mod frame;
+
+/// Finding a laser dot in the tee's frames, for `robotd`'s laser tracking. The scan is portable
+/// and tested anywhere; the subscription that feeds it frames is gated with [`pipeline`].
+pub mod laser;

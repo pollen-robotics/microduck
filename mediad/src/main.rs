@@ -1,16 +1,13 @@
 //! `mediad` — camera, mic, WebRTC, and the remote gateway.
 //!
-//! Runs the signalling server in this process, streams video to whoever connects, and gives each
-//! peer a `control` datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is
-//! the design.
+//! Runs the signalling server in this process and gives each admitted peer a `control`
+//! datachannel that is a pipe to the robot API. `docs/design/remote-webrtc.md` is the design.
 //!
 //! ## What it does not do
 //!
-//! **It does not authenticate.** Anyone who reaches the signalling port can drive the robot and
-//! see its camera. That is a decision, not an omission — §4 has the reasoning, and the short
-//! version is that the pairing PIN is a shared `000000`, so a gate would add a step to every
-//! connection and prove nothing. The bridge that makes a robot reachable from outside the LAN
-//! authenticates on both sides before a session arrives.
+//! **The local signalling server does not authenticate.** It therefore binds to loopback by
+//! default; the remote bridge authenticates before forwarding a session to it. Explicitly
+//! binding a LAN address exposes camera and control to every peer that can reach that address.
 //!
 //! **It is not on the recovery path.** If `mediad` will not start, the robot still walks, still
 //! takes an update, and is still reachable over Bluetooth. That is why it may depend on a plugin
@@ -26,10 +23,9 @@ use clap::Parser;
 struct Args {
     /// Where to bind the signalling server.
     ///
-    /// All interfaces by default, and that is the point: loopback-only would mean a peer on the
-    /// LAN cannot reach it at all and every session would have to go through a bridge, which
-    /// defeats having a local mode. See `remote-webrtc.md` §3.
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Also used for the unauthenticated console and snapshot endpoint. Keep loopback-only
+    /// until an authenticated local gateway is available. A LAN bind is for controlled benches.
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// The signalling server's port. 8443 is what `webrtcsink`'s own signaller defaults to, so a
@@ -476,9 +472,15 @@ fn main() -> ExitCode {
         // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
         // upright already, and turning them twice is a picture on its side with nothing to say why.
         let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
+        // What `media.laser` turns a pixel into a direction with — filled in below, once the
+        // intrinsics are known, which is only after the pipeline has pinned a sensor mode — and
+        // where every look is broadcast, for the console's overlay.
+        let laser_hub = std::sync::Arc::new(mediad::laser::Hub::default());
+        let frame_laser = laser_hub.clone();
         tokio::spawn(async move {
             let _lock = frame_lock;
-            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_rotate).await
+            if let Err(error) =
+                mediad::frame::serve(frame_listener, frame_source, frame_rotate, frame_laser).await
             {
                 tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
             }
@@ -601,6 +603,19 @@ fn main() -> ExitCode {
             ),
         }
 
+        // The laser detector's geometry: these intrinsics, and the same turn the duck detector's
+        // sampler gets — none when the pipeline already flipped the frames.
+        if let Some(geometry) = &intrinsics {
+            let _ = laser_hub.geometry.set(mediad::laser::Geometry::from_intrinsics(
+                geometry,
+                if args.flip_in_pipeline {
+                    uyvy::Turn::None
+                } else {
+                    turn
+                },
+            ));
+        }
+
         let video = mediad::session::Video {
             width,
             height,
@@ -714,6 +729,31 @@ fn main() -> ExitCode {
                 });
             }
 
+            // The laser detector's looks, for the console to draw over the video. Only while
+            // something has tracking on — the detector runs for robotd's subscription, never for
+            // a peer — and the newest look is all a slow peer needs, as with the ducks.
+            {
+                let mut dots = laser_hub.dots.subscribe();
+                let to_peer = channel.outbound.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match dots.recv().await {
+                            Ok(dot) => {
+                                if to_peer
+                                    .send(mediad::laser::notification(&dot))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             tokio::spawn(mediad::session::run(
                 channel.inbound,
                 channel.outbound,
@@ -747,4 +787,15 @@ fn main() -> ExitCode {
          install gstreamer\n    cargo build -p mediad --features gstreamer\n"
     );
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod security_defaults {
+    use super::*;
+
+    #[test]
+    fn local_listeners_are_not_exposed_by_default() {
+        let args = Args::try_parse_from(["mediad"]).unwrap();
+        assert_eq!(args.host, "127.0.0.1");
+    }
 }

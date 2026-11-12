@@ -7,7 +7,7 @@ use duck_ipc_proto as proto;
 use robotd_params::pad_axes::{AxisBinding, Sticks};
 
 use crate::buttons::Buttons;
-use crate::hold::{HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
+use crate::hold::{FLASHLIGHT_TAP, HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
 
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
@@ -142,6 +142,7 @@ pub struct Mapper {
     imu_reference: Option<[f32; 4]>,
     start: HoldButton,
     select: HoldButton,
+    home: HoldButton,
     /// Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     /// starts the wheee ride. The prototype's threshold.
     prev_rt: f64,
@@ -165,6 +166,7 @@ impl Mapper {
             imu_reference: None,
             start: HoldButton::default(),
             select: HoldButton::default(),
+            home: HoldButton::default(),
             prev_rt: 0.0,
             prev_lt: 0.0,
             up: false,
@@ -176,6 +178,7 @@ impl Mapper {
     pub fn pad_gone(&mut self) {
         self.start.reset();
         self.select.reset();
+        self.home.reset();
         self.imu_reference = None;
     }
 
@@ -329,8 +332,16 @@ impl Mapper {
 
         // Home: the flashlight. Not bindable — it is not a skill, and the robot owns the toggle.
         // A request, so a board without a flashlight says so in the journal rather than not at
-        // all.
-        if pad.pressed.contains(Buttons::HOME) {
+        // all. On a tap's release, not the press: holding Home is how a pad turns itself off,
+        // and that hold must not toggle the flashlight on its way out (#557). A hold past
+        // [`FLASHLIGHT_TAP`] crosses the threshold and its release is silent; a pad that drops
+        // mid-hold leaves the hold spent.
+        if let HoldAction::Tap = self.home.tick(
+            pad.held.contains(Buttons::HOME),
+            pad.released.contains(Buttons::HOME),
+            now,
+            &[FLASHLIGHT_TAP],
+        ) {
             out.push(Out::Request(proto::Call::RobotFlashlight(
                 proto::FlashlightParams {
                     toggle: true,
@@ -582,11 +593,13 @@ mod tests {
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change
     /// it again, a stick inside the deadzone walks nothing, and A's edge runs A's binding.
-    /// Home toggles the flashlight, on its edge: once per press, held or not, and the robot owns
-    /// the toggle.
+    /// Home toggles the flashlight on a tap's release, once — and never after a hold, which is
+    /// how a pad powers itself off (#557), nor after a hold the pad dropped in the middle of.
     #[test]
-    fn home_toggles_the_flashlight_once_per_press() {
-        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+    fn home_toggles_the_flashlight_on_a_tap_release_only() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
         let (mut out, mut frame) = (Vec::new(), Vec::new());
         let flashlight = |out: &[Out]| {
             out.iter()
@@ -601,21 +614,41 @@ mod tests {
                 })
                 .count()
         };
-
-        let pad = PadFrame {
+        let down = PadFrame {
             pressed: Buttons::HOME,
             held: Buttons::HOME,
             ..Default::default()
         };
-        m.tick(&pad, &cfg, t, &mut out, &mut frame);
-        assert_eq!(flashlight(&out), 1, "{out:?}");
-
-        let pad = PadFrame {
+        let still = PadFrame {
             held: Buttons::HOME,
             ..Default::default()
         };
-        m.tick(&pad, &cfg, t, &mut out, &mut frame);
-        assert_eq!(flashlight(&out), 0, "held is not a second press");
+        let up = PadFrame {
+            released: Buttons::HOME,
+            ..Default::default()
+        };
+
+        // A tap: nothing on the press, one toggle on the release.
+        m.tick(&down, &cfg, at(0), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "the press waits for the release");
+        m.tick(&still, &cfg, at(100), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "held is not a press");
+        m.tick(&up, &cfg, at(200), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 1, "{out:?}");
+
+        // The pad's power-off hold: nothing at any point, release included.
+        m.tick(&down, &cfg, at(1_000), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0);
+        m.tick(&still, &cfg, at(1_000 + 3_000), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0);
+        m.tick(&up, &cfg, at(1_000 + 3_020), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "a hold's release is silent");
+
+        // The pad going away mid-press: no release edge comes, and nothing toggles after.
+        m.tick(&down, &cfg, at(10_000), &mut out, &mut frame);
+        m.pad_gone();
+        m.tick(&up, &cfg, at(10_100), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "a dropped press is spent");
     }
 
     /// Select held: the rest goes at two seconds without waiting for the release, the power-off at
@@ -910,6 +943,13 @@ mod tests {
                 );
                 let frame = calls(mode, &cfg, s);
                 let mut expected = expected.map(|v| v * direction);
+                // Walking back is slower than walking forward.
+                if matches!(mode, Mode::Drive | Mode::HeadDrive)
+                    && direction < 0.0
+                    && positive.left_y != 0.0
+                {
+                    expected[0] = -0.3;
+                }
                 // The crouch goes further down than the rise goes up.
                 if mode == Mode::BodyPose && direction < 0.0 && positive.left_y != 0.0 {
                     expected[7] = -0.025;

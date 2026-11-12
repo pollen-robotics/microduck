@@ -342,6 +342,7 @@ cp "$BIN"/robotctl staged/
 cp "$BIN"/robotd staged/
 cp "$BIN"/configd staged/
 cp "$BIN"/btd staged/
+cp "$BIN"/duck-gateway staged/
 cp "$BIN"/padd staged/
 # netpadd is padd fed by UDP; an ExecCondition on `[netpad] enabled` picks which of the two runs.
 cp "$BIN"/netpadd staged/
@@ -391,6 +392,7 @@ cargo run -p xtask -- package \
     --include "updater/systemd/robot-boot-check.timer=systemd/robot-boot-check.timer" \
     --include "configd/systemd/configd.service=systemd/configd.service" \
     --include "btd/systemd/btd.service=systemd/btd.service" \
+    --include "duck-gateway/systemd/duck-gateway.service=systemd/duck-gateway.service" \
     --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
     --include "padd/systemd/padd.service=systemd/padd.service" \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
