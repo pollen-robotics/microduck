@@ -5325,6 +5325,13 @@ fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
         let mac = status.mac.as_deref().unwrap_or("unknown");
         let _ = writeln!(out, "iface   {iface}  {mac}");
     }
+    if let Some(joining) = &status.joining {
+        let _ = writeln!(
+            out,
+            "joining {}  {:?}, {}s of at most {}s",
+            joining.ssid, joining.step, joining.elapsed_seconds, joining.timeout_seconds
+        );
+    }
 
     // The one state worth explaining, because it is a provisioning mistake rather than a
     // network problem and the fix is a different script entirely.

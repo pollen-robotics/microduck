@@ -354,7 +354,8 @@ duckctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
 ```
 
 Omit `--psk` for an open network. Joining disconnects the robot from the network it is on, so an ssh
-session over wifi drops; that is the command working. It can take up to 45 seconds to answer.
+session over wifi drops; that is the command working. It can take up to a minute to answer, and
+prints each step on the way (`· joining <ssid>: checking the passphrase`).
 
 ```bash
 duckctl --name <robot-name> wifi forget <ssid>

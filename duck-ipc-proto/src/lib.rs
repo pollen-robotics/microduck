@@ -555,7 +555,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
 /// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
 /// has no socket, so the call fails to connect rather than being refused by name.
-pub const API_VERSION: u32 = 56;
+///
+/// # v57 — a join's progress
+///
+/// [`NetStatusResult::joining`]: while a `net.connect` is in flight, `net.status` says which
+/// network it is joining and how far it has got, so a client can show progress instead of a 45s
+/// spinner. Additive: absent from an older `configd`, and whenever no join is in flight.
+pub const API_VERSION: u32 = 57;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4838,6 +4844,45 @@ pub struct NetStatusResult {
     /// provisioning gives us a real serial (`updater-design.md` §5.7).
     pub mac: Option<String>,
     pub iface: Option<String>,
+    /// The `net.connect` in flight, if there is one. (v57)
+    ///
+    /// Present from the moment `configd` accepts the call until it answers, and only then: an
+    /// autoconnect NetworkManager starts on its own shows as `connecting` with no `joining`. While
+    /// it is present, the other fields still describe the link as it is — which, early in a join,
+    /// can be the network the robot is about to leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joining: Option<Joining>,
+}
+
+/// How far a `net.connect` has got. See [`NetStatusResult::joining`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Joining {
+    /// The network asked for.
+    pub ssid: String,
+    pub step: JoinStep,
+    /// Since `configd` accepted the call.
+    pub elapsed_seconds: u32,
+    /// The longest `configd` will take before answering `timeout`, counted from the same instant.
+    /// An upper bound for a progress bar, not an estimate: most joins finish well inside it.
+    pub timeout_seconds: u32,
+}
+
+/// One stage of a join, in the order a successful one passes through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStep {
+    /// Looking for the network before touching any profile — a few seconds.
+    Scanning,
+    /// NetworkManager is preparing the radio and associating with the access point.
+    Associating,
+    /// The WPA handshake: this is where a passphrase is checked.
+    Authenticating,
+    /// The access point rejected the handshake and NetworkManager is asking for a key, which
+    /// nothing on the robot will supply. Almost always a wrong passphrase; the call answers
+    /// `bad_key` shortly after.
+    KeyRejected,
+    /// Associated; waiting for an address, which on a busy network is where the time goes.
+    Addressing,
 }
 
 /// How a network is secured. What a client needs in order to know whether to ask for a
