@@ -323,6 +323,11 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     tracing::warn!("e-ink in the beak");
     let _ = robot.mouth(0.0);
     wiggle(robot, head, KEEP);
+    // TEMPORARY, to compare: the same sound with the head up, the beak shut and nothing moving.
+    if robot.sound(LET_GO).is_ok() {
+        tracing::warn!(sound = LET_GO.as_str(), "test: the let-go sound, head up");
+    }
+    hold(robot, head, Duration::from_millis(1500));
 
     // Head down, beak open: the display falls. Then the beak closes and the head comes straight
     // back up to the centre, before it is let go.
@@ -854,8 +859,8 @@ mod tests {
         assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
         assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
         assert_eq!(*robot.rolls.last().unwrap(), 0.0);
-        // A few quacks, besides the first quack, the shutter's and the retch.
-        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 3;
+        // A few quacks, besides the first quack, the shutter's and the two retches.
+        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 4;
         assert_eq!(quacks, 4);
         // No display, no rolling.
         let mut robot = Fake {
