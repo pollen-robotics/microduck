@@ -22,11 +22,13 @@
 //!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
-//! 6. [`BEFORE_SIT`] later a standing robot sits; once seated, it opens its beak wide.
+//! 6. [`BEFORE_SIT`] later a standing robot sits; once seated, it opens its beak a little
+//!    ([`TAKE_OPEN`]): enough for the display, and no more.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
-//! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves ([`wiggle`]):
-//!    where the photo will be written to it, which is not done yet.
+//! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves with a short
+//!    quack at each side ([`wiggle`]): where the photo will be written to it, which is not done
+//!    yet.
 //! 9. It lowers its head, opens its beak to let the display go, closes it [`DROP`] later, and
 //!    brings its head back up to the centre.
 //!    No display in time, and it just closes its beak.
@@ -84,6 +86,10 @@ pub const KEEP: Duration = Duration::from_secs(5);
 const ROLL: f64 = 0.14;
 /// One roll left and back right.
 const ROLL_PERIOD: Duration = Duration::from_millis(500);
+/// The quack at each side of the roll: the short mouth-trigger one.
+const ROLL_QUACK: proto::SoundTag = proto::SoundTag::Chirp;
+/// How far the beak opens for the display to go in: a share of wide open.
+pub const TAKE_OPEN: f64 = 0.35;
 /// How often the rolling head is sent: smooth enough at a 500 ms period.
 const ROLL_STEP: Duration = Duration::from_millis(50);
 /// Head down and beak open, for the display to fall, before the beak closes again.
@@ -283,7 +289,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
         }
         hold(robot, head, SIT);
     }
-    if let Err(why) = robot.mouth(1.0) {
+    if let Err(why) = robot.mouth(TAKE_OPEN) {
         return Outcome::Failed(format!("robot.mouth: {why}"));
     }
 
@@ -326,11 +332,22 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
 }
 
 /// Roll the head side to side around `head` for `d`, [`ROLL`] each way every [`ROLL_PERIOD`],
-/// then settle it back on `head`. Sent every [`ROLL_STEP`], so the look-around stays off too.
+/// then settle it back on `head`, with a [`ROLL_QUACK`] each time the head reaches a side. Sent
+/// every [`ROLL_STEP`], so the look-around stays off too.
 fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
     let mut t = Duration::ZERO;
+    let mut sides = 0;
     while t < d {
-        let phase = std::f64::consts::TAU * t.as_secs_f64() / ROLL_PERIOD.as_secs_f64();
+        let turns = t.as_secs_f64() / ROLL_PERIOD.as_secs_f64();
+        // A side is reached at a quarter turn, then every half turn.
+        let side = (2.0 * turns + 0.5).floor() as u32;
+        if side > sides {
+            sides = side;
+            if let Err(why) = robot.sound(ROLL_QUACK) {
+                tracing::info!(%why, "robot.sound");
+            }
+        }
+        let phase = std::f64::consts::TAU * turns;
         let rolled = proto::HeadParams {
             head_roll: head.head_roll + ROLL * phase.sin(),
             ..head
@@ -665,6 +682,11 @@ mod tests {
             if c == "head" {
                 continue;
             }
+            // The quacks of the roll, one run.
+            if c == "quack" && out.last().is_some_and(|l| l == "quack" || l == "quacks") {
+                *out.last_mut().unwrap() = "quacks".into();
+                continue;
+            }
             // Every light switch before the flash, the last one ahead of the capture, is a blink.
             let last_on = calls[..capture]
                 .iter()
@@ -710,9 +732,10 @@ mod tests {
                 "light 0",
                 "save",
                 "sit",
-                "mouth 1",
+                "mouth 0.35",
                 "eink",
                 "mouth 0",
+                "quacks",
                 "look",
                 "mouth 1",
                 "mouth 0"
@@ -815,6 +838,10 @@ mod tests {
         assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
         assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
         assert_eq!(*robot.rolls.last().unwrap(), 0.0);
+        // A quack at each side: two a roll, besides the first quack and the shutter's.
+        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 2;
+        let rolls = (KEEP.as_secs_f64() / ROLL_PERIOD.as_secs_f64()) as usize;
+        assert_eq!(quacks, 2 * rolls);
         // No display, no rolling.
         let mut robot = Fake {
             eink_after: None,
@@ -847,7 +874,7 @@ mod tests {
         };
         assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
         let shape = shape(&robot.calls);
-        assert_eq!(&shape[shape.len() - 3..], ["sit", "mouth 1", "mouth 0"]);
+        assert_eq!(&shape[shape.len() - 3..], ["sit", "mouth 0.35", "mouth 0"]);
         assert!(robot.slept >= EINK_WITHIN);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }
