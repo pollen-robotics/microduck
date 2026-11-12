@@ -537,16 +537,41 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
 ///
-/// # v54 — a phase-encoded skill
+/// # v54 — ssh on wifi over BLE (daemon 0.20.0 only)
+///
+/// `system.openWifiSsh`: configd opened ssh on wifi until reboot when asked over the secure BLE
+/// session. Shipped in daemon 0.20.0 and withdrawn in the next release (v55 below).
+///
+/// # v55 — `system.openWifiSsh` withdrawn
+///
+/// ssh on wifi stays a decision made with the robot open: over the head's USB-C link
+/// (`sudo touch /run/microduck-ssh-wifi`, microduck_yocto#110) or by flashing the dev image. Once
+/// opened, the login is the shared operator password, so an opening from a phone in Bluetooth range
+/// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
+/// refused by name; nothing else on the wire changed.
+///
+/// # v56 — writing a tag
+///
+/// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
+/// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
+/// has no socket, so the call fails to connect rather than being refused by name.
+///
+/// # v57 — a join's progress
+///
+/// [`NetStatusResult::joining`]: while a `net.connect` is in flight, `net.status` says which
+/// network it is joining and how far it has got, so a client can show progress instead of a 45s
+/// spinner. Additive: absent from an older `configd`, and whenever no join is in flight.
+///
+/// # v58 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v53 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v57 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 54;
+pub const API_VERSION: u32 = 58;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -621,6 +646,10 @@ pub mod socket {
     /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
+
+    /// `nfcd`'s — [`super::method::NFC_WRITE`], and nothing else. Under `/run/nfcd/`, its
+    /// `RuntimeDirectory=`, for the same reason as the pad's.
+    pub const NFC: &str = "/run/nfcd/nfc.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -861,6 +890,15 @@ pub mod method {
     /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
     /// `[laser]` needs.
     pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
+    /// Write a text onto the next tag touched to the reader: one NDEF text record, as a phone
+    /// app writes it, so the tag then reads as that text everywhere — a mode tag, a pairing tag.
+    /// The answer comes when a tag has been written and read back, or when none was touched in
+    /// time; see [`super::NfcWriteResult`]. Answered by `nfcd`.
+    ///
+    /// An NTAG (NFC Forum Type 2) is written, and on the beta board's reader an ISO 15693 tag
+    /// (Type 5) too, formatted first if blank. A MIFARE Classic, a locked tag or a text too long
+    /// for the tag is refused with why, and nothing on it changes.
+    pub const NFC_WRITE: &str = "nfc.write";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1378,13 +1416,15 @@ pub enum Call {
     /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
     /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
+    /// Write a text onto the next tag touched; see [`method::NFC_WRITE`]. Answered by `nfcd`.
+    NfcWrite(NfcWriteParams),
 }
 
 /// The service that owns the answer to a call.
 ///
 /// One socket per service, connected directly — there is no broker (`architecture.md` §2.2). A
 /// transport adapter holds connections to the services whose calls it carries, and to no others:
-/// `btd` holds three, and `padd` being absent from them is deliberate rather than incidental —
+/// `btd` holds four, and `padd` being absent from them is deliberate rather than incidental —
 /// `padd` is the unprivileged client whose whole value is having no special access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
@@ -1398,6 +1438,8 @@ pub enum Service {
     Pad,
     /// `tofd` — the depth stream.
     Tof,
+    /// `nfcd` — writing a tag.
+    Nfc,
 }
 
 /// How long answering a call holds a connection, and therefore which connection carries it.
@@ -1464,6 +1506,7 @@ impl Call {
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
+            Call::NfcWrite(_) => method::NFC_WRITE,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1741,6 +1784,12 @@ impl Call {
             Call::TofStream => (Tof, Stream),
             Call::HeadImuStream => (Tof, Stream),
 
+            // ── nfcd ────────────────────────────────────────────────────────
+            //
+            // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
+            // own lane.
+            Call::NfcWrite(_) => (Nfc, Operation),
+
             // ── answered by no service ──────────────────────────────────────
             //
             // The PIN check belongs to the transport, which is the whole point of it: BLE cannot
@@ -1811,6 +1860,7 @@ impl Call {
             Call::RobotVetbookTally(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
+            Call::NfcWrite(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1907,6 +1957,7 @@ impl Call {
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
+            method::NFC_WRITE => Call::NfcWrite(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -2722,6 +2773,45 @@ impl Default for LaserTrackResult {
             reason: None,
         }
     }
+}
+
+/// See [`method::NFC_WRITE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfcWriteParams {
+    /// What the tag will read: `walk_mode`, `microduck_gamepad_pairing`, any text.
+    pub text: String,
+    /// How long to wait for a tag, in seconds. Absent: [`NfcWriteParams::DEFAULT_TIMEOUT_S`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+}
+
+impl NfcWriteParams {
+    pub const DEFAULT_TIMEOUT_S: u32 = 20;
+    /// The longest wait asked for that is honoured; more is cut to this.
+    pub const MAX_TIMEOUT_S: u32 = 120;
+
+    /// The wait this asks for, defaulted and capped.
+    pub fn timeout(&self) -> std::time::Duration {
+        let s = self
+            .timeout_s
+            .unwrap_or(Self::DEFAULT_TIMEOUT_S)
+            .clamp(1, Self::MAX_TIMEOUT_S);
+        std::time::Duration::from_secs(u64::from(s))
+    }
+}
+
+/// Answer to [`Call::NfcWrite`]: the tag was written and read back, or why not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfcWriteResult {
+    pub written: bool,
+    /// The tag's UID, `04:a1:…`, when one was touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Why nothing was written: no tag in time, a tag that is not an NTAG, a text too long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// What laser tracking is doing, in [`RobotState`]. Absent while tracking is off.
@@ -4768,6 +4858,45 @@ pub struct NetStatusResult {
     /// provisioning gives us a real serial (`updater-design.md` §5.7).
     pub mac: Option<String>,
     pub iface: Option<String>,
+    /// The `net.connect` in flight, if there is one. (v57)
+    ///
+    /// Present from the moment `configd` accepts the call until it answers, and only then: an
+    /// autoconnect NetworkManager starts on its own shows as `connecting` with no `joining`. While
+    /// it is present, the other fields still describe the link as it is — which, early in a join,
+    /// can be the network the robot is about to leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joining: Option<Joining>,
+}
+
+/// How far a `net.connect` has got. See [`NetStatusResult::joining`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Joining {
+    /// The network asked for.
+    pub ssid: String,
+    pub step: JoinStep,
+    /// Since `configd` accepted the call.
+    pub elapsed_seconds: u32,
+    /// The longest `configd` will take before answering `timeout`, counted from the same instant.
+    /// An upper bound for a progress bar, not an estimate: most joins finish well inside it.
+    pub timeout_seconds: u32,
+}
+
+/// One stage of a join, in the order a successful one passes through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStep {
+    /// Looking for the network before touching any profile — a few seconds.
+    Scanning,
+    /// NetworkManager is preparing the radio and associating with the access point.
+    Associating,
+    /// The WPA handshake: this is where a passphrase is checked.
+    Authenticating,
+    /// The access point rejected the handshake and NetworkManager is asking for a key, which
+    /// nothing on the robot will supply. Almost always a wrong passphrase; the call answers
+    /// `bad_key` shortly after.
+    KeyRejected,
+    /// Associated; waiting for an address, which on a busy network is where the time goes.
+    Addressing,
 }
 
 /// How a network is secured. What a client needs in order to know whether to ask for a
@@ -6606,7 +6735,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v53 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v57 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {

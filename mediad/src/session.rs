@@ -519,6 +519,7 @@ mod tests {
             config: dir.join("configd.sock"),
             pad: dir.join("pad.sock"),
             tof: dir.join("tof.sock"),
+            nfc: dir.join("nfc.sock"),
         }
     }
 

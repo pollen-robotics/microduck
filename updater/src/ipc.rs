@@ -962,6 +962,14 @@ impl Server {
                 ),
             ),
 
+            Call::NfcWrite(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write is served by nfcd, on /run/nfcd/nfc.sock",
+                ),
+            ),
+
             // Answered by the transport that received it — `btd` checks the PIN itself and never
             // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over
             // a transport that has no PIN gate: on a unix socket, `SO_PEERCRED` already decided who

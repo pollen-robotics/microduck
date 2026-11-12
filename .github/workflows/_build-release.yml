@@ -138,6 +138,7 @@ jobs:
           # reads as a broken daemon rather than an incomplete artifact.
           cp target/aarch64-unknown-linux-gnu/release/configd staged/
           cp target/aarch64-unknown-linux-gnu/release/btd staged/
+          cp target/aarch64-unknown-linux-gnu/release/duck-gateway staged/
           # padd is the gamepad intent client. Shipped because a dev board is where
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
@@ -187,6 +188,7 @@ jobs:
             --include "updater/systemd/robot-boot-check.timer=systemd/robot-boot-check.timer" \
             --include "configd/systemd/configd.service=systemd/configd.service" \
             --include "btd/systemd/btd.service=systemd/btd.service" \
+            --include "duck-gateway/systemd/duck-gateway.service=systemd/duck-gateway.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \

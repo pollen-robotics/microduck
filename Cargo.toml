@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
+members = ["btd", "configd", "duck-auth", "duck-ble", "duck-control", "duck-detect", "duck-ether", "duck-gateway", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
 
 # Everything except `duckctl`, and that exception is the whole reason this key exists.
 #
@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-ble", "duck-control", "duck-detect", "duck-et
 # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
 #
 # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
-default-members = ["btd", "configd", "duck-ble", "duck-ble", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
+default-members = ["btd", "configd", "duck-auth", "duck-ble", "duck-ble", "duck-control", "duck-detect", "duck-gateway", "duck-ipc-proto", "kinematics", "mediad", "netpadd", "nfc", "odometry", "pad-imu", "pad-map", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "uyvy", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
@@ -56,7 +56,7 @@ runtime = "v2.3.2"
 # and it is bumped when a slot's default names a file only the new set carries.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
-version = "v9"
+version = "v10"
 
 # The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
 # and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
@@ -80,7 +80,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.18.9"
+version = "0.20.1"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers

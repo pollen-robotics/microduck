@@ -23,6 +23,7 @@
 
 pub mod board;
 pub mod edit;
+pub mod label;
 pub mod registry;
 pub mod serial;
 
@@ -399,7 +400,7 @@ impl Default for PadImuHeadControlParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PadParams {
-    /// A (South). Sit ↔ stand, by default.
+    /// A (South). Sit ↔ stand, by default. Unused on a roller robot, as is X.
     pub a: String,
     /// B (East). The ground pick, by default.
     pub b: String,

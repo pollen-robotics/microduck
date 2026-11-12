@@ -26,11 +26,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 async-trait.workspace = true
 libc = "0.2"
 
-# For the default name derived from the SoC serial (see `identity`). A digest rather than std's
-# hasher because std's output is not stable across Rust releases, and a toolchain bump must not
-# rename every robot. Already in the graph via the updater's release verification.
-sha2 = "0.11.0"
-
 # NetworkManager and logind, both Linux-only. As with btd, the crate must still build and test on
 # a macOS laptop — `cargo test` there is the onboarding path — so the backend sits behind a trait
 # with an in-memory fake and the D-Bus client is not in the graph off-Linux.

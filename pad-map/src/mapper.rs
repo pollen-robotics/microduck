@@ -7,7 +7,7 @@ use duck_ipc_proto as proto;
 use robotd_params::pad_axes::{AxisBinding, Sticks};
 
 use crate::buttons::Buttons;
-use crate::hold::{HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
+use crate::hold::{FLASHLIGHT_TAP, HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
 
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
@@ -124,6 +124,20 @@ pub struct Config {
     pub roller: bool,
 }
 
+impl Config {
+    /// The buttons a roller robot leaves unbound whatever `[pad]` says: A and X. Sit ↔ stand has
+    /// no meaning on wheels, and a skill held on X is not something the roller line has.
+    pub const ROLLER_UNBOUND: [&'static str; 2] = ["a", "x"];
+
+    /// The skill a button runs here, empty for none: its `[pad]` binding, except on wheels.
+    pub fn skill(&self, button: &str) -> &str {
+        if self.roller && Self::ROLLER_UNBOUND.contains(&button) {
+            return "";
+        }
+        self.bindings.skill(button).unwrap_or_default()
+    }
+}
+
 /// What to send, in order. A `Request` is answered — "refused, and here is why" is a real
 /// outcome — and the daemon hands the answer to [`report`]; a `Notify` is not.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +156,7 @@ pub struct Mapper {
     imu_reference: Option<[f32; 4]>,
     start: HoldButton,
     select: HoldButton,
+    home: HoldButton,
     /// Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     /// starts the wheee ride. The prototype's threshold.
     prev_rt: f64,
@@ -165,6 +180,7 @@ impl Mapper {
             imu_reference: None,
             start: HoldButton::default(),
             select: HoldButton::default(),
+            home: HoldButton::default(),
             prev_rt: 0.0,
             prev_lt: 0.0,
             up: false,
@@ -176,6 +192,7 @@ impl Mapper {
     pub fn pad_gone(&mut self) {
         self.start.reset();
         self.select.reset();
+        self.home.reset();
         self.imu_reference = None;
     }
 
@@ -317,7 +334,7 @@ impl Mapper {
         // one with the list it does have, which is a better error than this side could give.
         for button in pressed {
             // An empty binding is a button switched off on purpose, not a fault.
-            let skill = cfg.bindings.skill(button).unwrap_or_default();
+            let skill = cfg.skill(button);
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -329,8 +346,16 @@ impl Mapper {
 
         // Home: the flashlight. Not bindable — it is not a skill, and the robot owns the toggle.
         // A request, so a board without a flashlight says so in the journal rather than not at
-        // all.
-        if pad.pressed.contains(Buttons::HOME) {
+        // all. On a tap's release, not the press: holding Home is how a pad turns itself off,
+        // and that hold must not toggle the flashlight on its way out (#557). A hold past
+        // [`FLASHLIGHT_TAP`] crosses the threshold and its release is silent; a pad that drops
+        // mid-hold leaves the hold spent.
+        if let HoldAction::Tap = self.home.tick(
+            pad.held.contains(Buttons::HOME),
+            pad.released.contains(Buttons::HOME),
+            now,
+            &[FLASHLIGHT_TAP],
+        ) {
             out.push(Out::Request(proto::Call::RobotFlashlight(
                 proto::FlashlightParams {
                     toggle: true,
@@ -347,7 +372,7 @@ impl Mapper {
         // Whatever X is bound to, nothing by default: a skill that does not chain simply refuses
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
-        let held = cfg.bindings.skill("x").unwrap_or_default();
+        let held = cfg.skill("x");
         if pad.held.contains(Buttons::X) && !pad.pressed.contains(Buttons::X) && !held.is_empty() {
             out.push(Out::Notify(proto::Call::RobotDo(proto::DoParams {
                 skill: held.to_owned(),
@@ -582,11 +607,13 @@ mod tests {
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change
     /// it again, a stick inside the deadzone walks nothing, and A's edge runs A's binding.
-    /// Home toggles the flashlight, on its edge: once per press, held or not, and the robot owns
-    /// the toggle.
+    /// Home toggles the flashlight on a tap's release, once — and never after a hold, which is
+    /// how a pad powers itself off (#557), nor after a hold the pad dropped in the middle of.
     #[test]
-    fn home_toggles_the_flashlight_once_per_press() {
-        let (mut m, cfg, t) = (Mapper::new(), cfg(), Instant::now());
+    fn home_toggles_the_flashlight_on_a_tap_release_only() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
         let (mut out, mut frame) = (Vec::new(), Vec::new());
         let flashlight = |out: &[Out]| {
             out.iter()
@@ -601,21 +628,41 @@ mod tests {
                 })
                 .count()
         };
-
-        let pad = PadFrame {
+        let down = PadFrame {
             pressed: Buttons::HOME,
             held: Buttons::HOME,
             ..Default::default()
         };
-        m.tick(&pad, &cfg, t, &mut out, &mut frame);
-        assert_eq!(flashlight(&out), 1, "{out:?}");
-
-        let pad = PadFrame {
+        let still = PadFrame {
             held: Buttons::HOME,
             ..Default::default()
         };
-        m.tick(&pad, &cfg, t, &mut out, &mut frame);
-        assert_eq!(flashlight(&out), 0, "held is not a second press");
+        let up = PadFrame {
+            released: Buttons::HOME,
+            ..Default::default()
+        };
+
+        // A tap: nothing on the press, one toggle on the release.
+        m.tick(&down, &cfg, at(0), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "the press waits for the release");
+        m.tick(&still, &cfg, at(100), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "held is not a press");
+        m.tick(&up, &cfg, at(200), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 1, "{out:?}");
+
+        // The pad's power-off hold: nothing at any point, release included.
+        m.tick(&down, &cfg, at(1_000), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0);
+        m.tick(&still, &cfg, at(1_000 + 3_000), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0);
+        m.tick(&up, &cfg, at(1_000 + 3_020), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "a hold's release is silent");
+
+        // The pad going away mid-press: no release edge comes, and nothing toggles after.
+        m.tick(&down, &cfg, at(10_000), &mut out, &mut frame);
+        m.pad_gone();
+        m.tick(&up, &cfg, at(10_100), &mut out, &mut frame);
+        assert_eq!(flashlight(&out), 0, "a dropped press is spent");
     }
 
     /// Select held: the rest goes at two seconds without waiting for the release, the power-off at
@@ -958,6 +1005,41 @@ mod tests {
             assert_eq!(&twist(&cfg, mode, s)[..3], &[-0.5, 0.0, 0.3], "{mode:?}");
         }
         assert_eq!(twist(&cfg, Mode::Drive, sticks(0.0, 1.0, 0.0, 0.0))[0], 0.6);
+    }
+
+    /// On wheels A and X run nothing, pressed or held, even bound — and B still runs the crouch.
+    #[test]
+    fn on_wheels_a_and_x_run_no_skill() {
+        let t = Instant::now();
+        let mut cfg = cfg();
+        cfg.bindings.x = "roulade".to_owned();
+        let skills = |cfg: &Config, b: Buttons, held_only: bool| {
+            let (mut m, mut out, mut frame) = (Mapper::new(), Vec::new(), Vec::new());
+            let pressed = if held_only { Buttons::NONE } else { b };
+            let pad = PadFrame {
+                pressed,
+                held: b,
+                ..Default::default()
+            };
+            m.tick(&pad, cfg, t, &mut out, &mut frame);
+            let mut skills = Vec::new();
+            for o in out {
+                let (Out::Request(call) | Out::Notify(call)) = o;
+                if let proto::Call::RobotDo(d) = call {
+                    skills.push(d.skill);
+                }
+            }
+            skills
+        };
+        assert_eq!(skills(&cfg, Buttons::A, false), ["sit_toggle"]);
+        assert_eq!(skills(&cfg, Buttons::X, false), ["roulade"]);
+        assert_eq!(skills(&cfg, Buttons::X, true), ["roulade"]);
+
+        cfg.roller = true;
+        assert!(skills(&cfg, Buttons::A, false).is_empty());
+        assert!(skills(&cfg, Buttons::X, false).is_empty());
+        assert!(skills(&cfg, Buttons::X, true).is_empty());
+        assert_eq!(skills(&cfg, Buttons::B, false), ["ground_pick"]);
     }
 
     /// A binding moved, reversed, made gentler or switched off reaches the command, and so does

@@ -142,6 +142,12 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
+A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
+wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
+That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi means opening
+the robot. Over the USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot;
+or flash the dev image, which keeps ssh open on wifi.
+
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
 second, the scan is skipped. If nothing does — the robot moved, is off, or the laptop is on another
@@ -212,12 +218,13 @@ The robot serves a page that streams its camera and drives it:
 duckctl open
 ```
 
-Finds the robot, then opens `http://<address>:8080/` in a browser. `--print` gives the URL instead,
-for a machine with no browser or for a script; `--port` for a robot started with a non-default
-`mediad --web-port`.
-
-Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
-is a robot with a console.
+Finds the robot, then runs a small bridge on this machine and opens it in a browser; Ctrl-C closes
+it. `--print` gives the URL instead of opening a browser. It needs the robot's setup code
+(`duckctl setup-code add`), because since daemon 0.19 the robot serves its console on its own
+loopback and the LAN reaches it only through the authenticated media gateway. The page is this
+duckctl's copy, so keep duckctl current. Why it works this way, and what the bridge checks before
+it lets a browser through:
+[`webrtc-console.md` §2.2](../design/webrtc-console.md#22-duckctl-open).
 
 What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
 pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
@@ -259,6 +266,28 @@ duckctl info
 ```bash
 export DUCK_PIN=418299
 ```
+
+### A robot with a setup code
+
+A robot with a setup code — `sudo robotctl system setup-code` on it prints one — is in secure mode:
+it refuses the PIN and serves only a client that proves the code's key, in the handshake
+[`btd/src/secure.rs`](../../btd/src/secure.rs) answers. Store the code once and every command finds
+it by the robot's name:
+
+```bash
+duckctl ssh -- sudo robotctl system setup-code   # prints md1:<robot id>:<key>, and the QR
+duckctl setup-code add                           # paste it; read on stdin, kept out of history
+```
+
+`duckctl ssh` needs no code, since the address comes from the advertisement — so a robot already on
+a network is where to copy it from. The text under the QR works too, label serial and all. Given
+`--name` (or `DUCK_ROBOT`) that differs from the id in the code, `add` files it under both, and
+`duckctl name` files it under the new name; `setup-code list` shows what is held and `setup-code
+remove <name>` forgets one. The file is `~/.config/duckctl/setup-codes`, mode `0600`, and it is a
+credential: whoever copies it can talk to the robot.
+
+A wrong key is a silence, not a refusal — the robot drops the link — so a stale code shows up as a
+failed handshake that names both causes: the wrong code, or a robot with no code at all.
 
 For one command against a different robot, `--name` still wins:
 
@@ -325,7 +354,8 @@ duckctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
 ```
 
 Omit `--psk` for an open network. Joining disconnects the robot from the network it is on, so an ssh
-session over wifi drops; that is the command working. It can take up to 45 seconds to answer.
+session over wifi drops; that is the command working. It can take up to a minute to answer, and
+prints each step on the way (`· joining <ssid>: checking the passphrase`).
 
 ```bash
 duckctl --name <robot-name> wifi forget <ssid>
@@ -742,6 +772,16 @@ from this machine, in a voice of its own, while the duck only opens its mouth; `
 machine quiet and `--robot-sound-on` has the duck quack too. It is a LAN tool, and
 [`udp-pad.md`](udp-pad.md) has the setup, several ducks, the laptop's voice, and the wire format.
 
+## Writing an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-flash walk_mode
+```
+
+The duck asks for a tag with its pad-lost sound; touch a tag to its head within 20 seconds
+(`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
+[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+
 ## Anything else — `call`
 
 ```bash
@@ -780,8 +820,11 @@ escaped JSON is unreadable; a refusal from it still prints as JSON. So `duckctl 
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
-One command is one connection: it finds the robot, pairs if it has to, proves the PIN, asks, and
-disconnects.
+One command is one connection: it finds the robot, pairs if it has to, proves the PIN — or the
+setup code, for a robot it holds one for — asks, and disconnects. On Linux it registers a pairing agent of its own
+while it runs, consenting for that robot and refusing everything else, so a first pairing needs no
+desktop Bluetooth settings open — without one BlueZ refuses the bond (`No agent available` in
+`journalctl -u bluetooth`).
 
 Every command gives up after a period of silence rather than after a fixed total, so a slow update
 is never cut off and a robot that stops answering is reported in seconds. A link that *drops* is
@@ -828,3 +871,16 @@ sudo pkill bluetoothd
 
 Forgetting the robot in macOS Bluetooth settings does the same thing. On the robot itself,
 `journalctl -u btd -b` says whether the GATT application registered at all.
+
+**After the robot has been reflashed**, a laptop that was bonded with it before still holds its
+half of a bond the robot no longer has: connecting times out every time, though nothing else holds
+the robot. On Linux, `bluetoothctl info <mac>` shows `Paired: yes`, and
+
+```bash
+bluetoothctl remove <mac>
+```
+
+clears it; on macOS, forget the robot in Bluetooth settings. The same goes for a phone: forget the
+robot in the phone's Bluetooth settings, not only in the app. `scan` ignores a device that BlueZ
+remembers but has not heard in this scan — the cached copy of an old advertisement, with an
+address the robot may have left days ago — and `--verbose` says when it does.

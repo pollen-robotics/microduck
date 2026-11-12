@@ -52,6 +52,7 @@ mod imu_view;
 mod led;
 mod monitor;
 mod path_map;
+mod setup_code;
 mod show;
 mod vetbook;
 
@@ -100,6 +101,10 @@ struct Cli {
     /// Path to the configd socket — wifi and the robot's identity.
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
+
+    /// Path to `nfcd`'s socket, where `nfc-flash` asks for a tag to be written.
+    #[arg(long, global = true, default_value = proto::socket::NFC)]
+    nfc_socket: PathBuf,
 
     /// Path to `padd`'s raw input tap, which `monitor` reads the pad's own event stream from.
     ///
@@ -176,6 +181,20 @@ enum Namespace {
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Write a text onto an NFC tag: run this, then touch a tag to the duck's head.
+    ///
+    /// The tag then reads as that text — `walk_mode`, `microduck_gamepad_pairing`, anything — in
+    /// the duck and in a phone app alike. A tag already on the reader is written too. The duck
+    /// quacks when it took, and the tag is read back before this says so. An NTAG or an ISO 15693
+    /// tag is written; anything else is refused with why, and left as it was.
+    NfcFlash {
+        /// What the tag will read.
+        text: String,
+        /// How long to wait for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
 
     /// The duck's vet book: its whole life in numbers.
     ///
@@ -544,6 +563,15 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
+    ///
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
+    SetupCode {
+        #[command(subcommand)]
+        action: Option<SetupCodeAction>,
+    },
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
@@ -552,6 +580,24 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCodeAction {
+    /// Install the 32-byte key, read on stdin as 64 hex characters. Needs root.
+    ///
+    /// On stdin so the key is in no command line or shell history. Refuses to replace an
+    /// existing key, which would invalidate the printed QR and every phone holding the old code.
+    Install {
+        /// Replace an existing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -679,6 +725,30 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
         return Err(Failure::new(exit::REFUSED, reason));
     }
     println!("🦆");
+    Ok(())
+}
+
+/// `robotctl nfc-flash` — ask `nfcd` to write `text` onto the next tag touched.
+fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failure> {
+    let mut client = Client::connect_to("nfcd", socket)?;
+    client.hello()?;
+    let params = proto::NfcWriteParams {
+        text,
+        timeout_s: Some(timeout),
+    };
+    eprintln!(
+        "Touch a tag to the duck's head (waiting {} s)…",
+        params.timeout().as_secs()
+    );
+    let text = params.text.clone();
+    let result = result_of(client.call(&proto::Call::NfcWrite(params))?)?;
+    let outcome: proto::NfcWriteResult = decode(&result)?;
+    let tag = outcome.uid.unwrap_or_else(|| "no tag".to_owned());
+    if !outcome.written {
+        let reason = outcome.reason.unwrap_or_else(|| "not written".to_owned());
+        return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
+    }
+    println!("{tag} now reads {text:?}");
     Ok(())
 }
 
@@ -3519,6 +3589,14 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
 }
 
 fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Local files only: no daemon is involved in showing or installing the key.
+    if let SystemCommand::SetupCode { action } = &command {
+        return match action {
+            None => setup_code::show(),
+            Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
+        };
+    }
     // Asked before connecting, so a robot is not disturbed by a command the operator then
     // aborts.
     if let SystemCommand::Reboot { yes: false, .. } = &command {
@@ -3543,6 +3621,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             *json,
         ),
         SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -3595,6 +3674,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             let reboot: proto::RebootResult = decode(&result)?;
             println!("rebooting in {}s", reboot.in_seconds);
         }
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -5321,6 +5401,13 @@ fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
         let mac = status.mac.as_deref().unwrap_or("unknown");
         let _ = writeln!(out, "iface   {iface}  {mac}");
     }
+    if let Some(joining) = &status.joining {
+        let _ = writeln!(
+            out,
+            "joining {}  {:?}, {}s of at most {}s",
+            joining.ssid, joining.step, joining.elapsed_seconds, joining.timeout_seconds
+        );
+    }
 
     // The one state worth explaining, because it is a provisioning mistake rather than a
     // network problem and the fix is a different script entirely.
@@ -5634,6 +5721,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::NfcFlash { text, timeout } => {
+            return run_nfc_flash(&cli.nfc_socket, text, timeout);
         }
         Namespace::Flashlight { state, color } => {
             return run_flashlight(&cli.robot_socket, &state, &color);
