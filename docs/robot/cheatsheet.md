@@ -1109,8 +1109,10 @@ robot that stays put):
 - **Walking.** It turns in place until it faces the ball within `align_rad`, then walks straight
   at it; within `approach_m` it does the same aiming the kicking foot. `search_vyaw` (0 stands
   still while searching), `k_x`, `k_y`, `k_yaw`, `vx_max`, `vy_max`, `vyaw_max`.
-- **No kick?** The journal says `soccer: kick refused; trying again` with robotd's reason, and the
-  robot keeps the ball and asks again. Within `approach_m` the ball is remembered for
+- **No kick?** `spot +x +y` in the readout is how far the ball is from the kick spot, metres. The
+  robot kicks once that is inside `tol_x_m`/`tol_y_m` for `settle_ms`, or inside twice them for
+  `stall_ms` (it has stalled short). A refused kick says `soccer: kick refused; trying again` in
+  the journal with robotd's reason, and the robot keeps the ball and asks again. Within `approach_m` the ball is remembered for
   `close_memory_ms`, since the camera may not see it under the beak.
 
 The kicks are the `kick_left` / `kick_right` skills, which ship in the policy set; a robot without

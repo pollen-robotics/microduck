@@ -2926,6 +2926,11 @@ pub struct SoccerState {
     /// How long since the ball was last seen, milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
+    /// How far the ball is from the kick spot, `[x, y]` metres (+x: still ahead of it, +y: to
+    /// the left of it), while lining up. What to read when the robot stands at the ball and does
+    /// not kick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot_m: Option<[f64; 2]>,
     /// The foot the robot is lining up to kick with, `left` or `right`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foot: Option<String>,

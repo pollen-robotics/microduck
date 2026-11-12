@@ -143,6 +143,13 @@ pub struct Soccer {
     aligned: bool,
     /// Since when the ball has sat in the kick spot.
     settled: Option<Instant>,
+    /// In the kick spot, with the hysteresis: entered within the tolerances, left past twice
+    /// them — the gait sways the trunk a centimetre or two a step even standing, and a spot that
+    /// is left on every sway never settles.
+    in_spot: bool,
+    /// Since when the ball has been within twice the tolerances — near enough that a robot still
+    /// short of the spot after `stall_ms` has stalled, not missed.
+    near: Option<Instant>,
     /// A kick asked of the loop this tick, waiting for [`Soccer::kick_outcome`]: the foot, and
     /// where the ball was.
     asked: Option<(Foot, [f64; 2])>,
@@ -183,6 +190,8 @@ impl Soccer {
             foot: None,
             aligned: false,
             settled: None,
+            in_spot: false,
+            near: None,
             asked: None,
             kicked: None,
             kicks: 0,
@@ -210,6 +219,8 @@ impl Soccer {
             }
         }
         self.settled = None;
+        self.in_spot = false;
+        self.near = None;
     }
 
     /// Switch autonomous soccer. Switching it on starts from nothing: no remembered ball, no foot,
@@ -221,6 +232,8 @@ impl Soccer {
             self.foot = None;
             self.aligned = false;
             self.settled = None;
+            self.in_spot = false;
+            self.near = None;
             self.asked = None;
             self.kicked = None;
             if on {
@@ -282,6 +295,8 @@ impl Soccer {
                 self.foot = None;
                 self.aligned = false;
                 self.settled = None;
+                self.in_spot = false;
+                self.near = None;
             }
         }
 
@@ -382,6 +397,8 @@ impl Soccer {
             state.phase = "approaching".into();
             self.foot = None;
             self.settled = None;
+            self.in_spot = false;
+            self.near = None;
             let bearing = ahead[1].atan2(ahead[0]);
             let vyaw = (p.k_yaw * bearing).clamp(-p.vyaw_max, p.vyaw_max);
             let vx = if self.align(bearing, p) {
@@ -399,14 +416,28 @@ impl Soccer {
         });
         let spot = [p.kick_x_m, foot.side() * p.kick_y_m];
         let err = [ahead[0] - spot[0], ahead[1] - spot[1]];
-        if err[0].abs() <= p.tol_x_m && err[1].abs() <= p.tol_y_m {
+        state.spot_m = Some(err);
+        let within = |k: f64| err[0].abs() <= k * p.tol_x_m && err[1].abs() <= k * p.tol_y_m;
+        self.in_spot = within(if self.in_spot { 2.0 } else { 1.0 });
+        if within(2.0) {
+            self.near.get_or_insert(now);
+        } else {
+            self.near = None;
+        }
+        // Near the spot for `stall_ms` and still not in it: the last centimetres ask for a speed
+        // too small for the gait to walk, and waiting longer will not get it there.
+        let stalled = self.near.is_some_and(|at| {
+            now.saturating_duration_since(at) >= Duration::from_millis(p.stall_ms)
+        });
+        if self.in_spot || stalled {
             let since = *self.settled.get_or_insert(now);
             if !driving {
                 state.phase = "waiting for the policy".into();
                 return (Some([0.0; 3]), None);
             }
-            if p.kick && now.saturating_duration_since(since) >= Duration::from_millis(p.settle_ms)
-            {
+            let settled =
+                now.saturating_duration_since(since) >= Duration::from_millis(p.settle_ms);
+            if p.kick && (settled || stalled) {
                 state.phase = "kicking".into();
                 return (Some([0.0; 3]), Some(foot.skill()));
             }
@@ -789,6 +820,59 @@ mod tests {
             s.tick(&standing(), 0.0, true, t3).unwrap().kick,
             Some("kick_left")
         );
+    }
+
+    /// **Sway does not reset the settle.** Once in the spot, a centimetre or two of the trunk's
+    /// sway — past the tolerance, inside twice it — keeps it in, and the kick comes on time.
+    #[test]
+    fn sway_inside_twice_the_tolerance_still_kicks() {
+        let p = SoccerParams::default();
+        let mut s = soccer();
+        let t0 = Instant::now();
+        let spot = [p.kick_x_m, p.kick_y_m];
+        place(&mut s, spot, t0);
+        s.tick(&standing(), 0.0, true, t0);
+        let t1 = t0 + Duration::from_millis(p.settle_ms / 2);
+        let swayed = [spot[0], spot[1] + 1.5 * p.tol_y_m];
+        place(&mut s, swayed, t1);
+        let drive = s.tick(&standing(), 0.0, true, t1).unwrap();
+        assert_eq!(drive.twist, Some([0.0; 3]), "still in the spot");
+        let t2 = t0 + Duration::from_millis(p.settle_ms + 10);
+        place(&mut s, spot, t2);
+        assert_eq!(
+            s.tick(&standing(), 0.0, true, t2).unwrap().kick,
+            Some("kick_left")
+        );
+    }
+
+    /// **Stalled short.** Near the spot but never in it — the gait will not walk the last
+    /// centimetre — the robot kicks from there after `stall_ms`, and says how far off it was.
+    #[test]
+    fn stalled_near_the_spot_kicks_anyway() {
+        let p = SoccerParams::default();
+        let mut s = soccer();
+        let t0 = Instant::now();
+        let short = [p.kick_x_m + 1.5 * p.tol_x_m, p.kick_y_m];
+        place(&mut s, short, t0);
+        let drive = s.tick(&standing(), 0.0, true, t0).unwrap();
+        assert_eq!(drive.kick, None);
+        let [dx, dy] = drive.state.spot_m.expect("the error to the spot");
+        assert!((dx - 1.5 * p.tol_x_m).abs() < 1e-9 && dy.abs() < 1e-9);
+
+        let t1 = t0 + Duration::from_millis(p.stall_ms + 10);
+        place(&mut s, short, t1);
+        assert_eq!(
+            s.tick(&standing(), 0.0, true, t1).unwrap().kick,
+            Some("kick_left")
+        );
+
+        // Farther than twice the tolerance is not stalled, it is still walking.
+        let mut s = soccer();
+        let far = [p.kick_x_m + 3.0 * p.tol_x_m, p.kick_y_m];
+        place(&mut s, far, t0);
+        s.tick(&standing(), 0.0, true, t0);
+        place(&mut s, far, t1);
+        assert_eq!(s.tick(&standing(), 0.0, true, t1).unwrap().kick, None);
     }
 
     /// Under the beak, out of sight, the ball is not forgotten after `memory_ms` — only after

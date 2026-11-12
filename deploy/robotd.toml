@@ -569,12 +569,14 @@ mode = "walk"
 # align_rad = 0.25
 
 # The kick spot: ball centre kick_x_m ahead of the trunk and kick_y_m to the side (+ is the left
-# foot, kick_left), within tol for settle_ms; then cooldown_ms before looking again.
+# foot, kick_left), within tol for settle_ms (once in, it is left only past twice tol); stalled
+# within twice tol for stall_ms, it kicks from there. Then cooldown_ms before looking again.
 # kick_x_m = 0.15
 # kick_y_m = 0.05
 # tol_x_m = 0.04
 # tol_y_m = 0.025
 # settle_ms = 300
+# stall_ms = 1500
 # cooldown_ms = 2500
 
 # Gains and limits.

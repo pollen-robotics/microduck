@@ -1484,8 +1484,13 @@ pub struct SoccerParams {
     pub tol_x_m: f64,
     /// How far off `kick_y_m` still kicks, metres.
     pub tol_y_m: f64,
-    /// How long the ball must sit in the kick spot before the kick, milliseconds.
+    /// How long the ball must sit in the kick spot before the kick, milliseconds. Once in, it is
+    /// left only past twice the tolerances.
     pub settle_ms: u64,
+    /// Within twice the tolerances this long without getting into the spot, the robot has
+    /// stalled short of it — the last centimetres ask for less speed than the gait walks — and
+    /// kicks from there, milliseconds.
+    pub stall_ms: u64,
     /// After a kick, how long before looking for the ball again, milliseconds — the kick, and
     /// the ball rolling away.
     pub cooldown_ms: u64,
@@ -1532,6 +1537,7 @@ impl Default for SoccerParams {
             tol_x_m: 0.04,
             tol_y_m: 0.025,
             settle_ms: 300,
+            stall_ms: 1500,
             cooldown_ms: 2500,
             k_x: 1.2,
             k_y: 1.5,

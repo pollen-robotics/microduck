@@ -813,6 +813,11 @@ pub const REGISTRY: &[Entry] = &[
         "How long the ball must sit in the kick spot first, milliseconds",
     ),
     entry(
+        "soccer.stall_ms",
+        Kind::Integer,
+        "Near the spot this long without reaching it, kick from there, milliseconds",
+    ),
+    entry(
         "soccer.cooldown_ms",
         Kind::Integer,
         "After a kick, how long before looking again, milliseconds",

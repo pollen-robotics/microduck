@@ -1106,13 +1106,17 @@ fn soccer_line(soccer: &proto::SoccerState) -> String {
         .as_deref()
         .map(|f| format!(" {f}"))
         .unwrap_or_default();
+    let spot = soccer
+        .spot_m
+        .map(|[x, y]| format!(" spot {x:+.3} {y:+.3}"))
+        .unwrap_or_default();
     let doing = match (soccer.walk, soccer.twist) {
         (true, Some([vx, vy, vyaw])) => format!("{vx:+.2} {vy:+.2} m/s {vyaw:+.2} rad/s"),
         (false, Some(_)) => "pad has it".to_owned(),
         _ => String::new(),
     };
     format!(
-        "{ball}  {target:<34} {}{foot} {doing}  kicks {}",
+        "{ball}  {target:<34} {}{foot}{spot} {doing}  kicks {}",
         soccer.phase, soccer.kicks
     )
 }
