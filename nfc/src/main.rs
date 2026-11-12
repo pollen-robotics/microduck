@@ -554,7 +554,7 @@ impl photo::Driver for Session<'_> {
 
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
         let params = proto::DoParams {
-            skill: "sit".into(),
+            skill: "sit_toggle".into(),
         };
         call(
             &self.sockets.robot,

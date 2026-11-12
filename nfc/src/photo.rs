@@ -7,7 +7,7 @@
 //!
 //! 1. A quack, so the person holding the tag knows it was read.
 //! 2. Standing, still: laser tracking off (it would walk the robot to a dot), `robot.stop`, and a
-//!    seated robot stood up with `robot.do sit` — a toggle, so the robot's `robot.state` policy is
+//!    seated robot stood up with `robot.do sit_toggle` — a toggle, so the robot's `robot.state` policy is
 //!    read first. A robot whose policy is not driving (`held`: limp, or stood up by `robot.init`
 //!    alone) is started with `robot.enable`, the pad's Start, so the tag works with no pad around;
 //!    the sequence waits up to [`START_WITHIN`] for it to stand. A robot busy with something else
@@ -148,7 +148,7 @@ pub trait Driver {
     fn policy(&mut self) -> Result<String, String>;
     /// `robot.enable` on: the pad's Start.
     fn start(&mut self) -> Result<proto::IntentResult, String>;
-    /// `robot.do sit`, which stands a seated robot up and sits a standing one.
+    /// `robot.do sit_toggle`, which stands a seated robot up and sits a standing one.
     fn sit_toggle(&mut self) -> Result<proto::IntentResult, String>;
     /// `robot.look`.
     fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String>;
@@ -217,7 +217,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     match policy.as_str() {
         "walk" | "stand" => robot.sleep(STILL),
         "sit" => {
-            if let Err(why) = asked("robot.do sit", robot.sit_toggle()) {
+            if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
                 return Outcome::Failed(why);
             }
             robot.sleep(RISE);
@@ -258,8 +258,10 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     if let Err(why) = robot.mouth(1.0) {
         return Outcome::Failed(format!("robot.mouth: {why}"));
     }
-    if let Err(why) = asked("robot.do sit", robot.sit_toggle()) {
-        return Outcome::Failed(why);
+    // Not stopping when it will not sit: the display is taken standing just as well, and stopping
+    // here would leave the beak open with nothing to close it.
+    if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
+        tracing::warn!(%why, "not sitting down — waiting for the e-ink standing");
     }
     hold(robot, head, SIT);
 
@@ -496,6 +498,7 @@ mod tests {
         /// After how many asks a display is in the beak; `None` never.
         eink_after: Option<usize>,
         asked_beak: usize,
+        sit_refused: Option<String>,
     }
 
     impl Default for Fake {
@@ -512,6 +515,7 @@ mod tests {
                 holding: false,
                 eink_after: Some(3),
                 asked_beak: 0,
+                sit_refused: None,
             }
         }
     }
@@ -542,7 +546,10 @@ mod tests {
         }
         fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
             self.calls.push("sit".into());
-            Ok(proto::IntentResult::accepted())
+            Ok(match &self.sit_refused {
+                Some(why) => proto::IntentResult::refused(why.clone()),
+                None => proto::IntentResult::accepted(),
+            })
         }
         fn look(&mut self, _: proto::LookParams) -> Result<proto::LookResult, String> {
             self.calls.push("look".into());
@@ -738,6 +745,19 @@ mod tests {
         on_touch(&mut robot);
         assert!(robot.calls.iter().filter(|c| *c == "head").count() > 10);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    /// On the robot the sit was refused, and the sequence stopped with the beak open and the
+    /// display never waited for. A refused sit now waits for it standing.
+    #[test]
+    fn a_refused_sit_still_takes_the_display() {
+        let mut robot = Fake {
+            sit_refused: Some("no skill named \"sit\"".into()),
+            ..Fake::default()
+        };
+        assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
+        assert!(robot.calls.contains(&"eink".to_string()));
+        assert_eq!(robot.calls.last().unwrap(), "mouth 0");
     }
 
     /// No display in the beak: it waits, then closes its beak, the head held all along.
