@@ -305,6 +305,8 @@ impl Sound {
             }
             return;
         };
+        // Which file, not only which tag: the bank holds several of each, picked at random.
+        tracing::info!(tag, wav = %wav.display(), "playing");
         self.spawn(&wav, blocking);
     }
 
