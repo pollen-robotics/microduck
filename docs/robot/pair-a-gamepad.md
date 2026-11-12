@@ -72,7 +72,8 @@ always running and picks a reader up within thirty seconds of it being plugged i
 - It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
   15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
   *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
-  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only.
+  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only. A MIFARE Classic
+  is not read: it is said once in the journal, `tag cannot be read`.
 
 What it did is in `journalctl -u nfcd -b`.
 
@@ -99,6 +100,13 @@ A tag lifted half way through reads as no NDEF; write it again.
 
 It is `nfc.write` on `nfcd`'s socket, `/run/nfcd/nfc.sock`, so a robot whose `nfcd` predates it has
 nothing listening there: update the daemon.
+The same reader also takes **mode tags**, written the same way with one of `walk_mode`,
+`roller_skating_mode`, `soccer_mode`, `laser_mode` or `autonomous_mode`. `walk_mode` and
+`roller_skating_mode` switch the robot as holding D-pad up does, and switch laser tracking and
+soccer off; `laser_mode` puts it in walk and switches laser tracking on (`robotctl laser-track
+on`); `soccer_mode` puts it in walk and switches soccer mode on (`robotctl soccer on` — the
+cheat sheet's [Play soccer](cheatsheet.md#play-soccer)). `autonomous_mode` is read and quacked at,
+and does nothing yet. The table, and where a new mode's behaviour goes, are in `nfc/src/modes.rs`.
 
 ## Check it
 

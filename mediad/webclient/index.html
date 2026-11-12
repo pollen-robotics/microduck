@@ -172,6 +172,11 @@
   #laser .miss { stroke: #ffab00; stroke-dasharray: 4 3; }
   #laser text { fill: #ff1744; font: 600 11px ui-monospace, monospace; }
   #laser text.miss { fill: #ffab00; stroke: none; }
+  /* The soccer ball, the same way, at the size it was seen. */
+  #ball circle { fill: none; stroke: #d500f9; stroke-width: 2; vector-effect: non-scaling-stroke; }
+  #ball .miss { stroke: #ffab00; stroke-dasharray: 4 3; }
+  #ball text { fill: #d500f9; font: 600 11px ui-monospace, monospace; }
+  #ball text.miss { fill: #ffab00; stroke: none; }
   .stats { margin-top: .5rem; font: 12px/1.4 ui-monospace, monospace; gap: .75rem; }
   .stats b { font-weight: 600; opacity: .55; font-size: 11px; text-transform: uppercase; }
 
@@ -239,11 +244,14 @@
       <!-- The laser detector's dot, the same way: the upright frame's pixels, scaled by the browser.
            Only while laser tracking is on, since that is the only time anything looks. -->
       <svg id="laser" preserveAspectRatio="none" aria-hidden="true"></svg>
+      <!-- And the ball, while the robot plays soccer by itself. -->
+      <svg id="ball" preserveAspectRatio="none" aria-hidden="true"></svg>
     </div>
     <div class="row stats">
       <span><b>bitrate</b> <span id="bitrate">–</span></span>
       <span><b>ducks</b> <span id="detections">–</span></span>
       <span><b>laser</b> <span id="laserdot">–</span></span>
+      <span><b>ball</b> <span id="ballseen">–</span></span>
       <span><b>fps</b> <span id="fps">–</span></span>
       <span><b>loss</b> <span id="loss">–</span></span>
       <span><b>rtt</b> <span id="rtt">–</span></span>
@@ -1322,6 +1330,8 @@ function onControl(data) {
     if (msg.method === "media.detections") { onDetections(msg.params); return; }
     // The laser detector, 1–15 times a second while laser tracking is on. Not logged either.
     if (msg.method === "media.laserDot") { onLaserDot(msg.params); return; }
+    // The ball detector, likewise, while autonomous soccer is on.
+    if (msg.method === "media.ballSeen") { onBallSeen(msg.params); return; }
     log("in", "control ←", data.slice(0, 400));
     return;
   }
@@ -1828,6 +1838,45 @@ function onLaserDot(dot) {
   const peak = dot.peak_yuv ? ` · peak Y${dot.peak_yuv[0]} U${dot.peak_yuv[1]} V${dot.peak_yuv[2]}` : "";
   const what = dot.seen ? `dot n=${dot.pixels}` : dot.rejected ? `${dot.rejected} n=${dot.pixels}` : "none";
   $("laserdot").textContent = `${what}${peak} (${dot.hz.toFixed(0)} Hz, ${dot.took_ms.toFixed(1)} ms)`;
+}
+
+// ── the soccer ball ────────────────────────────────────────────────────────────
+//
+// For tuning `[soccer]`, as the laser's: a purple ring at the size the ball was seen, a dashed
+// amber one on the biggest purple blob when it was rejected, and the most purple colour in the
+// picture in the stats row, passed or not.
+let ballStale = null;
+
+function clearBall(reason) {
+  $("ball").replaceChildren();
+  $("ballseen").textContent = reason;
+}
+
+function onBallSeen(ball) {
+  clearTimeout(ballStale);
+  ballStale = setTimeout(() => clearBall("–"), LASER_TIMEOUT_MS);
+
+  const svg = $("ball");
+  svg.replaceChildren();
+  if (ball.frame) {
+    const [w, h] = ball.frame;
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    const ring = (x, y, r, cls, label) => {
+      svg.appendChild(svgEl("circle", { cx: x, cy: y, r }, cls));
+      const text = svgEl("text", { x: x + r + 4, y: y > 16 ? y - r : y + r + 12 }, cls);
+      text.textContent = label;
+      svg.appendChild(text);
+    };
+    if (ball.seen && ball.px) {
+      ring(ball.px[0], ball.px[1], ball.radius_px || Math.max(w, h) / 40, null, `ball n=${ball.cells}`);
+    } else if (ball.candidate_px) {
+      ring(ball.candidate_px[0], ball.candidate_px[1], Math.max(w, h) / 40, "miss", `${ball.rejected} n=${ball.cells}`);
+    }
+  }
+
+  const peak = ball.peak_yuv ? ` · peak Y${ball.peak_yuv[0]} U${ball.peak_yuv[1]} V${ball.peak_yuv[2]}` : "";
+  const what = ball.seen ? `ball n=${ball.cells}` : ball.rejected ? `${ball.rejected} n=${ball.cells}` : "none";
+  $("ballseen").textContent = `${what}${peak} (${ball.hz.toFixed(0)} Hz, ${ball.took_ms.toFixed(1)} ms)`;
 }
 
 function aim(event) {

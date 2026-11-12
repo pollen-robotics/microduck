@@ -161,6 +161,8 @@ fn apply_for(key: &str) -> Option<Apply> {
         // tuning it is many small edits, and each must not drop the robot. `enabled` included:
         // an edit to it switches tracking there and then.
         "laser" => Apply::Live("robotd"),
+        // The same, for autonomous soccer's reader and `[soccer]`.
+        "soccer" => Apply::Live("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,

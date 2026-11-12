@@ -30,6 +30,7 @@ mod params;
 mod pickup;
 mod posture;
 mod soc;
+mod soccer;
 mod sound;
 mod theremin;
 mod vetbook;
@@ -2551,6 +2552,9 @@ async fn control_loop<T: RobotIo>(
     // duck that never switches it on this is one sleeping thread. `[laser]` is re-read by that
     // thread while it is on — tuning it must not need a restart that drops the robot.
     let mut laser = laser::Laser::spawn(params.laser.clone(), params_path.clone());
+    // Autonomous soccer, the laser's sibling: likewise one sleeping thread until it is switched
+    // on, and `[soccer]` re-read live while it is.
+    let mut soccer = soccer::Soccer::spawn(params.soccer.clone(), params_path.clone());
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
@@ -2728,6 +2732,66 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // Soccer mode. Manual soccer moves nothing here — it is the pad's bumpers — so its block
+        // only says so; autonomous soccer shares the robot exactly as the laser does above, and
+        // after it, so the two never both drive (`robot.soccer` and `robot.laserTrack` switch each
+        // other off besides).
+        let soccer_switch = intents.soccer();
+        // A kick autonomous soccer queued this tick, by name, until the skill code below says
+        // whether it started — which `soccer.kick_outcome` is then told, this same tick.
+        let mut soccer_kick: Option<&'static str> = None;
+        let mut soccer_kick_result: Option<Result<(), String>> = None;
+        soccer.set_autonomous(soccer_switch.autonomous);
+        let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
+            phase: "manual".into(),
+            ..Default::default()
+        });
+        if let Some(sample) = sensors.as_ref() {
+            let pose = laser::Pose {
+                head: mapping::head_joints_of(&sample.positions),
+                imu: sample.imu.quat,
+                odom: odometry.position(),
+                yaw: odometry.yaw(),
+            };
+            let driving = snapshot.enabled && bringup == Bringup::Ready;
+            if let Some(drive) = soccer.tick(&pose, snapshot.command.head[0], driving, tick_start) {
+                let mut block = drive.state;
+                let client_twist = snapshot.twist_age
+                    < Duration::from_millis(params.safety.deadman_ms)
+                    && snapshot.command.twist.iter().any(|v| *v != 0.0);
+                let client_head = snapshot.head_age < LASER_CLIENT_HEAD
+                    && snapshot.command.head.iter().any(|v| v.abs() > 1e-3);
+                if let Some(head) = drive.head
+                    && !client_head
+                {
+                    snapshot.command.head = head;
+                    snapshot.head_age = Duration::ZERO;
+                    block.head = true;
+                }
+                if let Some(twist) = drive.twist
+                    && !client_twist
+                {
+                    snapshot.command.twist = twist;
+                    // Live for the deadman: the ball is as fresh as `[soccer] memory_ms` allows,
+                    // and the search turn stops the moment autonomous is switched off.
+                    snapshot.twist_age = Duration::ZERO;
+                    block.walk = true;
+                }
+                // Queued like a pad's `robot.do`, and taken below in this same tick. Not while
+                // somebody is steering: their stick says they have the robot.
+                if let Some(kick) = drive.kick {
+                    if client_twist {
+                        soccer_kick_result = Some(Err("a stick is pushed".to_owned()));
+                    } else if !queue_skill(&state, &intents, kick) {
+                        soccer_kick_result =
+                            Some(Err(format!("this robot has no {kick} skill configured")));
+                    }
+                    soccer_kick = Some(kick);
+                }
+                soccer_state = Some(block);
+            }
+        }
+
         // An emotion in progress has the head, the body and the beak, and holds the robot still.
         if let Some(p) = playing.as_ref() {
             match p.frame(tick_start) {
@@ -2892,7 +2956,11 @@ async fn control_loop<T: RobotIo>(
                             .get(index)
                             .cloned()
                             .unwrap_or_else(|| index.to_string());
-                        match controller.start_skill(index) {
+                        let started = controller.start_skill(index);
+                        if soccer_kick == Some(name.as_str()) {
+                            soccer_kick_result = Some(started.map(|_| ()).map_err(str::to_owned));
+                        }
+                        match started {
                             Ok(true) => tracing::warn!(skill = %name, "skill started"),
                             Ok(false) => {}
                             Err(reason) => {
@@ -2903,6 +2971,12 @@ async fn control_loop<T: RobotIo>(
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
             }
+        }
+        if let Some(kick) = soccer_kick {
+            let outcome = soccer_kick_result.unwrap_or_else(|| {
+                Err(format!("{kick} was not started: the policy is not driving"))
+            });
+            soccer.kick_outcome(outcome, tick_start);
         }
 
         // Emotions, like the skills above: started on a robot the policy drove last tick with no
@@ -4266,6 +4340,7 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 laser: laser_state.clone(),
+                soccer: soccer_state.clone(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -5612,7 +5687,22 @@ fn dispatch(
         // waiting for in `robot.state`'s laser block rather than here.
         proto::Call::RobotLaserTrack(p) => {
             intents.request_laser(p.active);
+            // One chaser at a time: a dot and a ball would fight over the legs.
+            if p.active {
+                intents.set_soccer(false, false);
+            }
             proto::Response::ok(Some(id), &proto::LaserTrackResult::default())
+        }
+
+        // Soccer mode, and autonomous soccer on it. Nothing to refuse at the door, for the
+        // laser's reason: whether `mediad` answers is a circumstance, and the soccer block in
+        // `robot.state` says what it is waiting for. Laser tracking goes off, as above.
+        proto::Call::RobotSoccer(p) => {
+            if p.active {
+                intents.request_laser(false);
+            }
+            intents.set_soccer(p.active, p.autonomous);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
@@ -5783,6 +5873,7 @@ fn dispatch(
                 mode: mode_of(state.mode.load(Ordering::Relaxed))
                     .as_str()
                     .to_owned(),
+                soccer: Some(intents.soccer()).filter(|s| s.active),
             },
         ),
 
@@ -7027,6 +7118,54 @@ mod tests {
             .result_as()
             .expect("robot.mode must deserialize as ModeResult");
         assert_eq!(mode.mode, "walk");
+    }
+
+    /// Soccer mode is read back in `robot.mode`, which is how a pad learns an NFC tag switched it;
+    /// autonomous implies soccer mode; and laser tracking and soccer switch each other off.
+    #[test]
+    fn soccer_is_answered_in_robot_mode_and_excludes_the_laser() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let mode = |intents: &Intents| -> Option<proto::SoccerParams> {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .soccer
+        };
+        let soccer = |active, autonomous| {
+            proto::Call::RobotSoccer(proto::SoccerParams { active, autonomous })
+        };
+        assert_eq!(mode(&intents), None);
+
+        let answer: proto::IntentResult = dispatch(&s, &intents, id(), &soccer(true, true))
+            .result_as()
+            .unwrap();
+        assert!(answer.accepted);
+        assert_eq!(
+            mode(&intents),
+            Some(proto::SoccerParams {
+                active: true,
+                autonomous: true
+            })
+        );
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        // Off is both off, whatever `autonomous` says.
+        dispatch(&s, &intents, id(), &soccer(false, true));
+        assert_eq!(mode(&intents), None);
+
+        dispatch(&s, &intents, id(), &soccer(true, false));
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
+        );
+        assert_eq!(mode(&intents), None, "the laser switches soccer off");
     }
 
     /// `robot.look` is a promise with two halves: the head actually moves (the intent is

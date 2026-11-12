@@ -754,6 +754,29 @@ fn main() -> ExitCode {
                 });
             }
 
+            // And the ball detector's, for the same reason, while autonomous soccer is on.
+            {
+                let mut balls = laser_hub.balls.subscribe();
+                let to_peer = channel.outbound.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match balls.recv().await {
+                            Ok(seen) => {
+                                if to_peer
+                                    .send(mediad::ball::notification(&seen))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             tokio::spawn(mediad::session::run(
                 channel.inbound,
                 channel.outbound,

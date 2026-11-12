@@ -151,6 +151,22 @@ pub struct Mapper {
     /// `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
     /// Starts false: padd starts with the robot, and a robotd restart restarts padd too.
     up: bool,
+    /// Soccer mode as this pad last knew it: from the robot's `robot.mode` answer, which the
+    /// daemon hands over with [`Mapper::set_soccer`], and from this pad's own `robot.soccer`
+    /// requests the moment it sends them — so the press after D-pad down already means
+    /// "back to manual", not a second wait for the poll.
+    soccer: proto::SoccerParams,
+    /// Buttons whose press was spent taking autonomous soccer back, until they are released: their
+    /// tap (Start's policy toggle, Home's flashlight) and X's held resend must not follow.
+    spent: Buttons,
+}
+
+/// `robot.soccer` with soccer mode on, autonomous or by hand.
+fn soccer_call(autonomous: bool) -> proto::Call {
+    proto::Call::RobotSoccer(proto::SoccerParams {
+        active: true,
+        autonomous,
+    })
 }
 
 impl Default for Mapper {
@@ -170,12 +186,35 @@ impl Mapper {
             prev_rt: 0.0,
             prev_lt: 0.0,
             up: false,
+            soccer: proto::SoccerParams::default(),
+            spent: Buttons::NONE,
+        }
+    }
+
+    /// What the robot says soccer mode is, from its `robot.mode` answer — `None` for off, which is
+    /// also what a robot too old to know soccer answers. Logged when it changes, since it changes
+    /// what the bumpers and D-pad down do.
+    pub fn set_soccer(&mut self, soccer: Option<proto::SoccerParams>) {
+        let soccer = soccer.unwrap_or_default();
+        if soccer != self.soccer {
+            tracing::warn!(
+                soccer = soccer.active,
+                autonomous = soccer.autonomous,
+                "soccer mode changed — {}",
+                if soccer.active {
+                    "LB/RB kick, D-pad down plays by itself, any button takes it back"
+                } else {
+                    "the pad is back to its own mapping"
+                }
+            );
+            self.soccer = soccer;
         }
     }
 
     /// The pad went away. A hold in flight was measured against it — see [`HoldButton::reset`] —
     /// and an IMU reference means nothing to the next pad.
     pub fn pad_gone(&mut self) {
+        self.spent = Buttons::NONE;
         self.start.reset();
         self.select.reset();
         self.home.reset();
@@ -206,6 +245,17 @@ impl Mapper {
             self.imu_reference = None;
         }
 
+        // Autonomous soccer gives the robot back on any button, and that press does nothing
+        // else: whoever presses A to take the robot back does not also want it to sit down.
+        let mut fresh = pad.pressed;
+        if self.soccer.autonomous && fresh.0 & Buttons::KNOWN != 0 {
+            tracing::warn!("soccer: a button — back to driving by hand");
+            self.soccer.autonomous = false;
+            out.push(Out::Request(soccer_call(false)));
+            self.spent |= fresh;
+            fresh = Buttons::NONE;
+        }
+
         // The D-pad picks what the sticks mean. Two arrows pressed inside one frame resolve in
         // this fixed order, the last one winning — which is what gilrs's event order did in
         // `padd` for the only case that matters, one arrow at a time.
@@ -216,15 +266,24 @@ impl Mapper {
             (Buttons::LEFT, Mode::Drive),
             (Buttons::DOWN, Mode::BodyPose),
         ] {
-            if pad.pressed.contains(button) {
+            if fresh.contains(button) {
                 wanted_mode = Some(mode);
             }
+        }
+        // In soccer mode D-pad down is autonomous soccer rather than body + head. The sticks go
+        // back to plain driving, so a stick pushed while the robot plays is a stick that walks
+        // it — which is what wins over the ball in `robotd`.
+        if self.soccer.active && wanted_mode == Some(Mode::BodyPose) {
+            tracing::warn!("soccer: D-pad down — playing by itself; any button takes it back");
+            self.soccer.autonomous = true;
+            out.push(Out::Request(soccer_call(true)));
+            wanted_mode = Some(Mode::Drive);
         }
         // Which bindable buttons went down this frame, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this mapping does not know.
         let pressed = Buttons::BINDABLE
             .iter()
-            .filter(|(b, _)| pad.pressed.contains(*b))
+            .filter(|(b, _)| fresh.contains(*b))
             .map(|(_, n)| *n);
 
         // Start: a tap stands the robot up, then toggles the policy; held, it is the way home.
@@ -238,6 +297,8 @@ impl Mapper {
             // Start's one threshold acts when it is reached; its release says nothing more.
             HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
             HoldAction::Reached(_) => go_home = true,
+            // The press that took autonomous soccer back; its release toggles nothing.
+            HoldAction::Tap if self.spent.contains(Buttons::START) => {}
             HoldAction::Tap if !self.up => {
                 tracing::warn!("Start — robot.init: standing up. Press Start again to drive");
                 out.push(Out::Request(proto::Call::RobotInit));
@@ -319,8 +380,13 @@ impl Mapper {
         // against anything: which skills exist is the robot's to know, and it answers an unknown
         // one with the list it does have, which is a better error than this side could give.
         for button in pressed {
-            // An empty binding is a button switched off on purpose, not a fault.
-            let skill = cfg.bindings.skill(button).unwrap_or_default();
+            // Soccer mode puts the kicks back on the bumpers, whatever they are bound to.
+            let skill = match button {
+                "lb" if self.soccer.active => "kick_left",
+                "rb" if self.soccer.active => "kick_right",
+                // An empty binding is a button switched off on purpose, not a fault.
+                _ => cfg.bindings.skill(button).unwrap_or_default(),
+            };
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -341,7 +407,8 @@ impl Mapper {
             pad.released.contains(Buttons::HOME),
             now,
             &[FLASHLIGHT_TAP],
-        ) {
+        ) && !self.spent.contains(Buttons::HOME)
+        {
             out.push(Out::Request(proto::Call::RobotFlashlight(
                 proto::FlashlightParams {
                     toggle: true,
@@ -359,7 +426,11 @@ impl Mapper {
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
         let held = cfg.bindings.skill("x").unwrap_or_default();
-        if pad.held.contains(Buttons::X) && !pad.pressed.contains(Buttons::X) && !held.is_empty() {
+        if pad.held.contains(Buttons::X)
+            && !pad.pressed.contains(Buttons::X)
+            && !self.spent.contains(Buttons::X)
+            && !held.is_empty()
+        {
             out.push(Out::Notify(proto::Call::RobotDo(proto::DoParams {
                 skill: held.to_owned(),
             })));
@@ -431,6 +502,8 @@ impl Mapper {
         }
         self.prev_rt = rt;
         self.prev_lt = lt;
+        // A spent press is spent until its button comes back up.
+        self.spent = Buttons(self.spent.0 & !pad.released.0);
 
         let sticks = Sticks {
             left_x: pad.left_x,
@@ -589,6 +662,173 @@ mod tests {
 
     fn cfg() -> Config {
         Config::defaults(false, &Default::default())
+    }
+
+    fn press(b: Buttons) -> PadFrame {
+        PadFrame {
+            pressed: b,
+            held: b,
+            ..Default::default()
+        }
+    }
+
+    fn release(b: Buttons) -> PadFrame {
+        PadFrame {
+            released: b,
+            ..Default::default()
+        }
+    }
+
+    fn skills(out: &[Out]) -> Vec<String> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Request(proto::Call::RobotDo(p)) => Some(p.skill.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn soccer_asks(out: &[Out]) -> Vec<proto::SoccerParams> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Request(proto::Call::RobotSoccer(p)) => Some(*p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const MANUAL: proto::SoccerParams = proto::SoccerParams {
+        active: true,
+        autonomous: false,
+    };
+    const AUTONOMOUS: proto::SoccerParams = proto::SoccerParams {
+        active: true,
+        autonomous: true,
+    };
+
+    /// Outside soccer mode nothing changes: D-pad down is body + head, the bumpers are bindings.
+    #[test]
+    fn outside_soccer_mode_the_pad_is_its_own() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(soccer_asks(&out).is_empty());
+        assert_eq!(m.mode, Mode::BodyPose);
+        m.tick(
+            &press(Buttons::LB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(
+            !skills(&out).iter().any(|s| s.starts_with("kick")),
+            "{out:?}"
+        );
+    }
+
+    /// Soccer mode: the bumpers kick, D-pad down plays by itself and hands the sticks to driving.
+    #[test]
+    fn soccer_mode_kicks_on_the_bumpers_and_plays_on_down() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.set_soccer(Some(MANUAL));
+        m.tick(
+            &press(Buttons::LB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(skills(&out), ["kick_left"]);
+        m.tick(
+            &press(Buttons::RB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(skills(&out), ["kick_right"]);
+
+        m.tick(
+            &press(Buttons::UP),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(m.mode, Mode::Head);
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(soccer_asks(&out), [AUTONOMOUS]);
+        assert_eq!(m.mode, Mode::Drive, "not body + head");
+        assert!(
+            out.contains(&Out::Notify(proto::Call::RobotHead(Default::default()))),
+            "leaving head mode puts the head back: {out:?}"
+        );
+    }
+
+    /// Autonomous: any button takes the robot back, and does nothing else — A does not sit it, and
+    /// Start's release does not toggle the policy. The next press is an ordinary press again.
+    #[test]
+    fn any_button_takes_autonomous_soccer_back_and_is_spent_on_it() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let now = Instant::now();
+        m.set_soccer(Some(AUTONOMOUS));
+
+        m.tick(&press(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [MANUAL]);
+        assert!(skills(&out).is_empty(), "the press is spent: {out:?}");
+        m.tick(&release(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        m.tick(&press(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        assert_eq!(skills(&out), ["kick_left"], "manual soccer again");
+        assert!(soccer_asks(&out).is_empty());
+
+        // Start: back to manual on the press, and its tap toggles nothing on the release.
+        m.tick(&press(Buttons::DOWN), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [AUTONOMOUS]);
+        m.tick(&release(Buttons::DOWN), &cfg, now, &mut out, &mut frame);
+        m.tick(&press(Buttons::START), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [MANUAL]);
+        let later = now + std::time::Duration::from_millis(100);
+        m.tick(&release(Buttons::START), &cfg, later, &mut out, &mut frame);
+        assert!(
+            !out.iter().any(|o| matches!(
+                o,
+                Out::Request(proto::Call::RobotEnable(_) | proto::Call::RobotInit)
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// The robot switching soccer off — another tag, `robotctl` — gives the pad its mapping back.
+    #[test]
+    fn soccer_switched_off_elsewhere_gives_the_pad_back() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.set_soccer(Some(MANUAL));
+        m.set_soccer(None);
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(soccer_asks(&out).is_empty());
+        assert_eq!(m.mode, Mode::BodyPose);
     }
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change

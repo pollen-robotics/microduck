@@ -30,6 +30,10 @@ const POWER_NONE: u8 = 0;
 /// level slot still reading "up" would pick it straight back up with a background of
 /// somewhere the duck no longer is.
 const THEREMIN_NONE: u8 = 0;
+
+/// [`Intents::soccer`]'s bits: soccer mode is on, and autonomous soccer on top of it.
+const SOCCER_ACTIVE: u8 = 1;
+const SOCCER_AUTONOMOUS: u8 = 2;
 const THEREMIN_UP: u8 = 1;
 const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
@@ -163,6 +167,10 @@ pub struct Intents {
     /// A pending laser-tracking switch, with the theremin's encoding: an edge, so the loop's own
     /// `[laser] enabled` at boot is not overridden by a level nobody wrote.
     laser: AtomicU8,
+    /// Soccer mode's two switches, [`SOCCER_ACTIVE`] and [`SOCCER_AUTONOMOUS`]. Levels, not
+    /// edges like the laser's: nothing in the config file starts soccer, so there is no boot
+    /// state for a level to override, and `robot.mode` reads them back to the pad daemons.
+    soccer: AtomicU8,
     /// The same, for the chorale.
     chorale: AtomicU8,
     /// The piece pinned by the pending chorale request, 0 for none. Written before the
@@ -292,6 +300,7 @@ impl Intents {
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
             laser: AtomicU8::new(THEREMIN_NONE),
+            soccer: AtomicU8::new(0),
             chorale: AtomicU8::new(THEREMIN_NONE),
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
@@ -615,6 +624,25 @@ impl Intents {
             THEREMIN_UP => Some(true),
             THEREMIN_DOWN => Some(false),
             _ => None,
+        }
+    }
+
+    /// Set soccer mode. `autonomous` implies `active`; `active: false` turns both off.
+    pub fn set_soccer(&self, active: bool, autonomous: bool) {
+        let bits = match (active, autonomous) {
+            (false, _) => 0,
+            (true, false) => SOCCER_ACTIVE,
+            (true, true) => SOCCER_ACTIVE | SOCCER_AUTONOMOUS,
+        };
+        self.soccer.store(bits, Ordering::Relaxed);
+    }
+
+    /// Soccer mode's switches as they stand.
+    pub fn soccer(&self) -> duck_ipc_proto::SoccerParams {
+        let bits = self.soccer.load(Ordering::Relaxed);
+        duck_ipc_proto::SoccerParams {
+            active: bits & SOCCER_ACTIVE != 0,
+            autonomous: bits & SOCCER_AUTONOMOUS != 0,
         }
     }
 

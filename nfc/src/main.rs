@@ -7,7 +7,9 @@
 //! whose NDEF says [`ndef::PAIRING`]: if a pad is already connected nothing happens, otherwise
 //! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
-//! are in [`nfc::pairing`].
+//! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
+//! asks `robotd` to switch to it; which names there are, and which do nothing yet, is
+//! [`nfc::modes`].
 //!
 //! ## Writing a tag
 //!
@@ -44,6 +46,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
+use nfc::modes::{self, Driver, ModeTag};
 use nfc::pairing::{self, Outcome, Robot, Touches};
 use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
@@ -189,8 +192,22 @@ enum Chip {
 enum Tech {
     /// ISO 14443A: a Type 2 tag (NTAG), read a page at a time.
     A,
+    /// ISO 14443A, a MIFARE Classic by its SAK: not read, and said so once rather than retried.
+    Classic,
     /// ISO 15693: a Type 5 tag (ST25TV, ICODE), read a block at a time.
     V,
+}
+
+impl Tech {
+    /// What an ISO 14443A tag is, from the SAK it selected with.
+    fn of(found: tag::Selected) -> (Vec<u8>, Tech) {
+        let tech = if tag::is_mifare_classic(found.sak) {
+            Tech::Classic
+        } else {
+            Tech::A
+        };
+        (found.uid, tech)
+    }
 }
 
 impl Chip {
@@ -213,15 +230,15 @@ impl Chip {
     /// next.
     fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech)> {
         let Chip::Spi(c) = self else {
-            return tag::select(self).map(|uid| (uid, Tech::A));
+            return tag::select_tag(self).map(Tech::of);
         };
         // Whatever the last touch left the chip framing, the 14443A ask starts from its own.
         c.set_proto(Proto::A)?;
         let mut last = Error::NoTag;
         for antenna in [Antenna::One, Antenna::Two] {
             c.set_antenna(antenna)?;
-            match tag::select(c) {
-                Ok(uid) => return Ok((uid, Tech::A)),
+            match tag::select_tag(c) {
+                Ok(found) => return Ok(Tech::of(found)),
                 Err(e) if !e.is_tag() => return Err(e),
                 _ => {}
             }
@@ -267,7 +284,7 @@ fn open(device: &Path) -> nfc::Result<Chip> {
 }
 
 /// Poll until the reader stops answering, acting on every touch. Returns why it stopped.
-fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot, writes: &mut Writes) -> Error {
+fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, writes: &mut Writes) -> Error {
     let mut touches = Touches::default();
     loop {
         let start = Instant::now();
@@ -302,17 +319,33 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot, writes: &mut 
             let id = hex(uid);
             let read = match tech {
                 Tech::A => tag::read_ndef_area(chip),
+                Tech::Classic => Err(Error::Unreadable(
+                    "a MIFARE Classic card: not read here — use an NTAG (Type 2) or a Type 5 tag"
+                        .into(),
+                )),
                 Tech::V => vtag::read_ndef_area(chip, uid),
             };
             match read.map(|data| ndef::parse(&data)) {
                 Err(e) if !e.is_tag() => return e,
+                // The same answer every time it is asked: said once, until the tag is lifted.
+                Err(Error::Unreadable(why)) => {
+                    tracing::warn!(tag = %id, ?tech, %why, "tag cannot be read")
+                }
                 Err(e) => {
                     tracing::info!(tag = %id, error = %e, "tag not read; trying again");
                     touches.unread();
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
-                    tracing::warn!(tag = %id, ?records, "not a pairing tag")
+                    match ModeTag::in_records(&records) {
+                        Some(mode) => {
+                            tracing::warn!(tag = %id, mode = mode.text(), "mode tag touched");
+                            report_mode(mode, modes::on_touch(robot, mode));
+                        }
+                        None => {
+                            tracing::warn!(tag = %id, ?records, "neither a pairing nor a mode tag")
+                        }
+                    }
                 }
                 Ok(Ok(_)) => {
                     // Off while the pairing blocks: no reason to power the antenna for the
@@ -390,6 +423,9 @@ fn write_touched(
     let written = match tech {
         Tech::V => Err(Error::Tag(
             "a Type 5 tag: only an NTAG (Type 2) is written".into(),
+        )),
+        Tech::Classic => Err(Error::Tag(
+            "a MIFARE Classic card: only an NTAG (Type 2) is written".into(),
         )),
         Tech::A => ndef::text_tlv(&job.text)
             .map_err(Error::Tag)
@@ -537,7 +573,7 @@ fn write_when_touched(
     };
     // Before the job is handed over, so a tag already on the reader is asked for before its quack
     // says it took.
-    if let Err(why) = robot.sound(WAITING) {
+    if let Err(why) = Robot::sound(robot, WAITING) {
         tracing::info!(%why, "the robot would not quack to ask for a tag");
     }
     if asked.send(job).is_err() {
@@ -591,6 +627,21 @@ fn report(outcome: Outcome) {
     }
 }
 
+fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
+    let tag = tag.text();
+    match outcome {
+        modes::Outcome::Switched(mode, switch) => {
+            let on = switch.map(modes::Switch::name);
+            tracing::warn!(tag, mode, on, "mode switched")
+        }
+        modes::Outcome::Refused(mode, why) => {
+            tracing::warn!(tag, mode, %why, "the robot refused the mode")
+        }
+        modes::Outcome::NotYet => tracing::warn!(tag, "this mode does nothing yet"),
+        modes::Outcome::Failed(why) => tracing::error!(tag, %why, "could not ask the robot"),
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -629,6 +680,38 @@ impl Robot for Sockets {
         } else {
             Err(outcome.reason.unwrap_or_else(|| "refused".into()))
         }
+    }
+}
+
+impl Driver for Sockets {
+    fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
+        Robot::sound(self, tag)
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<proto::IntentResult, String> {
+        let params = proto::SetModeParams { mode: mode.into() };
+        call(
+            &self.robot,
+            &proto::Call::RobotSetMode(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
+        let params = proto::LaserTrackParams { active };
+        call(
+            &self.robot,
+            &proto::Call::RobotLaserTrack(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn soccer(&mut self, active: bool) -> Result<proto::IntentResult, String> {
+        let params = proto::SoccerParams {
+            active,
+            autonomous: false,
+        };
+        call(&self.robot, &proto::Call::RobotSoccer(params), QUICK_ANSWER)
     }
 }
 
