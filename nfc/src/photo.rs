@@ -21,11 +21,12 @@
 //!    not light a scene anyway.
 //! 5. The frame is saved as a JPEG named for the local time, in the photo directory
 //!    (`/var/lib/robot/photos` on a robot).
-//! 6. The beak opens wide, and the robot sits.
+//! 6. The beak opens wide, and [`BEFORE_SIT`] later the robot sits.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
 //! 8. It holds it [`KEEP`]: where the photo will be written to it, which is not done yet.
-//! 9. It lowers its head, opens its beak to let the display go, and closes it [`DROP`] later.
+//! 9. It lowers its head, opens its beak to let the display go, closes it [`DROP`] later, and
+//!    brings its head back up to the centre.
 //!    No display in time, and it just closes its beak.
 //!
 //! **The idle look-around is kept off from the first look to the end.** It starts after two
@@ -57,8 +58,8 @@ pub const HEARD: proto::SoundTag = crate::pairing::HEARD;
 pub const COUNTDOWN: Duration = Duration::from_secs(5);
 
 /// The countdown's blinks, and the flash, as shares of the flashlight's full brightness.
-pub const BLINK: f64 = 0.10;
-pub const FLASH_AT: f64 = 0.15;
+pub const BLINK: f64 = 0.03;
+pub const FLASH_AT: f64 = 0.20;
 
 /// The shutter: a quack as the flash goes on, so the person posing hears the picture taken.
 pub const SHUTTER: proto::SoundTag = proto::SoundTag::Chirp;
@@ -78,7 +79,12 @@ const EINK_POLL: Duration = Duration::from_millis(300);
 /// The display held in the closed beak: where the photo will be written.
 pub const KEEP: Duration = Duration::from_secs(5);
 /// Head down and beak open, for the display to fall, before the beak closes again.
-pub const DROP: Duration = Duration::from_secs(3);
+pub const DROP: Duration = Duration::from_secs(2);
+/// After the picture, beak open, before the robot sits.
+pub const BEFORE_SIT: Duration = Duration::from_secs(1);
+/// The head brought back to the centre at the end, before it is let go: sent rather than left to
+/// the look-around, which would wait two seconds and then fade in slowly.
+const BACK_UP: Duration = Duration::from_millis(800);
 /// For the head to go down before the beak opens.
 const LOWER: Duration = Duration::from_millis(800);
 
@@ -260,6 +266,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     }
     // Not stopping when it will not sit: the display is taken standing just as well, and stopping
     // here would leave the beak open with nothing to close it.
+    hold(robot, head, BEFORE_SIT);
     if let Err(why) = asked("robot.do sit_toggle", robot.sit_toggle()) {
         tracing::warn!(%why, "not sitting down — waiting for the e-ink standing");
     }
@@ -282,13 +289,15 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     if !came {
         tracing::warn!("no e-ink in the beak — closing it");
         let _ = robot.mouth(0.0);
+        hold(robot, proto::HeadParams::default(), BACK_UP);
         return outcome;
     }
     tracing::warn!("e-ink in the beak");
     let _ = robot.mouth(0.0);
     hold(robot, head, KEEP);
 
-    // Head down, beak open: the display falls. Then the beak closes, and the head is let go.
+    // Head down, beak open: the display falls. Then the beak closes and the head comes straight
+    // back up to the centre, before it is let go.
     let down = match robot.look(LOOK_DOWN) {
         Ok(r) => r.head,
         Err(why) => return Outcome::Failed(format!("robot.look: {why}")),
@@ -297,6 +306,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     let _ = robot.mouth(1.0);
     hold(robot, down, DROP);
     let _ = robot.mouth(0.0);
+    hold(robot, proto::HeadParams::default(), BACK_UP);
     outcome
 }
 
@@ -649,7 +659,7 @@ mod tests {
                 "stop",
                 "look",
                 "blinks",
-                "light 0.15",
+                "light 0.2",
                 "quack",
                 "capture",
                 "light 0",
@@ -725,7 +735,8 @@ mod tests {
             Outcome::NoPhoto("no such socket".into())
         );
         assert!(!robot.calls.contains(&"save".to_string()));
-        assert_eq!(robot.calls.last().unwrap(), "mouth 0");
+        assert_eq!(shape(&robot.calls).last().unwrap(), "mouth 0");
+        assert_eq!(robot.calls.last().unwrap(), "head");
     }
 
     #[test]
@@ -757,7 +768,8 @@ mod tests {
         };
         assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
         assert!(robot.calls.contains(&"eink".to_string()));
-        assert_eq!(robot.calls.last().unwrap(), "mouth 0");
+        assert_eq!(shape(&robot.calls).last().unwrap(), "mouth 0");
+        assert_eq!(robot.calls.last().unwrap(), "head");
     }
 
     /// No display in the beak: it waits, then closes its beak, the head held all along.
@@ -774,7 +786,7 @@ mod tests {
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }
 
-    /// Dim, so it does not hurt: the blinks at a tenth, the flash at 15 %.
+    /// Dim, so it does not hurt: the blinks at 3 %, the flash at 20 %.
     #[test]
     fn the_light_is_dim() {
         let mut robot = Fake::default();
@@ -786,9 +798,9 @@ mod tests {
             .map(String::as_str)
             .collect();
         let (flash, blinks) = lit.split_last().unwrap();
-        assert_eq!(*flash, "light 0.15");
+        assert_eq!(*flash, "light 0.2");
         assert!(
-            blinks.len() > 8 && blinks.iter().all(|c| *c == "light 0.1"),
+            blinks.len() > 8 && blinks.iter().all(|c| *c == "light 0.03"),
             "{blinks:?}"
         );
     }
