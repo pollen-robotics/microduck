@@ -86,7 +86,10 @@ futures = "0.3"
 webbrowser = "1.2.4"
 serde_json.workspace = true
 socket2.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# `net`, `io-util` and `signal` for `open`'s local console bridge (`src/console.rs`).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "signal"] }
+# The console's per-run access token: an access credential, so the OS's generator.
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"

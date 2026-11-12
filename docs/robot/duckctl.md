@@ -142,6 +142,17 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — the variable [`dev-push.sh`](dev-push.md) reads, so a laptop set up for pushing is set up for this
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
+A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
+wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would. To
+open it until the robot next reboots, without opening the robot:
+
+```bash
+duckctl ssh-wifi
+```
+
+That asks `configd` over the same authenticated Bluetooth session every other command uses, so it
+needs the setup code. On the dev image it changes nothing: ssh is open on wifi there already.
+
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
 second, the scan is skipped. If nothing does — the robot moved, is off, or the laptop is on another
@@ -212,12 +223,13 @@ The robot serves a page that streams its camera and drives it:
 duckctl open
 ```
 
-Finds the robot, then opens `http://<address>:8080/` in a browser. `--print` gives the URL instead,
-for a machine with no browser or for a script; `--port` for a robot started with a non-default
-`mediad --web-port`.
-
-Nothing to install and nothing to serve — `mediad` embeds the page, so a robot running that daemon
-is a robot with a console.
+Finds the robot, then runs a small bridge on this machine and opens it in a browser; Ctrl-C closes
+it. `--print` gives the URL instead of opening a browser. It needs the robot's setup code
+(`duckctl setup-code add`), because since daemon 0.19 the robot serves its console on its own
+loopback and the LAN reaches it only through the authenticated media gateway. The page is this
+duckctl's copy, so keep duckctl current. Why it works this way, and what the bridge checks before
+it lets a browser through:
+[`webrtc-console.md` §2.2](../design/webrtc-console.md#22-duckctl-open).
 
 What is on it: the camera with the link's bitrate, frame rate, loss and round trip beside it; two
 pads and the keys `W`/`A`/`S`/`D` and `Q`/`E` to drive, at a gamepad's 0.3 m/s and 1.5 rad/s; a drag
@@ -853,3 +865,16 @@ sudo pkill bluetoothd
 
 Forgetting the robot in macOS Bluetooth settings does the same thing. On the robot itself,
 `journalctl -u btd -b` says whether the GATT application registered at all.
+
+**After the robot has been reflashed**, a laptop that was bonded with it before still holds its
+half of a bond the robot no longer has: connecting times out every time, though nothing else holds
+the robot. On Linux, `bluetoothctl info <mac>` shows `Paired: yes`, and
+
+```bash
+bluetoothctl remove <mac>
+```
+
+clears it; on macOS, forget the robot in Bluetooth settings. The same goes for a phone: forget the
+robot in the phone's Bluetooth settings, not only in the app. `scan` ignores a device that BlueZ
+remembers but has not heard in this scan — the cached copy of an old advertisement, with an
+address the robot may have left days ago — and `--verbose` says when it does.
