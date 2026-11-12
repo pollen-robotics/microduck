@@ -779,7 +779,7 @@ duckctl --name <robot-name> nfc-flash walk_mode
 
 The duck asks for a tag with its pad-lost sound; touch an NTAG to its head within 20 seconds
 (`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
-[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+[`nfc-tags.md`](nfc-tags.md#writing-a-tag).
 
 ## Anything else — `call`
 

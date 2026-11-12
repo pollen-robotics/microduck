@@ -73,6 +73,7 @@ It also sits, kicks a ball, rolls forward on command, and quacks in a voice that
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: drive, configure, voice, chorale, theremin, wifi, updates, logs. Start here. |
 | [Gamepad](docs/robot/cheatsheet.md#gamepad-configd) | The full button mapping, and pairing a pad — [once per pad](docs/robot/pair-a-gamepad.md), plus what to do when it will not bond. |
+| [NFC tags](docs/robot/nfc-tags.md) | Touch a tag to the head: pair a pad, or switch to walk, roller, laser or soccer. Writing your own tags. |
 | [`duckctl`](docs/robot/duckctl.md) | The robot from a laptop over Bluetooth, with no network and no ssh. |
 | [Updates](docs/robot/cheatsheet.md#updates-updaterd) | Install, roll back, pin. Every update is verified, health-gated and reversible. |
 

@@ -745,6 +745,9 @@ Pairing is once per pad and has a page of its own —
 pad without forgetting the first, and what to do when it will not bond (the `Privacy` setting in
 `/etc/bluetooth/main.conf` is the answer more often than anything else).
 
+On a robot with an NFC reader, a tag does the pairing with nothing typed, and other tags switch the
+mode — [`nfc-tags.md`](nfc-tags.md), which also has `robotctl nfc-flash` for writing one.
+
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. Each
 part of the pad has one job — face buttons and bumpers run skills, the D-pad picks what the sticks
 mean, and the two small middle buttons are holds, so nothing that cuts torque fires on a brush of
@@ -1029,7 +1032,8 @@ robotctl laser-track off
 
 A red laser dot on the floor is looked at and walked to. It shares the robot rather than taking
 it: a pushed stick wins over the dot, and with no dot in sight the robot does what the pad says —
-so it can be left on while driving. The video stream is untouched; `mediad` scans the frames it
+so it can be left on while driving. An NFC tag reading `laser_mode` switches it on, and the walk,
+roller and soccer tags off — [`nfc-tags.md`](nfc-tags.md). The video stream is untouched; `mediad` scans the frames it
 already has, once a second while searching and ~15 times once it sees a dot. Measured on a
 face-board-v1: searching costs about 1% of one core, tracking about 15%.
 
@@ -1070,7 +1074,7 @@ robotctl soccer off
 ```
 
 Touching an NFC tag that says `soccer_mode` does what `on` does (and puts the robot in `walk`); the
-walk, roller and laser tags end it.
+walk, roller and laser tags end it — [`nfc-tags.md`](nfc-tags.md).
 
 **Soccer mode** changes two things on the pad: **LB / RB kick** with the left and right foot,
 whatever they are bound to, and **D-pad down** sets the robot **playing by itself** — it turns in
