@@ -698,7 +698,7 @@ dereferencing the symlinks that repository uses to give stable names to particul
 | `alpha_ground_pick.onnx` | `alpha_ground_pick.onnx` | ground pick (phase command) |
 | `ball_kick_left.onnx` | `ball_kick_left.onnx` | left-leg kick |
 | `ball_kick_right.onnx` | `ball_kick_right.onnx` | right-leg kick |
-| `roller.onnx` | `BEST_roller.onnx` | roller-mode locomotion |
+| `roller.onnx` | `BEST_roller.onnx` until set v9; from v10, `pollen-robotics/microduck_rl` `Mjlab-Velocity-Swizzle-MicroDuck` (swizzle skating) | roller-mode locomotion |
 | `roller_crouch.onnx` | `BEST_roller_crounch.onnx` | roller-mode crouch (ground-pick slot) |
 | `roulade.onnx` | `roulade.onnx` | forward roll (Mjlab-Roulade-MicroDuck) |
 
