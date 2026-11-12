@@ -54,7 +54,7 @@ impl TryFrom<proto::Service> for Upstream {
             // Not sockets `btd` holds. Unreachable in practice, because `permits` refuses every
             // call these answer — and an error rather than a panic so that staying true is not
             // something this file has to be careful about.
-            proto::Service::Pad | proto::Service::Tof => Err(()),
+            proto::Service::Pad | proto::Service::Tof | proto::Service::Map => Err(()),
         }
     }
 }
@@ -543,6 +543,10 @@ fn permits(call: &proto::Call) -> bool {
         // `duckctl nfc-flash` is the client. It changes the tag, never the robot — the tag's
         // text does whatever it does only when touched again, like one a phone app wrote.
         NfcWrite(_) => true,
+        // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
+        // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
+        // reason to forward `map.status` — not yet one anybody has.
+        MapStatus | MapStream | MapGrid(_) | MapWipe => false,
     }
 }
 

@@ -1983,6 +1983,7 @@ mod tests {
                 "laser",
                 "soccer",
                 "head_imu",
+                "map",
                 "audio",
                 "emotions",
                 "media",

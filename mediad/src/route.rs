@@ -233,6 +233,9 @@ fn permits(call: &proto::Call) -> bool {
         TofStream => true,
         // The head IMU rides the same video path, for the same reason: it annotates the frames.
         HeadImuStream => true,
+        // The map and the pose in it: what a remote viewer draws the duck on. A wipe is the
+        // owner's to ask for, from wherever they drive the robot.
+        MapStatus | MapStream | MapGrid(_) | MapWipe => true,
 
         // Writing a tag needs a person at the robot's head to touch one, and BLE is the transport
         // that is in the room by construction; `btd` carries it. Nothing remote wants it yet.
@@ -467,6 +470,10 @@ mod tests {
                 // fifteen-second window, which a remote peer cannot satisfy — but unbonding one
                 // is a thing you do *because* the pad is not there.
                 proto::method::PAD_FORGET,
+                // Forgetting the map. Not `updaterd`'s to authorise — `mapd` answers it, and the
+                // map is the owner's — and the console is where somebody sees that the map has
+                // gone wrong.
+                proto::method::MAP_WIPE,
             ],
             "a mutating call was routed to WebRTC; is `deploy/updater.toml` still narrow enough?"
         );
@@ -507,6 +514,8 @@ mod tests {
                     | proto::Call::TofStream
                     | proto::Call::HeadImuStream
                     | proto::Call::PadInput
+                    | proto::Call::MapStream
+                    | proto::Call::MapGrid(_)
             );
             if wanted {
                 assert!(
