@@ -58,6 +58,11 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const PAIR_ANSWER: Duration = Duration::from_secs(40);
 const QUICK_ANSWER: Duration = Duration::from_secs(5);
 
+/// Where the ST25R100's two antennas are, found by touching a tag to each on a face-board-v1
+/// (`tag in the field` names the antenna): RFO1 under the top of the head, RFO2 in the beak.
+const HEAD: Antenna = Antenna::One;
+const BEAK: Antenna = Antenna::Two;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "nfcd",
@@ -301,14 +306,25 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets) -> Error {
             && touches.seen(Some(uid))
         {
             let id = hex(uid);
-            // Which antenna, for finding out which is where on a board: touch a tag to each.
-            tracing::warn!(tag = %id, ?tech, ?antenna, "tag in the field");
+            let place = match antenna {
+                Some(HEAD) => "head",
+                Some(BEAK) => "beak",
+                None => "reader",
+            };
+            tracing::warn!(tag = %id, ?tech, ?antenna, place, "tag in the field");
             let read = match tech {
                 Tech::A => tag::read_ndef_area(chip),
                 Tech::Classic => classic::read_ndef_area(chip, uid),
                 Tech::V => vtag::read_ndef_area(chip, uid),
+                // On the head, it starts the photo; in the beak, it is where the photo will be
+                // written, which is not done yet. The bench reader has one antenna, the head's.
+                Tech::Eink if antenna == Some(BEAK) => {
+                    tracing::warn!(tag = %id, "e-ink in the beak — writing the photo to it is not done yet");
+                    continue_after(period, start);
+                    continue;
+                }
                 Tech::Eink => {
-                    tracing::warn!(tag = %id, "e-ink touched — hold still");
+                    tracing::warn!(tag = %id, "e-ink on the head — hold still");
                     report_photo(photo::on_touch(robot));
                     continue_after(period, start);
                     continue;

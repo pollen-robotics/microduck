@@ -92,8 +92,9 @@ picture: it starts the robot if Start was not pressed, stands still, lifts its h
 five seconds with the flashlight blinking dimly and faster and faster, flashes at 15 % with a quack
 as it takes the photo, then sits with its beak open. The picture is kept in
 `/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how a
-display is recognised (any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. Every touch logs which
-of the board's two antennas saw it (`tag in the field`, `antenna=Some(One)`).
+display is recognised (any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. A display starts it
+from the top of the head only; in the beak, where the photo will be written to it, it is logged
+and nothing else yet. Every touch logs where it was seen (`tag in the field`, `place="head"`).
 
 ## Check it
 
