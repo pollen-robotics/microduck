@@ -1,5 +1,5 @@
 //! The NFC reader: a CLRC663 on USB serial or an ST25R100 on SPI, reading Type 2 (NTAG) and
-//! Type 5 (ISO 15693) tags, and on the ST25R100 NDEF-formatted MIFARE Classic cards too.
+//! Type 5 (ISO 15693) tags.
 //!
 //! A port of `ntag663` from the winnie repo, cut down to what `nfcd` does — find a tag, read its
 //! NDEF — and without its writer, which stays a bench tool on a laptop. The measurements behind
@@ -8,14 +8,11 @@
 //!
 //! Layered as the Python is: [`transport`] frames register accesses over the serial link,
 //! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
-//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`classic`] the MIFARE Classic
-//! authentication and reads over [`crypto1`], [`ndef`] is pure parsing.
+//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
 //! [`pairing`], [`modes`] and [`photo`] are what `nfcd` does with a tag, and are the part worth
 //! testing on a laptop.
 
-pub mod classic;
 pub mod clrc663;
-pub mod crypto1;
 pub mod eink;
 pub mod modes;
 pub mod ndef;
@@ -46,9 +43,9 @@ pub enum Error {
     Collision(String),
     /// A tag answered, and wrongly.
     Tag(String),
-    /// A tag answered properly and will not give its data to this reader: a MIFARE Classic whose
-    /// keys are not the NFC Forum's, or one touched to a reader without Crypto1 framing. Asking
-    /// again gives the same answer, so it is said once per touch rather than retried.
+    /// A tag answered properly and is not one this reader reads: a MIFARE Classic, whose sectors
+    /// open only after a Crypto1 authentication. Asking again gives the same answer, so it is said
+    /// once per touch rather than retried.
     Unreadable(String),
 }
 

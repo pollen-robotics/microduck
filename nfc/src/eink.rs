@@ -10,8 +10,8 @@
 //! means asking it, with its maker's commands over ISO 14443-4 — which `nfcd` does not speak yet,
 //! and which writing the photo to it needs anyway. Until then, this is the rule.
 //!
-//! It is checked before [`crate::classic::is_classic`], because a `28` also has the Classic bit:
-//! read as a Classic, a display fails authentication and nothing happens.
+//! It is checked before [`crate::tag::is_mifare_classic`], because a `28` also has the Classic
+//! bit: taken for a Classic, a display would be turned away as unreadable.
 
 /// Whether a SAK says ISO 14443-4, which is how a display is told from a tag.
 pub fn is_eink(sak: u8) -> bool {

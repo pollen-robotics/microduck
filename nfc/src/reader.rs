@@ -12,26 +12,6 @@ pub trait Reader {
 
     /// Send `data` to the tag and return its answer, CRC and parity already checked and removed.
     fn transceive(&mut self, data: &[u8], exchange: Exchange) -> Result<Vec<u8>>;
-
-    /// Send `bits` bits of `data` as they are — no parity, no CRC added — and return the bits
-    /// that came back, unchecked, with how many there are. Each byte least significant bit first,
-    /// the bit stream running on across byte boundaries.
-    ///
-    /// MIFARE Classic needs this: once authenticated, its parity bits are encrypted, so
-    /// [`crate::classic`] builds every 9-bit group itself. A reader that cannot frame raw bits
-    /// says so, once per touch — the CLRC663 could, through its own Crypto1, but nothing here
-    /// drives that yet.
-    fn transceive_bits(
-        &mut self,
-        data: &[u8],
-        bits: usize,
-        timeout_ms: u64,
-    ) -> Result<(Vec<u8>, usize)> {
-        let _ = (data, bits, timeout_ms);
-        Err(crate::Error::Unreadable(
-            "a MIFARE Classic card, and this reader does not read those".into(),
-        ))
-    }
 }
 
 /// How one exchange with a tag is framed.
