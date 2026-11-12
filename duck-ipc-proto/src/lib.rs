@@ -874,13 +874,14 @@ pub mod method {
     /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
     /// `[laser]` needs.
     pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
-    /// Write a text onto the next NTAG touched to the reader: one NDEF text record, as a phone
+    /// Write a text onto the next tag touched to the reader: one NDEF text record, as a phone
     /// app writes it, so the tag then reads as that text everywhere — a mode tag, a pairing tag.
     /// The answer comes when a tag has been written and read back, or when none was touched in
     /// time; see [`super::NfcWriteResult`]. Answered by `nfcd`.
     ///
-    /// Only an NTAG (NFC Forum Type 2) is written. A Type 5 tag, a MIFARE Classic, a locked tag
-    /// or a text too long for the tag is refused with why, and nothing on it changes.
+    /// An NTAG (NFC Forum Type 2) is written, and on the beta board's reader an ISO 15693 tag
+    /// (Type 5) too, formatted first if blank. A MIFARE Classic, a locked tag or a text too long
+    /// for the tag is refused with why, and nothing on it changes.
     pub const NFC_WRITE: &str = "nfc.write";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
