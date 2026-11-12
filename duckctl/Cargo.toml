@@ -32,6 +32,9 @@ description = "The robot from a laptop — over BLE today, over whatever reaches
 # was pulling a Linux daemon — and on Linux, `bluer` and a vendored libdbus with
 # it — to reach them.
 duck-ble = { path = "../duck-ble" }
+# The Noise handshake a robot in secure mode requires, from the crate `btd` answers it with — the
+# same argument as `framing` above: a second implementation could only agree with itself.
+duck-auth = { path = "../duck-auth" }
 
 # `API_VERSION`, and the `semver` re-export it is compared with. The version handshake is a
 # contract between this client and every daemon, so it is read from the crate that defines it
@@ -99,6 +102,12 @@ libdbus-sys = { version = "0.2", features = ["vendored"] }
 # grafted into the wheel, and that copy cannot find the PipeWire or PulseAudio plugin a
 # Debian-family desktop plays through — `src/udp_pad/voice/alsa.rs` has the whole of it.
 libloading = "0.9"
+# A pairing agent for the length of a command (`src/agent.rs`): without one, BlueZ refuses the
+# robot's just-works bond whenever no desktop agent is up. The same `dbus` btleplug already brings,
+# so this adds only the object-serving half.
+dbus = { version = "0.9", features = ["futures"] }
+dbus-tokio = "0.7"
+dbus-crossroads = "0.5"
 
 # The laptop's voice elsewhere: CoreAudio and WASAPI, which every such machine has. Not on Linux,
 # where `cpal` links libasound unconditionally.
