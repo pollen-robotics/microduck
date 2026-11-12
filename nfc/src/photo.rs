@@ -25,7 +25,8 @@
 //! 6. [`BEFORE_SIT`] later a standing robot sits; once seated, it opens its beak wide.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
-//! 8. It holds it [`KEEP`]: where the photo will be written to it, which is not done yet.
+//! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves ([`wiggle`]):
+//!    where the photo will be written to it, which is not done yet.
 //! 9. It lowers its head, opens its beak to let the display go, closes it [`DROP`] later, and
 //!    brings its head back up to the centre.
 //!    No display in time, and it just closes its beak.
@@ -79,6 +80,12 @@ pub const EINK_WITHIN: Duration = Duration::from_secs(60);
 const EINK_POLL: Duration = Duration::from_millis(300);
 /// The display held in the closed beak: where the photo will be written.
 pub const KEEP: Duration = Duration::from_secs(5);
+/// How far the head rolls each side while it holds the display, radians (about 8°).
+const ROLL: f64 = 0.14;
+/// One roll left and back right.
+const ROLL_PERIOD: Duration = Duration::from_millis(500);
+/// How often the rolling head is sent: smooth enough at a 500 ms period.
+const ROLL_STEP: Duration = Duration::from_millis(50);
 /// Head down and beak open, for the display to fall, before the beak closes again.
 pub const DROP: Duration = Duration::from_millis(1200);
 /// After the picture, before the robot sits.
@@ -302,7 +309,7 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     }
     tracing::warn!("e-ink in the beak");
     let _ = robot.mouth(0.0);
-    hold(robot, head, KEEP);
+    wiggle(robot, head, KEEP);
 
     // Head down, beak open: the display falls. Then the beak closes and the head comes straight
     // back up to the centre, before it is let go.
@@ -316,6 +323,28 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     let _ = robot.mouth(0.0);
     hold(robot, proto::HeadParams::default(), BACK_UP);
     outcome
+}
+
+/// Roll the head side to side around `head` for `d`, [`ROLL`] each way every [`ROLL_PERIOD`],
+/// then settle it back on `head`. Sent every [`ROLL_STEP`], so the look-around stays off too.
+fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
+    let mut t = Duration::ZERO;
+    while t < d {
+        let phase = std::f64::consts::TAU * t.as_secs_f64() / ROLL_PERIOD.as_secs_f64();
+        let rolled = proto::HeadParams {
+            head_roll: head.head_roll + ROLL * phase.sin(),
+            ..head
+        };
+        if let Err(why) = robot.head(rolled) {
+            tracing::info!(%why, "robot.head");
+        }
+        let step = (d - t).min(ROLL_STEP);
+        robot.sleep(step);
+        t += step;
+    }
+    if let Err(why) = robot.head(head) {
+        tracing::info!(%why, "robot.head");
+    }
 }
 
 /// Resend the head for `d`, often enough that the idle look-around never starts.
@@ -519,6 +548,8 @@ mod tests {
         sit_refused: Option<String>,
         /// The height of every `robot.look`.
         looks: Vec<f64>,
+        /// The roll of every `robot.head`.
+        rolls: Vec<f64>,
     }
 
     impl Default for Fake {
@@ -537,6 +568,7 @@ mod tests {
                 asked_beak: 0,
                 sit_refused: None,
                 looks: Vec::new(),
+                rolls: Vec::new(),
             }
         }
     }
@@ -581,8 +613,9 @@ mod tests {
                 clamped: false,
             })
         }
-        fn head(&mut self, _: proto::HeadParams) -> Result<(), String> {
+        fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
             self.calls.push("head".into());
+            self.rolls.push(head.head_roll);
             self.since_head = Duration::ZERO;
             Ok(())
         }
@@ -770,6 +803,25 @@ mod tests {
         on_touch(&mut robot);
         assert!(robot.calls.iter().filter(|c| *c == "head").count() > 10);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    /// The display held in the beak: the head rolls both ways, never past [`ROLL`], and ends level.
+    #[test]
+    fn the_head_rolls_while_it_holds_the_display() {
+        let mut robot = Fake::default();
+        on_touch(&mut robot);
+        let max = robot.rolls.iter().cloned().fold(f64::MIN, f64::max);
+        let min = robot.rolls.iter().cloned().fold(f64::MAX, f64::min);
+        assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
+        assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
+        assert_eq!(*robot.rolls.last().unwrap(), 0.0);
+        // No display, no rolling.
+        let mut robot = Fake {
+            eink_after: None,
+            ..Fake::default()
+        };
+        on_touch(&mut robot);
+        assert!(robot.rolls.iter().all(|r| *r == 0.0));
     }
 
     /// On the robot the sit was refused, and the sequence stopped with the beak open and the
