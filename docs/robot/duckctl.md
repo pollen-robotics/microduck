@@ -771,6 +771,16 @@ from this machine, in a voice of its own, while the duck only opens its mouth; `
 machine quiet and `--robot-sound-on` has the duck quack too. It is a LAN tool, and
 [`udp-pad.md`](udp-pad.md) has the setup, several ducks, the laptop's voice, and the wire format.
 
+## Writing an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-flash walk_mode
+```
+
+The duck asks for a tag with its pad-lost sound; touch an NTAG to its head within 20 seconds
+(`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
+[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+
 ## Anything else — `call`
 
 ```bash

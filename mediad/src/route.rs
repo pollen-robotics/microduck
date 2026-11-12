@@ -232,6 +232,10 @@ fn permits(call: &proto::Call) -> bool {
         // The head IMU rides the same video path, for the same reason: it annotates the frames.
         HeadImuStream => true,
 
+        // Writing a tag needs a person at the robot's head to touch one, and BLE is the transport
+        // that is in the room by construction; `btd` carries it. Nothing remote wants it yet.
+        NfcWrite(_) => false,
+
         // ── reading the robot's software ─────────────────────────────────────
         //
         // All read-only, all useful to a remote client, none of them touching `current`.

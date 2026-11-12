@@ -1253,6 +1253,18 @@ enum Command {
     /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
     /// that answers, in a voice that is only its own, is the one `--name` reached.
     Quack,
+    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    ///
+    /// `robotctl nfc-flash` on the robot. The tag then reads as that text — `walk_mode`,
+    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. Only an NTAG
+    /// (Type 2) is written; anything else is refused with why, and left as it was.
+    NfcFlash {
+        /// What the tag will read.
+        text: String,
+        /// How long the duck waits for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = duck_ipc_proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
     /// Is the control loop healthy?
     Health,
     /// Wifi.
@@ -2145,6 +2157,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
+    if let Command::NfcFlash { timeout, .. } = &cli.command {
+        eprintln!(
+            "Touch an NTAG to the duck's head (waiting {} s)…",
+            (*timeout).clamp(1, duck_ipc_proto::NfcWriteParams::MAX_TIMEOUT_S)
+        );
+    }
+
     // `for_replies`, not `new`: this is the client end, and the robot's answers are bounded by
     // `MAX_REPLY_LINE` rather than by the tighter cap that limits what a radio peer may send. A
     // `logs` tail is the reply that outgrew the other one.
@@ -2781,6 +2800,20 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             SLOW_REPLY_TIMEOUT,
         ),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
+        // The robot answers once a tag is written or its own wait runs out, so this waits that
+        // long and the ordinary budget on top.
+        Command::NfcFlash { text, timeout } => {
+            let params = proto::NfcWriteParams {
+                text: text.clone(),
+                timeout_s: Some(*timeout),
+            };
+            let wait = params.timeout() + REPLY_TIMEOUT;
+            (
+                proto::method::NFC_WRITE,
+                serde_json::to_value(params)?,
+                wait,
+            )
+        }
         Command::Name { name } => (
             "system.setName",
             serde_json::json!({ "name": name }),
