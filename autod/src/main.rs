@@ -21,6 +21,7 @@
 //! A broken connection to `robotd` ends the process and systemd starts it again, as with `padd`.
 
 mod brain;
+mod getup;
 mod obstacle;
 
 use std::io::{BufRead, BufReader, Write};
@@ -66,6 +67,22 @@ const SELF_AUDIO: Duration = Duration::from_millis(1500);
 
 /// How long to wait at boot for the robot to come up after `robot.enable`.
 const STAND_UP: Duration = Duration::from_secs(20);
+
+/// After a fall, what `autod` is doing about the get-up — `getup.rs` decides, this acts.
+enum Recovery {
+    Idle,
+    /// The policy is working the robot upright; `since` is when the watch started.
+    Watching {
+        g: getup::Getup,
+        since: Instant,
+    },
+    /// The policy cut by `autod`, the robot settling into its init pose until `until`.
+    Cut {
+        g: getup::Getup,
+        since: Instant,
+        until: Instant,
+    },
+}
 
 /// A laser or soccer switch `robotd` did not take is asked again after this, not every tick.
 const SWITCH_RETRY: Duration = Duration::from_secs(3);
@@ -494,6 +511,8 @@ fn drive(
     // When each switch was last asked for, so a refusal is not asked again fifty times a second.
     let mut laser_asked: Option<Instant> = None;
     let mut soccer_asked: Option<Instant> = None;
+    // After a fall: watching the get-up, or resetting it. See [`Recovery`].
+    let mut recovery = Recovery::Idle;
 
     loop {
         let tick = Instant::now();
@@ -570,6 +589,7 @@ fn drive(
                 soccer_mine = false;
                 posing = false;
                 wheee_on = false;
+                recovery = Recovery::Idle;
             } else {
                 tracing::info!(
                     "the duck on its own is off — waiting for it to be switched on \
@@ -592,6 +612,8 @@ fn drive(
             if !yielded {
                 tracing::warn!("the pad is driving — standing aside");
                 yielded = true;
+                // Whatever the get-up was, the pad's person has the robot now.
+                recovery = Recovery::Idle;
                 wheee_on = false;
                 posing = false;
                 // A game the brain started would take the legs back the moment the stick is
@@ -624,6 +646,83 @@ fn drive(
             tracing::warn!("the game is over — the duck takes back over");
             external_soccer = false;
             brain.reset();
+        }
+
+        // Down after a fall, with the policy trying to get it up. Given `getup.rs`'s timeout,
+        // then the policy cut so the robot settles into its init pose, then given back for a
+        // second try; after that, torque off and a call for help. Before the `off` check below:
+        // during the cut, the policy is off because `autod` turned it off.
+        let secs = |since: Instant| tick.duration_since(since).as_secs_f64();
+        recovery = match recovery {
+            Recovery::Idle if state.fallen && standing(&state.policy) => {
+                tracing::warn!("down — the policy is getting the duck up");
+                Recovery::Watching {
+                    g: getup::Getup::new(getup::Timing::default()),
+                    since: tick,
+                }
+            }
+            Recovery::Idle => Recovery::Idle,
+            // Somebody else turned the policy off (Start, Select): theirs now.
+            Recovery::Watching { .. } if matches!(state.policy.as_str(), "held" | "homing") => {
+                tracing::warn!(policy = %state.policy, "the policy went off during the get-up — leaving it");
+                Recovery::Idle
+            }
+            Recovery::Watching { mut g, since } => {
+                // A robot going over again mid-try is down, whatever the label says.
+                match g.tick(secs(since), state.fallen || !standing(&state.policy)) {
+                    getup::Verdict::Waiting => Recovery::Watching { g, since },
+                    getup::Verdict::GotUp {
+                        seconds,
+                        after_reset,
+                    } => {
+                        tracing::warn!(seconds, after_reset, "up again");
+                        brain.reset();
+                        Recovery::Idle
+                    }
+                    getup::Verdict::Reset => {
+                        tracing::warn!(
+                            timeout_s = g.timing.timeout,
+                            reset_s = g.timing.reset,
+                            "still down — back to the init pose, then trying again"
+                        );
+                        let off = proto::Call::RobotEnable(proto::EnableParams {
+                            on: false,
+                            toggle: false,
+                        });
+                        switch(commands, next_id, off)?;
+                        let until = tick + Duration::from_secs_f64(g.timing.reset);
+                        Recovery::Cut { g, since, until }
+                    }
+                    getup::Verdict::GaveUp => {
+                        tracing::warn!(
+                            "still down after the reset — torque off; it needs a hand (Start on the \
+                             pad once it is back on its feet)"
+                        );
+                        switch(commands, next_id, proto::Call::RobotRelax)?;
+                        let ask = proto::Call::RobotSound(proto::SoundParams {
+                            tag: proto::SoundTag::Inquire,
+                            hold: None,
+                        });
+                        commands.write_all(&line_of(&proto::Request::notify(&ask))?)?;
+                        commands.flush()?;
+                        Recovery::Idle
+                    }
+                }
+            }
+            Recovery::Cut { g, since, until } if tick < until => Recovery::Cut { g, since, until },
+            Recovery::Cut { mut g, since, .. } => {
+                let on = proto::Call::RobotEnable(proto::EnableParams {
+                    on: true,
+                    toggle: false,
+                });
+                switch(commands, next_id, on)?;
+                g.resumed(secs(since));
+                Recovery::Watching { g, since }
+            }
+        };
+        if !matches!(recovery, Recovery::Idle) {
+            sleep_rest(period, tick);
+            continue;
         }
 
         if off(&state.policy) {

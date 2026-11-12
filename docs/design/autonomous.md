@@ -75,6 +75,16 @@ so that a stopped daemon leaves no identity behind.)
   limp, someone may have stopped it, and standing it up behind their back is the bug this rule
   exists to prevent. To bring it back up, press Start, switch the duck off and on, or reboot.
 
+**After a fall, it sees the get-up through.** `robotd` catches a fall (limp, land, pose back) and
+hands the robot to the standing policy, which works it upright. When that fails, a robot left to
+it flails on the floor until somebody comes. So `autod` watches the get-up the way `robotctl stress`
+does (`autod/src/getup.rs`, ported from the `stress-test` branch): up is `fallen` clear for 1 s.
+Still down 5 s after the policy took over, it turns the policy off for 2 s, so the robot settles
+into its init pose, and gives it back for a second try. Still down after that, it turns the torque
+off and asks for help with the questioning quack: the robot needs a hand, and Start once it is on
+its feet. A pad touched mid-get-up, or the policy turned off by somebody else, ends the watch. This
+is the one time `autod` re-enables a policy: its own cut, given back.
+
 In the same spirit, `autod` **never re-enables a policy somebody else disabled.** It drives only
 while the policy is driving (the `policy` label is `walk` or `stand`). In any other state it holds
 its clock and sends nothing:
