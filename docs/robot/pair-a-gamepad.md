@@ -70,13 +70,10 @@ always running and picks a reader up within thirty seconds of it being plugged i
   tool writes one: `ntag write --text microduck_gamepad_pairing`. A tag with an address on it, as
   the first ones had, no longer pairs anything.
 - It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
-  15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV) or an **NDEF-formatted MIFARE Classic**
-  (1K, or a 4K's first 15 sectors). Any NFC phone writes the first two — NFC Tools,
+  15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
   *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
-  app first (NXP TagWriter, ST25 NFC Tap). A MIFARE Classic needs an Android phone with an NXP
-  chip (an iPhone cannot write one); writing a record formats it with the public NDEF keys the
-  robot reads with, and a card left on its factory keys is reported as not NDEF-formatted. The
-  USB reader reads NTAGs only.
+  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only. A MIFARE Classic
+  is not read: it is said once in the journal, `tag cannot be read`.
 
 What it did is in `journalctl -u nfcd -b`.
 

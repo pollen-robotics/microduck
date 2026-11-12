@@ -347,40 +347,6 @@ impl<B: Bus> St25r100<B> {
         self.write(reg::GENERAL, &[antenna.general()])
     }
 
-    /// Read the IRQ status until the exchange just started is over, then the FIFO: the bytes
-    /// received, and how many bits they hold — every bit of every byte, unless `fifo_lb` says the
-    /// last one is partial.
-    fn answer(&mut self, timeout_ms: u64) -> Result<(Vec<u8>, usize)> {
-        let until = Instant::now() + Duration::from_millis(timeout_ms + 20);
-        let mut seen = [0u8; 3];
-        loop {
-            let irq = self.irqs()?;
-            for (s, i) in seen.iter_mut().zip(irq) {
-                *s |= i;
-            }
-            if let Some(result) = outcome(seen) {
-                result?;
-                break;
-            }
-            if Instant::now() > until {
-                return Err(Error::Desync(format!(
-                    "no end of exchange (IRQ {:02x} {:02x} {:02x})",
-                    seen[0], seen[1], seen[2]
-                )));
-            }
-            sleep(Duration::from_micros(200));
-        }
-
-        let mut status = [0u8; 2];
-        self.read_n(reg::FIFO_STATUS1, &mut status)?;
-        let count = usize::from(status[0]) | (usize::from(status[1] >> 6 & 1) << 8);
-        let mut answer = vec![0u8; count];
-        if count > 0 {
-            self.read_n(FIFO, &mut answer)?;
-        }
-        Ok((answer, received_bits(count, status[1])))
-    }
-
     fn wait(
         &mut self,
         limit: Duration,
@@ -418,16 +384,6 @@ fn tx_frame(ntx: u16, nbtx: u8) -> [u8; 2] {
 /// The no-response timer's count for `timeout_ms`, in its 4.72 µs steps.
 fn nrt_ticks(timeout_ms: u64) -> u16 {
     ((timeout_ms as f64 * 1000.0 / NRT_STEP_US).ceil() as u64).clamp(1, 0xffff) as u16
-}
-
-/// How many bits `count` bytes in the FIFO hold, from FIFO status 2: `fifo_lb<2:0>` (bits 3-1)
-/// is the number of bits in a last byte that is not complete, zero when it is.
-fn received_bits(count: usize, fifo_status2: u8) -> usize {
-    match (count, (fifo_status2 >> 1 & 0x07) as usize) {
-        (0, _) => 0,
-        (n, 0) => n * 8,
-        (n, last) => (n - 1) * 8 + last,
-    }
 }
 
 /// What a finished exchange's IRQ bits mean, if they mean it is over.
@@ -488,50 +444,40 @@ impl<B: Bus> Reader for St25r100<B> {
         self.write(reg::TX_FRAME1, &tx_frame(ntx, nbtx))?;
         self.write(FIFO, data)?;
         self.command(cmd::TRANSMIT_DATA)?;
-        let (mut answer, _) = self.answer(exchange.timeout_ms)?;
+
+        let until = Instant::now() + Duration::from_millis(exchange.timeout_ms + 20);
+        let mut seen = [0u8; 3];
+        loop {
+            let irq = self.irqs()?;
+            for (s, i) in seen.iter_mut().zip(irq) {
+                *s |= i;
+            }
+            if let Some(result) = outcome(seen) {
+                result?;
+                break;
+            }
+            if Instant::now() > until {
+                return Err(Error::Desync(format!(
+                    "no end of exchange (IRQ {:02x} {:02x} {:02x})",
+                    seen[0], seen[1], seen[2]
+                )));
+            }
+            sleep(Duration::from_micros(200));
+        }
+
+        let mut status = [0u8; 2];
+        self.read_n(reg::FIFO_STATUS1, &mut status)?;
+        let count = usize::from(status[0]) | (usize::from(status[1] >> 6 & 1) << 8);
+        let mut answer = vec![0u8; count];
+        if count > 0 {
+            self.read_n(FIFO, &mut answer)?;
+        }
         // The chip checks a received CRC but leaves it in the FIFO: on the board a SELECT's SAK
-        // came back as three bytes. A CRC error has already been reported as I_crc by `answer`.
+        // came back as three bytes. A CRC error has already been reported as I_crc above.
         if exchange.rx_crc() {
             answer.truncate(answer.len().saturating_sub(2));
         }
         Ok(answer)
-    }
-
-    /// The same sequence with the framing off: `a_tx_par` and `tx_crc` clear, so the chip sends
-    /// exactly `bits` bits from the FIFO (`ntx`/`nbtx` count them, §5.13.53-54), and `a_rx_par`
-    /// and `rx_crc` clear, so what comes back lands in the FIFO parity bits and all, with
-    /// `fifo_lb` saying how many bits the last byte holds (§5.13.56). ISO 14443A framing only.
-    fn transceive_bits(
-        &mut self,
-        data: &[u8],
-        bits: usize,
-        timeout_ms: u64,
-    ) -> Result<(Vec<u8>, usize)> {
-        if self.proto != Proto::A {
-            return Err(Error::Desync(
-                "raw ISO 14443A frame while framing ISO 15693".into(),
-            ));
-        }
-        let bytes = bits.div_ceil(8);
-        let Some(data) = data.get(..bytes) else {
-            return Err(Error::Desync(format!(
-                "{bits} bits to send from {} bytes",
-                data.len()
-            )));
-        };
-        self.command(cmd::STOP_ALL)?;
-        self.command(cmd::CLEAR_RX_GAIN)?;
-        self.write(reg::PROTOCOL_TX1, &[0])?;
-        self.write(reg::PROTOCOL_RX1, &[RX_B_SOF_EOF])?;
-        let ticks = nrt_ticks(timeout_ms).to_be_bytes();
-        self.write(reg::NRT_GPT_CONFIG, &[0x00, ticks[0], ticks[1]])?;
-        self.write(
-            reg::TX_FRAME1,
-            &tx_frame((bits / 8) as u16, (bits % 8) as u8),
-        )?;
-        self.write(FIFO, data)?;
-        self.command(cmd::TRANSMIT_DATA)?;
-        self.answer(timeout_ms)
     }
 }
 
@@ -730,48 +676,6 @@ mod tests {
             .transceive(&[0x93, 0x70, 1, 2, 3, 4, 4], Exchange::framed(5))
             .unwrap();
         assert_eq!(sak, vec![0x00]);
-    }
-
-    /// fifo_lb counts the bits of a partial last byte; zero means every byte is whole.
-    #[test]
-    fn received_bits_count_a_partial_last_byte() {
-        assert_eq!(received_bits(0, 0), 0);
-        assert_eq!(received_bits(4, 0), 32);
-        // A MIFARE Classic tag's encrypted answer to the reader's nonce: 4 bytes and 4 parity
-        // bits, 36 bits in five FIFO bytes, the last holding four.
-        assert_eq!(received_bits(5, 4 << 1), 36);
-        // np_lb (bit 0) is about the parity bit, not the count.
-        assert_eq!(received_bits(21, 2 << 1 | 1), 162);
-    }
-
-    /// A raw exchange turns parity and CRC off both ways and counts the frame in bits.
-    #[test]
-    fn a_raw_exchange_has_no_framing_and_counts_bits() {
-        let mut chip = St25r100::new(Scripted::default(), Antenna::One);
-        chip.bus.answers.push_back(vec![I_RXS | I_RXE, 0, 0]);
-        chip.bus.answers.push_back(vec![5, 4 << 1]); // five bytes, four bits in the last
-        chip.bus.answers.push_back(vec![1, 2, 3, 4, 5]);
-        let frame = [0u8; 9];
-        let (answer, bits) = chip.transceive_bits(&frame, 72, 5).unwrap();
-        assert_eq!((answer, bits), (vec![1, 2, 3, 4, 5], 36));
-        let sent = &chip.bus.sent;
-        assert_eq!(sent[2], vec![reg::PROTOCOL_TX1, 0], "no parity, no CRC out");
-        assert_eq!(sent[3], vec![reg::PROTOCOL_RX1, RX_B_SOF_EOF], "nor back");
-        assert_eq!(
-            sent[5],
-            vec![reg::TX_FRAME1, 0x00, 9 << 3],
-            "nine whole bytes"
-        );
-        assert_eq!(sent[6].len(), 10);
-
-        // 36 bits out: four whole bytes and four bits.
-        let mut chip = St25r100::new(Scripted::default(), Antenna::One);
-        chip.bus.answers.push_back(vec![0, I_NRE, 0]);
-        assert!(matches!(
-            chip.transceive_bits(&[0; 5], 36, 5),
-            Err(Error::NoTag)
-        ));
-        assert_eq!(chip.bus.sent[5], vec![reg::TX_FRAME1, 0x00, 4 << 3 | 4]);
     }
 
     #[test]
