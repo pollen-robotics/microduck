@@ -330,8 +330,9 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     };
     hold(robot, down, LOWER);
     let _ = robot.mouth(1.0);
-    if let Err(why) = robot.sound(LET_GO) {
-        tracing::info!(%why, "robot.sound");
+    match robot.sound(LET_GO) {
+        Ok(()) => tracing::warn!(sound = LET_GO.as_str(), "letting the e-ink go"),
+        Err(why) => tracing::warn!(%why, sound = LET_GO.as_str(), "letting the e-ink go, silently"),
     }
     hold(robot, down, DROP);
     let _ = robot.mouth(0.0);
