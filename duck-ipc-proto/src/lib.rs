@@ -544,7 +544,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// a client that does not set it still works against an older `robotd`, which refuses the field by
 /// name when one does. A board whose LEDs are on/off only (the beta's GPIO expander) lights any
 /// brightness above zero fully.
-pub const API_VERSION: u32 = 54;
+///
+/// # v55 — `bwep`
+///
+/// [`SoundTag::Bwep`]: a tiny cute retch, which the photo sequence plays as the robot lets go of
+/// the e-ink display in its beak. An older `robotd` refuses the tag as unknown; its voice bank is
+/// re-rendered on install (bank v6) so the robot has the sound in its own voice.
+pub const API_VERSION: u32 = 55;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -2554,6 +2560,8 @@ pub enum SoundTag {
     Coo,
     /// The held joy ride: start → loop while held → end.
     Wheee,
+    /// A tiny cute retch and a bubble — letting go of what the beak held. (v55)
+    Bwep,
 }
 
 impl SoundTag {
@@ -2567,6 +2575,7 @@ impl SoundTag {
             SoundTag::Chirp => "chirp",
             SoundTag::Coo => "coo",
             SoundTag::Wheee => "wheee",
+            SoundTag::Bwep => "bwep",
         }
     }
 }

@@ -410,6 +410,57 @@ pub fn wheee(p: &Personality, variant: u32) -> Vec<f32> {
     out
 }
 
+/// A tiny cute retch, "bwep": a falling syllable with a wet throat flutter, then a little bubble
+/// pops. The robot plays it as it lets go of the e-ink display it held in its beak.
+pub fn bwep(p: &Personality, variant: u32) -> Vec<f32> {
+    let mut rng = p.variant_rng("bwep", variant);
+    let dur = (0.18 + 0.10 * rng.random()) / p.speed;
+    let t = s::t_axis(dur);
+    let peak = 1.25 + 0.20 * rng.random();
+    let fall = 0.62 + 0.15 * rng.random();
+    let jit = s::jitter(&t, 0.6, &mut rng);
+    let freq: Vec<f32> = s::lerp(&t, &[(0.0, 1.15), (0.22 * dur, peak), (dur, fall)])
+        .iter()
+        .zip(&jit)
+        .map(|(&c, &j)| (p.pitch_center_hz as f32) * c * j)
+        .collect();
+    let phase = s::phase_from_freq(&freq);
+    let mut sig = s::harmonic_osc(&phase, &p.harmonics());
+    // The gurgle: a deep, quickening flutter — the throat giving way.
+    let gurgle_hz = 24.0 + 8.0 * rng.random();
+    let wob = rng.uniform(0.0, std::f64::consts::TAU);
+    let env = s::expdecay(&t, 0.008, dur * 0.4);
+    let noise = s::pink_noise(t.len(), &mut rng);
+    for (i, v) in sig.iter_mut().enumerate() {
+        let x = f64::from(t[i]);
+        let flutter = 1.0
+            - 0.6
+                * (0.5
+                    + 0.5 * (std::f64::consts::TAU * gurgle_hz * x * (1.0 + 0.6 * x) + wob).sin());
+        *v = (*v * flutter as f32 + 0.1 * noise[i]) * env[i];
+    }
+    // The bubble: a sine whose pitch drops fast, "plop", just after.
+    let plop_dur = 0.07 + 0.03 * rng.random();
+    let pt = s::t_axis(plop_dur);
+    let hi = 750.0 + 300.0 * rng.random();
+    let pfreq = s::lerp(
+        &pt,
+        &[
+            (0.0, hi),
+            (plop_dur * 0.5, hi * 0.28),
+            (plop_dur, hi * 0.25),
+        ],
+    );
+    let penv = s::expdecay(&pt, 0.002, plop_dur * 0.3);
+    let start = sig.len() + ((0.01 + 0.03 * rng.random()) * f64::from(SR)) as usize;
+    sig.resize(start + pt.len(), 0.0);
+    for (i, (ph, e)) in s::phase_from_freq(&pfreq).iter().zip(&penv).enumerate() {
+        sig[start + i] += 0.5 * ph.sin() * e;
+    }
+    s::normalise(&mut sig, -6.0);
+    sig
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

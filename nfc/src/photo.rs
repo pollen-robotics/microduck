@@ -29,8 +29,8 @@
 //! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves with a short
 //!    quack at each side ([`wiggle`]): where the photo will be written to it, which is not done
 //!    yet.
-//! 9. It lowers its head, opens its beak to let the display go, closes it [`DROP`] later, and
-//!    brings its head back up to the centre.
+//! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch,
+//!    closes it [`DROP`] later, and brings its head back up to the centre.
 //!    No display in time, and it just closes its beak.
 //!
 //! **The idle look-around is kept off from the first look to the end.** It starts after two
@@ -88,6 +88,8 @@ const ROLL: f64 = 0.14;
 const ROLL_PERIOD: Duration = Duration::from_millis(500);
 /// The quack at each side of the roll: the short mouth-trigger one.
 const ROLL_QUACK: proto::SoundTag = proto::SoundTag::Chirp;
+/// The sound as the beak lets the display go: a tiny cute retch.
+const LET_GO: proto::SoundTag = proto::SoundTag::Bwep;
 /// How far the beak opens for the display to go in: a share of wide open.
 pub const TAKE_OPEN: f64 = 0.35;
 /// How often the rolling head is sent: smooth enough at a 500 ms period.
@@ -325,6 +327,9 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     };
     hold(robot, down, LOWER);
     let _ = robot.mouth(1.0);
+    if let Err(why) = robot.sound(LET_GO) {
+        tracing::info!(%why, "robot.sound");
+    }
     hold(robot, down, DROP);
     let _ = robot.mouth(0.0);
     hold(robot, proto::HeadParams::default(), BACK_UP);
@@ -738,6 +743,7 @@ mod tests {
                 "quacks",
                 "look",
                 "mouth 1",
+                "quack",
                 "mouth 0"
             ]
         );
@@ -838,8 +844,8 @@ mod tests {
         assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
         assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
         assert_eq!(*robot.rolls.last().unwrap(), 0.0);
-        // A quack at each side: two a roll, besides the first quack and the shutter's.
-        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 2;
+        // A quack at each side: two a roll, besides the first quack, the shutter's and the retch.
+        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 3;
         let rolls = (KEEP.as_secs_f64() / ROLL_PERIOD.as_secs_f64()) as usize;
         assert_eq!(quacks, 2 * rolls);
         // No display, no rolling.

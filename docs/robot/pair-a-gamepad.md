@@ -90,7 +90,8 @@ lifts its head (higher when seated), counts down five seconds with the flashligh
 %) and faster and faster, flashes at 20 % with a quack as it takes the photo, then sits if it was
 standing and opens its beak a little. It waits up to a minute for a display in its beak, closes it
 on it for five seconds, rolling its head side to side in small quick moves with a short quack at
-each side, then lowers its head and opens its beak wide to let it fall, and brings its head back up. The idle look-around is held off throughout. The picture is kept in `/var/lib/robot/photos`,
+each side, then lowers its head and opens its beak wide to let it fall with a tiny cute retch (the
+`bwep` sound), and brings its head back up. The idle look-around is held off throughout. The picture is kept in `/var/lib/robot/photos`,
 named for the local time. The sequence is in `nfc/src/photo.rs`, and how a display is recognised
 (any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. A display starts it from the top of the head
 only; in the beak it starts nothing, and is what the sequence waits for. Every touch logs where it
