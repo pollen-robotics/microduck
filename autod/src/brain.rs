@@ -381,6 +381,8 @@ pub struct Brain {
     nap_doze: bool,
     nap_sit_sent: bool,
     nap_stand_sent: bool,
+    /// A dot woke the duck: once standing, it chases rather than stretches.
+    nap_woken: bool,
     droop: f64,
     /// Dream twitches, the sneeze's CHOO latch.
     twitch_in: f64,
@@ -459,6 +461,7 @@ impl Brain {
             nap_doze: false,
             nap_sit_sent: false,
             nap_stand_sent: false,
+            nap_woken: false,
             droop: 0.0,
             twitch_in: 8.0,
             twitch_t: 1.0,
@@ -967,6 +970,18 @@ impl Brain {
                     // The sit never engaged (refused robot-side, or the stand-up already
                     // happened under us): give up on the nap.
                     self.enter(State::Chill);
+                } else if world.laser.dot && world.sitting && !self.nap_stand_sent {
+                    // A dot! Up at once — no stretch, no yawn — and after it. Laser tracking is
+                    // on through a nap for exactly this, unless the duck is napping off a chase
+                    // (`laser_tired`), which no dot interrupts.
+                    tracing::info!(energy = self.energy, "a dot — waking up to chase it");
+                    self.nap_woken = true;
+                    self.nap_stand_sent = true;
+                    self.state_dur = t;
+                    self.head = [0.0; 4];
+                    sit_toggle = true;
+                    self.start_quack_burst();
+                    sound = Some(Sound::Chirp);
                 } else if t < self.state_dur {
                     if t < 2.0 {
                         // Settling into the sit.
@@ -1040,6 +1055,14 @@ impl Brain {
                     self.nap_stand_sent = true;
                     self.head = [0.0; 4];
                     sit_toggle = true;
+                } else if !world.sitting && self.nap_woken {
+                    // Woken by a dot: straight after it, or looking for it if it has gone.
+                    let next = if world.laser.dot && self.wants_laser_standing() {
+                        State::Laser
+                    } else {
+                        State::LookAround
+                    };
+                    self.enter(next);
                 } else if !world.sitting {
                     // Back on two feet: usually a big wake-up stretch.
                     let next = if self.rng.chance(0.65) {
@@ -1296,15 +1319,21 @@ impl Brain {
         }
     }
 
-    /// Laser tracking is on whenever the duck could chase: not too tired, not resting, not being
-    /// petted (a dot would walk it out from under the hand), and not playing with the ball, which
-    /// `robotd` would not run beside it anyway.
+    /// Laser tracking is on whenever the duck could chase: not too tired, not being petted (a dot
+    /// would walk it out from under the hand), and not playing with the ball, which `robotd` would
+    /// not run beside it anyway. On through a nap, so a dot can wake it — unless the nap is the
+    /// rest after a chase, which `laser_tired` already keeps the laser off for.
     fn wants_laser(&self) -> bool {
         !self.laser_tired
             && !matches!(
                 self.state,
-                State::Nap | State::Petted | State::BallPlay | State::GroundPick
+                State::Petted | State::BallPlay | State::GroundPick
             )
+    }
+
+    /// Whether a duck now standing up would chase: `wants_laser` without the state it is leaving.
+    fn wants_laser_standing(&self) -> bool {
+        !self.laser_tired
     }
 
     /// The head target with its animation overlays: each quack throws the head up with the open
@@ -1564,6 +1593,7 @@ impl Brain {
                 self.nap_doze = self.rng.chance(0.55);
                 self.nap_sit_sent = false;
                 self.nap_stand_sent = false;
+                self.nap_woken = false;
                 self.droop = -0.3;
                 let dur = if self.nap_doze {
                     self.rng.range(20.0, 40.0)
@@ -2076,7 +2106,7 @@ mod tests {
                 dot: true,
             }
         });
-        assert!(!out.laser, "the laser goes off for the nap");
+        assert!(!out.laser, "the laser goes off for a nap after a chase");
         assert_ne!(
             bench.brain.state(),
             State::Laser,
@@ -2167,5 +2197,41 @@ mod tests {
         let (fresh, bored) = (count(0.0), count(0.95));
         assert!(fresh > 500, "a fresh duck plays: {fresh}");
         assert!(bored * 10 < fresh, "a bored one hardly: {bored} vs {fresh}");
+    }
+
+    /// A dot wakes a napping duck — up at once, and after it once standing. A nap that is the rest
+    /// after a chase is the exception: the laser is off for it, so nothing is seen.
+    #[test]
+    fn a_dot_wakes_a_napping_duck() {
+        let mut bench = Bench::new(12);
+        bench.brain.energy = 0.5;
+        bench.brain.next_quack_in = 1e9;
+        bench.brain.enter(State::Nap);
+        // Sit down, and doze a few seconds.
+        for _ in 0..50 * 5 {
+            bench.tick(|_| {});
+        }
+        assert!(bench.sitting && bench.brain.state() == State::Nap);
+        let out = bench.tick(|_| {});
+        assert!(out.laser, "the laser stays on through an ordinary nap");
+        let out = bench.tick(|w| {
+            w.laser = Laser {
+                on: true,
+                dot: true,
+            }
+        });
+        assert!(out.sit_toggle, "up at once");
+        let mut chased = false;
+        for _ in 0..50 * 5 {
+            bench.tick(|w| {
+                w.laser = Laser {
+                    on: true,
+                    dot: true,
+                }
+            });
+            chased |= bench.brain.state() == State::Laser;
+        }
+        assert!(chased, "standing, it went after the dot");
+        assert!(!bench.sitting);
     }
 }
