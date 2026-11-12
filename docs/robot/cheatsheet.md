@@ -1111,7 +1111,8 @@ robot that stays put):
   still while searching), `k_x`, `k_y`, `k_yaw`, `vx_max`, `vy_max`, `vyaw_max`.
 - **No kick?** `spot +x +y` in the readout is how far the ball is from the kick spot, metres. The
   robot kicks once that is inside `tol_x_m`/`tol_y_m` for `settle_ms`, or inside twice them for
-  `stall_ms` (it has stalled short). A refused kick says `soccer: kick refused; trying again` in
+  `stall_ms` (it has stalled short) — then it stands still with its head neutral for `ready_ms`
+  (`getting ready`) and kicks, because the kick starts from where it was trained to. A refused kick says `soccer: kick refused; trying again` in
   the journal with robotd's reason, and the robot keeps the ball and asks again. Within `approach_m` the ball is remembered for
   `close_memory_ms`, since the camera may not see it under the beak.
 

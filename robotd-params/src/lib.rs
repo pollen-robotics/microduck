@@ -1491,6 +1491,10 @@ pub struct SoccerParams {
     /// stalled short of it — the last centimetres ask for less speed than the gait walks — and
     /// kicks from there, milliseconds.
     pub stall_ms: u64,
+    /// Lined up, how long to stand still with the head neutral before the kick, milliseconds.
+    /// The kick network was trained from a robot standing still and looking ahead; started
+    /// mid-step with the head pitched down at the ball, it barely moves.
+    pub ready_ms: u64,
     /// After a kick, how long before looking for the ball again, milliseconds — the kick, and
     /// the ball rolling away.
     pub cooldown_ms: u64,
@@ -1538,6 +1542,7 @@ impl Default for SoccerParams {
             tol_y_m: 0.025,
             settle_ms: 300,
             stall_ms: 1500,
+            ready_ms: 600,
             cooldown_ms: 2500,
             k_x: 1.2,
             k_y: 1.5,

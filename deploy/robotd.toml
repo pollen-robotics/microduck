@@ -577,6 +577,9 @@ mode = "walk"
 # tol_y_m = 0.025
 # settle_ms = 300
 # stall_ms = 1500
+# Lined up, it stands still with its head neutral for ready_ms before kicking: the kick network
+# was trained from there, and started mid-step with the head looking down it barely moves.
+# ready_ms = 600
 # cooldown_ms = 2500
 
 # Gains and limits.

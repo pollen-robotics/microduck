@@ -20,7 +20,8 @@
 //! | no ball known | turn in place at `search_vyaw` | the loop's own |
 //! | ball beyond `approach_m` | turn in place to face it, then walk straight at it | on the ball |
 //! | nearer | turn in place to aim the kicking foot at it, then step until it sits at (`kick_x_m`, ±`kick_y_m`) | on the ball |
-//! | there, for `settle_ms` | still, then `kick_left`/`kick_right` through `robot.do`'s queue | on the ball |
+//! | there, for `settle_ms` | still | on the ball |
+//! | getting ready, `ready_ms` | still | neutral — then `kick_left`/`kick_right` through `robot.do`'s queue |
 //! | the kick running, `cooldown_ms` | nothing asked | where the ball was |
 //!
 //! **Turn, then walk.** Walking and turning at once draws a curve the ball is not on; so the legs
@@ -150,6 +151,10 @@ pub struct Soccer {
     /// Since when the ball has been within twice the tolerances — near enough that a robot still
     /// short of the spot after `stall_ms` has stalled, not missed.
     near: Option<Instant>,
+    /// Lined up, and getting ready to kick since then: standing still with the head neutral for
+    /// `ready_ms`, because the kick network was trained from a robot standing still and looking
+    /// ahead, and started from one mid-step with its head pitched down at the ball it barely moves.
+    ready: Option<Instant>,
     /// A kick asked of the loop this tick, waiting for [`Soccer::kick_outcome`]: the foot, and
     /// where the ball was.
     asked: Option<(Foot, [f64; 2])>,
@@ -192,6 +197,7 @@ impl Soccer {
             settled: None,
             in_spot: false,
             near: None,
+            ready: None,
             asked: None,
             kicked: None,
             kicks: 0,
@@ -221,6 +227,7 @@ impl Soccer {
         self.settled = None;
         self.in_spot = false;
         self.near = None;
+        self.ready = None;
     }
 
     /// Switch autonomous soccer. Switching it on starts from nothing: no remembered ball, no foot,
@@ -234,6 +241,7 @@ impl Soccer {
             self.settled = None;
             self.in_spot = false;
             self.near = None;
+            self.ready = None;
             self.asked = None;
             self.kicked = None;
             if on {
@@ -297,6 +305,7 @@ impl Soccer {
                 self.settled = None;
                 self.in_spot = false;
                 self.near = None;
+                self.ready = None;
             }
         }
 
@@ -316,23 +325,16 @@ impl Soccer {
         };
 
         // The look at a world point `[x, y]` on the ball's plane.
-        let look = |at: [f64; 2]| {
-            params.head.then(|| {
-                let rel = [
-                    at[0] - pose.odom[0],
-                    at[1] - pose.odom[1],
-                    plane - pose.odom[2],
-                ];
-                self.fk
-                    .look_at(laser::in_trunk(pose, rel), neck_pitch)
-                    .joints
-            })
+        let look = |this: &Self, at: [f64; 2]| {
+            params
+                .head
+                .then(|| this.look_at(at, pose, plane, neck_pitch))
         };
 
         if let Some((_, at)) = kicking {
             state.phase = "kicking".into();
             return Some(Drive {
-                head: look(at),
+                head: look(self, at),
                 twist: None,
                 kick: None,
                 state,
@@ -361,9 +363,14 @@ impl Soccer {
         let ahead = [wx * c + wy * s, -wx * s + wy * c];
         state.target_m = Some(ahead);
 
-        let head = look(world);
-
         let (twist, kick) = self.plan(ahead, &params, driving, now, &mut state);
+        // Getting ready, the head goes neutral — where the kick network expects it — rather
+        // than following the ball under the beak.
+        let head = if self.ready.is_some() {
+            params.head.then_some([0.0; 4])
+        } else {
+            look(self, world)
+        };
         if let Some(skill) = kick {
             let foot = if skill == Foot::Left.skill() {
                 Foot::Left
@@ -383,6 +390,18 @@ impl Soccer {
         })
     }
 
+    /// The head joints that look at world point `at`, on the plane at height `plane`.
+    fn look_at(&self, at: [f64; 2], pose: &Pose, plane: f64, neck_pitch: f64) -> [f64; 4] {
+        let rel = [
+            at[0] - pose.odom[0],
+            at[1] - pose.odom[1],
+            plane - pose.odom[2],
+        ];
+        self.fk
+            .look_at(laser::in_trunk(pose, rel), neck_pitch)
+            .joints
+    }
+
     /// The twist toward a ball at `ahead`, and the kick when it is time for one.
     fn plan(
         &mut self,
@@ -392,6 +411,21 @@ impl Soccer {
         now: Instant,
         state: &mut proto::SoccerState,
     ) -> (Option<[f64; 3]>, Option<&'static str>) {
+        // Committed to a kick: stand still, head neutral, then kick — whatever the remembered
+        // ball does meanwhile, since the robot is not moving and the head going up is not news.
+        if let (Some(at), Some(foot)) = (self.ready, self.foot) {
+            if !driving {
+                self.ready = None;
+                state.phase = "waiting for the policy".into();
+                return (Some([0.0; 3]), None);
+            }
+            if now.saturating_duration_since(at) >= Duration::from_millis(p.ready_ms) {
+                state.phase = "kicking".into();
+                return (Some([0.0; 3]), Some(foot.skill()));
+            }
+            state.phase = "getting ready".into();
+            return (Some([0.0; 3]), None);
+        }
         let distance = ahead[0].hypot(ahead[1]);
         if distance > p.approach_m {
             state.phase = "approaching".into();
@@ -399,6 +433,7 @@ impl Soccer {
             self.settled = None;
             self.in_spot = false;
             self.near = None;
+            self.ready = None;
             let bearing = ahead[1].atan2(ahead[0]);
             let vyaw = (p.k_yaw * bearing).clamp(-p.vyaw_max, p.vyaw_max);
             let vx = if self.align(bearing, p) {
@@ -438,8 +473,14 @@ impl Soccer {
             let settled =
                 now.saturating_duration_since(since) >= Duration::from_millis(p.settle_ms);
             if p.kick && (settled || stalled) {
-                state.phase = "kicking".into();
-                return (Some([0.0; 3]), Some(foot.skill()));
+                tracing::info!(
+                    foot = foot.name(),
+                    stalled,
+                    "soccer: lined up, getting ready to kick"
+                );
+                self.ready = Some(now);
+                state.phase = "getting ready".into();
+                return (Some([0.0; 3]), None);
             }
             state.phase = "lining up".into();
             return (Some([0.0; 3]), None);
@@ -657,6 +698,25 @@ mod tests {
         s.target = Some((ahead, seen));
     }
 
+    /// Lined up at `t`: the robot gets ready first — still, head neutral — and the kick comes
+    /// `ready_ms` later. Returns that kick, and when it came.
+    fn ready_then_kick(
+        s: &mut Soccer,
+        ball: [f64; 2],
+        t: Instant,
+    ) -> (Option<&'static str>, Instant) {
+        let p = SoccerParams::default();
+        place(s, ball, t);
+        let drive = s.tick(&standing(), 0.0, true, t).unwrap();
+        assert_eq!(drive.state.phase, "getting ready");
+        assert_eq!(drive.kick, None);
+        assert_eq!(drive.twist, Some([0.0; 3]), "standing still");
+        assert_eq!(drive.head, Some([0.0; 4]), "head neutral");
+        let later = t + Duration::from_millis(p.ready_ms + 10);
+        place(s, ball, later);
+        (s.tick(&standing(), 0.0, true, later).unwrap().kick, later)
+    }
+
     /// Off is off: nothing asked of the loop at all.
     #[test]
     fn switched_off_asks_for_nothing() {
@@ -768,9 +828,8 @@ mod tests {
         assert_eq!(drive.twist, Some([0.0; 3]));
 
         let t1 = t0 + Duration::from_millis(p.settle_ms + 10);
-        place(&mut s, spot, t1);
-        let drive = s.tick(&standing(), 0.0, true, t1).unwrap();
-        assert_eq!(drive.kick, Some("kick_right"));
+        let (kick, t1) = ready_then_kick(&mut s, spot, t1);
+        assert_eq!(kick, Some("kick_right"));
         s.kick_outcome(Ok(()), t1);
 
         // The kick running: the legs are the skill's, and the head stays where the ball was.
@@ -801,11 +860,8 @@ mod tests {
         place(&mut s, spot, t0);
         s.tick(&standing(), 0.0, true, t0);
         let t1 = t0 + Duration::from_millis(p.settle_ms + 10);
-        place(&mut s, spot, t1);
-        assert_eq!(
-            s.tick(&standing(), 0.0, true, t1).unwrap().kick,
-            Some("kick_left")
-        );
+        let (kick, t1) = ready_then_kick(&mut s, spot, t1);
+        assert_eq!(kick, Some("kick_left"));
         s.kick_outcome(Err("a scripted move is already running".into()), t1);
 
         let t2 = t1 + Duration::from_millis(20);
@@ -816,10 +872,7 @@ mod tests {
         assert_eq!(drive.kick, None, "settling again first");
 
         let t3 = t2 + Duration::from_millis(p.settle_ms + 10);
-        assert_eq!(
-            s.tick(&standing(), 0.0, true, t3).unwrap().kick,
-            Some("kick_left")
-        );
+        assert_eq!(ready_then_kick(&mut s, spot, t3).0, Some("kick_left"));
     }
 
     /// **Sway does not reset the settle.** Once in the spot, a centimetre or two of the trunk's
@@ -838,11 +891,7 @@ mod tests {
         let drive = s.tick(&standing(), 0.0, true, t1).unwrap();
         assert_eq!(drive.twist, Some([0.0; 3]), "still in the spot");
         let t2 = t0 + Duration::from_millis(p.settle_ms + 10);
-        place(&mut s, spot, t2);
-        assert_eq!(
-            s.tick(&standing(), 0.0, true, t2).unwrap().kick,
-            Some("kick_left")
-        );
+        assert_eq!(ready_then_kick(&mut s, spot, t2).0, Some("kick_left"));
     }
 
     /// **Stalled short.** Near the spot but never in it — the gait will not walk the last
@@ -860,11 +909,7 @@ mod tests {
         assert!((dx - 1.5 * p.tol_x_m).abs() < 1e-9 && dy.abs() < 1e-9);
 
         let t1 = t0 + Duration::from_millis(p.stall_ms + 10);
-        place(&mut s, short, t1);
-        assert_eq!(
-            s.tick(&standing(), 0.0, true, t1).unwrap().kick,
-            Some("kick_left")
-        );
+        assert_eq!(ready_then_kick(&mut s, short, t1).0, Some("kick_left"));
 
         // Farther than twice the tolerance is not stalled, it is still walking.
         let mut s = soccer();
@@ -872,7 +917,11 @@ mod tests {
         place(&mut s, far, t0);
         s.tick(&standing(), 0.0, true, t0);
         place(&mut s, far, t1);
-        assert_eq!(s.tick(&standing(), 0.0, true, t1).unwrap().kick, None);
+        let drive = s.tick(&standing(), 0.0, true, t1).unwrap();
+        assert_eq!(drive.state.phase, "lining up", "not getting ready");
+        let later = t1 + Duration::from_millis(p.ready_ms + 10);
+        place(&mut s, far, later);
+        assert_eq!(s.tick(&standing(), 0.0, true, later).unwrap().kick, None);
     }
 
     /// Under the beak, out of sight, the ball is not forgotten after `memory_ms` — only after

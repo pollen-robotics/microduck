@@ -818,6 +818,11 @@ pub const REGISTRY: &[Entry] = &[
         "Near the spot this long without reaching it, kick from there, milliseconds",
     ),
     entry(
+        "soccer.ready_ms",
+        Kind::Integer,
+        "Lined up, stand still with the head neutral this long before kicking, milliseconds",
+    ),
+    entry(
         "soccer.cooldown_ms",
         Kind::Integer,
         "After a kick, how long before looking again, milliseconds",
