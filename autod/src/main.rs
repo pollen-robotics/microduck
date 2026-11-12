@@ -123,6 +123,9 @@ struct Latest {
     ball: brain::Ball,
     /// Soccer mode is on at all — by hand or playing by itself.
     soccer_mode: bool,
+    /// When this `robotd` started, whole seconds of `CLOCK_MONOTONIC`: which `robotd` it is. A new
+    /// one comes up with the robot limp, which nobody chose.
+    robotd_started_s: i64,
 }
 
 /// What the robot has, from the subscribe ack.
@@ -245,6 +248,7 @@ fn subscribe(
                     },
                 ),
                 soccer_mode: state.soccer.is_some(),
+                robotd_started_s: (state.t_ns as f64 / 1e9 - state.t).round() as i64,
             };
             let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
             shared.history.push(latest.sample);
@@ -346,12 +350,27 @@ fn boot_id() -> Option<String> {
         .map(|id| id.trim().to_owned())
 }
 
-/// Whether the marker says the robot was already stood up on the boot `boot`.
-fn stood_up_on(marker: &Path, boot: Option<&str>) -> bool {
-    match (std::fs::read_to_string(marker), boot) {
-        (Ok(recorded), Some(boot)) => recorded.trim() == boot,
-        _ => false,
-    }
+/// Which `robotd` stood the robot up: the boot, and when that `robotd` started on it.
+fn instance(boot: &str, robotd_started_s: i64) -> String {
+    format!("{boot} {robotd_started_s}")
+}
+
+/// Whether the marker says this very `robotd`, on this boot, was already stood up. A `robotd` that
+/// restarted since (an update) came back limp by itself, so it is not the same one: the robot did
+/// not stop because somebody stopped it. A marker from before `robotd` was part of it matches
+/// nothing, which stands up once.
+fn stood_up_on(marker: &Path, boot: Option<&str>, robotd_started_s: i64) -> bool {
+    let (Ok(recorded), Some(boot)) = (std::fs::read_to_string(marker), boot) else {
+        return false;
+    };
+    let mut parts = recorded.split_whitespace();
+    let same_boot = parts.next() == Some(boot);
+    // Two seconds of slack: `t` and `t_ns` are read a few microseconds apart, and rounding.
+    let same_robotd = parts
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .is_some_and(|s| s.abs_diff(robotd_started_s) <= 2);
+    same_boot && same_robotd
 }
 
 /// Stand the robot up: `robot.enable`, then wait until it is driving. `Ok(false)` when
@@ -391,26 +410,32 @@ fn stand_up(
 }
 
 /// The duck on its own was just switched on. Stands the robot up — except the first time this
-/// process sees the switch on, on a boot it already stood the robot up on: that is this unit
-/// restarting (an update, a crash), and somebody may have stopped the robot since.
+/// process sees the switch on, with the same `robotd` it already stood the robot up with: that is
+/// this unit alone restarting (a crash), and somebody may have stopped the robot since. A `robotd`
+/// that restarted (an update restarts both) came back limp on its own, and is stood up again.
 /// `docs/design/autonomous.md` §2.
 fn switched_on(
     commands: &mut UnixStream,
     next_id: &mut u64,
     shared: &Mutex<Shared>,
     state_dir: &Path,
-    policy: &str,
+    state: &Latest,
     first_sight: bool,
 ) -> std::io::Result<()> {
     let marker = state_dir.join("started");
     let boot = boot_id();
-    if first_sight && stood_up_on(&marker, boot.as_deref()) {
-        tracing::info!("already stood up on this boot — leaving the policy as it is");
+    if first_sight && stood_up_on(&marker, boot.as_deref(), state.robotd_started_s) {
+        tracing::warn!(
+            policy = %state.policy,
+            "already stood up with this robotd — leaving the policy as it is (Start on the pad, or \
+             robotctl autonomous off then on, stands it up)"
+        );
         return Ok(());
     }
+    let mark = instance(boot.as_deref().unwrap_or_default(), state.robotd_started_s);
     // Not marked when refused: the next switch-on, or the next start of this unit, tries again.
-    if stand_up(commands, next_id, shared, policy)?
-        && let Err(e) = std::fs::write(&marker, boot.unwrap_or_default())
+    if stand_up(commands, next_id, shared, &state.policy)?
+        && let Err(e) = std::fs::write(&marker, mark)
     {
         tracing::warn!(error = %e, path = %marker.display(), "cannot remember the stand-up");
     }
@@ -516,7 +541,7 @@ fn drive(
                     next_id,
                     shared,
                     &args.state_dir,
-                    &state.policy,
+                    &state,
                     was_on.is_none(),
                 )?;
                 brain.reset();
@@ -795,21 +820,32 @@ fn request(
 mod tests {
     use super::*;
 
-    /// The marker is per boot: the same boot is remembered, a new one is not, and a machine that
-    /// cannot say which boot it is on stands up every time rather than never.
+    /// The marker is per boot and per `robotd`: the same pair is remembered; a new boot, or a
+    /// `robotd` restarted since (an update), stands up again; and a machine that cannot say which
+    /// boot it is on stands up every time rather than never.
     #[test]
-    fn standing_up_is_remembered_per_boot() {
+    fn standing_up_is_remembered_per_robotd() {
         let dir = std::env::temp_dir().join(format!("autod-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("started");
-        assert!(!stood_up_on(&marker, Some("a")), "no marker yet");
-        std::fs::write(&marker, "a\n").unwrap();
-        assert!(stood_up_on(&marker, Some("a")));
+        assert!(!stood_up_on(&marker, Some("a"), 100), "no marker yet");
+        std::fs::write(&marker, instance("a", 100)).unwrap();
+        assert!(stood_up_on(&marker, Some("a"), 100));
+        assert!(stood_up_on(&marker, Some("a"), 101), "rounding slack");
         assert!(
-            !stood_up_on(&marker, Some("b")),
+            !stood_up_on(&marker, Some("a"), 640),
+            "robotd restarted: stands up again"
+        );
+        assert!(
+            !stood_up_on(&marker, Some("b"), 100),
             "a new boot stands up again"
         );
-        assert!(!stood_up_on(&marker, None));
+        assert!(!stood_up_on(&marker, None, 100));
+        std::fs::write(&marker, "a\n").unwrap();
+        assert!(
+            !stood_up_on(&marker, Some("a"), 100),
+            "a marker from before robotd was in it matches nothing"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

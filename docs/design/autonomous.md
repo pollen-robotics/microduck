@@ -58,17 +58,22 @@ A robot boots limp with its policy off, and until now only the pad's Start broug
 duck on its own switched on, `autod` does it: `robot.enable {on: true}`, then waits until the
 policy drives. A robot booted sitting rises through `sitstand`, the same way Start does it.
 
-**It does this when the switch goes on, and once per boot for the switch at boot.** Switching it
-on — a tag, `robotctl autonomous on` — is somebody asking for it now, so the robot stands up. The
-switch already on when `autod` starts is different: that is either the boot, or `autod` restarting
-later in a boot (it crashed, an update restarted it). So the first time `autod` sees the switch
-on, it stands the robot up only if it has not already done so on this boot. Once the robot is up,
-it writes the kernel's `boot_id` to `/var/lib/autod/started`, its `StateDirectory`, and checks it
-against the running boot. (It is not under `/run/autod`: that directory goes away with the unit,
-so that a stopped daemon leaves no identity behind.) A restarted `autod` therefore does not bring
-the robot back up on its own. Someone stopped it, and standing it up behind their back is the bug
-this rule exists to prevent. To bring it back up, press Start, switch the duck off and on, or
-reboot.
+**It does this when the switch goes on, and once per `robotd` for the switch already on.**
+Switching it on (a tag, `robotctl autonomous on`) is somebody asking for it now, so the robot
+stands up. The switch already on when `autod` starts is different: that is the boot, an update
+(which restarts `robotd` and `autod` together), or `autod` alone restarting after a crash. Once the
+robot is up, `autod` writes which `robotd` it stood up with to `/var/lib/autod/started`, its
+`StateDirectory`: the kernel's `boot_id` and the second that `robotd` started (`robot.state`'s
+`t_ns − t`). The first time it sees the switch on, it stands the robot up unless that marker names
+the `robotd` running now. (It is not under `/run/autod`: that directory goes away with the unit,
+so that a stopped daemon leaves no identity behind.)
+
+- **A new `robotd`** (a boot, an update) came up limp by itself. Nobody stopped the robot, so it
+  stands up again. The first version keyed the marker on the boot alone, and a duck updated
+  without a reboot stayed limp after the update.
+- **The same `robotd`**, with only `autod` restarted: the robot is as somebody left it. If it is
+  limp, someone may have stopped it, and standing it up behind their back is the bug this rule
+  exists to prevent. To bring it back up, press Start, switch the duck off and on, or reboot.
 
 In the same spirit, `autod` **never re-enables a policy somebody else disabled.** It drives only
 while the policy is driving (the `policy` label is `walk` or `stand`). In any other state it holds
