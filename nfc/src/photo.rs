@@ -93,6 +93,8 @@ const ROLL_QUACK: proto::SoundTag = proto::SoundTag::Chirp;
 const QUACK_EVERY_SIDES: u32 = 5;
 /// The sound as the beak lets the display go: a tiny cute retch.
 const LET_GO: proto::SoundTag = proto::SoundTag::Bwep;
+/// After the beak starts opening wide, before [`LET_GO`]: for the beak's motor to stop.
+const LET_GO_AFTER: Duration = Duration::from_millis(300);
 /// How far the beak opens for the display to go in: a share of wide open.
 pub const TAKE_OPEN: f64 = 0.35;
 /// How often the rolling head is sent: smooth enough at a 500 ms period.
@@ -330,11 +332,13 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     };
     hold(robot, down, LOWER);
     let _ = robot.mouth(1.0);
+    // The beak's motor first, then the sound: started together, the motor drowns most of it.
+    hold(robot, down, LET_GO_AFTER);
     match robot.sound(LET_GO) {
         Ok(()) => tracing::warn!(sound = LET_GO.as_str(), "letting the e-ink go"),
         Err(why) => tracing::warn!(%why, sound = LET_GO.as_str(), "letting the e-ink go, silently"),
     }
-    hold(robot, down, DROP);
+    hold(robot, down, DROP - LET_GO_AFTER);
     let _ = robot.mouth(0.0);
     hold(robot, proto::HeadParams::default(), BACK_UP);
     outcome
