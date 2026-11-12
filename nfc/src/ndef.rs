@@ -171,8 +171,8 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
-/// What every pairing tag starts with. On its own it names no pad; followed by an address it names
-/// one — see [`pairing`].
+/// What every pairing tag starts with. On its own it names no pad; followed by `:` and an address
+/// it names one — see [`pairing`].
 pub const PAIRING: &str = "microduck_gamepad_pairing";
 
 /// A pairing tag, read: which pad it asks for, if it names one.
@@ -181,27 +181,40 @@ pub struct Pairing {
     /// The pad's Bluetooth address, upper case and colon-separated, as BlueZ writes it. `None`
     /// for a tag that names no pad: the robot takes the one in pairing mode.
     pub mac: Option<String>,
+    /// What followed the `:` when it was not an address. Ignored — the tag pairs as one naming no
+    /// pad — and kept only so the journal can say why.
+    pub unreadable: Option<String>,
 }
 
 /// Does one of these records ask to pair a gamepad, and which one?
 ///
-/// A record is a pairing record when it is exactly [`PAIRING`], or [`PAIRING`], a space and a
-/// Bluetooth address — `microduck_gamepad_pairing 78:86:2E:BB:13:28`. Surrounding whitespace
-/// aside, nothing else counts: a tag that merely mentions it in other text is not a pairing tag,
-/// and neither is one whose address does not parse, because pairing whatever pad is in range is
-/// not what a tag naming a particular one asked for. An address on its own, as the first tags
-/// had, does not pair anything either.
+/// A record is a pairing record when it is exactly [`PAIRING`], or [`PAIRING`], `:` and a
+/// Bluetooth address — `microduck_gamepad_pairing:78:86:2E:BB:13:28`. Surrounding whitespace
+/// aside, nothing else counts: a tag that merely mentions it in other text is not a pairing tag.
+///
+/// The address is a preference, not a condition. One that does not parse is ignored and the tag
+/// pairs as if it named no pad, the same fallback [`crate::pairing::on_touch`] takes when the
+/// named pad is not in range: a touch should pair the pad someone is holding in pairing mode
+/// rather than nothing. An address on its own, as the first tags had, does not pair anything.
 pub fn pairing(records: &[Record]) -> Option<Pairing> {
     records.iter().find_map(|r| {
         let rest = r.value().trim().strip_prefix(PAIRING)?;
         if rest.is_empty() {
-            return Some(Pairing { mac: None });
+            return Some(Pairing {
+                mac: None,
+                unreadable: None,
+            });
         }
-        if !rest.starts_with(char::is_whitespace) {
-            return None;
-        }
-        Some(Pairing {
-            mac: Some(mac(rest.trim_start())?),
+        let named = rest.strip_prefix(':')?.trim();
+        Some(match mac(named) {
+            Some(mac) => Pairing {
+                mac: Some(mac),
+                unreadable: None,
+            },
+            None => Pairing {
+                mac: None,
+                unreadable: Some(named.to_owned()),
+            },
         })
     })
 }
@@ -294,32 +307,59 @@ mod tests {
         let named = |mac: &str| {
             Some(Pairing {
                 mac: Some(mac.into()),
+                unreadable: None,
             })
         };
-        assert_eq!(read(PAIRING), Some(Pairing { mac: None }));
         assert_eq!(
-            read(&format!("{PAIRING} 78:86:2E:BB:13:28")),
+            read(PAIRING),
+            Some(Pairing {
+                mac: None,
+                unreadable: None
+            })
+        );
+        assert_eq!(
+            read(&format!("{PAIRING}:78:86:2E:BB:13:28")),
             named("78:86:2E:BB:13:28")
         );
         // Typed on a phone: lower case, a trailing newline.
         assert_eq!(
-            read(&format!("{PAIRING} 78:86:2e:bb:13:28\n")),
+            read(&format!("{PAIRING}:78:86:2e:bb:13:28\n")),
             named("78:86:2E:BB:13:28")
         );
         assert_eq!(
-            pairing(&[Record::Uri(format!("{PAIRING} 98:B6:E9:28:06:09"))]),
+            pairing(&[Record::Uri(format!("{PAIRING}:98:B6:E9:28:06:09"))]),
             named("98:B6:E9:28:06:09")
         );
     }
 
     #[test]
-    fn an_address_that_does_not_parse_pairs_nothing() {
+    fn an_address_that_does_not_parse_pairs_as_naming_no_pad() {
         let read = |text: &str| pairing(&[Record::Text(text.into())]);
-        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13")), None);
-        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:2G")), None);
-        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:28:00")), None);
-        assert_eq!(read(&format!("{PAIRING} 788:6:2E:BB:13:28")), None);
-        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:28 extra")), None);
+        for garbled in [
+            "78:86:2E:BB:13",
+            "78:86:2E:BB:13:2G",
+            "78:86:2E:BB:13:28:00",
+            "788:6:2E:BB:13:28",
+            "78:86:2E:BB:13:28 extra",
+            "",
+        ] {
+            assert_eq!(
+                read(&format!("{PAIRING}:{garbled}")),
+                Some(Pairing {
+                    mac: None,
+                    unreadable: Some(garbled.into())
+                }),
+                "{garbled:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anything_but_a_colon_after_the_pairing_text_is_not_a_pairing_tag() {
+        let read = |text: &str| pairing(&[Record::Text(text.into())]);
+        // The space-separated form this branch first had.
+        assert_eq!(read(&format!("{PAIRING} 78:86:2E:BB:13:28")), None);
         assert_eq!(read(&format!("{PAIRING}78:86:2E:BB:13:28")), None);
+        assert_eq!(read(&format!("{PAIRING}_please")), None);
     }
 }

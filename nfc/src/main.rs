@@ -263,11 +263,14 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut dyn Robot) -> Error {
                         if let Err(e) = chip.field_off() {
                             return e;
                         }
-                        match &asked.mac {
-                            Some(mac) => {
+                        match (&asked.mac, &asked.unreadable) {
+                            (Some(mac), _) => {
                                 tracing::warn!(tag = %id, %mac, "pairing tag touched — pairing that pad")
                             }
-                            None => {
+                            (None, Some(unreadable)) => {
+                                tracing::warn!(tag = %id, %unreadable, "pairing tag touched — not an address, looking for a pad in pairing mode")
+                            }
+                            (None, None) => {
                                 tracing::warn!(tag = %id, "pairing tag touched — looking for a pad in pairing mode")
                             }
                         }
@@ -327,10 +330,14 @@ impl Robot for Sockets {
         Ok(status.pads)
     }
 
-    fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String> {
+    fn pair(
+        &mut self,
+        mac: Option<&str>,
+        timeout_seconds: Option<u32>,
+    ) -> Result<proto::PadPairResult, String> {
         let params = proto::PadPairParams {
             mac: mac.map(str::to_owned),
-            ..proto::PadPairParams::default()
+            timeout_seconds,
         };
         call(&self.config, &proto::Call::PadPair(params), PAIR_ANSWER)
     }

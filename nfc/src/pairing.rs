@@ -3,9 +3,15 @@
 //!
 //! Every tag says [`crate::ndef::PAIRING`], and may follow it with a pad's address. Without one, a
 //! touch is `robotctl pad pair` with no address: the robot looks for a gamepad in pairing mode and
-//! takes the one it finds — and refuses, saying so, when it finds two. With one, it is
-//! `robotctl pad pair <mac>`: that pad and no other, which is what a room with several pads in
-//! pairing mode, or a pad the robot does not recognise as one, needs.
+//! takes the one it finds — and refuses, saying so, when it finds two. With one, it is first
+//! `robotctl pad pair <mac>`: that pad, which is what a room with several pads in pairing mode, or a
+//! pad the robot does not recognise as one, needs.
+//!
+//! **The address is a preference, not a condition.** When the named pad does not turn up within
+//! [`NAMED_WINDOW_SECONDS`], the touch carries on as a tag naming no pad would — so a tag written
+//! for one pad still pairs the one someone is holding in pairing mode. Only "not found" falls back:
+//! a named pad that was found and then failed to bond is reported as that, not papered over by
+//! pairing a different one.
 //!
 //! The rule, in full:
 //!  - a pad already **connected** means nothing happens. The robot has a driver, and a tag brushed
@@ -24,6 +30,15 @@ use duck_ipc_proto as proto;
 pub const HEARD: proto::SoundTag = proto::SoundTag::Chirp;
 /// "Paired": the wake-up quack, sometimes a double "wak-wak" — unmistakably not [`HEARD`].
 pub const PAIRED: proto::SoundTag = proto::SoundTag::Greet;
+
+/// How long a tag naming a pad looks for that one before falling back to whichever is in pairing
+/// mode.
+///
+/// Shorter than `configd`'s own window, because a named pad that is not there costs its whole
+/// window — discovery cannot tell "not yet" from "never" — and the pad someone is holding stops
+/// flashing after a while. A pad in pairing mode shows up within a few seconds of discovery
+/// starting; one named but not seen in this long is not coming.
+pub const NAMED_WINDOW_SECONDS: u32 = 8;
 
 /// Polls in a row without the tag before it counts as lifted.
 ///
@@ -74,8 +89,13 @@ impl Touches {
 /// The rest of the robot, as far as a tag is concerned.
 pub trait Robot {
     fn pads(&mut self) -> Result<Vec<proto::Pad>, String>;
-    /// `pad.pair`: the pad at `mac`, or with none whichever pad is in pairing mode.
-    fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String>;
+    /// `pad.pair`: the pad at `mac`, or with none whichever pad is in pairing mode. `timeout_seconds`
+    /// is how long to look, `None` for `configd`'s default.
+    fn pair(
+        &mut self,
+        mac: Option<&str>,
+        timeout_seconds: Option<u32>,
+    ) -> Result<proto::PadPairResult, String>;
     fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String>;
 }
 
@@ -107,7 +127,23 @@ pub fn on_touch(robot: &mut dyn Robot, mac: Option<&str>) -> Outcome {
     if let Err(why) = robot.sound(HEARD) {
         tracing::info!(%why, "the robot would not quack for the tag");
     }
-    match robot.pair(mac) {
+    let answer = match mac {
+        None => robot.pair(None, None),
+        Some(mac) => match robot.pair(Some(mac), Some(NAMED_WINDOW_SECONDS)) {
+            Ok(proto::PadPairResult::Failed {
+                reason: proto::PadPairFailure::NotFound,
+                ..
+            }) => {
+                tracing::warn!(
+                    %mac,
+                    "the pad the tag names is not in range — pairing whichever is in pairing mode"
+                );
+                robot.pair(None, None)
+            }
+            answer => answer,
+        },
+    };
+    match answer {
         Err(e) => Outcome::Failed(format!("pad.pair: {e}")),
         Ok(proto::PadPairResult::Failed { reason, detail, .. }) => {
             Outcome::NotPaired(reason, detail)
@@ -136,7 +172,10 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         pads: Vec<proto::Pad>,
+        /// How a pairing naming no pad is refused, if it is.
         refuse: Option<proto::PadPairFailure>,
+        /// How a pairing naming a pad is refused, if it is — `NotFound` for a pad not in range.
+        refuse_named: Option<proto::PadPairFailure>,
         calls: Vec<String>,
     }
 
@@ -145,12 +184,24 @@ mod tests {
             self.calls.push("status".into());
             Ok(self.pads.clone())
         }
-        fn pair(&mut self, mac: Option<&str>) -> Result<proto::PadPairResult, String> {
-            self.calls.push(match mac {
-                Some(mac) => format!("pair {mac}"),
-                None => "pair".into(),
-            });
-            Ok(match self.refuse {
+        fn pair(
+            &mut self,
+            mac: Option<&str>,
+            timeout_seconds: Option<u32>,
+        ) -> Result<proto::PadPairResult, String> {
+            let mut call = "pair".to_owned();
+            if let Some(mac) = mac {
+                call += &format!(" {mac}");
+            }
+            if let Some(seconds) = timeout_seconds {
+                call += &format!(" {seconds}s");
+            }
+            self.calls.push(call);
+            let refuse = match mac {
+                Some(_) => self.refuse_named,
+                None => self.refuse,
+            };
+            Ok(match refuse {
                 Some(reason) => proto::PadPairResult::Failed {
                     reason,
                     detail: None,
@@ -211,7 +262,64 @@ mod tests {
         let named = "78:86:2E:BB:13:28";
         let outcome = on_touch(&mut robot, Some(named));
         assert!(matches!(outcome, Outcome::Paired(p) if p.mac == named));
-        assert_eq!(robot.calls, ["status", "chirp", "pair 78:86:2E:BB:13:28", "greet"]);
+        assert_eq!(
+            robot.calls,
+            ["status", "chirp", "pair 78:86:2E:BB:13:28 8s", "greet"]
+        );
+    }
+
+    #[test]
+    fn a_named_pad_not_in_range_falls_back_to_the_one_in_pairing_mode() {
+        let mut robot = Fake {
+            refuse_named: Some(proto::PadPairFailure::NotFound),
+            ..Fake::default()
+        };
+        let outcome = on_touch(&mut robot, Some("78:86:2E:BB:13:28"));
+        assert!(matches!(outcome, Outcome::Paired(p) if p.mac == MAC));
+        assert_eq!(
+            robot.calls,
+            [
+                "status",
+                "chirp",
+                "pair 78:86:2E:BB:13:28 8s",
+                "pair",
+                "greet"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fallback_is_refused_like_any_tag_naming_no_pad() {
+        let mut robot = Fake {
+            refuse_named: Some(proto::PadPairFailure::NotFound),
+            refuse: Some(proto::PadPairFailure::Ambiguous),
+            ..Fake::default()
+        };
+        assert_eq!(
+            on_touch(&mut robot, Some("78:86:2E:BB:13:28")),
+            Outcome::NotPaired(proto::PadPairFailure::Ambiguous, None)
+        );
+        assert_eq!(
+            robot.calls,
+            ["status", "chirp", "pair 78:86:2E:BB:13:28 8s", "pair"]
+        );
+    }
+
+    #[test]
+    fn a_named_pad_found_but_not_bonded_does_not_fall_back() {
+        // It was there: pairing some other pad instead would hide what went wrong with this one.
+        let mut robot = Fake {
+            refuse_named: Some(proto::PadPairFailure::Timeout),
+            ..Fake::default()
+        };
+        assert_eq!(
+            on_touch(&mut robot, Some("78:86:2E:BB:13:28")),
+            Outcome::NotPaired(proto::PadPairFailure::Timeout, None)
+        );
+        assert_eq!(
+            robot.calls,
+            ["status", "chirp", "pair 78:86:2E:BB:13:28 8s"]
+        );
     }
 
     #[test]

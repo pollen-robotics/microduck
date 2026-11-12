@@ -67,16 +67,19 @@ always running and picks a reader up within thirty seconds of it being plugged i
 - **A pairing tag holds one text (or URI) record**, in one of two forms:
   - `microduck_gamepad_pairing` names no pad. The robot takes the one in pairing mode, and refuses
     if it finds two, as `robotctl pad pair` does.
-  - `microduck_gamepad_pairing 78:86:2E:BB:13:28`, the pairing text, a space and the pad's address,
-    names that pad. The robot pairs that one and no other, as `robotctl pad pair 78:86:2E:BB:13:28`
-    does — the tag to stick on a pad when several are in pairing mode in the same room, or when the
-    robot does not recognise the hardware as a gamepad. An address that is not six hex octets
-    separated by `:` makes it not a pairing tag: nothing is paired, rather than whatever pad is in
-    range.
+  - `microduck_gamepad_pairing:78:86:2E:BB:13:28`, the pairing text, `:` and the pad's address,
+    names that pad. The robot looks for that one first, as `robotctl pad pair 78:86:2E:BB:13:28`
+    does — the tag to stick on a pad when several are in pairing mode in the same room, or when
+    the robot does not recognise the hardware as a gamepad.
+
+  **The address is a preference.** If the named pad does not show up within eight seconds, or the
+  address is not six hex octets separated by `:`, the robot carries on as for a tag naming no pad
+  and takes the one in pairing mode. A named pad that is found but fails to bond is reported as
+  that, with no fallback. Expect a tag naming an absent pad to take about eight seconds longer.
 
   From a laptop with the reader plugged in, winnie's tool writes either:
   `ntag write --text microduck_gamepad_pairing` or
-  `ntag write --text "microduck_gamepad_pairing 78:86:2E:BB:13:28"`. A tag holding an address and
+  `ntag write --text microduck_gamepad_pairing:78:86:2E:BB:13:28`. A tag holding an address and
   nothing else, as the first ones had, does not pair anything.
 - It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
   15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
