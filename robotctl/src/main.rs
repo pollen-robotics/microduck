@@ -102,6 +102,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// Path to `nfcd`'s socket, where `nfc-flash` asks for a tag to be written.
+    #[arg(long, global = true, default_value = proto::socket::NFC)]
+    nfc_socket: PathBuf,
+
     /// Path to `padd`'s raw input tap, which `monitor` reads the pad's own event stream from.
     ///
     /// Optional in the only sense that matters: nothing fails when it is absent. `monitor` says the
@@ -177,6 +181,20 @@ enum Namespace {
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    ///
+    /// The tag then reads as that text — `walk_mode`, `microduck_gamepad_pairing`, anything — in
+    /// the duck and in a phone app alike. A tag already on the reader is written too. The duck
+    /// quacks when it took, and the tag is read back before this says so. Only an NTAG (Type 2)
+    /// is written; anything else is refused with why, and left as it was.
+    NfcFlash {
+        /// What the tag will read.
+        text: String,
+        /// How long to wait for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
 
     /// The duck's vet book: its whole life in numbers.
     ///
@@ -723,6 +741,30 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
         return Err(Failure::new(exit::REFUSED, reason));
     }
     println!("🦆");
+    Ok(())
+}
+
+/// `robotctl nfc-flash` — ask `nfcd` to write `text` onto the next tag touched.
+fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failure> {
+    let mut client = Client::connect_to("nfcd", socket)?;
+    client.hello()?;
+    let params = proto::NfcWriteParams {
+        text,
+        timeout_s: Some(timeout),
+    };
+    eprintln!(
+        "Touch an NTAG to the duck's head (waiting {} s)…",
+        params.timeout().as_secs()
+    );
+    let text = params.text.clone();
+    let result = result_of(client.call(&proto::Call::NfcWrite(params))?)?;
+    let outcome: proto::NfcWriteResult = decode(&result)?;
+    let tag = outcome.uid.unwrap_or_else(|| "no tag".to_owned());
+    if !outcome.written {
+        let reason = outcome.reason.unwrap_or_else(|| "not written".to_owned());
+        return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
+    }
+    println!("{tag} now reads {text:?}");
     Ok(())
 }
 
@@ -5751,6 +5793,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::NfcFlash { text, timeout } => {
+            return run_nfc_flash(&cli.nfc_socket, text, timeout);
         }
         Namespace::Flashlight { state, color } => {
             return run_flashlight(&cli.robot_socket, &state, &color);

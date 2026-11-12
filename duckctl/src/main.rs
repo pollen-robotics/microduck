@@ -565,8 +565,9 @@ fn ssh_refusal(address: &str) -> Result<(), String> {
     match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
             "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
-             (microduck@192.168.42.1). `duckctl ssh-wifi` opens it on wifi until the robot next \
-             reboots; then run this again."
+             (microduck@192.168.42.1), on purpose: reaching it means opening the robot. Over that \
+             link, `sudo touch /run/microduck-ssh-wifi` opens wifi ssh until the next reboot; the \
+             dev image has it open always."
         )),
         _ => Ok(()),
     }
@@ -1252,6 +1253,18 @@ enum Command {
     /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
     /// that answers, in a voice that is only its own, is the one `--name` reached.
     Quack,
+    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    ///
+    /// `robotctl nfc-flash` on the robot. The tag then reads as that text — `walk_mode`,
+    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. Only an NTAG
+    /// (Type 2) is written; anything else is refused with why, and left as it was.
+    NfcFlash {
+        /// What the tag will read.
+        text: String,
+        /// How long the duck waits for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = duck_ipc_proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
     /// Is the control loop healthy?
     Health,
     /// Wifi.
@@ -1340,13 +1353,6 @@ enum Command {
     },
     /// Reboot it.
     Reboot,
-    /// Open ssh on wifi until the robot next reboots.
-    ///
-    /// A shipping image answers ssh on the head's USB-C link only, so `duckctl ssh` over wifi is
-    /// refused there. This asks `configd`, over the same authenticated Bluetooth session every
-    /// other command uses, to open port 22 on every interface until the next reboot. Then
-    /// `duckctl ssh` works. The dev image listens on wifi already, so there it changes nothing.
-    SshWifi,
     /// Send any method, for whatever is not wrapped above.
     Call {
         method: String,
@@ -2151,6 +2157,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
+    if let Command::NfcFlash { timeout, .. } = &cli.command {
+        eprintln!(
+            "Touch an NTAG to the duck's head (waiting {} s)…",
+            (*timeout).clamp(1, duck_ipc_proto::NfcWriteParams::MAX_TIMEOUT_S)
+        );
+    }
+
     // `for_replies`, not `new`: this is the client end, and the robot's answers are bounded by
     // `MAX_REPLY_LINE` rather than by the tighter cap that limits what a radio peer may send. A
     // `logs` tail is the reply that outgrew the other one.
@@ -2787,17 +2800,26 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             SLOW_REPLY_TIMEOUT,
         ),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
+        // The robot answers once a tag is written or its own wait runs out, so this waits that
+        // long and the ordinary budget on top.
+        Command::NfcFlash { text, timeout } => {
+            let params = proto::NfcWriteParams {
+                text: text.clone(),
+                timeout_s: Some(*timeout),
+            };
+            let wait = params.timeout() + REPLY_TIMEOUT;
+            (
+                proto::method::NFC_WRITE,
+                serde_json::to_value(params)?,
+                wait,
+            )
+        }
         Command::Name { name } => (
             "system.setName",
             serde_json::json!({ "name": name }),
             REPLY_TIMEOUT,
         ),
         Command::Reboot => ("system.reboot", serde_json::json!({}), REPLY_TIMEOUT),
-        Command::SshWifi => (
-            proto::method::SYSTEM_OPEN_WIFI_SSH,
-            serde_json::json!({}),
-            REPLY_TIMEOUT,
-        ),
         Command::Do { skill } => (
             proto::method::ROBOT_DO,
             serde_json::json!({ "skill": skill }),

@@ -143,15 +143,10 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 — else `microduck`. Words after `--` run on the robot instead of opening a shell.
 
 A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
-wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would. To
-open it until the robot next reboots, without opening the robot:
-
-```bash
-duckctl ssh-wifi
-```
-
-That asks `configd` over the same authenticated Bluetooth session every other command uses, so it
-needs the setup code. On the dev image it changes nothing: ssh is open on wifi there already.
+wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
+That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi means opening
+the robot. Over the USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot;
+or flash the dev image, which keeps ssh open on wifi.
 
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a
@@ -775,6 +770,16 @@ sends a second. One per duck drives several ducks from one laptop. The quack and
 from this machine, in a voice of its own, while the duck only opens its mouth; `--mute` keeps this
 machine quiet and `--robot-sound-on` has the duck quack too. It is a LAN tool, and
 [`udp-pad.md`](udp-pad.md) has the setup, several ducks, the laptop's voice, and the wire format.
+
+## Writing an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-flash walk_mode
+```
+
+The duck asks for a tag with its pad-lost sound; touch an NTAG to its head within 20 seconds
+(`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
+[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
 
 ## Anything else — `call`
 

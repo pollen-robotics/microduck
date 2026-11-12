@@ -919,7 +919,6 @@ impl Server {
             | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
-            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             // `pad.*` is `configd`'s for the same reason: pairing a gamepad is a root-only question
@@ -961,6 +960,14 @@ impl Server {
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "tof.stream is served by tofd, on /run/tofd/tof.sock; head_imu.stream by tofd on a zero3 and by robotd (/run/robotd.sock) on a beta",
+                ),
+            ),
+
+            Call::NfcWrite(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write is served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

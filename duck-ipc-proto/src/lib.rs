@@ -537,13 +537,26 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
 /// servos have no guard.
 ///
-/// # v54 — ssh on wifi, on request
+/// # v54 — ssh on wifi over BLE (daemon 0.20.0 only)
 ///
-/// [`method::SYSTEM_OPEN_WIFI_SSH`]: a shipping image answers ssh on the head's USB-C link only
-/// (microduck_yocto#110), and this is the request that image was built to accept instead of
-/// opening the robot. An older `configd` refuses it by name.
+/// `system.openWifiSsh`: configd opened ssh on wifi until reboot when asked over the secure BLE
+/// session. Shipped in daemon 0.20.0 and withdrawn in the next release (v55 below).
 ///
-/// # v55 — soccer mode
+/// # v55 — `system.openWifiSsh` withdrawn
+///
+/// ssh on wifi stays a decision made with the robot open: over the head's USB-C link
+/// (`sudo touch /run/microduck-ssh-wifi`, microduck_yocto#110) or by flashing the dev image. Once
+/// opened, the login is the shared operator password, so an opening from a phone in Bluetooth range
+/// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
+/// refused by name; nothing else on the wire changed.
+///
+/// # v56 — writing a tag
+///
+/// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
+/// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
+/// has no socket, so the call fails to connect rather than being refused by name.
+///
+/// # v57 — soccer mode
 ///
 /// [`method::ROBOT_SOCCER`] switches soccer mode — the pad's bumpers kick — and, on top of it,
 /// autonomous soccer, where the robot finds a purple ball, walks to it and kicks it.
@@ -552,7 +565,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// learns of a switch made from elsewhere — an NFC tag. Underneath, `robotd` subscribes to
 /// `mediad`'s local [`method::MEDIA_BALL`]; a `mediad` older than this refuses it, and the soccer
 /// block's `camera` line says so. All additive.
-pub const API_VERSION: u32 = 55;
+pub const API_VERSION: u32 = 57;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -627,6 +640,10 @@ pub mod socket {
     /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
+
+    /// `nfcd`'s — [`super::method::NFC_WRITE`], and nothing else. Under `/run/nfcd/`, its
+    /// `RuntimeDirectory=`, for the same reason as the pad's.
+    pub const NFC: &str = "/run/nfcd/nfc.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -885,6 +902,14 @@ pub mod method {
     /// foot, then looks for it again — sharing the robot the way laser tracking does: a deflected
     /// client stick wins. Switching soccer on switches laser tracking off, and the other way round.
     pub const ROBOT_SOCCER: &str = "robot.soccer";
+    /// Write a text onto the next NTAG touched to the reader: one NDEF text record, as a phone
+    /// app writes it, so the tag then reads as that text everywhere — a mode tag, a pairing tag.
+    /// The answer comes when a tag has been written and read back, or when none was touched in
+    /// time; see [`super::NfcWriteResult`]. Answered by `nfcd`.
+    ///
+    /// Only an NTAG (NFC Forum Type 2) is written. A Type 5 tag, a MIFARE Classic, a locked tag
+    /// or a text too long for the tag is refused with why, and nothing on it changes.
+    pub const NFC_WRITE: &str = "nfc.write";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -1074,9 +1099,6 @@ pub mod method {
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
     pub const SYSTEM_REBOOT: &str = "system.reboot";
-    /// Open ssh on wifi until the next reboot. A shipping image listens on the head's USB-C link
-    /// only, so without this a shell over wifi means opening the robot.
-    pub const SYSTEM_OPEN_WIFI_SSH: &str = "system.openWifiSsh";
     /// The Bluetooth pairing PIN. Never reachable over Bluetooth itself.
     pub const SYSTEM_PAIRING_PIN: &str = "system.pairingPin";
     /// Set the Bluetooth pairing PIN.
@@ -1375,8 +1397,6 @@ pub enum Call {
     SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
-    /// See [`method::SYSTEM_OPEN_WIFI_SSH`].
-    SystemOpenWifiSsh,
     /// Read the pairing PIN.
     ///
     /// Exists so `btd` can answer a BLE passkey request without owning config. It must never be
@@ -1409,13 +1429,15 @@ pub enum Call {
     /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
     /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
+    /// Write a text onto the next tag touched; see [`method::NFC_WRITE`]. Answered by `nfcd`.
+    NfcWrite(NfcWriteParams),
 }
 
 /// The service that owns the answer to a call.
 ///
 /// One socket per service, connected directly — there is no broker (`architecture.md` §2.2). A
 /// transport adapter holds connections to the services whose calls it carries, and to no others:
-/// `btd` holds three, and `padd` being absent from them is deliberate rather than incidental —
+/// `btd` holds four, and `padd` being absent from them is deliberate rather than incidental —
 /// `padd` is the unprivileged client whose whole value is having no special access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
@@ -1429,6 +1451,8 @@ pub enum Service {
     Pad,
     /// `tofd` — the depth stream.
     Tof,
+    /// `nfcd` — writing a tag.
+    Nfc,
 }
 
 /// How long answering a call holds a connection, and therefore which connection carries it.
@@ -1496,6 +1520,7 @@ impl Call {
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
+            Call::NfcWrite(_) => method::NFC_WRITE,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1536,7 +1561,6 @@ impl Call {
             Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
-            Call::SystemOpenWifiSsh => method::SYSTEM_OPEN_WIFI_SSH,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
             Call::SystemSetPairingPin(_) => method::SYSTEM_SET_PAIRING_PIN,
             Call::SystemAuthenticate(_) => method::SYSTEM_AUTHENTICATE,
@@ -1572,9 +1596,6 @@ impl Call {
                 | Call::NetForget(_)
                 | Call::SystemSetName(_)
                 | Call::SystemReboot
-                // A root shell reachable from the network is at least as consequential as a
-                // reboot, even with the password still required.
-                | Call::SystemOpenWifiSsh
                 | Call::SystemSetPairingPin(_)
                 // Powering the machine off is at least as disruptive as rebooting it.
                 | Call::RobotShutdown
@@ -1742,7 +1763,6 @@ impl Call {
             | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
-            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
@@ -1778,6 +1798,12 @@ impl Call {
             Call::PadInput => (Pad, Stream),
             Call::TofStream => (Tof, Stream),
             Call::HeadImuStream => (Tof, Stream),
+
+            // ── nfcd ────────────────────────────────────────────────────────
+            //
+            // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
+            // own lane.
+            Call::NfcWrite(_) => (Nfc, Operation),
 
             // ── answered by no service ──────────────────────────────────────
             //
@@ -1850,6 +1876,7 @@ impl Call {
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
             Call::RobotSoccer(p) => encode(p),
+            Call::NfcWrite(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1892,7 +1919,6 @@ impl Call {
             | Call::SystemInfo
             | Call::SystemServices
             | Call::SystemReboot
-            | Call::SystemOpenWifiSsh
             | Call::SystemPairingPin
             | Call::PadStatus
             | Call::PadBindings
@@ -1948,6 +1974,7 @@ impl Call {
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
+            method::NFC_WRITE => Call::NfcWrite(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -2001,7 +2028,6 @@ impl Call {
             method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
-            method::SYSTEM_OPEN_WIFI_SSH => Call::SystemOpenWifiSsh,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
             method::SYSTEM_SET_PAIRING_PIN => Call::SystemSetPairingPin(decode(params)?),
             method::SYSTEM_AUTHENTICATE => Call::SystemAuthenticate(decode(params)?),
@@ -2208,7 +2234,6 @@ pub mod test_support {
                 name: "duck-01".into(),
             }),
             Call::SystemReboot,
-            Call::SystemOpenWifiSsh,
             Call::SystemPairingPin,
             Call::SystemSetPairingPin(SetPairingPinParams {
                 pin: "042042".into(),
@@ -2767,6 +2792,45 @@ impl Default for LaserTrackResult {
     }
 }
 
+/// See [`method::NFC_WRITE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfcWriteParams {
+    /// What the tag will read: `walk_mode`, `microduck_gamepad_pairing`, any text.
+    pub text: String,
+    /// How long to wait for a tag, in seconds. Absent: [`NfcWriteParams::DEFAULT_TIMEOUT_S`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+}
+
+impl NfcWriteParams {
+    pub const DEFAULT_TIMEOUT_S: u32 = 20;
+    /// The longest wait asked for that is honoured; more is cut to this.
+    pub const MAX_TIMEOUT_S: u32 = 120;
+
+    /// The wait this asks for, defaulted and capped.
+    pub fn timeout(&self) -> std::time::Duration {
+        let s = self
+            .timeout_s
+            .unwrap_or(Self::DEFAULT_TIMEOUT_S)
+            .clamp(1, Self::MAX_TIMEOUT_S);
+        std::time::Duration::from_secs(u64::from(s))
+    }
+}
+
+/// Answer to [`Call::NfcWrite`]: the tag was written and read back, or why not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfcWriteResult {
+    pub written: bool,
+    /// The tag's UID, `04:a1:…`, when one was touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Why nothing was written: no tag in time, a tag that is not an NTAG, a text too long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// What laser tracking is doing, in [`RobotState`]. Absent while tracking is off.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -3114,7 +3178,7 @@ pub struct ModeResult {
     pub mode: String,
     /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
     /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
-    /// the pad's buttons do. (v55)
+    /// the pad's buttons do. (v57)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerParams>,
 }
@@ -4734,7 +4798,7 @@ pub struct RobotState {
     /// [`LaserTrackState`]. (v52)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laser: Option<LaserTrackState>,
-    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v55)
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v57)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
@@ -5107,19 +5171,6 @@ pub struct PairingPinResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebootResult {
     pub in_seconds: u64,
-}
-
-/// Answer to [`Call::SystemOpenWifiSsh`].
-///
-/// The opening lasts until the next reboot and no longer: the image's switch is a file in `/run`,
-/// a tmpfs. There is no call to close it early, because a reboot already does.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenWifiSshResult {
-    /// False on an image with no such switch — a board with no USB link, which keeps ssh on wifi
-    /// anyway. Nothing was done, and ssh on wifi is whatever the image makes it. True on the dev
-    /// image too: it ships the switch, but listens on wifi permanently, so pressing it changes
-    /// nothing there.
-    pub switched: bool,
 }
 
 // ── pad.* results ────────────────────────────────────────────────────────────
@@ -6697,7 +6748,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            79,
+            78,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6929,7 +6980,6 @@ mod tests {
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,
                 method::SYSTEM_REBOOT,
-                method::SYSTEM_OPEN_WIFI_SSH,
                 method::SYSTEM_SET_PAIRING_PIN,
                 // Bonding a pad decides what may drive this robot. `pad.status` must stay off this
                 // list: reading which pads are paired is exactly the kind of inspection support

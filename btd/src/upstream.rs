@@ -50,6 +50,7 @@ pub struct Sockets {
     pub updater: PathBuf,
     pub robot: PathBuf,
     pub config: PathBuf,
+    pub nfc: PathBuf,
 }
 
 impl Sockets {
@@ -58,6 +59,7 @@ impl Sockets {
             Upstream::Updater => &self.updater,
             Upstream::Robot => &self.robot,
             Upstream::Config => &self.config,
+            Upstream::Nfc => &self.nfc,
         }
     }
 }
@@ -375,6 +377,7 @@ mod tests {
             updater: path.clone(),
             robot: dir.path().join("robotd.sock"),
             config: dir.path().join("configd.sock"),
+            nfc: dir.path().join("nfc.sock"),
         };
         let (replies, mut forwarded) = mpsc::channel(8);
         let mut pool = Pool::new(sockets, replies);

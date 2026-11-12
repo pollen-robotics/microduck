@@ -23,7 +23,7 @@ use duck_ipc_proto as proto;
 /// How long a call holds a connection. Defined once, in the protocol crate.
 pub use proto::Lane;
 
-/// The service that owns the answer to a call, restricted to the three `btd` holds sockets to.
+/// The service that owns the answer to a call, restricted to the four `btd` holds sockets to.
 ///
 /// Narrower than [`proto::Service`] on purpose. `padd` and `tofd` answer calls too, and `btd` has
 /// no connection to either: `padd` is the unprivileged client whose whole value is having no
@@ -38,6 +38,8 @@ pub enum Upstream {
     Robot,
     /// `configd` — wifi and the robot's identity.
     Config,
+    /// `nfcd` — writing a tag.
+    Nfc,
 }
 
 impl TryFrom<proto::Service> for Upstream {
@@ -48,6 +50,7 @@ impl TryFrom<proto::Service> for Upstream {
             proto::Service::Updater => Ok(Upstream::Updater),
             proto::Service::Robot => Ok(Upstream::Robot),
             proto::Service::Config => Ok(Upstream::Config),
+            proto::Service::Nfc => Ok(Upstream::Nfc),
             // Not sockets `btd` holds. Unreachable in practice, because `permits` refuses every
             // call these answer — and an error rather than a panic so that staying true is not
             // something this file has to be careful about.
@@ -203,13 +206,6 @@ fn permits(call: &proto::Call) -> bool {
         // confused — the alternative being "unplug it", which for a walking robot is worse.
         // Unlike `resetToGolden` it discards nothing.
         SystemReboot => true,
-
-        // ssh on wifi until the next reboot. The shipping image listens on the head's USB-C link
-        // only (microduck_yocto#110), so without this a shell over wifi means opening the robot.
-        // BLE is where it belongs for the same reason as `net.connect`: whoever asks is in the
-        // room, holding a phone that proved the setup code, and the login it opens still needs
-        // the operator password on top.
-        SystemOpenWifiSsh => true,
 
         // ── the gamepad ─────────────────────────────────────────────────────
         //
@@ -541,6 +537,12 @@ fn permits(call: &proto::Call) -> bool {
         TofStream => false,
         // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
         HeadImuStream => false,
+
+        // **Writing a tag is asked from the room by construction**: nothing is written until
+        // somebody touches a tag to the robot's head, which is where a phone in BLE range is.
+        // `duckctl nfc-flash` is the client. It changes the tag, never the robot — the tag's
+        // text does whatever it does only when touched again, like one a phone app wrote.
+        NfcWrite(_) => true,
     }
 }
 
@@ -650,7 +652,6 @@ mod tests {
                 proto::method::NET_FORGET,
                 proto::method::SYSTEM_SET_NAME,
                 proto::method::SYSTEM_REBOOT,
-                proto::method::SYSTEM_OPEN_WIFI_SSH,
                 // Bonding a gamepad, which afterwards can enable the walking policy. Allowed for
                 // the same reason as provisioning: it takes a pad held in pairing mode next to the
                 // robot, so BLE's physical-presence claim (§4.2) is not being stretched — and the
@@ -717,7 +718,6 @@ mod tests {
                 name: "duck".into(),
             }),
             proto::Call::SystemReboot,
-            proto::Call::SystemOpenWifiSsh,
         ] {
             assert_eq!(
                 upstream_for(&call),
