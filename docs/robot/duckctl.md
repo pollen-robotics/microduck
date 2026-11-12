@@ -260,6 +260,28 @@ duckctl info
 export DUCK_PIN=418299
 ```
 
+### A robot with a setup code
+
+A robot with a setup code — `sudo robotctl system setup-code` on it prints one — is in secure mode:
+it refuses the PIN and serves only a client that proves the code's key, in the handshake
+[`btd/src/secure.rs`](../../btd/src/secure.rs) answers. Store the code once and every command finds
+it by the robot's name:
+
+```bash
+duckctl ssh -- sudo robotctl system setup-code   # prints md1:<robot id>:<key>, and the QR
+duckctl setup-code add                           # paste it; read on stdin, kept out of history
+```
+
+`duckctl ssh` needs no code, since the address comes from the advertisement — so a robot already on
+a network is where to copy it from. The text under the QR works too, label serial and all. Given
+`--name` (or `DUCK_ROBOT`) that differs from the id in the code, `add` files it under both, and
+`duckctl name` files it under the new name; `setup-code list` shows what is held and `setup-code
+remove <name>` forgets one. The file is `~/.config/duckctl/setup-codes`, mode `0600`, and it is a
+credential: whoever copies it can talk to the robot.
+
+A wrong key is a silence, not a refusal — the robot drops the link — so a stale code shows up as a
+failed handshake that names both causes: the wrong code, or a robot with no code at all.
+
 For one command against a different robot, `--name` still wins:
 
 ```bash
@@ -780,8 +802,11 @@ escaped JSON is unreadable; a refusal from it still prints as JSON. So `duckctl 
 from the robot still exits non-zero. Progress lines start with `·` and are one line each, so
 `update apply > outcome.json` leaves them on screen and keeps the outcome in the file.
 
-One command is one connection: it finds the robot, pairs if it has to, proves the PIN, asks, and
-disconnects.
+One command is one connection: it finds the robot, pairs if it has to, proves the PIN — or the
+setup code, for a robot it holds one for — asks, and disconnects. On Linux it registers a pairing agent of its own
+while it runs, consenting for that robot and refusing everything else, so a first pairing needs no
+desktop Bluetooth settings open — without one BlueZ refuses the bond (`No agent available` in
+`journalctl -u bluetooth`).
 
 Every command gives up after a period of silence rather than after a fixed total, so a slow update
 is never cut off and a robot that stops answering is reported in seconds. A link that *drops* is
