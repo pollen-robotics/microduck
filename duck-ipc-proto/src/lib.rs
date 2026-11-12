@@ -4924,8 +4924,10 @@ pub struct RebootResult {
 /// a tmpfs. There is no call to close it early, because a reboot already does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenWifiSshResult {
-    /// False on an image with no such switch (the dev image, which listens on wifi already, or a
-    /// board with no USB link). Nothing was done, and ssh on wifi is whatever the image makes it.
+    /// False on an image with no such switch — a board with no USB link, which keeps ssh on wifi
+    /// anyway. Nothing was done, and ssh on wifi is whatever the image makes it. True on the dev
+    /// image too: it ships the switch, but listens on wifi permanently, so pressing it changes
+    /// nothing there.
     pub switched: bool,
 }
 

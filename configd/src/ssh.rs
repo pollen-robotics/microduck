@@ -17,7 +17,8 @@ use duck_ipc_proto as proto;
 pub const SWITCH: &str = "/run/microduck-ssh-wifi";
 
 /// What the image installs alongside the path unit. Its absence means an image with no switch to
-/// press: the dev image, which listens on wifi already, or a board with no USB link.
+/// press: a board with no USB link, which keeps ssh on wifi. The dev image has it — and a
+/// permanent drop-in that opens wifi anyway, so pressing it there is harmless and changes nothing.
 pub const INSTALLED: &str = "/usr/share/microduck-ssh-access/30-wifi-until-reboot.conf";
 
 /// Press the switch, if this image has one.

@@ -151,8 +151,7 @@ duckctl ssh-wifi
 ```
 
 That asks `configd` over the same authenticated Bluetooth session every other command uses, so it
-needs the setup code. It answers `switched: false` on the dev image, where ssh is open on wifi
-already.
+needs the setup code. On the dev image it changes nothing: ssh is open on wifi there already.
 
 `ssh` and `scp` remember where they last found each robot, in `~/.cache/duckctl/addresses`
 (`$XDG_CACHE_HOME` if set), and try that address first: if something answers on port 22 within a

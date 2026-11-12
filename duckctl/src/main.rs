@@ -1345,8 +1345,7 @@ enum Command {
     /// A shipping image answers ssh on the head's USB-C link only, so `duckctl ssh` over wifi is
     /// refused there. This asks `configd`, over the same authenticated Bluetooth session every
     /// other command uses, to open port 22 on every interface until the next reboot. Then
-    /// `duckctl ssh` works. On the dev image it reports `switched: false`: ssh is open there
-    /// already.
+    /// `duckctl ssh` works. The dev image listens on wifi already, so there it changes nothing.
     SshWifi,
     /// Send any method, for whatever is not wrapped above.
     Call {
