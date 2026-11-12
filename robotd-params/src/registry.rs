@@ -758,6 +758,11 @@ pub const REGISTRY: &[Entry] = &[
         "How long a ball out of sight is still walked to, milliseconds",
     ),
     entry(
+        "soccer.close_memory_ms",
+        Kind::Integer,
+        "The same within approach_m, where the ball is under the beak, milliseconds",
+    ),
+    entry(
         "soccer.max_range_m",
         Kind::Float,
         "Ignore balls projected farther than this, metres",
@@ -776,6 +781,11 @@ pub const REGISTRY: &[Entry] = &[
         "soccer.approach_m",
         Kind::Float,
         "Nearer than this, line a foot up rather than walk at the ball, metres",
+    ),
+    entry(
+        "soccer.align_rad",
+        Kind::Float,
+        "Turn in place until the ball is this close to straight ahead, then walk, radians",
     ),
     entry(
         "soccer.kick_x_m",

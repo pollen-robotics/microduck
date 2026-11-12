@@ -1422,10 +1422,11 @@ impl LaserParams {
 /// reason — tuning it is many small edits with a robot on the floor.
 ///
 /// What it does, in order: no ball known, it turns in place at `search_vyaw` (0 to stand still)
-/// with the head on the idle look-around; a ball farther than `approach_m` is turned to and walked
-/// at, as the laser's dot is; nearer, it picks the foot on the ball's side and walks sideways and
-/// forwards until the ball sits at (`kick_x_m`, ±`kick_y_m`) in front of the trunk, within
-/// `tol_x_m`/`tol_y_m`, for `settle_ms`; then it kicks, waits `cooldown_ms`, and looks again.
+/// with the head on the idle look-around; a ball farther than `approach_m` is turned to in place
+/// until within `align_rad`, then walked at; nearer, it picks the foot on the ball's side, turns to
+/// aim that foot at it, and steps until the ball sits at (`kick_x_m`, ±`kick_y_m`) in front of
+/// the trunk, within `tol_x_m`/`tol_y_m`, for `settle_ms`; then it kicks, waits `cooldown_ms`, and
+/// looks again.
 /// The ball's side: +y is left, and `kick_left` is the kick lined up with the ball at
 /// +`kick_y_m` — a robot whose kicks are mirrored wants `kick_y_m` negative.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1461,6 +1462,9 @@ pub struct SoccerParams {
     /// How long a ball out of sight is still walked to, milliseconds — long, because the last
     /// steps to it are taken with the ball under the beak, where the camera may not see it.
     pub memory_ms: u64,
+    /// The same within `approach_m`, where the ball is under the beak and out of the picture for
+    /// the last steps: long enough to line up and kick by odometry alone, milliseconds.
+    pub close_memory_ms: u64,
     /// Ignore a ball projected farther than this, metres.
     pub max_range_m: f64,
     /// Added to the floor's height under the trunk, metres, as `[laser] floor_offset_m`.
@@ -1469,6 +1473,9 @@ pub struct SoccerParams {
     pub search_vyaw: f64,
     /// Nearer than this, metres, the robot stops walking at the ball and lines its foot up.
     pub approach_m: f64,
+    /// How far off straight ahead the ball may be for the robot to walk, radians; past it the
+    /// robot turns in place first. Walking stops again past twice this.
+    pub align_rad: f64,
     /// Where the ball's centre should be for a kick: this far ahead of the trunk, metres.
     pub kick_x_m: f64,
     /// And this far to the side of it, metres — +y for `kick_left`, −y for `kick_right`.
@@ -1514,10 +1521,12 @@ impl Default for SoccerParams {
             kick: true,
             ball_radius_m: 0.035,
             memory_ms: 3000,
+            close_memory_ms: 10000,
             max_range_m: 3.0,
             floor_offset_m: 0.0,
             search_vyaw: 0.5,
             approach_m: 0.45,
+            align_rad: 0.25,
             kick_x_m: 0.15,
             kick_y_m: 0.05,
             tol_x_m: 0.04,
@@ -1572,6 +1581,7 @@ impl SoccerParams {
         for (key, v) in [
             ("max_range_m", self.max_range_m),
             ("approach_m", self.approach_m),
+            ("align_rad", self.align_rad),
             ("kick_x_m", self.kick_x_m),
             ("tol_x_m", self.tol_x_m),
             ("tol_y_m", self.tol_y_m),

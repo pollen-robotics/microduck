@@ -1106,8 +1106,12 @@ robot that stays put):
   trunk, within `tol_x_m`/`tol_y_m`, for `settle_ms`. +`kick_y_m` is the left foot (`kick_left`); a
   robot whose kicks come out mirrored wants it negative. `cooldown_ms` covers the kick and the ball
   rolling away.
-- **Walking.** `search_vyaw` (0 stands still while searching), `approach_m`, `k_x`, `k_y`, `k_yaw`,
-  `vx_max`, `vy_max`, `vyaw_max`.
+- **Walking.** It turns in place until it faces the ball within `align_rad`, then walks straight
+  at it; within `approach_m` it does the same aiming the kicking foot. `search_vyaw` (0 stands
+  still while searching), `k_x`, `k_y`, `k_yaw`, `vx_max`, `vy_max`, `vyaw_max`.
+- **No kick?** The journal says `soccer: kick refused; trying again` with robotd's reason, and the
+  robot keeps the ball and asks again. Within `approach_m` the ball is remembered for
+  `close_memory_ms`, since the camera may not see it under the beak.
 
 The kicks are the `kick_left` / `kick_right` skills, which ship in the policy set; a robot without
 them says so in the journal when it tries.

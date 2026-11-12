@@ -2737,6 +2737,10 @@ async fn control_loop<T: RobotIo>(
         // after it, so the two never both drive (`robot.soccer` and `robot.laserTrack` switch each
         // other off besides).
         let soccer_switch = intents.soccer();
+        // A kick autonomous soccer queued this tick, by name, until the skill code below says
+        // whether it started — which `soccer.kick_outcome` is then told, this same tick.
+        let mut soccer_kick: Option<&'static str> = None;
+        let mut soccer_kick_result: Option<Result<(), String>> = None;
         soccer.set_autonomous(soccer_switch.autonomous);
         let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
             phase: "manual".into(),
@@ -2775,11 +2779,14 @@ async fn control_loop<T: RobotIo>(
                 }
                 // Queued like a pad's `robot.do`, and taken below in this same tick. Not while
                 // somebody is steering: their stick says they have the robot.
-                if let Some(kick) = drive.kick
-                    && !client_twist
-                    && !queue_skill(&state, &intents, kick)
-                {
-                    tracing::warn!(kick, "soccer: this robot has no such kick configured");
+                if let Some(kick) = drive.kick {
+                    if client_twist {
+                        soccer_kick_result = Some(Err("a stick is pushed".to_owned()));
+                    } else if !queue_skill(&state, &intents, kick) {
+                        soccer_kick_result =
+                            Some(Err(format!("this robot has no {kick} skill configured")));
+                    }
+                    soccer_kick = Some(kick);
                 }
                 soccer_state = Some(block);
             }
@@ -2949,7 +2956,11 @@ async fn control_loop<T: RobotIo>(
                             .get(index)
                             .cloned()
                             .unwrap_or_else(|| index.to_string());
-                        match controller.start_skill(index) {
+                        let started = controller.start_skill(index);
+                        if soccer_kick == Some(name.as_str()) {
+                            soccer_kick_result = Some(started.map(|_| ()).map_err(str::to_owned));
+                        }
+                        match started {
                             Ok(true) => tracing::warn!(skill = %name, "skill started"),
                             Ok(false) => {}
                             Err(reason) => {
@@ -2960,6 +2971,12 @@ async fn control_loop<T: RobotIo>(
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
             }
+        }
+        if let Some(kick) = soccer_kick {
+            let outcome = soccer_kick_result.unwrap_or_else(|| {
+                Err(format!("{kick} was not started: the policy is not driving"))
+            });
+            soccer.kick_outcome(outcome, tick_start);
         }
 
         // Emotions, like the skills above: started on a robot the policy drove last tick with no
