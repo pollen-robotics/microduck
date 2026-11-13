@@ -90,7 +90,8 @@ enum Command {
         #[arg(long)]
         min_supported: Option<semver::Version>,
 
-        /// Extra files to include, as `src=dest` (e.g. a post-install hook).
+        /// Extra files to include, as `src=dest` (e.g. a post-install hook). A directory is
+        /// every file directly in it, under `dest/`.
         #[arg(long = "include")]
         includes: Vec<String>,
 
@@ -355,7 +356,24 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0o644
             };
-            append_file(&mut builder, Path::new(src), dest, mode)?;
+            let src = Path::new(src);
+            if src.is_dir() {
+                // Sorted, so the same tree packs into the same archive.
+                let mut files: Vec<_> = std::fs::read_dir(src)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<Result<_, _>>()?;
+                files.retain(|p| p.is_file());
+                files.sort();
+                for file in files {
+                    let name = file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| format!("{}: not a UTF-8 file name", file.display()))?;
+                    append_file(&mut builder, &file, &format!("{dest}/{name}"), mode)?;
+                }
+            } else {
+                append_file(&mut builder, src, dest, mode)?;
+            }
         }
 
         // The preinstall hook, always, generated from its template.
@@ -555,8 +573,10 @@ fn keygen(
         KeyKind::Dev => {
             println!("This is a DEV key, for signing branch builds.");
             println!();
-            println!("  public  → trusted_keys_dir of DEVELOPER boards only, alongside");
-            println!("            allow_dev_keys = true in updater.toml");
+            println!("  public  → deploy/dev-key/team.dev.pub, which updaterd compiles in and");
+            println!(
+                "            uses only on a dev board (robotctl configure --allow-dev-daemon on)"
+            );
             println!("  private → shared with the team (password manager / CI secret)");
             println!();
             println!("It must NOT reach a customer robot: a robot that trusts this key");
@@ -1431,6 +1451,57 @@ mod tests {
         );
     }
 
+    /// **The twin must walk on what a robot walks on.**
+    ///
+    /// `duck-sim` names every slot explicitly, because robotd's own default paths point into a
+    /// release directory a laptop does not have — so its `[policy]` block is a hand-kept copy of
+    /// robotd's walk-mode defaults. It drifted once: set v5 made the default `velstand` with no
+    /// standing network, and the twin stayed on `alpha_walking` + `alpha_stand` for weeks,
+    /// walking on a gait no robot ran and unable to turn on the spot. A slot robotd leaves
+    /// unloaded must be `"none"` here, not merely absent, since absent means robotd's default.
+    #[test]
+    fn duck_sim_names_robotds_walk_defaults() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = std::fs::read_to_string(root.join("scripts/duck-sim")).unwrap();
+        let block: Vec<&str> = script
+            .lines()
+            .skip_while(|l| !l.contains("cat > \"$STATE/robotd.toml\""))
+            .skip_while(|l| *l != "[policy]")
+            .skip(1)
+            .take_while(|l| !l.is_empty() && !l.starts_with('['))
+            .collect();
+        assert!(!block.is_empty(), "duck-sim must write a [policy] block");
+
+        let resolved = robotd_params::PolicyParams {
+            mode: robotd_params::Mode::Walk,
+            ..Default::default()
+        }
+        .resolved();
+        for slot in robotd_params::Slot::ALL {
+            let key = format!("{} = ", slot.as_str());
+            let named = block
+                .iter()
+                .find_map(|l| l.strip_prefix(&key))
+                .unwrap_or_else(|| panic!("duck-sim must name the {} slot", slot.as_str()))
+                .trim_matches('"');
+            let named = (named != "none").then(|| {
+                named
+                    .strip_prefix("$POLICIES/")
+                    .unwrap_or_else(|| panic!("{named:?} is not under $POLICIES"))
+                    .to_owned()
+            });
+            let default = resolved
+                .slot(slot)
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+            assert_eq!(
+                named,
+                default,
+                "duck-sim's {} slot has drifted from robotd's walk-mode default",
+                slot.as_str()
+            );
+        }
+    }
+
     /// **The seeder's `sed` must match what the manifest actually says.**
     ///
     /// There is no JSON parser where that script runs — a release on a board with curl and a
@@ -1833,6 +1904,28 @@ mod tests {
             assert!(
                 text.contains("=models/pet_detect.onnx"),
                 "{site} does not package the petting classifier"
+            );
+        }
+    }
+
+    /// The emotions ship inside the release, and robotd loads them from there
+    /// (`emotion::Library::load_release`). A site that forgets them produces robots on which every
+    /// pad button bound to an emotion is refused as an unknown skill.
+    #[test]
+    fn the_emotions_are_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("robotd/emotions/yes.json").exists(),
+            "the vendored emotions are gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("--include \"robotd/emotions=emotions\""),
+                "{site} does not package the emotions"
             );
         }
     }

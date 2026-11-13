@@ -1,8 +1,11 @@
 //! The face board's LEDs: their names, and the one way a daemon switches one.
 //!
 //! **Which daemon owns which LED, and what each one says, is `architecture.md` §3.2.** This is
-//! the mechanism they share: an LED is a directory under `/sys/class/leds` that the beta board's
-//! device tree hands to `gpio-leds`, and switching it is a write to `brightness` or `trigger`.
+//! the mechanism they share: an LED is a directory under `/sys/class/leds`, from `gpio-leds` on the
+//! beta board's expander and from the Awinic PWM drivers on face-board-v1, and switching it is a
+//! write to `brightness` or `trigger`. On is [`name::lit_level`], capped at the LED's own
+//! `max_brightness`: on an on/off LED that is always `1`, on a PWM one it is a level picked by eye
+//! so the face does not glare.
 //!
 //! Here rather than in each daemon because three of them write LEDs and they must agree on two
 //! things that are easy to get subtly wrong: that a blinking LED is switched on by dropping its
@@ -38,6 +41,21 @@ pub mod name {
     pub const BATTERY_LOW_RED: &str = "face:gr1:red";
     pub const BATTERY_MID: &str = "face:green2:green";
     pub const BATTERY_HIGH: &str = "face:green1:green";
+
+    /// What lighting the LED `name` writes, before [`Led::open`](super::Led::open) caps it at the
+    /// LED's `max_brightness`. `None` is the maximum itself.
+    ///
+    /// On face-board-v1's PWM drivers (0–255) the indicators at full are far brighter than
+    /// anything they say needs; the camera LED, red and facing whoever is filmed, lower still. The
+    /// flashlight is meant to light things and was tuned at full. On the beta's on/off LEDs every
+    /// one of these caps to `1`, which is on.
+    pub fn lit_level(name: &str) -> Option<u32> {
+        match name {
+            FLASHLIGHT_RED | FLASHLIGHT_GREEN | FLASHLIGHT_BLUE => None,
+            CAMERA => Some(5),
+            _ => Some(15),
+        }
+    }
 }
 
 /// What an LED is doing.
@@ -63,6 +81,9 @@ impl From<bool> for Light {
 #[derive(Debug)]
 pub struct Led {
     path: PathBuf,
+    /// What [`Light::On`] and [`Light::Blink`] light it at: [`name::lit_level`] within the LED's
+    /// `max_brightness`.
+    full: String,
     shown: Option<Light>,
 }
 
@@ -75,9 +96,23 @@ impl Led {
     /// The LED `name` under `dir` — a fake tree, in tests.
     pub fn open_in(dir: &Path, name: &str) -> Option<Led> {
         let path = dir.join(name);
-        path.join("brightness")
-            .exists()
-            .then_some(Led { path, shown: None })
+        if !path.join("brightness").exists() {
+            return None;
+        }
+        // The kernel always publishes it; without it, `1` is lit on any LED.
+        let max = std::fs::read_to_string(path.join("max_brightness"))
+            .ok()
+            .and_then(|max| max.trim().parse::<u32>().ok())
+            .filter(|&max| max > 0)
+            .unwrap_or(1);
+        let full = name::lit_level(name)
+            .map_or(max, |level| level.clamp(1, max))
+            .to_string();
+        Some(Led {
+            path,
+            full,
+            shown: None,
+        })
     }
 
     /// Show `light`. A no-op when it is already showing it.
@@ -95,9 +130,14 @@ impl Led {
             Light::Off => self.write("brightness", "0"),
             Light::On => {
                 self.write("trigger", "none")?;
-                self.write("brightness", "1")
+                self.write("brightness", &self.full)
             }
-            Light::Blink => self.write("trigger", "timer"),
+            // The timer blinks at the brightness the LED has when it starts, or at
+            // `max_brightness` from off — so light it at its level first.
+            Light::Blink => {
+                self.write("brightness", &self.full)?;
+                self.write("trigger", "timer")
+            }
         }
     }
 
@@ -118,6 +158,7 @@ mod tests {
             let led = dir.path().join(name);
             std::fs::create_dir(&led).unwrap();
             std::fs::write(led.join("brightness"), "0").unwrap();
+            std::fs::write(led.join("max_brightness"), "1\n").unwrap();
             std::fs::write(led.join("trigger"), "[none] timer").unwrap();
         }
         dir
@@ -145,6 +186,34 @@ mod tests {
         assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
         led.set(Light::Off).unwrap();
         assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "0");
+    }
+
+    #[test]
+    fn a_pwm_led_lights_at_its_level_and_the_flashlight_at_full() {
+        let names = [name::FLASHLIGHT_RED, name::CAMERA, name::STATUS_GREEN];
+        let dir = fake(&names);
+        for n in names {
+            std::fs::write(dir.path().join(n).join("max_brightness"), "255\n").unwrap();
+            Led::open_in(dir.path(), n).unwrap().set(Light::On).unwrap();
+        }
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "255");
+        assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "5");
+        assert_eq!(read(dir.path(), name::STATUS_GREEN, "brightness"), "15");
+    }
+
+    #[test]
+    fn a_blink_starts_at_the_level_and_an_on_off_led_caps_to_one() {
+        let dir = fake(&[name::NETWORK_GREEN, name::CAMERA]);
+        let pwm = dir.path().join(name::NETWORK_GREEN);
+        std::fs::write(pwm.join("max_brightness"), "255\n").unwrap();
+        let mut led = Led::open_in(dir.path(), name::NETWORK_GREEN).unwrap();
+        led.set(Light::Blink).unwrap();
+        assert_eq!(read(dir.path(), name::NETWORK_GREEN, "brightness"), "15");
+        assert_eq!(read(dir.path(), name::NETWORK_GREEN, "trigger"), "timer");
+        // The beta's gpio-leds: max_brightness 1, so every level is on.
+        let mut cam = Led::open_in(dir.path(), name::CAMERA).unwrap();
+        cam.set(Light::On).unwrap();
+        assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
     }
 
     #[test]

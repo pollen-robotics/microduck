@@ -105,7 +105,7 @@ mkdir -p "$INSTALL_STAGED" "$INSTALL_RELEASE"
 # where it can name its own cause.
 PACKAGING_WORKFLOW=.github/workflows/_build-release.yml
 
-staged_binaries="$(grep -o -- 'release/[a-z]* staged/' "$PACKAGING_WORKFLOW" \
+staged_binaries="$(grep -oE -- 'release/[a-z][a-z0-9-]* staged/' "$PACKAGING_WORKFLOW" \
     | sed 's|release/||; s| staged/||' | sort -u)"
 if [ -z "$staged_binaries" ]; then
     echo "error: no staged binaries found in ${PACKAGING_WORKFLOW}." >&2
@@ -653,6 +653,22 @@ test -f /var/lib/robot/weird-ble \
     || { echo "    [FAIL] a re-run without the flag removed the marker"; exit 1; }
 echo "    [ok] a re-run without --weird-ble leaves an already-configured board alone"
 
+# A phone that forgot the robot pairs again: every board, no flag. By now the script has run several
+# times against this file, inserting after [General] on the first, so the key must appear once.
+grep -qE "^JustWorksRepairing = always$" /etc/bluetooth/main.conf \
+    || { echo "    [FAIL] setup-board did not set JustWorksRepairing = always"; exit 1; }
+test "$(grep -cE "^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=" /etc/bluetooth/main.conf)" = 1 \
+    || { echo "    [FAIL] JustWorksRepairing is not set exactly once"; exit 1; }
+echo "    [ok] JustWorksRepairing = always is set exactly once"
+
+# The shape a stock BlueZ main.conf ships: the default commented out, which has to be replaced in
+# place rather than shadowed by a second line.
+sed -i "s|^JustWorksRepairing = always|#JustWorksRepairing = never|" /etc/bluetooth/main.conf
+ONNX_VERSION=9.9.9 PATH="/stub:$PATH" sh /bin/scripts/setup-board.sh >/tmp/board5.log 2>&1
+grep -qE "^JustWorksRepairing = always$" /etc/bluetooth/main.conf
+test "$(grep -cE "^[[:space:]]*#?[[:space:]]*JustWorksRepairing[[:space:]]*=" /etc/bluetooth/main.conf)" = 1
+echo "    [ok] the stock commented-out JustWorksRepairing is replaced in place"
+
 # ── the generated preinstall hook ──
 #
 # The hook that asserts a board can run the release being installed. Exercised here because
@@ -988,7 +1004,7 @@ fi
 # And it takes down what a previous install left running, rather than only declining to enable.
 # Skipping the enable on a board that already runs these leaves all five up while the script
 # reports that nothing is — which is how the first attempt at this measurement was wasted.
-for unit in updaterd robotd configd btd padd; do
+for unit in updaterd robotd configd btd padd autod; do
     grep -q "^disable --now ${unit}.service$" /stub/systemctl.log \
         || { echo "    [FAIL] DUCK_NO_START did not disable ${unit}.service"; exit 1; }
 done

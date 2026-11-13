@@ -279,7 +279,12 @@ fn load(args: &Args) -> Option<Loaded> {
 
     // An empty trusted-keys directory is fatal, never an empty allow-list: silently
     // trusting nothing looks identical to a misconfigured path.
-    let keys = match updater::verify::KeyRing::load(&config.trusted_keys_dir, config.allow_dev_keys)
+    let allow_dev_keys = config.dev_keys_allowed();
+    if allow_dev_keys {
+        tracing::info!("dev board: dev-signed releases are accepted");
+    }
+    let keys = match updater::verify::KeyRing::load(&config.trusted_keys_dir, allow_dev_keys)
+        .and_then(updater::verify::KeyRing::with_builtin_dev_key)
     {
         Ok(keys) => keys,
         Err(e) => {
@@ -852,9 +857,6 @@ mod tests {
             }
             async fn model_api(&self, _: std::time::Duration) -> Option<u32> {
                 None
-            }
-            async fn remote_session_active(&self, _: std::time::Duration) -> bool {
-                false
             }
             async fn reload_policies(&self, _: std::time::Duration) -> bool {
                 false

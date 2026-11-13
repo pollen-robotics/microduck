@@ -1,4 +1,7 @@
-//! NDEF, read-only and limited to text and URI records — and the Bluetooth address in them.
+//! NDEF, limited to text and URI records — and whether they ask to pair a gamepad. A MIME
+//! `text/plain` record reads as text too: some phone apps write that rather than a text record,
+//! and the person holding the tag cannot tell the difference. Read, and
+//! written only as one text record ([`text_tlv`]), which is all `nfc.write` puts on a tag.
 //!
 //! Pure: no hardware, entirely testable off a board.
 
@@ -6,9 +9,18 @@ const TLV_NULL: u8 = 0x00;
 const TLV_NDEF: u8 = 0x03;
 const TLV_TERMINATOR: u8 = 0xFE;
 
+const FLAG_MB: u8 = 0x80;
 const FLAG_ME: u8 = 0x40;
 const FLAG_SR: u8 = 0x10;
 const FLAG_IL: u8 = 0x08;
+const TNF_MASK: u8 = 0x07;
+const TNF_WELL_KNOWN: u8 = 0x01;
+/// A record whose type is a MIME type (RFC 2046), e.g. `text/plain`.
+const TNF_MEDIA: u8 = 0x02;
+
+/// The language a written text record says it is in. Readers ignore it — [`parse`] does — and
+/// `en` is what phone apps write by default.
+const LANG: &[u8] = b"en";
 
 /// The NFC Forum abbreviation table: a URI record's first byte indexes it.
 const URI_PREFIXES: [&str; 36] = [
@@ -117,6 +129,10 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         i += payload_len;
 
         match (kind, payload.split_first()) {
+            // The whole payload is the text: a MIME record has no status or language byte.
+            _ if header & TNF_MASK == TNF_MEDIA && is_plain_text(kind) => {
+                records.push(Record::Text(String::from_utf8_lossy(payload).into_owned()));
+            }
             (b"T", Some((&status, rest))) => {
                 let lang = (status & 0x3F) as usize;
                 let text = rest.get(lang..).unwrap_or_default();
@@ -137,6 +153,13 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         }
     }
     Ok(records)
+}
+
+/// Whether a MIME type is `text/plain`, whatever its case and parameters
+/// (`text/plain; charset=utf-8`).
+fn is_plain_text(mime: &[u8]) -> bool {
+    let essence = mime.split(|&b| b == b';').next().unwrap_or_default();
+    essence.trim_ascii().eq_ignore_ascii_case(b"text/plain")
 }
 
 /// The NDEF TLV's payload, skipping NULL TLVs and any other TLV before it.
@@ -170,37 +193,54 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
-/// The first Bluetooth address in these records, as `AA:BB:CC:DD:EE:FF`.
+/// A tag's user memory holding `text` as its one record: the NDEF TLV, then the terminator —
+/// what a phone app writes for a text, and what [`parse`] reads back as [`Record::Text`].
 ///
-/// Written by a person, so spelled however they like: `:` or `-` between the octets or nothing,
-/// either case, inside other text. Twelve hex digits with a separator used consistently, and
-/// not part of a longer run of hex — which is what keeps a serial number from reading as one.
-pub fn mac_in(records: &[Record]) -> Option<String> {
-    records.iter().find_map(|r| mac_in_text(r.value()))
-}
+/// Refused only for a text whose message no TLV length can say (64 KiB); whether it fits the tag
+/// is the tag's question, asked by [`crate::tag::write_ndef_area`].
+pub fn text_tlv(text: &str) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(1 + LANG.len() + text.len());
+    payload.push(LANG.len() as u8); // UTF-8, and the language's length
+    payload.extend(LANG);
+    payload.extend(text.as_bytes());
 
-fn mac_in_text(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let hex = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_hexdigit);
-    for start in 0..bytes.len() {
-        if start > 0 && hex(start - 1) {
-            continue;
-        }
-        for sep in [Some(b':'), Some(b'-'), None] {
-            let step = if sep.is_some() { 3 } else { 2 };
-            let end = start + 5 * step + 2;
-            let fits = (0..6).all(|k| hex(start + k * step) && hex(start + k * step + 1))
-                && (1..6).all(|k| sep.is_none_or(|s| bytes.get(start + k * step - 1) == Some(&s)))
-                && !hex(end);
-            if fits {
-                let octets: Vec<String> = (0..6)
-                    .map(|k| text[start + k * step..start + k * step + 2].to_ascii_uppercase())
-                    .collect();
-                return Some(octets.join(":"));
-            }
+    let mut record = Vec::with_capacity(payload.len() + 7);
+    match u8::try_from(payload.len()) {
+        Ok(len) => record.extend([FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN, 1, len]),
+        Err(_) => {
+            record.extend([FLAG_MB | FLAG_ME | TNF_WELL_KNOWN, 1]);
+            record.extend((payload.len() as u32).to_be_bytes());
         }
     }
-    None
+    record.push(b'T');
+    record.extend(payload);
+
+    let mut tlv = vec![TLV_NDEF];
+    match u16::try_from(record.len()) {
+        Ok(len) if len < 0xFF => tlv.push(len as u8),
+        Ok(len) if len < 0xFFFF => {
+            tlv.push(0xFF);
+            tlv.extend(len.to_be_bytes());
+        }
+        _ => {
+            return Err(format!(
+                "a text of {} bytes is too long for any tag",
+                text.len()
+            ));
+        }
+    }
+    tlv.extend(record);
+    tlv.push(TLV_TERMINATOR);
+    Ok(tlv)
+}
+
+/// What a pairing tag holds: every one is written with this text, and none names a pad.
+pub const PAIRING: &str = "microduck_gamepad_pairing";
+
+/// Does one of these records say "pair a gamepad"? The whole record, surrounding whitespace aside —
+/// a tag that merely mentions it in other text is not a pairing tag.
+pub fn asks_to_pair(records: &[Record]) -> bool {
+    records.iter().any(|r| r.value().trim() == PAIRING)
 }
 
 #[cfg(test)]
@@ -221,9 +261,34 @@ mod tests {
     }
 
     #[test]
+    fn a_written_text_reads_back_as_itself() {
+        for text in ["walk_mode", PAIRING, "é🦆", ""] {
+            let tlv = text_tlv(text).unwrap();
+            assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+            assert_eq!(parse(&tlv).unwrap(), [Record::Text(text.into())]);
+        }
+        // What `text_tag` above — a phone app's layout — holds, byte for byte but the language.
+        let short = text_tlv("walk_mode").unwrap();
+        assert_eq!(&short[..7], [TLV_NDEF, 16, 0xD1, 1, 12, b'T', 2]);
+    }
+
+    /// Past 255 bytes the record takes a four-byte length and the TLV a three-byte one; both
+    /// still read back.
+    #[test]
+    fn a_long_text_takes_the_long_lengths() {
+        let text = "a".repeat(300);
+        let tlv = text_tlv(&text).unwrap();
+        assert_eq!(&tlv[..2], [TLV_NDEF, 0xFF]);
+        assert_eq!(tlv[4] & FLAG_SR, 0);
+        assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+        assert_eq!(parse(&tlv).unwrap(), [Record::Text(text)]);
+        assert!(text_tlv(&"a".repeat(70_000)).is_err());
+    }
+
+    #[test]
     fn a_text_record_reads_back_without_its_language() {
-        let records = parse(&text_tag("98:B6:E9:28:06:09")).unwrap();
-        assert_eq!(records, vec![Record::Text("98:B6:E9:28:06:09".into())]);
+        let records = parse(&text_tag(PAIRING)).unwrap();
+        assert_eq!(records, vec![Record::Text(PAIRING.into())]);
     }
 
     #[test]
@@ -235,9 +300,50 @@ mod tests {
         );
     }
 
+    /// One MIME record, the way NFC Tools shows "Media : text/plain".
+    fn mime_tag(mime: &str, text: &str) -> Vec<u8> {
+        let mut record = vec![
+            FLAG_MB | FLAG_ME | FLAG_SR | TNF_MEDIA,
+            mime.len() as u8,
+            text.len() as u8,
+        ];
+        record.extend(mime.as_bytes());
+        record.extend(text.as_bytes());
+        let mut tag = vec![TLV_NDEF, record.len() as u8];
+        tag.extend(record);
+        tag.push(TLV_TERMINATOR);
+        tag
+    }
+
+    /// A MIME `text/plain` record pairs and switches modes like a text record: its payload is the
+    /// text, with no language byte to skip.
+    #[test]
+    fn a_plain_text_mime_record_reads_as_text() {
+        for mime in ["text/plain", "Text/Plain", "text/plain; charset=utf-8"] {
+            let records = parse(&mime_tag(mime, PAIRING)).unwrap();
+            assert_eq!(records, [Record::Text(PAIRING.into())], "{mime}");
+            assert!(asks_to_pair(&records));
+        }
+        assert_eq!(
+            parse(&mime_tag("text/plain", "walk_mode")).unwrap(),
+            [Record::Text("walk_mode".into())]
+        );
+    }
+
+    /// Any other MIME type is skipped, as any other record is — and a well-known record whose
+    /// type happens to read `text/plain` is not a MIME record.
+    #[test]
+    fn other_mime_records_are_skipped() {
+        assert_eq!(parse(&mime_tag("text/html", PAIRING)).unwrap(), []);
+        assert_eq!(parse(&mime_tag("application/json", PAIRING)).unwrap(), []);
+        let mut well_known = mime_tag("text/plain", PAIRING);
+        well_known[2] = FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN;
+        assert_eq!(parse(&well_known).unwrap(), []);
+    }
+
     #[test]
     fn the_tlv_size_is_known_from_the_first_bytes() {
-        let tag = text_tag("98:B6:E9:28:06:09");
+        let tag = text_tag(PAIRING);
         assert_eq!(tlv_size(&tag), Some(2 + tag[1] as usize + 1));
         assert_eq!(tlv_size(&[0x00, 0x00]), None);
     }
@@ -248,17 +354,25 @@ mod tests {
         assert_eq!(parse(&[TLV_NDEF, 0, TLV_TERMINATOR]).unwrap(), vec![]);
     }
 
+    /// Phone NFC apps write a Lock Control TLV ahead of the record; the walk has to skip
+    /// unknown TLVs by their length, which is what keeps such a tag readable.
     #[test]
-    fn an_address_is_found_however_it_is_spelled() {
-        let mac = |s: &str| mac_in(&[Record::Text(s.into())]);
-        let want = Some("98:B6:E9:28:06:09".to_owned());
-        assert_eq!(mac("98:B6:E9:28:06:09"), want);
-        assert_eq!(mac("pad=98-b6-e9-28-06-09 !"), want);
-        assert_eq!(mac("98b6e9280609"), want);
-        // Mixed separators, or a longer run of hex, are not an address.
-        assert_eq!(mac("98:B6-E9:28:06:09"), None);
-        assert_eq!(mac("198:B6:E9:28:06:09"), None);
-        assert_eq!(mac("98b6e92806091"), None);
-        assert_eq!(mac("nothing here"), None);
+    fn a_lock_tlv_ahead_of_the_message_is_walked_past() {
+        let mut tag = vec![0x01, 0x03, 0xA0, 0x0C, 0x34]; // a phone app's lock TLV
+        tag.extend(text_tag(PAIRING));
+        assert!(asks_to_pair(&parse(&tag).unwrap()));
+    }
+
+    #[test]
+    fn only_the_pairing_text_itself_asks_to_pair() {
+        let asks = |r: Record| asks_to_pair(&[r]);
+        assert!(asks(Record::Text(PAIRING.into())));
+        assert!(asks(Record::Text(format!(" {PAIRING}\n"))));
+        assert!(asks(Record::Uri(PAIRING.into())));
+        // The old tags, an address and nothing else, no longer pair anything.
+        assert!(!asks(Record::Text("98:B6:E9:28:06:09".into())));
+        assert!(!asks(Record::Text(format!("not {PAIRING}"))));
+        assert!(!asks(Record::Text("MICRODUCK_GAMEPAD_PAIRING".into())));
+        assert!(!asks_to_pair(&[]));
     }
 }

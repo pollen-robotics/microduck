@@ -4,7 +4,8 @@
 # mostly a change needs a restart — of the daemon that reads the section, which is not
 # always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
 # exceptions: padd re-reads [pad], [pad_imu_head_control] and [pad_drive] a second after the
-# file changes, and robotd re-reads [policy] when asked. `robotctl configure` knows which is
+# file changes, and robotd re-reads [policy] when asked. [autonomous] enabled is where robotd's
+# switch starts at boot (`robotctl autonomous` changes it now), and padd re-reads pad_idle_s. `robotctl configure` knows which is
 # which and offers it (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
@@ -23,8 +24,9 @@
 
 [board]
 # Which electronic board this robot is built on: "zero3" (the Radxa Zero 3W with the prototype's
-# HAT) or "beta" (the custom board). Set when the robot is provisioned — `provision-board.sh
-# --board` — and not something to change on a robot that works. The updater reads it for the
+# HAT), "beta" (the custom board) or "face-board-v1" (the custom board with the V1.0 face board).
+# Set when the robot is provisioned — `provision-board.sh --board`, or the OS image built for the
+# board — and not something to change on a robot that works. The updater reads it for the
 # hardware revision a release is checked against, so declaring the wrong board can cost a robot
 # its updates; `robotctl health` says when this and the device tree disagree.
 # version = "zero3"
@@ -45,6 +47,37 @@ port = "/dev/ttyS2"
 # fails and the journal fills with `bus read failed`. That is the symptom to match against
 # this line. Needs a robotd restart.
 # fast_sync_read = true
+
+# The impact guard on servos running ROBOTIS's impact guard firmwares (V3 and V4,
+# firmware_version 3 and 4):
+# a servo that arrives faster than 6 rad/s and hits something brakes 20 ms, and its PWM limit
+# falls from 100 % at rest to 40 % at 7 rad/s, which keeps arrivals near 7 rad/s — what keeps
+# the gear teeth whole and still lets the policy walk and catch a push. OFF leaves the factory
+# firmware with only Current Limit (1000 mA either way): settings that never fire on V3, the
+# switch below on V4, which keeps its settings.
+# robotd writes them to every V3 and V4 servo when it starts with torque off; a robot standing
+# at the restart gets them at the next start. V4 also has an on/off switch that every power-up
+# turns off, and robotd sets it to this value with every torque on. Needs a robotd restart.
+# OFF by default until it is understood why the stress test robot on it fell on its own far
+# more often than any other (2026-11-09).
+# impact_guard = false
+
+# What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's
+# factory values, the gear bench's (V Min 1, brake 50, hold 500 mA, 50 % at 9 rad/s), tripped
+# the brake on nearly every step and their hold softened the stance leg, so the robot fell.
+# An impact is a deceleration past impact_guard_decel rad/s² while the servo moves toward its
+# goal faster than impact_guard_v_min rad/s; the H-bridge then brakes for impact_guard_brake_ms
+# and the servo holds at impact_guard_i_hold_ma (32767: no hold) until its goal comes back past
+# it. The PWM limit falls from 100 % at rest to impact_guard_pwm_fast % at impact_guard_v_fast
+# rad/s (never 0). Change these with the robot relaxed: the servos run them from the next Start,
+# no reboot needed. A start that writes anything else says so in the journal, so a recording can
+# be matched to the settings it ran on.
+# impact_guard_v_min = 6
+# impact_guard_brake_ms = 20
+# impact_guard_decel = 400
+# impact_guard_i_hold_ma = 32767
+# impact_guard_v_fast = 7
+# impact_guard_pwm_fast = 40
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
@@ -117,6 +150,13 @@ hz = 50
 # restart counts. updaterd restarts every 10 s and needs about 45 s to show a crash loop, so
 # below that a release whose updaterd cannot start passes. Clamped to 20–300.
 # boot_deadline_s = 60
+
+# Whether a failed release is reverted without anyone asking: the health gate after
+# `update apply` / `select` / `rollback`, the boot counter on an unconfirmed update, and the
+# boot check falling back to golden. Off, a release that fails stays live, reported stuck,
+# and `robotctl update rollback daemon` reverts it by hand. Read by updaterd when it would
+# revert, and by robot-boot-check once per boot — not by robotd.
+# auto_rollback = false
 
 [policy]
 # Whether to load a policy at all.
@@ -198,6 +238,17 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+
+# How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s² in
+# yaw. It acts after [control] cmd_alpha, so a small stick move is the EMA as before, and only a
+# big jump — full forward to full back — becomes a ramp at this slope. Unset resolves per mode:
+# no limit walking; the roller limits accel_vx to 1.0 (about a second to reverse) and leaves
+# strafe and yaw free, so it still turns as quickly. 0 is no limit. A roller reversing in the
+# bare EMA's quarter second fell over; lowering cmd_alpha instead kept it up but made it hard to
+# steer, since that slows every axis.
+# accel_vx = 1.0
+# accel_vy = 0
+# accel_vyaw = 0
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5
@@ -308,6 +359,22 @@ mode = "walk"
 # limp_fall_pose_ms = 600
 # limp_fall_pose_gain = 160
 
+# A stand-up that stalls. From the back, the policy sometimes gets half-way and stays there,
+# holding a pose it never gets out of; Start twice (policy off — home pose — policy on) is
+# what un-sticks it. This does the same by itself: whenever the policy takes the robot — the
+# hand-back above, or an enable on the floor — it has `limp_fall_standup_ms` to have it up
+# (inside `limp_fall_tilt_z` for `limp_fall_arm_ms`, the same test that arms the predictor).
+# If it has not, the robot is posed back to standing and handed over again, up to
+# `limp_fall_standup_retries` times in a row. 0 turns it off. Disabling the policy, or
+# anything else taking the robot, drops the watch.
+#
+# Out of retries, the robot is parked: stiff at the home pose, policy off, nothing grinding.
+# Stand it on its feet and let go — upright and still (under `limp_fall_still_rate`) for
+# `limp_fall_standup_resume_ms` — and the policy takes it back by itself. Start twice works too.
+# limp_fall_standup_ms = 3000
+# limp_fall_standup_retries = 3
+# limp_fall_standup_resume_ms = 1000
+
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
 # floor (6.6 V — the same value the battery percentage maps to 0%). The EMA moves over
 # ~10 s, so a load sag cannot trip it; reaching 6.6 requires a genuinely spent pack.
@@ -413,6 +480,133 @@ mode = "walk"
 # withdrew keeps sounding.
 # hold_ms = 250
 
+[laser]
+# Laser tracking: a red laser dot on the floor is followed with the head and walked to. Switched
+# live with `robotctl laser-track on|off` (or `robot.laserTrack`), which does not write this file;
+# this key is whether it starts on — and changing it here switches it too. A deflected stick always
+# wins over the dot, and with no dot in sight the robot does whatever it was told — so it can be
+# left on while driving.
+#
+# The video stream is untouched: `mediad` scans the frames it already has, at the stream's own
+# auto-exposure, a few times a second while searching and faster once it sees a dot.
+#
+# **Everything in this section applies live** — save, and robotd picks it up within a second. Tune with `robotctl laser-track` running: it prints the colour of the best
+# candidate in each look, whether it passed or not.
+# enabled = false
+
+# mediad's local socket.
+# socket = "/run/mediad/media.sock"
+
+# What a dot pixel is, in the camera's YUV (0-255, chroma 128 = grey). At normal exposure a dot is
+# a white core with a red rim, and these gate on the rim: bright, red, not blue. Point the laser,
+# read `peak` in `robotctl laser-track`, and set each a little on the safe side of it. If it
+# chases red objects, raise y_min and v_min; if it misses the dot, lower them.
+# y_min = 150
+# v_min = 165
+# u_max = 140
+
+# How big a dot is, in sampled pixels (every other row and column of the frame) around the
+# brightest hit, within radius_px of it. Fewer than min_pixels is noise; more than max_pixels is
+# a red lamp or a jumper, not a laser.
+# min_pixels = 3
+# max_pixels = 600
+# radius_px = 24
+
+# Looks per second, searching and tracking. Each look copies one frame (~1.8 MB) out of the camera
+# pipeline and scans a quarter of it — about 5 ms on a face-board-v1 — so the cost is the rate:
+# measured there, 3 Hz was 3.4% of one core and 15 Hz 15%. Searching at 1 Hz costs about 1%, and
+# means up to a second before a dot is first noticed; tracking starts at track_hz from that look.
+# search_hz = 1.0
+# track_hz = 15.0
+
+# Which halves to drive. Both off is detection only: `robotctl laser-track` still shows the dot.
+# head = true
+# walk = true
+
+# How long a dot that left the picture is still followed, milliseconds — across a blink of the
+# detector or a dot that ran past the frame's edge.
+# memory_ms = 1000
+
+# Walking to it. Forward speed is k_dist × (distance − stop_m), capped at vx_max, and only while
+# roughly facing the dot; turning is k_yaw × bearing, capped at vyaw_max. Too much k_yaw wobbles.
+# stop_m = 0.25
+# max_range_m = 2.5
+# k_dist = 1.0
+# k_yaw = 1.5
+# vx_max = 0.25
+# vyaw_max = 0.8
+
+# The floor's height under the trunk comes from odometry. If distances in `robotctl laser-track`
+# are consistently long or short against a tape measure, nudge this: + raises the floor (nearer).
+# floor_offset_m = 0.0
+
+[soccer]
+# Autonomous soccer: find the purple ball, walk to it, kick it. Soccer mode itself is switched with
+# `robotctl soccer on|auto|off`, an NFC `soccer_mode` tag, or D-pad down on the pad once in it —
+# never from here; this section is only how autonomous play sees and moves. **Everything here
+# applies live.** Tune with `robotctl soccer` running; `walk = false` tunes on a robot that stays put.
+
+# mediad's local socket.
+# socket = "/run/mediad/media.sock"
+
+# What a ball pixel is, in the camera's YUV (0-255, chroma 128 = grey). Purple is the hue with both
+# chromas above grey. Hold the ball up, read `peak` in `robotctl soccer`, set each a little below.
+# u_min = 145
+# v_min = 134
+# y_min = 20
+
+# What a ball is, in 4x4-pixel cells: big enough, filling enough of its box (a disc is 0.79), and
+# about as tall as wide (skipped for a ball cut by the picture's edge).
+# min_cells = 6
+# min_fill = 0.45
+# max_aspect = 1.8
+
+# Looks per second, searching and tracking — the laser's costs, per look.
+# search_hz = 5.0
+# track_hz = 15.0
+
+# Which halves to drive, and whether to kick once lined up.
+# head = true
+# walk = true
+# kick = true
+
+# The ball: its centre is this far above the floor. Remembered this long out of sight, and longer
+# within approach_m, where the last steps are taken with it under the beak.
+# ball_radius_m = 0.035
+# memory_ms = 3000
+# close_memory_ms = 10000
+# max_range_m = 3.0
+# floor_offset_m = 0.0
+
+# Turn rate while no ball is known (0 stands still), and where walking at the ball turns into
+# lining a foot up. It turns in place until the ball (near: the kicking foot's line to it) is within
+# align_rad of straight ahead, then walks; past twice that, it stops to turn again.
+# search_vyaw = 0.5
+# approach_m = 0.45
+# align_rad = 0.25
+
+# The kick spot: ball centre kick_x_m ahead of the trunk and kick_y_m to the side (+ is the left
+# foot, kick_left), within tol for settle_ms (once in, it is left only past twice tol); stalled
+# within twice tol for stall_ms, it kicks from there. Then cooldown_ms before looking again.
+# kick_x_m = 0.15
+# kick_y_m = 0.05
+# tol_x_m = 0.04
+# tol_y_m = 0.025
+# settle_ms = 300
+# stall_ms = 1500
+# Lined up, it stands still with its head neutral for ready_ms before kicking: the kick network
+# was trained from there, and started mid-step with the head looking down it barely moves.
+# ready_ms = 600
+# cooldown_ms = 2500
+
+# Gains and limits.
+# k_x = 1.2
+# k_y = 1.5
+# k_yaw = 1.5
+# vx_max = 0.2
+# vy_max = 0.1
+# vyaw_max = 0.8
+
 [duck_detector]
 # Finding other Microducks in the head camera. Read by `mediad`, not `robotd` — the frames are on
 # `mediad`'s pipeline and perception belongs next to the sensor — but the switch lives here because
@@ -461,6 +655,27 @@ mode = "walk"
 # sensor fitted. Depth is unaffected either way.
 # enabled = true
 
+[map]
+# The onboard map, built by mapd from the robot state and the ToF, and where the robot is in it
+# (`robotctl map`). It maps only where the robot stops and looks around: a stop of a few seconds is
+# one view, and the views are the map. Kept across updates and reboots; after a reboot the robot
+# does not know where it is until a stop or two recognise somewhere it has been.
+#
+# **Off by default** until its cost on the board has been measured: mapd parses the robot state
+# stream at state_hz while it runs. Turn it on, then `sudo systemctl restart mapd`. The duck on its
+# own ([autonomous]) maps whatever this says.
+# enabled = false
+# path = "/var/lib/mapd/map.json"
+# Seconds between saves while the map changes, and so what a power cut can lose. Also saved when
+# mapd stops.
+# autosave_s = 60
+# How often mapd reads the robot state. Poses are interpolated between samples, so more buys
+# little and costs JSON parsing.
+# state_hz = 25
+# How long before its timestamp a depth frame was captured. Wrong, and walls smear while the head
+# turns.
+# tof_latency_ms = 10.0
+
 [chorale]
 # Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
 # conducting duck's beat counter is the timebase, and the parts are worked out from each duck's own
@@ -484,7 +699,12 @@ mode = "walk"
 #
 # Angles are radians, durations seconds. All of it is taste: these are the knobs for how alive it
 # reads. Read once at startup, so a change needs robotd restarted.
-# enabled = true
+#
+# `enabled` unset resolves per mode: on walking, OFF on the roller. What it moves is the head
+# command, which the policy reads as an input — and roller.onnx was not trained with one moving:
+# left alone, the roller collapsed about three seconds after the stick was let go. Set it true
+# to have the roller look around anyway, once a roller policy is trained for it.
+# enabled = true      # unset: per mode, as above
 # after_s = 2.0
 # fade_s = 1.5
 
@@ -633,7 +853,7 @@ mode = "walk"
 # inside the range it was trained on.
 # [pad_drive]
 # vx_max = 0.4
-# vx_min = -0.4
+# vx_min = -0.3
 # vy_max = 0.3
 # vy_min = -0.3
 # vyaw_max = 1.0
@@ -655,11 +875,17 @@ mode = "walk"
 # invert = true
 #
 # Head limits in radians. Also bound controller-IMU head targets.
+# `expo` (0–1) curves the head sticks: higher is finer near the centre, full stick unchanged —
+# at 0.6, half a stick is 28 % of the travel. `max_speed` caps how fast the sticks move the head
+# target, rad/s (0 = no cap): a full snap glides there at that speed instead of jumping. Neither
+# touches the IMU head, and both come on top of `[control] head_alpha`.
 # [pad_head]
 # neck_pitch_max = 2.5
 # head_pitch_max = 2.5
 # head_yaw_max = 2.5
 # head_roll_max = 2.5
+# expo = 0.6
+# max_speed = 10.0
 #
 # Body height in metres, tilt in radians; pitch is unbound by default.
 # [pad_body]
@@ -688,3 +914,17 @@ mode = "walk"
 # max_hz = 30          # intent frames a second to robotd, at most, 10–100
 # stale_ms = 300       # nothing new this long stops the robot; below [safety] deadman_ms
 # timeout_ms = 1000    # silence that counts as the client gone; at least stale_ms
+# ── The duck on its own ──────────────────────────────────────────────────────────────────────
+#
+# docs/design/autonomous.md. With `enabled` on, the robot stands itself up at boot with no pad
+# connected, then wanders, looks around, grooms, naps, chases a laser dot, plays with the ball and
+# answers when spoken to, avoiding obstacles with the head's depth sensor, and maps as it goes. A
+# pad stays silent until it is touched; touching it takes over, and `pad_idle_s` untouched seconds
+# later the duck takes back over. Off by default: a duck that walks off by itself is something
+# somebody chooses. `enabled` is only how each boot starts: `robotctl autonomous on|off`, or an
+# `autonomous_mode` NFC tag, switches it until the next one.
+# [autonomous]
+# enabled = false
+
+# Seconds of an untouched pad before the duck takes back over.
+# pad_idle_s = 30.0

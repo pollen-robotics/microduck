@@ -1,4 +1,4 @@
-# The NFC reader daemon: touch a tag carrying a gamepad's address, and that pad is paired.
+# The NFC reader daemon: touch a pairing tag, and the gamepad in pairing mode is paired.
 #
 # Nothing depends on this unit, and most robots have no reader fitted. `nfcd` then logs one line
 # and retries the port every thirty seconds, so plugging a reader in is all it takes — no restart,
@@ -6,6 +6,10 @@
 [Unit]
 Description=Robot NFC reader daemon
 Documentation=file:///opt/robot/daemon/current/docs/architecture.md
+# It also serves `nfc.write` and `nfc.read` — writing and reading a tag, for `robotctl nfc-flash` /
+# `nfc-read` and, through btd, `duckctl` —
+# on /run/nfcd/nfc.sock: nfcd's, group `robot`, mode 0660.
+#
 # `After`, not `Requires`: a touch is answered by configd (pad.pair) and robotd (the quack), and
 # each call opens its own connection, so either daemon may come and go under this one.
 After=local-fs.target configd.service robotd.service
@@ -18,7 +22,8 @@ Group=nfcd
 # dialout — /dev/ttyACM* is root:dialout mode 0660, which is the whole of this daemon's
 #           privileged access
 # robot   — configd's and robotd's 0660 sockets. Asking configd to *pair* takes more than the
-#           group: configd.service names this user in `--allow-user`.
+#           group: configd.service names this user in `--allow-user`. Also the group nfcd hands
+#           its own socket to.
 SupplementaryGroups=dialout robot
 Restart=always
 RestartSec=5s
@@ -45,7 +50,7 @@ CapabilityBoundingSet=
 Environment=RUST_LOG=info
 StandardOutput=journal
 StandardError=journal
-# identity.json, for `robotctl health` and updaterd's startup check.
+# identity.json, for `robotctl health` and updaterd's startup check, and nfc.sock.
 RuntimeDirectory=nfcd
 
 [Install]

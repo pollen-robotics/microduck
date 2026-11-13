@@ -201,10 +201,18 @@ impl<T: RobotIo> Safety<T> {
         self.io.hardware_errors()
     }
 
+    pub fn census(&mut self) -> Result<Option<crate::io::Census>, IoError> {
+        self.io.census()
+    }
+
     pub fn servo_identity(
         &mut self,
     ) -> Result<Option<[crate::io::ServoIdentity; crate::model::NUM_JOINTS]>, IoError> {
         self.io.servo_identity()
+    }
+
+    pub fn impact_guard(&mut self) -> Result<Option<[u8; crate::model::NUM_JOINTS]>, IoError> {
+        self.io.impact_guard()
     }
 
     pub fn fallen(&self) -> bool {

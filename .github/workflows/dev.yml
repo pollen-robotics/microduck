@@ -5,8 +5,8 @@
 # every push, and both are enforced somewhere other than this file:
 #
 #   1. **Signed with `team.dev`, not `release-1`.** A customer robot refuses these outright:
-#      `allow_dev_keys = false` in the shipped config, *and* a trusted key is only usable as
-#      a dev key if its filename ends `.dev.pub`. Two independent conditions.
+#      `updaterd` uses that key only on a robot made a dev board (`robotctl configure
+#      --allow-dev-daemon on`, docs/design/updater-design.md §5.4), and nothing ships one.
 #   2. **The version is a semver prerelease** (`0.1.0-dev.42.abc1234`), so it sorts *below*
 #      the release it precedes and can never be what `latest` resolves to for the fleet.
 #      GitHub's prerelease flag below is the second, independent guard.
@@ -133,6 +133,7 @@ jobs:
           # reads as a broken daemon rather than an incomplete artifact.
           cp target/aarch64-unknown-linux-gnu/release/configd staged/
           cp target/aarch64-unknown-linux-gnu/release/btd staged/
+          cp target/aarch64-unknown-linux-gnu/release/duck-gateway staged/
           # padd is the gamepad intent client. Shipped because a dev board is where
           # anyone drives the robot from, and the intent API only stays honest if the
           # thing exercising it daily is actually on the robot.
@@ -140,6 +141,9 @@ jobs:
           # netpadd is the same intent client fed by UDP instead of Bluetooth. Its unit is enabled
           # beside padd's and an ExecCondition on `[netpad] enabled` picks which of the two runs.
           cp target/aarch64-unknown-linux-gnu/release/netpadd staged/
+          # autod is the autonomous brain. Shipped and enabled everywhere, idle unless
+          # `[autonomous] enabled` (docs/design/autonomous.md).
+          cp target/aarch64-unknown-linux-gnu/release/autod staged/
           # mediad is the WebRTC gateway. Shipped so a board *can* run it; its unit has no
           # [Install], so nothing starts it until someone does. See mediad/systemd/mediad.service.
           cp target/aarch64-unknown-linux-gnu/release/mediad staged/
@@ -153,6 +157,8 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/tofd staged/
           # The NFC reader daemon, the same way: a board with no reader runs it, and it says so.
           cp target/aarch64-unknown-linux-gnu/release/nfcd staged/
+          # The onboard map, built from robotd's and tofd's streams.
+          cp target/aarch64-unknown-linux-gnu/release/mapd staged/
 
           # Same contents as a real release: a dev build that omitted the units or robotd
           # would fail its own restart step on the board and roll itself back, which is a
@@ -183,23 +189,29 @@ jobs:
             --include "updater/systemd/robot-boot-check.timer=systemd/robot-boot-check.timer" \
             --include "configd/systemd/configd.service=systemd/configd.service" \
             --include "btd/systemd/btd.service=systemd/btd.service" \
+            --include "duck-gateway/systemd/duck-gateway.service=systemd/duck-gateway.service" \
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
             --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
             --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
+            --include "autod/systemd/autod.service=systemd/autod.service" \
+            --include "autod/systemd/sysusers.d/autod.conf=systemd/sysusers.d/autod.conf" \
             --include "mediad/systemd/mediad.service=systemd/mediad.service" \
             --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \
             --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
             --include "nfc/systemd/nfcd.service=systemd/nfcd.service" \
             --include "nfc/systemd/sysusers.d/nfcd.conf=systemd/sysusers.d/nfcd.conf" \
+            --include "mapd/systemd/mapd.service=systemd/mapd.service" \
+            --include "mapd/systemd/sysusers.d/mapd.conf=systemd/sysusers.d/mapd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \
             --include "deploy/README.md=docs/deploy.md" \
             --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx" \
-            --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx"
+            --include "duck-control/models/pickup_detector.onnx=models/pickup_detector.onnx" \
+            --include "robotd/emotions=emotions"
 
 
           # `--ref` resolves a *tag*, and the manifest it fetches is the asset named
@@ -286,9 +298,9 @@ jobs:
           sudo robotctl update apply daemon --ref ${GITHUB_REF_NAME}
           \`\`\`
 
-          Signed with \`team.dev\`, so a customer robot refuses it. The board needs
-          \`team.dev.pub\` in its trusted keys and \`allow_dev_keys = true\` — see
-          docs/deploy.md.
+          Signed with \`team.dev\`, so a customer robot refuses it. Make a board a dev
+          board once with \`sudo robotctl configure --allow-dev-daemon on\` — see
+          docs/robot/install-dev.md.
 
           \`duckctl\` from this branch, on Linux or macOS:
 

@@ -23,6 +23,7 @@
 
 pub mod board;
 pub mod edit;
+pub mod label;
 pub mod registry;
 pub mod serial;
 
@@ -196,9 +197,18 @@ pub struct Params {
     pub policy: PolicyParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
+    pub emotions: EmotionsParams,
     pub theremin: ThereminParams,
+    /// Following a laser dot with the head and the legs. `robotd` reads it, and re-reads it while
+    /// tracking is on — see [`LaserParams`].
+    pub laser: LaserParams,
+    /// Soccer mode's autonomous half: finding the purple ball, walking to it, kicking it. Re-read
+    /// live while autonomous soccer is on — see [`SoccerParams`].
+    pub soccer: SoccerParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
+    /// The onboard map. `mapd` reads this, not `robotd`.
+    pub map: MapParams,
     pub chorale: ChoraleParams,
     pub idle: IdleParams,
     pub media: MediaParams,
@@ -231,6 +241,9 @@ pub struct Params {
     pub pad_roller: PadRollerParams,
     /// The pad over UDP: `netpadd` reads this, and so does `padd`, to know whether to stand down.
     pub netpad: NetpadParams,
+    /// The autonomous brain. `autod` reads it, and so does `padd` — the pad stays silent until
+    /// touched while it is on.
+    pub autonomous: AutonomousParams,
     /// Why the user layer ([`USER_PATH`]) was set aside, when it was — not a key in any file.
     ///
     /// A broken user layer does not stop the robot: it runs on the base alone, and `robotd`
@@ -270,13 +283,13 @@ pub struct PadDriveParams {
 }
 
 impl Default for PadDriveParams {
-    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Since the
-    /// v8 velstand, which tracks yaw commands, forward/back is 0.4 m/s and turning 1.0 rad/s —
-    /// what that policy follows well on the robot.
+    /// Started as the prototype's alpha defaults (`padd`'s old command-line defaults). Forward is
+    /// 0.4 m/s and turning 1.0 rad/s since the v8 velstand; the v9 set went back to the v7
+    /// velstand, and these still feel right on the robot. Back is 0.3 m/s.
     fn default() -> Self {
         Self {
             vx_max: 0.4,
-            vx_min: -0.4,
+            vx_min: -0.3,
             vy_max: 0.3,
             vy_min: -0.3,
             vyaw_max: 1.0,
@@ -343,6 +356,30 @@ impl Default for NetpadParams {
     }
 }
 
+/// `[autonomous]` — the duck on its own. `docs/design/autonomous.md` is the design.
+///
+/// **Off by default.** A duck that wanders, naps and quacks by itself is a lovely thing to have
+/// chosen and an alarming thing to unbox, and it also boots straight into a standing walk with no
+/// pad — so it is a decision somebody makes for a robot, never one a release makes for them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AutonomousParams {
+    /// Run the brain. With this on, `autod` stands the robot up at boot with no pad connected,
+    /// and the pad takes over only while somebody is touching it.
+    pub enabled: bool,
+    /// Seconds of an untouched pad before `padd` goes quiet and the brain takes back over.
+    pub pad_idle_s: f64,
+}
+
+impl Default for AutonomousParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pad_idle_s: 30.0,
+        }
+    }
+}
+
 /// Controller-IMU head control: pose the head by tilting the pad.
 ///
 /// Some pads carry an inertial unit — the "Pro Controller" Switch clones do; an Xbox pad does not.
@@ -383,9 +420,11 @@ impl Default for PadImuHeadControlParams {
 /// needs. It would also put "the button that stops the robot" behind a config key, which is the
 /// one binding worth not being able to lose.
 ///
-/// The defaults keep the pad sparse on purpose: A sits or stands, B picks up, and X, Y and the
-/// bumpers do nothing until somebody puts a skill there (the kicks are still in the set, unbound). A named button is rebound; the rest
-/// stay as they were.
+/// The defaults: A sits or stands, B picks up, the bumpers nod yes and shake no, Y is excited —
+/// three emotions (`robotd/src/emotion.rs`) — and X does nothing until somebody puts a skill there
+/// (the kicks are still in the set, unbound). An emotion whose files are missing is a skill the
+/// robot does not have, so its button does nothing. A named button is rebound; the rest stay as
+/// they were.
 ///
 /// A name here is not checked against anything at parse time: which skills exist is a property of
 /// the robot, and `padd` learns it from `robot.subscribe`. An unknown name is refused by `robotd`
@@ -393,19 +432,20 @@ impl Default for PadImuHeadControlParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PadParams {
-    /// A (South). Sit ↔ stand, by default.
+    /// A (South). Sit ↔ stand, by default. Unused on a roller robot, as is X.
     pub a: String,
     /// B (East). The ground pick, by default.
     pub b: String,
     /// X (West). Free by default. Held, it is re-sent every tick, so a chaining skill such as
     /// the roulade keeps going for as long as it is held.
     pub x: String,
-    /// Y (North). Free by default.
+    /// Y (North). The excited emotion, by default.
     pub y: String,
     /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
-    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
+    /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses. The yes
+    /// emotion, by default.
     pub lb: String,
-    /// The right bumper, likewise.
+    /// The right bumper, likewise. The no emotion, by default.
     pub rb: String,
 }
 
@@ -415,9 +455,9 @@ impl Default for PadParams {
             a: "sit_toggle".to_owned(),
             b: "ground_pick".to_owned(),
             x: String::new(),
-            y: String::new(),
-            lb: String::new(),
-            rb: String::new(),
+            y: "excited".to_owned(),
+            lb: "yes".to_owned(),
+            rb: "no".to_owned(),
         }
     }
 }
@@ -1024,8 +1064,9 @@ pub struct ChoraleParams {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct IdleParams {
-    /// Master switch.
-    pub enabled: bool,
+    /// Master switch. Absent resolves per mode ([`Self::enabled_in`]): on walking, off on the
+    /// roller.
+    pub enabled: Option<bool>,
     /// Still for this long before it starts.
     pub after_s: f64,
     /// How long it takes to fade in, and out.
@@ -1088,7 +1129,7 @@ pub struct IdleParams {
 impl Default for IdleParams {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: None,
             after_s: 2.0,
             fade_s: 1.5,
             glance_yaw: 0.6,
@@ -1123,6 +1164,17 @@ impl Default for IdleParams {
 }
 
 impl IdleParams {
+    /// Whether the look-around runs in `mode`.
+    ///
+    /// Off for the roller unless asked for, because what it moves is the head *command*, and the
+    /// head command is an observation input (`duck_control::obs`, 51..55), not a target added on
+    /// top. `roller.onnx` was not trained with one moving, and folds under it: the robot collapsed
+    /// about three seconds after the stick was let go — the 2 s delay plus the fade-in. Walking
+    /// keeps it on, as it always had it.
+    pub fn enabled_in(&self, mode: Mode) -> bool {
+        self.enabled.unwrap_or(mode == Mode::Walk)
+    }
+
     /// What is wrong with these values, if anything, as (key, reason).
     fn invalid(&self) -> Option<(&'static str, &'static str)> {
         let finite = [
@@ -1250,6 +1302,353 @@ impl Default for ThereminParams {
     }
 }
 
+/// `[laser]` — laser tracking: a red laser dot on the floor is followed with the head and walked to.
+///
+/// Switched with `robotctl laser-track on|off` (`robot.laserTrack`), which does not write this
+/// file; `enabled` is whether it starts switched on. **Every key here applies live** — `robotd`
+/// re-reads this section within a second of the file changing, switches tracking if `enabled`
+/// moved, and hands the detection half to `mediad` by resubscribing — because tuning it means
+/// pointing a laser, reading `robotctl laser-track`, and changing a number, many times over, and a
+/// restart each time would drop the robot.
+///
+/// The camera keeps streaming exactly as it does without this: `mediad` scans the frames the tee
+/// already has at the stream's own auto-exposure, and nothing about the sensor changes. That is
+/// why the thresholds are here. A dot at normal exposure is a white core with a red rim, and the
+/// right numbers depend on the room and the laser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LaserParams {
+    /// Tracking is on from boot, and editing it switches tracking live. Off by default: the camera
+    /// is scanned for as long as tracking is on.
+    pub enabled: bool,
+    /// `mediad`'s local socket, where `media.laser` is served.
+    pub socket: PathBuf,
+    /// Luma a dot pixel must reach, 0–255.
+    pub y_min: u8,
+    /// Red chroma (V / Cr) a dot pixel must reach, 0–255; 128 is grey.
+    pub v_min: u8,
+    /// Blue chroma (U / Cb) a dot pixel must stay below, 0–255; 128 is grey.
+    pub u_max: u8,
+    /// Fewest sampled pixels that make a dot.
+    pub min_pixels: u32,
+    /// Most sampled pixels that are still a dot rather than something red and lit.
+    pub max_pixels: u32,
+    /// How far from the brightest hit still belongs to the dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second while nothing is in sight.
+    pub search_hz: f64,
+    /// Looks per second while following a dot.
+    pub track_hz: f64,
+    /// Point the head at the dot.
+    pub head: bool,
+    /// Walk to the dot.
+    pub walk: bool,
+    /// How long a dot that went out of sight is still followed, milliseconds.
+    pub memory_ms: u64,
+    /// Stop walking this close to the dot, metres — measured from the trunk, so this is about
+    /// where the beak ends up over it.
+    pub stop_m: f64,
+    /// Ignore a dot projected farther than this, metres. Far along a shallow ray, a pixel of
+    /// error is a lot of floor.
+    pub max_range_m: f64,
+    /// Forward speed per metre of distance left, 1/s.
+    pub k_dist: f64,
+    /// Turn rate per radian of bearing to the dot, 1/s.
+    pub k_yaw: f64,
+    /// Fastest forward speed, m/s.
+    pub vx_max: f64,
+    /// Fastest turn, rad/s.
+    pub vyaw_max: f64,
+    /// Added to the floor's height under the trunk, metres. Positive raises the floor, so dots
+    /// project nearer. For when `robotctl laser-track` reports a distance that is consistently off.
+    pub floor_offset_m: f64,
+}
+
+impl Default for LaserParams {
+    fn default() -> Self {
+        let detect = duck_ipc_proto::LaserDetectParams::default();
+        Self {
+            enabled: false,
+            socket: PathBuf::from(duck_ipc_proto::socket::MEDIA),
+            y_min: detect.y_min,
+            v_min: detect.v_min,
+            u_max: detect.u_max,
+            min_pixels: detect.min_pixels,
+            max_pixels: detect.max_pixels,
+            radius_px: detect.radius_px,
+            search_hz: detect.search_hz,
+            track_hz: detect.track_hz,
+            head: true,
+            walk: true,
+            memory_ms: 1000,
+            stop_m: 0.25,
+            max_range_m: 2.5,
+            k_dist: 1.0,
+            k_yaw: 1.5,
+            vx_max: 0.25,
+            vyaw_max: 0.8,
+            floor_offset_m: 0.0,
+        }
+    }
+}
+
+impl LaserParams {
+    /// The half of this section `mediad` needs, as the wire carries it.
+    pub fn detect(&self) -> duck_ipc_proto::LaserDetectParams {
+        duck_ipc_proto::LaserDetectParams {
+            y_min: self.y_min,
+            v_min: self.v_min,
+            u_max: self.u_max,
+            min_pixels: self.min_pixels,
+            max_pixels: self.max_pixels,
+            radius_px: self.radius_px,
+            search_hz: self.search_hz,
+            track_hz: self.track_hz,
+        }
+    }
+
+    fn check(&self) -> Option<(&'static str, &'static str)> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.search_hz) || self.search_hz > 30.0 {
+            return Some(("search_hz", "must be above 0 and at most 30"));
+        }
+        if !positive(self.track_hz) || self.track_hz > 30.0 {
+            return Some(("track_hz", "must be above 0 and at most 30"));
+        }
+        if self.min_pixels == 0 || self.max_pixels < self.min_pixels {
+            return Some((
+                "max_pixels",
+                "must be at least min_pixels, and min_pixels at least 1",
+            ));
+        }
+        if self.radius_px == 0 {
+            return Some(("radius_px", "must be at least 1"));
+        }
+        for (key, v) in [
+            ("stop_m", self.stop_m),
+            ("max_range_m", self.max_range_m),
+            ("k_dist", self.k_dist),
+            ("k_yaw", self.k_yaw),
+            ("vx_max", self.vx_max),
+            ("vyaw_max", self.vyaw_max),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Some((key, "must be zero or positive"));
+            }
+        }
+        if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
+            return Some(("floor_offset_m", "must be within ±0.2 m"));
+        }
+        None
+    }
+}
+
+/// `[soccer]` — autonomous soccer: find the purple ball, walk to it, kick it.
+///
+/// Soccer mode itself is switched with `robot.soccer` (an NFC `soccer_mode` tag, `robotctl
+/// soccer`), never from here: it is a game somebody starts, not a boot state, so this section
+/// holds only how autonomous soccer sees and moves. **Every key applies live**, for the laser's
+/// reason — tuning it is many small edits with a robot on the floor.
+///
+/// What it does, in order: no ball known, it turns in place at `search_vyaw` (0 to stand still)
+/// with the head on the idle look-around; a ball farther than `approach_m` is turned to in place
+/// until within `align_rad`, then walked at; nearer, it picks the foot on the ball's side, turns to
+/// aim that foot at it, and steps until the ball sits at (`kick_x_m`, ±`kick_y_m`) in front of
+/// the trunk, within `tol_x_m`/`tol_y_m`, for `settle_ms`; then it kicks, waits `cooldown_ms`, and
+/// looks again.
+/// The ball's side: +y is left, and `kick_left` is the kick lined up with the ball at
+/// +`kick_y_m` — a robot whose kicks are mirrored wants `kick_y_m` negative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SoccerParams {
+    /// `mediad`'s local socket, where `media.ball` is served.
+    pub socket: PathBuf,
+    /// Blue chroma (U / Cb) a ball pixel must reach, 0–255; 128 is grey.
+    pub u_min: u8,
+    /// Red chroma (V / Cr) a ball pixel must reach, 0–255; 128 is grey.
+    pub v_min: u8,
+    /// Luma a ball pixel must reach, 0–255.
+    pub y_min: u8,
+    /// Fewest 4×4-pixel grid cells that make a ball.
+    pub min_cells: u32,
+    /// How much of its bounding box the blob must fill, 0–1; a disc fills 0.79.
+    pub min_fill: f64,
+    /// Longest over shortest side of the blob's box, for a blob clear of the frame's edge.
+    pub max_aspect: f64,
+    /// Looks per second while nothing is in sight.
+    pub search_hz: f64,
+    /// Looks per second while following the ball.
+    pub track_hz: f64,
+    /// Point the head at the ball.
+    pub head: bool,
+    /// Walk to the ball. Off, the robot only looks — for tuning the detector on a robot that
+    /// stays put.
+    pub walk: bool,
+    /// Kick once lined up. Off, it lines up and waits.
+    pub kick: bool,
+    /// The ball's radius, metres. Its centre is this far above the floor.
+    pub ball_radius_m: f64,
+    /// How long a ball out of sight is still walked to, milliseconds — long, because the last
+    /// steps to it are taken with the ball under the beak, where the camera may not see it.
+    pub memory_ms: u64,
+    /// The same within `approach_m`, where the ball is under the beak and out of the picture for
+    /// the last steps: long enough to line up and kick by odometry alone, milliseconds.
+    pub close_memory_ms: u64,
+    /// Ignore a ball projected farther than this, metres.
+    pub max_range_m: f64,
+    /// Added to the floor's height under the trunk, metres, as `[laser] floor_offset_m`.
+    pub floor_offset_m: f64,
+    /// Turn rate while no ball is known, rad/s; positive is left. 0 stands still.
+    pub search_vyaw: f64,
+    /// Nearer than this, metres, the robot stops walking at the ball and lines its foot up.
+    pub approach_m: f64,
+    /// How far off straight ahead the ball may be for the robot to walk, radians; past it the
+    /// robot turns in place first. Walking stops again past twice this.
+    pub align_rad: f64,
+    /// Where the ball's centre should be for a kick: this far ahead of the trunk, metres.
+    pub kick_x_m: f64,
+    /// And this far to the side of it, metres — +y for `kick_left`, −y for `kick_right`.
+    pub kick_y_m: f64,
+    /// How far off `kick_x_m` still kicks, metres.
+    pub tol_x_m: f64,
+    /// How far off `kick_y_m` still kicks, metres.
+    pub tol_y_m: f64,
+    /// How long the ball must sit in the kick spot before the kick, milliseconds. Once in, it is
+    /// left only past twice the tolerances.
+    pub settle_ms: u64,
+    /// Within twice the tolerances this long without getting into the spot, the robot has
+    /// stalled short of it — the last centimetres ask for less speed than the gait walks — and
+    /// kicks from there, milliseconds.
+    pub stall_ms: u64,
+    /// Lined up, how long to stand still with the head neutral before the kick, milliseconds.
+    /// The kick network was trained from a robot standing still and looking ahead; started
+    /// mid-step with the head pitched down at the ball, it barely moves.
+    pub ready_ms: u64,
+    /// After a kick, how long before looking for the ball again, milliseconds — the kick, and
+    /// the ball rolling away.
+    pub cooldown_ms: u64,
+    /// Forward speed per metre to go, 1/s.
+    pub k_x: f64,
+    /// Sideways speed per metre to go while lining up, 1/s.
+    pub k_y: f64,
+    /// Turn rate per radian of bearing, 1/s.
+    pub k_yaw: f64,
+    /// Fastest forward speed, m/s.
+    pub vx_max: f64,
+    /// Fastest sideways speed while lining up, m/s.
+    pub vy_max: f64,
+    /// Fastest turn, rad/s.
+    pub vyaw_max: f64,
+}
+
+impl Default for SoccerParams {
+    fn default() -> Self {
+        let detect = duck_ipc_proto::BallDetectParams::default();
+        Self {
+            socket: PathBuf::from(duck_ipc_proto::socket::MEDIA),
+            u_min: detect.u_min,
+            v_min: detect.v_min,
+            y_min: detect.y_min,
+            min_cells: detect.min_cells,
+            min_fill: detect.min_fill,
+            max_aspect: detect.max_aspect,
+            search_hz: detect.search_hz,
+            track_hz: detect.track_hz,
+            head: true,
+            walk: true,
+            kick: true,
+            ball_radius_m: 0.035,
+            memory_ms: 3000,
+            close_memory_ms: 10000,
+            max_range_m: 3.0,
+            floor_offset_m: 0.0,
+            search_vyaw: 0.5,
+            approach_m: 0.45,
+            align_rad: 0.25,
+            kick_x_m: 0.15,
+            kick_y_m: 0.05,
+            tol_x_m: 0.04,
+            tol_y_m: 0.025,
+            settle_ms: 300,
+            stall_ms: 1500,
+            ready_ms: 600,
+            cooldown_ms: 2500,
+            k_x: 1.2,
+            k_y: 1.5,
+            k_yaw: 1.5,
+            vx_max: 0.2,
+            vy_max: 0.1,
+            vyaw_max: 0.8,
+        }
+    }
+}
+
+impl SoccerParams {
+    /// The half of this section `mediad` needs, as the wire carries it.
+    pub fn detect(&self) -> duck_ipc_proto::BallDetectParams {
+        duck_ipc_proto::BallDetectParams {
+            u_min: self.u_min,
+            v_min: self.v_min,
+            y_min: self.y_min,
+            min_cells: self.min_cells,
+            min_fill: self.min_fill,
+            max_aspect: self.max_aspect,
+            search_hz: self.search_hz,
+            track_hz: self.track_hz,
+        }
+    }
+
+    fn check(&self) -> Option<(&'static str, &'static str)> {
+        let positive = |v: f64| v.is_finite() && v > 0.0;
+        if !positive(self.search_hz) || self.search_hz > 30.0 {
+            return Some(("search_hz", "must be above 0 and at most 30"));
+        }
+        if !positive(self.track_hz) || self.track_hz > 30.0 {
+            return Some(("track_hz", "must be above 0 and at most 30"));
+        }
+        if self.min_cells == 0 {
+            return Some(("min_cells", "must be at least 1"));
+        }
+        if !(self.min_fill.is_finite() && (0.0..=1.0).contains(&self.min_fill)) {
+            return Some(("min_fill", "must be between 0 and 1"));
+        }
+        if !(self.max_aspect.is_finite() && self.max_aspect >= 1.0) {
+            return Some(("max_aspect", "must be at least 1"));
+        }
+        if !positive(self.ball_radius_m) || self.ball_radius_m > 0.2 {
+            return Some(("ball_radius_m", "must be above 0 and at most 0.2 m"));
+        }
+        for (key, v) in [
+            ("max_range_m", self.max_range_m),
+            ("approach_m", self.approach_m),
+            ("align_rad", self.align_rad),
+            ("kick_x_m", self.kick_x_m),
+            ("tol_x_m", self.tol_x_m),
+            ("tol_y_m", self.tol_y_m),
+            ("k_x", self.k_x),
+            ("k_y", self.k_y),
+            ("k_yaw", self.k_yaw),
+            ("vx_max", self.vx_max),
+            ("vy_max", self.vy_max),
+            ("vyaw_max", self.vyaw_max),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Some((key, "must be zero or positive"));
+            }
+        }
+        if !self.kick_y_m.is_finite() || self.kick_y_m.abs() > 0.3 {
+            return Some(("kick_y_m", "must be within ±0.3 m"));
+        }
+        if !self.search_vyaw.is_finite() || self.search_vyaw.abs() > 2.0 {
+            return Some(("search_vyaw", "must be within ±2 rad/s"));
+        }
+        if !self.floor_offset_m.is_finite() || self.floor_offset_m.abs() > 0.2 {
+            return Some(("floor_offset_m", "must be within ±0.2 m"));
+        }
+        None
+    }
+}
+
 /// `[pickup]`: pause the policy while somebody holds the robot, resume when it is put down.
 ///
 /// A classifier over the last second of what the loop already reads (`duck_control::pickup`,
@@ -1333,18 +1732,55 @@ impl HeadImuParams {
     /// board's default — off for the BMI088 a `zero3` reads on the CPU, on for the `beta`'s
     /// self-fusing LSM6DSV16X.
     pub fn enabled_on(&self, board: board::Board) -> bool {
-        self.enabled.unwrap_or(match board {
-            board::Board::Zero3 => false,
-            board::Board::Beta => true,
-        })
+        self.enabled.unwrap_or(board.is_beta_main_board())
     }
 
     /// The daemon that reads the head IMU on `board`, and so the one to restart when this
     /// section changes.
     pub fn reader(board: board::Board) -> &'static str {
-        match board {
-            board::Board::Zero3 => "tofd",
-            board::Board::Beta => "robotd",
+        if board.is_beta_main_board() {
+            "robotd"
+        } else {
+            "tofd"
+        }
+    }
+}
+
+/// `[map]` — `mapd`, the onboard map and where the robot is in it.
+///
+/// `mapd` builds the map from the same two streams any client can subscribe to — `robot.state`
+/// and `tof.frame` — and keeps it across reboots. It maps only where the robot **stops**: a stop
+/// is a few seconds of frames from one place, voted into one rigid view, and the views are what
+/// the map is made of. A robot that never stops never maps, and that is by design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MapParams {
+    /// Build the map at all. Off, `mapd` answers `map.status` with why and subscribes to nothing.
+    ///
+    /// **Off by default** until it has been measured on a board: its standing cost is parsing the
+    /// state stream at `state_hz`, and nobody has watched that on an A55 yet.
+    pub enabled: bool,
+    /// Where the map is kept, across updates and reboots.
+    pub path: PathBuf,
+    /// Seconds between saves while the map is changing. It is also saved on shutdown; this
+    /// bounds what a power cut loses.
+    pub autosave_s: u64,
+    /// The state stream's rate, Hz. Poses are interpolated between samples, so this is a trade of
+    /// CPU for nothing much below 25: the mapper's own work is a few milliseconds per stop.
+    pub state_hz: u32,
+    /// How long before its stamp a depth frame's light was collected, milliseconds — the stamp is
+    /// taken when the frame is read. A wrong value smears walls while the head turns.
+    pub tof_latency_ms: f64,
+}
+
+impl Default for MapParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("/var/lib/mapd/map.json"),
+            autosave_s: 60,
+            state_hz: 25,
+            tof_latency_ms: 60.0,
         }
     }
 }
@@ -1361,6 +1797,7 @@ mod head_imu_tests {
         let unset = HeadImuParams::default();
         assert!(!unset.enabled_on(Board::Zero3));
         assert!(unset.enabled_on(Board::Beta));
+        assert!(unset.enabled_on(Board::FaceBoardV1));
         let off = HeadImuParams {
             enabled: Some(false),
         };
@@ -1375,6 +1812,7 @@ mod head_imu_tests {
     fn each_board_names_the_daemon_that_reads_it() {
         assert_eq!(HeadImuParams::reader(Board::Zero3), "tofd");
         assert_eq!(HeadImuParams::reader(Board::Beta), "robotd");
+        assert_eq!(HeadImuParams::reader(Board::FaceBoardV1), "robotd");
     }
 }
 
@@ -1484,6 +1922,24 @@ impl AudioParams {
     }
 }
 
+/// `[emotions]` — the robot's own emotions, `<name>.json` keyframes and `<name>.wav` beside them,
+/// read once at startup on top of the set the release ships (`emotions/` in [`RELEASE_DIR`]): a
+/// file here adds one or replaces the shipped one of the same name. A directory that is not there
+/// is a robot with only the shipped set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmotionsParams {
+    pub dir: PathBuf,
+}
+
+impl Default for EmotionsParams {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::from("/var/lib/robot/emotions"),
+        }
+    }
+}
+
 /// Which drive configuration this robot runs. One robot, two personalities: legs, or the
 /// roller. They differ in policies *and* tuning, so the mode is one switch here rather than
 /// six paths an operator has to keep consistent — the prototype's launcher kept two whole
@@ -1557,6 +2013,16 @@ pub struct PolicyParams {
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s²
+    /// in yaw. Applied after `[control] cmd_alpha`, so a small stick move is the EMA it always
+    /// was and only a large one — full forward to full back — becomes a ramp at this slope. An
+    /// EMA alone moves fastest exactly then, its rate being proportional to the jump.
+    ///
+    /// Absent resolves per mode: no limit walking; the roller limits `vx` to 1.0 and leaves
+    /// `vy` and `vyaw` free. `0` is no limit.
+    pub accel_vx: Option<f64>,
+    pub accel_vy: Option<f64>,
+    pub accel_vyaw: Option<f64>,
     /// The one-shot skills this robot has, in priority order.
     ///
     /// Empty means the built-in three — kicks and roulade, with the numbers they have always
@@ -2134,6 +2600,8 @@ pub struct ResolvedPolicy {
     pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
+    /// The twist's acceleration limit per axis, `[vx, vy, vyaw]`; `None` is no limit.
+    pub twist_accel: [Option<f64>; 3],
     /// Seconds the sitstand network rises before the gait takes over.
     pub sitstand_rise_s: f64,
     /// Seconds the seat takes to settle after the flag flips.
@@ -2370,6 +2838,14 @@ impl PolicyParams {
                     Mode::Roller => 0.8,
                 }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
+            // Only the roller's forward/back. A roller reversing from full forward to full back
+            // in the EMA's ~0.25 s fell over; walking never asked for a limit, and the roller's
+            // yaw has to stay quick enough to steer.
+            twist_accel: {
+                let roller_vx = (self.mode == Mode::Roller).then_some(1.0);
+                [self.accel_vx.or(roller_vx), self.accel_vy, self.accel_vyaw]
+                    .map(|a| a.filter(|a| *a > 0.0))
+            },
             sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
             sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
@@ -2439,6 +2915,19 @@ pub struct SafetyParams {
     /// Gain for that ramp. The joints have to actually travel across the floor, so it is
     /// not the limp gain; it is the softened standing gain rather than the walking one.
     pub limp_fall_pose_gain: u16,
+    /// How long the policy gets to stand a fallen robot up before it counts as stuck. A
+    /// stand-up from the back sometimes stalls half-way, the policy holding a pose it never
+    /// gets out of; the cure is the one a human applies with Start twice — back to the
+    /// standing pose, hand it over again. "Up" is the arming test: inside `limp_fall_tilt_z`
+    /// for `limp_fall_arm_ms`. The clock starts each time the policy takes the robot.
+    pub limp_fall_standup_ms: u64,
+    /// How many times in a row a stuck stand-up is re-posed and handed back before the
+    /// daemon stops trying. 0 turns the retry off. Out of retries, the robot is parked stiff
+    /// at the home pose with the policy off until it is stood on its feet.
+    pub limp_fall_standup_retries: u32,
+    /// How long a parked robot must be upright and still — stood on its feet and let go —
+    /// before the policy gets it back.
+    pub limp_fall_standup_resume_ms: u64,
 }
 
 impl Default for PolicyParams {
@@ -2463,6 +2952,9 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
+            accel_vx: None,
+            accel_vy: None,
+            accel_vyaw: None,
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
@@ -2490,6 +2982,9 @@ impl Default for SafetyParams {
             limp_fall_max_ms: 1500,
             limp_fall_pose_ms: 600,
             limp_fall_pose_gain: 160,
+            limp_fall_standup_ms: 3000,
+            limp_fall_standup_retries: 3,
+            limp_fall_standup_resume_ms: 1000,
         }
     }
 }
@@ -2517,6 +3012,52 @@ pub struct Bus {
     /// the bus drops, `update_gate` sees an unhealthy robot, and a release that turned this on
     /// against firmware that cannot do it is rolled back on its own.
     pub fast_sync_read: bool,
+    /// The impact guard on servos running ROBOTIS's impact guard firmwares (V3, V4): a servo that
+    /// hits something brakes, then holds softly, and its PWM limit falls with speed — the fix for
+    /// broken gear teeth. **Off by default** until it is understood why a stress test robot on it
+    /// fell on its own far more often than any other (2026-11-09); an update that turns this on is
+    /// how robots get it. Off leaves the factory firmware with only Current Limit: settings that
+    /// never fire on V3, the switch on V4, which keeps the settings it has. On writes the six
+    /// `impact_guard_*` settings below to every V3 and V4 servo at startup with torque off, and
+    /// V4's Impact Guard Enable follows this with every torque on; servos on any other firmware
+    /// have no guard to set. Their defaults are what a microduck walks with:
+    /// a short brake on fast arrivals only, no hold, and a stronger speed taper. ROBOTIS's factory
+    /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
+    /// test looks for a guard that keeps the gears whole and still lets the policy walk.
+    pub impact_guard: bool,
+    /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
+    pub impact_guard_v_min: u8,
+    /// Brake Time, ms: how long the H-bridge is shorted after an impact.
+    pub impact_guard_brake_ms: u8,
+    /// Deceleration, rad/s²: what counts as an impact.
+    pub impact_guard_decel: u16,
+    /// i Hold, mA: the current allowed after the brake, until the goal comes back past the
+    /// position.
+    pub impact_guard_i_hold_ma: u16,
+    /// V Fast, rad/s: where the PWM limit has fallen to `impact_guard_pwm_fast`. Not 0: the
+    /// firmware divides by it.
+    pub impact_guard_v_fast: u8,
+    /// PWM Fast, % of PWM Limit, at `impact_guard_v_fast` and above.
+    pub impact_guard_pwm_fast: u8,
+}
+
+impl Bus {
+    /// The first impact guard setting the firmware cannot take, and why.
+    fn invalid(&self) -> Option<(&'static str, &'static str)> {
+        if self.impact_guard_v_fast == 0 {
+            return Some((
+                "impact_guard_v_fast",
+                "must be above 0: the firmware divides by it",
+            ));
+        }
+        if !(1..=100).contains(&self.impact_guard_pwm_fast) {
+            return Some((
+                "impact_guard_pwm_fast",
+                "must be 1 to 100, a percentage of PWM Limit",
+            ));
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2592,6 +3133,15 @@ pub struct UpdateGate {
     /// refused here: every daemon reading this file exits on a value [`Params::load`] refuses,
     /// and a robotd that will not start is exactly what the check rolls a release back for.
     pub boot_deadline_s: u32,
+    /// Whether anything may put this robot back on another release without being asked: the
+    /// health gate reverting a failed `update apply` / `select` / `rollback`, the boot counter
+    /// reverting an unconfirmed trial, and `robot-boot-check` handing over to `robot-rescue`.
+    ///
+    /// Off by default. A release that fails is left live and reported `Stuck`, and the operator
+    /// reverts by hand (`robotctl update rollback`). Not robotd's: `updaterd` reads it at the
+    /// moment it would revert ([`UpdateGate::auto_rollback_enabled`]), and the boot check reads
+    /// it once per boot.
+    pub auto_rollback: bool,
 }
 
 /// The bounds `robot-boot-check` clamps `[update_gate] boot_deadline_s` to. The script repeats
@@ -2605,6 +3155,13 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
+            impact_guard: false,
+            impact_guard_v_min: 6,
+            impact_guard_brake_ms: 20,
+            impact_guard_decel: 400,
+            impact_guard_i_hold_ma: 32767,
+            impact_guard_v_fast: 7,
+            impact_guard_pwm_fast: 40,
         }
     }
 }
@@ -2632,7 +3189,31 @@ impl Default for UpdateGate {
             stall_periods: 25,
             max_consecutive_errors: 10,
             boot_deadline_s: 60,
+            auto_rollback: false,
         }
+    }
+}
+
+impl UpdateGate {
+    /// Whether `[update_gate] auto_rollback` is on in `robotd.toml` at `path`, read on its own.
+    ///
+    /// For `updaterd`, at the moment it would revert, the way it reads the board
+    /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a
+    /// file that is invalid somewhere else still answers. Both layers, the user's winning.
+    /// Missing, unreadable or not a bool is `false` — the default, and the answer that leaves the
+    /// release alone.
+    pub fn auto_rollback_enabled(path: &Path) -> bool {
+        let Ok(text) = layered_text(path) else {
+            return false;
+        };
+        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+            return false;
+        };
+        table
+            .get("update_gate")
+            .and_then(|gate| gate.get("auto_rollback"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -2681,6 +3262,30 @@ pub enum ParamsError {
         min: f64,
         max: f64,
     },
+    #[error("{path}: bus.{key} {reason}")]
+    Bus {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: policy.{key} {reason}")]
+    Policy {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: laser.{key} {reason}")]
+    Laser {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
+    #[error("{path}: soccer.{key} {reason}")]
+    Soccer {
+        path: String,
+        key: &'static str,
+        reason: &'static str,
+    },
     #[error("{path}: idle.{key} {reason}")]
     Idle {
         path: String,
@@ -2696,6 +3301,8 @@ pub enum ParamsError {
         pause: f32,
         resume: f32,
     },
+    #[error("{path}: autonomous.pad_idle_s must be a positive number of seconds, got {got}")]
+    PadIdle { path: String, got: f64 },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2860,6 +3467,20 @@ impl Params {
                 got: self.control.hz,
             });
         }
+        if let Some((key, reason)) = self.laser.check() {
+            return Err(ParamsError::Laser {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
+        if let Some((key, reason)) = self.soccer.check() {
+            return Err(ParamsError::Soccer {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
         // Checked here rather than in `mediad`, so `robotctl configure` refuses to write it:
         // the daemon that would choke on this one is not the daemon whose gate the editor runs.
         if let Some(bitrate) = self.media.bitrate
@@ -2883,6 +3504,26 @@ impl Params {
                     axis,
                     min,
                     max,
+                });
+            }
+        }
+        if let Some((key, reason)) = self.bus.invalid() {
+            return Err(ParamsError::Bus {
+                path: path.display().to_string(),
+                key,
+                reason,
+            });
+        }
+        for (key, accel) in [
+            ("accel_vx", self.policy.accel_vx),
+            ("accel_vy", self.policy.accel_vy),
+            ("accel_vyaw", self.policy.accel_vyaw),
+        ] {
+            if accel.is_some_and(|a| !(a.is_finite() && a >= 0.0)) {
+                return Err(ParamsError::Policy {
+                    path: path.display().to_string(),
+                    key,
+                    reason: "must be finite and nonnegative (0 is no limit)",
                 });
             }
         }
@@ -2949,12 +3590,16 @@ impl Params {
             ("pad_head.head_pitch_max", self.pad_head.head_pitch_max),
             ("pad_head.head_yaw_max", self.pad_head.head_yaw_max),
             ("pad_head.head_roll_max", self.pad_head.head_roll_max),
+            ("pad_head.max_speed", self.pad_head.max_speed),
             ("pad_body.pitch_max", self.pad_body.pitch_max),
             ("pad_body.roll_max", self.pad_body.roll_max),
         ] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(invalid(key, "must be finite and nonnegative"));
             }
+        }
+        if !(self.pad_head.expo.is_finite() && (0.0..=1.0).contains(&self.pad_head.expo)) {
+            return Err(invalid("pad_head.expo", "must be finite and in [0, 1]"));
         }
         for (key, min, max) in std::iter::once((
             "pad_body.z".to_owned(),
@@ -2982,6 +3627,15 @@ impl Params {
                 path: path.display().to_string(),
                 pause,
                 resume,
+            });
+        }
+        // Zero would mean a pad that hands control back the instant it is let go of — in practice
+        // between two stick reports — so the two drivers would alternate every tick.
+        let idle = self.autonomous.pad_idle_s;
+        if !idle.is_finite() || idle <= 0.0 {
+            return Err(ParamsError::PadIdle {
+                path: path.display().to_string(),
+                got: idle,
             });
         }
         Ok(())
@@ -3173,6 +3827,8 @@ mod tests {
             "[pad_axes.drive.vx]\ngain = inf",
             "[pad_axes.drive.vx]\nsource = 'typo'",
             "[pad_head]\nhead_yaw_max = -1.0",
+            "[pad_head]\nexpo = 1.5",
+            "[pad_head]\nmax_speed = -1.0",
             "[pad_body]\nz_min = 0.01",
             "[pad_roller]\nvx_max = -0.2",
         ] {
@@ -3461,16 +4117,16 @@ mod tests {
         );
     }
 
-    /// The shipped mapping: A sits, B picks up, X, Y and the bumpers are free.
+    /// The shipped mapping: A sits, B picks up, the bumpers say yes and no, Y is excited, X is free.
     #[test]
     fn the_default_bindings() {
         let pad = super::PadParams::default();
         assert_eq!(pad.a, "sit_toggle");
         assert_eq!(pad.b, "ground_pick");
         assert_eq!(pad.x, "");
-        assert_eq!(pad.y, "");
-        assert_eq!(pad.lb, "");
-        assert_eq!(pad.rb, "");
+        assert_eq!(pad.y, "excited");
+        assert_eq!(pad.lb, "yes");
+        assert_eq!(pad.rb, "no");
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is
@@ -4429,6 +5085,115 @@ mod tests {
         assert_eq!((idle.hold_max_s, idle.nudge_yaw), (1.5, 0.0));
     }
 
+    /// Impact guard settings the firmware cannot take are refused by name, so `robotctl configure`
+    /// cannot write them; a retuned guard loads.
+    #[test]
+    fn an_impact_guard_the_firmware_cannot_take_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            (
+                "[bus]\nimpact_guard_v_fast = 0\n",
+                "bus.impact_guard_v_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 0\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+            (
+                "[bus]\nimpact_guard_pwm_fast = 120\n",
+                "bus.impact_guard_pwm_fast",
+            ),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(
+            dir.path(),
+            "[bus]\nimpact_guard_decel = 1000\nimpact_guard_i_hold_ma = 800\n",
+        );
+        let bus = Params::load(&path, true).unwrap().bus;
+        assert_eq!(
+            (bus.impact_guard_decel, bus.impact_guard_i_hold_ma),
+            (1000, 800)
+        );
+    }
+
+    /// The look-around is on for walking and off for the roller unless the file says otherwise.
+    /// Its head command is an observation input, and `roller.onnx` folds under one it was not
+    /// trained with — seen on the robot as a collapse about three seconds after the stick was
+    /// let go. A file that already says `enabled = true` keeps saying it, in either mode.
+    #[test]
+    fn the_idle_look_around_resolves_per_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let unset = Params::load(&write(dir.path(), ""), true).unwrap().idle;
+        assert!(unset.enabled_in(Mode::Walk), "walking looks around");
+        assert!(!unset.enabled_in(Mode::Roller), "the roller does not");
+
+        let on = Params::load(&write(dir.path(), "[idle]\nenabled = true\n"), true)
+            .unwrap()
+            .idle;
+        assert!(on.enabled_in(Mode::Roller), "an explicit on wins");
+        let off = Params::load(&write(dir.path(), "[idle]\nenabled = false\n"), true)
+            .unwrap()
+            .idle;
+        assert!(!off.enabled_in(Mode::Walk), "an explicit off wins");
+    }
+
+    /// The twist acceleration limit is the roller's: walking runs exactly as before, with no
+    /// limit on any axis. The roller ramps forward/back, and leaves strafe and yaw to the EMA —
+    /// a global `cmd_alpha` low enough to keep it up through a full reversal made it hard to turn.
+    #[test]
+    fn the_twist_acceleration_limit_resolves_per_mode() {
+        let walk = super::PolicyParams::default().resolved_with(None);
+        assert_eq!(walk.twist_accel, [None; 3], "walking is not limited");
+
+        let roller = super::PolicyParams {
+            mode: Mode::Roller,
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(roller.twist_accel, [Some(1.0), None, None]);
+
+        let tuned = super::PolicyParams {
+            mode: Mode::Roller,
+            accel_vx: Some(0.0),
+            accel_vyaw: Some(4.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(
+            tuned.twist_accel,
+            [None, None, Some(4.0)],
+            "an explicit value wins, and 0 is off"
+        );
+
+        let walk_tuned = super::PolicyParams {
+            accel_vx: Some(2.0),
+            ..Default::default()
+        }
+        .resolved_with(None);
+        assert_eq!(walk_tuned.twist_accel[0], Some(2.0), "walking can opt in");
+    }
+
+    #[test]
+    fn a_negative_twist_acceleration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (text, key) in [
+            ("[policy]\naccel_vx = -1.0\n", "policy.accel_vx"),
+            ("[policy]\naccel_vyaw = nan\n", "policy.accel_vyaw"),
+        ] {
+            let path = write(dir.path(), text);
+            let error = Params::load(&path, true).unwrap_err().to_string();
+            assert!(error.contains(key), "{error}");
+        }
+        let path = write(dir.path(), "[policy]\naccel_vy = 0.5\n");
+        assert_eq!(
+            Params::load(&path, true).unwrap().policy.accel_vy,
+            Some(0.5)
+        );
+    }
+
     #[test]
     fn an_inverted_pickup_band_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -4500,6 +5265,18 @@ mod tests {
 
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
+        assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
+        let guard = |b: &Bus| {
+            (
+                b.impact_guard_v_min,
+                b.impact_guard_brake_ms,
+                b.impact_guard_decel,
+                b.impact_guard_i_hold_ma,
+                b.impact_guard_v_fast,
+                b.impact_guard_pwm_fast,
+            )
+        };
+        assert_eq!(guard(&from_file.bus), guard(&built_in.bus));
         assert_eq!(from_file.control.hz, built_in.control.hz);
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
@@ -4824,5 +5601,33 @@ mod tests {
         assert!(!read("not toml ["));
         std::fs::remove_file(&path).expect("remove");
         assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// `updaterd` asks this before every revert, so it must answer from a file `robotd` would
+    /// reject, let the user layer win, and fall to "no" — leave the release alone — otherwise.
+    #[test]
+    fn auto_rollback_reads_one_key_layered_and_defaults_to_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("robotd.toml");
+
+        let read = |text: &str| {
+            std::fs::write(&path, text).expect("write");
+            UpdateGate::auto_rollback_enabled(&path)
+        };
+        assert!(read("[update_gate]\nauto_rollback = true\n"));
+        assert!(
+            read("[update_gate]\nauto_rollback = true\n[future]\nx = 2\n"),
+            "a section this build does not know is no reason to change the answer"
+        );
+        assert!(!read("[update_gate]\nauto_rollback = false\n"));
+        assert!(!read("[update_gate]\n# auto_rollback = true\n"));
+        assert!(!read("[update_gate]\nauto_rollback = \"yes\"\n"));
+        assert!(!read("not toml ["));
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!UpdateGate::auto_rollback_enabled(&path));
+        assert!(
+            !Params::default().update_gate.auto_rollback,
+            "off unless asked for"
+        );
     }
 }

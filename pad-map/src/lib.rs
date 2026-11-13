@@ -8,6 +8,7 @@
 mod bindings;
 mod buttons;
 mod continuous;
+pub mod engage;
 mod hold;
 pub mod loss;
 mod mapper;

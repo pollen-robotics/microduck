@@ -400,6 +400,7 @@ pub fn log_line(entry: &duck_ipc_proto::LogEntry) -> String {
         Outcome::Success => "applied".to_owned(),
         Outcome::RolledBack { reason } => format!("ROLLED BACK — {reason}"),
         Outcome::Aborted { reason } => format!("refused — {reason}"),
+        Outcome::Stuck { reason } => format!("STUCK — {reason}"),
     };
     format!(
         "{run}  {}  {:<10} {versions}: {outcome}",

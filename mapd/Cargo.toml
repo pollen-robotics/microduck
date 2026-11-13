@@ -1,0 +1,28 @@
+# The onboard map: where the robot is in its home, kept across reboots.
+#
+# A client of `robotd` and `tofd` like any other — it subscribes to `robot.state` and `tof.frame`
+# and owns nothing the robot needs to walk — so it is its own process: a mapping bug, a slow
+# relocalization search or a corrupt map file must never reach the control loop. The algorithm is
+# the `maploc` library; this crate is its sockets, its file and its thread.
+[package]
+name = "mapd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { workspace = true, features = ["derive"] }
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+libc = "0.2"
+maploc = { path = "../maploc" }
+robotd-params = { path = "../robotd-params" }
+serde = { workspace = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "sync", "time", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

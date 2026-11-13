@@ -189,6 +189,7 @@ mod tests {
                 head_pitch: 0.0,
                 head_yaw: 0.0,
                 head_roll: 0.0,
+                alpha: None,
             }),
         ];
 

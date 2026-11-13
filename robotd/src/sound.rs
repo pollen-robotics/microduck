@@ -214,19 +214,25 @@ impl Sound {
         }
     }
 
-    /// Random wav from the bank's `tag` directory — the prototype's nanos-based pick, which
-    /// is exactly as random as a duck needs.
-    fn pick(&mut self, tag: &str) -> Option<PathBuf> {
-        let dir = self.bank.join(tag);
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
-            .ok()?
+    /// The bank's `tag` wavs, sorted by name.
+    fn files(&self, tag: &str) -> Vec<PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(self.bank.join(tag))
+            .into_iter()
+            .flatten()
             .filter_map(|e| Some(e.ok()?.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "wav"))
             .collect();
+        files.sort();
+        files
+    }
+
+    /// Random wav from the bank's `tag` directory — the prototype's nanos-based pick, which
+    /// is exactly as random as a duck needs.
+    fn pick(&mut self, tag: &str) -> Option<PathBuf> {
+        let mut files = self.files(tag);
         if files.is_empty() {
             return None;
         }
-        files.sort();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as usize)
@@ -305,9 +311,43 @@ impl Sound {
             }
             return;
         };
+        self.spawn(&wav, blocking);
+    }
+
+    /// Play the bank's `nth` `tag` wav by name (counting from 0, wrapping round a short bank),
+    /// the same one every time, where [`Self::play`] picks one at random: a cue someone learns to
+    /// recognise has to sound alike each time. Silent without a bank, as `play` is.
+    pub fn play_same(&mut self, tag: &str, nth: usize) {
+        let mut files = self.files(tag);
+        if !files.is_empty() {
+            let wav = files.swap_remove(nth % files.len());
+            self.play_file(&wav);
+        }
+    }
+
+    /// Play one wav file the way [`Self::play`] plays a bank sound: an emotion's own sound,
+    /// which is a file beside its keyframes rather than a tag in the bank.
+    pub fn play_file(&mut self, wav: &Path) {
+        if self.ride != Ride::Off {
+            tracing::debug!(wav = %wav.display(), "sound skipped: the wheee ride has the PCM");
+            return;
+        }
+        self.stop_child();
+        self.spawn(wav, false);
+    }
+
+    /// Cut a one-shot short: an emotion's sound when the emotion is. Never a ride, a theremin or
+    /// a chorale, which hold the PCM for reasons of their own.
+    pub fn stop(&mut self) {
+        if self.ride == Ride::Off {
+            self.stop_child();
+        }
+    }
+
+    fn spawn(&mut self, wav: &Path, blocking: bool) {
         let child = Command::new("aplay")
             .args(["-q", "-D", &self.device])
-            .arg(&wav)
+            .arg(wav)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -318,7 +358,7 @@ impl Sound {
         match child {
             Ok(mut c) if blocking => wait_bounded(&mut c, BLOCKING_PLAY_MAX),
             Ok(c) => self.child = Some(c),
-            Err(e) => tracing::debug!(error = %e, tag, "aplay failed"),
+            Err(e) => tracing::debug!(error = %e, wav = %wav.display(), "aplay failed"),
         }
     }
 
@@ -904,10 +944,29 @@ mod tests {
     fn a_missing_bank_is_silent_not_fatal() {
         let mut sound = Sound::new(PathBuf::from("/nonexistent/bank"), "default".into());
         sound.play("chirp", false);
+        sound.play_same("chirp", 1);
         sound.wheee(WheeeHold::Held);
         sound.wheee(WheeeHold::Released);
         assert!(sound.child.is_none());
         assert_eq!(sound.ride, Ride::Off);
+    }
+
+    /// `play_same` takes the first wav by name, whatever order the directory lists them in, and
+    /// only wavs.
+    #[test]
+    fn the_same_sound_is_the_first_wav_by_name() {
+        let dir = std::env::temp_dir().join(format!("sound-same-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("chirp")).unwrap();
+        for name in ["chirp_2.wav", "chirp_0.wav", "a_note.txt", "chirp_1.wav"] {
+            std::fs::write(dir.join("chirp").join(name), b"").unwrap();
+        }
+        let sound = Sound::new(dir.clone(), "null".into());
+        assert_eq!(
+            sound.files("chirp").first(),
+            Some(&dir.join("chirp").join("chirp_0.wav"))
+        );
+        assert_eq!(sound.files("chirp").len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A bank whose `wheee/` holds no triads (a half-rendered `ensure-bank`, or a bank from
