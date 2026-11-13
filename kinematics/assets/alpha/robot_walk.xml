@@ -63,12 +63,29 @@
               <joint axis="0 0 1" name="head_roll" type="hinge" range="-0.4363323129986037 0.43633231299856107" />
               <inertial pos="0.00368889 0.00145319 -0.0329861" mass="0.172649" fullinertia="0.000292186 0.000223546 0.000142648 -1.11987e-06 3.85879e-06 3.78829e-06" />
               
+              <!-- Issue #480: collision geometry so head/lip contact is
+                   measurable in sim. Body frame: -z forward toward the beak,
+                   +x up, y lateral (matches the site poses below). -->
+              <geom name="head_shell_collision" type="capsule" fromto="0.004 0 -0.005 0.004 0 -0.058" size="0.034" />
+              <geom name="upper_beak_collision" type="box" pos="0 0 -0.076" size="0.02 0.016 0.006" />
+              
               <site group="3" name="head_camera" pos="0.01175 0 -0.0735" quat="0.707107 0 0.707107 -0" />
               <site group="3" name="mouth_tip" pos="-0.00829334 0 -0.0777383" quat="0.658004 -0.0201775 0.75239 0.0230718" />
               
               <site group="3" name="tof" pos="0.0143 0.0225 -0.0735" quat="0.707107 0 0.707107 -0" />
               
               <site group="3" name="head_imu" pos="0.0114823 0.000202447 -0.05126" quat="1 0 0 -0" />
+              
+              <!-- Issue #480: articulated lower beak; positive jaw angles
+                   open the mouth downward. -->
+              <body name="lower_beak" pos="-0.004 0 -0.062">
+                
+                <joint axis="0 1 0" name="jaw" type="hinge" range="0 0.7" />
+                <inertial pos="0 0 -0.012" mass="0.008" fullinertia="7.3e-07 1.09e-06 1.6e-06 0 0 0" />
+                
+                <geom name="lower_beak_collision" type="box" pos="0 0 -0.012" size="0.019 0.015 0.006" />
+                <site group="3" name="lower_beak_tip" pos="0 0 -0.018" quat="1 0 0 0" />
+              </body>
             </body>
           </body>
         </body>
