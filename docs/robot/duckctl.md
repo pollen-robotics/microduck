@@ -145,8 +145,8 @@ the exit status are ssh's own. The account is `--user`, else `DUCK_BOARD_USER` f
 A shipping image answers ssh only on the head's USB-C link (`microduck@192.168.42.1`), never on
 wifi (microduck_yocto#110), so over wifi `duckctl ssh` stops with "refused ssh" before ssh would.
 That is deliberate, and there is no way to change it from Bluetooth: a shell on wifi takes hands
-on the robot. A short press of the face button (a pin through the hole) opens it for 30 minutes,
-and the network LED blinks blue while it is open; pressing again restarts the 30 minutes. Over the
+on the robot. Holding the face button for 5 s (a pin through the hole) opens it for 30 minutes, with a honk,
+and the network LED blinks blue while it is open; holding again restarts the 30 minutes. Over the
 USB link, `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot. Either way a reboot
 closes it, and sessions already open outlive the 30 minutes. Or flash the dev image, which keeps
 ssh open on wifi.

@@ -1,4 +1,4 @@
-//! ssh on wifi for 30 minutes, opened by a short press of the face board's button.
+//! ssh on wifi for 30 minutes, opened by a 5 s hold of the face board's button, with a honk.
 //!
 //! The shipping image answers ssh on the head's USB-C link only (microduck_yocto#110). Its
 //! `microduck-ssh-access` package watches for [`SWITCH`] and, when it appears, installs a `/run`
@@ -14,7 +14,7 @@
 //! clock jumps when NTP syncs. Boot time is only comparable within one boot, and that is all it
 //! needs: `/run` is a tmpfs, so a reboot drops the switch, the drop-in and the deadline together,
 //! and the image comes up with ssh on USB only. An empty switch — `sudo touch` over USB — has no
-//! deadline and stays open until reboot, as it always did. A press on an open robot (re)starts the
+//! deadline and stays open until reboot, as it always did. A hold on an open robot (re)starts the
 //! 30 minutes.
 //!
 //! Closing restarts `sshd.socket`, which stops new connections; sessions already open are their
@@ -37,12 +37,12 @@ pub const DROP_IN: &str = "/run/systemd/system/sshd.socket.d/30-wifi-until-reboo
 /// The face button: gpio-keys `face-keys`, `KEY_ENTER` (face-board-v1 device tree).
 pub const BUTTON: &str = "/dev/input/by-path/platform-face-keys-event";
 
-/// How long a press opens ssh on wifi for.
+/// How long a hold opens ssh on wifi for.
 pub const OPEN_FOR: Duration = Duration::from_secs(30 * 60);
 
-/// A press released within this is a press. Longer is a hold, which is the factory reset's
-/// (10 s, in the OS image) and must not open anything on the way.
-pub const SHORT_PRESS: Duration = Duration::from_secs(3);
+/// How long the button is held to open it. It opens, and honks, at this mark while still held:
+/// the honk is the cue to let go.
+pub const HOLD: Duration = Duration::from_secs(5);
 
 /// How often the deadline is checked. A close up to this late is fine.
 const CHECK_EVERY: Duration = Duration::from_secs(10);
@@ -185,15 +185,21 @@ pub async fn run() {
 }
 
 /// Blocking: `fetch_events` waits on the device. A board without the button returns at once.
+///
+/// A hold is timed by a thread per press rather than by the release, so the honk comes *at* 5 s,
+/// while the button is still down: that is the cue to let go. `press` counts presses, and a timer
+/// whose press has since been released (or replaced) finds it changed and does nothing.
 #[cfg(target_os = "linux")]
 fn watch_button() {
     use evdev::{EventType, KeyCode};
-    use std::time::Instant;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     if !Path::new(BUTTON).exists() {
         tracing::debug!("no face button on this board");
         return;
     }
+    let press = Arc::new(AtomicU64::new(0));
     loop {
         let mut device = match evdev::Device::open(BUTTON) {
             Ok(device) => device,
@@ -203,13 +209,14 @@ fn watch_button() {
                 continue;
             }
         };
-        tracing::info!("watching the face button: a short press opens ssh on wifi for 30 min");
-        let mut down: Option<Instant> = None;
+        tracing::info!("watching the face button: a 5 s hold opens ssh on wifi for 30 min");
         loop {
             let events = match device.fetch_events() {
                 Ok(events) => events.collect::<Vec<_>>(),
                 Err(e) => {
                     tracing::warn!(error = %e, "lost the face button; reopening");
+                    // A release lost with the device must not leave a hold running.
+                    press.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_secs(5));
                     break;
                 }
@@ -219,28 +226,73 @@ fn watch_button() {
                     continue;
                 }
                 match event.value() {
-                    1 => down = Some(Instant::now()),
-                    0 => {
-                        let Some(at) = down.take() else { continue };
-                        if at.elapsed() > SHORT_PRESS {
-                            continue;
-                        }
-                        match open(Path::new(SWITCH), Path::new(INSTALLED), boottime()) {
-                            // Warn: a root-capable login just became reachable from the network,
-                            // and the journal is where anyone auditing that will look.
-                            Ok(true) => tracing::warn!("face button: ssh open on wifi for 30 min"),
-                            Ok(false) => {
-                                tracing::info!(
-                                    "face button pressed; this image has no wifi ssh switch"
-                                )
+                    1 => {
+                        let this = press.fetch_add(1, Ordering::SeqCst) + 1;
+                        let press = Arc::clone(&press);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(HOLD);
+                            if press.load(Ordering::SeqCst) == this {
+                                held();
                             }
-                            Err(e) => tracing::error!(error = %e, "could not open ssh on wifi"),
-                        }
+                        });
+                    }
+                    0 => {
+                        press.fetch_add(1, Ordering::SeqCst);
                     }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+/// The hold reached 5 s: open, and honk so whoever holds the pin knows to let go.
+#[cfg(target_os = "linux")]
+fn held() {
+    match open(Path::new(SWITCH), Path::new(INSTALLED), boottime()) {
+        // Warn: a root-capable login just became reachable from the network, and the journal is
+        // where anyone auditing that will look.
+        Ok(true) => {
+            tracing::warn!("face button held: ssh open on wifi for 30 min");
+            // Best effort: configd does not depend on robotd, and the LED says it as well.
+            if let Err(e) = honk() {
+                tracing::warn!(error = %e, "no honk for the face button");
+            }
+        }
+        Ok(false) => tracing::info!("face button held; this image has no wifi ssh switch"),
+        Err(e) => tracing::error!(error = %e, "could not open ssh on wifi"),
+    }
+}
+
+/// `robot.sound` alarm, the loudest in the voice bank.
+#[cfg(target_os = "linux")]
+fn honk() -> Result<(), String> {
+    use duck_ipc_proto as proto;
+    use std::io::{BufRead, BufReader, Write};
+
+    let socket = proto::socket::ROBOT;
+    let fail = |e: io::Error| format!("{socket}: {e}");
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(fail)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(fail)?;
+    let call = proto::Call::RobotSound(proto::SoundParams {
+        tag: proto::SoundTag::Alarm,
+        hold: None,
+    });
+    let mut line = serde_json::to_vec(&proto::Request::call(proto::Id::Number(1), &call))
+        .map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.write_all(&line).map_err(fail)?;
+    let mut answer = String::new();
+    BufReader::new(stream)
+        .read_line(&mut answer)
+        .map_err(fail)?;
+    let response: proto::Response =
+        serde_json::from_str(&answer).map_err(|e| format!("unparsable answer: {e}"))?;
+    match response.error {
+        Some(error) => Err(error.message),
+        None => Ok(()),
     }
 }
 
