@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Virtual Duck</string>
+    <string name="loading">Waking the duck…</string>
+    <string name="channel_name">Your duck</string>
+    <string name="notification_title">%1$s is on your screen</string>
+
+    <string name="feed">Feed</string>
+    <string name="ball">Ball</string>
+    <string name="dance">Dance</string>
+    <string name="trick">Roll</string>
+    <string name="put_away">Put away</string>
+    <string name="sleep">Sleep</string>
+    <string name="sing">Sing</string>
+    <string name="sing_locked">🔒 Sing</string>
+    <string name="sing_unlocks">Singing unlocks at friendship level %1$d. Keep playing together!</string>
+
+    <string name="need_food">Food</string>
+    <string name="need_energy">Energy</string>
+    <string name="need_joy">Fun</string>
+    <string name="need_love">Love</string>
+
+    <string name="mood_happy">Happy as a duck can be.</string>
+    <string name="mood_content">Content, pottering about.</string>
+    <string name="mood_hungry">Hungry — a few seeds would help.</string>
+    <string name="mood_sleepy">Sleepy. It will nap soon.</string>
+    <string name="mood_lonely">Lonely. It would like a stroke.</string>
+    <string name="mood_bored">Bored. It wants a game.</string>
+
+    <string name="let_out">Put the duck on my screen</string>
+    <string name="bring_home">Bring the duck home</string>
+    <string name="allow_overlay">Allow the duck over other apps</string>
+    <string name="out_explained">Out on your screen it walks along the bottom over whatever you are using. Tap it, rub its head, pick it up and throw it, or hold your finger on it for food, a ball, tricks and a song. Drag it onto the ✕ to put it away.</string>
+
+    <string name="blocked_title">One more step: Android blocked it</string>
+    <string name="blocked_message">Because this app was installed from a file rather than a store, Android locks the \"Display over other apps\" switch and says \"App was denied access\".\n\nTo unlock it:\n1. Tap Open app info below.\n2. Tap ⋮ in the top-right corner and choose Allow restricted settings, then confirm.\n3. Come back and tap the button again: the switch will work now.\n\nIf ⋮ has no such option, try the switch once more first; Android only offers it after it has refused once.</string>
+    <string name="allow_title">The duck needs your permission</string>
+    <string name="allow_message">To walk over your other apps, the duck needs \"Display over other apps\". Turn on the switch for Virtual Duck, then come back.</string>
+    <string name="open_app_info">Open app info</string>
+    <string name="try_again">Try again</string>
+    <string name="not_now">Not now</string>
+
+    <string name="room_hint">Tap the duck to say hi, rub its head to pet it, double-tap to make it dance, tap the floor to call it over — or just talk to it.</string>
+
+    <string name="level">Lv %1$d</string>
+    <string name="streak">🔥 %1$d-day streak · day %2$d together</string>
+    <string name="together">🐣 Day %1$d together · look after it every day to start a streak</string>
+    <string name="stats">Strokes ❤️ %1$d · Seeds 🌾 %2$d · Kicks ⚽ %3$d · Chats 💬 %4$d</string>
+    <string name="level_up">🎉 Friendship level %1$d!</string>
+    <string name="unlocked_song">It can sing now: try 🎵 Sing.</string>
+
+    <string name="talk">Talk to it</string>
+    <string name="talk_on">🎤 Talking: on — it answers you</string>
+    <string name="talk_off">🎤 Talking: off</string>
+    <string name="talk_explained">When it is on, the duck listens for your voice and answers in duck, as many sounds as you said words. It only measures how loud the room is: nothing is recorded, nothing leaves your phone, and it listens only while it is on your screen.</string>
+
+    <string name="where">Where it walks</string>
+    <string name="where_bottom">Bottom</string>
+    <string name="where_middle">Middle</string>
+    <string name="where_top">Top</string>
+    <string name="where_note">Out on your screen. You can also hold the duck, tap 📍 and then tap anywhere: it walks there, or jumps up or down to live at that height.</string>
+
+    <string name="sound">Sound</string>
+    <string name="sound_off">Off</string>
+    <string name="sound_soft">Soft</string>
+    <string name="sound_normal">Normal</string>
+
+    <string name="point_hint">Tap where %1$s should go</string>
+
+    <string name="reminders_channel">Reminders from your duck</string>
+    <string name="remind_hungry">🦆 %1$s is hungry</string>
+    <string name="remind_lonely">🦆 %1$s misses you</string>
+    <string name="remind_bored">🦆 %1$s wants to play</string>
+    <string name="remind_streak">🔥 Keep your %1$d-day streak with %2$s</string>
+    <string name="remind_tap">Tap to say hi.</string>
+
+    <string name="voice">Voice</string>
+    <string name="pitch_low">Low</string>
+    <string name="pitch_middle">Middle</string>
+    <string name="pitch_high">High</string>
+    <string name="voice_note">Babble talks back in duck-speak, Duckling peeps, Squeaky squeaks like a bath toy. Tap one to hear it.</string>
+    <string name="size">Size</string>
+    <string name="size_note">How big the duck is when it is out on your screen.</string>
+    <string name="size_small">Small</string>
+    <string name="size_medium">Medium</string>
+    <string name="size_large">Large</string>
+
+    <string name="credits">The duck is the Microduck by Pollen Robotics. Its motions were recorded from the robot\'s own walking, sitting, pecking, kicking and get-up policies, its voice is the robot\'s own synthesiser. 3D model © Pollen Robotics, CC BY-NC-SA 4.0, adapted: decimated and converted to glTF. Not for sale.</string>
+</resources>
