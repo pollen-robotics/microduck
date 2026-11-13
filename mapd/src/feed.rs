@@ -56,13 +56,26 @@ impl Source {
     }
 }
 
-pub fn spawn(source: Source, socket: PathBuf, tx: SyncSender<Input>, shared: Arc<Mutex<Shared>>) {
+/// Feed `source` to the worker until `active` goes false. A stopped worker ends the connection at
+/// the next sample (it can no longer be sent), and the feed then sees `active` and ends too, rather
+/// than subscribing again every two seconds for nobody.
+pub fn spawn(
+    source: Source,
+    socket: PathBuf,
+    tx: SyncSender<Input>,
+    shared: Arc<Mutex<Shared>>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
     std::thread::Builder::new()
         .name(format!("feed-{}", source.name()))
         .spawn(move || {
             let mut said = None::<String>;
-            loop {
+            while active.load(Ordering::Relaxed) {
                 let err = stream(source, &socket, &tx, &shared);
+                if !active.load(Ordering::Relaxed) {
+                    break;
+                }
                 let down = format!("{}: {err}", source.name());
                 // Once per distinct failure: a robot with no ToF fitted would otherwise log this
                 // every two seconds forever.

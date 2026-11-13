@@ -37,14 +37,22 @@ The switch lives in `robotd` rather than in the file because nothing that reads 
 write `robotd.toml`, and because a switch made with a tag is a decision for now, not for every
 boot. The unit ships and is enabled like every other daemon, because no unit in this repository is
 started or stopped by a setting ([`tof-on-demand.md`](../project/tof-on-demand.md) §"Why not start
-and stop the unit"). Switched off, `autod` stays connected and sends nothing.
+and stop the unit"). **Switched off, the duck costs nothing**: `autod` holds one connection to
+`robotd` and asks `robot.mode` once a second — no state stream, no depth, no map, no brain —
+and `mapd`, unless `[map] enabled`, asks every two seconds and maps nothing. Laser tracking and
+soccer stay off unless somebody switches them on. Switched on, `autod` opens a session: the state
+stream, the ToF and the map, and a fresh brain (the novelty grid is kept on disk); switched off,
+the session closes all three. Measured against a `--fake` `robotd`: no CPU at all off, and the
+streams gone within a second of the switch.
 
 Switching it off from on stops the robot where it stands (one zero twist, beak closed, body pose
-released) and switches laser tracking off, and autonomous soccer if the brain had started it. The
-robot is left standing: switching the duck off is not a reason to sit it down.
+released, the wheee stopped). The robot is left standing: switching the duck off is not a reason to
+sit it down. **`robotd` switches laser tracking and autonomous soccer off with the switch** — not
+`autod`, which may be down or restarting at that moment and would otherwise leave the camera
+looking for a dot and the legs following it. Soccer by hand, a pad's, is left alone.
 
-**The map comes with it.** `mapd` maps whenever `[map] enabled` is set, and otherwise from the first
-time it sees the duck on its own switched on, until it restarts
+**The map comes with it.** `mapd` maps whenever `[map] enabled` is set, and otherwise exactly while
+the duck on its own is switched on, saving the map when it goes off
 ([`mapping-design.md`](mapping-design.md) owns the map). §6 is what the brain does with it.
 
 The brain itself (`autod/src/brain.rs`) is pure: it reads a snapshot of the world each tick and

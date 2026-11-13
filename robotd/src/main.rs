@@ -5747,7 +5747,18 @@ fn dispatch(
 
         // The duck on its own. A switch `autod` reads in `robot.state`; it moves nothing here, so
         // there is nothing to refuse. Whether `autod` is running is `systemctl`'s to say.
+        //
+        // Switched off, the laser and a ball game the duck may have been playing go off here, not
+        // only in `autod`: an `autod` that is down, or restarting, when the switch goes off would
+        // otherwise leave the camera looking for a dot and the legs following it, on a robot
+        // somebody just switched back to being theirs. Soccer by hand is left alone — it is a pad's.
         proto::Call::RobotAutonomous(p) => {
+            if intents.autonomous() && !p.active {
+                intents.request_laser(false);
+                if intents.soccer().autonomous {
+                    intents.set_soccer(false, false);
+                }
+            }
             if intents.autonomous() != p.active {
                 tracing::warn!(on = p.active, "the duck on its own switched");
             }
@@ -7249,6 +7260,8 @@ mod tests {
             None,
             "the laser is left alone"
         );
+        // The duck playing ball when it is switched off: the game and the laser go with it.
+        intents.set_soccer(true, true);
         dispatch(
             &s,
             &intents,
@@ -7256,6 +7269,22 @@ mod tests {
             &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
         );
         assert!(!on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        assert!(!intents.soccer().active, "the ball game ends");
+        // Off when already off touches nothing; soccer by hand is a pad's, never the switch's.
+        intents.set_soccer(true, false);
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert_eq!(intents.take_laser_request(), None);
+        assert!(intents.soccer().active && !intents.soccer().autonomous);
     }
 
     /// `robot.look` is a promise with two halves: the head actually moves (the intent is

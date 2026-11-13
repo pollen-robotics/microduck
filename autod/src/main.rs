@@ -141,6 +141,8 @@ struct Shared {
     latest: Option<Latest>,
     /// The state stream ended: `robotd` is gone.
     lost: bool,
+    /// The session is over (the duck was switched off): every stream thread hangs up.
+    ended: bool,
     /// What `mapd` last said, and when.
     map: Option<(brain::MapFix, Instant)>,
     /// The newest grid, and a counter bumped with each, so the loop hands each one over once.
@@ -196,21 +198,90 @@ fn run(args: &Args, params: &robotd_params::Params) -> std::io::Result<()> {
         );
     }
 
-    let shared = Arc::new(Mutex::new(Shared::default()));
-    let abilities = subscribe(&args.socket, &shared, api >= 59)?;
-    tracing::warn!(?abilities, "autonomous — the duck is on its own");
-    spawn_depth(args.tof_socket.clone(), Arc::clone(&shared));
-    spawn_map(args.map_socket.clone(), Arc::clone(&shared));
+    // Off, this process holds one connection and asks one question a second — no state stream,
+    // no depth, no map: a duck nobody switched on pays nothing for the brain it is not using. On,
+    // a session opens all three, and closes them when the duck is switched off again.
+    let mut at_start = true;
+    loop {
+        let on_at_start = wait_until_on(&mut commands, &mut next_id)?;
+        let first_sight = at_start && on_at_start;
+        at_start = false;
 
-    drive(
-        args,
-        params,
-        &mut commands,
-        &mut next_id,
-        &shared,
-        abilities,
-    )
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let abilities = subscribe(&args.socket, &shared, api >= 59)?;
+        tracing::warn!(?abilities, "autonomous — the duck is on its own");
+        spawn_depth(args.tof_socket.clone(), Arc::clone(&shared));
+        spawn_map(args.map_socket.clone(), Arc::clone(&shared));
+        let result = drive(
+            args,
+            params,
+            &mut commands,
+            &mut next_id,
+            &shared,
+            abilities,
+            first_sight,
+        );
+        shared.lock().unwrap_or_else(|p| p.into_inner()).ended = true;
+        result?;
+    }
 }
+
+/// How often a switched-off `autod` asks whether it has been switched on.
+const OFF_POLL: Duration = Duration::from_secs(1);
+
+/// Wait, asking `robot.mode` once a second, until the duck on its own is switched on. Says
+/// whether it already was at the first ask — the switch on at boot, or under a restart, rather
+/// than somebody switching it on now (§2 treats the two differently).
+fn wait_until_on(commands: &mut UnixStream, next_id: &mut u64) -> std::io::Result<bool> {
+    let mut first = true;
+    loop {
+        let on = request(commands, next_id, &proto::Call::RobotMode)?
+            .and_then(|r| r.result_as::<proto::ModeResult>().ok())
+            .is_some_and(|m| m.autonomous);
+        if on {
+            return Ok(first);
+        }
+        if first {
+            tracing::info!(
+                "the duck on its own is off — idle (robotctl autonomous on, or an \
+                 autonomous_mode tag, switches it on)"
+            );
+        }
+        first = false;
+        std::thread::sleep(OFF_POLL);
+    }
+}
+
+fn ended(shared: &Mutex<Shared>) -> bool {
+    shared.lock().map(|s| s.ended).unwrap_or(true)
+}
+
+/// A line from a stream that may go quiet, or `None` once the session has ended. A read timeout
+/// is only a chance to look at `ended`.
+fn next_line(
+    reader: &mut BufReader<UnixStream>,
+    raw: &mut String,
+    shared: &Mutex<Shared>,
+) -> std::io::Result<Option<usize>> {
+    loop {
+        if ended(shared) {
+            return Ok(None);
+        }
+        raw.clear();
+        match reader.read_line(raw) {
+            Ok(n) => return Ok(Some(n)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How long a stream read waits before looking at whether the session has ended.
+const READ_WAKE: Duration = Duration::from_secs(1);
 
 /// Open the state stream, and read it on a thread of its own from then on.
 fn subscribe(
@@ -261,6 +332,9 @@ fn subscribe(
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
+            if ended(&shared) {
+                return;
+            }
             let Ok(request) = serde_json::from_str::<proto::Request>(&raw) else {
                 continue;
             };
@@ -304,7 +378,7 @@ fn subscribe(
 fn spawn_depth(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
     std::thread::spawn(move || {
         let mut warned = false;
-        loop {
+        while !ended(&shared) {
             if let Err(e) = depth(&socket, &shared) {
                 if !warned {
                     tracing::warn!(
@@ -321,6 +395,7 @@ fn spawn_depth(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
 
 fn depth(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(READ_WAKE))?;
     let call = proto::Request::call(proto::Id::Number(1), &proto::Call::TofStream);
     let mut line = serde_json::to_vec(&call)?;
     line.push(b'\n');
@@ -329,9 +404,10 @@ fn depth(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
     let mut raw = String::new();
     let mut announced = false;
     loop {
-        raw.clear();
-        if reader.read_line(&mut raw)? == 0 {
-            return Err(std::io::Error::other("tofd closed the depth stream"));
+        match next_line(&mut reader, &mut raw, shared)? {
+            None => return Ok(()),
+            Some(0) => return Err(std::io::Error::other("tofd closed the depth stream")),
+            Some(_) => {}
         }
         let Ok(request) = serde_json::from_str::<proto::Request>(&raw) else {
             // The ack, or a refusal: a sensor that is unavailable says so here.
@@ -367,7 +443,7 @@ fn spawn_map(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
     let stream_shared = Arc::clone(&shared);
     std::thread::spawn(move || {
         let mut warned = false;
-        loop {
+        while !ended(&stream_shared) {
             if let Err(e) = map_stream(&stream_socket, &stream_shared)
                 && !warned
             {
@@ -381,6 +457,9 @@ fn spawn_map(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
         let mut seq = 0u64;
         loop {
             std::thread::sleep(GRID_EVERY);
+            if ended(&shared) {
+                return;
+            }
             let known = shared
                 .lock()
                 .map(|s| matches!(s.map, Some((brain::MapFix::Known(_), _))))
@@ -404,6 +483,7 @@ fn spawn_map(socket: PathBuf, shared: Arc<Mutex<Shared>>) {
 
 fn map_stream(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(READ_WAKE))?;
     stream.write_all(&line_of(&proto::Request::call(
         proto::Id::Number(1),
         &proto::Call::MapStream,
@@ -411,8 +491,11 @@ fn map_stream(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream);
     let mut raw = String::new();
     loop {
-        raw.clear();
-        if reader.read_line(&mut raw)? == 0 {
+        let read = next_line(&mut reader, &mut raw, shared)?;
+        if read.is_none() {
+            return Ok(());
+        }
+        if read == Some(0) {
             if let Ok(mut s) = shared.lock() {
                 s.map = None;
             }
@@ -590,7 +673,11 @@ fn stand_up(
         if lost {
             return Err(std::io::Error::other("robotd closed the state stream"));
         }
-        if state.is_some_and(|s| !off(&s.policy)) {
+        if state.as_ref().is_some_and(|s| !off(&s.policy)) {
+            break;
+        }
+        // Switched off while it was coming up: stop waiting, the loop takes it from there.
+        if state.is_some_and(|s| !s.autonomous) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -655,6 +742,7 @@ fn drive(
     next_id: &mut u64,
     shared: &Mutex<Shared>,
     abilities: Abilities,
+    first_sight: bool,
 ) -> std::io::Result<()> {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -745,7 +833,7 @@ fn drive(
                     shared,
                     &args.state_dir,
                     &state,
-                    was_on.is_none(),
+                    first_sight && was_on.is_none(),
                 )?;
                 brain.reset();
             } else if was_on.is_some() {
@@ -763,28 +851,26 @@ fn drive(
                     });
                     commands.write_all(&line_of(&proto::Request::notify(&rest))?)?;
                 }
+                if wheee_on {
+                    let quiet = proto::Call::RobotSound(proto::SoundParams {
+                        tag: proto::SoundTag::Wheee,
+                        hold: Some(false),
+                    });
+                    commands.write_all(&line_of(&proto::Request::notify(&quiet))?)?;
+                }
                 commands.flush()?;
-                if soccer_mine && state.soccer_mode {
-                    switch(commands, next_id, soccer_switch(false))?;
+                // Kept for the next session, which starts a fresh brain.
+                if let Some(visits) = brain.visits_in_map() {
+                    save_visits(&visits_path, visits);
                 }
-                if state.laser.on {
-                    switch(commands, next_id, laser_switch(false))?;
-                }
-                soccer_mine = false;
-                posing = false;
-                wheee_on = false;
-                recovery = Recovery::Idle;
+                // The laser and the brain's ball game: `robotd` switches them off with the switch.
+                // The session ends; the streams close.
+                return Ok(());
             } else {
-                tracing::info!(
-                    "the duck on its own is off — waiting for it to be switched on \
-                     (robotctl autonomous on, or an autonomous_mode tag)"
-                );
+                // Switched off between the ask and the first frame.
+                return Ok(());
             }
             was_on = Some(state.autonomous);
-        }
-        if !state.autonomous {
-            sleep_rest(period, tick);
-            continue;
         }
 
         // The pad is driving: say nothing at all, so it has the head, mouth and voice too.

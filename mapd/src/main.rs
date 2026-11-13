@@ -88,14 +88,15 @@ async fn run(args: Args) -> Result<()> {
         *mapping.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
     } else {
         tracing::warn!(
-            "mapping is off ([map] enabled = false) — it starts when the duck on its own does; \
+            "mapping is off ([map] enabled = false) — it runs while the duck on its own does; \
              answering map.status until then"
         );
         if let Ok(mut s) = shared.lock() {
             s.status.unavailable = Some(OFF.to_owned());
         }
-        // The duck on its own maps: a robot finding its way around is what the map is for. It can
-        // be switched on at any time (an NFC tag), so it is watched for rather than read once.
+        // The duck on its own maps: a robot finding its way around is what the map is for. It is
+        // switched at any time (an NFC tag, `robotctl autonomous`), so it is watched, and mapping
+        // runs exactly while it is on — off, nothing here reads a stream.
         let (args, mapping, worker, shared) = (
             args.clone(),
             mapping.clone(),
@@ -105,18 +106,33 @@ async fn run(args: Args) -> Result<()> {
         std::thread::Builder::new()
             .name("autonomy-watch".to_owned())
             .spawn(move || {
-                wait_for_autonomy(&args.robot_socket);
-                match start_mapping(&params, &args, &shared) {
-                    Ok(started) => {
-                        tracing::warn!("the duck is on its own — mapping");
-                        if let Ok(mut s) = shared.lock() {
-                            s.status.unavailable = None;
+                loop {
+                    wait_for_autonomy(&args.robot_socket, true);
+                    match start_mapping(&params, &args, &shared) {
+                        Ok(started) => {
+                            tracing::warn!("the duck is on its own — mapping");
+                            if let Ok(mut s) = shared.lock() {
+                                s.status.unavailable = None;
+                            }
+                            *worker.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(started.tx.clone());
+                            *mapping.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
                         }
-                        *worker.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(started.tx.clone());
-                        *mapping.lock().unwrap_or_else(|p| p.into_inner()) = Some(started);
+                        Err(e) => {
+                            tracing::error!(error = format!("{e:#}"), "cannot start mapping");
+                            return;
+                        }
                     }
-                    Err(e) => tracing::error!(error = format!("{e:#}"), "cannot start mapping"),
+                    wait_for_autonomy(&args.robot_socket, false);
+                    tracing::warn!("the duck on its own is off — saving the map, mapping stops");
+                    *worker.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    let running = mapping.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(running) = running {
+                        stop_mapping(running);
+                    }
+                    if let Ok(mut s) = shared.lock() {
+                        s.status.unavailable = Some(OFF.to_owned());
+                    }
                 }
             })
             .context("spawning the autonomy watch")?;
@@ -150,20 +166,9 @@ async fn run(args: Args) -> Result<()> {
     // Save on the way out: what the map learned since the last autosave, and the pose the boot
     // hint will start from.
     let running = mapping.lock().unwrap_or_else(|p| p.into_inner()).take();
-    if let Some(Mapping { tx, thread }) = running {
+    if let Some(running) = running {
         tracing::info!("stopping; saving the map");
-        let saved = tokio::task::spawn_blocking(move || {
-            let (reply, done) = std::sync::mpsc::sync_channel(1);
-            if tx.send(worker::Input::Shutdown(reply)).is_ok() {
-                let _ = done.recv_timeout(Duration::from_secs(8));
-            }
-            thread.is_finished()
-        })
-        .await
-        .unwrap_or(false);
-        if !saved {
-            tracing::warn!("the map worker did not finish saving in time");
-        }
+        let _ = tokio::task::spawn_blocking(move || stop_mapping(running)).await;
     }
     Ok(())
 }
@@ -175,10 +180,25 @@ const OFF: &str =
 /// How often an idle `mapd` asks whether the duck on its own has been switched on.
 const AUTONOMY_POLL: Duration = Duration::from_secs(2);
 
-/// The mapper's thread and the way to reach it.
+/// The mapper's thread, the way to reach it, and the switch its feeds watch.
 struct Mapping {
     tx: std::sync::mpsc::SyncSender<worker::Input>,
     thread: std::thread::JoinHandle<()>,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Stop mapping: the feeds told to end, the worker asked to save and stop, and waited for. Blocks
+/// up to eight seconds.
+fn stop_mapping(m: Mapping) {
+    m.active.store(false, std::sync::atomic::Ordering::Relaxed);
+    let (reply, done) = std::sync::mpsc::sync_channel(1);
+    let saved = m.tx.send(worker::Input::Shutdown(reply)).is_ok()
+        && done.recv_timeout(Duration::from_secs(8)).is_ok();
+    if !saved {
+        tracing::warn!("the map worker did not finish saving in time");
+    }
+    // It answered as it finished: the thread is ending, not waited for.
+    drop(m.thread);
 }
 
 /// Start the worker and both feeds.
@@ -193,6 +213,7 @@ fn start_mapping(
         ..MapperConfig::default()
     };
     let (tx, rx) = std::sync::mpsc::sync_channel(INPUT_QUEUE);
+    let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let w = worker::Worker::new(
         cfg,
         path,
@@ -210,21 +231,23 @@ fn start_mapping(
         args.robot_socket.clone(),
         tx.clone(),
         shared.clone(),
+        active.clone(),
     );
     feed::spawn(
         feed::Source::Tof,
         args.tof_socket.clone(),
         tx.clone(),
         shared.clone(),
+        active.clone(),
     );
-    Ok(Mapping { tx, thread })
+    Ok(Mapping { tx, thread, active })
 }
 
-/// Block until `robotd` says the duck on its own is on. A `robotd` that is down, or too old to
-/// say, is asked again: either can change under an update.
-fn wait_for_autonomy(socket: &Path) {
+/// Block until `robotd` says the duck on its own is `on`. A `robotd` that cannot be asked
+/// changes nothing either way — down under an update, it is asked again.
+fn wait_for_autonomy(socket: &Path, on: bool) {
     loop {
-        if autonomy_on(socket).unwrap_or(false) {
+        if autonomy_on(socket).is_ok_and(|now| now == on) {
             return;
         }
         std::thread::sleep(AUTONOMY_POLL);

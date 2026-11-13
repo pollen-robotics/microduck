@@ -7,9 +7,9 @@ work stands on: going somewhere, coming back, finding a place again after a powe
 This page owns the mechanism. The algorithm is the `maploc` crate; the service is `mapd`; the
 wire is `map.*` (`duck-ipc-proto`, API v58); the switch is `[map] enabled` in `robotd.toml`, **off by
 default** until its standing cost — parsing the state stream — has been measured on a board. Off,
-`mapd` still runs and answers `map.status` with why it is not mapping, and it starts mapping the
-first time the duck on its own is switched on, until it restarts
-([`autonomous.md`](autonomous.md) §1).
+`mapd` still runs and answers `map.status` with why it is not mapping, asks `robotd` once every
+two seconds whether the duck on its own is on, and maps exactly while it is — saving the map when it
+goes off ([`autonomous.md`](autonomous.md) §1).
 
 ## 1. What the hardware allows
 
