@@ -108,6 +108,13 @@ StateDirectory=robot/config
 # switches them off when it stops cleanly — ExecStopPost does it when it did not, so a crashed
 # configd cannot leave an LED claiming something it has stopped keeping true.
 ReadWritePaths=-/sys/devices/platform/face-leds
+
+# The face button (`configd::wifi_ssh`): a short press opens ssh on wifi for 30 minutes. The one
+# input device handed into PrivateDevices' empty /dev, read-only, and nothing else of the input
+# class; `-` because only face-board-v1 has it. Closing again reloads systemd and restarts
+# sshd.socket over D-Bus, as root, which is the same uid check logind's Reboot passes.
+BindReadOnlyPaths=-/dev/input/by-path/platform-face-keys-event
+DeviceAllow=char-input r
 ExecStopPost=-/bin/sh -c 'cd /sys/class/leds 2>/dev/null || exit 0; for l in face:gb:green face:gb:blue; do echo 0 > "$$l/brightness"; done 2>/dev/null; exit 0'
 
 # stderr → journal; level via RUST_LOG. The startup identity line is at `warn` so it survives

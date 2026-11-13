@@ -575,9 +575,10 @@ fn ssh_refusal(address: &str) -> Result<(), String> {
     match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
             "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
-             (microduck@192.168.42.1), on purpose: reaching it means opening the robot. Over that \
-             link, `sudo touch /run/microduck-ssh-wifi` opens wifi ssh until the next reboot; the \
-             dev image has it open always."
+             (microduck@192.168.42.1), on purpose. A short press of the face button opens wifi \
+             ssh for 30 minutes (the network LED blinks blue); over the USB link, \
+             `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot; the dev image \
+             has it open always."
         )),
         _ => Ok(()),
     }

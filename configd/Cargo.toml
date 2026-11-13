@@ -40,6 +40,8 @@ zbus = "5"
 # but not `futures_util` (the combinators), and the connect path has to consume NM's `StateChanged`
 # signal to learn *why* an activation failed. Already in the graph via btd.
 futures = "0.3"
+# The face button (`wifi_ssh`): a gpio-keys device. Already in the graph via padd.
+evdev = "0.13"
 
 [dev-dependencies]
 tempfile = "3.27.0"
