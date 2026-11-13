@@ -258,8 +258,8 @@ impl Receiver {
 struct Delivery {
     fastest: Option<u32>,
     /// Late datagrams agreeing on an offset, within the limit: since when, and the fastest of them.
-    /// A moved clock holds one steady; a backlog never does, as each burst is far less late than
-    /// the last datagram of the one before.
+    /// A moved clock holds one steady. A backlog does not: each datagram is less late than the one
+    /// before, and a drain of a few milliseconds at a time is still a drain.
     moved: Option<(Instant, u32)>,
 }
 
@@ -277,7 +277,11 @@ impl Delivery {
             let (since, steady) = match self.moved {
                 Some((since, steady)) => match offset.wrapping_sub(steady) as i32 {
                     d if d.unsigned_abs() as u128 > limit.as_millis() => (now, offset),
-                    d if d < 0 => (since, offset),
+                    // Less late than the offset this wait is measuring. That is a backlog
+                    // draining, not a clock that has settled, so the wait starts again here.
+                    // Keeping the old `since` let a few ms a datagram walk the offset down, and
+                    // after `LATE_FOR` the stream was taken still seconds late.
+                    d if d < 0 => (now, offset),
                     _ => (since, steady),
                 },
                 None => (now, offset),
@@ -637,6 +641,28 @@ mod tests {
         }
         let first = first_taken.expect("taken in the end");
         assert!((1500..1600).contains(&first), "taken at {first} ms");
+    }
+
+    /// A backlog that arrives a little faster than it was sent, rather than in a burst. Each
+    /// datagram is only a few ms less late than the last, which is inside the limit, so it used to
+    /// count as one steady offset — and a second later the robot drove on input still seconds old.
+    #[test]
+    fn a_backlog_that_drains_a_little_at_a_time_stays_dropped() {
+        let (mut r, t) = (rx_with(250, 1000), Instant::now());
+        r.on_datagram(ms(t, 2), addr(A), &sent(1, 5000, Buttons::NONE));
+        for i in 0..50u32 {
+            let sent_at = 33 * (i + 1);
+            let delivered = 2033 + 30 * u64::from(i);
+            assert_eq!(
+                r.on_datagram(
+                    ms(t, delivered),
+                    addr(A),
+                    &sent(2 + i, 5000 + sent_at, Buttons::START)
+                ),
+                Accept::Late,
+                "sent at {sent_at} ms, delivered at {delivered} ms"
+            );
+        }
     }
 
     /// The link lets a backlog go in two bursts, more than [`LATE_FOR`] apart: neither drives, as
