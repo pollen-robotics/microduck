@@ -104,6 +104,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
+use pad_map::engage::{Engage, Engagement};
 use pad_map::{
     BINDINGS_POLL, Buttons, Config, Continuous, Mapper, Out, Overrides, PadFrame, PadLoss,
     PadLossAction,
@@ -281,6 +282,18 @@ fn main() -> std::process::ExitCode {
 
     let mut next_id = 1u64;
 
+    // Named, so `robot.state.move.source` says when the pad is the one driving — which is how the
+    // autonomous brain knows to step aside (`docs/design/autonomous.md` §3). A robot too old to
+    // take the name refuses the hello; that is logged and changes nothing about driving.
+    let hello = proto::Call::Hello(proto::HelloParams {
+        api_version: proto::API_VERSION,
+        client: Some("padd".to_owned()),
+    });
+    if let Err(e) = request(&mut stream, &mut next_id, &hello) {
+        tracing::error!(error = %e, "cannot reach robotd");
+        return std::process::ExitCode::FAILURE;
+    }
+
     // Which robot is this? A roller duck wants the roller stick shaping. Asked at startup and then
     // again with the config check below, so a `robot.setMode` from anywhere — the pad no longer
     // switches modes itself — changes the stick shaping within a second.
@@ -292,6 +305,9 @@ fn main() -> std::process::ExitCode {
         }
     };
     let roller = mode.mode == "roller";
+    // The duck on its own: while it is on, the pad keeps quiet until touched. `robot.mode` says,
+    // so an NFC tag switching it is heard within a second, like soccer mode.
+    let mut autonomy_on = mode.autonomous;
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
@@ -324,6 +340,8 @@ fn main() -> std::process::ExitCode {
     let mut driving = false;
     // A driving pad that went away: the robot sits after a second — see `pad_map::loss`.
     let mut pad_loss = PadLoss::default();
+    // With `[autonomous] enabled`, whether the pad is the one driving — see `pad_map::engage`.
+    let mut engagement = Engagement::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -358,6 +376,13 @@ fn main() -> std::process::ExitCode {
                     }
                     // Soccer mode changes what the buttons do, and an NFC tag switches it.
                     mapper.set_soccer(mode.soccer);
+                    if mode.autonomous != autonomy_on {
+                        tracing::warn!(
+                            on = mode.autonomous,
+                            "the duck on its own switched — the pad keeps quiet until touched while it is on"
+                        );
+                        autonomy_on = mode.autonomous;
+                    }
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -407,7 +432,12 @@ fn main() -> std::process::ExitCode {
                     pad_map::loss::PAD_LOST_SIT
                 );
                 driving = false;
-                pad_loss.lost(tick);
+                // A pad nobody was touching was not holding the robot — the duck's own brain was.
+                // Losing it is no reason to sit the robot down.
+                if engagement.engaged() || !autonomy_on {
+                    pad_loss.lost(tick);
+                }
+                engagement.reset();
             }
             // Heard, because whoever lost the pad is looking at the robot, not the journal — but only
             // once the loss has lasted to the sit: a blip on bad Wi-Fi is not worth a quack.
@@ -493,6 +523,39 @@ fn main() -> std::process::ExitCode {
             attitude,
             has_imu: tap.as_ref().is_some_and(|t| t.has_imu()),
         };
+
+        // With the duck's own brain on, the pad says nothing until somebody touches it, and lets go
+        // `pad_idle_s` after the last touch. A press is a touch, so it engages the pad in the same
+        // tick it is mapped.
+        let touch = pad_map::engage::touched(&frame_in, config.axes.deadzone);
+        match engagement.tick(touch, tick, autonomy_on, &config.autonomy) {
+            Engage::Drive => {}
+            Engage::LetGo => {
+                // Stop on the pad's word rather than the deadman, and close the beak; then the
+                // next engagement goes out on its first tick rather than waiting out a heartbeat.
+                mapper.pad_gone();
+                continuous = Continuous::default();
+                for call in [
+                    proto::Call::RobotMove(proto::MoveParams::default()),
+                    proto::Call::RobotMouth(proto::MouthParams { open: 0.0 }),
+                ] {
+                    if let Err(e) = notify(&mut stream, &call) {
+                        tracing::error!(error = %e, call = call.method(), "send failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+                if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+                continue;
+            }
+            Engage::Silent => {
+                if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+                continue;
+            }
+        }
 
         // The mapping says what to send; this sends it, in its order. A failed write ends the
         // process as it always has, and systemd brings back a `padd` with a fresh connection.

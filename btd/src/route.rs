@@ -54,7 +54,7 @@ impl TryFrom<proto::Service> for Upstream {
             // Not sockets `btd` holds. Unreachable in practice, because `permits` refuses every
             // call these answer — and an error rather than a panic so that staying true is not
             // something this file has to be careful about.
-            proto::Service::Pad | proto::Service::Tof => Err(()),
+            proto::Service::Pad | proto::Service::Tof | proto::Service::Map => Err(()),
         }
     }
 }
@@ -307,6 +307,8 @@ fn permits(call: &proto::Call) -> bool {
         RobotLaserTrack(_) => false,
         // The same, for a ball: autonomous soccer walks the robot. An NFC tag is local, not the radio.
         RobotSoccer(_) => false,
+        // The same again: the duck on its own walks the robot. An NFC tag switches it locally.
+        RobotAutonomous(_) => false,
         // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
         RobotFlashlight(_) => false,
 
@@ -543,6 +545,10 @@ fn permits(call: &proto::Call) -> bool {
         // `duckctl nfc-flash` is the client. It changes the tag, never the robot — the tag's
         // text does whatever it does only when touched again, like one a phone app wrote.
         NfcWrite(_) => true,
+        // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
+        // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
+        // reason to forward `map.status` — not yet one anybody has.
+        MapStatus | MapStream | MapGrid(_) | MapWipe => false,
     }
 }
 
@@ -760,6 +766,7 @@ mod tests {
             (
                 proto::Call::Hello(proto::HelloParams {
                     api_version: proto::API_VERSION,
+                    client: None,
                 }),
                 Upstream::Updater,
             ),
@@ -890,6 +897,7 @@ mod tests {
                 head_pitch: 0.0,
                 head_yaw: 0.0,
                 head_roll: 0.0,
+                alpha: None,
             }),
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());

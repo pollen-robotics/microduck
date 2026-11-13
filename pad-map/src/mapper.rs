@@ -76,6 +76,7 @@ fn head_from_pad(
         head_pitch: angle(pitch, limits.head_pitch_max),
         head_yaw: angle(yaw, limits.head_yaw_max),
         head_roll: -angle(roll, limits.head_roll_max),
+        alpha: None,
     }
 }
 
@@ -121,6 +122,9 @@ pub struct Config {
     pub body: robotd_params::PadBodyParams,
     /// `[pad_roller]`: full deflection on wheels, in place of `drive`.
     pub roller_limits: robotd_params::PadRollerParams,
+    /// `[autonomous]`: how long an untouched pad drives before it lets go — see [`crate::engage`].
+    /// Whether it keeps quiet at all is `robot.mode`'s `autonomous`, not this file's `enabled`.
+    pub autonomy: robotd_params::AutonomousParams,
     pub roller: bool,
 }
 
@@ -567,6 +571,7 @@ fn stick_frame(
             head_pitch: value(pitch) * head.head_pitch_max,
             head_yaw: value(yaw) * head.head_yaw_max,
             head_roll: value(roll) * head.head_roll_max,
+            alpha: None,
         })
     };
     match mode {

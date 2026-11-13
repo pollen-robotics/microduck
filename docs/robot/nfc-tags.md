@@ -17,11 +17,11 @@ ignored, case is not. A tag that merely *contains* one of these texts among othe
 | Text on the tag | What the robot does | Same as |
 |---|---|---|
 | `microduck_gamepad_pairing` | pairs the pad that is in pairing mode | `robotctl pad pair` |
-| `walk_mode` | laser tracking and soccer off, then walk mode | holding D-pad up |
-| `roller_skating_mode` | laser tracking and soccer off, then roller mode | holding D-pad up |
-| `laser_mode` | soccer off, walk mode, then laser tracking on | `robotctl laser-track on` |
-| `soccer_mode` | laser tracking off, walk mode, then soccer mode on | `robotctl soccer on` |
-| `autonomous_mode` | read and quacked at; nothing yet | — |
+| `walk_mode` | laser tracking, soccer and the duck on its own off, then walk mode | holding D-pad up |
+| `roller_skating_mode` | laser tracking, soccer and the duck on its own off, then roller mode | holding D-pad up |
+| `laser_mode` | soccer and the duck on its own off, walk mode, then laser tracking on | `robotctl laser-track on` |
+| `soccer_mode` | laser tracking and the duck on its own off, walk mode, then soccer mode on | `robotctl soccer on` |
+| `autonomous_mode` | laser tracking and soccer off, walk mode, then the duck on its own | `robotctl autonomous on` |
 
 The robot **quacks** (a short chirp) as soon as it has read any of them, so the person holding the
 tag knows it was read, whatever follows.
@@ -49,8 +49,8 @@ When a pad will not bond at all, that is the pad and the radio, not the tag:
 ### Switching mode
 
 **A mode tag is the mode the robot is then in**, not something added to the last one. Laser
-tracking and soccer are switches on top of walk mode rather than modes of their own, so their tags
-put the robot in walk first, and every other mode tag switches them off.
+tracking, soccer and the duck on its own are switches on top of walk mode rather than modes of
+their own, so their tags put the robot in walk first, and every other mode tag switches them off.
 
 - **`walk_mode`, `roller_skating_mode`** switch the policy as holding D-pad up does.
 - **`laser_mode`** follows a laser dot on the floor with the head and walks to it. A pushed stick on
@@ -61,9 +61,16 @@ put the robot in walk first, and every other mode tag switches them off.
   kicks it. Any button takes it back to soccer by hand. The tag deliberately does not start
   autonomous play: a robot that sets off after a ball the moment a card touches it surprises
   whoever is holding it. The cheat sheet's [Play soccer](cheatsheet.md#play-soccer) has the rest.
-- **`autonomous_mode`** is recognised, so a tag written today keeps working, and does nothing yet.
+- **`autonomous_mode`** switches on the duck on its own (`autod`): it stands up, wanders, naps
+  when tired, chases a laser dot and plays with the ball when it feels like it, and steers clear of
+  walls with the head's ToF. It turns the laser and the ball on by itself, which is why its tag
+  starts from both off. **Touching the pad takes over** — a button or a pushed stick — and the duck
+  takes back over 30 s after the pad was last touched. Until the next boot, which starts from
+  `[autonomous] enabled` again; any other mode tag, or `robotctl autonomous off`, switches it off
+  and leaves it standing where it is. `journalctl -u autod -f` is what it is thinking;
+  [`autonomous.md`](../design/autonomous.md) owns the rest.
 
-A `robotd` too old to know laser tracking or soccer refuses that switch; the journal says so and the
+A `robotd` too old to know laser tracking, soccer or the duck on its own refuses that switch; the journal says so and the
 mode itself still changes.
 
 The table and where a new mode's behaviour goes are in `nfc/src/modes.rs`.
@@ -139,7 +146,6 @@ Then touch the tag and read the line that appears:
 | `a pad is already connected — nothing to do` | a pad was driving; disconnect it first |
 | `mode tag touched`, then `mode switched` | the mode changed |
 | `the robot refused the mode` | `robotd` said no, and says why |
-| `this mode does nothing yet` | `autonomous_mode` |
 | `neither a pairing nor a mode tag` | the tag's text is something else — the line shows it |
 | `tag holds no readable NDEF` | a blank tag, or one lifted during a write |
 | `tag cannot be read` | a MIFARE Classic |

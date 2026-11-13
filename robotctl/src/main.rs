@@ -50,6 +50,7 @@ mod endurance;
 mod frame;
 mod imu_view;
 mod led;
+mod map;
 mod monitor;
 mod path_map;
 mod setup_code;
@@ -124,6 +125,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::MEDIA)]
     media_socket: PathBuf,
 
+    /// Path to `mapd`'s socket, which `map` reads the map and the pose from.
+    #[arg(long, global = true, default_value = proto::socket::MAP)]
+    map_socket: PathBuf,
+
     #[command(subcommand)]
     namespace: Namespace,
 }
@@ -176,6 +181,13 @@ enum Namespace {
     /// rotation has no compass. Served by robotd on a beta; on a zero3 it is tofd's, and this
     /// says so. Ctrl-C to stop.
     HeadImu,
+
+    /// The onboard map: where the robot is in its home, the map itself, and forgetting it.
+    /// Served by `mapd`. It maps where the robot stops and looks around.
+    Map {
+        #[command(subcommand)]
+        command: Option<map::MapCommand>,
+    },
 
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
@@ -289,6 +301,18 @@ enum Namespace {
     Soccer {
         /// `on`, `auto` or `off`. Absent: just watch.
         #[arg(value_parser = ["on", "auto", "off"])]
+        state: Option<String>,
+    },
+
+    /// The duck on its own (`autod`): it wanders, naps, chases a laser dot and plays with the
+    /// ball, and a touched pad takes over.
+    ///
+    /// Until the next boot, which starts from `[autonomous] enabled` again. What an NFC
+    /// `autonomous_mode` tag does. With no argument, says whether it is on.
+    /// `journalctl -u autod -f` is what it is thinking.
+    Autonomous {
+        /// `on` or `off`. Absent: just say.
+        #[arg(value_parser = ["on", "off"])]
         state: Option<String>,
     },
 
@@ -1022,6 +1046,33 @@ fn laser_line(laser: &proto::LaserTrackState) -> String {
         _ => String::new(),
     };
     format!("{dot}  {target:<24} {doing}")
+}
+
+/// `robotctl autonomous` — switch the duck on its own, or say whether it is on.
+fn run_autonomous(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let params = proto::AutonomyParams {
+            active: state == "on",
+        };
+        let outcome: proto::IntentResult = decode(&result_of(
+            client.call(&proto::Call::RobotAutonomous(params))?,
+        )?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+    }
+    let mode: proto::ModeResult = decode(&result_of(client.call(&proto::Call::RobotMode)?)?)?;
+    if mode.autonomous {
+        println!(
+            "the duck is on its own — touch the pad to take over; `journalctl -u autod -f` says what it is doing"
+        );
+    } else {
+        println!("the duck on its own is off");
+    }
+    Ok(())
 }
 
 /// `robotctl soccer` — switch soccer mode, and watch what autonomous play makes of the ball.
@@ -1935,6 +1986,7 @@ impl Client {
     fn hello_result(&mut self) -> Result<proto::HelloResult, Failure> {
         let response = self.call(&proto::Call::Hello(proto::HelloParams {
             api_version: proto::API_VERSION,
+            client: None,
         }))?;
         if let Some(error) = response.error {
             // Passed through unadorned. This side cannot add a remedy the daemon does not
@@ -5737,6 +5789,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.pad_socket,
                 &cli.tof_socket,
                 &cli.media_socket,
+                &cli.map_socket,
                 hz,
                 json,
             );
@@ -5810,6 +5863,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::HeadImu => {
             return run_head_imu(&cli.robot_socket);
         }
+        Namespace::Map { command } => {
+            return map::run(&cli.map_socket, command);
+        }
         Namespace::Led { command } => {
             return led::run(Path::new(led::LEDS_DIR), command);
         }
@@ -5821,6 +5877,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Soccer { state } => {
             return run_soccer(&cli.robot_socket, state.as_deref());
+        }
+        Namespace::Autonomous { state } => {
+            return run_autonomous(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);

@@ -885,6 +885,7 @@ impl Server {
             | Call::RobotTheremin(_)
             | Call::RobotLaserTrack(_)
             | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)
@@ -951,6 +952,15 @@ impl Server {
                     proto::code::METHOD_NOT_FOUND,
                     "pad.input is served by padd itself, on /run/padd/pad.sock — unlike the rest \
                      of pad.*, which configd answers",
+                ),
+            ),
+
+            // And again for the map: `mapd` owns it.
+            Call::MapStatus | Call::MapStream | Call::MapGrid(_) | Call::MapWipe => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "map.* is served by mapd, on /run/mapd/map.sock",
                 ),
             ),
 

@@ -163,7 +163,9 @@ impl Subscription {
     }
 }
 
-/// A detector's params from a request, or the answer refusing them.
+/// A detector's params from a request, or the answer refusing them. The refusal is the answer
+/// itself, sent once per subscribe, so its size is no cost worth boxing for.
+#[allow(clippy::result_large_err)]
 fn detector_params<T: serde::de::DeserializeOwned + Default>(
     request: &proto::Request,
 ) -> std::result::Result<T, proto::Response> {

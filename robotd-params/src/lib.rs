@@ -207,6 +207,8 @@ pub struct Params {
     pub soccer: SoccerParams,
     pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
+    /// The onboard map. `mapd` reads this, not `robotd`.
+    pub map: MapParams,
     pub chorale: ChoraleParams,
     pub idle: IdleParams,
     pub media: MediaParams,
@@ -239,6 +241,9 @@ pub struct Params {
     pub pad_roller: PadRollerParams,
     /// The pad over UDP: `netpadd` reads this, and so does `padd`, to know whether to stand down.
     pub netpad: NetpadParams,
+    /// The autonomous brain. `autod` reads it, and so does `padd` — the pad stays silent until
+    /// touched while it is on.
+    pub autonomous: AutonomousParams,
     /// Why the user layer ([`USER_PATH`]) was set aside, when it was — not a key in any file.
     ///
     /// A broken user layer does not stop the robot: it runs on the base alone, and `robotd`
@@ -347,6 +352,30 @@ impl Default for NetpadParams {
             max_hz: 30,
             stale_ms: 300,
             timeout_ms: 1000,
+        }
+    }
+}
+
+/// `[autonomous]` — the duck on its own. `docs/design/autonomous.md` is the design.
+///
+/// **Off by default.** A duck that wanders, naps and quacks by itself is a lovely thing to have
+/// chosen and an alarming thing to unbox, and it also boots straight into a standing walk with no
+/// pad — so it is a decision somebody makes for a robot, never one a release makes for them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AutonomousParams {
+    /// Run the brain. With this on, `autod` stands the robot up at boot with no pad connected,
+    /// and the pad takes over only while somebody is touching it.
+    pub enabled: bool,
+    /// Seconds of an untouched pad before `padd` goes quiet and the brain takes back over.
+    pub pad_idle_s: f64,
+}
+
+impl Default for AutonomousParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pad_idle_s: 30.0,
         }
     }
 }
@@ -1713,6 +1742,45 @@ impl HeadImuParams {
             "robotd"
         } else {
             "tofd"
+        }
+    }
+}
+
+/// `[map]` — `mapd`, the onboard map and where the robot is in it.
+///
+/// `mapd` builds the map from the same two streams any client can subscribe to — `robot.state`
+/// and `tof.frame` — and keeps it across reboots. It maps only where the robot **stops**: a stop
+/// is a few seconds of frames from one place, voted into one rigid view, and the views are what
+/// the map is made of. A robot that never stops never maps, and that is by design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MapParams {
+    /// Build the map at all. Off, `mapd` answers `map.status` with why and subscribes to nothing.
+    ///
+    /// **Off by default** until it has been measured on a board: its standing cost is parsing the
+    /// state stream at `state_hz`, and nobody has watched that on an A55 yet.
+    pub enabled: bool,
+    /// Where the map is kept, across updates and reboots.
+    pub path: PathBuf,
+    /// Seconds between saves while the map is changing. It is also saved on shutdown; this
+    /// bounds what a power cut loses.
+    pub autosave_s: u64,
+    /// The state stream's rate, Hz. Poses are interpolated between samples, so this is a trade of
+    /// CPU for nothing much below 25: the mapper's own work is a few milliseconds per stop.
+    pub state_hz: u32,
+    /// How long before its stamp a depth frame's light was collected, milliseconds — the stamp is
+    /// taken when the frame is read. A wrong value smears walls while the head turns.
+    pub tof_latency_ms: f64,
+}
+
+impl Default for MapParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from("/var/lib/mapd/map.json"),
+            autosave_s: 60,
+            state_hz: 25,
+            tof_latency_ms: 60.0,
         }
     }
 }
@@ -3217,6 +3285,8 @@ pub enum ParamsError {
         pause: f32,
         resume: f32,
     },
+    #[error("{path}: autonomous.pad_idle_s must be a positive number of seconds, got {got}")]
+    PadIdle { path: String, got: f64 },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -3537,6 +3607,15 @@ impl Params {
                 path: path.display().to_string(),
                 pause,
                 resume,
+            });
+        }
+        // Zero would mean a pad that hands control back the instant it is let go of — in practice
+        // between two stick reports — so the two drivers would alternate every tick.
+        let idle = self.autonomous.pad_idle_s;
+        if !idle.is_finite() || idle <= 0.0 {
+            return Err(ParamsError::PadIdle {
+                path: path.display().to_string(),
+                got: idle,
             });
         }
         Ok(())
