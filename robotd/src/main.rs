@@ -2508,7 +2508,7 @@ async fn control_loop<T: RobotIo>(
         && model.exists()
     {
         match pet_detect::worker::PetHandle::spawn(pet_detect::worker::PetConfig {
-            alsa_device: audio.capture.clone(),
+            source: pet_detect::worker::AudioSource::Alsa(audio.capture.clone()),
             model_path: model.clone(),
             enter_threshold: params.audio.pet_enter_threshold,
             exit_threshold: params.audio.pet_exit_threshold,
