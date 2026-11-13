@@ -801,6 +801,9 @@ struct RobotState {
     /// Not `busy`: a seated duck is parked, not travelling, which is the distinction
     /// [`control::Controller::busy`] already draws.
     sitting: AtomicBool,
+    /// A roller crouch is running nearer its bottom than its top — see
+    /// [`control::Controller::crouching_low`]. What Start reads to hold it down rather than stop.
+    crouching_low: AtomicBool,
 
     /// The vet book: the robot's lifetime record. The loop hands it what it counted once a second
     /// and never waits for it — see [`vetbook`].
@@ -870,6 +873,7 @@ impl RobotState {
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
             sitting: AtomicBool::new(false),
+            crouching_low: AtomicBool::new(false),
             // In memory until `main` opens the robot's own; tests keep it that way.
             vetbook: vetbook::Book::open(None, env!("CARGO_PKG_VERSION")),
             period_us: params.period().as_micros() as u64,
@@ -3750,6 +3754,10 @@ async fn control_loop<T: RobotIo>(
             controller.as_ref().is_some_and(|c| c.is_sitting()),
             Ordering::Relaxed,
         );
+        state.crouching_low.store(
+            controller.as_ref().is_some_and(|c| c.crouching_low()),
+            Ordering::Relaxed,
+        );
 
         // The policy must not start on an unconverged orientation filter — the first
         // seconds of projected gravity are whatever the filter is mid-way through deciding,
@@ -5885,23 +5893,34 @@ fn dispatch(
             // `toggle` flips the robot's own state — the pad's Start. Evaluated here, not
             // in the client, because a client-side belief drifts (relax, shutdown, either
             // side restarting) and a stale one turns Start into a no-op every other press.
-            // On wheels Start stands a seated robot up rather than stopping it. The seat there is
-            // the held crouch the pad-loss sit, a rest or an emotion leaves it in, and the pad
-            // has no other way out of it: A, which stands a robot up on legs, runs nothing on
-            // wheels. Stopping instead would only hold the crouch with the policy off.
+            // On wheels Start never stops a crouched robot. Seated — the held crouch the pad-loss
+            // sit, a rest or an emotion leaves it in — it stands it up: A, which does that on
+            // legs, runs nothing on wheels, and stopping would only hold the crouch with the
+            // policy off. Mid-crouch and nearer the bottom, it holds the crouch down as that
+            // seat, so the next Start stands it up: cutting the policy there sends a crouched
+            // robot on wheels straight to the standing home pose, and over. Both are the sit
+            // toggle, which on wheels is exactly those two.
             if p.toggle
                 && intents.enabled()
                 && mode_of(state.mode.load(Ordering::Relaxed)) == Mode::Roller
-                && state.sitting.load(Ordering::Relaxed)
             {
-                intents.request_sit_toggle();
-                return proto::Response::ok(
-                    Some(id),
-                    &proto::IntentResult {
-                        accepted: true,
-                        reason: Some("seated on wheels — standing up".to_owned()),
-                    },
-                );
+                let reason = if state.sitting.load(Ordering::Relaxed) {
+                    Some("seated on wheels — standing up")
+                } else if state.crouching_low.load(Ordering::Relaxed) {
+                    Some("crouching on wheels — holding the crouch; Start again stands it up")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    intents.request_sit_toggle();
+                    return proto::Response::ok(
+                        Some(id),
+                        &proto::IntentResult {
+                            accepted: true,
+                            reason: Some(reason.to_owned()),
+                        },
+                    );
+                }
             }
             let on = if p.toggle { !intents.enabled() } else { p.on };
             // Never refused for being down. Start on a robot lying on the floor is exactly
@@ -6721,6 +6740,15 @@ mod tests {
         assert!(intents.take_skills().sit_toggle, "and stands up");
 
         s.sitting.store(false, Ordering::Relaxed);
+        s.crouching_low.store(true, Ordering::Relaxed);
+        start();
+        assert!(intents.enabled(), "crouching low, it keeps driving");
+        assert!(
+            intents.take_skills().sit_toggle,
+            "and holds the crouch down"
+        );
+
+        s.crouching_low.store(false, Ordering::Relaxed);
         start();
         assert!(!intents.enabled(), "standing, Start stops it as ever");
         assert!(!intents.take_skills().sit_toggle);

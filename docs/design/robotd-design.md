@@ -519,6 +519,10 @@ robot question, not a test-suite one. The seat rules above apply unchanged — p
 kept across a stop, resumed at the hold. Getting out of it is Start: `robot.enable` with `toggle`
 on a seated, driving roller robot stands it up instead of stopping it, because A — the stand on
 legs — runs nothing on wheels, and stopping would only hold the crouch with the policy off.
+Start during a running crouch nearer its bottom than its top (phase 0.05–0.55,
+`ROLLER_LOW_PHASES`) holds it down as that seat instead of stopping: a stop there sends a crouched
+robot on wheels straight to the standing home pose, and over. Nearer the top the jump is small,
+and Start stops the policy as it does everywhere else.
 
 **The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
 reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of

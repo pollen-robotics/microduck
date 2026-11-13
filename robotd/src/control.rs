@@ -116,6 +116,11 @@ pub struct SkillTuning {
 /// is the one the network was trained on.
 pub const ROLLER_SEAT_PHASE: f64 = 0.3;
 
+/// The part of the roller crouch's cycle that is nearer the bottom than the top: from halfway
+/// down (the descent ends at 0.10) to halfway up (the rise runs 0.50–0.60). A stop asked for in
+/// here stays down — see [`Controller::crouching_low`].
+pub const ROLLER_LOW_PHASES: std::ops::RangeInclusive<f64> = 0.05..=0.55;
+
 impl Default for SkillTuning {
     fn default() -> Self {
         Self {
@@ -409,6 +414,17 @@ impl Controller {
         self.sit == Sit::Sitting
     }
 
+    /// A roller crouch is running and is nearer its bottom than its top. Start then holds it
+    /// down as the seat rather than stopping the policy: cutting the policy there sends a
+    /// crouched robot on wheels straight to the standing home pose, and over.
+    pub fn crouching_low(&self) -> bool {
+        self.crouch_seat().is_some()
+            && self.sit == Sit::Up
+            && self
+                .ground_pick
+                .is_some_and(|p| ROLLER_LOW_PHASES.contains(&p))
+    }
+
     /// A scripted move is mid-flight. Sitting itself is not busy — a seated robot is
     /// parked, not travelling, and that includes one parked in a held crouch.
     pub fn busy(&self) -> bool {
@@ -479,8 +495,16 @@ impl Controller {
     /// prototype refuses it, and on the way down into the seat.
     ///
     /// On wheels the seat is the crouch held at [`ROLLER_SEAT_PHASE`]: sitting runs the crouch
-    /// down to it and stops there, and standing lets the crouch finish its cycle.
+    /// down to it and stops there, and standing lets the crouch finish its cycle. Sitting during
+    /// a crouch already running keeps it down — back to the hold if it had passed it.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
+        if let (Some(hold), Some(phase), Sit::Up) = (self.crouch_seat(), self.ground_pick, self.sit)
+        {
+            self.sit = Sit::Sitting;
+            self.ground_pick = Some(phase.min(hold));
+            self.sit_settle = (hold - phase).max(0.0) * self.skills.ground_pick_period;
+            return Ok("sit");
+        }
         if self.ground_pick.is_some() && self.sit == Sit::Up {
             return Err("a ground pick is running");
         }
@@ -1050,6 +1074,39 @@ mod tests {
             Some(ROLLER_SEAT_PHASE),
             "the shutdown sit is the crouch"
         );
+    }
+
+    /// **A sit during a running crouch keeps it down.** Low in the cycle the crouch stops at the
+    /// hold — back to it if it had passed it — and is the seat; high in it, it is not low, and
+    /// Start stops the policy as ever.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn on_wheels_a_sit_mid_crouch_holds_it_down() {
+        let mut c = full_controller();
+        c.skills.crouch_seat = Some(ROLLER_SEAT_PHASE);
+        c.skills.ground_pick_period = 5.0;
+
+        assert_eq!(c.start_ground_pick(), Ok(()));
+        assert!(!c.crouching_low(), "at the top of the cycle");
+        tick(&mut c, 0.1 * 5.0);
+        assert!(c.crouching_low(), "down");
+        tick(&mut c, 0.35 * 5.0);
+        assert!(c.crouching_low(), "still down, past the hold");
+        assert_eq!(c.sit_toggle(), Ok("sit"));
+        assert!(c.is_sitting() && !c.crouching_low());
+        tick(&mut c, 10.0);
+        assert_eq!(
+            c.ground_pick,
+            Some(ROLLER_SEAT_PHASE),
+            "back at the hold, and held"
+        );
+        assert_eq!(c.sit_toggle(), Ok("stand"));
+        tick(&mut c, 3.0);
+        assert!(!c.busy() && !c.is_sitting(), "risen: the gait has it");
+
+        assert_eq!(c.start_ground_pick(), Ok(()));
+        tick(&mut c, 0.58 * 5.0);
+        assert!(!c.crouching_low(), "nearly up: not low");
     }
 
     /// The glide down into the seat is a move too: standing up halfway down is refused.
