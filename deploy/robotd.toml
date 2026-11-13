@@ -98,7 +98,7 @@ hz = 50
 # follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist; `head_alpha` covers
 # head targets and the body pose.
 # cmd_alpha = 0.2
-# head_alpha = 0.2
+# head_alpha = 0.1
 
 # Whether the state stream carries measured joint velocity and load — `velocities` and
 # `currents_ma` on `robot.state`. The servos report both in the same twelve-byte read as
@@ -780,7 +780,7 @@ mode = "walk"
 # head_yaw_max = 2.5
 # head_roll_max = 2.5
 # expo = 0.6
-# max_speed = 3.0
+# max_speed = 10.0
 #
 # Body height in metres, tilt in radians; pitch is unbound by default.
 # [pad_body]

@@ -269,7 +269,7 @@ impl Default for PadHeadParams {
 
 impl PadHeadParams {
     pub const DEFAULT_EXPO: f64 = 0.6;
-    pub const DEFAULT_MAX_SPEED: f64 = 3.0;
+    pub const DEFAULT_MAX_SPEED: f64 = 10.0;
 
     /// One limit for every joint — `--max-head` — with the shipped shaping.
     pub fn all(max: f64) -> Self {
