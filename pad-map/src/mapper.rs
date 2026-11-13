@@ -9,6 +9,15 @@ use robotd_params::pad_axes::{AxisBinding, Sticks};
 use crate::buttons::Buttons;
 use crate::hold::{FLASHLIGHT_TAP, HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
 
+/// Which D-pad arrow selects which [`Mode`], in the order two arrows pressed in one frame
+/// resolve: the last one wins.
+const ARROWS: [(Buttons, Mode); 4] = [
+    (Buttons::UP, Mode::Head),
+    (Buttons::RIGHT, Mode::HeadDrive),
+    (Buttons::LEFT, Mode::Drive),
+    (Buttons::DOWN, Mode::BodyPose),
+];
+
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +85,7 @@ fn head_from_pad(
         head_pitch: angle(pitch, limits.head_pitch_max),
         head_yaw: angle(yaw, limits.head_yaw_max),
         head_roll: -angle(roll, limits.head_roll_max),
+        alpha: None,
     }
 }
 
@@ -121,6 +131,9 @@ pub struct Config {
     pub body: robotd_params::PadBodyParams,
     /// `[pad_roller]`: full deflection on wheels, in place of `drive`.
     pub roller_limits: robotd_params::PadRollerParams,
+    /// `[autonomous]`: how long an untouched pad drives before it lets go — see [`crate::engage`].
+    /// Whether it keeps quiet at all is `robot.mode`'s `autonomous`, not this file's `enabled`.
+    pub autonomy: robotd_params::AutonomousParams,
     pub roller: bool,
 }
 
@@ -165,6 +178,25 @@ pub struct Mapper {
     /// `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
     /// Starts false: padd starts with the robot, and a robotd restart restarts padd too.
     up: bool,
+    /// Soccer mode as this pad last knew it: from the robot's `robot.mode` answer, which the
+    /// daemon hands over with [`Mapper::set_soccer`], and from this pad's own `robot.soccer`
+    /// requests the moment it sends them — so the press after D-pad down already means
+    /// "back to manual", not a second wait for the poll.
+    soccer: proto::SoccerParams,
+    /// Buttons whose press was spent taking autonomous soccer back, until they are released: their
+    /// tap (Start's policy toggle, Home's flashlight) and X's held resend must not follow.
+    spent: Buttons,
+    /// The head pose last sent and when, for `[pad_head] max_speed`. Centred whenever no head
+    /// pose is going out, because leaving a head mode re-centres the head.
+    head: HeadSlew,
+}
+
+/// `robot.soccer` with soccer mode on, autonomous or by hand.
+fn soccer_call(autonomous: bool) -> proto::Call {
+    proto::Call::RobotSoccer(proto::SoccerParams {
+        active: true,
+        autonomous,
+    })
 }
 
 impl Default for Mapper {
@@ -184,16 +216,41 @@ impl Mapper {
             prev_rt: 0.0,
             prev_lt: 0.0,
             up: false,
+            soccer: proto::SoccerParams::default(),
+            spent: Buttons::NONE,
+            head: HeadSlew::default(),
+        }
+    }
+
+    /// What the robot says soccer mode is, from its `robot.mode` answer — `None` for off, which is
+    /// also what a robot too old to know soccer answers. Logged when it changes, since it changes
+    /// what the bumpers and D-pad down do.
+    pub fn set_soccer(&mut self, soccer: Option<proto::SoccerParams>) {
+        let soccer = soccer.unwrap_or_default();
+        if soccer != self.soccer {
+            tracing::warn!(
+                soccer = soccer.active,
+                autonomous = soccer.autonomous,
+                "soccer mode changed — {}",
+                if soccer.active {
+                    "LB/RB kick, D-pad down plays by itself, any button takes it back"
+                } else {
+                    "the pad is back to its own mapping"
+                }
+            );
+            self.soccer = soccer;
         }
     }
 
     /// The pad went away. A hold in flight was measured against it — see [`HoldButton::reset`] —
     /// and an IMU reference means nothing to the next pad.
     pub fn pad_gone(&mut self) {
+        self.spent = Buttons::NONE;
         self.start.reset();
         self.select.reset();
         self.home.reset();
         self.imu_reference = None;
+        self.head = HeadSlew::default();
     }
 
     /// One frame: the discrete intents into `out`, in the order they must be sent, and the
@@ -220,25 +277,40 @@ impl Mapper {
             self.imu_reference = None;
         }
 
+        // Autonomous soccer gives the robot back on any button, and that press does nothing
+        // else: whoever presses A to take the robot back does not also want it to sit down.
+        let mut fresh = pad.pressed;
+        if self.soccer.autonomous && fresh.0 & Buttons::KNOWN != 0 {
+            tracing::warn!("soccer: a button — back to driving by hand");
+            self.soccer.autonomous = false;
+            out.push(Out::Request(soccer_call(false)));
+            self.spent |= fresh;
+            fresh = Buttons::NONE;
+        }
+
         // The D-pad picks what the sticks mean. Two arrows pressed inside one frame resolve in
-        // this fixed order, the last one winning — which is what gilrs's event order did in
+        // [`ARROWS`]' order, the last one winning — which is what gilrs's event order did in
         // `padd` for the only case that matters, one arrow at a time.
         let mut wanted_mode = None;
-        for (button, mode) in [
-            (Buttons::UP, Mode::Head),
-            (Buttons::RIGHT, Mode::HeadDrive),
-            (Buttons::LEFT, Mode::Drive),
-            (Buttons::DOWN, Mode::BodyPose),
-        ] {
-            if pad.pressed.contains(button) {
+        for (button, mode) in ARROWS {
+            if fresh.contains(button) {
                 wanted_mode = Some(mode);
             }
+        }
+        // In soccer mode D-pad down is autonomous soccer rather than body + head. The sticks go
+        // back to plain driving, so a stick pushed while the robot plays is a stick that walks
+        // it — which is what wins over the ball in `robotd`.
+        if self.soccer.active && wanted_mode == Some(Mode::BodyPose) {
+            tracing::warn!("soccer: D-pad down — playing by itself; any button takes it back");
+            self.soccer.autonomous = true;
+            out.push(Out::Request(soccer_call(true)));
+            wanted_mode = Some(Mode::Drive);
         }
         // Which bindable buttons went down this frame, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this mapping does not know.
         let pressed = Buttons::BINDABLE
             .iter()
-            .filter(|(b, _)| pad.pressed.contains(*b))
+            .filter(|(b, _)| fresh.contains(*b))
             .map(|(_, n)| *n);
 
         // Start: a tap stands the robot up, then toggles the policy; held, it is the way home.
@@ -252,6 +324,8 @@ impl Mapper {
             // Start's one threshold acts when it is reached; its release says nothing more.
             HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
             HoldAction::Reached(_) => go_home = true,
+            // The press that took autonomous soccer back; its release toggles nothing.
+            HoldAction::Tap if self.spent.contains(Buttons::START) => {}
             HoldAction::Tap if !self.up => {
                 tracing::warn!("Start — robot.init: standing up. Press Start again to drive");
                 out.push(Out::Request(proto::Call::RobotInit));
@@ -333,8 +407,13 @@ impl Mapper {
         // against anything: which skills exist is the robot's to know, and it answers an unknown
         // one with the list it does have, which is a better error than this side could give.
         for button in pressed {
-            // An empty binding is a button switched off on purpose, not a fault.
-            let skill = cfg.skill(button);
+            // Soccer mode puts the kicks back on the bumpers, whatever they are bound to.
+            let skill = match button {
+                "lb" if self.soccer.active => "kick_left",
+                "rb" if self.soccer.active => "kick_right",
+                // An empty binding is a button switched off on purpose, not a fault.
+                _ => cfg.skill(button),
+            };
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -355,7 +434,8 @@ impl Mapper {
             pad.released.contains(Buttons::HOME),
             now,
             &[FLASHLIGHT_TAP],
-        ) {
+        ) && !self.spent.contains(Buttons::HOME)
+        {
             out.push(Out::Request(proto::Call::RobotFlashlight(
                 proto::FlashlightParams {
                     toggle: true,
@@ -373,7 +453,11 @@ impl Mapper {
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
         let held = cfg.skill("x");
-        if pad.held.contains(Buttons::X) && !pad.pressed.contains(Buttons::X) && !held.is_empty() {
+        if pad.held.contains(Buttons::X)
+            && !pad.pressed.contains(Buttons::X)
+            && !self.spent.contains(Buttons::X)
+            && !held.is_empty()
+        {
             out.push(Out::Notify(proto::Call::RobotDo(proto::DoParams {
                 skill: held.to_owned(),
             })));
@@ -445,6 +529,8 @@ impl Mapper {
         }
         self.prev_rt = rt;
         self.prev_lt = lt;
+        // A spent press is spent until its button comes back up.
+        self.spent = Buttons(self.spent.0 & !pad.released.0);
 
         let sticks = Sticks {
             left_x: pad.left_x,
@@ -460,6 +546,71 @@ impl Mapper {
         // a `Vec` per tick is an allocation fifty times a second to say what the sticks
         // were doing, which is the shape of thing this loop is meant not to do.
         stick_frame(self.mode, sticks, imu, cfg, frame);
+        self.head
+            .apply(frame, imu.is_none(), cfg.head.max_speed, now);
+    }
+}
+
+/// The longest gap between two ticks that [`HeadSlew`] spends as travel. Ticks come every 20 ms
+/// or so; one that comes a second late — a stalled client, a slow write — must not license a
+/// second's worth of head movement in a single step.
+const HEAD_SLEW_MAX_DT: f64 = 0.1;
+
+/// `[pad_head] max_speed`: the stick-driven head target moves at most that fast.
+///
+/// After the stick has been shaped and scaled, and before `robotd`'s `head_alpha` EMA. That
+/// order is the point. The EMA's speed is proportional to the distance left, so on its own a
+/// full stick snap is a jump at the start and a long crawl at the end — and lowering
+/// `head_alpha` to tame the jump lengthens the crawl. Capped here first, a big move becomes a
+/// glide at a constant speed that the EMA only rounds off at the end, while a small one never
+/// reaches the cap and feels exactly as it did.
+///
+/// Here rather than in `robotd`: it is how a pad should feel, and the other clients posing the
+/// head — the app, a tracker — keep the response `robotd` gives everyone.
+#[derive(Debug, Default)]
+struct HeadSlew {
+    /// The head pose last sent, `None` for centred.
+    sent: Option<proto::HeadParams>,
+    at: Option<Instant>,
+}
+
+impl HeadSlew {
+    /// Limit the head pose in `frame`, if it has one and the sticks drive it. A pose from the
+    /// pad's tilt goes out untouched but is remembered, so the sticks take over from it rather
+    /// than from wherever they last were.
+    fn apply(
+        &mut self,
+        frame: &mut [proto::Call],
+        from_sticks: bool,
+        max_speed: f64,
+        now: Instant,
+    ) {
+        let dt = self.at.map_or(0.0, |at| {
+            now.duration_since(at).as_secs_f64().min(HEAD_SLEW_MAX_DT)
+        });
+        self.at = Some(now);
+        let Some(target) = frame.iter_mut().find_map(|call| match call {
+            proto::Call::RobotHead(head) => Some(head),
+            _ => None,
+        }) else {
+            // No head pose this tick: a mode that does not pose the head, which re-centred it
+            // on the way in.
+            self.sent = None;
+            return;
+        };
+        if from_sticks && max_speed > 0.0 {
+            let from = self.sent.unwrap_or_default();
+            let step = max_speed * dt;
+            let toward = |from: f64, to: f64| from + (to - from).clamp(-step, step);
+            *target = proto::HeadParams {
+                neck_pitch: toward(from.neck_pitch, target.neck_pitch),
+                head_pitch: toward(from.head_pitch, target.head_pitch),
+                head_yaw: toward(from.head_yaw, target.head_yaw),
+                head_roll: toward(from.head_roll, target.head_roll),
+                alpha: target.alpha,
+            };
+        }
+        self.sent = Some(*target);
     }
 }
 
@@ -488,12 +639,16 @@ fn stick_frame(
         })
     };
     let head = &cfg.head;
+    // The head sticks go through `[pad_head] expo` first, so the travel near the centre is fine
+    // control and full deflection is still the full limit. The speed cap is [`HeadSlew`]'s.
     let look = |neck: &AxisBinding, pitch: &AxisBinding, yaw: &AxisBinding, roll: &AxisBinding| {
+        let shaped = |binding: &AxisBinding| head.shape(value(binding));
         proto::Call::RobotHead(proto::HeadParams {
-            neck_pitch: value(neck) * head.neck_pitch_max,
-            head_pitch: value(pitch) * head.head_pitch_max,
-            head_yaw: value(yaw) * head.head_yaw_max,
-            head_roll: value(roll) * head.head_roll_max,
+            neck_pitch: shaped(neck) * head.neck_pitch_max,
+            head_pitch: shaped(pitch) * head.head_pitch_max,
+            head_yaw: shaped(yaw) * head.head_yaw_max,
+            head_roll: shaped(roll) * head.head_roll_max,
+            alpha: None,
         })
     };
     match mode {
@@ -603,6 +758,173 @@ mod tests {
 
     fn cfg() -> Config {
         Config::defaults(false, &Default::default())
+    }
+
+    fn press(b: Buttons) -> PadFrame {
+        PadFrame {
+            pressed: b,
+            held: b,
+            ..Default::default()
+        }
+    }
+
+    fn release(b: Buttons) -> PadFrame {
+        PadFrame {
+            released: b,
+            ..Default::default()
+        }
+    }
+
+    fn skills(out: &[Out]) -> Vec<String> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Request(proto::Call::RobotDo(p)) => Some(p.skill.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn soccer_asks(out: &[Out]) -> Vec<proto::SoccerParams> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Request(proto::Call::RobotSoccer(p)) => Some(*p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const MANUAL: proto::SoccerParams = proto::SoccerParams {
+        active: true,
+        autonomous: false,
+    };
+    const AUTONOMOUS: proto::SoccerParams = proto::SoccerParams {
+        active: true,
+        autonomous: true,
+    };
+
+    /// Outside soccer mode nothing changes: D-pad down is body + head, the bumpers are bindings.
+    #[test]
+    fn outside_soccer_mode_the_pad_is_its_own() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(soccer_asks(&out).is_empty());
+        assert_eq!(m.mode, Mode::BodyPose);
+        m.tick(
+            &press(Buttons::LB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(
+            !skills(&out).iter().any(|s| s.starts_with("kick")),
+            "{out:?}"
+        );
+    }
+
+    /// Soccer mode: the bumpers kick, D-pad down plays by itself and hands the sticks to driving.
+    #[test]
+    fn soccer_mode_kicks_on_the_bumpers_and_plays_on_down() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.set_soccer(Some(MANUAL));
+        m.tick(
+            &press(Buttons::LB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(skills(&out), ["kick_left"]);
+        m.tick(
+            &press(Buttons::RB),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(skills(&out), ["kick_right"]);
+
+        m.tick(
+            &press(Buttons::UP),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(m.mode, Mode::Head);
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert_eq!(soccer_asks(&out), [AUTONOMOUS]);
+        assert_eq!(m.mode, Mode::Drive, "not body + head");
+        assert!(
+            out.contains(&Out::Notify(proto::Call::RobotHead(Default::default()))),
+            "leaving head mode puts the head back: {out:?}"
+        );
+    }
+
+    /// Autonomous: any button takes the robot back, and does nothing else — A does not sit it, and
+    /// Start's release does not toggle the policy. The next press is an ordinary press again.
+    #[test]
+    fn any_button_takes_autonomous_soccer_back_and_is_spent_on_it() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let now = Instant::now();
+        m.set_soccer(Some(AUTONOMOUS));
+
+        m.tick(&press(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [MANUAL]);
+        assert!(skills(&out).is_empty(), "the press is spent: {out:?}");
+        m.tick(&release(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        m.tick(&press(Buttons::LB), &cfg, now, &mut out, &mut frame);
+        assert_eq!(skills(&out), ["kick_left"], "manual soccer again");
+        assert!(soccer_asks(&out).is_empty());
+
+        // Start: back to manual on the press, and its tap toggles nothing on the release.
+        m.tick(&press(Buttons::DOWN), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [AUTONOMOUS]);
+        m.tick(&release(Buttons::DOWN), &cfg, now, &mut out, &mut frame);
+        m.tick(&press(Buttons::START), &cfg, now, &mut out, &mut frame);
+        assert_eq!(soccer_asks(&out), [MANUAL]);
+        let later = now + std::time::Duration::from_millis(100);
+        m.tick(&release(Buttons::START), &cfg, later, &mut out, &mut frame);
+        assert!(
+            !out.iter().any(|o| matches!(
+                o,
+                Out::Request(proto::Call::RobotEnable(_) | proto::Call::RobotInit)
+            )),
+            "{out:?}"
+        );
+    }
+
+    /// The robot switching soccer off — another tag, `robotctl` — gives the pad its mapping back.
+    #[test]
+    fn soccer_switched_off_elsewhere_gives_the_pad_back() {
+        let (mut m, cfg) = (Mapper::new(), cfg());
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        m.set_soccer(Some(MANUAL));
+        m.set_soccer(None);
+        m.tick(
+            &press(Buttons::DOWN),
+            &cfg,
+            Instant::now(),
+            &mut out,
+            &mut frame,
+        );
+        assert!(soccer_asks(&out).is_empty());
+        assert_eq!(m.mode, Mode::BodyPose);
     }
 
     /// The whole path a frame takes: a D-pad edge changes mode once, a held one does not change
@@ -1063,6 +1385,7 @@ mod tests {
         );
 
         cfg.head.head_yaw_max = 0.7;
+        cfg.head.expo = 0.0;
         cfg.axes.head.head_yaw.source = AxisSource::RightY;
         cfg.axes.head.head_yaw.gain = 0.5;
         let t = flat(&calls(Mode::Head, &cfg, sticks(0.0, 0.0, 0.0, 1.0)));
@@ -1077,6 +1400,170 @@ mod tests {
         cfg.roller_limits.vyaw_max = 0.1;
         let t = flat(&calls(Mode::HeadDrive, &cfg, sticks(-1.0, 0.0, 0.0, 0.0)));
         assert_eq!(t[2], 0.1);
+    }
+
+    /// `[pad_head] expo`: fine near the centre, the full limit at full deflection, and the same
+    /// both ways. `0` is the linear stick it used to be.
+    #[test]
+    fn expo_makes_the_middle_of_the_head_stick_fine() {
+        let mut cfg = cfg();
+        let yaw =
+            |cfg: &Config, x: f64| flat(&calls(Mode::Head, cfg, sticks(-x, 0.0, 0.0, 0.0)))[5];
+        assert_eq!(cfg.head.expo, 0.6, "the shipped curve");
+        assert!(
+            (yaw(&cfg, 0.5) - 2.5 * 0.275).abs() < 1e-9,
+            "half a stick is 27.5 %"
+        );
+        assert!(
+            (yaw(&cfg, -0.5) + 2.5 * 0.275).abs() < 1e-9,
+            "and the same the other way"
+        );
+        assert_eq!(yaw(&cfg, 1.0), 2.5, "full stick is still the full limit");
+        for x in [0.1, 0.3, 0.7, 0.9] {
+            assert!(yaw(&cfg, x) < yaw(&cfg, x + 0.05), "monotonic at {x}");
+        }
+        cfg.head.expo = 0.0;
+        assert_eq!(yaw(&cfg, 0.5), 1.25, "expo 0 is linear");
+        // Not the body: only the head sticks are curved.
+        let pitch = flat(&calls(Mode::BodyPose, &cfg, sticks(0.0, 0.5, 0.0, 0.0)))[7];
+        cfg.head.expo = 1.0;
+        assert_eq!(
+            flat(&calls(Mode::BodyPose, &cfg, sticks(0.0, 0.5, 0.0, 0.0)))[7],
+            pitch
+        );
+    }
+
+    /// Head mode's yaw, sent for the yaw stick (the left one, pushed left) at `x`, one tick at `at` milliseconds.
+    fn head_yaw_at(m: &mut Mapper, cfg: &Config, t0: Instant, at: u64, x: f64) -> Option<f64> {
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let pad = PadFrame {
+            left_x: -x,
+            ..Default::default()
+        };
+        m.tick(
+            &pad,
+            cfg,
+            t0 + std::time::Duration::from_millis(at),
+            &mut out,
+            &mut frame,
+        );
+        frame.iter().find_map(|c| match c {
+            proto::Call::RobotHead(h) => Some(h.head_yaw),
+            _ => None,
+        })
+    }
+
+    /// Press the arrow for `mode`, whichever one the D-pad layout has it on.
+    fn enter(m: &mut Mapper, cfg: &Config, t0: Instant, at: u64, mode: Mode) {
+        let (arrow, _) = *ARROWS
+            .iter()
+            .find(|(_, m)| *m == mode)
+            .expect("every mode has an arrow");
+        let (mut out, mut frame) = (Vec::new(), Vec::new());
+        let pad = PadFrame {
+            pressed: arrow,
+            held: arrow,
+            ..Default::default()
+        };
+        m.tick(
+            &pad,
+            cfg,
+            t0 + std::time::Duration::from_millis(at),
+            &mut out,
+            &mut frame,
+        );
+    }
+
+    /// `[pad_head] max_speed`: a full stick snap glides to the limit at the cap's speed and
+    /// arrives, where it used to land on the first tick; a small move is under the cap and goes
+    /// out as it is.
+    #[test]
+    fn a_head_stick_snap_glides_at_max_speed_and_a_small_move_does_not() {
+        let (mut m, mut cfg, t0) = (Mapper::new(), cfg(), Instant::now());
+        cfg.head.max_speed = 2.5; // the full 2.5 rad in one second
+        enter(&mut m, &cfg, t0, 0, Mode::Head);
+        let mut yaw = 0.0;
+        for tick in 1..=50 {
+            yaw = head_yaw_at(&mut m, &cfg, t0, 20 * tick, 1.0).unwrap();
+            assert!(
+                (yaw - 0.05 * tick as f64).abs() < 1e-9,
+                "tick {tick}: {yaw}"
+            );
+        }
+        assert!((yaw - 2.5).abs() < 1e-9);
+        assert_eq!(
+            head_yaw_at(&mut m, &cfg, t0, 1_020, 1.0),
+            Some(2.5),
+            "and stays"
+        );
+
+        // From there, a nudge of the stick is less than one tick's travel: it goes out whole.
+        let nudged = head_yaw_at(&mut m, &cfg, t0, 1_040, 0.995).unwrap();
+        assert_eq!(nudged, 2.5 * cfg.head.shape(0.995));
+
+        // A late tick does not spend its whole gap at once.
+        let after = head_yaw_at(&mut m, &cfg, t0, 3_040, -1.0).unwrap();
+        assert!(
+            (nudged - after - 2.5 * HEAD_SLEW_MAX_DT).abs() < 1e-9,
+            "{after}"
+        );
+
+        // `0` is no cap: the target goes out on the first tick, as it used to.
+        cfg.head.max_speed = 0.0;
+        assert_eq!(head_yaw_at(&mut m, &cfg, t0, 3_060, 1.0), Some(2.5));
+    }
+
+    /// Leaving the head modes re-centres the head, so coming back glides from the centre — not
+    /// from wherever the head was before it was put back. The pad going away does the same.
+    #[test]
+    fn the_head_glide_starts_from_the_centre_after_a_mode_change() {
+        let (mut m, mut cfg, t0) = (Mapper::new(), cfg(), Instant::now());
+        cfg.head.max_speed = 2.5;
+        enter(&mut m, &cfg, t0, 0, Mode::Head);
+        for tick in 1..=60 {
+            head_yaw_at(&mut m, &cfg, t0, 20 * tick, 1.0);
+        }
+        enter(&mut m, &cfg, t0, 1_220, Mode::Drive);
+        head_yaw_at(&mut m, &cfg, t0, 1_240, 1.0);
+        enter(&mut m, &cfg, t0, 1_260, Mode::Head);
+        let yaw = head_yaw_at(&mut m, &cfg, t0, 1_280, 1.0).unwrap();
+        assert!((yaw - 0.05).abs() < 1e-9, "from the centre: {yaw}");
+
+        m.pad_gone();
+        let yaw = head_yaw_at(&mut m, &cfg, t0, 5_000, 1.0).unwrap();
+        assert_eq!(yaw, 0.0, "a new pad's first tick has no gap to spend");
+    }
+
+    /// The speed cap is the sticks': a head that follows the pad's tilt follows it at once.
+    #[test]
+    fn the_imu_head_is_not_speed_capped() {
+        let mut slew = HeadSlew::default();
+        let t0 = Instant::now();
+        let pose = proto::HeadParams {
+            head_yaw: 1.0,
+            ..Default::default()
+        };
+        let mut frame = vec![proto::Call::RobotHead(pose)];
+        slew.apply(&mut frame, false, 0.1, t0);
+        slew.apply(
+            &mut frame,
+            false,
+            0.1,
+            t0 + std::time::Duration::from_millis(20),
+        );
+        assert_eq!(frame, vec![proto::Call::RobotHead(pose)]);
+        // And the sticks take over from where the tilt left the head.
+        let mut frame = vec![proto::Call::RobotHead(proto::HeadParams::default())];
+        slew.apply(
+            &mut frame,
+            true,
+            1.0,
+            t0 + std::time::Duration::from_millis(40),
+        );
+        let proto::Call::RobotHead(h) = frame[0] else {
+            unreachable!()
+        };
+        assert!((h.head_yaw - 0.98).abs() < 1e-9, "{h:?}");
     }
 
     /// With the pad's IMU on the head, head + move takes the *drive* bindings for the sticks —

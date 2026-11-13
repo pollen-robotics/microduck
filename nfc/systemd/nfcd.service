@@ -6,7 +6,8 @@
 [Unit]
 Description=Robot NFC reader daemon
 Documentation=file:///opt/robot/daemon/current/docs/architecture.md
-# It also serves `nfc.write` — writing a tag, for `robotctl nfc-flash` and, through btd, `duckctl` —
+# It also serves `nfc.write` and `nfc.read` — writing and reading a tag, for `robotctl nfc-flash` /
+# `nfc-read` and, through btd, `duckctl` —
 # on /run/nfcd/nfc.sock: nfcd's, group `robot`, mode 0660.
 #
 # `After`, not `Requires`: a touch is answered by configd (pad.pair) and robotd (the quack), and

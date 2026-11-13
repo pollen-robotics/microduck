@@ -139,6 +139,13 @@ const NRT_STEP_US: f64 = 64.0 / 13.56;
 const GUARD: Duration = Duration::from_millis(5);
 /// Field off this long puts every tag back in IDLE (the CLRC663 driver measured 10 ms).
 const FIELD_RESET: Duration = Duration::from_millis(10);
+/// Between two reads of the IRQ status while waiting on the chip.
+///
+/// With no tag there, every ask runs to its no-response timeout — about 50 ms a poll across both
+/// antennas and both protocols — so this sets the daemon's idle cost: each read is an SPI ioctl
+/// and a sleep, two wakeups. At 200 µs that was ~1,700 a second and ~10% of a core on the beta
+/// (2026-11-06). A millisecond adds at most that to each exchange that does get an answer.
+const IRQ_POLL: Duration = Duration::from_millis(1);
 
 /// Which of the board's two antennas the field is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +368,7 @@ impl<B: Bus> St25r100<B> {
             if Instant::now() > until {
                 return Err(Error::Desync(format!("timed out waiting for {what}")));
             }
-            sleep(Duration::from_micros(200));
+            sleep(IRQ_POLL);
         }
     }
 }
@@ -462,7 +469,7 @@ impl<B: Bus> Reader for St25r100<B> {
                     seen[0], seen[1], seen[2]
                 )));
             }
-            sleep(Duration::from_micros(200));
+            sleep(IRQ_POLL);
         }
 
         let mut status = [0u8; 2];

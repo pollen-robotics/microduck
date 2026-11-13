@@ -1990,7 +1990,9 @@ mod tests {
                 "pickup",
                 "theremin",
                 "laser",
+                "soccer",
                 "head_imu",
+                "map",
                 "audio",
                 "emotions",
                 "media",
@@ -2003,7 +2005,8 @@ mod tests {
                 "pad_head",
                 "pad_body",
                 "pad_roller",
-                "netpad"
+                "netpad",
+                "autonomous"
             ]
         );
     }

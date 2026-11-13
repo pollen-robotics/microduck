@@ -17,6 +17,7 @@ docs give the reasoning and point at it.
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
+| [`nfc-tags.md`](robot/nfc-tags.md) | NFC tags: the pairing tag, the mode tags (walk, roller, laser, soccer), which tags work, writing one with `nfc-flash`, reading one with `nfc-read`, and reading the journal. |
 | [`udp-pad.md`](robot/udp-pad.md) | A pad on the LAN over UDP: turning it on, `duckctl udp-pad`, and the wire format for writing your own sender. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
@@ -53,6 +54,8 @@ own the mechanism is the bug.
 | [`webrtc-console.md`](design/webrtc-console.md) | The WebRTC client: serving it from the robot, finding the robot, and what the page should be. |
 | [`remote-access-design.md`](design/remote-access-design.md) | Reaching a duck from outside the LAN: the Hugging Face account, the device flow, and the bridge to a rendezvous service. |
 | [`boot-recovery-net.md`](design/boot-recovery-net.md) | Falling back to golden when the release that booted cannot start its daemons. |
+| [`mapping-design.md`](design/mapping-design.md) | `mapd` and `maploc`: the onboard map from the ToF and the legs, a stop as the unit of mapping, losing and finding itself, what is kept. |
+| [`autonomous.md`](design/autonomous.md) | `autod`, the duck on its own: the brain, booting without a pad, the pad's takeover, and ToF obstacle avoidance. |
 | [`simulation.md`](design/simulation.md) | The twin: where the seam between daemon and body is, the body protocol, the fake radio, the containers, and what it is and is not a twin of. |
 
 ## `project/` — you are running the project

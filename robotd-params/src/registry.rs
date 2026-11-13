@@ -390,6 +390,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    entry(
+        "safety.limp_fall_standup_ms",
+        Kind::Integer,
+        "How long a stand-up may take before it is re-posed and retried",
+    ),
+    entry(
+        "safety.limp_fall_standup_retries",
+        Kind::Integer,
+        "Stuck stand-ups retried in a row before parking at home; 0 is off",
+    ),
+    entry(
+        "safety.limp_fall_standup_resume_ms",
+        Kind::Integer,
+        "How long a parked robot must stand still on its feet to resume",
+    ),
     // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
         "duck_detector.enabled",
@@ -694,11 +709,184 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Raise (+) or lower (-) the floor if reported distances are off, metres",
     ),
+    // ── [soccer] ─────────────────────────────────────────────────────────────
+    entry(
+        "soccer.socket",
+        Kind::Text,
+        "mediad's local socket (media.ball)",
+    ),
+    entry(
+        "soccer.u_min",
+        Kind::Integer,
+        "Blue chroma (U) a ball pixel must reach, 0-255, 128 = grey — read peak in robotctl soccer",
+    ),
+    entry(
+        "soccer.v_min",
+        Kind::Integer,
+        "Red chroma (V) a ball pixel must reach, 0-255, 128 = grey",
+    ),
+    entry(
+        "soccer.y_min",
+        Kind::Integer,
+        "Luma a ball pixel must reach, 0-255",
+    ),
+    entry(
+        "soccer.min_cells",
+        Kind::Integer,
+        "Fewest 4x4-pixel cells that make a ball — raise if it chases specks",
+    ),
+    entry(
+        "soccer.min_fill",
+        Kind::Float,
+        "How much of its box the blob must fill, 0-1 (a disc is 0.79)",
+    ),
+    entry(
+        "soccer.max_aspect",
+        Kind::Float,
+        "Longest over shortest side of the blob, for a blob clear of the edge",
+    ),
+    entry(
+        "soccer.search_hz",
+        Kind::Float,
+        "Looks per second with no ball in sight",
+    ),
+    entry(
+        "soccer.track_hz",
+        Kind::Float,
+        "Looks per second while following the ball",
+    ),
+    entry("soccer.head", Kind::Bool, "Point the head at the ball"),
+    entry(
+        "soccer.walk",
+        Kind::Bool,
+        "Walk to the ball — off to tune the detector on a robot that stays put",
+    ),
+    entry("soccer.kick", Kind::Bool, "Kick once lined up"),
+    entry(
+        "soccer.ball_radius_m",
+        Kind::Float,
+        "The ball's radius, metres",
+    ),
+    entry(
+        "soccer.memory_ms",
+        Kind::Integer,
+        "How long a ball out of sight is still walked to, milliseconds",
+    ),
+    entry(
+        "soccer.close_memory_ms",
+        Kind::Integer,
+        "The same within approach_m, where the ball is under the beak, milliseconds",
+    ),
+    entry(
+        "soccer.max_range_m",
+        Kind::Float,
+        "Ignore balls projected farther than this, metres",
+    ),
+    entry(
+        "soccer.floor_offset_m",
+        Kind::Float,
+        "Raise (+) or lower (-) the floor if reported distances are off, metres",
+    ),
+    entry(
+        "soccer.search_vyaw",
+        Kind::Float,
+        "Turn rate while no ball is known, rad/s, + is left; 0 stands still",
+    ),
+    entry(
+        "soccer.approach_m",
+        Kind::Float,
+        "Nearer than this, line a foot up rather than walk at the ball, metres",
+    ),
+    entry(
+        "soccer.align_rad",
+        Kind::Float,
+        "Turn in place until the ball is this close to straight ahead, then walk, radians",
+    ),
+    entry(
+        "soccer.kick_x_m",
+        Kind::Float,
+        "Ball centre this far ahead of the trunk to kick, metres",
+    ),
+    entry(
+        "soccer.kick_y_m",
+        Kind::Float,
+        "Ball centre this far to the side to kick, metres (+ for kick_left)",
+    ),
+    entry(
+        "soccer.tol_x_m",
+        Kind::Float,
+        "How far off kick_x_m still kicks, metres",
+    ),
+    entry(
+        "soccer.tol_y_m",
+        Kind::Float,
+        "How far off kick_y_m still kicks, metres",
+    ),
+    entry(
+        "soccer.settle_ms",
+        Kind::Integer,
+        "How long the ball must sit in the kick spot first, milliseconds",
+    ),
+    entry(
+        "soccer.stall_ms",
+        Kind::Integer,
+        "Near the spot this long without reaching it, kick from there, milliseconds",
+    ),
+    entry(
+        "soccer.ready_ms",
+        Kind::Integer,
+        "Lined up, stand still with the head neutral this long before kicking, milliseconds",
+    ),
+    entry(
+        "soccer.cooldown_ms",
+        Kind::Integer,
+        "After a kick, how long before looking again, milliseconds",
+    ),
+    entry("soccer.k_x", Kind::Float, "Forward speed per metre to go"),
+    entry(
+        "soccer.k_y",
+        Kind::Float,
+        "Sideways speed per metre to go while lining up",
+    ),
+    entry(
+        "soccer.k_yaw",
+        Kind::Float,
+        "Turn rate per radian of bearing",
+    ),
+    entry("soccer.vx_max", Kind::Float, "Fastest forward speed, m/s"),
+    entry(
+        "soccer.vy_max",
+        Kind::Float,
+        "Fastest sideways speed while lining up, m/s",
+    ),
+    entry("soccer.vyaw_max", Kind::Float, "Fastest turn, rad/s"),
     // ── [head_imu] ───────────────────────────────────────────────────────────
     feature(
         "head_imu.enabled",
         Kind::Bool,
         "Read the head IMU at all — default off on zero3 (BMI088, ~4% of a core), on on beta (LSM6DSV16X, fused on the chip)",
+    ),
+    // ── [map] ────────────────────────────────────────────────────────────────
+    feature(
+        "map.enabled",
+        Kind::Bool,
+        "Build the onboard map from the ToF and the legs (mapd); it maps where the robot stops",
+    ),
+    entry("map.path", Kind::Text, "Where the map is kept"),
+    entry(
+        "map.autosave_s",
+        Kind::Integer,
+        "Seconds between saves while the map changes — what a power cut can lose",
+    ),
+    entry(
+        "map.state_hz",
+        Kind::Integer,
+        "How often mapd reads the robot state, Hz",
+    ),
+    entry(
+        "map.tof_latency_ms",
+        Kind::Float,
+        "How long before its stamp a depth frame was captured, ms — wrong smears walls",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -1175,6 +1363,16 @@ pub const REGISTRY: &[Entry] = &[
         "Full-deflection head roll, radians",
     ),
     entry(
+        "pad_head.expo",
+        Kind::Float,
+        "Head stick response curve, 0–1 — higher is finer near the centre, full stick unchanged",
+    ),
+    entry(
+        "pad_head.max_speed",
+        Kind::Float,
+        "Fastest the sticks move the head target, rad/s; 0 is no cap",
+    ),
+    entry(
         "pad_body.z_min",
         Kind::Float,
         "Full crouch, metres — negative",
@@ -1243,6 +1441,19 @@ pub const REGISTRY: &[Entry] = &[
         "netpad.timeout_ms",
         Kind::Integer,
         "Silence after which the UDP client counts as gone — at least stale_ms",
+    ),
+    // ── [autonomous] ─────────────────────────────────────────────────────────
+    //
+    // Read by `autod`, and by `padd`, which stays silent until the pad is touched while it is on.
+    feature(
+        "autonomous.enabled",
+        Kind::Bool,
+        "The duck on its own at boot: stands up with no pad, wanders, plays; touching the pad takes over — `robotctl autonomous on` switches it now",
+    ),
+    entry(
+        "autonomous.pad_idle_s",
+        Kind::Float,
+        "Seconds of an untouched pad before the duck takes back over",
     ),
 ];
 
@@ -1463,6 +1674,7 @@ mod tests {
                 "theremin.enabled",
                 "laser.enabled",
                 "head_imu.enabled",
+                "map.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
@@ -1477,6 +1689,7 @@ mod tests {
                 "pad.lb",
                 "pad.rb",
                 "pad_imu_head_control.enabled",
+                "autonomous.enabled",
             ]
         );
     }

@@ -30,7 +30,7 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
     config_socket: PathBuf,
 
-    /// `nfcd`'s socket — writing a tag.
+    /// `nfcd`'s socket — writing and reading a tag.
     #[arg(long, default_value = duck_ipc_proto::socket::NFC)]
     nfc_socket: PathBuf,
 

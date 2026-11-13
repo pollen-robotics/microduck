@@ -780,7 +780,16 @@ duckctl --name <robot-name> nfc-flash walk_mode
 
 The duck asks for a tag with its pad-lost sound; touch a tag to its head within 20 seconds
 (`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
-[`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
+[`nfc-tags.md`](nfc-tags.md#writing-a-tag).
+
+## Reading an NFC tag
+
+```bash
+duckctl --name <robot-name> nfc-read
+```
+
+The same wait, then the tag's UID and records as `nfc.read` answers them, as JSON. While it waits
+the tag is only read, never acted on — [`nfc-tags.md`](nfc-tags.md#reading-a-tag).
 
 ## Anything else — `call`
 

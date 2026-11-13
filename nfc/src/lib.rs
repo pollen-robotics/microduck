@@ -12,6 +12,7 @@
 //! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
 
 pub mod clrc663;
+pub mod modes;
 pub mod ndef;
 pub mod pairing;
 pub mod reader;
@@ -39,12 +40,19 @@ pub enum Error {
     Collision(String),
     /// A tag answered, and wrongly.
     Tag(String),
+    /// A tag answered properly and is not one this reader reads: a MIFARE Classic, whose sectors
+    /// open only after a Crypto1 authentication. Asking again gives the same answer, so it is said
+    /// once per touch rather than retried.
+    Unreadable(String),
 }
 
 impl Error {
     /// Is this about the tag — absent, doubled, badly placed — rather than the reader?
     pub fn is_tag(&self) -> bool {
-        matches!(self, Self::NoTag | Self::Collision(_) | Self::Tag(_))
+        matches!(
+            self,
+            Self::NoTag | Self::Collision(_) | Self::Tag(_) | Self::Unreadable(_)
+        )
     }
 }
 
@@ -60,7 +68,7 @@ impl std::fmt::Display for Error {
             ),
             Self::NoTag => write!(f, "no tag"),
             Self::Collision(why) => write!(f, "several tags in the field: {why}"),
-            Self::Tag(why) => write!(f, "{why}"),
+            Self::Tag(why) | Self::Unreadable(why) => write!(f, "{why}"),
         }
     }
 }

@@ -21,12 +21,31 @@ const ACK: u8 = 0x0A;
 pub const PAGE_USER_START: u8 = 4;
 pub const PAGE_USER_END: u8 = 129;
 
+/// A selected tag: its UID, and the SAK its last cascade level answered — which says what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selected {
+    pub uid: Vec<u8>,
+    pub sak: u8,
+}
+
+/// Whether a SAK is a MIFARE Classic's: bit 4 (`08`) — `08` for a 1K, `18` for a 4K, `09` for a
+/// Mini, `88` for Infineon's 1K. An NTAG answers `00`. A Classic selects like an NTAG and then
+/// refuses its READ until a Crypto1 authentication, which nothing here does.
+pub fn is_mifare_classic(sak: u8) -> bool {
+    sak & 0x08 != 0
+}
+
+/// Wake whatever tag is in the field and select it, returning only its UID. See [`select_tag`].
+pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
+    select_tag(chip).map(|tag| tag.uid)
+}
+
 /// Wake whatever tag is in the field — WUPA rather than REQA, since it also wakes one in HALT —
-/// and select it. Returns its UID.
+/// and select it.
 ///
 /// Resets the field first: see [`crate::clrc663::Clrc663::reset_field`] for why that is what makes a second read
 /// in a session work.
-pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
+pub fn select_tag<R: Reader>(chip: &mut R) -> Result<Selected> {
     chip.reset_field()?;
     let atqa = chip.transceive(&[CMD_WUPA], Exchange::bare(5, 7))?;
     if atqa.len() != 2 {
@@ -70,7 +89,7 @@ pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
             uid.extend([a, b, c, d]);
         }
         if sak & 0x04 == 0 {
-            return Ok(uid);
+            return Ok(Selected { uid, sak });
         }
     }
     Err(Error::Tag(
