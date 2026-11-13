@@ -627,14 +627,8 @@ impl Controller {
             match self.sit {
                 // The posture flag rides the twist vx slot: 1 = sit, 0 = stand. Head and
                 // body slots stay live — the prototype keeps them in the buffer too.
-                Sit::Sitting => {
-                    c.twist = [1.0, 0.0, 0.0];
-                    (Net::SitStand, c, "sit".into())
-                }
-                Sit::Rising { .. } => {
-                    c.twist = [0.0; 3];
-                    (Net::SitStand, c, "rise".into())
-                }
+                Sit::Sitting => (Net::SitStand, seat_command(command, true), "sit".into()),
+                Sit::Rising { .. } => (Net::SitStand, seat_command(command, false), "rise".into()),
                 Sit::Up => {
                     if body_active {
                         c.twist = [0.0; 3];
@@ -764,9 +758,47 @@ impl Controller {
     }
 }
 
+/// The command the sit/stand network is given while the robot sits (`sitting`) or rises.
+///
+/// The posture flag rides the twist vx slot: 1 = sit, 0 = stand. The head slots stay live — the
+/// prototype keeps them in the buffer too, and a head posed while seated sits fine. The standing
+/// body pose (z, roll, pitch) does not: it is a standing-only input, and held through a sit it
+/// leaves the robot half-way down. Measured in the twin, roll 0.25 held when A was pressed sat to
+/// a knee of 26° where a plain sit reaches 75°, with `sit_toggle` answering "accepted" throughout.
+/// So the pad's body-pose mode, or any client holding a `robot.pose`, cannot spoil the seat.
+fn seat_command(command: &Command, sitting: bool) -> Command {
+    let mut c = *command;
+    c.twist = if sitting { [1.0, 0.0, 0.0] } else { [0.0; 3] };
+    c.body = Default::default();
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body pose held when the robot sits or rises must not reach the sit/stand network; the
+    /// head, and the posture flag in the twist, still do.
+    #[test]
+    fn a_held_body_pose_does_not_reach_the_sit_network() {
+        let held = Command {
+            twist: [0.3, 0.1, 0.2],
+            head: [0.1, -0.2, 0.9, 0.05],
+            body: duck_control::obs::BodyPose {
+                z: -0.025,
+                roll: 0.25,
+                pitch: -0.25,
+            },
+        };
+        let sit = seat_command(&held, true);
+        assert_eq!(sit.twist, [1.0, 0.0, 0.0], "the posture flag: sit");
+        assert_eq!(sit.body, Default::default(), "no body pose while sitting");
+        assert_eq!(sit.head, held.head, "the head stays live");
+        let rise = seat_command(&held, false);
+        assert_eq!(rise.twist, [0.0; 3], "the posture flag: stand");
+        assert_eq!(rise.body, Default::default(), "no body pose while rising");
+        assert_eq!(rise.head, held.head);
+    }
 
     #[test]
     #[ignore = "requires ONNX Runtime >= 1.23"]
