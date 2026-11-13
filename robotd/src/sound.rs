@@ -314,11 +314,13 @@ impl Sound {
         self.spawn(&wav, blocking);
     }
 
-    /// Play the bank's first `tag` wav by name, the same one every time, where [`Self::play`]
-    /// picks one at random: a cue someone learns to recognise has to sound alike each time.
-    /// Silent without a bank, as `play` is.
-    pub fn play_same(&mut self, tag: &str) {
-        if let Some(wav) = self.files(tag).into_iter().next() {
+    /// Play the bank's `nth` `tag` wav by name (counting from 0, wrapping round a short bank),
+    /// the same one every time, where [`Self::play`] picks one at random: a cue someone learns to
+    /// recognise has to sound alike each time. Silent without a bank, as `play` is.
+    pub fn play_same(&mut self, tag: &str, nth: usize) {
+        let mut files = self.files(tag);
+        if !files.is_empty() {
+            let wav = files.swap_remove(nth % files.len());
             self.play_file(&wav);
         }
     }
@@ -942,7 +944,7 @@ mod tests {
     fn a_missing_bank_is_silent_not_fatal() {
         let mut sound = Sound::new(PathBuf::from("/nonexistent/bank"), "default".into());
         sound.play("chirp", false);
-        sound.play_same("chirp");
+        sound.play_same("chirp", 1);
         sound.wheee(WheeeHold::Held);
         sound.wheee(WheeeHold::Released);
         assert!(sound.child.is_none());
