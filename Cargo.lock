@@ -857,6 +857,7 @@ dependencies = [
  "async-trait",
  "clap",
  "duck-ipc-proto",
+ "evdev",
  "futures",
  "libc",
  "robotd-params",

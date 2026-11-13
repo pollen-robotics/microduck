@@ -550,6 +550,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
 /// refused by name; nothing else on the wire changed.
 ///
+/// Since daemon 0.22, a 5 s hold of the face button (behind a hole, so it takes a pin) opens it
+/// for 30 minutes too: hands on the robot, which is the line BLE crossed. `configd::wifi_ssh` owns
+/// it; it is not on the wire, so the API version is unchanged.
+///
 /// # v56 — writing a tag
 ///
 /// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
