@@ -17,7 +17,7 @@ use duck_ipc_proto as proto;
 use futures::StreamExt;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::net::{Net, NetResult};
+use crate::net::{JoinTracker, Net, NetResult};
 
 /// Values from NetworkManager's own `nm-dbus-interface.h`, read from upstream rather than
 /// remembered. These are the numbers that make "you typed the password wrong" reportable, which
@@ -30,6 +30,11 @@ mod ids {
 
     pub const STATE_UNAVAILABLE: u32 = 20;
     pub const STATE_DISCONNECTED: u32 = 30;
+    pub const STATE_PREPARE: u32 = 40;
+    pub const STATE_CONFIG: u32 = 50;
+    pub const STATE_IP_CONFIG: u32 = 70;
+    pub const STATE_IP_CHECK: u32 = 80;
+    pub const STATE_SECONDARIES: u32 = 90;
     pub const STATE_ACTIVATED: u32 = 100;
     pub const STATE_FAILED: u32 = 120;
 
@@ -208,12 +213,14 @@ trait Connection {
 
 pub struct NetworkManager {
     bus: zbus::Connection,
+    joins: JoinTracker,
 }
 
 impl NetworkManager {
     pub async fn new() -> zbus::Result<Self> {
         Ok(Self {
             bus: zbus::Connection::system().await?,
+            joins: JoinTracker::default(),
         })
     }
 
@@ -355,6 +362,21 @@ fn security_of(flags: u32, rsn: u32, wpa: u32) -> proto::Security {
 ///
 /// This mapping is the payoff for choosing NetworkManager: `BadKey` is a distinct, actionable
 /// answer, and no other stack on the board reports it.
+/// The step a device state means during a join, or `None` for a state that says nothing about this
+/// join — the old network's deactivation passing through, most often, which leaves the step as it
+/// was.
+fn step_of(state: u32) -> Option<proto::JoinStep> {
+    match state {
+        ids::STATE_PREPARE => Some(proto::JoinStep::Associating),
+        ids::STATE_CONFIG => Some(proto::JoinStep::Authenticating),
+        ids::STATE_NEED_AUTH => Some(proto::JoinStep::KeyRejected),
+        ids::STATE_IP_CONFIG | ids::STATE_IP_CHECK | ids::STATE_SECONDARIES => {
+            Some(proto::JoinStep::Addressing)
+        }
+        _ => None,
+    }
+}
+
 fn failure_of(state: u32, reason: u32) -> (proto::ConnectFailure, Option<String>) {
     let detail = Some(format!("NetworkManager state {state}, reason {reason}"));
     let failure = match reason {
@@ -380,6 +402,7 @@ impl Net for NetworkManager {
                 ip6: None,
                 mac: None,
                 iface: None,
+                joining: self.joins.snapshot(),
             });
         };
 
@@ -457,6 +480,7 @@ impl Net for NetworkManager {
             ip6,
             mac: wireless.hw_address().await.ok(),
             iface: device.interface().await.ok(),
+            joining: self.joins.snapshot(),
         })
     }
 
@@ -548,6 +572,11 @@ impl Net for NetworkManager {
     }
 
     async fn connect(&self, ssid: &str, psk: Option<&str>) -> NetResult<proto::ConnectResult> {
+        // Announced before anything else, so a `net.status` asked a moment after this call sees
+        // it. Dropped on every return, which is what clears it. The bound is the two waits this
+        // function has; the profile calls between them are quick, so it holds in practice.
+        let join = self.joins.begin(ssid, SCAN_WAIT + CONNECT_TIMEOUT);
+
         let Some(device_path) = self.wifi_device().await? else {
             return Ok(proto::ConnectResult::Failed {
                 reason: proto::ConnectFailure::Unsupported,
@@ -673,6 +702,7 @@ impl Net for NetworkManager {
             .await
             .map_err(bus_err)?;
 
+        join.step(proto::JoinStep::Associating);
         let (added, activation) = match manager
             .add_and_activate_connection(settings, &device, &root)
             .await
@@ -766,6 +796,11 @@ impl Net for NetworkManager {
                 () = tokio::time::sleep(Duration::from_millis(500)) => {}
                 Some(transition) = transitions.next() => {
                     if let Ok(args) = transition.args()
+                        && let Some(step) = step_of(*args.new_state())
+                    {
+                        join.step(step);
+                    }
+                    if let Ok(args) = transition.args()
                         && (*args.new_state() == ids::STATE_FAILED
                             || *args.new_state() == ids::STATE_NEED_AUTH)
                         && *args.reason() != 0
@@ -841,6 +876,27 @@ mod tests {
             ),
             proto::Security::Enterprise
         );
+    }
+
+    /// A join's steps come from the device's transitions, so the mapping is what `joining` shows.
+    /// The ones that must not move the step are the old network's deactivation and the end
+    /// states, which pass through during a join that has not finished.
+    #[test]
+    fn device_states_map_to_join_steps() {
+        use proto::JoinStep::*;
+        assert_eq!(step_of(ids::STATE_PREPARE), Some(Associating));
+        assert_eq!(step_of(ids::STATE_CONFIG), Some(Authenticating));
+        assert_eq!(step_of(ids::STATE_NEED_AUTH), Some(KeyRejected));
+        assert_eq!(step_of(ids::STATE_IP_CONFIG), Some(Addressing));
+        assert_eq!(step_of(ids::STATE_IP_CHECK), Some(Addressing));
+        for unrelated in [
+            ids::STATE_DISCONNECTED,
+            ids::STATE_ACTIVATED,
+            110, // DEACTIVATING
+            ids::STATE_FAILED,
+        ] {
+            assert_eq!(step_of(unrelated), None, "state {unrelated}");
+        }
     }
 
     /// The reason mapping is why NetworkManager was chosen over netplan, so the one that matters

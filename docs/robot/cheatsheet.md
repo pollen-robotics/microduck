@@ -219,7 +219,7 @@ Three properties worth trusting:
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
 for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s on a zero3 and `robotd`'s on a beta), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]`,
-`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `sudo`, because the file
+`[pad_imu_head_control]` and the other `pad_` sections, which the pad daemon picks up within a second. `[autonomous] enabled` is read at the next boot. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -745,6 +745,9 @@ Pairing is once per pad and has a page of its own —
 pad without forgetting the first, and what to do when it will not bond (the `Privacy` setting in
 `/etc/bluetooth/main.conf` is the answer more often than anything else).
 
+On a robot with an NFC reader, a tag does the pairing with nothing typed, and other tags switch the
+mode — [`nfc-tags.md`](nfc-tags.md), which also has `robotctl nfc-flash` for writing one and `robotctl nfc-read` for reading one.
+
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. Each
 part of the pad has one job — face buttons and bumpers run skills, the D-pad picks what the sticks
 mean, and the two small middle buttons are holds, so nothing that cuts torque fires on a brush of
@@ -754,14 +757,14 @@ the thumb:
 | --- | --- |
 | **A** / cross | sit ↔ stand |
 | **B** / circle | ground pick |
-| **LB / RB** | the yes / no emotions |
+| **LB / RB** | the yes / no emotions — the kicks in [soccer mode](#play-soccer) |
 | **Y** | the excited emotion |
 | **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
 | **D-pad right** | head + move: left stick forward/back and turn, right stick looks around (head yaw and pitch). With `[pad_imu_head_control] enabled` and a pad that has an IMU, the pad's tilt poses the head instead and the sticks keep the move mapping — see below |
-| **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
+| **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk. In [soccer mode](#play-soccer), the robot plays by itself instead |
 | **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
 | **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
 | **Select**, held 2 s | rest (`robot.rest`), at once, without waiting for the release — the robot sitting down says the two seconds are up: a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
@@ -808,7 +811,8 @@ happens in move mode. `journalctl -fu robotd` logs each spell starting and stopp
 in `[idle]` — `sudo robotctl configure`, then restart `robotd`.
 
 On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. Forward and
+shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. A and X
+run nothing on wheels, whatever `[pad]` binds to them. Forward and
 back ramp at 1 m/s² (`[policy] accel_vx`), so a full reversal takes about a second rather than
 throwing it over; turning keeps its usual response. It does not
 look around when idle: the head command is a policy input, and the roller network collapses under
@@ -1029,7 +1033,8 @@ robotctl laser-track off
 
 A red laser dot on the floor is looked at and walked to. It shares the robot rather than taking
 it: a pushed stick wins over the dot, and with no dot in sight the robot does what the pad says —
-so it can be left on while driving. The video stream is untouched; `mediad` scans the frames it
+so it can be left on while driving. An NFC tag reading `laser_mode` switches it on, and the walk,
+roller and soccer tags off — [`nfc-tags.md`](nfc-tags.md). The video stream is untouched; `mediad` scans the frames it
 already has, once a second while searching and ~15 times once it sees a dot. Measured on a
 face-board-v1: searching costs about 1% of one core, and tracking was about 15% while every look
 scanned the whole frame, 8 points of it the scan. A tracking look now scans around the dot, about
@@ -1061,6 +1066,97 @@ It uses the camera geometry `mediad` already publishes — the family calibratio
 sensor (IMX219 on the Zero 3W, GC2093 on `beta` and `face-board-v1`), or this robot's own
 `[media.intrinsics]` — and the board's mount (a quarter turn on the Zero 3W, upright on the
 others). If neither is known, the readout says so instead of guessing.
+
+### Play soccer
+
+```
+robotctl soccer on      # soccer mode by hand, and watch; Ctrl-C stops watching, the mode stays
+robotctl soccer auto    # play by itself
+robotctl soccer         # just watch
+robotctl soccer off
+```
+
+Touching an NFC tag that says `soccer_mode` does what `on` does (and puts the robot in `walk`); the
+walk, roller and laser tags end it — [`nfc-tags.md`](nfc-tags.md).
+
+**Soccer mode** changes two things on the pad: **LB / RB kick** with the left and right foot,
+whatever they are bound to, and **D-pad down** sets the robot **playing by itself** — it turns in
+place until it sees the purple ball, walks to it, steps sideways until the ball is in front of the
+foot on its side, kicks, and looks for it again. **Any button** takes it back to soccer by hand;
+that press does nothing else (A does not also sit it down). **The robot quacks once as it starts
+playing by itself and twice as it stops**, whoever switched it: the pad, `robotctl soccer` or the
+duck on its own. The quacks are always the same ones, and the two of the pair differ. A pushed stick wins over autonomous play while it is pushed, as it does over
+the laser. Soccer and laser tracking switch each other off.
+
+The pad learns of a switch made elsewhere — a tag, `robotctl` — within a second.
+
+The readout, while playing:
+
+```
+  BALL ( 402, 611) r=22    peak Y 86 U169 V145  15Hz  → 0.62 m  -14° (size 0.60 m)  approaching +0.20 +0.00 m/s -0.37 rad/s  kicks 2
+  not round (n=40)         peak Y 90 U160 V140   5Hz                                searching +0.00 +0.00 m/s +0.50 rad/s  kicks 2
+```
+
+The web console draws the same over the video while the robot plays: a purple ring at the size the
+ball was seen, a dashed amber one on a purple blob that was rejected, and `ball` in the stats row.
+
+Tuning, all in `[soccer]` (`robotctl configure`, every key applies live; `walk = false` tunes on a
+robot that stays put):
+
+- **Colour.** Purple is the hue with both chromas above grey (128): `peak` is the most purple
+  thing in the picture, passed or not. Hold the ball up, read it, and set `u_min` and `v_min` a
+  little below; take it away and check the room's `peak` sits clearly short of them.
+- **Shape.** `min_cells` (4×4-pixel cells), `min_fill` and `max_aspect`; `too small`, `not filled`
+  and `not round` say which rejected a blob. A ball cut by the picture's edge skips the roundness
+  test — it is under the beak for the last steps.
+- **Distance.** The `→` distance is from the floor; `size` is from the ball's apparent width. Two
+  that disagree want `floor_offset_m` (or a camera calibration).
+- **The kick.** The ball is kicked once it sits at `kick_x_m` ahead and `kick_y_m` to the side of the
+  trunk, within `tol_x_m`/`tol_y_m`, for `settle_ms`. +`kick_y_m` is the left foot (`kick_left`); a
+  robot whose kicks come out mirrored wants it negative. `cooldown_ms` covers the kick and the ball
+  rolling away.
+- **Walking.** It turns in place until it faces the ball within `align_rad`, then walks straight
+  at it; within `approach_m` it does the same aiming the kicking foot. `search_vyaw` (0 stands
+  still while searching), `k_x`, `k_y`, `k_yaw`, `vx_max`, `vy_max`, `vyaw_max`.
+- **No kick?** `spot +x +y` in the readout is how far the ball is from the kick spot, metres. The
+  robot kicks once that is inside `tol_x_m`/`tol_y_m` for `settle_ms`, or inside twice them for
+  `stall_ms` (it has stalled short) — then it stands still with its head neutral for `ready_ms`
+  (`getting ready`) and kicks, because the kick starts from where it was trained to. A refused kick says `soccer: kick refused; trying again` in
+  the journal with robotd's reason, and the robot keeps the ball and asks again. Within `approach_m` the ball is remembered for
+  `close_memory_ms`, since the camera may not see it under the beak.
+
+The kicks are the `kick_left` / `kick_right` skills, which ship in the policy set; a robot without
+them says so in the journal when it tries.
+
+### The duck on its own (`autod`)
+
+Off by default. Switch it on now — or touch an `autonomous_mode` NFC tag to the head:
+
+```bash
+robotctl autonomous on         # until the next boot; `off` stops it, no argument says
+sudo robotctl configure        # features → autonomous.enabled: on at every boot
+```
+
+The robot stands itself up with no pad, and wanders, looks around, grooms, naps, answers when
+spoken to, and turns away from what the head ToF sees ahead. It chases a laser dot whenever one
+shows up, until it is tired and naps. Now and then it goes looking for the purple ball and plays
+with it for a while, until it has had enough; if there is no ball around, it stops looking for a
+while. It maps the room as it goes (`robotctl map`).
+
+At boot it stands up **once**: if you stop it (Start, Select), it stays stopped until you press
+Start again, switch it off and on, or reboot, even if `autod` restarts. Any other mode tag (walk,
+roller, laser, soccer) switches it off, and it then stands still where it is.
+
+A connected pad stays silent until you touch it. Touching it takes over at once, and
+`autonomous.pad_idle_s` (30 s) after your last touch the duck takes back over. What it thinks it is
+doing, one line per change of mind:
+
+```bash
+journalctl -u autod -f
+```
+
+With no depth frames it still looks around and grooms, but it never walks: it only advances along a
+path it has seen. [`autonomous.md`](../design/autonomous.md) is the design.
 
 ### The ToF sensor (`tofd`)
 

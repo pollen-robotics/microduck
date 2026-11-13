@@ -337,6 +337,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "autod"
+version = "0.21.1"
+dependencies = [
+ "clap",
+ "duck-ipc-proto",
+ "kinematics",
+ "robotd-params",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -563,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "btd"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "bluer",
  "clap",
@@ -838,11 +852,12 @@ dependencies = [
 
 [[package]]
 name = "configd"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "clap",
  "duck-ipc-proto",
+ "evdev",
  "futures",
  "libc",
  "robotd-params",
@@ -1287,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "duck-auth"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "base64",
  "serde",
@@ -1298,14 +1313,14 @@ dependencies = [
 
 [[package]]
 name = "duck-ble"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "uuid",
 ]
 
 [[package]]
 name = "duck-control"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "duck-ipc-proto",
  "libloading 0.8.9",
@@ -1321,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "duck-detect"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1335,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ether"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -1348,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "duck-gateway"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "duck-auth",
@@ -1361,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "duck-ipc-proto"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "libc",
  "semver",
@@ -1372,14 +1387,19 @@ dependencies = [
 
 [[package]]
 name = "duckctl"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "btleplug",
  "clap",
  "cpal",
+ "dbus",
+ "dbus-crossroads",
+ "dbus-tokio",
+ "duck-auth",
  "duck-ble",
  "duck-ipc-proto",
  "futures",
+ "getrandom 0.3.4",
  "gilrs",
  "libdbus-sys",
  "libloading 0.9.0",
@@ -2735,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "kinematics"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "roxmltree",
  "serde",
@@ -2907,6 +2927,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
+name = "mapd"
+version = "0.21.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "duck-ipc-proto",
+ "libc",
+ "maploc",
+ "robotd-params",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "maploc"
+version = "0.21.1"
+dependencies = [
+ "duck-ipc-proto",
+ "kinematics",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2933,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "mediad"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3173,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "netpadd"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -3189,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "nfc"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -3502,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "odometry"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -3572,14 +3621,14 @@ checksum = "06503bb33f294c5f1ba484011e053bfa6ae227074bdb841e9863492dc5960d4b"
 
 [[package]]
 name = "pad-imu"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "duck-ipc-proto",
 ]
 
 [[package]]
 name = "pad-map"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "duck-ipc-proto",
  "pad-imu",
@@ -3592,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "padd"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "duck-ipc-proto",
@@ -3701,7 +3750,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pet-detect"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4198,7 +4247,7 @@ dependencies = [
 
 [[package]]
 name = "robotctl"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -4220,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "robotd"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "arc-swap",
  "clap",
@@ -4251,7 +4300,7 @@ dependencies = [
 
 [[package]]
 name = "robotd-params"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "duck-ipc-proto",
  "kinematics",
@@ -4340,9 +4389,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.46"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -4810,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "sounds"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5014,7 +5063,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "minisign",
@@ -5123,7 +5172,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tof"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "anyhow",
  "bmi088",
@@ -5551,7 +5600,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -5621,7 +5670,7 @@ dependencies = [
 
 [[package]]
 name = "uyvy"
-version = "0.19.0"
+version = "0.21.1"
 
 [[package]]
 name = "valuable"
@@ -6111,7 +6160,7 @@ checksum = "636f85e5ca6488e96401b61eb7de54f4e44755c988af0f52cf90230c312a1a89"
 
 [[package]]
 name = "xtask"
-version = "0.19.0"
+version = "0.21.1"
 dependencies = [
  "clap",
  "minisign",

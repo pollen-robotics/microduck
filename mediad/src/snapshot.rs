@@ -15,6 +15,7 @@ pub(crate) async fn fetch(socket: &Path) -> Result<(proto::MediaFrameHeader, Vec
             proto::Id::Number(1),
             &proto::Call::Hello(proto::HelloParams {
                 api_version: proto::API_VERSION,
+                client: None,
             }),
         );
         let mut line = serde_json::to_vec(&request)?;

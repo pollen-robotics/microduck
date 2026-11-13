@@ -74,12 +74,12 @@ impl Robotd {
         }
     }
 
-    /// Whether this robot is on wheels. `None` for an answer that did not say.
-    pub async fn ask_roller(&mut self) -> std::io::Result<Option<bool>> {
+    /// The robot's mode — on wheels or not, and soccer mode. `None` for an answer that did not
+    /// say.
+    pub async fn ask_mode(&mut self) -> std::io::Result<Option<proto::ModeResult>> {
         Ok(self
             .request(&proto::Call::RobotMode)
             .await?
-            .and_then(|a| a.result_as::<proto::ModeResult>().ok())
-            .map(|m| m.mode == "roller"))
+            .and_then(|a| a.result_as::<proto::ModeResult>().ok()))
     }
 }

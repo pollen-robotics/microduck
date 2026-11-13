@@ -30,6 +30,10 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// `nfcd`'s socket — writing and reading a tag.
+    #[arg(long, default_value = duck_ipc_proto::socket::NFC)]
+    nfc_socket: PathBuf,
+
     /// Retained for compatibility with existing service overrides. Pairing is now required
     /// unless `--insecure-no-pairing` is explicitly selected for a controlled bench.
     #[arg(long, conflicts_with = "insecure_no_pairing")]
@@ -101,6 +105,7 @@ async fn main() -> ExitCode {
         updater: args.update_socket,
         robot: args.robot_socket,
         config: args.config_socket,
+        nfc: args.nfc_socket,
     };
     // The hostname is only a last resort now: `configd` derives a distinguishable default from the
     // board's SoC serial, so `radxa-zero3` appears only when `configd` cannot be reached at all.

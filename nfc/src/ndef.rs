@@ -1,4 +1,7 @@
-//! NDEF, read-only and limited to text and URI records — and whether they ask to pair a gamepad.
+//! NDEF, limited to text and URI records — and whether they ask to pair a gamepad. A MIME
+//! `text/plain` record reads as text too: some phone apps write that rather than a text record,
+//! and the person holding the tag cannot tell the difference. Read, and
+//! written only as one text record ([`text_tlv`]), which is all `nfc.write` puts on a tag.
 //!
 //! Pure: no hardware, entirely testable off a board.
 
@@ -6,9 +9,18 @@ const TLV_NULL: u8 = 0x00;
 const TLV_NDEF: u8 = 0x03;
 const TLV_TERMINATOR: u8 = 0xFE;
 
+const FLAG_MB: u8 = 0x80;
 const FLAG_ME: u8 = 0x40;
 const FLAG_SR: u8 = 0x10;
 const FLAG_IL: u8 = 0x08;
+const TNF_MASK: u8 = 0x07;
+const TNF_WELL_KNOWN: u8 = 0x01;
+/// A record whose type is a MIME type (RFC 2046), e.g. `text/plain`.
+const TNF_MEDIA: u8 = 0x02;
+
+/// The language a written text record says it is in. Readers ignore it — [`parse`] does — and
+/// `en` is what phone apps write by default.
+const LANG: &[u8] = b"en";
 
 /// The NFC Forum abbreviation table: a URI record's first byte indexes it.
 const URI_PREFIXES: [&str; 36] = [
@@ -117,6 +129,10 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         i += payload_len;
 
         match (kind, payload.split_first()) {
+            // The whole payload is the text: a MIME record has no status or language byte.
+            _ if header & TNF_MASK == TNF_MEDIA && is_plain_text(kind) => {
+                records.push(Record::Text(String::from_utf8_lossy(payload).into_owned()));
+            }
             (b"T", Some((&status, rest))) => {
                 let lang = (status & 0x3F) as usize;
                 let text = rest.get(lang..).unwrap_or_default();
@@ -137,6 +153,13 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         }
     }
     Ok(records)
+}
+
+/// Whether a MIME type is `text/plain`, whatever its case and parameters
+/// (`text/plain; charset=utf-8`).
+fn is_plain_text(mime: &[u8]) -> bool {
+    let essence = mime.split(|&b| b == b';').next().unwrap_or_default();
+    essence.trim_ascii().eq_ignore_ascii_case(b"text/plain")
 }
 
 /// The NDEF TLV's payload, skipping NULL TLVs and any other TLV before it.
@@ -170,6 +193,47 @@ fn message(data: &[u8]) -> Result<&[u8], String> {
     Err("no NDEF message: a blank or unformatted tag".into())
 }
 
+/// A tag's user memory holding `text` as its one record: the NDEF TLV, then the terminator —
+/// what a phone app writes for a text, and what [`parse`] reads back as [`Record::Text`].
+///
+/// Refused only for a text whose message no TLV length can say (64 KiB); whether it fits the tag
+/// is the tag's question, asked by [`crate::tag::write_ndef_area`].
+pub fn text_tlv(text: &str) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(1 + LANG.len() + text.len());
+    payload.push(LANG.len() as u8); // UTF-8, and the language's length
+    payload.extend(LANG);
+    payload.extend(text.as_bytes());
+
+    let mut record = Vec::with_capacity(payload.len() + 7);
+    match u8::try_from(payload.len()) {
+        Ok(len) => record.extend([FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN, 1, len]),
+        Err(_) => {
+            record.extend([FLAG_MB | FLAG_ME | TNF_WELL_KNOWN, 1]);
+            record.extend((payload.len() as u32).to_be_bytes());
+        }
+    }
+    record.push(b'T');
+    record.extend(payload);
+
+    let mut tlv = vec![TLV_NDEF];
+    match u16::try_from(record.len()) {
+        Ok(len) if len < 0xFF => tlv.push(len as u8),
+        Ok(len) if len < 0xFFFF => {
+            tlv.push(0xFF);
+            tlv.extend(len.to_be_bytes());
+        }
+        _ => {
+            return Err(format!(
+                "a text of {} bytes is too long for any tag",
+                text.len()
+            ));
+        }
+    }
+    tlv.extend(record);
+    tlv.push(TLV_TERMINATOR);
+    Ok(tlv)
+}
+
 /// What a pairing tag holds: every one is written with this text, and none names a pad.
 pub const PAIRING: &str = "microduck_gamepad_pairing";
 
@@ -197,6 +261,31 @@ mod tests {
     }
 
     #[test]
+    fn a_written_text_reads_back_as_itself() {
+        for text in ["walk_mode", PAIRING, "é🦆", ""] {
+            let tlv = text_tlv(text).unwrap();
+            assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+            assert_eq!(parse(&tlv).unwrap(), [Record::Text(text.into())]);
+        }
+        // What `text_tag` above — a phone app's layout — holds, byte for byte but the language.
+        let short = text_tlv("walk_mode").unwrap();
+        assert_eq!(&short[..7], [TLV_NDEF, 16, 0xD1, 1, 12, b'T', 2]);
+    }
+
+    /// Past 255 bytes the record takes a four-byte length and the TLV a three-byte one; both
+    /// still read back.
+    #[test]
+    fn a_long_text_takes_the_long_lengths() {
+        let text = "a".repeat(300);
+        let tlv = text_tlv(&text).unwrap();
+        assert_eq!(&tlv[..2], [TLV_NDEF, 0xFF]);
+        assert_eq!(tlv[4] & FLAG_SR, 0);
+        assert_eq!(tlv_size(&tlv), Some(tlv.len()));
+        assert_eq!(parse(&tlv).unwrap(), [Record::Text(text)]);
+        assert!(text_tlv(&"a".repeat(70_000)).is_err());
+    }
+
+    #[test]
     fn a_text_record_reads_back_without_its_language() {
         let records = parse(&text_tag(PAIRING)).unwrap();
         assert_eq!(records, vec![Record::Text(PAIRING.into())]);
@@ -209,6 +298,47 @@ mod tests {
             parse(&data).unwrap(),
             vec![Record::Uri("https://ab".into())]
         );
+    }
+
+    /// One MIME record, the way NFC Tools shows "Media : text/plain".
+    fn mime_tag(mime: &str, text: &str) -> Vec<u8> {
+        let mut record = vec![
+            FLAG_MB | FLAG_ME | FLAG_SR | TNF_MEDIA,
+            mime.len() as u8,
+            text.len() as u8,
+        ];
+        record.extend(mime.as_bytes());
+        record.extend(text.as_bytes());
+        let mut tag = vec![TLV_NDEF, record.len() as u8];
+        tag.extend(record);
+        tag.push(TLV_TERMINATOR);
+        tag
+    }
+
+    /// A MIME `text/plain` record pairs and switches modes like a text record: its payload is the
+    /// text, with no language byte to skip.
+    #[test]
+    fn a_plain_text_mime_record_reads_as_text() {
+        for mime in ["text/plain", "Text/Plain", "text/plain; charset=utf-8"] {
+            let records = parse(&mime_tag(mime, PAIRING)).unwrap();
+            assert_eq!(records, [Record::Text(PAIRING.into())], "{mime}");
+            assert!(asks_to_pair(&records));
+        }
+        assert_eq!(
+            parse(&mime_tag("text/plain", "walk_mode")).unwrap(),
+            [Record::Text("walk_mode".into())]
+        );
+    }
+
+    /// Any other MIME type is skipped, as any other record is — and a well-known record whose
+    /// type happens to read `text/plain` is not a MIME record.
+    #[test]
+    fn other_mime_records_are_skipped() {
+        assert_eq!(parse(&mime_tag("text/html", PAIRING)).unwrap(), []);
+        assert_eq!(parse(&mime_tag("application/json", PAIRING)).unwrap(), []);
+        let mut well_known = mime_tag("text/plain", PAIRING);
+        well_known[2] = FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN;
+        assert_eq!(parse(&well_known).unwrap(), []);
     }
 
     #[test]

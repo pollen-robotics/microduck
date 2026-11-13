@@ -2344,6 +2344,8 @@ mod tests {
             config: dir.join("config.sock"),
             pad: dir.join("pad.sock"),
             tof: dir.join("tof.sock"),
+            nfc: dir.join("nfc.sock"),
+            map: dir.join("map.sock"),
         }
     }
 

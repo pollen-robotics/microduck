@@ -2,16 +2,17 @@
 //! Type 5 (ISO 15693) tags.
 //!
 //! A port of `ntag663` from the winnie repo, cut down to what `nfcd` does — find a tag, read its
-//! NDEF — and without its writer, which stays a bench tool on a laptop. The measurements behind
+//! NDEF, and write one text onto a tag when asked (`nfc.write`). The measurements behind
 //! the driver's choices (two soft resets, a field reset before every WUPA, no IRQ polling loop)
 //! were made on that board and are kept next to the code they justify.
 //!
 //! Layered as the Python is: [`transport`] frames register accesses over the serial link,
 //! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
-//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
+//! reads and writes, [`vtag`] the ISO 15693 inventory and the Type 5 reads and writes, [`ndef`] is pure parsing and encoding.
 //! [`pairing`] is what `nfcd` does with a tag, and is the part worth testing on a laptop.
 
 pub mod clrc663;
+pub mod modes;
 pub mod ndef;
 pub mod pairing;
 pub mod reader;
@@ -39,12 +40,19 @@ pub enum Error {
     Collision(String),
     /// A tag answered, and wrongly.
     Tag(String),
+    /// A tag answered properly and is not one this reader reads: a MIFARE Classic, whose sectors
+    /// open only after a Crypto1 authentication. Asking again gives the same answer, so it is said
+    /// once per touch rather than retried.
+    Unreadable(String),
 }
 
 impl Error {
     /// Is this about the tag — absent, doubled, badly placed — rather than the reader?
     pub fn is_tag(&self) -> bool {
-        matches!(self, Self::NoTag | Self::Collision(_) | Self::Tag(_))
+        matches!(
+            self,
+            Self::NoTag | Self::Collision(_) | Self::Tag(_) | Self::Unreadable(_)
+        )
     }
 }
 
@@ -60,7 +68,7 @@ impl std::fmt::Display for Error {
             ),
             Self::NoTag => write!(f, "no tag"),
             Self::Collision(why) => write!(f, "several tags in the field: {why}"),
-            Self::Tag(why) => write!(f, "{why}"),
+            Self::Tag(why) | Self::Unreadable(why) => write!(f, "{why}"),
         }
     }
 }
