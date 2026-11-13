@@ -22,11 +22,10 @@
 //!
 //! While tracking, a look scans only a window around the last dot ([`WINDOW_RADII`] times
 //! `radius_px` each way, about 4% of a 720p frame at the defaults), and the whole frame when the
-//! dot is not found near where it was ([`FOLLOW_RADII`]), and once every [`FULL_SCAN_EVERY`]. What
-//! that changes: a higher-scoring dot outside the window, or a red thing within `FOLLOW_RADII` of a
-//! dot that jumped away, holds until the next whole-frame scan, a second at most, where the old scan
-//! settled it on the next look; and `peak` outside the window is as of that scan. [`Scope`]
-//! decides.
+//! dot is not found near where it was ([`FOLLOW_RADII`]), and once every [`FULL_SCAN_EVERY`]. So a
+//! higher-scoring dot outside the window, or a red thing within `FOLLOW_RADII` of a dot that jumped
+//! away, takes over at the next whole-frame scan, a second at most; and `peak` outside the window
+//! is as of that scan. [`Scope`] decides.
 
 use duck_ipc_proto::{LaserDetectParams, LaserDot};
 use uyvy::Turn;
@@ -45,9 +44,8 @@ pub const WINDOW_RADII: usize = 4;
 
 /// How far from the last dot the window's answer may be and still count as that dot, in
 /// `radius_px`: 48 px at the default 24. Further, the laser may have jumped away and left a red
-/// thing behind in the window, so the same look scans the whole frame and takes its answer, as
-/// every look did before the window. A dot that moves this far between two looks costs a whole
-/// scan, nothing more.
+/// thing behind in the window, so the same look scans the whole frame and takes its answer. A dot
+/// that moves this far between two looks costs a whole-frame scan, nothing more.
 pub const FOLLOW_RADII: usize = 2;
 
 /// How often a look scans the whole frame while tracking, window or not (the first look after it
@@ -479,7 +477,7 @@ where
 {
     tracing::info!(?params, "laser: looking");
     // Where the last dot was and when the whole frame was last scanned: the window's memory, one
-    // per subscription, so a new one starts with a whole frame scan.
+    // per subscription, so a new one starts with a whole-frame scan.
     let mut scope = Scope::default();
     let looks = Looks {
         name: "laser",
