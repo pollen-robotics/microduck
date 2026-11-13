@@ -394,12 +394,8 @@ them, and every owner does nothing on a board without its LED.
 | Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
 | Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
 | Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
-| Network | `gb:{green,blue}` | `configd` | Blue when reachable from outside the LAN (the relay is registered with a live heartbeat); otherwise green on wifi, blinking green while joining, off without. |
+| Network | `gb:{green,blue}` | `configd` | Green on wifi, blinking green while joining. Without wifi, blue while a bonded Bluetooth gamepad is connected; off with neither. Wifi wins: a robot on wifi with a pad connected shows green. |
 | Battery | `gr1:{green,red}`, `green2`, `green1` (bottom to top) | `robotd` | A three-step gauge filling up from `gr1`: three green above 70%, two above 40%, one above 15%; then `gr1` red, blinking at 5% and below. 3% hysteresis on each step. Off until the first reading. |
-
-The network LED reads one fact it does not own: whether `mediad`'s relay is registered, from the
-file `mediad` publishes for readers (`/run/mediad/remote.json`). It still has one writer, because
-green and blue from two daemons would show both at once.
 
 Every owner writes only on a change, which leaves `robotctl led` usable as a bench override until
 the owner next has something new to say; switches its LEDs off when it stops; and has an
