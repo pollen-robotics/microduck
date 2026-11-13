@@ -50,8 +50,11 @@
 //! active — a robot that keeps walking because you started posing its head is a bad surprise —
 //! and leaving a mode puts back what it moved: the body snaps to nominal, the head re-centres.
 //!
-//! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), not here: this
-//! process sends raw targets, so every client gets the same feel.
+//! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), so every client gets the
+//! same feel. One exception is the pad's own: the head sticks go through `[pad_head] expo` (a
+//! response curve, for fine movements) and `max_speed` (a cap on how fast they move the head
+//! target, so a full snap glides rather than jumps) in `pad-map`, because that is how a thumb on
+//! a stick should feel, not how every client's head should.
 //!
 //! ## Roller mode
 //!

@@ -62,7 +62,13 @@ impl Config {
             self.axes.deadzone = deadzone;
         }
         if let Some(max_head) = overrides.max_head {
-            self.head = robotd_params::PadHeadParams::all(max_head);
+            // The limits only: the file's `expo` and `max_speed` are not what `--max-head` says.
+            let (expo, max_speed) = (self.head.expo, self.head.max_speed);
+            self.head = robotd_params::PadHeadParams {
+                expo,
+                max_speed,
+                ..robotd_params::PadHeadParams::all(max_head)
+            };
         }
     }
 

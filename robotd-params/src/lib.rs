@@ -2878,7 +2878,7 @@ impl Default for Control {
         Self {
             hz: 50,
             cmd_alpha: 0.2,
-            head_alpha: 0.2,
+            head_alpha: 0.1,
             publish_velocity_and_load: true,
         }
     }
@@ -3282,12 +3282,16 @@ impl Params {
             ("pad_head.head_pitch_max", self.pad_head.head_pitch_max),
             ("pad_head.head_yaw_max", self.pad_head.head_yaw_max),
             ("pad_head.head_roll_max", self.pad_head.head_roll_max),
+            ("pad_head.max_speed", self.pad_head.max_speed),
             ("pad_body.pitch_max", self.pad_body.pitch_max),
             ("pad_body.roll_max", self.pad_body.roll_max),
         ] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(invalid(key, "must be finite and nonnegative"));
             }
+        }
+        if !(self.pad_head.expo.is_finite() && (0.0..=1.0).contains(&self.pad_head.expo)) {
+            return Err(invalid("pad_head.expo", "must be finite and in [0, 1]"));
         }
         for (key, min, max) in std::iter::once((
             "pad_body.z".to_owned(),
@@ -3506,6 +3510,8 @@ mod tests {
             "[pad_axes.drive.vx]\ngain = inf",
             "[pad_axes.drive.vx]\nsource = 'typo'",
             "[pad_head]\nhead_yaw_max = -1.0",
+            "[pad_head]\nexpo = 1.5",
+            "[pad_head]\nmax_speed = -1.0",
             "[pad_body]\nz_min = 0.01",
             "[pad_roller]\nvx_max = -0.2",
         ] {
@@ -5067,7 +5073,7 @@ mod tests {
     fn command_smoothing_defaults_match_the_prototype() {
         let c = Control::default();
         assert_eq!(c.cmd_alpha, 0.2);
-        assert_eq!(c.head_alpha, 0.2);
+        assert_eq!(c.head_alpha, 0.1);
     }
 
     /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset,
