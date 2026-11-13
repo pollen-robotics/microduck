@@ -604,7 +604,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///   a pad take over, so it would fight the pad. That is the consequence of a half-updated robot:
 ///   updating moves every daemon together.
 /// - **A v59 client reading a v60 robot** ignores the new fields; nothing it reads changed.
-pub const API_VERSION: u32 = 60;
+///
+/// # v61 — reading a tag
+///
+/// [`method::NFC_READ`]: `nfcd` reads the next tag touched and says what is on it, on the same
+/// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
+/// else on the wire changed.
+pub const API_VERSION: u32 = 61;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -684,7 +690,7 @@ pub mod socket {
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
 
-    /// `nfcd`'s — [`super::method::NFC_WRITE`], and nothing else. Under `/run/nfcd/`, its
+    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and nothing else. Under `/run/nfcd/`, its
     /// `RuntimeDirectory=`, for the same reason as the pad's.
     pub const NFC: &str = "/run/nfcd/nfc.sock";
 }
@@ -945,6 +951,13 @@ pub mod method {
     /// (Type 5) too, formatted first if blank. A MIFARE Classic, a locked tag or a text too long
     /// for the tag is refused with why, and nothing on it changes.
     pub const NFC_WRITE: &str = "nfc.write";
+    /// Read the next tag touched to the reader, or one already lying on it, and say what it
+    /// holds: its UID and its NDEF text and URI records. The answer comes when a tag has been
+    /// read or when none was touched in time; see [`super::NfcReadResult`]. Answered by `nfcd`.
+    ///
+    /// While a read waits, the tag touched is read rather than acted on: reading a pairing tag
+    /// does not pair, reading a mode tag does not switch the mode.
+    pub const NFC_READ: &str = "nfc.read";
     /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
     /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
     ///
@@ -1502,6 +1515,8 @@ pub enum Call {
     HeadImuStream,
     /// Write a text onto the next tag touched; see [`method::NFC_WRITE`]. Answered by `nfcd`.
     NfcWrite(NfcWriteParams),
+    /// Read the next tag touched; see [`method::NFC_READ`]. Answered by `nfcd`.
+    NfcRead(NfcReadParams),
     /// Answered by `mapd`; see [`method::MAP_STATUS`].
     MapStatus,
     MapStream,
@@ -1527,7 +1542,7 @@ pub enum Service {
     Pad,
     /// `tofd` — the depth stream.
     Tof,
-    /// `nfcd` — writing a tag.
+    /// `nfcd` — writing and reading a tag.
     Nfc,
     /// `mapd` — the map and the pose in it.
     Map,
@@ -1598,6 +1613,7 @@ impl Call {
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::NfcWrite(_) => method::NFC_WRITE,
+            Call::NfcRead(_) => method::NFC_READ,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
@@ -1890,7 +1906,7 @@ impl Call {
             //
             // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
             // own lane.
-            Call::NfcWrite(_) => (Nfc, Operation),
+            Call::NfcWrite(_) | Call::NfcRead(_) => (Nfc, Operation),
             // ── mapd ────────────────────────────────────────────────────────
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
@@ -1969,6 +1985,7 @@ impl Call {
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
             Call::NfcWrite(p) => encode(p),
+            Call::NfcRead(p) => encode(p),
             Call::RobotSoccer(p) => encode(p),
             Call::RobotAutonomous(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -2072,6 +2089,10 @@ impl Call {
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
             method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
             method::NFC_WRITE => Call::NfcWrite(decode(params)?),
+            method::NFC_READ => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::NfcRead(decode(params.or(Some(&empty)))?)
+            }
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
             method::ROBOT_AUTONOMOUS => Call::RobotAutonomous(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
@@ -2371,6 +2392,13 @@ pub mod test_support {
             Call::PadInput,
             Call::TofStream,
             Call::HeadImuStream,
+            Call::NfcWrite(NfcWriteParams {
+                text: "walk_mode".into(),
+                timeout_s: Some(30),
+            }),
+            Call::NfcRead(NfcReadParams {
+                timeout_s: Some(30),
+            }),
             Call::MapStatus,
             Call::MapStream,
             Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
@@ -2959,6 +2987,53 @@ impl NfcWriteParams {
             .clamp(1, Self::MAX_TIMEOUT_S);
         std::time::Duration::from_secs(u64::from(s))
     }
+}
+
+/// See [`method::NFC_READ`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfcReadParams {
+    /// How long to wait for a tag, in seconds. Absent: [`NfcWriteParams::DEFAULT_TIMEOUT_S`],
+    /// capped as a write's is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+}
+
+impl NfcReadParams {
+    /// The wait this asks for, defaulted and capped as [`NfcWriteParams::timeout`] is.
+    pub fn timeout(&self) -> std::time::Duration {
+        NfcWriteParams {
+            text: String::new(),
+            timeout_s: self.timeout_s,
+        }
+        .timeout()
+    }
+}
+
+/// Answer to [`Call::NfcRead`]: what the tag touched holds, or why nothing was read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfcReadResult {
+    /// A tag was touched and its memory read. True for a blank tag too, with no records.
+    pub read: bool,
+    /// The tag's UID, `04:a1:…`, when one was touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// The NDEF message's text and URI records, in order. Records of any other type are left out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<NfcRecord>,
+    /// Why nothing was read — no tag in time, a MIFARE Classic — or, with `read`, why the memory
+    /// holds no NDEF message: a blank tag, one lifted during a write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One NDEF record on a tag, as a person wrote it: `{"type": "text", "value": "walk_mode"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "lowercase")]
+pub enum NfcRecord {
+    Text(String),
+    Uri(String),
 }
 
 /// Answer to [`Call::NfcWrite`]: the tag was written and read back, or why not.
@@ -7061,11 +7136,40 @@ mod tests {
         }
     }
 
+    /// What a client of `nfc.read` parses: each record a type and a value, a blank tag no
+    /// `records` member at all.
+    #[test]
+    fn a_read_tag_is_records_of_a_type_and_a_value() {
+        let read = NfcReadResult {
+            read: true,
+            uid: Some("04:a1".into()),
+            records: vec![
+                NfcRecord::Text("walk_mode".into()),
+                NfcRecord::Uri("https://pollen.ai".into()),
+            ],
+            reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&read).unwrap(),
+            serde_json::json!({
+                "read": true,
+                "uid": "04:a1",
+                "records": [
+                    {"type": "text", "value": "walk_mode"},
+                    {"type": "uri", "value": "https://pollen.ai"},
+                ],
+            })
+        );
+        let blank: NfcReadResult =
+            serde_json::from_value(serde_json::json!({"read": true, "reason": "blank"})).unwrap();
+        assert!(blank.records.is_empty());
+    }
+
     #[test]
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            83,
+            85,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

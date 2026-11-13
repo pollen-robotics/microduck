@@ -973,11 +973,11 @@ impl Server {
                 ),
             ),
 
-            Call::NfcWrite(_) => Response::err(
+            Call::NfcWrite(_) | Call::NfcRead(_) => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "nfc.write is served by nfcd, on /run/nfcd/nfc.sock",
+                    "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

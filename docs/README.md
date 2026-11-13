@@ -17,7 +17,7 @@ docs give the reasoning and point at it.
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
-| [`nfc-tags.md`](robot/nfc-tags.md) | NFC tags: the pairing tag, the mode tags (walk, roller, laser, soccer), which tags work, writing one with `nfc-flash`, and reading the journal. |
+| [`nfc-tags.md`](robot/nfc-tags.md) | NFC tags: the pairing tag, the mode tags (walk, roller, laser, soccer), which tags work, writing one with `nfc-flash`, reading one with `nfc-read`, and reading the journal. |
 | [`udp-pad.md`](robot/udp-pad.md) | A pad on the LAN over UDP: turning it on, `duckctl udp-pad`, and the wire format for writing your own sender. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |

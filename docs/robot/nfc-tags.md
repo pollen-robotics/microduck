@@ -1,8 +1,8 @@
 # NFC tags
 
 A tag touched to the duck's head pairs a gamepad or switches the robot's mode, with nothing typed.
-The robot writes its own tags too. This page owns all of it: which tags there are, what each one
-does, which tags the reader takes, how to write one, and how to see what happened.
+The robot writes and reads its own tags too. This page owns all of it: which tags there are, what
+each one does, which tags the reader takes, how to write or read one, and how to see what happened.
 
 `nfcd` is the daemon behind it. It is always running, polls the reader five times a second, and
 picks a USB reader up within thirty seconds of it being plugged in. The robot's other daemons do
@@ -129,6 +129,35 @@ the tag to the phone. If the phone says *erreur d'écriture* / *write error*, ho
 against the phone's NFC spot (usually near the camera) until it confirms; a tag moved during the
 write is the usual cause.
 
+## Reading a tag
+
+To see what a tag holds, as the robot reads it — on the robot, or from a laptop over Bluetooth:
+
+```bash
+robotctl nfc-read
+duckctl --name <robot-name> nfc-read
+```
+
+It waits for a tag the way `nfc-flash` does: the questioning quack, **20 seconds** (`--timeout`,
+up to 120), a tag already on the reader counts, and a quack once it is read. Then it prints the
+UID and each record:
+
+```
+04:a1:b2:9f:12:34:80
+  text "walk_mode"
+```
+
+A blank tag, or one lifted during a write, prints `(nothing: …)` with why. A MIFARE Classic, or no
+tag in time, fails with the reason. A tag that moves during the read is read again on the next
+poll until the time runs out. `robotctl nfc-read --json`, and `duckctl` always, print the answer
+as `nfc.read` gives it: `{"read": true, "uid": "…", "records": [{"type": "text", "value": "walk_mode"}]}`.
+
+**While a read is waiting, the tag is read and nothing else**: a pairing tag does not pair, a mode
+tag does not switch the mode — the way to check a tag without it acting.
+
+It is `nfc.read` on `/run/nfcd/nfc.sock`; an `nfcd` older than it answers that it serves
+`nfc.write` and nothing else: update the daemon.
+
 ## What happened
 
 ```bash
@@ -151,6 +180,7 @@ Then touch the tag and read the line that appears:
 | `tag cannot be read` | a MIFARE Classic |
 | `tag not read; trying again` | the tag moved or sits at the edge of the field |
 | `tag written` / `tag not written` | an `nfc-flash`, and why not |
+| `tag read` | an `nfc-read`, and the records it found |
 
 **Nothing at all appears** when the tag is touched: the reader did not see it. Take the shell off or
 press the tag flat against the head; check the tag is an NTAG; then check the reader line above.

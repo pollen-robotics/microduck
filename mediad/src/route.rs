@@ -242,6 +242,8 @@ fn permits(call: &proto::Call) -> bool {
         // Writing a tag needs a person at the robot's head to touch one, and BLE is the transport
         // that is in the room by construction; `btd` carries it. Nothing remote wants it yet.
         NfcWrite(_) => false,
+        // Reading one too: it needs the same person at the head, holding the same tag.
+        NfcRead(_) => false,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
