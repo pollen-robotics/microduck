@@ -210,7 +210,7 @@ fn busy() -> proto::Error {
 
 /// Whether the update unit exists and has not finished. `--collect` removes it once it has,
 /// failed or not, so anything but these two states is "not running".
-async fn running(tools: &Tools) -> bool {
+pub async fn running(tools: &Tools) -> bool {
     let unit = format!("{APPLY_UNIT}.service");
     match run(
         &tools.systemctl,
