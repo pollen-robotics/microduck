@@ -632,6 +632,17 @@ wait for the gyro to go quiet, ramp back to the standing pose over ~1 s, hand ov
 hand-back is nothing more than that — the twist has been held at zero throughout, so command
 magnitude selects the standing network, and that is the stand-up.
 
+A stand-up can still stall: from the back the policy sometimes gets half-way and holds a pose
+it never gets out of, and the human cure is Start twice — policy off, home pose, policy on. The
+daemon does that itself. Whenever the policy takes the robot (this hand-back, or an enable on the
+floor) it has `limp_fall_standup_ms` (3 s) to have it up — inside the tilt gate for
+`limp_fall_arm_ms`, the predictor's own arming test. If not, the sequence's pose ramp puts it
+back into the standing pose and hands over again, up to `limp_fall_standup_retries` (3) times in
+a row. A disable, a skill or a sit drops the watch. Out of retries, the robot is parked: stiff at
+the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
+upright and still for `limp_fall_standup_resume_ms` (1 s), which is somebody standing it on its
+feet and letting go, and then the policy takes it back. Start twice also ends the park.
+
 It runs off the policy's path by construction: `driving` is false for the whole sequence
 (§1.4), so the targets come from the sequence rather than the controller, and they reach the
 motors through `apply` like anything else — no exemption, no back door. Nothing in `safety`
@@ -986,7 +997,11 @@ can reach the requested pose.
 
 D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
 `head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
-Smoothing remains in `robotd`'s `[control]` settings. `--deadzone` and `--max-head`, on either
+Smoothing remains in `robotd`'s `[control]` settings, with one pad-only addition: the head
+sticks go through `[pad_head] expo`, a response curve that spends the stick's centre on fine
+movements, and `max_speed`, a cap in rad/s on how fast they move the head target — a full snap
+glides at that speed rather than jumping and then crawling in on `head_alpha`. Neither applies to
+the IMU head. `--deadzone` and `--max-head`, on either
 daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how

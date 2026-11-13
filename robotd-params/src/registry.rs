@@ -390,6 +390,21 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    entry(
+        "safety.limp_fall_standup_ms",
+        Kind::Integer,
+        "How long a stand-up may take before it is re-posed and retried",
+    ),
+    entry(
+        "safety.limp_fall_standup_retries",
+        Kind::Integer,
+        "Stuck stand-ups retried in a row before parking at home; 0 is off",
+    ),
+    entry(
+        "safety.limp_fall_standup_resume_ms",
+        Kind::Integer,
+        "How long a parked robot must stand still on its feet to resume",
+    ),
     // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
         "duck_detector.enabled",
@@ -1346,6 +1361,16 @@ pub const REGISTRY: &[Entry] = &[
         "pad_head.head_roll_max",
         Kind::Float,
         "Full-deflection head roll, radians",
+    ),
+    entry(
+        "pad_head.expo",
+        Kind::Float,
+        "Head stick response curve, 0–1 — higher is finer near the centre, full stick unchanged",
+    ),
+    entry(
+        "pad_head.max_speed",
+        Kind::Float,
+        "Fastest the sticks move the head target, rad/s; 0 is no cap",
     ),
     entry(
         "pad_body.z_min",

@@ -2915,6 +2915,19 @@ pub struct SafetyParams {
     /// Gain for that ramp. The joints have to actually travel across the floor, so it is
     /// not the limp gain; it is the softened standing gain rather than the walking one.
     pub limp_fall_pose_gain: u16,
+    /// How long the policy gets to stand a fallen robot up before it counts as stuck. A
+    /// stand-up from the back sometimes stalls half-way, the policy holding a pose it never
+    /// gets out of; the cure is the one a human applies with Start twice — back to the
+    /// standing pose, hand it over again. "Up" is the arming test: inside `limp_fall_tilt_z`
+    /// for `limp_fall_arm_ms`. The clock starts each time the policy takes the robot.
+    pub limp_fall_standup_ms: u64,
+    /// How many times in a row a stuck stand-up is re-posed and handed back before the
+    /// daemon stops trying. 0 turns the retry off. Out of retries, the robot is parked stiff
+    /// at the home pose with the policy off until it is stood on its feet.
+    pub limp_fall_standup_retries: u32,
+    /// How long a parked robot must be upright and still — stood on its feet and let go —
+    /// before the policy gets it back.
+    pub limp_fall_standup_resume_ms: u64,
 }
 
 impl Default for PolicyParams {
@@ -2969,6 +2982,9 @@ impl Default for SafetyParams {
             limp_fall_max_ms: 1500,
             limp_fall_pose_ms: 600,
             limp_fall_pose_gain: 160,
+            limp_fall_standup_ms: 3000,
+            limp_fall_standup_retries: 3,
+            limp_fall_standup_resume_ms: 1000,
         }
     }
 }
@@ -3155,7 +3171,7 @@ impl Default for Control {
         Self {
             hz: 50,
             cmd_alpha: 0.2,
-            head_alpha: 0.2,
+            head_alpha: 0.1,
             publish_velocity_and_load: true,
         }
     }
@@ -3574,12 +3590,16 @@ impl Params {
             ("pad_head.head_pitch_max", self.pad_head.head_pitch_max),
             ("pad_head.head_yaw_max", self.pad_head.head_yaw_max),
             ("pad_head.head_roll_max", self.pad_head.head_roll_max),
+            ("pad_head.max_speed", self.pad_head.max_speed),
             ("pad_body.pitch_max", self.pad_body.pitch_max),
             ("pad_body.roll_max", self.pad_body.roll_max),
         ] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(invalid(key, "must be finite and nonnegative"));
             }
+        }
+        if !(self.pad_head.expo.is_finite() && (0.0..=1.0).contains(&self.pad_head.expo)) {
+            return Err(invalid("pad_head.expo", "must be finite and in [0, 1]"));
         }
         for (key, min, max) in std::iter::once((
             "pad_body.z".to_owned(),
@@ -3807,6 +3827,8 @@ mod tests {
             "[pad_axes.drive.vx]\ngain = inf",
             "[pad_axes.drive.vx]\nsource = 'typo'",
             "[pad_head]\nhead_yaw_max = -1.0",
+            "[pad_head]\nexpo = 1.5",
+            "[pad_head]\nmax_speed = -1.0",
             "[pad_body]\nz_min = 0.01",
             "[pad_roller]\nvx_max = -0.2",
         ] {
@@ -5368,7 +5390,7 @@ mod tests {
     fn command_smoothing_defaults_match_the_prototype() {
         let c = Control::default();
         assert_eq!(c.cmd_alpha, 0.2);
-        assert_eq!(c.head_alpha, 0.2);
+        assert_eq!(c.head_alpha, 0.1);
     }
 
     /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset,

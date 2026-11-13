@@ -226,6 +226,108 @@ impl Landing {
     }
 }
 
+/// Watching the policy stand a robot up, for a stand-up that stalls.
+///
+/// From the back, the stand-up sometimes gets half-way and stays there: the policy holds a
+/// pose it never gets out of, and nothing else moves it. A human cures that with Start twice —
+/// policy off, which returns to the home pose, and on again. This is the same cure without
+/// the human: if the robot is not up `limp_fall_standup_ms` after the policy took it, the
+/// limp-fall sequence's pose ramp puts it back into the standing pose and hands it over again.
+///
+/// "Up" is the predictor's arming test — inside `limp_fall_tilt_z` for `limp_fall_arm_ms` —
+/// so a robot rocking through vertical on its way up is not called standing. The clock only
+/// runs while the policy is actually driving: a retry's pose ramp, a pick-up pause or a blind
+/// bus restart it rather than eat into it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StandUp {
+    since: Instant,
+    upright_for: Duration,
+    /// Retries already spent on this stand-up.
+    retries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StandUpVerdict {
+    Waiting,
+    Up,
+    Stuck,
+}
+
+impl StandUp {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            upright_for: Duration::ZERO,
+            retries: 0,
+        }
+    }
+
+    /// The policy is not driving this tick: hold the clock at zero.
+    fn restart(&mut self, now: Instant) {
+        self.since = now;
+        self.upright_for = Duration::ZERO;
+    }
+
+    /// One driving tick. `gravity_z` is `None` on a tick with no fresh sample, which neither
+    /// counts as upright nor stops the timeout: a robot nobody can read is not standing.
+    fn observe(
+        &mut self,
+        gravity_z: Option<f64>,
+        now: Instant,
+        period: Duration,
+        upright_z: f64,
+        held: Duration,
+        timeout: Duration,
+    ) -> StandUpVerdict {
+        self.upright_for = match gravity_z {
+            Some(z) if z <= upright_z => self.upright_for.saturating_add(period),
+            _ => Duration::ZERO,
+        };
+        if self.upright_for >= held {
+            StandUpVerdict::Up
+        } else if now.duration_since(self.since) >= timeout {
+            StandUpVerdict::Stuck
+        } else {
+            StandUpVerdict::Waiting
+        }
+    }
+}
+
+/// A robot whose stand-up retries ran out, parked at the home pose with the policy off.
+///
+/// Not limp and not driving: stiff at home, as Start-off leaves it, so nothing grinds against
+/// whatever it is stuck on. It goes back to the policy by itself once somebody has stood it on
+/// its feet — upright inside `limp_fall_tilt_z` *and* still (gyro under `limp_fall_still_rate`)
+/// for `limp_fall_standup_resume_ms`. Still as well as upright, so a robot being carried the
+/// right way up is not handed over mid-air; and if it is, `[pickup]` is what catches that, as
+/// it would any other time.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Parked {
+    on_feet_for: Duration,
+}
+
+impl Parked {
+    /// One tick: `imu` is this tick's (gravity z, gyro magnitude), or `None` when blind —
+    /// which restarts the count, as for [`Landing`]. `true` once it has been on its feet long
+    /// enough to hand back.
+    fn observe(
+        &mut self,
+        imu: Option<(f64, f64)>,
+        period: Duration,
+        upright_z: f64,
+        still_rate: f64,
+        held: Duration,
+    ) -> bool {
+        self.on_feet_for = match imu {
+            Some((z, rate)) if z <= upright_z && rate < still_rate => {
+                self.on_feet_for.saturating_add(period)
+            }
+            _ => Duration::ZERO,
+        };
+        self.on_feet_for >= held
+    }
+}
+
 impl LimpFall {
     /// The interpolated pose target for this tick, or `None` once the ramp is done.
     ///
@@ -2484,6 +2586,14 @@ async fn control_loop<T: RobotIo>(
     let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
     let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
     let mut limp_fall = LimpFall::Idle;
+    // The stalled-stand-up watch ([`StandUp`]): started whenever the policy takes the robot,
+    // gone once the robot is up, the retries are spent, or something else took over.
+    let mut standup: Option<StandUp> = None;
+    let standup_timeout = Duration::from_millis(params.safety.limp_fall_standup_ms);
+    let standup_upright = Duration::from_millis(params.safety.limp_fall_arm_ms);
+    // Retries spent: parked at home, policy off, until somebody stands it on its feet.
+    let mut standup_parked: Option<Parked> = None;
+    let standup_resume = Duration::from_millis(params.safety.limp_fall_standup_resume_ms);
 
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
@@ -3522,6 +3632,112 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
             }
+
+            // A stand-up that stalls: what Start twice does by hand, done by itself — see
+            // [`StandUp`]. The watch is started on the driving edge further down.
+            if let Some(watch) = standup.as_mut() {
+                let still_ours = snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off
+                    && controller
+                        .as_ref()
+                        .is_some_and(|c| !c.busy() && !c.is_sitting());
+                if !still_ours || params.safety.limp_fall_standup_retries == 0 {
+                    // A disable, a skill, a sit, a shutdown: somebody else has the robot.
+                    standup = None;
+                } else if limp_fall != LimpFall::Idle || !was_driving {
+                    // Posing for a retry, limping through a fresh fall, paused: the policy is
+                    // not the one failing to stand it up right now.
+                    watch.restart(tick_start);
+                } else {
+                    match watch.observe(
+                        fresh.as_ref().map(|s| s.imu.gravity[2]),
+                        tick_start,
+                        period,
+                        params.safety.limp_fall_tilt_z,
+                        standup_upright,
+                        standup_timeout,
+                    ) {
+                        StandUpVerdict::Waiting => {}
+                        StandUpVerdict::Up => {
+                            if watch.retries > 0 {
+                                tracing::warn!(retries = watch.retries, "stood up after retrying");
+                            }
+                            standup = None;
+                        }
+                        StandUpVerdict::Stuck
+                            if watch.retries < params.safety.limp_fall_standup_retries =>
+                        {
+                            watch.retries += 1;
+                            watch.restart(tick_start);
+                            tracing::warn!(
+                                retry = watch.retries,
+                                of = params.safety.limp_fall_standup_retries,
+                                after_ms = standup_timeout.as_millis(),
+                                gravity_z =
+                                    fresh.as_ref().map(|s| format!("{:.2}", s.imu.gravity[2])),
+                                "stand-up stalled — posing back to standing and handing over again"
+                            );
+                            // The limp-fall sequence's own pose ramp, from where the robot is,
+                            // and its hand-back resets the controller: the Start-off/Start-on a
+                            // human does, through the path that already owns a robot on the floor.
+                            limp_fall = LimpFall::Posing {
+                                from: coast.known_positions(hold),
+                                since: tick_start,
+                            };
+                            falling.reset();
+                        }
+                        StandUpVerdict::Stuck => {
+                            tracing::warn!(
+                                retries = watch.retries,
+                                resume_ms = standup_resume.as_millis(),
+                                "stand-up still stalled — parking at the home pose; stand it on \
+                                 its feet to hand it back, or Start twice"
+                            );
+                            standup = None;
+                            // The same ramp to the standing pose, and then held there: parked
+                            // keeps `driving` false, so the hand-back at the end of the ramp
+                            // leaves the robot at `hold`, which it sets to the home pose.
+                            limp_fall = LimpFall::Posing {
+                                from: coast.known_positions(hold),
+                                since: tick_start,
+                            };
+                            falling.reset();
+                            standup_parked = Some(Parked::default());
+                        }
+                    }
+                }
+            }
+
+            // Parked after giving up: wait to be stood on its feet. Anything that takes the
+            // robot — Start (a disable), a relax, a shutdown — ends the park, and the next
+            // enable starts over with a fresh set of retries.
+            if let Some(parked) = standup_parked.as_mut() {
+                let still_ours = snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off;
+                if !still_ours {
+                    standup_parked = None;
+                } else if limp_fall == LimpFall::Idle
+                    && parked.observe(
+                        fresh.as_ref().map(|s| {
+                            (
+                                s.imu.gravity[2],
+                                s.imu.gyro.iter().map(|w| w * w).sum::<f64>().sqrt(),
+                            )
+                        }),
+                        period,
+                        params.safety.limp_fall_tilt_z,
+                        params.safety.limp_fall_still_rate,
+                        standup_resume,
+                    )
+                {
+                    tracing::warn!("on its feet — handing the parked robot back to the policy");
+                    standup_parked = None;
+                }
+            }
         }
         let in_limp_fall = limp_fall != LimpFall::Idle;
 
@@ -3536,6 +3752,7 @@ async fn control_loop<T: RobotIo>(
                     && snapshot.enabled
                     && bringup == Bringup::Ready
                     && !in_limp_fall
+                    && standup_parked.is_none()
                     && safety.imu_ready()
                     && shutdown_sit.is_none()
                     && shutdown_rest.is_none()
@@ -3921,6 +4138,8 @@ async fn control_loop<T: RobotIo>(
             // The limp-fall sequence owns the robot for its duration: the whole point is
             // that the policy is *not* driving while the robot falls, lands and is posed.
             && !in_limp_fall
+            // Parked at home after a stand-up that would not happen, until it is on its feet.
+            && standup_parked.is_none()
             // Held in somebody's hand: the robot holds the pause pose until it is put down.
             && !pickup_paused
             // The rest ramp has the robot for the end of a shutdown.
@@ -3945,6 +4164,15 @@ async fn control_loop<T: RobotIo>(
             // A seated robot is held in its seat, not at home: start the network from there.
             if start_from_hold && let Some(controller) = controller.as_mut() {
                 controller.seed_from_pose(&hold);
+            }
+            // Every time the policy takes the robot, watch it get up — a robot that is already
+            // standing passes in `limp_fall_arm_ms`. Kept, not restarted, across a retry's own
+            // hand-back, or the retries would never run out.
+            if params.safety.limp_fall
+                && params.safety.limp_fall_standup_retries > 0
+                && standup.is_none()
+            {
+                standup = Some(StandUp::new(tick_start));
             }
         }
         if was_driving && !driving {
@@ -6769,6 +6997,104 @@ mod tests {
         assert!(
             !landing.observe(Some(0.1), period, 1.0, held),
             "counting again"
+        );
+    }
+
+    /// The stalled-stand-up watch: a robot that gets up passes once it has stood for the
+    /// arming time, and one that stays tipped past the timeout is stuck.
+    #[test]
+    fn a_stand_up_passes_on_standing_and_stalls_on_the_timeout() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let timeout = Duration::from_secs(3);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Lying on its back, then up: three upright ticks and it is standing.
+        let mut w = StandUp::new(t0);
+        assert_eq!(
+            w.observe(Some(0.0), at(1_000), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        for ms in [1_020, 1_040] {
+            assert_eq!(
+                w.observe(Some(-0.98), at(ms), period, -0.9, held, timeout),
+                StandUpVerdict::Waiting
+            );
+        }
+        assert_eq!(
+            w.observe(Some(-0.98), at(1_060), period, -0.9, held, timeout),
+            StandUpVerdict::Up
+        );
+
+        // Stuck half-way — rocking through vertical for a tick now and then is not standing.
+        let mut w = StandUp::new(t0);
+        assert_eq!(
+            w.observe(Some(-0.95), at(2_000), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(2_980), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(3_000), period, -0.9, held, timeout),
+            StandUpVerdict::Stuck
+        );
+    }
+
+    /// The clock counts only the policy's own time: restarting it — the retry's pose ramp, a
+    /// pause — gives the next hand-back the whole timeout, and a blind tick is not upright.
+    #[test]
+    fn a_restart_gives_the_stand_up_its_whole_time_again() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let timeout = Duration::from_secs(3);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut w = StandUp::new(t0);
+        w.observe(Some(-0.98), at(2_000), period, -0.9, held, timeout);
+        w.observe(Some(-0.98), at(2_020), period, -0.9, held, timeout);
+        w.restart(at(2_900));
+        assert_eq!(
+            w.observe(None, at(3_500), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting,
+            "timed from the restart, and the upright count went with it"
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(5_900), period, -0.9, held, timeout),
+            StandUpVerdict::Stuck
+        );
+    }
+
+    /// A parked robot goes back to the policy only once it is on its feet *and* still for the
+    /// whole hold: lying there is not it, being carried upright is not it, and a blind tick
+    /// restarts the count.
+    #[test]
+    fn a_parked_robot_resumes_only_standing_still_on_its_feet() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let observe = |p: &mut Parked, imu| p.observe(imu, period, -0.9, 1.0, held);
+        let mut p = Parked::default();
+
+        // Still on its back, as it was parked: never.
+        for _ in 0..50 {
+            assert!(!observe(&mut p, Some((0.1, 0.0))));
+        }
+        // Upright but swinging in somebody's hands: never.
+        for _ in 0..50 {
+            assert!(!observe(&mut p, Some((-0.98, 2.0))));
+        }
+        // Set down: two still ticks, a blind one, then the full three.
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, None), "blind, not standing");
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(
+            observe(&mut p, Some((-0.98, 0.2))),
+            "on its feet and let go"
         );
     }
 
