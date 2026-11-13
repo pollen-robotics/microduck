@@ -51,8 +51,12 @@ pub enum Zone {
     Hit {
         /// The return, in the trunk frame, metres.
         point: [f64; 3],
-        /// Horizontal distance from the trunk origin's vertical axis — the
-        /// number obstacle avoidance compares against a stop threshold.
+        /// Horizontal distance from the sensor (the horizontal part of the
+        /// slant range), not from the trunk origin's vertical axis — those
+        /// differ by the sensor's forward offset in the trunk (~8 cm for a
+        /// level head). Obstacle avoidance that needs a trunk-axis distance
+        /// should compute `hypot(point.x, point.y)` on a levelled `point`.
+        /// See issue #430.
         range: f64,
     },
 }
