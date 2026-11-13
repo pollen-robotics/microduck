@@ -215,6 +215,22 @@ impl KeyRing {
         Err(Self::no_key_error(tried))
     }
 
+    /// Whether a signature that [`Self::verify_bytes`] refused is good under a dev key this robot
+    /// is leaving out of its usable set.
+    ///
+    /// For the error message only: it admits nothing. It tells "this is a branch build, and this
+    /// is not a dev board" from a release signed by a key nobody here knows.
+    pub fn signed_by_withheld_dev_key(&self, data: &[u8], signature: &[u8]) -> bool {
+        let Ok(sig) = Self::parse_signature(signature) else {
+            return false;
+        };
+        !self.allow_dev_keys
+            && self
+                .keys
+                .iter()
+                .any(|k| k.dev_only && k.key.verify(data, &sig, false).is_ok())
+    }
+
     /// Verify a detached signature over a file, streaming it.
     ///
     /// Streaming rather than reading it whole: this runs on a board with limited
@@ -520,6 +536,20 @@ mod tests {
             .with_builtin_dev_key()
             .unwrap();
         assert_eq!(ring.usable().count(), 2);
+    }
+
+    #[test]
+    fn a_withheld_dev_key_is_named_only_for_its_own_signature() {
+        let (kp, pk) = keypair();
+        let (other, _) = keypair();
+        let data = b"manifest bytes";
+
+        let ring = ring(&pk, true, false);
+        let sig = sign(&kp, data);
+        assert!(ring.verify_bytes(data, &sig).is_err(), "still refused");
+        assert!(ring.signed_by_withheld_dev_key(data, &sig));
+        assert!(!ring.signed_by_withheld_dev_key(data, &sign(&other, data)));
+        assert!(!ring.signed_by_withheld_dev_key(data, b"not a signature"));
     }
 
     #[test]

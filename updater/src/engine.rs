@@ -2600,11 +2600,22 @@ impl Engine {
     /// Returns the id of the trusted key that admitted it. A *set* of keys is allowed, so which
     /// one signed a release is a fact about that release — and [`crate::verify::TrustedKey::id`]
     /// has said it was for the log since the day it was written.
+    ///
+    /// A branch build on a robot that is not a dev board is the one failure with a known remedy,
+    /// so it gets its own error rather than the question above.
     fn verify_manifest(&self, signed: &source::SignedBytes<Manifest>) -> Result<String, Error> {
         self.keys
             .verify_bytes(&signed.bytes, &signed.signature)
             .map(|key| key.id.clone())
             .map_err(|e| {
+                if self
+                    .keys
+                    .signed_by_withheld_dev_key(&signed.bytes, &signed.signature)
+                {
+                    return Error::DevBuildsNotAllowed {
+                        channel: signed.parsed.channel.clone(),
+                    };
+                }
                 Error::Verification(format!(
                     "manifest for {} {} (unverified): {e}. \
                      Was the signing key rotated, or is this a stale release?",
