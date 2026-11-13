@@ -396,6 +396,13 @@ impl Controller {
         }
     }
 
+    /// Whether a robot found sitting at bring-up is taken into the seat and risen from it: the
+    /// sitstand network's seat on legs. Never on wheels — the seat there is the crouch, which no
+    /// robot is found in, and the sitstand pose is the one a robot on rollers cannot take.
+    pub fn rises_from_seat(&self) -> bool {
+        self.skills.crouch_seat.is_none() && self.policy.has_sitstand()
+    }
+
     /// How long the seat takes to reach: the sitstand glide, or the crouch's way down.
     fn seat_settle_secs(&self) -> f64 {
         match self.crouch_seat() {
@@ -1027,6 +1034,10 @@ mod tests {
         c.skills.crouch_seat = Some(ROLLER_SEAT_PHASE);
         c.skills.ground_pick_period = 5.0;
         assert!(c.has_seat());
+        assert!(
+            !c.rises_from_seat(),
+            "no sitstand seat at bring-up on wheels"
+        );
         assert_eq!(c.shutdown_sit_secs(), 0.3 * 5.0 + 1.0);
 
         assert_eq!(c.sit_toggle(), Ok("sit"));

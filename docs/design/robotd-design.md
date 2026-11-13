@@ -522,7 +522,9 @@ legs — runs nothing on wheels, and stopping would only hold the crouch with th
 Start during a running crouch nearer its bottom than its top (phase 0.05–0.55,
 `ROLLER_LOW_PHASES`) holds it down as that seat instead of stopping: a stop there sends a crouched
 robot on wheels straight to the standing home pose, and over. Nearer the top the jump is small,
-and Start stops the policy as it does everywhere else.
+and Start stops the policy as it does everywhere else. The bring-up seat below — ramping a robot that reads
+seated to the sitstand pose and rising it from there — is legs only: a robot on wheels must not
+take that pose, so whatever it reads it ramps to home and the gait takes it.
 
 **The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
 reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of

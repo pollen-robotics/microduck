@@ -3806,7 +3806,7 @@ async fn control_loop<T: RobotIo>(
                 let height = format!("{:.0}%", 100.0 * reading.height_ratio);
                 let tilt = format!("{:.0}°", reading.tilt_deg);
                 match reading.posture {
-                    posture::Posture::Seated if controller.has_seat() => {
+                    posture::Posture::Seated if controller.rises_from_seat() => {
                         tracing::warn!(
                             %height,
                             %tilt,
@@ -3820,7 +3820,7 @@ async fn control_loop<T: RobotIo>(
                             posture::Posture::Standing => "standing",
                             posture::Posture::Lying => "lying down",
                             posture::Posture::Seated => {
-                                "seated, with no sitstand policy to rise with"
+                                "seated, with no sitstand seat to rise from (none loaded, or on wheels)"
                             }
                             posture::Posture::Unsure => {
                                 "neither clearly standing nor clearly seated"
@@ -5210,13 +5210,14 @@ const SEAT_POSITION: [f64; NUM_JOINTS] = [
 /// A robot that reads seated goes to [`SEAT_POSITION`] — ramping it straight-legged to the standing
 /// home pose drags it out of the seat and over backwards — and the seat is marked on the
 /// controller; the next Start rises it. Only on a clear seated verdict, with a converged IMU and a
-/// network to rise with. Anything else goes home, as it always has.
+/// network to rise with. Anything else goes home, as it always has — and so does every robot on
+/// wheels, which must not take the sitstand seat ([`control::Controller::rises_from_seat`]).
 fn ramp_target(
     sensors: &duck_control::Sensors,
     imu_ready: bool,
     controller: Option<&mut Controller>,
 ) -> [f64; NUM_JOINTS] {
-    let Some(controller) = controller.filter(|c| c.has_seat()) else {
+    let Some(controller) = controller.filter(|c| c.rises_from_seat()) else {
         return DEFAULT_POSITION;
     };
     if !imu_ready {
