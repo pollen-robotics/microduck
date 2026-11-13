@@ -633,7 +633,8 @@ impl Engine {
         })
     }
 
-    /// Versions whose most recent recorded outcome was a rollback.
+    /// Versions whose most recent recorded outcome was a rollback, or `Stuck` on a release the
+    /// robot has since been moved back off ([`crate::journal::Journal::known_bad`]).
     ///
     /// Derived from the journal rather than stored, so it self-heals: a version that
     /// failed once and later succeeded drops off the list. Used to keep `rollback` off a
@@ -1241,8 +1242,8 @@ impl Engine {
     /// A failure here is [`Error::RollbackFailed`] — the most serious outcome, kept
     /// distinct so support sees it immediately rather than reading it as an
     /// ordinary failure.
-    /// Highest installed release strictly *older* than `current`, skipping any whose
-    /// most recent recorded outcome was a rollback.
+    /// Highest installed release strictly *older* than `current`, skipping any the journal
+    /// calls known bad ([`Self::known_bad`]).
     ///
     /// Two constraints, both learned the hard way:
     ///
@@ -1251,8 +1252,8 @@ impl Engine {
     ///    disk (the failure path deliberately doesn't prune). That would make
     ///    `rollback` — the one command a support engineer reaches for after a bad
     ///    update — reinstall the bad update.
-    ///  - **Not known-bad.** A release the journal recorded as rolled back is not a
-    ///    safe landing spot, even if it is the newest older one.
+    ///  - **Not known-bad.** A release the journal recorded as rolled back, or as `Stuck`
+    ///    and then reverted, is not a safe landing spot, even if it is the newest older one.
     fn rollback_target(
         &self,
         component: &str,
@@ -1287,9 +1288,9 @@ impl Engine {
     ///
     /// The trial is cleared, as [`Self::rollback_to`] clears it when there is nothing to revert
     /// to: left armed, the boot counter would ask the same question on every start and decide
-    /// the same way. `Stuck` rather than `RolledBack`, because nothing moved — and because
-    /// `known_bad` reads only `RolledBack`, so a release kept this way is still a target for a
-    /// later `select`. The reason names the command that does what the robot did not.
+    /// the same way. `Stuck` rather than `RolledBack`, because nothing moved, and `known_bad`
+    /// leaves a `Stuck` release out until the robot is moved back off it. The reason names the
+    /// command that does what the robot did not.
     fn keep_failed(
         &self,
         component: &str,

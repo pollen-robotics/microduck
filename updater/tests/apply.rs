@@ -3322,3 +3322,119 @@ async fn an_exhausted_trial_stays_live_when_auto_rollback_is_off() {
         "{log:?}"
     );
 }
+
+/// With auto-rollback off, a release that failed its gate and was then reverted by hand (what the
+/// `Stuck` reason says to do) is as failed as one the gate reverted itself. A later `rollback`
+/// must not land on it, as `rollback_skips_known_bad_releases` holds with auto-rollback on.
+#[tokio::test]
+async fn rollback_skips_a_release_that_was_stuck_and_reverted_by_hand() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 5";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+
+    // The operator follows the reason: `robotctl update rollback daemon`.
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+
+    // A fixed release, then a rollback from it.
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.2.0"));
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "rollback landed on 1.1.0, which failed its gate here and was reverted by hand; \
+         known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
+}
+
+/// With the shipped `keep_previous = 1`, the release after a reverted `Stuck` one prunes the
+/// release before it and keeps the reverted one as its only older release. `rollback` then
+/// refuses rather than reinstall what someone reverted, as it does after a gate rollback.
+#[tokio::test]
+async fn rollback_refuses_rather_than_reinstall_a_reverted_stuck_release() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+    engine.rollback("daemon").await.unwrap();
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+
+    assert!(engine.rollback("daemon").await.is_err());
+    assert_eq!(fx.live_version().as_deref(), Some("1.2.0"));
+}
+
+/// Moving forward past a `Stuck` release reverts nothing, so it is not known bad: with the shipped
+/// `keep_previous = 1` the release before it has been pruned by then, and a `rollback` from the
+/// next one lands on it, as it does with no journal rule at all.
+#[tokio::test]
+async fn rollback_can_land_on_a_stuck_release_the_robot_moved_past() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
+}
+
+/// The `Stuck` reason names `rollback`, so it has to work for two stuck releases in a row: the
+/// first was never reverted, only moved past, so the rollback from the second lands on it.
+#[tokio::test]
+async fn rollback_from_a_stuck_release_lands_on_the_stuck_one_before_it() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 5";
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    for v in ["1.0.0", "1.1.0"] {
+        let result = apply_exact(&mut sick, v).await.unwrap();
+        assert!(
+            matches!(result, ApplyResult::Stuck { .. }),
+            "{v}: {result:?}"
+        );
+    }
+
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
+}
