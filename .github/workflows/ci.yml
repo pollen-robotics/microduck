@@ -60,7 +60,9 @@ jobs:
       # before it checks anything.
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
-      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs, and
+      # plugins-base carries `gstreamer-rtp-1.0.pc` for the capture-time extension in
+      # `wire_payloader_setup`.
       #
       # The downloaded .debs are kept in the Actions cache: plugins-bad drags in OpenCV, VTK and
       # ffmpeg, ~250 MB, and a slow mirror has turned that download into 20+ minutes. apt still
@@ -284,7 +286,9 @@ jobs:
       # Same reason as the check job: the workspace does not build without it.
       # And GStreamer, because `mediad`'s pipeline is gated on `target_os = "linux"` and these
       # runners are Linux — so the host build compiles it, unlike a developer's Mac. plugins-bad
-      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs.
+      # is the one carrying `gstreamer-webrtc-1.0.pc`, which is what the data channel needs, and
+      # plugins-base carries `gstreamer-rtp-1.0.pc` for the capture-time extension in
+      # `wire_payloader_setup`.
       # Same packages and cache entry as `check`.
       - uses: actions/cache@v4
         with:

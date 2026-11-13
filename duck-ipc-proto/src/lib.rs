@@ -288,10 +288,11 @@ pub const JSONRPC_VERSION: &str = "2.0";
 ///   published so no client has to carry a copy of the kinematics.
 /// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
 ///
-/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
-/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
-/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
-/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read back to
+/// back, so a peer can put a sample stamped with `t_ns` onto the wall-clock axis if it needs one.
+/// Media itself does not: `mediad` states its sender reports and its frames on `CLOCK_MONOTONIC`
+/// directly. Additive everywhere: an older client ignores fields it does not know, and an older
+/// daemon leaves them at their defaults (zero, or absent).
 ///
 /// # v25 — the whole skeleton's pose, for a viewer
 ///
