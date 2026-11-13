@@ -1,10 +1,10 @@
 //! Names to numbers: the two lookups this crate needs from the user database.
 //!
-//! Everything in this crate that cares about identity is configured by **name** —
+//! Everything in this crate that cares about identity is configured by **name**:
 //! `deploy/updater.toml` names `btd` and `mediad` in `allow_users`, and the account token is
-//! group-owned by `robot` — because `systemd-sysusers` allocates dynamically and a number written
-//! down is right on one board and wrong on the next. `SO_PEERCRED` and `chown(2)` deal in
-//! numbers, so the translation has to happen somewhere, and doing it here means one SAFETY
+//! group-owned by `robot-account`. That is because `systemd-sysusers` allocates dynamically, and a
+//! number written down is right on one board and wrong on the next. `SO_PEERCRED` and `chown(2)`
+//! deal in numbers, so the translation has to happen somewhere, and doing it here means one SAFETY
 //! argument rather than one per caller.
 //!
 //! Not shared with `configd`, `padd` and `tof`, which have their own copies: the obvious common
