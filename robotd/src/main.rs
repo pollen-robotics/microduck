@@ -2865,17 +2865,18 @@ async fn control_loop<T: RobotIo>(
         let soccer_was_autonomous = soccer.autonomous();
         soccer.set_autonomous(soccer_switch.autonomous);
         // Said aloud, for whoever holds the pad or the tag: one quack as the robot starts playing
-        // by itself, two as it stops — whoever switched it, the pad, `robotctl` or `autod`.
+        // by itself, two as it stops — whoever switched it, the pad, `robotctl` or `autod`. Always
+        // the same quack rather than the bank's random pick, so it is recognised as this cue.
         if soccer_switch.autonomous != soccer_was_autonomous {
             if let Some(voice) = voice.as_mut() {
-                voice.play("chirp", false);
+                voice.play_same("chirp");
             }
             soccer_quack_again = (!soccer_switch.autonomous).then(|| tick_start + SOCCER_QUACK_GAP);
         }
         if soccer_quack_again.is_some_and(|at| tick_start >= at) {
             soccer_quack_again = None;
             if let Some(voice) = voice.as_mut() {
-                voice.play("chirp", false);
+                voice.play_same("chirp");
             }
         }
         let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
