@@ -927,9 +927,11 @@ impl Brain {
             self.enter(State::Petted);
         }
 
-        // A dot on the floor is the second-best interrupt: whatever the duck was doing, it goes.
-        // Not from a nap, a pick, a petting or the ball — the laser is off for those anyway, and
-        // a dot still remembered from before is not a reason to jump.
+        // A dot on the floor is the second-best interrupt: whatever the duck was doing, it goes —
+        // a survey too, which stands still like the other standing states. Not from a pick, a
+        // petting, the ball or a brace — the laser is off for those anyway — nor from a nap, which
+        // wakes up for a dot on its own; and a dot still remembered from before is not a reason
+        // to jump.
         if world.laser.dot
             && self.wants_laser()
             && matches!(
@@ -943,9 +945,14 @@ impl Brain {
                     | State::Ruffle
                     | State::Dance
                     | State::Sneeze
+                    | State::Survey
             )
         {
             tracing::info!(energy = self.energy, "a dot! chasing it");
+            // The map's check of where the duck is, cut short, is still owed: after the chase.
+            if self.state == State::Survey && self.fix == MapFix::Unsure {
+                self.survey_next = true;
+            }
             self.enter(State::Laser);
             self.start_quack_burst();
             sound = Some(Sound::Chirp);
@@ -1613,12 +1620,15 @@ impl Brain {
     /// Laser tracking is on whenever the duck could chase: not too tired, not being petted (a dot
     /// would walk it out from under the hand), and not playing with the ball, which `robotd` would
     /// not run beside it anyway. On through a nap, so a dot can wake it — unless the nap is the
-    /// rest after a chase, which `laser_tired` already keeps the laser off for.
+    /// rest after a chase, which `laser_tired` already keeps the laser off for. Off through a
+    /// brace, which ends a chase as it ends a ball game: left on, `robotd` would keep following
+    /// the dot on the brace's zero twist and centred head, and the turning that drifted the duck
+    /// backwards would carry on into the wall.
     fn wants_laser(&self) -> bool {
         !self.laser_tired
             && !matches!(
                 self.state,
-                State::Petted | State::BallPlay | State::GroundPick
+                State::Petted | State::BallPlay | State::GroundPick | State::Brace
             )
     }
 
@@ -2634,6 +2644,68 @@ mod tests {
             west > 120,
             "the blank side wins most of the time: {west}/200"
         );
+    }
+
+    /// A dot ends a survey, as it ends the other standing states. Left out, the brain went on
+    /// sweeping the head for the map while `robotd` walked the legs to the dot on the survey's zero
+    /// twist. The map's check of where the duck is, cut short, comes after the chase instead.
+    #[test]
+    fn a_dot_interrupts_a_survey() {
+        let mut bench = Bench::new(13);
+        bench.brain.next_quack_in = 1e9;
+        bench.tick(|w| w.map = MapFix::Known(map::IDENTITY));
+        bench.brain.enter(State::Chill);
+        let mut ticks = 0;
+        while bench.brain.state() != State::Survey {
+            bench.tick(|w| w.map = MapFix::Unsure);
+            ticks += 1;
+            assert!(ticks < 50 * 30, "the map's check never came");
+        }
+        bench.tick(|w| {
+            w.map = MapFix::Unsure;
+            w.laser = Laser {
+                on: true,
+                dot: true,
+            }
+        });
+        assert_eq!(bench.brain.state(), State::Laser, "a dot ends a survey");
+        assert!(
+            bench.brain.survey_next,
+            "and the check is owed for after the chase"
+        );
+    }
+
+    /// A brace ends a chase. Left on, the laser kept the chase going through it, since a chase and
+    /// a standing brace send the same zero twist, so the turning that drifted the duck backwards
+    /// carried on into the wall.
+    #[test]
+    fn a_brace_ends_a_chase() {
+        let dot = |w: &mut World| {
+            w.laser = Laser {
+                on: true,
+                dot: true,
+            };
+            // Nothing clear ahead, so the brace stands rather than stepping away.
+            w.obstacle = Some(Obstacle {
+                ahead_m: REACT_M / 2.0,
+                away: 1.0,
+                age_s: 0.0,
+            });
+        };
+        let mut bench = Bench::new(14);
+        bench.brain.next_quack_in = 1e9;
+        bench.tick(|_| {});
+        bench.brain.enter(State::Laser);
+        assert!(bench.tick(dot).laser, "chasing");
+        bench.brain.enter(State::Brace);
+        let out = bench.tick(dot);
+        assert_eq!(
+            bench.brain.state(),
+            State::Brace,
+            "a dot does not end a brace"
+        );
+        assert_eq!(out.cmd, [0.0; 3]);
+        assert!(!out.laser, "the chase ends with the laser");
     }
 
     /// A dot wakes a napping duck — up at once, and after it once standing. A nap that is the rest
