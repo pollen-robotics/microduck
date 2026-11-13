@@ -3171,7 +3171,7 @@ impl Default for Control {
         Self {
             hz: 50,
             cmd_alpha: 0.2,
-            head_alpha: 0.1,
+            head_alpha: 0.2,
             publish_velocity_and_load: true,
         }
     }
@@ -5390,7 +5390,7 @@ mod tests {
     fn command_smoothing_defaults_match_the_prototype() {
         let c = Control::default();
         assert_eq!(c.cmd_alpha, 0.2);
-        assert_eq!(c.head_alpha, 0.1);
+        assert_eq!(c.head_alpha, 0.2);
     }
 
     /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset,

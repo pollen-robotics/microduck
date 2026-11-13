@@ -99,7 +99,7 @@ hz = 50
 # follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist; `head_alpha` covers
 # head targets and the body pose.
 # cmd_alpha = 0.2
-# head_alpha = 0.1
+# head_alpha = 0.2
 
 # Whether the state stream carries measured joint velocity and load — `velocities` and
 # `currents_ma` on `robot.state`. The servos report both in the same twelve-byte read as
