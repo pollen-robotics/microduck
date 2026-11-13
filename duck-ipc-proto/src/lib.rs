@@ -3155,7 +3155,8 @@ pub struct LaserDot {
     pub pixels: u32,
     /// The best candidate's colour, `[Y, U, V]` — the brightest red-leaning pixel in the frame,
     /// reported **whether or not it passed**. Point the laser, read this, set the thresholds a
-    /// little below it.
+    /// little below it. While tracking, a look scans a window around the dot, so outside that
+    /// window this is as of the last whole-frame scan, a second old at most.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_yuv: Option<[u8; 3]>,
     /// Why a candidate was rejected, when there was one and it was: `"too small"`, `"too big"`.
