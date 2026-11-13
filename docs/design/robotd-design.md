@@ -986,7 +986,11 @@ can reach the requested pose.
 
 D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
 `head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
-Smoothing remains in `robotd`'s `[control]` settings. `--deadzone` and `--max-head`, on either
+Smoothing remains in `robotd`'s `[control]` settings, with one pad-only addition: the head
+sticks go through `[pad_head] expo`, a response curve that spends the stick's centre on fine
+movements, and `max_speed`, a cap in rad/s on how fast they move the head target — a full snap
+glides at that speed rather than jumping and then crawling in on `head_alpha`. Neither applies to
+the IMU head. `--deadzone` and `--max-head`, on either
 daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how

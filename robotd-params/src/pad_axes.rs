@@ -237,9 +237,12 @@ impl PadAxesParams {
     }
 }
 
-/// `[pad_head]`: full-deflection head travel per joint, radians. The head command feeds the
-/// policy's observation rather than a servo directly, so this is the prototype's generous 2.5 —
-/// the network itself decides how far the head actually goes. Also the clamp on the pad-IMU head.
+/// `[pad_head]`: how the sticks pose the head — full-deflection travel per joint, radians, and
+/// the shaping that makes small corrections possible. The head command feeds the policy's
+/// observation rather than a servo directly, so the travel is the prototype's generous 2.5 — the
+/// network itself decides how far the head actually goes. The travel is also the clamp on the
+/// pad-IMU head; `expo` and `max_speed` are the sticks' alone, since a pad followed by its tilt
+/// is already as fine and as fast as the wrist holding it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PadHeadParams {
@@ -247,6 +250,15 @@ pub struct PadHeadParams {
     pub head_pitch_max: f64,
     pub head_yaw_max: f64,
     pub head_roll_max: f64,
+    /// The stick's response curve, in `[0, 1]`: `(1 − expo)·x + expo·x³`. `0` is linear; higher
+    /// spends more of the stick's travel near the centre, where fine movements are, and full
+    /// deflection still reaches the full limit. At `0.6`, half a stick is 28 % of the travel.
+    pub expo: f64,
+    /// The fastest the stick-driven head target moves, rad/s per joint; `0` is no cap. A full
+    /// stick snap becomes a constant-speed glide that arrives, where `robotd`'s
+    /// `[control] head_alpha` alone gives a jump at the start and a long tail at the end. A small
+    /// move stays under the cap and is untouched.
+    pub max_speed: f64,
 }
 
 impl Default for PadHeadParams {
@@ -256,14 +268,25 @@ impl Default for PadHeadParams {
 }
 
 impl PadHeadParams {
-    /// One limit for every joint — `--max-head`.
+    pub const DEFAULT_EXPO: f64 = 0.6;
+    pub const DEFAULT_MAX_SPEED: f64 = 3.0;
+
+    /// One limit for every joint — `--max-head` — with the shipped shaping.
     pub fn all(max: f64) -> Self {
         Self {
             neck_pitch_max: max,
             head_pitch_max: max,
             head_yaw_max: max,
             head_roll_max: max,
+            expo: Self::DEFAULT_EXPO,
+            max_speed: Self::DEFAULT_MAX_SPEED,
         }
+    }
+
+    /// A stick value in `[-1, 1]` through the `expo` curve. Odd, monotonic, and fixed at 0 and ±1.
+    pub fn shape(&self, x: f64) -> f64 {
+        let e = self.expo.clamp(0.0, 1.0);
+        (1.0 - e) * x + e * x * x * x
     }
 }
 

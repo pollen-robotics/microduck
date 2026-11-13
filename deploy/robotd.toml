@@ -770,11 +770,17 @@ mode = "walk"
 # invert = true
 #
 # Head limits in radians. Also bound controller-IMU head targets.
+# `expo` (0–1) curves the head sticks: higher is finer near the centre, full stick unchanged —
+# at 0.6, half a stick is 28 % of the travel. `max_speed` caps how fast the sticks move the head
+# target, rad/s (0 = no cap): a full snap glides there at that speed instead of jumping. Neither
+# touches the IMU head, and both come on top of `[control] head_alpha`.
 # [pad_head]
 # neck_pitch_max = 2.5
 # head_pitch_max = 2.5
 # head_yaw_max = 2.5
 # head_roll_max = 2.5
+# expo = 0.6
+# max_speed = 3.0
 #
 # Body height in metres, tilt in radians; pitch is unbound by default.
 # [pad_body]
