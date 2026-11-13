@@ -390,6 +390,16 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    entry(
+        "safety.limp_fall_standup_ms",
+        Kind::Integer,
+        "How long a stand-up may take before it is re-posed and retried",
+    ),
+    entry(
+        "safety.limp_fall_standup_retries",
+        Kind::Integer,
+        "Stuck stand-ups retried in a row before giving up; 0 is off",
+    ),
     // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
         "duck_detector.enabled",

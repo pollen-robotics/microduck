@@ -2638,6 +2638,15 @@ pub struct SafetyParams {
     /// Gain for that ramp. The joints have to actually travel across the floor, so it is
     /// not the limp gain; it is the softened standing gain rather than the walking one.
     pub limp_fall_pose_gain: u16,
+    /// How long the policy gets to stand a fallen robot up before it counts as stuck. A
+    /// stand-up from the back sometimes stalls half-way, the policy holding a pose it never
+    /// gets out of; the cure is the one a human applies with Start twice — back to the
+    /// standing pose, hand it over again. "Up" is the arming test: inside `limp_fall_tilt_z`
+    /// for `limp_fall_arm_ms`. The clock starts each time the policy takes the robot.
+    pub limp_fall_standup_ms: u64,
+    /// How many times in a row a stuck stand-up is re-posed and handed back before the
+    /// daemon stops trying and leaves it to the humans. 0 turns the retry off.
+    pub limp_fall_standup_retries: u32,
 }
 
 impl Default for PolicyParams {
@@ -2692,6 +2701,8 @@ impl Default for SafetyParams {
             limp_fall_max_ms: 1500,
             limp_fall_pose_ms: 600,
             limp_fall_pose_gain: 160,
+            limp_fall_standup_ms: 3000,
+            limp_fall_standup_retries: 3,
         }
     }
 }

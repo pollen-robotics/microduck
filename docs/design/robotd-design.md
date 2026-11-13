@@ -632,6 +632,14 @@ wait for the gyro to go quiet, ramp back to the standing pose over ~1 s, hand ov
 hand-back is nothing more than that — the twist has been held at zero throughout, so command
 magnitude selects the standing network, and that is the stand-up.
 
+A stand-up can still stall: from the back the policy sometimes gets half-way and holds a pose
+it never gets out of, and the human cure is Start twice — policy off, home pose, policy on. The
+daemon does that itself. Whenever the policy takes the robot (this hand-back, or an enable on the
+floor) it has `limp_fall_standup_ms` (3 s) to have it up — inside the tilt gate for
+`limp_fall_arm_ms`, the predictor's own arming test. If not, the sequence's pose ramp puts it
+back into the standing pose and hands over again, up to `limp_fall_standup_retries` (3) times in
+a row, and then leaves it to the humans. A disable, a skill or a sit drops the watch.
+
 It runs off the policy's path by construction: `driving` is false for the whole sequence
 (§1.4), so the targets come from the sequence rather than the controller, and they reach the
 motors through `apply` like anything else — no exemption, no back door. Nothing in `safety`
