@@ -351,10 +351,10 @@ impl Default for NetpadParams {
 /// Controller-IMU head control: pose the head by tilting the pad.
 ///
 /// Some pads carry an inertial unit — the "Pro Controller" Switch clones do; an Xbox pad does not.
-/// With this on and such a pad connected, head + move mode (**D-pad right**) stops meaning "the
+/// With this on and such a pad connected, head + move mode (**D-pad left**) stops meaning "the
 /// right stick poses the head" and means "the pad's tilt poses the head": the sticks keep the
 /// whole drive mapping, and turning the pad in your hands turns the robot's head. Press D-pad
-/// right again and the pad drives the head **from where the pad is now** — the pad's yaw comes
+/// left again and the pad drives the head **from where the pad is now** — the pad's yaw comes
 /// from a gyro and drifts, and re-centring on every press is how a person beats the drift
 /// without a magnetometer.
 ///
