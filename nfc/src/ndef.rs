@@ -129,6 +129,9 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
                 let text = rest.get(lang..).unwrap_or_default();
                 records.push(Record::Text(String::from_utf8_lossy(text).into_owned()));
             }
+            (b"text/plain", _) => {
+                records.push(Record::Text(String::from_utf8_lossy(payload).into_owned()));
+            }
             (b"U", Some((&prefix, rest))) => {
                 let prefix = URI_PREFIXES.get(prefix as usize).copied().unwrap_or("");
                 records.push(Record::Uri(format!(
@@ -282,6 +285,16 @@ mod tests {
             parse(&data).unwrap(),
             vec![Record::Uri("https://ab".into())]
         );
+    }
+
+    #[test]
+    fn a_mime_text_record_reads_back() {
+        let text = b"microduck_gamepad_pairing";
+        let mut data = vec![TLV_NDEF, (3 + 10 + text.len()) as u8, 0xD2, 10, text.len() as u8];
+        data.extend(b"text/plain");
+        data.extend(text);
+        data.push(TLV_TERMINATOR);
+        assert_eq!(parse(&data).unwrap(), vec![Record::Text(PAIRING.into())]);
     }
 
     #[test]
