@@ -808,7 +808,8 @@ happens in move mode. `journalctl -fu robotd` logs each spell starting and stopp
 in `[idle]` — `sudo robotctl configure`, then restart `robotd`.
 
 On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. Forward and
+shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. A and X
+run nothing on wheels, whatever `[pad]` binds to them. Forward and
 back ramp at 1 m/s² (`[policy] accel_vx`), so a full reversal takes about a second rather than
 throwing it over; turning keeps its usual response. It does not
 look around when idle: the head command is a policy input, and the roller network collapses under

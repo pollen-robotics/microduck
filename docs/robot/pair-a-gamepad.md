@@ -72,7 +72,7 @@ always running and picks a reader up within thirty seconds of it being plugged i
 - It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
   15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
   *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
-  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only. A MIFARE Classic
+  app first (NXP TagWriter, ST25 NFC Tap) — or write it with the robot, below, which formats it. The USB reader reads NTAGs only. A MIFARE Classic
   is not read: it is said once in the journal, `tag cannot be read`.
 
 What it did is in `journalctl -u nfcd -b`.
@@ -87,15 +87,18 @@ duckctl nfc-flash microduck_gamepad_pairing
 ```
 
 The robot asks for a tag with the sound it makes when it loses its pad, the questioning quack;
-touch an NTAG to the head within 20 seconds (`--timeout` changes that, up to 120). A tag already on
+touch a tag to the head within 20 seconds (`--timeout` changes that, up to 120). A tag already on
 the reader is written too. The robot quacks when the tag took, and the command says so
 once it has read it back; the tag then holds that one text record, exactly as a phone app writes
 it. While a write is waiting, a touched tag is written rather than acted on, and the tag just
 written is not then read as a touch — writing a pairing tag does not pair.
 
-Only an **NTAG** is written. A Type 5 tag, a MIFARE Classic, a tag locked read-only or a text longer
-than the tag holds is refused with why, and nothing on it changes. Nothing but the message area is
-written — never the UID, the lock bytes or the configuration pages — so a write cannot lock a tag.
+An **NTAG** is written, and on the beta board's reader an **ISO 15693 tag** too. A blank ISO 15693
+tag is formatted for NDEF as it is written, so one no phone app recognises still works. A MIFARE
+Classic, a tag locked read-only or a text longer than the tag holds is refused with why, and
+nothing on it changes. Nothing but the message area and, on a blank ISO 15693 tag, its capability
+container is written — never the UID, the lock bytes or the configuration pages — so a write
+cannot lock a tag.
 A tag lifted half way through reads as no NDEF; write it again.
 
 It is `nfc.write` on `nfcd`'s socket, `/run/nfcd/nfc.sock`, so a robot whose `nfcd` predates it has

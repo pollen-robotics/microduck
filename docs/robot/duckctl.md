@@ -354,7 +354,8 @@ duckctl --name <robot-name> wifi connect <ssid> --psk <passphrase>
 ```
 
 Omit `--psk` for an open network. Joining disconnects the robot from the network it is on, so an ssh
-session over wifi drops; that is the command working. It can take up to 45 seconds to answer.
+session over wifi drops; that is the command working. It can take up to a minute to answer, and
+prints each step on the way (`· joining <ssid>: checking the passphrase`).
 
 ```bash
 duckctl --name <robot-name> wifi forget <ssid>
@@ -777,7 +778,7 @@ machine quiet and `--robot-sound-on` has the duck quack too. It is a LAN tool, a
 duckctl --name <robot-name> nfc-flash walk_mode
 ```
 
-The duck asks for a tag with its pad-lost sound; touch an NTAG to its head within 20 seconds
+The duck asks for a tag with its pad-lost sound; touch a tag to its head within 20 seconds
 (`--timeout`, up to 120). It quacks when the tag took. What is written and what is refused is in
 [`pair-a-gamepad.md`](pair-a-gamepad.md#writing-a-tag).
 

@@ -25,7 +25,7 @@ does not have, and it is safe to kill: the deadman stops the robot within `[safe
 
 **It is off by default and runs only when switched on.** The switch is `robotd`'s:
 `robot.autonomous {active}` sets it, and `robot.state.autonomous` and `robot.mode`'s `autonomous`
-read it back (v59). It starts every boot from `[autonomous] enabled` in `robotd.toml`
+read it back (v60). It starts every boot from `[autonomous] enabled` in `robotd.toml`
 (`robotctl configure`, "features"), and three things change it until the next boot:
 
 - `robotctl autonomous on|off`;
@@ -115,7 +115,7 @@ two cooperating clients and one fact `robotd` reports.
   somebody is running on purpose, and it drives as it always has.
 - **`robotd` says whose twist it is.** Clients name themselves in `hello {client}`, and
   `robot.state.move.source` carries the name of the client whose `robot.move` filled the twist
-  slot (v59).
+  slot (v60).
 - **`autod` yields while the pad is driving:** `move.source == "padd"` and the twist is not stale
   (`limited_by` has no `deadman`). While it yields it sends nothing at all, so the pad also gets
   the head, mouth and sounds to itself. Its brain is reset on resume, but its memories (energy,
@@ -236,7 +236,7 @@ on an obstacle, arriving at a goal) used to land there. So `autod` never asks fo
 
 **Smoothing.** `robotd` slews the head at `[control] head_alpha` for everyone. The brain's calm
 glances are fine at that rate, but a 4.5 Hz feather shiver comes out at a third of its amplitude.
-So `robot.head` takes an optional `alpha` for that one intent (v59). The brain sends its own
+So `robot.head` takes an optional `alpha` for that one intent (v60). The brain sends its own
 per-state rate, and every other client keeps the shared feel.
 
 ## 5. Obstacles

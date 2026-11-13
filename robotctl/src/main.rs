@@ -194,12 +194,12 @@ enum Namespace {
     /// its own — is the one you're SSH'd into.
     Quack,
 
-    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    /// Write a text onto an NFC tag: run this, then touch a tag to the duck's head.
     ///
     /// The tag then reads as that text — `walk_mode`, `microduck_gamepad_pairing`, anything — in
     /// the duck and in a phone app alike. A tag already on the reader is written too. The duck
-    /// quacks when it took, and the tag is read back before this says so. Only an NTAG (Type 2)
-    /// is written; anything else is refused with why, and left as it was.
+    /// quacks when it took, and the tag is read back before this says so. An NTAG or an ISO 15693
+    /// tag is written; anything else is refused with why, and left as it was.
     NfcFlash {
         /// What the tag will read.
         text: String,
@@ -777,7 +777,7 @@ fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failur
         timeout_s: Some(timeout),
     };
     eprintln!(
-        "Touch an NTAG to the duck's head (waiting {} s)…",
+        "Touch a tag to the duck's head (waiting {} s)…",
         params.timeout().as_secs()
     );
     let text = params.text.clone();
@@ -5531,6 +5531,13 @@ fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
     if let Some(iface) = &status.iface {
         let mac = status.mac.as_deref().unwrap_or("unknown");
         let _ = writeln!(out, "iface   {iface}  {mac}");
+    }
+    if let Some(joining) = &status.joining {
+        let _ = writeln!(
+            out,
+            "joining {}  {:?}, {}s of at most {}s",
+            joining.ssid, joining.step, joining.elapsed_seconds, joining.timeout_seconds
+        );
     }
 
     // The one state worth explaining, because it is a provisioning mistake rather than a

@@ -174,7 +174,7 @@ struct Latest {
 struct Abilities {
     ground_pick: bool,
     sit_stand: bool,
-    /// The robot speaks v59: `robot.head` takes `alpha`.
+    /// The robot speaks v60: `robot.head` takes `alpha`.
     head_alpha: bool,
 }
 
@@ -189,12 +189,12 @@ fn run(args: &Args, params: &robotd_params::Params) -> std::io::Result<()> {
     let api = request(&mut commands, &mut next_id, &hello)?
         .and_then(|r| r.result_as::<proto::HelloResult>().ok())
         .map_or(0, |h| h.api_version);
-    if api < 59 {
+    if api < 60 {
         // Logged and served, never refused: this robot cannot say who is driving, so the brain
         // cannot see a pad take over. Updating moves every daemon together.
         tracing::warn!(
             api,
-            "robotd predates v59 — the pad's takeover is invisible to the brain on this robot"
+            "robotd predates v60 — the pad's takeover is invisible to the brain on this robot"
         );
     }
 
@@ -208,7 +208,7 @@ fn run(args: &Args, params: &robotd_params::Params) -> std::io::Result<()> {
         at_start = false;
 
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let abilities = subscribe(&args.socket, &shared, api >= 59)?;
+        let abilities = subscribe(&args.socket, &shared, api >= 60)?;
         tracing::warn!(?abilities, "autonomous — the duck is on its own");
         spawn_depth(args.tof_socket.clone(), Arc::clone(&shared));
         spawn_map(args.map_socket.clone(), Arc::clone(&shared));

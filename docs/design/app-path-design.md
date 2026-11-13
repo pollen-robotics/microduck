@@ -141,6 +141,23 @@ fixing.
   Note this disconnects the robot when the profile being replaced is the active one. Unavoidable —
   changing a key means re-associating — and a client on BLE is unaffected, which is the property the
   whole design rests on.
+- **A join in flight is visible in `net.status`.** `net.connect` answers once, at the end, after up
+  to 55s: the scan (≤10s) and then the activation (≤45s). While it runs, `net.status` carries
+  `joining: {ssid, step, elapsed_seconds, timeout_seconds}`, with `step` one of `scanning`,
+  `associating`, `authenticating`, `key_rejected`, `addressing`. A client polls it rather than
+  showing a minute-long spinner; it is answered at once because `btd` puts `net.status` and
+  `net.connect` on different lanes (§3.5).
+
+  `configd` reports what its own `connect` is doing rather than reading the device state from
+  `status`, which was the cheaper option. The device state cannot see the scan, reports the network
+  being left as `connected` until its profile drops, and cannot tell this join from an autoconnect
+  NetworkManager started by itself. The steps after the scan are the device's transitions, which
+  `connect` already subscribes to for the failure reason. `key_rejected` is `NEED_AUTH`: `configd`
+  registers no secret agent, so NetworkManager asking for a key during a join that supplied one means
+  the handshake failed, seconds before the call answers `bad_key`.
+
+  The slot is cleared when the `Join` handle `connect` holds is dropped, so every return clears it.
+  When two joins overlap, the later one owns the slot and the earlier one finishing leaves it alone.
 
 ## 3. The GATT surface: a pipe, not an API
 
