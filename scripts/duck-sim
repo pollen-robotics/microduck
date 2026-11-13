@@ -99,6 +99,8 @@ ctl() {
         --tof-socket "$STATE/$name-tof.sock" \
         --config-socket "$STATE/$name-config.sock" \
         --socket "$STATE/$name-updater.sock" \
+        --map-socket "$STATE/$name-map.sock" \
+        --media-socket "$STATE/$name-frame.sock" \
         "$@"
 }
 
@@ -172,6 +174,8 @@ down() {
     stop_one body "body_server --port $PORT"
     i=0
     while [ "$i" -lt 16 ]; do
+        stop_one "$(duck_name "$i")-auto" "$STATE/$(duck_name "$i")/autod"
+        stop_one "$(duck_name "$i")-map" "$STATE/$(duck_name "$i")/map.json"
         stop_one "$(duck_name "$i")" "$STATE/$(duck_name "$i").sock"
         stop_one "$(duck_name "$i")-tof" "$STATE/$(duck_name "$i")-tof.sock"
         stop_one "$(duck_name "$i")-media" "$STATE/mediad-$(duck_name "$i").toml"
@@ -201,7 +205,8 @@ down() {
 # enable". cargo returns in a moment when nothing changed, which is the only case the guard saved.
 build_daemons() {
     say "building the daemons from $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
-    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds -p configd -p updater)
+    (cd "$REPO" && cargo build --quiet -p robotd -p robotctl -p tof -p sounds -p configd -p updater \
+        -p mapd -p autod)
 }
 
 # **A checkout has no policies.** They live on the Hub and reach a robot through
@@ -282,6 +287,15 @@ dir = "$REPO/robotd/emotions"
 # has one and they must not share.
 [theremin]
 socket = "$STATE/DUCK-tof.sock"
+
+# Where laser tracking and soccer ask mediad for sightings: on a board /run/mediad/media.sock,
+# here the frame socket of this duck's own mediad. A duck without a camera has none, and says so
+# when either is switched on, as a board without mediad would.
+[laser]
+socket = "$STATE/DUCK-frame.sock"
+
+[soccer]
+socket = "$STATE/DUCK-frame.sock"
 TOML
 
     # **A voice each, and it is not decoration.** `robotctl chorale` refuses without one — but more
@@ -293,7 +307,7 @@ TOML
     i=0
     while [ "$i" -lt "$DUCKS" ]; do
         name="$(duck_name "$i")"
-        sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" \
+        sed -e "s|/sounds/DUCK|/sounds/$name|" -e "s|/DUCK-tof.sock|/$name-tof.sock|" -e "s|/DUCK-frame.sock|/$name-frame.sock|" \
             "$STATE/robotd.toml" > "$STATE/robotd-$name.toml"
         if [ ! -d "$STATE/sounds/$name" ]; then
             say "rendering $name a voice"
@@ -426,6 +440,30 @@ TOML
     ln -sf "$STATE/$(duck_name 0).log" "$STATE/robotd.log"
     wait_for_socket || die "robotd did not come up. $STATE/$(duck_name 0).log has why."
 
+    # **The duck on its own:** mapd keeps the map, autod is the brain. Both idle until autonomy is
+    # switched on (an NFC tag, or scripts/duck-sim ctl autonomous on), as they do on a robot, so
+    # a duck nobody switches on pays nothing for them. Each reads its duck's own robotd.toml.
+    say "starting mapd and autod"
+    i=0
+    while [ "$i" -lt "$DUCKS" ]; do
+        name="$(duck_name "$i")"
+        mkdir -p "$STATE/$name/autod"
+        DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" $SETSID nohup "$REPO/target/debug/mapd" \
+            --config "$STATE/robotd-$name.toml" --map "$STATE/$name/map.json" \
+            --socket "$STATE/$name-map.sock" --robot-socket "$STATE/$name.sock" \
+            --tof-socket "$STATE/$name-tof.sock" \
+            > "$STATE/$name-map.log" 2>&1 &
+        echo $! > "$STATE/$name-map.pid"
+        wait_for_duck "$name" || say "$name's robotd has no socket yet, so its autod will exit: see $STATE/$name-auto.log"
+        DUCK_RUNTIME_DIR="$STATE" RUST_LOG="${RUST_LOG:-info}" $SETSID nohup "$REPO/target/debug/autod" \
+            --socket "$STATE/$name.sock" --tof-socket "$STATE/$name-tof.sock" \
+            --map-socket "$STATE/$name-map.sock" --config "$STATE/robotd-$name.toml" \
+            --state-dir "$STATE/$name/autod" \
+            > "$STATE/$name-auto.log" 2>&1 &
+        echo $! > "$STATE/$name-auto.pid"
+        i=$((i + 1))
+    done
+
     # A `mediad` for every duck with an eye. On the host rather than in a container even in
     # container mode: `webrtcsink` here is a local build at /opt/gst-plugins-rs, and a Debian
     # container has no packaged one — so the console is served from the host, pointed at the
@@ -543,6 +581,7 @@ WHY
     scripts/duck-sim ctl robot do roulade
     scripts/duck-sim log          what the daemon is saying
     scripts/duck-sim ctl account login    reach it from anywhere, like a real duck
+    scripts/duck-sim ctl autonomous on    the duck on its own
     scripts/duck-sim down
 
 NEXT
@@ -729,6 +768,18 @@ wait_for_socket() {
         i=$((i + 1)); sleep 0.2
     done
     return 1
+}
+
+# **This duck's robotd, not the first's.** autod connects once and exits when nobody answers, and
+# on a robot systemd starts it again; here nothing does, so it waits for its own duck instead.
+# `waited`, not `i`, for the reason `stop_one` gives.
+wait_for_duck() {
+    waited=0
+    while [ $waited -lt 150 ] && [ ! -S "$STATE/$1.sock" ]; do
+        waited=$((waited + 1))
+        sleep 0.2
+    done
+    [ -S "$STATE/$1.sock" ]
 }
 
 # Walking has no robotctl subcommand — intents come from a pad or the console — so this is the
