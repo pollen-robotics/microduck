@@ -9,6 +9,15 @@ use robotd_params::pad_axes::{AxisBinding, Sticks};
 use crate::buttons::Buttons;
 use crate::hold::{FLASHLIGHT_TAP, HOME_HOLD, HoldAction, HoldButton, REST_HOLD, SHUTDOWN_HOLD};
 
+/// Which D-pad arrow selects which [`Mode`], in the order two arrows pressed in one frame
+/// resolve: the last one wins.
+const ARROWS: [(Buttons, Mode); 4] = [
+    (Buttons::UP, Mode::Head),
+    (Buttons::RIGHT, Mode::HeadDrive),
+    (Buttons::LEFT, Mode::Drive),
+    (Buttons::DOWN, Mode::BodyPose),
+];
+
 /// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,15 +235,10 @@ impl Mapper {
         }
 
         // The D-pad picks what the sticks mean. Two arrows pressed inside one frame resolve in
-        // this fixed order, the last one winning — which is what gilrs's event order did in
+        // [`ARROWS`]' order, the last one winning — which is what gilrs's event order did in
         // `padd` for the only case that matters, one arrow at a time.
         let mut wanted_mode = None;
-        for (button, mode) in [
-            (Buttons::UP, Mode::Head),
-            (Buttons::RIGHT, Mode::HeadDrive),
-            (Buttons::LEFT, Mode::Drive),
-            (Buttons::DOWN, Mode::BodyPose),
-        ] {
+        for (button, mode) in ARROWS {
             if pad.pressed.contains(button) {
                 wanted_mode = Some(mode);
             }
@@ -1203,7 +1207,12 @@ mod tests {
         })
     }
 
-    fn enter(m: &mut Mapper, cfg: &Config, t0: Instant, at: u64, arrow: Buttons) {
+    /// Press the arrow for `mode`, whichever one the D-pad layout has it on.
+    fn enter(m: &mut Mapper, cfg: &Config, t0: Instant, at: u64, mode: Mode) {
+        let (arrow, _) = *ARROWS
+            .iter()
+            .find(|(_, m)| *m == mode)
+            .expect("every mode has an arrow");
         let (mut out, mut frame) = (Vec::new(), Vec::new());
         let pad = PadFrame {
             pressed: arrow,
@@ -1226,7 +1235,7 @@ mod tests {
     fn a_head_stick_snap_glides_at_max_speed_and_a_small_move_does_not() {
         let (mut m, mut cfg, t0) = (Mapper::new(), cfg(), Instant::now());
         cfg.head.max_speed = 2.5; // the full 2.5 rad in one second
-        enter(&mut m, &cfg, t0, 0, Buttons::UP);
+        enter(&mut m, &cfg, t0, 0, Mode::Head);
         let mut yaw = 0.0;
         for tick in 1..=50 {
             yaw = head_yaw_at(&mut m, &cfg, t0, 20 * tick, 1.0).unwrap();
@@ -1264,13 +1273,13 @@ mod tests {
     fn the_head_glide_starts_from_the_centre_after_a_mode_change() {
         let (mut m, mut cfg, t0) = (Mapper::new(), cfg(), Instant::now());
         cfg.head.max_speed = 2.5;
-        enter(&mut m, &cfg, t0, 0, Buttons::UP);
+        enter(&mut m, &cfg, t0, 0, Mode::Head);
         for tick in 1..=60 {
             head_yaw_at(&mut m, &cfg, t0, 20 * tick, 1.0);
         }
-        enter(&mut m, &cfg, t0, 1_220, Buttons::DOWN);
+        enter(&mut m, &cfg, t0, 1_220, Mode::Drive);
         head_yaw_at(&mut m, &cfg, t0, 1_240, 1.0);
-        enter(&mut m, &cfg, t0, 1_260, Buttons::UP);
+        enter(&mut m, &cfg, t0, 1_260, Mode::Head);
         let yaw = head_yaw_at(&mut m, &cfg, t0, 1_280, 1.0).unwrap();
         assert!((yaw - 0.05).abs() < 1e-9, "from the centre: {yaw}");
 
