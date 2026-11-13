@@ -2645,8 +2645,12 @@ pub struct SafetyParams {
     /// for `limp_fall_arm_ms`. The clock starts each time the policy takes the robot.
     pub limp_fall_standup_ms: u64,
     /// How many times in a row a stuck stand-up is re-posed and handed back before the
-    /// daemon stops trying and leaves it to the humans. 0 turns the retry off.
+    /// daemon stops trying. 0 turns the retry off. Out of retries, the robot is parked stiff
+    /// at the home pose with the policy off until it is stood on its feet.
     pub limp_fall_standup_retries: u32,
+    /// How long a parked robot must be upright and still — stood on its feet and let go —
+    /// before the policy gets it back.
+    pub limp_fall_standup_resume_ms: u64,
 }
 
 impl Default for PolicyParams {
@@ -2703,6 +2707,7 @@ impl Default for SafetyParams {
             limp_fall_pose_gain: 160,
             limp_fall_standup_ms: 3000,
             limp_fall_standup_retries: 3,
+            limp_fall_standup_resume_ms: 1000,
         }
     }
 }

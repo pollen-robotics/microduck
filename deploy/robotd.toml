@@ -364,10 +364,15 @@ mode = "walk"
 # hand-back above, or an enable on the floor — it has `limp_fall_standup_ms` to have it up
 # (inside `limp_fall_tilt_z` for `limp_fall_arm_ms`, the same test that arms the predictor).
 # If it has not, the robot is posed back to standing and handed over again, up to
-# `limp_fall_standup_retries` times in a row; then it is left to the humans. 0 turns it off.
-# Disabling the policy, or anything else taking the robot, drops the watch.
+# `limp_fall_standup_retries` times in a row. 0 turns it off. Disabling the policy, or
+# anything else taking the robot, drops the watch.
+#
+# Out of retries, the robot is parked: stiff at the home pose, policy off, nothing grinding.
+# Stand it on its feet and let go — upright and still (under `limp_fall_still_rate`) for
+# `limp_fall_standup_resume_ms` — and the policy takes it back by itself. Start twice works too.
 # limp_fall_standup_ms = 3000
 # limp_fall_standup_retries = 3
+# limp_fall_standup_resume_ms = 1000
 
 # Sit down gracefully and power the machine off when the battery EMA reaches the empty
 # floor (6.6 V — the same value the battery percentage maps to 0%). The EMA moves over

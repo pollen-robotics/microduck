@@ -398,7 +398,12 @@ pub const REGISTRY: &[Entry] = &[
     entry(
         "safety.limp_fall_standup_retries",
         Kind::Integer,
-        "Stuck stand-ups retried in a row before giving up; 0 is off",
+        "Stuck stand-ups retried in a row before parking at home; 0 is off",
+    ),
+    entry(
+        "safety.limp_fall_standup_resume_ms",
+        Kind::Integer,
+        "How long a parked robot must stand still on its feet to resume",
     ),
     // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
