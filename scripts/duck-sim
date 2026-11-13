@@ -659,10 +659,15 @@ start_body() {
     # the *subshell's* pid, because `A && B & C` parses as `(A && B) & C` — so `down` killed a
     # wrapper and left MuJoCo running as an orphan. `setsid` puts the simulator in its own process
     # group, which is what makes stopping it one signal rather than a hunt.
+
+    # An argument list, not a string to split later: scene paths can contain spaces or globs.
+    set -- -m mjlab_microduck.sim.body_server \
+        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}"
+    [ -z "$HEADLESS" ] || set -- "$@" "$HEADLESS"
     case "$SCENE" in
-        "")   scene_arg="" ;;
-        */*)  scene_arg="--scene $SCENE" ;;
-        *)    scene_arg="--scene $RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
+        "")   ;;
+        */*)  set -- "$@" --scene "$SCENE" ;;
+        *)    set -- "$@" --scene "$RL/src/mjlab_microduck/robot/microduck/scene_$SCENE.xml" ;;
     esac
     # **The camera flags go with the cameras.** Rendering is newer than the body server, and a
     # build without it has no `--cameras`/`--frame-port` — argparse then refuses the whole
@@ -677,15 +682,11 @@ start_body() {
     # line that would mean something if the simulator really were falling behind. 30 costs about a
     # third of a core per camera, which is the trade `DUCK_SIM_CAMERAS` already exists to let you
     # decline.
-    cam_args=""
     if [ -n "$CAMERAS" ]; then
-        cam_args="--cameras $CAMERAS --frame-port $FRAME_PORT --camera-fps 30"
+        set -- "$@" --cameras "$CAMERAS" --frame-port "$FRAME_PORT" --camera-fps 30
     fi
     # shellcheck disable=SC2086
-    $SETSID nohup "$PY_BIN" -m mjlab_microduck.sim.body_server \
-        --port "$PORT" --ducks "$DUCKS" --keyframe "${DUCK_SIM_KEYFRAME:-SIT}" $HEADLESS $scene_arg \
-        $cam_args \
-        > "$STATE/body.log" 2>&1 &
+    $SETSID nohup "$PY_BIN" "$@" > "$STATE/body.log" 2>&1 &
     echo $! > "$STATE/body.pid"
     if ! wait_for_port; then
         # **The one failure here that belongs to the other repo.** The camera arrived in
@@ -1058,8 +1059,8 @@ CONF
         fi
         say "booting $name (body on port $(duck_port "$i"))"
         # An empty AUDIO_BIND must pass no argument at all, so the word split is the point — the
-        # same shape as the four other deliberately unquoted lists here: `$mediad_features`, two
-        # calls' `$args`, and the body server's `$HEADLESS $scene_arg $cam_args`.
+        # same shape as the other deliberately unquoted lists here: `$mediad_features` and both
+        # calls' `$args`.
         # shellcheck disable=SC2086
         sudo systemd-run --collect --unit="$name" --quiet \
             systemd-nspawn -D "$upper/merged" --machine="$name" --boot \
