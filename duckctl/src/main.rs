@@ -130,6 +130,16 @@ const FOLLOW_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 /// far below every budget here and costs one cheap CoreBluetooth query each time.
 const LINK_POLL: Duration = Duration::from_secs(2);
 
+/// How often `wifi connect` asks `net.status` how far the join has got.
+///
+/// The steps a join passes through last seconds each, so polling faster would mostly repeat the
+/// same answer over a link that carries twenty bytes a write.
+const JOIN_POLL: Duration = Duration::from_secs(2);
+
+/// The `id` of those polls. The call itself is `1`, so a reply carrying this one is progress, not
+/// the answer.
+const JOIN_POLL_ID: u64 = 2;
+
 /// Every step before the first reply gets its own budget and its own message.
 ///
 /// btleplug bounds none of these, so without them a stall anywhere between "found the robot" and
@@ -1253,11 +1263,11 @@ enum Command {
     /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
     /// that answers, in a voice that is only its own, is the one `--name` reached.
     Quack,
-    /// Write a text onto an NFC tag: run this, then touch an NTAG to the duck's head.
+    /// Write a text onto an NFC tag: run this, then touch a tag to the duck's head.
     ///
     /// `robotctl nfc-flash` on the robot. The tag then reads as that text — `walk_mode`,
-    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. Only an NTAG
-    /// (Type 2) is written; anything else is refused with why, and left as it was.
+    /// `microduck_gamepad_pairing`, anything — and the duck quacks when it took. An NTAG or an
+    /// ISO 15693 tag is written; anything else is refused with why, and left as it was.
     NfcFlash {
         /// What the tag will read.
         text: String,
@@ -2142,24 +2152,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("→ {line}");
     }
 
-    // Chunked by the same code the robot uses. btleplug does not expose the negotiated MTU, so
-    // 20 bytes — the floor every BLE link guarantees — is the safe assumption. Slower than
-    // necessary on a good link, and correct on every link.
-    let line = match &mut secure {
-        Some(session) => Frame::Data(session.seal(line.as_bytes()).map_err(|_| SEAL_FAILED)?)
-            .encode(MAX_CLIENT_LINE)
-            .map_err(|_| "the request is too long to send encrypted")?,
-        None => line,
-    };
-    for chunk in framing::chunks(&line, 20) {
-        peripheral
-            .write(&request, &chunk, WriteType::WithoutResponse)
-            .await?;
-    }
+    send_line(&peripheral, &request, &mut secure, &line).await?;
 
     if let Command::NfcFlash { timeout, .. } = &cli.command {
         eprintln!(
-            "Touch an NTAG to the duck's head (waiting {} s)…",
+            "Touch a tag to the duck's head (waiting {} s)…",
             (*timeout).clamp(1, duck_ipc_proto::NfcWriteParams::MAX_TIMEOUT_S)
         );
     }
@@ -2172,13 +2169,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // because a robot sending progress is a robot that is working. See `REPLY_TIMEOUT`.
     let mut deadline = tokio::time::Instant::now() + timeout;
 
+    // A join takes up to a minute and answers once, at the end. Asking `net.status` alongside it
+    // turns that minute into steps; `btd` serves the two on separate connections to `configd`, so
+    // the poll is answered while the join is still waiting on NetworkManager.
+    let polls_join = matches!(cli.command, Command::Wifi(Wifi::Connect { .. }));
+    let mut next_poll = tokio::time::Instant::now() + JOIN_POLL;
+    let mut last_join_line: Option<String> = None;
+
     loop {
-        let notification = match next_chunk(&peripheral, &mut notifications, deadline).await {
+        let wake = if polls_join {
+            deadline.min(next_poll)
+        } else {
+            deadline
+        };
+        let notification = match next_chunk(&peripheral, &mut notifications, wake).await {
             Waited::Chunk(notification) => notification,
             Waited::Dropped => return Err(dropped(&cli.command).into()),
+            Waited::Silent if tokio::time::Instant::now() < deadline => {
+                let poll = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": JOIN_POLL_ID,
+                    "method": "net.status",
+                    "params": {},
+                });
+                send_line(&peripheral, &request, &mut secure, &poll.to_string()).await?;
+                next_poll = tokio::time::Instant::now() + JOIN_POLL;
+                continue;
+            }
             Waited::Silent => return Err(silence(timeout).into()),
         };
-        deadline = tokio::time::Instant::now() + timeout;
+        // The answers to this tool's own polls do not count as the robot getting on with the
+        // call: they would keep a join that configd never answers waiting forever. So while
+        // polling, the clock restarts per line, on lines that are not poll replies, below.
+        if !polls_join {
+            deadline = tokio::time::Instant::now() + timeout;
+        }
 
         for line in reassembler.push(&notification.value)? {
             let line = match &mut secure {
@@ -2191,6 +2216,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Notifications with no `id` are a progress stream, not an answer; report them and
             // keep waiting for the response that closes the call.
             let value: serde_json::Value = serde_json::from_str(&line)?;
+
+            if polls_join {
+                if value["id"] == serde_json::json!(JOIN_POLL_ID) {
+                    let line = join_line(&value["result"]);
+                    if line.is_some() && line != last_join_line {
+                        eprintln!("· {}", line.as_deref().unwrap_or_default());
+                    }
+                    last_join_line = line;
+                    continue;
+                }
+                deadline = tokio::time::Instant::now() + timeout;
+            }
+
             let is_answer = value.get("id").is_some_and(|id| !id.is_null());
 
             if !is_answer {
@@ -2555,6 +2593,50 @@ async fn secure_handshake(
         eprintln!("← secure session open");
     }
     Ok(session)
+}
+
+/// Send one request line, sealed into a `Data` frame when the session is secure.
+///
+/// Chunked by the same code the robot uses. btleplug does not expose the negotiated MTU, so 20
+/// bytes — the floor every BLE link guarantees — is the safe assumption. Slower than necessary on a
+/// good link, and correct on every link.
+async fn send_line(
+    peripheral: &Peripheral,
+    characteristic: &Characteristic,
+    secure: &mut Option<duck_auth::Session>,
+    line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sealed;
+    let line = match secure {
+        Some(session) => {
+            sealed = Frame::Data(session.seal(line.as_bytes()).map_err(|_| SEAL_FAILED)?)
+                .encode(MAX_CLIENT_LINE)
+                .map_err(|_| "the request is too long to send encrypted")?;
+            sealed.as_str()
+        }
+        None => line,
+    };
+    for chunk in framing::chunks(line, 20) {
+        peripheral
+            .write(characteristic, &chunk, WriteType::WithoutResponse)
+            .await?;
+    }
+    Ok(())
+}
+
+/// How far a join has got, from a `net.status` result, as a line for a person — or `None` when
+/// no join is in flight, or the robot's `configd` predates `joining` (API v57).
+fn join_line(status: &serde_json::Value) -> Option<String> {
+    use duck_ipc_proto as proto;
+    let joining: proto::Joining = serde_json::from_value(status.get("joining")?.clone()).ok()?;
+    let step = match joining.step {
+        proto::JoinStep::Scanning => "looking for the network",
+        proto::JoinStep::Associating => "associating",
+        proto::JoinStep::Authenticating => "checking the passphrase",
+        proto::JoinStep::KeyRejected => "passphrase rejected",
+        proto::JoinStep::Addressing => "waiting for an address",
+    };
+    Some(format!("joining {}: {step}", joining.ssid))
 }
 
 /// One line from a secure robot, decrypted: every line it sends is a `Data` frame.
@@ -4341,6 +4423,29 @@ mod tests {
     ///
     /// The phase is always there; the percent only during a download, and the detail rarely. A
     /// `None` percent must not print as `null%`, which is what a naive format would do.
+    /// Printed only when it changes, so the line must not carry the elapsed time — or every poll
+    /// would print.
+    #[test]
+    fn a_join_prints_its_step_and_nothing_without_one() {
+        let status = serde_json::json!({
+            "state": "connecting",
+            "joining": {
+                "ssid": "Pollen",
+                "step": "authenticating",
+                "elapsed_seconds": 7,
+                "timeout_seconds": 55,
+            },
+        });
+        assert_eq!(
+            join_line(&status).as_deref(),
+            Some("joining Pollen: checking the passphrase")
+        );
+        assert_eq!(
+            join_line(&serde_json::json!({ "state": "connected" })),
+            None
+        );
+    }
+
     #[test]
     fn progress_prints_as_a_line() {
         let full = serde_json::json!({

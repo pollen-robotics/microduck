@@ -556,7 +556,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
 /// has no socket, so the call fails to connect rather than being refused by name.
 ///
-/// # v57 — soccer mode
+/// # v57 — a join's progress
+///
+/// [`NetStatusResult::joining`]: while a `net.connect` is in flight, `net.status` says which
+/// network it is joining and how far it has got, so a client can show progress instead of a 45s
+/// spinner. Additive: absent from an older `configd`, and whenever no join is in flight.
+///
+/// # v58 — soccer mode
 ///
 /// [`method::ROBOT_SOCCER`] switches soccer mode — the pad's bumpers kick — and, on top of it,
 /// autonomous soccer, where the robot finds a purple ball, walks to it and kicks it.
@@ -565,7 +571,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// learns of a switch made from elsewhere — an NFC tag. Underneath, `robotd` subscribes to
 /// `mediad`'s local [`method::MEDIA_BALL`]; a `mediad` older than this refuses it, and the soccer
 /// block's `camera` line says so. All additive.
-pub const API_VERSION: u32 = 57;
+pub const API_VERSION: u32 = 58;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -902,13 +908,14 @@ pub mod method {
     /// foot, then looks for it again — sharing the robot the way laser tracking does: a deflected
     /// client stick wins. Switching soccer on switches laser tracking off, and the other way round.
     pub const ROBOT_SOCCER: &str = "robot.soccer";
-    /// Write a text onto the next NTAG touched to the reader: one NDEF text record, as a phone
+    /// Write a text onto the next tag touched to the reader: one NDEF text record, as a phone
     /// app writes it, so the tag then reads as that text everywhere — a mode tag, a pairing tag.
     /// The answer comes when a tag has been written and read back, or when none was touched in
     /// time; see [`super::NfcWriteResult`]. Answered by `nfcd`.
     ///
-    /// Only an NTAG (NFC Forum Type 2) is written. A Type 5 tag, a MIFARE Classic, a locked tag
-    /// or a text too long for the tag is refused with why, and nothing on it changes.
+    /// An NTAG (NFC Forum Type 2) is written, and on the beta board's reader an ISO 15693 tag
+    /// (Type 5) too, formatted first if blank. A MIFARE Classic, a locked tag or a text too long
+    /// for the tag is refused with why, and nothing on it changes.
     pub const NFC_WRITE: &str = "nfc.write";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
@@ -3178,7 +3185,7 @@ pub struct ModeResult {
     pub mode: String,
     /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
     /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
-    /// the pad's buttons do. (v57)
+    /// the pad's buttons do. (v58)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerParams>,
 }
@@ -4798,7 +4805,7 @@ pub struct RobotState {
     /// [`LaserTrackState`]. (v52)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub laser: Option<LaserTrackState>,
-    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v57)
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v58)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soccer: Option<SoccerState>,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
@@ -5028,6 +5035,45 @@ pub struct NetStatusResult {
     /// provisioning gives us a real serial (`updater-design.md` §5.7).
     pub mac: Option<String>,
     pub iface: Option<String>,
+    /// The `net.connect` in flight, if there is one. (v57)
+    ///
+    /// Present from the moment `configd` accepts the call until it answers, and only then: an
+    /// autoconnect NetworkManager starts on its own shows as `connecting` with no `joining`. While
+    /// it is present, the other fields still describe the link as it is — which, early in a join,
+    /// can be the network the robot is about to leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joining: Option<Joining>,
+}
+
+/// How far a `net.connect` has got. See [`NetStatusResult::joining`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Joining {
+    /// The network asked for.
+    pub ssid: String,
+    pub step: JoinStep,
+    /// Since `configd` accepted the call.
+    pub elapsed_seconds: u32,
+    /// The longest `configd` will take before answering `timeout`, counted from the same instant.
+    /// An upper bound for a progress bar, not an estimate: most joins finish well inside it.
+    pub timeout_seconds: u32,
+}
+
+/// One stage of a join, in the order a successful one passes through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStep {
+    /// Looking for the network before touching any profile — a few seconds.
+    Scanning,
+    /// NetworkManager is preparing the radio and associating with the access point.
+    Associating,
+    /// The WPA handshake: this is where a passphrase is checked.
+    Authenticating,
+    /// The access point rejected the handshake and NetworkManager is asking for a key, which
+    /// nothing on the robot will supply. Almost always a wrong passphrase; the call answers
+    /// `bad_key` shortly after.
+    KeyRejected,
+    /// Associated; waiting for an address, which on a busy network is where the time goes.
+    Addressing,
 }
 
 /// How a network is secured. What a client needs in order to know whether to ask for a

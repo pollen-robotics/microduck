@@ -124,6 +124,20 @@ pub struct Config {
     pub roller: bool,
 }
 
+impl Config {
+    /// The buttons a roller robot leaves unbound whatever `[pad]` says: A and X. Sit ↔ stand has
+    /// no meaning on wheels, and a skill held on X is not something the roller line has.
+    pub const ROLLER_UNBOUND: [&'static str; 2] = ["a", "x"];
+
+    /// The skill a button runs here, empty for none: its `[pad]` binding, except on wheels.
+    pub fn skill(&self, button: &str) -> &str {
+        if self.roller && Self::ROLLER_UNBOUND.contains(&button) {
+            return "";
+        }
+        self.bindings.skill(button).unwrap_or_default()
+    }
+}
+
 /// What to send, in order. A `Request` is answered — "refused, and here is why" is a real
 /// outcome — and the daemon hands the answer to [`report`]; a `Notify` is not.
 #[derive(Debug, Clone, PartialEq)]
@@ -385,7 +399,7 @@ impl Mapper {
                 "lb" if self.soccer.active => "kick_left",
                 "rb" if self.soccer.active => "kick_right",
                 // An empty binding is a button switched off on purpose, not a fault.
-                _ => cfg.bindings.skill(button).unwrap_or_default(),
+                _ => cfg.skill(button),
             };
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
@@ -425,7 +439,7 @@ impl Mapper {
         // Whatever X is bound to, nothing by default: a skill that does not chain simply refuses
         // the resend, which costs a notification nobody reads. Only X, because it is the button
         // the prototype held the roulade on.
-        let held = cfg.bindings.skill("x").unwrap_or_default();
+        let held = cfg.skill("x");
         if pad.held.contains(Buttons::X)
             && !pad.pressed.contains(Buttons::X)
             && !self.spent.contains(Buttons::X)
@@ -1231,6 +1245,41 @@ mod tests {
             assert_eq!(&twist(&cfg, mode, s)[..3], &[-0.5, 0.0, 0.3], "{mode:?}");
         }
         assert_eq!(twist(&cfg, Mode::Drive, sticks(0.0, 1.0, 0.0, 0.0))[0], 0.6);
+    }
+
+    /// On wheels A and X run nothing, pressed or held, even bound — and B still runs the crouch.
+    #[test]
+    fn on_wheels_a_and_x_run_no_skill() {
+        let t = Instant::now();
+        let mut cfg = cfg();
+        cfg.bindings.x = "roulade".to_owned();
+        let skills = |cfg: &Config, b: Buttons, held_only: bool| {
+            let (mut m, mut out, mut frame) = (Mapper::new(), Vec::new(), Vec::new());
+            let pressed = if held_only { Buttons::NONE } else { b };
+            let pad = PadFrame {
+                pressed,
+                held: b,
+                ..Default::default()
+            };
+            m.tick(&pad, cfg, t, &mut out, &mut frame);
+            let mut skills = Vec::new();
+            for o in out {
+                let (Out::Request(call) | Out::Notify(call)) = o;
+                if let proto::Call::RobotDo(d) = call {
+                    skills.push(d.skill);
+                }
+            }
+            skills
+        };
+        assert_eq!(skills(&cfg, Buttons::A, false), ["sit_toggle"]);
+        assert_eq!(skills(&cfg, Buttons::X, false), ["roulade"]);
+        assert_eq!(skills(&cfg, Buttons::X, true), ["roulade"]);
+
+        cfg.roller = true;
+        assert!(skills(&cfg, Buttons::A, false).is_empty());
+        assert!(skills(&cfg, Buttons::X, false).is_empty());
+        assert!(skills(&cfg, Buttons::X, true).is_empty());
+        assert_eq!(skills(&cfg, Buttons::B, false), ["ground_pick"]);
     }
 
     /// A binding moved, reversed, made gentler or switched off reaches the command, and so does

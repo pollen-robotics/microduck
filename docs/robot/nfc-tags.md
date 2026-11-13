@@ -11,7 +11,7 @@ sockets exactly as `robotctl` would.
 
 ## The tags
 
-Every tag holds **one text record**, and the text is the whole message: surrounding spaces are
+Every tag holds **one text (or URI) record**, and the text is the whole message: surrounding spaces are
 ignored, case is not. A tag that merely *contains* one of these texts among others does nothing.
 
 | Text on the tag | What the robot does | Same as |
@@ -72,9 +72,9 @@ The table and where a new mode's behaviour goes are in `nfc/src/modes.rs`.
 
 - **NTAG** (NFC Forum Type 2, ISO 14443A) — NTAG213, 215, 216. The one to buy: every reader reads it
   and the robot writes it.
-- **ISO 15693** (NFC Forum Type 5: ICODE SLIX, ST25TV) — read by the beta board's reader only, not
-  by the USB reader, and not written by the robot. One that is not NDEF-formatted yet needs its
-  maker's app first (NXP TagWriter, ST25 NFC Tap).
+- **ISO 15693** (NFC Forum Type 5: ICODE SLIX, ST25TV) — read and written by the beta board's
+  reader only, not by the USB reader. A blank one is formatted for NDEF as the robot writes it; a
+  phone needs the maker's app for that first (NXP TagWriter, ST25 NFC Tap).
 - **MIFARE Classic** (SAK `08`, "NXP MIFARE Classic 1K" in a phone app) — **not read.** It says
   so once per touch in the journal, `tag cannot be read`. Use an NTAG.
 
@@ -95,7 +95,7 @@ duckctl --name <robot-name> nfc-flash "walk_mode"
 ```
 
 1. The robot asks for a tag with the sound it makes when it loses its pad, the questioning quack.
-2. Touch an NTAG to the head within **20 seconds** (`--timeout` changes that, up to 120). A tag
+2. Touch a tag to the head within **20 seconds** (`--timeout` changes that, up to 120). A tag
    already on the reader is written too.
 3. The robot **quacks** when the tag took, and the command prints `<uid> now reads "walk_mode"` once
    it has read it back.
@@ -107,9 +107,11 @@ While a write is waiting, a touched tag is written rather than acted on, and the
 is not then read as a touch: writing a pairing tag does not pair, writing a mode tag does not
 switch the mode.
 
-**Only an NTAG is written.** A Type 5 tag, a MIFARE Classic, a tag locked read-only, or a text
-longer than the tag holds is refused with why, and nothing on it changes. Only the message area is
-written — never the UID, the lock bytes or the configuration pages — so a write cannot lock a tag.
+**An NTAG is written, and on the beta board's reader an ISO 15693 tag too** — a blank one is
+formatted for NDEF as it is written. A MIFARE Classic, a tag locked read-only, or a text longer than
+the tag holds is refused with why, and nothing on it changes. Only the message area is written, and
+on a blank ISO 15693 tag its capability container — never the UID, the lock bytes or the
+configuration pages — so a write cannot lock a tag.
 A tag lifted half way through reads as no NDEF; write it again.
 
 `duckctl nfc-flash` needs a `duckctl` and a daemon that both know `nfc.write`; on a robot whose
