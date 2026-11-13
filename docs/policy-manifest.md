@@ -27,12 +27,15 @@ contract.
 | `encoding` | the twist | who |
 | --- | --- | --- |
 | absent or `constant` | a fixed twist for the window, `idle` on the way back | every kick, the roulade, every community one-shot so far |
-| `phase` | `[cos 2πφ, sin 2πφ, 0]`, φ from 0 over `period_s` s, hands back at `end_phase` | the ground pick; the roller crouch |
+| `phase` | `[cos 2πφ, sin 2πφ, 0]`, φ from 0 over `period_s` s; episodic hands back at `end_phase`; perpetual wraps | the ground pick; the roller crouch; a community skill added with `policy add` |
 | `posture_flag` | one slot carries `sit` or `stand` | the sit↔stand |
 
-Only a constant-command `episodic` policy can be a generic one-shot. A `phase` or `posture_flag`
-policy is refused by `policy add` and belongs in the slot the daemon drives (`policy load
-ground_pick …`, `policy load sitstand …`). The daemon guards this on the encoding, not the name.
+A constant-command `episodic` policy is a generic one-shot, and so is a `phase` policy: `policy
+add` accepts it and the daemon writes the clock. Episodic duration is `period_s × end_phase`.
+Perpetual still needs `--hold`, and φ wraps until then. A `posture_flag` policy is refused by
+`policy add` and belongs in the slot the daemon drives (`policy load sitstand …`). The official
+set's phase entries are still each mode's ground pick (`policy load ground_pick …`). The daemon
+guards this on the encoding, not the name.
 
 ## Fields
 
@@ -50,7 +53,7 @@ a policy only on a claim that is present and wrong.
 | `name` | str | skills | what a client asks for; defaults to the file's stem |
 | `description` | str | display | one line, untrusted — what `policy search` shows under each hit, and `policy fetch` on the way in |
 | `kind` | str | skills, slots | see above |
-| `duration_s` | float | skills | seconds it runs; for a phase policy `period_s × end_phase` |
+| `duration_s` | float | skills | seconds it runs; for an episodic phase policy `period_s × end_phase` |
 | `chain` | bool | skills | a held button starts another run when this one ends |
 | `action_scale` | float | skills | its own output scale while it runs |
 | `unwind_s` | float | skills, sitstand | seconds driving `command.idle` before handing back; for the sit↔stand, the rise |
@@ -60,7 +63,7 @@ a policy only on a claim that is present and wrong.
 | `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
 | `command.encoding` | str | skills | see above |
 | `command.idle` | [3] | skills | the twist that means "stop doing the thing" |
-| `command.period_s`, `command.end_phase` | float | ground pick | the phase cycle |
+| `command.period_s`, `command.end_phase` | float | skills, ground pick | the phase cycle; a skill needs a positive `period_s`; episodic hands back at `end_phase` |
 | `command.sit`, `command.stand`, `command.slot` | | display | the flag's values and where it rides |
 | `command.twist`, `command.head`, `command.body` | prose | display | what each block means to a person |
 | `training` | object | display | `task_id`, `repo`, `commit`, `branch`, `dirty`, `run`, `checkpoint`, `exported` |
@@ -97,10 +100,11 @@ and offline rehearsal.
 
 The repo carries exactly one `.onnx`, named `policy.onnx`. `robotctl policy add polite-bow
 <user>/microduck-polite-bow` reads `duration_s`, `chain`, `action_scale`, `command.idle` and
-`unwind_s`, refuses on `obs_len`, `action_len`, `model_api`, `robot.model` or a non-constant
-encoding, and writes the skill. `RemiFabre/microduck-flamingo-cycle` is a published `perpetual`
-example: no `duration_s`, so `--hold` is required, and its `command.idle` is what the unwind
-drives.
+`unwind_s`, refuses on `obs_len`, `action_len`, `model_api`, `robot.model` or a `posture_flag`
+encoding, and writes the skill. A phase encoding needs a positive `command.period_s`; episodic
+duration is `period_s × end_phase` when the manifest does not declare `duration_s`. Perpetual
+still needs `--hold`. `RemiFabre/microduck-flamingo-cycle` is a published `perpetual` example: no
+`duration_s`, so `--hold` is required, and its `command.idle` is what the unwind drives.
 
 ## The official set
 
