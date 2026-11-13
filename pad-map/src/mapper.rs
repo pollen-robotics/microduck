@@ -13,15 +13,15 @@ use crate::hold::{FLASHLIGHT_TAP, HOME_HOLD, HoldAction, HoldButton, REST_HOLD, 
 /// degrees of freedom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// D-pad left. Left stick walks and strafes, right stick turns.
+    /// D-pad down. Left stick walks and strafes, right stick turns.
     Drive,
     /// D-pad up. All four axes pose the head; the body holds still.
     Head,
-    /// D-pad right. Left stick walks and turns, right stick looks around — or, with
+    /// D-pad left. Left stick walks and turns, right stick looks around — or, with
     /// `[pad_imu_head_control]` on a pad that has an IMU, the pad's tilt poses the head and the
     /// sticks keep the whole [`Mode::Drive`] mapping.
     HeadDrive,
-    /// D-pad down. Body + head: the left stick crouches and leans the standing robot sideways,
+    /// D-pad right. Body + head: the left stick crouches and leans the standing robot sideways,
     /// the right stick looks around. The body does not walk.
     BodyPose,
 }
@@ -226,9 +226,9 @@ impl Mapper {
         let mut wanted_mode = None;
         for (button, mode) in [
             (Buttons::UP, Mode::Head),
-            (Buttons::RIGHT, Mode::HeadDrive),
-            (Buttons::LEFT, Mode::Drive),
-            (Buttons::DOWN, Mode::BodyPose),
+            (Buttons::LEFT, Mode::HeadDrive),
+            (Buttons::RIGHT, Mode::BodyPose),
+            (Buttons::DOWN, Mode::Drive),
         ] {
             if pad.pressed.contains(button) {
                 wanted_mode = Some(mode);

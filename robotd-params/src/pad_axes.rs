@@ -148,7 +148,7 @@ macro_rules! mode_axes {
 }
 
 mode_axes! {
-    /// D-pad left: the left stick walks and strafes, the right stick turns. Also the sticks of
+    /// D-pad down: the left stick walks and strafes, the right stick turns. Also the sticks of
     /// head + move while the pad's IMU has the head.
     DriveAxes, "drive" {
         vx: LeftY;
@@ -170,7 +170,7 @@ mode_axes! {
 }
 
 mode_axes! {
-    /// D-pad right, when the right stick has the head: the left stick walks and turns — no
+    /// D-pad left, when the right stick has the head: the left stick walks and turns — no
     /// strafe, the right stick is busy — and the right stick looks around with the signs head
     /// mode gives its left stick.
     HeadDriveAxes, "head_drive" {
@@ -185,7 +185,7 @@ mode_axes! {
 }
 
 mode_axes! {
-    /// D-pad down: the left stick crouches and leans the standing robot sideways, and the right
+    /// D-pad right: the left stick crouches and leans the standing robot sideways, and the right
     /// stick looks around as in head + move, so it means one thing wherever it poses the head.
     /// No forward/back tilt: the right stick has the head. The lean keeps the old body mode's
     /// sign, moved from the right stick to the left.
