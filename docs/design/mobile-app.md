@@ -212,7 +212,7 @@ they are all app-facing.
 | **`identify`** — §8.2 | Make *this* robot do something, so a list of three names becomes the duck in your hands. Two thirds solved: `robot.do` and `robot.sound` are both routed — `duckctl quack` is the second — and §8.2's claim that nothing drives a speaker is stale. What is left is that it must work *before* authentication, since requiring the PIN first is circular when aiming the PIN at the right robot is the problem. Reachy Mini's `PLAY_SOUND` — explicitly public, no PIN, played from the scan list — is the shape to copy |
 | **A per-robot PIN** — §5.3, §8.2 | Nothing generates, prints or records one, and it cannot be derived from the identity because the identity is advertised. Waits on hardware |
 | **Bond revocation** — §5.6 | "Forget this phone" is a settings-app staple and there is no API for it |
-| **Factory reset** — §8.2 | Nothing clears `configd`'s config, so a provisioned name and a user rename are indistinguishable |
+| **Factory reset** — §8.2 | A 10 s hold of the face button, owned by the OS image. The app's part is only to expect a robot that no longer knows it: unbonded, default name and PIN, no wifi |
 | **A pad that reconnects while a phone is connected** — [`pad-minimal-pairing.md`](../project/pad-minimal-pairing.md) fault 3 | The controller will not initiate as central while `btd` holds a peripheral link, so a bonded pad switched on during a session simply sits there. No daemon fix: the obvious one is the call that fails. The app could yield its link for twenty seconds on request; until then the answer is to turn the pad on first |
 
 Settled by using the app, and named because each was a refusal whose own reasoning did not survive

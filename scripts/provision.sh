@@ -716,9 +716,9 @@ wait_for_updaterd() {
 # `install.sh` cannot do this itself: it resolves the release through GitHub`s `/releases/latest`,
 # which excludes pre-releases, and every branch build is one. So provisioning brings the board up on
 # the stable release and this puts the branch build on top — which is also the right arrangement
-# rather than a workaround. The first release installed becomes **golden**, the boot recovery net`s
-# fallback, and a branch build as golden would give a broken branch a broken fallback. This way
-# `golden` stays stable and `current` is the branch.
+# rather than a workaround: if golden is ever set on a provisioned board (only an OS image sets it
+# today, to the release it seeds), it should be a stable release, never a branch build -- a broken
+# branch as the boot recovery net`s fallback is a broken fallback.
 #
 # **Fatal, not a warning.** A dev board asked to run a branch and quietly running the stable release
 # instead is the failure that is worst to debug: everything looks installed and the code under test

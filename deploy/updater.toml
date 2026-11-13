@@ -95,13 +95,16 @@ required_files = [
     "bin/tofd", "bin/nfcd",
 ]
 
-# `golden` is deliberately unset until 1.0.0 exists.
+# `golden` names a never-pruned known-good release: what `robotctl update reset-to-golden`,
+# robot-rescue and the OS image's factory reset go back to (§8.2). It is only true of a
+# board that has that release installed, so it stays commented out here: naming a version
+# the robot has never installed would make those fail at exactly the moment they are
+# needed, which is worse than reporting honestly that no golden is configured.
 #
-# It names a never-pruned known-good release, and `robotctl update reset-to-golden` is
-# the last link in the never-brick chain (§8.2). Naming a version the robot has never
-# installed would make that command fail at exactly the moment it is needed, which is
-# worse than it reporting honestly that no golden is configured. Set it in the same
-# change that ships 1.0.0.
+# The OS image is the place that knows: microduck_yocto's daemon recipe sets this line to
+# the release the image seeds, matching the `golden` symlink it creates. Its sed matches
+# the line below, commented or not, so keep it a single `golden = "<version>"` line.
+# A board set up by install.sh has no golden.
 # golden = "1.0.0"
 
 # The stable channel. `daemon-v*` tags only: staging publishes `daemon-staging-v*` and

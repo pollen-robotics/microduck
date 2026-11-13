@@ -810,6 +810,74 @@ mod tests {
         );
     }
 
+    /// The OS image sets `golden` by rewriting one line of `deploy/updater.toml`, and this
+    /// file cannot see that recipe — so it pins the shape the rewrite relies on.
+    ///
+    /// microduck_yocto's daemon recipe runs `sed 's|^#\? *golden *= *".*"$|golden = "${PV}"|'`
+    /// and fails the build unless exactly one `golden = "<PV>"` line results. A second
+    /// matching line, or rewording the one here, fails every image build; a line that stops
+    /// matching ships an image whose golden release is unprotected from `prune`. Either is
+    /// found here rather than there.
+    #[test]
+    fn image_golden_rewrite_still_applies_to_the_shipped_config() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let text = std::fs::read_to_string(repo.join("deploy/updater.toml")).unwrap();
+
+        // The sed's pattern, by hand: optional `#`, spaces, `golden`, spaces, `=`, spaces,
+        // then a double-quoted value ending the line.
+        let matches = |line: &str| {
+            let rest = line
+                .strip_prefix('#')
+                .unwrap_or(line)
+                .trim_start_matches(' ');
+            let Some(rest) = rest.strip_prefix("golden") else {
+                return false;
+            };
+            let Some(rest) = rest.trim_start_matches(' ').strip_prefix('=') else {
+                return false;
+            };
+            let rest = rest.trim_start_matches(' ');
+            rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"')
+        };
+        let rewritten: Vec<String> = text
+            .lines()
+            .map(|l| {
+                if matches(l) {
+                    "golden = \"1.0.0\"".to_owned()
+                } else {
+                    l.to_owned()
+                }
+            })
+            .collect();
+        assert_eq!(
+            rewritten
+                .iter()
+                .filter(|l| *l == "golden = \"1.0.0\"")
+                .count(),
+            1,
+            "the image's golden rewrite must hit exactly one line of deploy/updater.toml"
+        );
+
+        let config =
+            Config::from_toml(&rewritten.join("\n")).expect("the rewritten config is valid");
+        assert_eq!(
+            config.component("daemon").unwrap().golden,
+            Some(semver::Version::new(1, 0, 0)),
+            "the rewritten line must land in [component.daemon], not a neighbouring table"
+        );
+        assert!(
+            Config::from_toml(&text)
+                .unwrap()
+                .component("daemon")
+                .unwrap()
+                .golden
+                .is_none(),
+            "the shipped config itself names no golden: only an image knows one is installed"
+        );
+    }
+
     /// The placeholder in `deploy/updater.toml` must be recognisable as one.
     ///
     /// `scripts/install.sh` refuses to install a config still containing `ORG/`, so that a

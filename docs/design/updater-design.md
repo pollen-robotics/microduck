@@ -625,7 +625,10 @@ half-written state is ever live.
 
 `golden` is written by `Engine::refresh_golden_links` on every start, from
 `ComponentConfig::golden`. It exists so that recovery outside this process needs no
-parser — see [`boot-recovery-net.md`](boot-recovery-net.md).
+parser — see [`boot-recovery-net.md`](boot-recovery-net.md). The config key is set by the
+OS image, to the release it seeds (microduck_yocto's daemon recipe); a board installed by
+`install.sh` has none, and with no key `prune` does not protect a release, so a `golden`
+link left by an earlier setup can dangle.
 
 ### 7.2 Preflight preconditions
 

@@ -1080,10 +1080,13 @@ whatever the owner called it.
 - **A sticker, and a per-robot PIN to print on it.** §5.3 wants the PIN; both wait on hardware
   nobody has settled. Note that the PIN cannot be derived from the identity: the identity is
   published in an advertisement, so anything computed from it is public.
-- **What a factory reset does.** Nothing clears `configd`'s config today — it survives updates and
-  rollbacks by design, and `update.resetToGolden` reverts releases rather than config — so a
-  provisioned name and a user rename are indistinguishable. A separate "factory name" slot only
-  earns its keep once something can clear one without clearing the other.
+- **What a factory reset does.** On face-board-v1, holding the face button for 10 seconds erases
+  the owner's data on the data partition at the next boot — `configd`'s name and PIN, BlueZ's
+  bonds (phones and pads), wifi profiles, settings, logins — and puts the daemon back on golden.
+  It is physical by construction, which is what §5.4 asks of a reset that revokes bonds. The OS
+  image owns it: `microduck-factory-reset` in microduck_yocto, whose script holds the keep list.
+  It clears a provisioned name and a user rename alike, so a separate "factory name" slot still
+  has nothing to tell apart.
 
 #### What the tests do not cover
 
