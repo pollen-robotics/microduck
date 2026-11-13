@@ -1,7 +1,7 @@
 /**
  * What the Hub offers a duck, read the way the robot reads it.
  *
- * A port of `spaces/shared/../policy-playground/catalogue.py`, which makes the same two requests
+ * A port of `spaces/policy-playground/catalogue.py`, which makes the same two requests
  * `updater/src/policy.rs` makes — `?search=microduck` and a `manifest.json` per hit — so the
  * gallery and `policy.search` cannot disagree about what exists.
  *

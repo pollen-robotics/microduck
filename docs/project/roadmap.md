@@ -156,9 +156,9 @@ because the first-party device-code client takes no `scope` parameter. Narrowing
 the rendezvous control lane
 ([`remote-access-design.md`](../design/remote-access-design.md) §3.8), which is JSON-RPC over
 HTTP with no WebRTC and reaches a duck from a data centre. Video is an optional extra over WebRTC,
-with `media.stream` as the fallback. `spaces/shared/` already holds the three pieces —
-`rendezvous.py` to find a duck, `wire.py` to carry calls, `control.py` to match answers — so the
-SDK is those, packaged, with the Spaces importing it rather than keeping their own copy.
+with `media.stream` as the fallback. `sdk/` is the client: `rendezvous.py` to find a duck,
+`wire.py` to carry calls and `control.py` to match answers, packaged, with the Spaces importing it
+rather than keeping their own copy.
 
 **Privacy, and it is now two items rather than one.** *Consent* — explicit per-session approval
 before a stream starts — is a `mediad` session-layer change and is not blocked on anything. The
