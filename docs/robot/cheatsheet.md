@@ -758,10 +758,10 @@ the thumb:
 | **Y** | the excited emotion |
 | **X** | nothing — free for a skill of your own (`robotctl pad bind`, e.g. `x kick_left`) |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
-| **D-pad down** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
+| **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
 | **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
-| **D-pad left** | head + move: left stick forward/back and turn, right stick looks around (head yaw and pitch). With `[pad_imu_head_control] enabled` and a pad that has an IMU, the pad's tilt poses the head instead and the sticks keep the move mapping — see below |
-| **D-pad right** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
+| **D-pad right** | head + move: left stick forward/back and turn, right stick looks around (head yaw and pitch). With `[pad_imu_head_control] enabled` and a pad that has an IMU, the pad's tilt poses the head instead and the sticks keep the move mapping — see below |
+| **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
 | **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
 | **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
 | **Select**, held 2 s | rest (`robot.rest`), at once, without waiting for the release — the robot sitting down says the two seconds are up: a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
@@ -782,8 +782,8 @@ robot; the journal says how long to hold it.
 sudo robotctl configure      # Controller-IMU head control → enabled
 ```
 
-head + move (D-pad left) hands the head to the pad — tilt it and the head tilts, turn it and the
-head turns — while the sticks go on driving the body exactly as in move mode. Press D-pad left
+head + move (D-pad right) hands the head to the pad — tilt it and the head tilts, turn it and the
+head turns — while the sticks go on driving the body exactly as in move mode. Press D-pad right
 again and the pad drives the head **from wherever the pad is now**: its yaw is a gyro's word alone
 and drifts, and re-centring on every press is how you beat the drift without a magnetometer.
 `gain` in the same section is head radians per pad radian, 1 by default. On an Xbox pad, or with

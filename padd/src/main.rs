@@ -35,9 +35,9 @@
 //! X (West)        nothing, until a skill is bound there
 //! RT / LT         mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! D-pad up        head mode — the sticks pose the head, the body holds still
-//! D-pad left      head + move — left stick walks and turns, right stick looks around
-//! D-pad right     body + head — left stick crouches and leans sideways, right stick looks around
-//! D-pad down      move — the sticks walk, strafe and turn
+//! D-pad right     head + move — left stick walks and turns, right stick looks around
+//! D-pad left      move — the sticks walk, strafe and turn
+//! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
 //! Home            tap: flashlight on / off (a board with one); held does nothing
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
@@ -296,7 +296,7 @@ fn main() -> std::process::ExitCode {
         hz = args.hz,
         roller,
         "driving — A sit, B ground pick, triggers mouth; D-pad up head, \
-         left head + move, right body + head, down move; Start stands up then toggles the policy, \
+         right head + move, left move, down body + head; Start stands up then toggles the policy, \
          Start (1.5s) home pose; Select (2s) rest, Select (4s) power off"
     );
 
