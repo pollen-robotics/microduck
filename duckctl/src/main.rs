@@ -1275,6 +1275,16 @@ enum Command {
         #[arg(long, default_value_t = duck_ipc_proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
         timeout: u32,
     },
+    /// Read an NFC tag: run this, then touch a tag to the duck's head.
+    ///
+    /// `robotctl nfc-read` on the robot. Prints the tag's UID and its text and URI records, as
+    /// the duck reads them. While this waits the tag is only read: a pairing tag does not pair, a
+    /// mode tag does not switch the mode. The duck quacks when it has read it.
+    NfcRead {
+        /// How long the duck waits for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = duck_ipc_proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
     /// Is the control loop healthy?
     Health,
     /// Wifi.
@@ -2154,7 +2164,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     send_line(&peripheral, &request, &mut secure, &line).await?;
 
-    if let Command::NfcFlash { timeout, .. } = &cli.command {
+    if let Command::NfcFlash { timeout, .. } | Command::NfcRead { timeout } = &cli.command {
         eprintln!(
             "Touch a tag to the duck's head (waiting {} s)…",
             (*timeout).clamp(1, duck_ipc_proto::NfcWriteParams::MAX_TIMEOUT_S)
@@ -2882,7 +2892,7 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
             SLOW_REPLY_TIMEOUT,
         ),
         Command::Health => ("robot.health", serde_json::json!({}), REPLY_TIMEOUT),
-        // The robot answers once a tag is written or its own wait runs out, so this waits that
+        // The robot answers once a tag is written (or read) or its own wait runs out, so this waits that
         // long and the ordinary budget on top.
         Command::NfcFlash { text, timeout } => {
             let params = proto::NfcWriteParams {
@@ -2895,6 +2905,13 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
                 serde_json::to_value(params)?,
                 wait,
             )
+        }
+        Command::NfcRead { timeout } => {
+            let params = proto::NfcReadParams {
+                timeout_s: Some(*timeout),
+            };
+            let wait = params.timeout() + REPLY_TIMEOUT;
+            (proto::method::NFC_READ, serde_json::to_value(params)?, wait)
         }
         Command::Name { name } => (
             "system.setName",

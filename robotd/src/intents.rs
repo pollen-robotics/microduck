@@ -30,6 +30,10 @@ const POWER_NONE: u8 = 0;
 /// level slot still reading "up" would pick it straight back up with a background of
 /// somewhere the duck no longer is.
 const THEREMIN_NONE: u8 = 0;
+
+/// [`Intents::soccer`]'s bits: soccer mode is on, and autonomous soccer on top of it.
+const SOCCER_ACTIVE: u8 = 1;
+const SOCCER_AUTONOMOUS: u8 = 2;
 const THEREMIN_UP: u8 = 1;
 const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
@@ -141,7 +145,15 @@ pub struct Intents {
     /// Epoch for every stamp. `Instant` so the clock cannot run backwards under us.
     epoch: Instant,
     twist: ArcSwap<Stamped<[f64; 3]>>,
+    /// Who filled the twist slot, by their `hello` name. Its own slot rather than part of the
+    /// twist's, because only the connection handler knows the name and every other writer
+    /// (`robot.stop`, the loop's own stops) would otherwise have to invent one. Set in the same
+    /// call as the twist, so the two disagree for at most one interleaving.
+    twist_source: ArcSwapOption<String>,
     head: ArcSwap<Stamped<[f64; 4]>>,
+    /// The head smoothing rate the latest `robot.head` asked for, as `f64::to_bits`; NaN for
+    /// "the shared rate".
+    head_alpha: std::sync::atomic::AtomicU64,
     /// Standing body pose. Unstamped: `active: false` is its own "nobody is posing".
     pose: ArcSwap<PoseIntent>,
     /// Mouth opening, 0..1, as `f64::to_bits`. Continuous like the twist, unstamped like
@@ -163,6 +175,13 @@ pub struct Intents {
     /// A pending laser-tracking switch, with the theremin's encoding: an edge, so the loop's own
     /// `[laser] enabled` at boot is not overridden by a level nobody wrote.
     laser: AtomicU8,
+    /// Soccer mode's two switches, [`SOCCER_ACTIVE`] and [`SOCCER_AUTONOMOUS`]. Levels, not
+    /// edges like the laser's: nothing in the config file starts soccer, so there is no boot
+    /// state for a level to override, and `robot.mode` reads them back to the pad daemons.
+    soccer: AtomicU8,
+    /// The duck on its own (`robot.autonomous`): a level `autod` obeys. Set at boot from
+    /// `[autonomous] enabled`, so the file is only where it starts.
+    autonomous: AtomicBool,
     /// The same, for the chorale.
     chorale: AtomicU8,
     /// The piece pinned by the pending chorale request, 0 for none. Written before the
@@ -256,6 +275,8 @@ pub struct Snapshot {
     /// How long since the head was last commanded — by anyone. The idle sweep waits on it, so a
     /// client steering the head is never fought.
     pub head_age: Duration,
+    /// The head smoothing rate the latest `robot.head` asked for; `None` is the shared one.
+    pub head_alpha: Option<f64>,
     pub enabled: bool,
     /// The body-pose intent. The loop smooths `body` into `command.body` itself, because
     /// smoothing is per-tick state the intent slots must not own.
@@ -282,16 +303,20 @@ impl Intents {
                 value: [0.0; 3],
                 at_us: 0,
             }),
+            twist_source: ArcSwapOption::empty(),
             head: ArcSwap::from_pointee(Stamped {
                 value: [0.0; 4],
                 at_us: 0,
             }),
+            head_alpha: std::sync::atomic::AtomicU64::new(f64::NAN.to_bits()),
             pose: ArcSwap::from_pointee(PoseIntent::default()),
             mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
             laser: AtomicU8::new(THEREMIN_NONE),
+            soccer: AtomicU8::new(0),
+            autonomous: AtomicBool::new(false),
             chorale: AtomicU8::new(THEREMIN_NONE),
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
@@ -321,7 +346,31 @@ impl Intents {
         }));
     }
 
+    /// The twist, and the name of the client that sent it.
+    pub fn set_twist_from(&self, twist: [f64; 3], source: Option<Arc<str>>) {
+        self.twist_source
+            .store(source.map(|name| Arc::new(name.to_string())));
+        self.set_twist(twist);
+    }
+
+    /// Who sent the twist now in the slot, by `hello` name — published as `move.source`. Read
+    /// apart from [`Self::snapshot`], which is `Copy` and read every tick, while this is only
+    /// wanted when a state frame is being assembled for a subscriber.
+    pub fn twist_source(&self) -> Option<String> {
+        self.twist_source.load_full().map(|name| (*name).clone())
+    }
+
     pub fn set_head(&self, head: [f64; 4]) {
+        self.set_head_at(head, None);
+    }
+
+    /// A head target with its own smoothing rate — `None` is the shared `[control] head_alpha`.
+    pub fn set_head_at(&self, head: [f64; 4], alpha: Option<f64>) {
+        let alpha = alpha.filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 1.0));
+        self.head_alpha.store(
+            alpha.unwrap_or(f64::NAN).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.head.store(Arc::new(Stamped {
             value: head,
             at_us: self.now_us(),
@@ -618,6 +667,35 @@ impl Intents {
         }
     }
 
+    /// Set soccer mode. `autonomous` implies `active`; `active: false` turns both off.
+    pub fn set_soccer(&self, active: bool, autonomous: bool) {
+        let bits = match (active, autonomous) {
+            (false, _) => 0,
+            (true, false) => SOCCER_ACTIVE,
+            (true, true) => SOCCER_ACTIVE | SOCCER_AUTONOMOUS,
+        };
+        self.soccer.store(bits, Ordering::Relaxed);
+    }
+
+    /// Soccer mode's switches as they stand.
+    pub fn soccer(&self) -> duck_ipc_proto::SoccerParams {
+        let bits = self.soccer.load(Ordering::Relaxed);
+        duck_ipc_proto::SoccerParams {
+            active: bits & SOCCER_ACTIVE != 0,
+            autonomous: bits & SOCCER_AUTONOMOUS != 0,
+        }
+    }
+
+    /// Switch the duck on its own on or off — `docs/design/autonomous.md`.
+    pub fn set_autonomous(&self, on: bool) {
+        self.autonomous.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the duck on its own is switched on.
+    pub fn autonomous(&self) -> bool {
+        self.autonomous.load(Ordering::Relaxed)
+    }
+
     pub fn take_power_request(&self) -> Option<PowerRequest> {
         match self.power.swap(POWER_NONE, Ordering::Relaxed) {
             POWER_INIT => Some(PowerRequest::Init),
@@ -642,6 +720,10 @@ impl Intents {
             },
             twist_age: Duration::from_micros(now.saturating_sub(twist.at_us)),
             head_age: Duration::from_micros(now.saturating_sub(head.at_us)),
+            head_alpha: Some(f64::from_bits(
+                self.head_alpha.load(std::sync::atomic::Ordering::Relaxed),
+            ))
+            .filter(|a| !a.is_nan()),
             enabled: self.enabled.load(Ordering::Relaxed),
             pose,
             mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),

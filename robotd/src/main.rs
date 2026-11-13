@@ -30,6 +30,7 @@ mod params;
 mod pickup;
 mod posture;
 mod soc;
+mod soccer;
 mod sound;
 mod theremin;
 mod vetbook;
@@ -1317,6 +1318,9 @@ async fn main() -> ExitCode {
     }
 
     let intents = Arc::new(Intents::new());
+    // Where the duck on its own starts; `robot.autonomous` (an NFC tag, `robotctl autonomous`)
+    // changes it until the next boot.
+    intents.set_autonomous(params.autonomous.enabled);
 
     start_head_imu(&state, &params, args.fake || args.sim.is_some());
 
@@ -2655,12 +2659,18 @@ async fn control_loop<T: RobotIo>(
     // connection as well as for frames — a second of silence that reads as a broken feature.
     // Also off when audio is off, since a theremin with no voice is a mouth opening for no
     // reason.
+    // What the microphone heard, for `robot.state.hearing`: petting as a level, noises and voices
+    // as counters, so a subscriber that missed a frame still sees that something happened.
+    let mut hearing = proto::HearingState::default();
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // Laser tracking. The reader holds no connection to `mediad` while tracking is off, so on a
     // duck that never switches it on this is one sleeping thread. `[laser]` is re-read by that
     // thread while it is on — tuning it must not need a restart that drops the robot.
     let mut laser = laser::Laser::spawn(params.laser.clone(), params_path.clone());
+    // Autonomous soccer, the laser's sibling: likewise one sleeping thread until it is switched
+    // on, and `[soccer]` re-read live while it is.
+    let mut soccer = soccer::Soccer::spawn(params.soccer.clone(), params_path.clone());
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
@@ -2711,6 +2721,11 @@ async fn control_loop<T: RobotIo>(
     {
         voice.play("greet", false);
     }
+
+    // The second quack of the two that say autonomous soccer has ended, and when it is due. Not
+    // played back to back: a sound cuts off the one before it, so two in one tick are one.
+    const SOCCER_QUACK_GAP: Duration = Duration::from_millis(350);
+    let mut soccer_quack_again: Option<Instant> = None;
 
     // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
     // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
@@ -2835,6 +2850,83 @@ async fn control_loop<T: RobotIo>(
                     block.walk = true;
                 }
                 laser_state = Some(block);
+            }
+        }
+
+        // Soccer mode. Manual soccer moves nothing here — it is the pad's bumpers — so its block
+        // only says so; autonomous soccer shares the robot exactly as the laser does above, and
+        // after it, so the two never both drive (`robot.soccer` and `robot.laserTrack` switch each
+        // other off besides).
+        let soccer_switch = intents.soccer();
+        // A kick autonomous soccer queued this tick, by name, until the skill code below says
+        // whether it started — which `soccer.kick_outcome` is then told, this same tick.
+        let mut soccer_kick: Option<&'static str> = None;
+        let mut soccer_kick_result: Option<Result<(), String>> = None;
+        let soccer_was_autonomous = soccer.autonomous();
+        soccer.set_autonomous(soccer_switch.autonomous);
+        // Said aloud, for whoever holds the pad or the tag: one quack as the robot starts playing
+        // by itself, two as it stops — whoever switched it, the pad, `robotctl` or `autod`. Always
+        // the same quacks rather than the bank's random pick, so the cue is recognised: the
+        // bank's first chirp, and for the second of the pair its second, so the two differ.
+        if soccer_switch.autonomous != soccer_was_autonomous {
+            if let Some(voice) = voice.as_mut() {
+                voice.play_same("chirp", 0);
+            }
+            soccer_quack_again = (!soccer_switch.autonomous).then(|| tick_start + SOCCER_QUACK_GAP);
+        }
+        if soccer_quack_again.is_some_and(|at| tick_start >= at) {
+            soccer_quack_again = None;
+            if let Some(voice) = voice.as_mut() {
+                voice.play_same("chirp", 1);
+            }
+        }
+        let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
+            phase: "manual".into(),
+            ..Default::default()
+        });
+        if let Some(sample) = sensors.as_ref() {
+            let pose = laser::Pose {
+                head: mapping::head_joints_of(&sample.positions),
+                imu: sample.imu.quat,
+                odom: odometry.position(),
+                yaw: odometry.yaw(),
+            };
+            let driving = snapshot.enabled && bringup == Bringup::Ready;
+            if let Some(drive) = soccer.tick(&pose, snapshot.command.head[0], driving, tick_start) {
+                let mut block = drive.state;
+                let client_twist = snapshot.twist_age
+                    < Duration::from_millis(params.safety.deadman_ms)
+                    && snapshot.command.twist.iter().any(|v| *v != 0.0);
+                let client_head = snapshot.head_age < LASER_CLIENT_HEAD
+                    && snapshot.command.head.iter().any(|v| v.abs() > 1e-3);
+                if let Some(head) = drive.head
+                    && !client_head
+                {
+                    snapshot.command.head = head;
+                    snapshot.head_age = Duration::ZERO;
+                    block.head = true;
+                }
+                if let Some(twist) = drive.twist
+                    && !client_twist
+                {
+                    snapshot.command.twist = twist;
+                    // Live for the deadman: the ball is as fresh as `[soccer] memory_ms` allows,
+                    // and the search turn stops the moment autonomous is switched off.
+                    snapshot.twist_age = Duration::ZERO;
+                    block.walk = true;
+                }
+                // Queued like a pad's `robot.do`, and taken below in this same tick. Not while
+                // somebody is steering: their stick says they have the robot.
+                if let Some(kick) = drive.kick {
+                    if client_twist {
+                        soccer_kick_result = Some(Err("a stick is pushed".to_owned()));
+                    } else if !queue_skill(&state, &intents, kick) {
+                        soccer_kick_result =
+                            Some(Err(format!("this robot has no {kick} skill configured")));
+                    }
+                    soccer_kick = Some(kick);
+                }
+                soccer_state = Some(block);
             }
         }
 
@@ -3002,7 +3094,11 @@ async fn control_loop<T: RobotIo>(
                             .get(index)
                             .cloned()
                             .unwrap_or_else(|| index.to_string());
-                        match controller.start_skill(index) {
+                        let started = controller.start_skill(index);
+                        if soccer_kick == Some(name.as_str()) {
+                            soccer_kick_result = Some(started.map(|_| ()).map_err(str::to_owned));
+                        }
+                        match started {
                             Ok(true) => tracing::warn!(skill = %name, "skill started"),
                             Ok(false) => {}
                             Err(reason) => {
@@ -3013,6 +3109,12 @@ async fn control_loop<T: RobotIo>(
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
             }
+        }
+        if let Some(kick) = soccer_kick {
+            let outcome = soccer_kick_result.unwrap_or_else(|| {
+                Err(format!("{kick} was not started: the policy is not driving"))
+            });
+            soccer.kick_outcome(outcome, tick_start);
         }
 
         // Emotions, like the skills above: started on a robot the policy drove last tick with no
@@ -3092,11 +3194,20 @@ async fn control_loop<T: RobotIo>(
                         }
                         pet_detect::PettingEvent::End => tracing::debug!("petting ended"),
                     }
+                    hearing.petting = matches!(ev, pet_detect::PettingEvent::Start);
                 }
-                // Ambient sound events have no consumer until the autonomous brain arrives;
-                // surfaced at debug so mic tuning on a bench has data to look at.
+                // Counted for `robot.state.hearing`, where the autonomous brain reads them, and
+                // still logged at debug so mic tuning on a bench has data to look at.
                 while let Some(ev) = pet.try_recv_sound() {
                     tracing::debug!(event = ?ev, "ambient sound");
+                    match ev {
+                        pet_detect::worker::SoundEvent::Noise => {
+                            hearing.noises = hearing.noises.wrapping_add(1);
+                        }
+                        pet_detect::worker::SoundEvent::Voice => {
+                            hearing.voices = hearing.voices.wrapping_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -3712,8 +3823,9 @@ async fn control_loop<T: RobotIo>(
         {
             ramp(ema, target, cmd_alpha, accel, period.as_secs_f64());
         }
+        let head_rate = snapshot.head_alpha.unwrap_or(head_alpha);
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            slew(ema, target, head_alpha);
+            slew(ema, target, head_rate);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
@@ -4452,6 +4564,7 @@ async fn control_loop<T: RobotIo>(
                 movement: proto::MoveState {
                     requested: snapshot.command.twist,
                     applied: command.twist,
+                    source: intents.twist_source(),
                     limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
                 },
                 head: command.head,
@@ -4494,6 +4607,8 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 laser: laser_state.clone(),
+                soccer: soccer_state.clone(),
+                autonomous: intents.autonomous(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -4504,6 +4619,7 @@ async fn control_loop<T: RobotIo>(
                     &sensors.positions,
                 ))),
                 skeleton: mapping::skeleton_at(&sensors.positions),
+                hearing: pet.as_ref().map(|_| hearing),
             });
         }
 
@@ -4940,6 +5056,9 @@ async fn handle(
     let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
+    // What the client called itself in `hello`, for `move.source`: the brain's only way to see a
+    // pad that has taken over, since nothing here arbitrates between drivers.
+    let mut client: Option<Arc<str>> = None;
 
     loop {
         // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
@@ -5051,6 +5170,20 @@ async fn handle(
 
         let call = request.as_call();
 
+        if let Ok(proto::Call::Hello(hello)) = &call {
+            client = hello.client.as_deref().map(Arc::from);
+        }
+        // The twist is stamped with who sent it, so it is set here, where the connection is known,
+        // rather than in `apply_intent`, which serves every connection alike.
+        if let Ok(proto::Call::RobotMove(p)) = &call {
+            intents.set_twist_from([p.vx, p.vy, p.vyaw], client.clone());
+            if let Some(id) = request.id.clone() {
+                let response = proto::Response::ok(Some(id), &proto::IntentResult::accepted());
+                write_line(&mut write_half, &response).await?;
+            }
+            continue;
+        }
+
         // Notifications get no reply, per the spec. Continuous intents arrive this way —
         // at 50 Hz a response per message would be pure overhead, and there is nothing
         // useful to say about a velocity that is superseded 20 ms later.
@@ -5107,7 +5240,10 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
             true
         }
         proto::Call::RobotHead(p) => {
-            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            intents.set_head_at(
+                [p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll],
+                p.alpha,
+            );
             true
         }
         proto::Call::RobotPose(p) => {
@@ -5748,6 +5884,7 @@ fn dispatch(
                         head_pitch,
                         head_yaw,
                         head_roll,
+                        alpha: None,
                     },
                     clamped: gaze.clamped,
                 },
@@ -5840,7 +5977,43 @@ fn dispatch(
         // waiting for in `robot.state`'s laser block rather than here.
         proto::Call::RobotLaserTrack(p) => {
             intents.request_laser(p.active);
+            // One chaser at a time: a dot and a ball would fight over the legs.
+            if p.active {
+                intents.set_soccer(false, false);
+            }
             proto::Response::ok(Some(id), &proto::LaserTrackResult::default())
+        }
+
+        // Soccer mode, and autonomous soccer on it. Nothing to refuse at the door, for the
+        // laser's reason: whether `mediad` answers is a circumstance, and the soccer block in
+        // `robot.state` says what it is waiting for. Laser tracking goes off, as above.
+        proto::Call::RobotSoccer(p) => {
+            if p.active {
+                intents.request_laser(false);
+            }
+            intents.set_soccer(p.active, p.autonomous);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // The duck on its own. A switch `autod` reads in `robot.state`; it moves nothing here, so
+        // there is nothing to refuse. Whether `autod` is running is `systemctl`'s to say.
+        //
+        // Switched off, the laser and a ball game the duck may have been playing go off here, not
+        // only in `autod`: an `autod` that is down, or restarting, when the switch goes off would
+        // otherwise leave the camera looking for a dot and the legs following it, on a robot
+        // somebody just switched back to being theirs. Soccer by hand is left alone — it is a pad's.
+        proto::Call::RobotAutonomous(p) => {
+            if intents.autonomous() && !p.active {
+                intents.request_laser(false);
+                if intents.soccer().autonomous {
+                    intents.set_soccer(false, false);
+                }
+            }
+            if intents.autonomous() != p.active {
+                tracing::warn!(on = p.active, "the duck on its own switched");
+            }
+            intents.set_autonomous(p.active);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
@@ -6011,6 +6184,8 @@ fn dispatch(
                 mode: mode_of(state.mode.load(Ordering::Relaxed))
                     .as_str()
                     .to_owned(),
+                soccer: Some(intents.soccer()).filter(|s| s.active),
+                autonomous: intents.autonomous(),
             },
         ),
 
@@ -7355,6 +7530,111 @@ mod tests {
         assert_eq!(mode.mode, "walk");
     }
 
+    /// Soccer mode is read back in `robot.mode`, which is how a pad learns an NFC tag switched it;
+    /// autonomous implies soccer mode; and laser tracking and soccer switch each other off.
+    #[test]
+    fn soccer_is_answered_in_robot_mode_and_excludes_the_laser() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let mode = |intents: &Intents| -> Option<proto::SoccerParams> {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .soccer
+        };
+        let soccer = |active, autonomous| {
+            proto::Call::RobotSoccer(proto::SoccerParams { active, autonomous })
+        };
+        assert_eq!(mode(&intents), None);
+
+        let answer: proto::IntentResult = dispatch(&s, &intents, id(), &soccer(true, true))
+            .result_as()
+            .unwrap();
+        assert!(answer.accepted);
+        assert_eq!(
+            mode(&intents),
+            Some(proto::SoccerParams {
+                active: true,
+                autonomous: true
+            })
+        );
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        // Off is both off, whatever `autonomous` says.
+        dispatch(&s, &intents, id(), &soccer(false, true));
+        assert_eq!(mode(&intents), None);
+
+        dispatch(&s, &intents, id(), &soccer(true, false));
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
+        );
+        assert_eq!(mode(&intents), None, "the laser switches soccer off");
+    }
+
+    /// The duck on its own is a level `robot.autonomous` sets and `robot.mode` reads back — the
+    /// pad daemons' way to learn an NFC tag switched it — and it touches no other switch: the
+    /// brain manages the laser and the ball itself.
+    #[test]
+    fn autonomy_is_a_switch_answered_in_robot_mode() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let on = |intents: &Intents| -> bool {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .autonomous
+        };
+        assert!(!on(&intents));
+        let answer: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: true }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(answer.accepted);
+        assert!(on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            None,
+            "the laser is left alone"
+        );
+        // The duck playing ball when it is switched off: the game and the laser go with it.
+        intents.set_soccer(true, true);
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert!(!on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        assert!(!intents.soccer().active, "the ball game ends");
+        // Off when already off touches nothing; soccer by hand is a pad's, never the switch's.
+        intents.set_soccer(true, false);
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert_eq!(intents.take_laser_request(), None);
+        assert!(intents.soccer().active && !intents.soccer().autonomous);
+    }
+
     /// `robot.look` is a promise with two halves: the head actually moves (the intent is
     /// set), and the answer names the joints it moves to — so a client can hold the gaze by
     /// resending them as `robot.head`. A left-of-robot target must come back with a
@@ -8266,6 +8546,90 @@ mod tests {
             written.positions, resting,
             "the loop moved the robot instead of holding where it found it"
         );
+    }
+
+    /// `move.source` is how the autonomous brain sees a pad that has taken over, and nothing else
+    /// tells it. So a client that named itself in `hello` must be the name on its twist, on both
+    /// framings of `robot.move`, and an unnamed client must not inherit the previous driver's name.
+    #[tokio::test]
+    async fn a_named_client_is_the_source_of_its_twist() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let s = Arc::new(RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let intents = Arc::new(Intents::new());
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+
+        let hello = proto::Request::call(
+            proto::Id::Number(1),
+            &proto::Call::Hello(proto::HelloParams {
+                api_version: proto::API_VERSION,
+                client: Some("padd".into()),
+            }),
+        );
+        let twist = proto::Call::RobotMove(proto::MoveParams {
+            vx: 0.2,
+            vy: 0.0,
+            vyaw: 0.0,
+        });
+        for line in [
+            serde_json::to_string(&hello).unwrap(),
+            serde_json::to_string(&proto::Request::notify(&twist)).unwrap(),
+        ] {
+            write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        replies.next_line().await.unwrap().expect("hello answered");
+        // A request after the notification: once it is answered, the notification before it has
+        // been applied too, since one connection is served in order.
+        let request = proto::Request::call(proto::Id::Number(2), &twist);
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let reply: proto::Response =
+            serde_json::from_str(&replies.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(reply.result_as::<proto::IntentResult>().unwrap().accepted);
+        assert_eq!(intents.twist_source().as_deref(), Some("padd"));
+        assert_eq!(intents.snapshot().command.twist, [0.2, 0.0, 0.0]);
+
+        drop(write);
+        served.await.unwrap().unwrap();
+
+        // A second, anonymous connection drives: the name goes with it.
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        replies.next_line().await.unwrap().expect("move answered");
+        assert_eq!(intents.twist_source(), None);
+        drop(write);
+        served.await.unwrap().unwrap();
+    }
+
+    /// A head target may carry its own smoothing rate; the next one without it goes back to the
+    /// shared rate rather than keeping the last client's.
+    #[test]
+    fn a_head_rate_applies_to_its_own_target_only() {
+        let intents = Intents::new();
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(0.9));
+        assert_eq!(intents.snapshot().head_alpha, Some(0.9));
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(7.0));
+        assert_eq!(intents.snapshot().head_alpha, Some(1.0), "clamped");
+        intents.set_head([0.0; 4]);
+        assert_eq!(intents.snapshot().head_alpha, None);
     }
 
     /// **The policy-failure contract.** A policy that cannot load must not stop the robot

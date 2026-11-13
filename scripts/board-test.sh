@@ -1004,7 +1004,7 @@ fi
 # And it takes down what a previous install left running, rather than only declining to enable.
 # Skipping the enable on a board that already runs these leaves all five up while the script
 # reports that nothing is — which is how the first attempt at this measurement was wasted.
-for unit in updaterd robotd configd btd padd; do
+for unit in updaterd robotd configd btd padd autod; do
     grep -q "^disable --now ${unit}.service$" /stub/systemctl.log \
         || { echo "    [FAIL] DUCK_NO_START did not disable ${unit}.service"; exit 1; }
 done
