@@ -516,7 +516,9 @@ Standing up resumes the cycle from that point, so the rise is the one the crouch
 and the gait takes over where a ground pick would hand back. The held phase is a pose every
 training episode passes through, held rather than passed: what that does over minutes is a
 robot question, not a test-suite one. The seat rules above apply unchanged — parked, not busy;
-kept across a stop, resumed at the hold.
+kept across a stop, resumed at the hold. Getting out of it is Start: `robot.enable` with `toggle`
+on a seated, driving roller robot stands it up instead of stopping it, because A — the stand on
+legs — runs nothing on wheels, and stopping would only hold the crouch with the policy off.
 
 **The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
 reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of

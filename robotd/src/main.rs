@@ -5885,6 +5885,24 @@ fn dispatch(
             // `toggle` flips the robot's own state — the pad's Start. Evaluated here, not
             // in the client, because a client-side belief drifts (relax, shutdown, either
             // side restarting) and a stale one turns Start into a no-op every other press.
+            // On wheels Start stands a seated robot up rather than stopping it. The seat there is
+            // the held crouch the pad-loss sit, a rest or an emotion leaves it in, and the pad
+            // has no other way out of it: A, which stands a robot up on legs, runs nothing on
+            // wheels. Stopping instead would only hold the crouch with the policy off.
+            if p.toggle
+                && intents.enabled()
+                && mode_of(state.mode.load(Ordering::Relaxed)) == Mode::Roller
+                && state.sitting.load(Ordering::Relaxed)
+            {
+                intents.request_sit_toggle();
+                return proto::Response::ok(
+                    Some(id),
+                    &proto::IntentResult {
+                        accepted: true,
+                        reason: Some("seated on wheels — standing up".to_owned()),
+                    },
+                );
+            }
             let on = if p.toggle { !intents.enabled() } else { p.on };
             // Never refused for being down. Start on a robot lying on the floor is exactly
             // how someone asks it to stand back up, and it brings the robot up and hands it
@@ -6661,6 +6679,51 @@ mod tests {
             .result_as()
             .unwrap();
         assert!(init.accepted, "nor may init refuse for gravity");
+    }
+
+    /// **On wheels Start stands a seated robot up**, because A — the stand on legs — runs nothing
+    /// there and the crouch the pad-loss sit leaves it in would otherwise have no way out. Only
+    /// a driving, seated roller robot: anything else toggles the policy as ever.
+    #[test]
+    fn on_wheels_start_stands_a_seated_robot_up() {
+        let s = RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Arc::new(Intents::new());
+        let start = || {
+            let answer: proto::IntentResult = dispatch(
+                &s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotEnable(proto::EnableParams {
+                    on: false,
+                    toggle: true,
+                }),
+            )
+            .result_as()
+            .unwrap();
+            assert!(answer.accepted);
+        };
+        intents.set_enabled(true);
+        s.sitting.store(true, Ordering::Relaxed);
+
+        start();
+        assert!(!intents.enabled(), "on legs, Start stops the seated robot");
+        assert!(!intents.take_skills().sit_toggle);
+
+        intents.set_enabled(true);
+        s.mode.store(mode_code(Mode::Roller), Ordering::Relaxed);
+        start();
+        assert!(intents.enabled(), "on wheels it keeps driving");
+        assert!(intents.take_skills().sit_toggle, "and stands up");
+
+        s.sitting.store(false, Ordering::Relaxed);
+        start();
+        assert!(!intents.enabled(), "standing, Start stops it as ever");
+        assert!(!intents.take_skills().sit_toggle);
     }
 
     /// The theremin ships **off**, and the refusal has to name the switch.
