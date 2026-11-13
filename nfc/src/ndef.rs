@@ -1,4 +1,6 @@
-//! NDEF, limited to text and URI records — and whether they ask to pair a gamepad. Read, and
+//! NDEF, limited to text and URI records — and whether they ask to pair a gamepad. A MIME
+//! `text/plain` record reads as text too: some phone apps write that rather than a text record,
+//! and the person holding the tag cannot tell the difference. Read, and
 //! written only as one text record ([`text_tlv`]), which is all `nfc.write` puts on a tag.
 //!
 //! Pure: no hardware, entirely testable off a board.
@@ -11,7 +13,10 @@ const FLAG_MB: u8 = 0x80;
 const FLAG_ME: u8 = 0x40;
 const FLAG_SR: u8 = 0x10;
 const FLAG_IL: u8 = 0x08;
+const TNF_MASK: u8 = 0x07;
 const TNF_WELL_KNOWN: u8 = 0x01;
+/// A record whose type is a MIME type (RFC 2046), e.g. `text/plain`.
+const TNF_MEDIA: u8 = 0x02;
 
 /// The language a written text record says it is in. Readers ignore it — [`parse`] does — and
 /// `en` is what phone apps write by default.
@@ -124,6 +129,10 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         i += payload_len;
 
         match (kind, payload.split_first()) {
+            // The whole payload is the text: a MIME record has no status or language byte.
+            _ if header & TNF_MASK == TNF_MEDIA && is_plain_text(kind) => {
+                records.push(Record::Text(String::from_utf8_lossy(payload).into_owned()));
+            }
             (b"T", Some((&status, rest))) => {
                 let lang = (status & 0x3F) as usize;
                 let text = rest.get(lang..).unwrap_or_default();
@@ -144,6 +153,13 @@ pub fn parse(data: &[u8]) -> Result<Vec<Record>, String> {
         }
     }
     Ok(records)
+}
+
+/// Whether a MIME type is `text/plain`, whatever its case and parameters
+/// (`text/plain; charset=utf-8`).
+fn is_plain_text(mime: &[u8]) -> bool {
+    let essence = mime.split(|&b| b == b';').next().unwrap_or_default();
+    essence.trim_ascii().eq_ignore_ascii_case(b"text/plain")
 }
 
 /// The NDEF TLV's payload, skipping NULL TLVs and any other TLV before it.
@@ -282,6 +298,47 @@ mod tests {
             parse(&data).unwrap(),
             vec![Record::Uri("https://ab".into())]
         );
+    }
+
+    /// One MIME record, the way NFC Tools shows "Media : text/plain".
+    fn mime_tag(mime: &str, text: &str) -> Vec<u8> {
+        let mut record = vec![
+            FLAG_MB | FLAG_ME | FLAG_SR | TNF_MEDIA,
+            mime.len() as u8,
+            text.len() as u8,
+        ];
+        record.extend(mime.as_bytes());
+        record.extend(text.as_bytes());
+        let mut tag = vec![TLV_NDEF, record.len() as u8];
+        tag.extend(record);
+        tag.push(TLV_TERMINATOR);
+        tag
+    }
+
+    /// A MIME `text/plain` record pairs and switches modes like a text record: its payload is the
+    /// text, with no language byte to skip.
+    #[test]
+    fn a_plain_text_mime_record_reads_as_text() {
+        for mime in ["text/plain", "Text/Plain", "text/plain; charset=utf-8"] {
+            let records = parse(&mime_tag(mime, PAIRING)).unwrap();
+            assert_eq!(records, [Record::Text(PAIRING.into())], "{mime}");
+            assert!(asks_to_pair(&records));
+        }
+        assert_eq!(
+            parse(&mime_tag("text/plain", "walk_mode")).unwrap(),
+            [Record::Text("walk_mode".into())]
+        );
+    }
+
+    /// Any other MIME type is skipped, as any other record is — and a well-known record whose
+    /// type happens to read `text/plain` is not a MIME record.
+    #[test]
+    fn other_mime_records_are_skipped() {
+        assert_eq!(parse(&mime_tag("text/html", PAIRING)).unwrap(), []);
+        assert_eq!(parse(&mime_tag("application/json", PAIRING)).unwrap(), []);
+        let mut well_known = mime_tag("text/plain", PAIRING);
+        well_known[2] = FLAG_MB | FLAG_ME | FLAG_SR | TNF_WELL_KNOWN;
+        assert_eq!(parse(&well_known).unwrap(), []);
     }
 
     #[test]
