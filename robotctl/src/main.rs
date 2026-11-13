@@ -103,7 +103,7 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
 
-    /// Path to `nfcd`'s socket, where `nfc-flash` asks for a tag to be written.
+    /// Path to `nfcd`'s socket, where `nfc-flash` and `nfc-read` ask for a tag.
     #[arg(long, global = true, default_value = proto::socket::NFC)]
     nfc_socket: PathBuf,
 
@@ -206,6 +206,22 @@ enum Namespace {
         /// How long to wait for a tag, in seconds (at most 120).
         #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
         timeout: u32,
+    },
+
+    /// Read an NFC tag: run this, then touch a tag to the duck's head.
+    ///
+    /// Prints the tag's UID and each text or URI record on it, one per line — what the duck
+    /// reads when the tag is touched. A tag already on the reader is read too. While this waits,
+    /// the tag is read and nothing else: a pairing tag does not pair, a mode tag does not switch
+    /// the mode. The duck quacks when it has read it. A blank tag reads as no records, and says
+    /// why.
+    NfcRead {
+        /// How long to wait for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+        /// The answer as JSON, exactly as `nfc.read` gives it.
+        #[arg(long)]
+        json: bool,
     },
 
     /// The duck's vet book: its whole life in numbers.
@@ -789,6 +805,50 @@ fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failur
         return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
     }
     println!("{tag} now reads {text:?}");
+    Ok(())
+}
+
+/// `robotctl nfc-read` — ask `nfcd` to read the next tag touched, and print what it holds.
+fn run_nfc_read(socket: &Path, timeout: u32, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("nfcd", socket)?;
+    client.hello()?;
+    let params = proto::NfcReadParams {
+        timeout_s: Some(timeout),
+    };
+    eprintln!(
+        "Touch a tag to the duck's head (waiting {} s)…",
+        params.timeout().as_secs()
+    );
+    let result = result_of(client.call(&proto::Call::NfcRead(params))?)?;
+    let outcome: proto::NfcReadResult = decode(&result)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome).unwrap_or_default()
+        );
+    }
+    let tag = outcome.uid.clone().unwrap_or_else(|| "no tag".to_owned());
+    if !outcome.read {
+        let reason = outcome.reason.unwrap_or_else(|| "not read".to_owned());
+        return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
+    }
+    if json {
+        return Ok(());
+    }
+    println!("{tag}");
+    for record in &outcome.records {
+        match record {
+            proto::NfcRecord::Text(text) => println!("  text {text:?}"),
+            proto::NfcRecord::Uri(uri) => println!("  uri  {uri:?}"),
+        }
+    }
+    if outcome.records.is_empty() {
+        let why = outcome
+            .reason
+            .as_deref()
+            .unwrap_or("no text or URI records");
+        println!("  (nothing: {why})");
+    }
     Ok(())
 }
 
@@ -5856,6 +5916,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::NfcFlash { text, timeout } => {
             return run_nfc_flash(&cli.nfc_socket, text, timeout);
+        }
+        Namespace::NfcRead { timeout, json } => {
+            return run_nfc_read(&cli.nfc_socket, timeout, json);
         }
         Namespace::Flashlight { state, color } => {
             return run_flashlight(&cli.robot_socket, &state, &color);

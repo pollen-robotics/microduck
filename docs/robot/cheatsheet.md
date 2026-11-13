@@ -746,7 +746,7 @@ pad without forgetting the first, and what to do when it will not bond (the `Pri
 `/etc/bluetooth/main.conf` is the answer more often than anything else).
 
 On a robot with an NFC reader, a tag does the pairing with nothing typed, and other tags switch the
-mode — [`nfc-tags.md`](nfc-tags.md), which also has `robotctl nfc-flash` for writing one.
+mode — [`nfc-tags.md`](nfc-tags.md), which also has `robotctl nfc-flash` for writing one and `robotctl nfc-read` for reading one.
 
 `padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. Each
 part of the pad has one job — face buttons and bumpers run skills, the D-pad picks what the sticks

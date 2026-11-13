@@ -21,6 +21,13 @@
 //! a blank Type 5 one formatted first; see [`tag::write_ndef_area`] and [`vtag::write_ndef_area`]
 //! for what is never touched.
 //!
+//! ## Reading a tag
+//!
+//! `nfc.read` on the same socket — `robotctl nfc-read` — reads the next tag touched, or one
+//! already on the reader, and answers with its UID and NDEF records. It waits, quacks and keeps
+//! the tag from being acted on just as a write does: reading a pairing tag does not pair. A tag
+//! that moves during the read is read again on the next poll, until the wait runs out.
+//!
 //! ## Why its own daemon
 //!
 //! The reader is a device someone has to own, and nothing else here wants it: `configd` is in the
@@ -95,12 +102,12 @@ struct Args {
     socket: PathBuf,
 }
 
-/// Who may ask for a tag to be written: the group that may drive the robot. `btd` is in it, which
+/// Who may ask for a tag to be written or read: the group that may drive the robot. `btd` is in it, which
 /// is how `duckctl` reaches this over Bluetooth.
 const SOCKET_GROUP: &str = "robot";
 const SOCKET_MODE: u32 = 0o660;
-/// Past a write's own timeout, how long its asker waits for the poll loop to answer — a write
-/// under way when the time ran out.
+/// Past a job's own timeout, how long its asker waits for the poll loop to answer — a write or
+/// read under way when the time ran out.
 const ANSWER_MARGIN: Duration = Duration::from_secs(5);
 /// "Touch a tag": the questioning quack a lost pad gets, so whoever ran the command hears that the
 /// robot is waiting, and for what.
@@ -134,10 +141,10 @@ fn main() -> std::process::ExitCode {
         robot: args.robot_socket.clone(),
     };
     if let Err(e) = serve(&args.socket, asked, reader_up.clone(), asker) {
-        // Tags are still read; only writing one is gone.
+        // Tags are still acted on; only writing and reading one on request is gone.
         tracing::warn!(socket = %args.socket.display(), error = %e, "not serving nfc.write");
     }
-    let mut writes = Writes {
+    let mut waiting = Jobs {
         asked: jobs,
         waiting: None,
     };
@@ -154,7 +161,7 @@ fn main() -> std::process::ExitCode {
                 said = None;
                 backoff = RETRY_MIN;
                 reader_up.store(true, Ordering::Release);
-                let why = watch(&mut chip, period, &mut robot, &mut writes);
+                let why = watch(&mut chip, period, &mut robot, &mut waiting);
                 reader_up.store(false, Ordering::Release);
                 tracing::warn!(device = %device.display(), error = %why, "reader lost");
             }
@@ -284,11 +291,11 @@ fn open(device: &Path) -> nfc::Result<Chip> {
 }
 
 /// Poll until the reader stops answering, acting on every touch. Returns why it stopped.
-fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, writes: &mut Writes) -> Error {
+fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut Jobs) -> Error {
     let mut touches = Touches::default();
     loop {
         let start = Instant::now();
-        writes.expire();
+        waiting.expire();
         let touched = match chip.select() {
             Ok(found) => Some(found),
             Err(e) if e.is_tag() => None,
@@ -304,10 +311,32 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, writes: &mut Wr
         };
 
         if let Some((uid, tech)) = touched.as_ref()
-            && let Some(job) = writes.take()
+            && let Some(job) = waiting.take()
         {
-            let lost = write_touched(chip, robot, uid, *tech, job);
-            // The tag just written stays where it is: it is not a touch to act on.
+            let lost = match job.ask {
+                Ask::Write { text, answer } => write_touched(chip, robot, uid, *tech, text, answer),
+                Ask::Read { answer } => match read_touched(chip, robot, uid, *tech) {
+                    Ok(result) => {
+                        let _ = answer.send(result);
+                        None
+                    }
+                    // Moved or at the edge of the field: asked again on the next poll, while
+                    // there is time.
+                    Err(e @ (Error::NoTag | Error::Tag(_) | Error::Collision(_))) => {
+                        tracing::info!(tag = %hex(uid), error = %e, "tag not read; trying again");
+                        waiting.again(Job {
+                            ask: Ask::Read { answer },
+                            until: job.until,
+                        });
+                        None
+                    }
+                    Err(e) => {
+                        let _ = answer.send(not_read(Some(hex(uid)), e.to_string()));
+                        (!e.is_tag()).then_some(e)
+                    }
+                },
+            };
+            // The tag just written or read stays where it is: it is not a touch to act on.
             touches.seen(Some(uid));
             if let Some(e) = lost {
                 return e;
@@ -317,15 +346,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, writes: &mut Wr
             && touches.seen(Some(uid))
         {
             let id = hex(uid);
-            let read = match tech {
-                Tech::A => tag::read_ndef_area(chip),
-                Tech::Classic => Err(Error::Unreadable(
-                    "a MIFARE Classic card: not read here — use an NTAG (Type 2) or a Type 5 tag"
-                        .into(),
-                )),
-                Tech::V => vtag::read_ndef_area(chip, uid),
-            };
-            match read.map(|data| ndef::parse(&data)) {
+            match read_ndef(chip, uid, tech) {
                 Err(e) if !e.is_tag() => return e,
                 // The same answer every time it is asked: said once, until the tag is lifted.
                 Err(Error::Unreadable(why)) => {
@@ -367,21 +388,48 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, writes: &mut Wr
     }
 }
 
-/// A `nfc.write` waiting for a tag.
-struct Job {
-    text: String,
-    until: Instant,
-    answer: mpsc::Sender<proto::NfcWriteResult>,
+/// The tag's NDEF records, or why its memory holds none (the inner error); the outer error is
+/// the tag or the reader failing to read at all.
+fn read_ndef(
+    chip: &mut Chip,
+    uid: &[u8],
+    tech: Tech,
+) -> nfc::Result<Result<Vec<ndef::Record>, String>> {
+    let data = match tech {
+        Tech::A => tag::read_ndef_area(chip),
+        Tech::Classic => Err(Error::Unreadable(
+            "a MIFARE Classic card: not read here — use an NTAG (Type 2) or a Type 5 tag".into(),
+        )),
+        Tech::V => vtag::read_ndef_area(chip, uid),
+    }?;
+    Ok(ndef::parse(&data))
 }
 
-/// The writes asked for, in order, and the one waiting for a tag now.
-struct Writes {
+/// A `nfc.write` or `nfc.read` waiting for a tag.
+struct Job {
+    ask: Ask,
+    until: Instant,
+}
+
+/// What a [`Job`] does with the tag, and where its answer goes.
+enum Ask {
+    Write {
+        text: String,
+        answer: mpsc::Sender<proto::NfcWriteResult>,
+    },
+    Read {
+        answer: mpsc::Sender<proto::NfcReadResult>,
+    },
+}
+
+/// The jobs asked for, in order, and the one waiting for a tag now.
+struct Jobs {
     asked: mpsc::Receiver<Job>,
     waiting: Option<Job>,
 }
 
-impl Writes {
-    /// Take up the next write asked for, answering any whose time ran out with no tag.
+impl Jobs {
+    /// Take up the next job asked for, answering any whose time ran out with no tag.
     fn expire(&mut self) {
         loop {
             if self.waiting.is_none() {
@@ -390,16 +438,78 @@ impl Writes {
             let Some(job) = self.waiting.take_if(|job| Instant::now() >= job.until) else {
                 return;
             };
-            tracing::warn!(text = %job.text, "no tag touched to write");
-            let _ = job
-                .answer
-                .send(not_written(None, "no tag touched in time".into()));
+            let reason = "no tag touched in time".to_owned();
+            match job.ask {
+                Ask::Write { text, answer } => {
+                    tracing::warn!(%text, "no tag touched to write");
+                    let _ = answer.send(not_written(None, reason));
+                }
+                Ask::Read { answer } => {
+                    tracing::warn!("no tag touched to read");
+                    let _ = answer.send(not_read(None, reason));
+                }
+            }
         }
     }
 
     fn take(&mut self) -> Option<Job> {
         self.waiting.take()
     }
+
+    /// Put a job back to wait for the next poll, ahead of any asked after it.
+    fn again(&mut self, job: Job) {
+        self.waiting = Some(job);
+    }
+}
+
+fn not_read(uid: Option<String>, reason: String) -> proto::NfcReadResult {
+    proto::NfcReadResult {
+        read: false,
+        uid,
+        records: Vec::new(),
+        reason: Some(reason),
+    }
+}
+
+/// Read the tag just selected for a `nfc.read`, quacking when it was. A tag that answered wrongly
+/// is the caller's to retry; the answer is everything else, a blank tag included.
+fn read_touched(
+    chip: &mut Chip,
+    robot: &mut dyn Robot,
+    uid: &[u8],
+    tech: Tech,
+) -> nfc::Result<proto::NfcReadResult> {
+    let id = hex(uid);
+    let parsed = read_ndef(chip, uid, tech)?;
+    if let Err(why) = robot.sound(pairing::HEARD) {
+        tracing::info!(%why, "the robot would not quack for the tag");
+    }
+    Ok(match parsed {
+        Ok(records) => {
+            tracing::warn!(tag = %id, ?records, "tag read");
+            proto::NfcReadResult {
+                read: true,
+                uid: Some(id),
+                records: records
+                    .into_iter()
+                    .map(|record| match record {
+                        ndef::Record::Text(s) => proto::NfcRecord::Text(s),
+                        ndef::Record::Uri(s) => proto::NfcRecord::Uri(s),
+                    })
+                    .collect(),
+                reason: None,
+            }
+        }
+        Err(why) => {
+            tracing::warn!(tag = %id, %why, "tag read; it holds no readable NDEF");
+            proto::NfcReadResult {
+                read: true,
+                uid: Some(id),
+                records: Vec::new(),
+                reason: Some(format!("no readable NDEF: {why}")),
+            }
+        }
+    })
 }
 
 fn not_written(uid: Option<String>, reason: String) -> proto::NfcWriteResult {
@@ -417,10 +527,11 @@ fn write_touched(
     robot: &mut dyn Robot,
     uid: &[u8],
     tech: Tech,
-    job: Job,
+    text: String,
+    answer: mpsc::Sender<proto::NfcWriteResult>,
 ) -> Option<Error> {
     let id = hex(uid);
-    let written = ndef::text_tlv(&job.text)
+    let written = ndef::text_tlv(&text)
         .map_err(Error::Tag)
         .and_then(|data| match tech {
             Tech::A => tag::write_ndef_area(chip, &data),
@@ -431,11 +542,11 @@ fn write_touched(
         });
     match written {
         Ok(()) => {
-            tracing::warn!(tag = %id, text = %job.text, "tag written");
+            tracing::warn!(tag = %id, %text, "tag written");
             if let Err(why) = robot.sound(pairing::HEARD) {
                 tracing::info!(%why, "the robot would not quack for the tag");
             }
-            let _ = job.answer.send(proto::NfcWriteResult {
+            let _ = answer.send(proto::NfcWriteResult {
                 written: true,
                 uid: Some(id),
                 reason: None,
@@ -443,14 +554,14 @@ fn write_touched(
             None
         }
         Err(e) => {
-            tracing::warn!(tag = %id, text = %job.text, error = %e, "tag not written");
-            let _ = job.answer.send(not_written(Some(id), e.to_string()));
+            tracing::warn!(tag = %id, %text, error = %e, "tag not written");
+            let _ = answer.send(not_written(Some(id), e.to_string()));
             (!e.is_tag()).then_some(e)
         }
     }
 }
 
-/// Serve `nfc.write` on `socket`, on threads of its own: each asker waits for its tag, and the
+/// Serve `nfc.write` and `nfc.read` on `socket`, on threads of its own: each asker waits for its tag, and the
 /// poll loop answers through the [`Job`] it is handed.
 fn serve(
     socket: &Path,
@@ -531,11 +642,14 @@ fn client(
                         id,
                         &write_when_touched(params, asked, reader_up, robot),
                     ),
+                    Ok(proto::Call::NfcRead(params)) => {
+                        proto::Response::ok(id, &read_when_touched(params, asked, reader_up, robot))
+                    }
                     Ok(_) => proto::Response::err(
                         id,
                         proto::Error::new(
                             proto::code::METHOD_NOT_FOUND,
-                            "nfcd serves nfc.write and nothing else",
+                            "nfcd serves nfc.write and nfc.read, and nothing else",
                         ),
                     ),
                     Err(e) => proto::Response::err(id, e),
@@ -565,9 +679,11 @@ fn write_when_touched(
     let (answer, answered) = mpsc::channel();
     tracing::warn!(text = %params.text, seconds = wait.as_secs(), "touch a tag to write it");
     let job = Job {
-        text: params.text,
+        ask: Ask::Write {
+            text: params.text,
+            answer,
+        },
         until: Instant::now() + wait,
-        answer,
     };
     // Before the job is handed over, so a tag already on the reader is asked for before its quack
     // says it took.
@@ -580,6 +696,35 @@ fn write_when_touched(
     answered
         .recv_timeout(wait + ANSWER_MARGIN)
         .unwrap_or_else(|_| not_written(None, "no answer from the reader in time".into()))
+}
+
+/// Hand a read to the poll loop and wait for its answer.
+fn read_when_touched(
+    params: proto::NfcReadParams,
+    asked: &mpsc::Sender<Job>,
+    reader_up: &AtomicBool,
+    robot: &mut Sockets,
+) -> proto::NfcReadResult {
+    if !reader_up.load(Ordering::Acquire) {
+        return not_read(None, "no NFC reader answering on this robot".into());
+    }
+    let wait = params.timeout();
+    let (answer, answered) = mpsc::channel();
+    tracing::warn!(seconds = wait.as_secs(), "touch a tag to read it");
+    let job = Job {
+        ask: Ask::Read { answer },
+        until: Instant::now() + wait,
+    };
+    // As for a write: the ask is heard before a tag already on the reader is.
+    if let Err(why) = Robot::sound(robot, WAITING) {
+        tracing::info!(%why, "the robot would not quack to ask for a tag");
+    }
+    if asked.send(job).is_err() {
+        return not_read(None, "nfcd is stopping".into());
+    }
+    answered
+        .recv_timeout(wait + ANSWER_MARGIN)
+        .unwrap_or_else(|_| not_read(None, "no answer from the reader in time".into()))
 }
 
 /// Hand the socket to `group`, as `tofd` does its own. A missing group is the caller's warning.
