@@ -1081,8 +1081,10 @@ walk, roller and laser tags end it — [`nfc-tags.md`](nfc-tags.md).
 whatever they are bound to, and **D-pad down** sets the robot **playing by itself** — it turns in
 place until it sees the purple ball, walks to it, steps sideways until the ball is in front of the
 foot on its side, kicks, and looks for it again. **Any button** takes it back to soccer by hand;
-that press does nothing else (A does not also sit it down). A pushed stick wins over autonomous
-play while it is pushed, as it does over the laser. Soccer and laser tracking switch each other off.
+that press does nothing else (A does not also sit it down). **The robot quacks once as it starts
+playing by itself and twice as it stops**, whoever switched it — the pad, `robotctl soccer` or
+the duck on its own. A pushed stick wins over autonomous play while it is pushed, as it does over
+the laser. Soccer and laser tracking switch each other off.
 
 The pad learns of a switch made elsewhere — a tag, `robotctl` — within a second.
 

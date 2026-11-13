@@ -2722,6 +2722,11 @@ async fn control_loop<T: RobotIo>(
         voice.play("greet", false);
     }
 
+    // The second quack of the two that say autonomous soccer has ended, and when it is due. Not
+    // played back to back: a sound cuts off the one before it, so two in one tick are one.
+    const SOCCER_QUACK_GAP: Duration = Duration::from_millis(350);
+    let mut soccer_quack_again: Option<Instant> = None;
+
     // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
     // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
     // `controller.step()` (an ONNX forward pass) sits between the two and would bias every
@@ -2857,7 +2862,22 @@ async fn control_loop<T: RobotIo>(
         // whether it started — which `soccer.kick_outcome` is then told, this same tick.
         let mut soccer_kick: Option<&'static str> = None;
         let mut soccer_kick_result: Option<Result<(), String>> = None;
+        let soccer_was_autonomous = soccer.autonomous();
         soccer.set_autonomous(soccer_switch.autonomous);
+        // Said aloud, for whoever holds the pad or the tag: one quack as the robot starts playing
+        // by itself, two as it stops — whoever switched it, the pad, `robotctl` or `autod`.
+        if soccer_switch.autonomous != soccer_was_autonomous {
+            if let Some(voice) = voice.as_mut() {
+                voice.play("chirp", false);
+            }
+            soccer_quack_again = (!soccer_switch.autonomous).then(|| tick_start + SOCCER_QUACK_GAP);
+        }
+        if soccer_quack_again.is_some_and(|at| tick_start >= at) {
+            soccer_quack_again = None;
+            if let Some(voice) = voice.as_mut() {
+                voice.play("chirp", false);
+            }
+        }
         let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
             phase: "manual".into(),
             ..Default::default()
