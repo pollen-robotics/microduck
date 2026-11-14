@@ -273,7 +273,9 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    the beak (`BEAK_M`), not from the trunk origin. Clear space to the left and to the right picks
    which way to steer.
 7. **Freshness.** Fresh means the forward corridor was observed within `FRESH_S`, either by a
-   trusted range or by a 255 (the head is not glancing away). The gate is the runtime's:
+   trusted range or by a 255 (the head is not glancing away), with at least two of those beams
+   steep enough to see a drop (step 3): a head held up past that stops the walk, a bob does not.
+   The gate is the runtime's:
 
    | data ahead | result |
    |---|---|
@@ -351,9 +353,6 @@ at the first fix, when the map's frame is known to be the same one.
   - Off a table the floor may be out of range, and a status 255 there still reads as clear:
     treating "no return" as a drop would bring back the stalls in front of dark floors that step 2
     removed.
-  - With the head pitched up more than about 5°, as the walking bob takes it for part of each
-    stride, or with the trunk nose up, no beam is steep enough to be judged, yet the path still
-    counts as freshly seen.
   - A polished floor's mirror image of a wall comes back long, and below the floor: on such a floor
     the duck may stop for edges that are not there. Not yet tried on a robot.
 - **Going somewhere on purpose.** Planning a path on the grid around what the map knows — back to a

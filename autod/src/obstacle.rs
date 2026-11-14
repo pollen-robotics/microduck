@@ -239,7 +239,8 @@ impl Model {
         let sensor = self.reprojector.sensor_in_trunk(at.head);
         let t_s = secs(frame.t_ns);
 
-        let mut forward = 0usize;
+        let judged = self.reprojector.judged(at.head, &posture);
+        let (mut forward, mut forward_low) = (0usize, 0usize);
         let mut hits: Vec<[f64; 3]> = Vec::new();
         let mut drops: Vec<bool> = Vec::new();
         for (i, zone) in zones.iter().enumerate() {
@@ -250,6 +251,7 @@ impl Model {
             let observed = !matches!(zone, Zone::Empty) || frame.status[i] == NO_TARGET;
             if ahead && observed {
                 forward += 1;
+                forward_low += usize::from(judged[i]);
             }
             match *zone {
                 Zone::Hit {
@@ -265,13 +267,12 @@ impl Model {
             }
         }
         // Two beams, so one stray zone sweeping past the axis during a glance does not refresh a
-        // path the head is not really looking at.
-        if forward >= 2 {
+        // path the head is not really looking at; and two steep enough to see a drop on it.
+        if forward >= 2 && forward_low >= 2 {
             self.seen = Some(Seen { t_s, pose: at.pose });
         }
 
         // Drops: autonomous.md §5 step 3.
-        let judged = self.reprojector.judged(at.head, &posture);
         let bearing = |p: [f64; 2]| (p[1] - sensor.pos[1]).atan2(p[0] - sensor.pos[0]);
         let mut drop_now = [false; ZONES];
         let mut unplaced: Vec<[f64; 3]> = Vec::new();
@@ -846,6 +847,59 @@ mod tests {
                 "the stop lapsed after {k} frames: ahead {ahead}"
             );
         }
+    }
+
+    /// Every zone of a head at `head` returning the flat floor, or nothing where it looks up.
+    fn flat_floor(t_ns: u64, head: [f64; 4]) -> proto::TofFrame {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk(head);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        let mut f = frame(t_ns, 0, NO_TARGET);
+        for i in 0..64 {
+            let down = -sensor.quat.rotate(rp.beams()[i])[2];
+            if down > 0.05 {
+                f.distance_mm[i] = (above_floor / down * 1000.0) as i16;
+                f.status[i] = 5;
+            }
+        }
+        f
+    }
+
+    /// With the head up past where any beam can see a drop, the path goes stale and the duck
+    /// stops advancing, rather than walking on a path it cannot see an edge on.
+    #[test]
+    fn a_head_too_high_to_see_a_drop_leaves_the_path_unseen() {
+        let up = [0.0, -0.12, 0.0, 0.0];
+        let mut model = Model::default();
+        let mut last = upright(1000 * MS, [0.0; 3]);
+        for k in 0..30u64 {
+            last = Sample {
+                head: up,
+                ..upright(1000 * MS + k * 66 * MS, [0.0; 3])
+            };
+            model.observe(&flat_floor(last.t_ns, up), &last);
+        }
+        assert!(
+            model.summary(&last).is_none_or(|o| o.age_s > STALE_S),
+            "two seconds looking up still counted as seeing the path"
+        );
+    }
+
+    /// The walking bob lifts the head past that point for a moment each stride: the path stays
+    /// fresh through it.
+    #[test]
+    fn the_walking_bob_keeps_the_path_fresh() {
+        let mut model = Model::default();
+        let mut last = upright(1000 * MS, [0.0; 3]);
+        for k in 0..30u64 {
+            let head = [0.0, if k % 7 < 2 { -0.12 } else { 0.05 }, 0.0, 0.0];
+            last = Sample {
+                head,
+                ..upright(1000 * MS + k * 66 * MS, [0.0; 3])
+            };
+            model.observe(&flat_floor(last.t_ns, head), &last);
+        }
+        assert!(model.summary(&last).unwrap().age_s <= FRESH_S);
     }
 
     /// Flat floor seen by the same zones is clear.
