@@ -159,7 +159,20 @@ impl HeadFk {
             [v[0].atan2(v[2]), v[1].atan2(flat)]
         };
 
-        let mut joints = [clamp(neck_pitch, range(0)), 0.0, 0.0, 0.0];
+        let neck = if neck_pitch.is_finite() {
+            clamp(neck_pitch, range(0))
+        } else {
+            0.0
+        };
+
+        if !target_in_trunk.iter().all(|v| v.is_finite()) {
+            return Gaze {
+                joints: [neck, 0.0, 0.0, 0.0],
+                clamped: true,
+            };
+        }
+
+        let mut joints = [neck, 0.0, 0.0, 0.0];
         let mut residual = f64::INFINITY;
         for _ in 0..30 {
             let e = error(joints);
@@ -189,20 +202,29 @@ impl HeadFk {
                 j[1][1].mul_add(e[1], j[0][1] * e[0]),
             ];
             let det = b.mul_add(-b, a * d);
-            if det.abs() < 1e-12 {
+            if det.abs() < 1e-12 || !det.is_finite() {
                 break; // fully singular and damped-out: nothing left to gain
             }
             let step = [
                 b.mul_add(g[1], -d * g[0]) / det,
                 a.mul_add(-g[1], b * g[0]) / det,
             ];
-            let scale = (MAX_STEP / step[0].hypot(step[1])).min(1.0);
-            joints[1] = clamp(joints[1] + scale * step[0], range(1));
-            joints[2] = clamp(joints[2] + scale * step[1], range(2));
+            let hypot = step[0].hypot(step[1]);
+            if !hypot.is_finite() || hypot < 1e-12 {
+                break;
+            }
+            let scale = (MAX_STEP / hypot).min(1.0);
+            let next_pitch = clamp(joints[1] + scale * step[0], range(1));
+            let next_yaw = clamp(joints[2] + scale * step[1], range(2));
+            if !next_pitch.is_finite() || !next_yaw.is_finite() {
+                break;
+            }
+            joints[1] = next_pitch;
+            joints[2] = next_yaw;
         }
         Gaze {
             joints,
-            clamped: residual >= TOLERANCE,
+            clamped: residual >= TOLERANCE || !residual.is_finite(),
         }
     }
 }
@@ -327,6 +349,35 @@ mod tests {
             "the head should be pinned at its yaw limit: {} vs {yaw_limit}",
             gaze.joints[2]
         );
+    }
+
+    /// A non-finite target or neck pitch must not produce NaN joints or claim an unearned lock.
+    #[test]
+    fn non_finite_target_or_neck_clamps_without_nan() {
+        let fk = HeadFk::alpha();
+        for target in [
+            [f64::NAN, 0.0, 0.0],
+            [0.0, f64::INFINITY, 0.0],
+            [0.0, 0.0, f64::NEG_INFINITY],
+        ] {
+            let gaze = fk.look_at(target, 0.0);
+            assert!(gaze.clamped, "target {target:?} must report clamped");
+            for (i, angle) in gaze.joints.into_iter().enumerate() {
+                assert!(
+                    angle.is_finite(),
+                    "joint {i} must stay finite on target {target:?}, got {angle}"
+                );
+            }
+        }
+
+        let gaze = fk.look_at([1.0, 0.0, 0.0], f64::NAN);
+        assert!(
+            gaze.joints[0].is_finite(),
+            "neck_pitch must default to finite angle on NaN"
+        );
+        for angle in gaze.joints {
+            assert!(angle.is_finite());
+        }
     }
 
     /// The sensor pose sits on the MJCF's own `tof` site — exactly — and its
