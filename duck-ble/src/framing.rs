@@ -179,8 +179,13 @@ impl Reassembler {
 /// reassembles until newline then needs no notion of "end of message" beyond the one it
 /// already has.
 pub fn chunks(line: &str, mtu: usize) -> Vec<Vec<u8>> {
-    // A zero or absurd MTU would divide by zero or emit one chunk per byte.
-    let mtu = mtu.max(FLOOR_MTU);
+    // A zero or absurd MTU would divide by zero or emit one chunk per byte. An MTU above the
+    // 512-octet characteristic limit is the other bad direction: a central handed an oversized
+    // value keeps the first 512 bytes and discards the rest silently, so the tail of that chunk
+    // — possibly its newline — never arrives. `notification_payload` already applies this cap
+    // to the value a session writes with; the function that cuts the bytes has to agree, or a
+    // caller passing the negotiated ATT MTU (517) reintroduces the failure that cap was for.
+    let mtu = mtu.clamp(FLOOR_MTU, MAX_ATTRIBUTE_VALUE);
 
     let mut bytes = line.as_bytes().to_vec();
     if !bytes.ends_with(b"\n") {
@@ -309,6 +314,33 @@ mod tests {
     #[test]
     fn an_absurd_mtu_falls_back_to_the_ble_floor() {
         assert_eq!(chunks(&"z".repeat(40), 0).len(), 3); // 41 bytes over 20-byte chunks
+    }
+
+    /// 517 is what a CoreBluetooth central negotiates, and `chunks` takes a value called `mtu`.
+    /// Passing it must not produce a 517-byte value: the central keeps 512 and drops the rest
+    /// without saying anything. The cap has to live where the bytes are cut, not only in the
+    /// helper that computes a payload size.
+    #[test]
+    fn chunks_never_exceed_the_characteristic_value_limit() {
+        let line = "z".repeat(4096);
+        for mtu in [512, 517, 1000, 4096, usize::MAX] {
+            let parts = chunks(&line, mtu);
+            assert!(parts.len() > 1, "mtu {mtu}");
+            for part in &parts {
+                assert!(
+                    part.len() <= MAX_ATTRIBUTE_VALUE,
+                    "mtu {mtu} produced a {} byte chunk",
+                    part.len()
+                );
+            }
+            // Splitting at the link's own bound must still reassemble into the same line.
+            let mut r = Reassembler::for_replies();
+            let mut got = Vec::new();
+            for part in parts {
+                got.extend(r.push(&part).unwrap());
+            }
+            assert_eq!(got, vec![line.clone()], "mtu {mtu}");
+        }
     }
 }
 
