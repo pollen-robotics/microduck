@@ -255,8 +255,15 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    odometry's trunk height. The runtime's floor rule used a fixed 0.12 m trunk height and no IMU,
    so a pitched trunk read the floor as a wall. Hits higher than `MAX_HEIGHT_M` above the floor
    (0.35 m, above the duck) or farther than 1.5 m are dropped: the duck walks under tables.
+   **A drop is in the way too.** A steep beam (at least 15° below the horizon) that comes back from
+   more than 5 cm below the floor, plus 3 cm per metre it landed out, went over an edge: down a
+   step, off a table. Seen two frames running, it becomes a hit at floor height, at the furthest
+   floor seen in front of it: a steeper beam of its column on the floor, or floor seen earlier on
+   the same bearing within the last 0.5 m walked. With neither, and no drop already known up to its
+   edge, the edge may be under the beak: in the path, the drop is kept at the sensor, which stops
+   the duck until it has turned well away.
 4. **Confirm before believing.** A hit counts only if a second hit, in the same frame or the one
-   before, lies within 8 cm of it. A single noisy zone stops nothing.
+   before, lies within 8 cm of it. A single noisy zone stops nothing. A drop is seen twice instead.
 5. **Remember in the world.** Confirmed hits are stored in the odometry frame and re-expressed in
    the *current* body frame every tick, so a remembered chair leg keeps getting closer as the duck
    walks at it. A hit expires after `STALE_S` (1.5 s). It is not dropped just because a later
@@ -266,7 +273,9 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    the beak (`BEAK_M`), not from the trunk origin. Clear space to the left and to the right picks
    which way to steer.
 7. **Freshness.** Fresh means the forward corridor was observed within `FRESH_S`, either by a
-   trusted range or by a 255 (the head is not glancing away). The gate is the runtime's:
+   trusted range or by a 255 (the head is not glancing away), with at least two of those beams
+   steep enough to see a drop (step 3): a head held up past that stops the walk, a bob does not.
+   The gate is the runtime's:
 
    | data ahead | result |
    |---|---|
@@ -340,6 +349,12 @@ at the first fix, when the map's frame is known to be the same one.
 
 ## 7. What is not here yet
 
+- **Drops the sensor cannot see.**
+  - Off a table the floor may be out of range, and a status 255 there still reads as clear:
+    treating "no return" as a drop would bring back the stalls in front of dark floors that step 2
+    removed.
+  - A polished floor's mirror image of a wall comes back long, and below the floor: on such a floor
+    the duck may stop for edges that are not there. Not yet tried on a robot.
 - **Going somewhere on purpose.** Planning a path on the grid around what the map knows — back to a
   favourite nap spot, to where the ball was last seen. Goals are still straight lines.
 - **A wiped map leaves the saved novelty grid behind**, in a frame that no longer exists. It fades

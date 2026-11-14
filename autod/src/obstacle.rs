@@ -17,13 +17,15 @@
 //! - **Single noisy zones.** A hit counts only with a second hit within [`CONFIRM_M`] of it, in
 //!   the same frame or the one before. At 15 Hz that costs one frame at most.
 //!
+//! Drops, beams that went over an edge, are hazards too: §5 step 3.
+//!
 //! Pure: frames and states in, a summary out, no sockets — the tests drive it with synthetic
 //! frames.
 
 use std::collections::VecDeque;
 
 use duck_ipc_proto as proto;
-use kinematics::tof::{Posture, Reprojector, Zone};
+use kinematics::tof::{COLS, Posture, ROWS, Reprojector, Zone};
 
 /// Walking at a remembered obstacle closer than this, measured from the beak, stops the duck and
 /// turns it away. Practically beak distance: bolder reads better.
@@ -58,6 +60,12 @@ const FORWARD_AZ_RAD: f64 = 0.3;
 /// made: "ahead" no longer means what was seen. The prototype's numbers.
 const TURNED_RAD: f64 = 0.45;
 const MOVED_M: f64 = 0.5;
+/// A floor seen earlier places a drop only if it lies on the drop's bearing from the sensor,
+/// within this: floor seen during a glance says nothing about the path.
+const ALONG_RAD: f64 = 0.1;
+/// And only if the duck has walked less than this since it was seen.
+const FLOOR_KEPT_M: f64 = 0.5;
+const ZONES: usize = ROWS * COLS;
 
 /// ST status bytes whose distance is believed: the theremin's set (`[theremin] statuses`).
 /// ST documents only 5 and 9 as valid, and past ~30 cm a dark or moving target comes back 4 or 13
@@ -146,11 +154,15 @@ impl History {
     }
 }
 
-/// A confirmed hit, in the odometry frame.
+/// Something in the way, in the odometry frame.
 #[derive(Debug, Clone, Copy)]
 struct Hazard {
     xy: [f64; 2],
     t_s: f64,
+    drop: bool,
+    /// Counts toward which way to turn. Not a drop put at the sensor, which is on one side of
+    /// the trunk whichever way the edge runs.
+    steer: bool,
 }
 
 /// Where the path was last observed from.
@@ -165,6 +177,10 @@ pub struct Model {
     hazards: Vec<Hazard>,
     /// The previous frame's hits, `[x, y, height]` in the odometry frame, for confirmation.
     previous: Vec<[f64; 3]>,
+    /// Each zone's last floor from a judged beam, in the odometry frame, and where the duck was.
+    floor_seen: [Option<([f64; 2], [f64; 3])>; ZONES],
+    /// Which zones were drops last frame: a drop counts once it is seen twice.
+    previous_drop: [bool; ZONES],
     seen: Option<Seen>,
 }
 
@@ -174,6 +190,8 @@ impl Default for Model {
             reprojector: Reprojector::alpha(),
             hazards: Vec::new(),
             previous: Vec::new(),
+            floor_seen: [None; ZONES],
+            previous_drop: [false; ZONES],
             seen: None,
         }
     }
@@ -221,8 +239,10 @@ impl Model {
         let sensor = self.reprojector.sensor_in_trunk(at.head);
         let t_s = secs(frame.t_ns);
 
-        let mut forward = 0usize;
+        let judged = self.reprojector.judged(at.head, &posture);
+        let (mut forward, mut forward_low) = (0usize, 0usize);
         let mut hits: Vec<[f64; 3]> = Vec::new();
+        let mut drops: Vec<bool> = Vec::new();
         for (i, zone) in zones.iter().enumerate() {
             let dir = sensor.quat.rotate(self.reprojector.beams()[i]);
             let ahead = dir[0] > 0.0 && dir[1].atan2(dir[0]).abs() < FORWARD_AZ_RAD;
@@ -231,41 +251,136 @@ impl Model {
             let observed = !matches!(zone, Zone::Empty) || frame.status[i] == NO_TARGET;
             if ahead && observed {
                 forward += 1;
+                forward_low += usize::from(judged[i]);
             }
-            if let Zone::Hit {
-                point,
-                range,
-                height,
-            } = *zone
-                && height <= MAX_HEIGHT_M
-                && range <= MAX_RANGE_M
-            {
-                let xy = to_world(at.pose, [point[0], point[1]]);
-                hits.push([xy[0], xy[1], height]);
+            match *zone {
+                Zone::Hit {
+                    point,
+                    range,
+                    height,
+                } if height <= MAX_HEIGHT_M && range <= MAX_RANGE_M => {
+                    let xy = to_world(at.pose, [point[0], point[1]]);
+                    hits.push([xy[0], xy[1], height]);
+                    drops.push(false);
+                }
+                _ => {}
             }
         }
         // Two beams, so one stray zone sweeping past the axis during a glance does not refresh a
-        // path the head is not really looking at.
-        if forward >= 2 {
+        // path the head is not really looking at; and two steep enough to see a drop on it.
+        if forward >= 2 && forward_low >= 2 {
             self.seen = Some(Seen { t_s, pose: at.pose });
         }
+
+        // Drops: autonomous.md §5 step 3.
+        let bearing = |p: [f64; 2]| (p[1] - sensor.pos[1]).atan2(p[0] - sensor.pos[0]);
+        let mut drop_now = [false; ZONES];
+        let mut unplaced: Vec<[f64; 3]> = Vec::new();
+        for col in 0..COLS {
+            let mut floor_here: Option<[f64; 2]> = None;
+            for row in (0..ROWS).rev() {
+                let i = row * COLS + col;
+                match zones[i] {
+                    Zone::Floor { point } if judged[i] => {
+                        let xy = to_world(at.pose, [point[0], point[1]]);
+                        floor_here = Some(xy);
+                        self.floor_seen[i] = Some((xy, at.pose));
+                    }
+                    Zone::Drop { edge, .. }
+                        if (edge[0] - sensor.pos[0]).hypot(edge[1] - sensor.pos[1])
+                            <= MAX_RANGE_M =>
+                    {
+                        drop_now[i] = true;
+                        if !(row..ROWS).any(|r| self.previous_drop[r * COLS + col]) {
+                            continue;
+                        }
+                        let earlier = self.floor_seen[i]
+                            .filter(|&(xy, from)| {
+                                let b = to_body(at.pose, xy);
+                                (from[0] - at.pose[0]).hypot(from[1] - at.pose[1]) < FLOOR_KEPT_M
+                                    && b[0] <= edge[0]
+                                    && crate::brain::wrap_angle(
+                                        bearing(b) - bearing([edge[0], edge[1]]),
+                                    )
+                                    .abs()
+                                        < ALONG_RAD
+                            })
+                            .map(|(xy, _)| xy);
+                        match floor_here.or(earlier) {
+                            Some(xy) => {
+                                hits.push([xy[0], xy[1], 0.0]);
+                                drops.push(true);
+                            }
+                            None => unplaced.push(edge),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.previous_drop = drop_now;
 
         let close = |a: &[f64; 3], b: &[f64; 3]| {
             let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
             (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() <= CONFIRM_M
         };
-        for (i, hit) in hits.iter().enumerate() {
-            let confirmed = hits
-                .iter()
-                .enumerate()
-                .any(|(j, other)| j != i && close(hit, other))
-                || self.previous.iter().any(|other| close(hit, other));
-            if confirmed {
-                self.hazards.push(Hazard {
-                    xy: [hit[0], hit[1]],
-                    t_s,
-                });
+        let confirmed: Vec<bool> = (0..hits.len())
+            .map(|i| {
+                (0..hits.len()).any(|j| j != i && close(&hits[i], &hits[j]))
+                    || self.previous.iter().any(|other| close(&hits[i], other))
+            })
+            .collect();
+
+        let mut stop_here = false;
+        for edge in unplaced {
+            if edge[0] <= 0.0 || edge[1].abs() >= HALF_WIDTH_M {
+                continue;
             }
+            let known = |xy: [f64; 2]| {
+                let [x, y] = to_body(at.pose, xy);
+                x > 0.0 && y.abs() < HALF_WIDTH_M && x <= edge[0]
+            };
+            let placed = (0..hits.len())
+                .any(|i| drops[i] && confirmed[i] && known([hits[i][0], hits[i][1]]));
+            // A drop still in the path keeps the one already known for it, or the stop lapses.
+            let mut remembered = false;
+            for h in self.hazards.iter_mut().filter(|h| h.drop && known(h.xy)) {
+                h.t_s = t_s;
+                remembered = true;
+            }
+            stop_here |= !placed && !remembered;
+        }
+        // Seen twice already, so it needs no second hit.
+        if stop_here {
+            self.hazards.push(Hazard {
+                xy: to_world(at.pose, [sensor.pos[0], sensor.pos[1]]),
+                t_s,
+                drop: true,
+                steer: false,
+            });
+        }
+
+        for (i, hit) in hits.iter().enumerate() {
+            if !confirmed[i] {
+                continue;
+            }
+            let xy = [hit[0], hit[1]];
+            // A drop seen again where one is kept refreshes it rather than piling up.
+            if drops[i]
+                && let Some(h) = self
+                    .hazards
+                    .iter_mut()
+                    .find(|h| h.drop && (h.xy[0] - xy[0]).hypot(h.xy[1] - xy[1]) <= CONFIRM_M)
+            {
+                h.t_s = t_s;
+                continue;
+            }
+            self.hazards.push(Hazard {
+                xy,
+                t_s,
+                drop: drops[i],
+                steer: true,
+            });
         }
         self.previous = hits;
         self.hazards.retain(|h| t_s - h.t_s <= STALE_S);
@@ -293,6 +408,9 @@ impl Model {
             }
             if y.abs() < HALF_WIDTH_M {
                 ahead_m = ahead_m.min((x - BEAK_M).max(0.0));
+            }
+            if !h.steer {
+                continue;
             }
             let d = x.hypot(y);
             if y >= 0.0 {
@@ -351,6 +469,17 @@ mod tests {
 
     const MS: u64 = 1_000_000;
 
+    /// Two frames a 15th of a second apart, from the same place: a drop counts once seen twice.
+    fn twice(model: &mut Model, at: &Sample, frame: impl Fn(u64) -> proto::TofFrame) -> Sample {
+        model.observe(&frame(at.t_ns), at);
+        let next = Sample {
+            t_ns: at.t_ns + 66 * MS,
+            ..*at
+        };
+        model.observe(&frame(next.t_ns), &next);
+        next
+    }
+
     #[test]
     fn nothing_seen_is_no_summary() {
         let model = Model::default();
@@ -390,6 +519,397 @@ mod tests {
             "ahead {} for a wall ~0.5 m from the head",
             o.ahead_m
         );
+    }
+
+    /// Steep forward zones of a level head, returning from `below` metres under the floor.
+    fn floor_ahead(t_ns: u64, below: f64) -> proto::TofFrame {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk([0.0; 4]);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        let mut f = frame(t_ns, 0, NO_TARGET);
+        let mut steep = 0;
+        for row in 0..8 {
+            for col in 2..6 {
+                let down = -sensor.quat.rotate(rp.beams()[row * 8 + col])[2];
+                if down >= Reprojector::DROP_MIN_DOWNWARD {
+                    f.distance_mm[row * 8 + col] = ((above_floor + below) / down * 1000.0) as i16;
+                    f.status[row * 8 + col] = 5;
+                    steep += 1;
+                }
+            }
+        }
+        assert!(steep >= 4, "a level head has steep forward zones");
+        f
+    }
+
+    /// Steep forward zones of a level head at `pose`, with a step of `depth` where the world's x
+    /// passes `edge_x`.
+    fn edge_at(t_ns: u64, pose: [f64; 3], edge_x: f64, depth: f64) -> proto::TofFrame {
+        edge_ahead(t_ns, pose, [0.0; 4], edge_x, depth)
+    }
+
+    /// [`edge_at`] across every column, not only the forward ones.
+    fn edge_all(t_ns: u64, pose: [f64; 3], edge_x: f64, depth: f64) -> proto::TofFrame {
+        edge_cols(t_ns, pose, [0.0; 4], 0..8, edge_x, depth)
+    }
+
+    /// [`edge_at`] for a head at `head`.
+    fn edge_ahead(
+        t_ns: u64,
+        pose: [f64; 3],
+        head: [f64; 4],
+        edge_x: f64,
+        depth: f64,
+    ) -> proto::TofFrame {
+        edge_cols(t_ns, pose, head, 2..6, edge_x, depth)
+    }
+
+    fn edge_cols(
+        t_ns: u64,
+        pose: [f64; 3],
+        head: [f64; 4],
+        cols: std::ops::Range<usize>,
+        edge_x: f64,
+        depth: f64,
+    ) -> proto::TofFrame {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk(head);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        let mut f = frame(t_ns, 0, NO_TARGET);
+        for row in 0..8 {
+            for col in cols.clone() {
+                let dir = sensor.quat.rotate(rp.beams()[row * 8 + col]);
+                let down = -dir[2];
+                if down < Reprojector::DROP_MIN_DOWNWARD {
+                    continue;
+                }
+                let at_floor = above_floor / down;
+                let lands = to_world(
+                    pose,
+                    [
+                        sensor.pos[0] + at_floor * dir[0],
+                        sensor.pos[1] + at_floor * dir[1],
+                    ],
+                );
+                let range = if lands[0] > edge_x {
+                    (above_floor + depth) / down
+                } else {
+                    at_floor
+                };
+                f.distance_mm[row * 8 + col] = (range * 1000.0) as i16;
+                f.status[row * 8 + col] = 5;
+            }
+        }
+        f
+    }
+
+    /// Walks at a 10 cm step at `speed` until the gate stops; how far short of it the beak is.
+    fn walk_at_an_edge(speed: f64) -> f64 {
+        let mut model = Model::default();
+        let edge_x = 1.5;
+        let dt = 1.0 / 15.0;
+        let mut x = 0.0;
+        for k in 0..((2.0 / speed / dt) as u64) {
+            let at = upright(1000 * MS + k * (dt * 1e9) as u64, [x, 0.0, 0.0]);
+            model.observe(&edge_at(at.t_ns, at.pose, edge_x, 0.10), &at);
+            if model.summary(&at).unwrap().ahead_m <= STOP_M {
+                return edge_x - (x + BEAK_M);
+            }
+            x += speed * dt;
+        }
+        panic!("never stopped, at x {x:.2} with the edge at {edge_x}");
+    }
+
+    /// Walking at an edge at the pad's top speed, the duck stops short of it, two frames and all.
+    #[test]
+    fn a_duck_walking_at_an_edge_stops_before_it() {
+        let short = walk_at_an_edge(0.3);
+        assert!(
+            (0.0..0.25).contains(&short),
+            "{short:.3} m short of the edge"
+        );
+    }
+
+    /// A slow approach still stops short of the edge.
+    #[test]
+    fn a_slow_approach_keeps_the_edge() {
+        let short = walk_at_an_edge(0.01);
+        assert!(
+            (0.0..0.25).contains(&short),
+            "{short:.3} m short of the edge"
+        );
+    }
+
+    /// Setting off with every beam already past an edge, the duck stops at once.
+    #[test]
+    fn a_duck_setting_off_close_to_an_edge_stops_at_once() {
+        let mut model = Model::default();
+        let at = upright(1000 * MS, [1.0, 0.0, 0.0]);
+        let edge_x = 1.35;
+        let at = twice(&mut model, &at, |t| edge_at(t, at.pose, edge_x, 0.10));
+        let ahead = model.summary(&at).unwrap().ahead_m;
+        assert!(
+            ahead <= STOP_M,
+            "ahead {ahead:.3} m with the edge {:.3} m past the beak",
+            edge_x - 1.0 - BEAK_M
+        );
+    }
+
+    /// Looking down, the edge goes past the floor the steeper rows saw, not at the sensor.
+    #[test]
+    fn the_floor_seen_short_of_an_edge_places_it() {
+        let head = [0.0, 0.3, 0.0, 0.0];
+        let at = Sample {
+            head,
+            ..upright(1000 * MS, [0.0; 3])
+        };
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk(head);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        // An edge between the nearest and furthest landings, so some rows see floor.
+        let lands: Vec<f64> = (0..64)
+            .filter(|i| (2..6).contains(&(i % 8)))
+            .map(|i| sensor.quat.rotate(rp.beams()[i]))
+            .filter(|dir| -dir[2] >= Reprojector::DROP_MIN_DOWNWARD)
+            .map(|dir| sensor.pos[0] + above_floor / -dir[2] * dir[0])
+            .collect();
+        let (near, far) = lands
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        assert!(far - near > 0.1, "rows to tell apart: {near:.2}..{far:.2}");
+        let edge_x = (near + far) / 2.0;
+        let mut model = Model::default();
+        let at = twice(&mut model, &at, |t| {
+            edge_ahead(t, at.pose, head, edge_x, 0.10)
+        });
+        let ahead = model.summary(&at).unwrap().ahead_m;
+        assert!(
+            ahead > 0.05 && ahead <= edge_x - BEAK_M + 0.01,
+            "ahead {ahead:.3} m, the edge {:.3} m past the beak",
+            edge_x - BEAK_M
+        );
+    }
+
+    /// Every steep zone of a level head at `pose`, with a step of `depth` along the floor at
+    /// `edge_y` to the left: a beam landing further left comes back from the lower floor.
+    fn edge_beside(t_ns: u64, pose: [f64; 3], edge_y: f64, depth: f64) -> proto::TofFrame {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk([0.0; 4]);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        let mut f = frame(t_ns, 0, NO_TARGET);
+        for i in 0..64 {
+            let dir = sensor.quat.rotate(rp.beams()[i]);
+            let down = -dir[2];
+            if down < Reprojector::DROP_MIN_DOWNWARD {
+                continue;
+            }
+            let at_floor = above_floor / down;
+            let lands_y = pose[1] + sensor.pos[1] + at_floor * dir[1];
+            let range = if lands_y > edge_y {
+                (above_floor + depth) / down
+            } else {
+                at_floor
+            };
+            f.distance_mm[i] = (range * 1000.0) as i16;
+            f.status[i] = 5;
+        }
+        f
+    }
+
+    /// An edge beside the path does not stop a duck walking along it.
+    #[test]
+    fn an_edge_beside_the_path_does_not_stop_the_duck() {
+        let mut model = Model::default();
+        let (dt, speed) = (1.0 / 15.0, 0.2);
+        let mut x = 0.0;
+        for k in 0..60u64 {
+            let at = upright(1000 * MS + k * (dt * 1e9) as u64, [x, 0.0, 0.0]);
+            model.observe(&edge_beside(at.t_ns, at.pose, 0.2, 0.10), &at);
+            let ahead = model.summary(&at).unwrap().ahead_m;
+            assert!(
+                ahead > STOP_M,
+                "stopped at x {x:.2} with the edge to the side"
+            );
+            x += speed * dt;
+        }
+    }
+
+    /// Standing at an edge keeps a handful of drops, not one more every frame.
+    #[test]
+    fn standing_at_an_edge_keeps_a_handful_of_drops() {
+        let head = [0.0, 0.3, 0.0, 0.0];
+        let mut model = Model::default();
+        for k in 0..225u64 {
+            let at = Sample {
+                head,
+                ..upright(1000 * MS + k * 66 * MS, [0.0; 3])
+            };
+            model.observe(&edge_ahead(at.t_ns, at.pose, head, 0.45, 0.10), &at);
+        }
+        assert!(model.hazards.len() <= 16, "{} kept", model.hazards.len());
+    }
+
+    /// One frame that reads a drop, say from a pitch jolt, stops nothing.
+    #[test]
+    fn a_drop_seen_once_stops_nothing() {
+        let mut model = Model::default();
+        let at = upright(1000 * MS, [0.0; 3]);
+        model.observe(&floor_ahead(at.t_ns, 0.10), &at);
+        let next = upright(1066 * MS, [0.0; 3]);
+        model.observe(&floor_ahead(next.t_ns, 0.0), &next);
+        assert_eq!(model.summary(&next).unwrap().ahead_m, f64::INFINITY);
+    }
+
+    /// Stopped at an edge with a wall on its right, the duck turns left, away from the wall.
+    #[test]
+    fn a_stop_at_an_edge_turns_away_from_the_wall_beside_it() {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk([0.0; 4]);
+        let right: Vec<usize> = (0..64)
+            .filter(|&i| {
+                let dir = sensor.quat.rotate(rp.beams()[i]);
+                dir[1] < -0.25 && dir[2].abs() < 0.2
+            })
+            .collect();
+        assert!(right.len() >= 2, "a level head has zones to the right");
+        let mut model = Model::default();
+        let at = twice(&mut model, &upright(1000 * MS, [1.1, 0.0, 0.0]), |t| {
+            let mut f = edge_at(t, [1.1, 0.0, 0.0], 1.3, 0.10);
+            for &i in &right {
+                f.distance_mm[i] = 400;
+                f.status[i] = 5;
+            }
+            f
+        });
+        let o = model.summary(&at).unwrap();
+        assert!(o.ahead_m <= STOP_M, "stopped: {}", o.ahead_m);
+        assert_eq!(o.away, 1.0, "away from the wall on the right");
+    }
+
+    /// Floor seen during a glance does not vouch for the path: a lip ahead stops the duck at once.
+    #[test]
+    fn floor_seen_in_a_glance_does_not_place_an_edge_ahead() {
+        let mut model = Model::default();
+        let pose = [1.0, 0.0, 0.0];
+        let glance = [0.0, 0.0, 0.9, 0.0];
+        let at = Sample {
+            head: glance,
+            ..upright(1000 * MS, pose)
+        };
+        model.observe(&edge_ahead(at.t_ns, pose, glance, 5.0, 0.10), &at);
+        let at = twice(&mut model, &upright(1066 * MS, pose), |t| {
+            edge_at(t, pose, 1.0 + BEAK_M + 0.07, 0.10)
+        });
+        let ahead = model.summary(&at).unwrap().ahead_m;
+        assert!(
+            ahead <= STOP_M,
+            "ahead {ahead:.3} m with a lip 7 cm past the beak"
+        );
+    }
+
+    /// Turned away from an edge, the stop it set lets go: an edge beside the path keeps nothing.
+    #[test]
+    fn an_edge_left_beside_the_path_lets_the_duck_go() {
+        let mut model = Model::default();
+        let pose = [1.1, 0.0, 0.0];
+        let at = twice(&mut model, &upright(1000 * MS, pose), |t| {
+            edge_all(t, pose, 1.35, 0.10)
+        });
+        assert!(
+            model.summary(&at).unwrap().ahead_m <= STOP_M,
+            "stopped facing the edge"
+        );
+        let turned = [1.1, 0.0, 80f64.to_radians()];
+        let mut last = at;
+        for k in 1..=40u64 {
+            last = upright(at.t_ns + k * 66 * MS, turned);
+            model.observe(&edge_all(last.t_ns, turned, 1.35, 0.10), &last);
+        }
+        assert_eq!(model.summary(&last).unwrap().ahead_m, f64::INFINITY);
+    }
+
+    /// Standing at a lip, the stop holds for as long as the edge is in the path, with no gap a
+    /// creeping turn or a brace could step through.
+    #[test]
+    fn a_stop_at_an_edge_holds_while_the_edge_is_in_the_path() {
+        let mut model = Model::default();
+        let pose = [1.0, 0.0, 0.0];
+        let edge_x = 1.0 + BEAK_M + 0.05;
+        let at = twice(&mut model, &upright(1000 * MS, pose), |t| {
+            edge_at(t, pose, edge_x, 0.10)
+        });
+        for k in 1..=450u64 {
+            let now = upright(at.t_ns + k * 66 * MS, pose);
+            model.observe(&edge_at(now.t_ns, pose, edge_x, 0.10), &now);
+            let ahead = model.summary(&now).unwrap().ahead_m;
+            assert!(
+                ahead <= STOP_M,
+                "the stop lapsed after {k} frames: ahead {ahead}"
+            );
+        }
+    }
+
+    /// Every zone of a head at `head` returning the flat floor, or nothing where it looks up.
+    fn flat_floor(t_ns: u64, head: [f64; 4]) -> proto::TofFrame {
+        let rp = Reprojector::alpha();
+        let sensor = rp.sensor_in_trunk(head);
+        let above_floor = sensor.pos[2] + kinematics::Model::alpha().trunk_height_m();
+        let mut f = frame(t_ns, 0, NO_TARGET);
+        for i in 0..64 {
+            let down = -sensor.quat.rotate(rp.beams()[i])[2];
+            if down > 0.05 {
+                f.distance_mm[i] = (above_floor / down * 1000.0) as i16;
+                f.status[i] = 5;
+            }
+        }
+        f
+    }
+
+    /// With the head up past where any beam can see a drop, the path goes stale and the duck
+    /// stops advancing, rather than walking on a path it cannot see an edge on.
+    #[test]
+    fn a_head_too_high_to_see_a_drop_leaves_the_path_unseen() {
+        let up = [0.0, -0.12, 0.0, 0.0];
+        let mut model = Model::default();
+        let mut last = upright(1000 * MS, [0.0; 3]);
+        for k in 0..30u64 {
+            last = Sample {
+                head: up,
+                ..upright(1000 * MS + k * 66 * MS, [0.0; 3])
+            };
+            model.observe(&flat_floor(last.t_ns, up), &last);
+        }
+        assert!(
+            model.summary(&last).is_none_or(|o| o.age_s > STALE_S),
+            "two seconds looking up still counted as seeing the path"
+        );
+    }
+
+    /// The walking bob lifts the head past that point for a moment each stride: the path stays
+    /// fresh through it.
+    #[test]
+    fn the_walking_bob_keeps_the_path_fresh() {
+        let mut model = Model::default();
+        let mut last = upright(1000 * MS, [0.0; 3]);
+        for k in 0..30u64 {
+            let head = [0.0, if k % 7 < 2 { -0.12 } else { 0.05 }, 0.0, 0.0];
+            last = Sample {
+                head,
+                ..upright(1000 * MS + k * 66 * MS, [0.0; 3])
+            };
+            model.observe(&flat_floor(last.t_ns, head), &last);
+        }
+        assert!(model.summary(&last).unwrap().age_s <= FRESH_S);
+    }
+
+    /// Flat floor seen by the same zones is clear.
+    #[test]
+    fn the_flat_floor_is_not_a_drop() {
+        let mut model = Model::default();
+        let at = twice(&mut model, &upright(1000 * MS, [0.0; 3]), |t| {
+            floor_ahead(t, 0.0)
+        });
+        assert_eq!(model.summary(&at).unwrap().ahead_m, f64::INFINITY);
     }
 
     /// One noisy zone on its own stops nothing.
