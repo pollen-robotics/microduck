@@ -834,6 +834,7 @@ mod tests {
                 let (point, rgb) = match zone {
                     kinematics::tof::Zone::Hit { point, .. } => (point, [225, 200, 70]),
                     kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
+                    kinematics::tof::Zone::Drop { edge, .. } => (edge, [220, 60, 60]),
                     _ => continue,
                 };
                 markers.push(Marker {

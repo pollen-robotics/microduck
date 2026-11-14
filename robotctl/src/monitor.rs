@@ -842,7 +842,8 @@ const TOF_STALE: Duration = Duration::from_millis(400);
 
 /// Said in the block's border, because the two non-numeric cells are the ones a
 /// reader has no way to guess.
-const TOF_LEGEND: &str = " · nothing in range · x could not measure · green floor · near→far ";
+const TOF_LEGEND: &str =
+    " · nothing in range · x could not measure · green floor · red block drop · near→far ";
 
 /// The near-to-far colour ramp, warm to cool.
 ///
@@ -923,6 +924,13 @@ fn tof_cell(zone: tof_zone::Zone, class: Option<kinematics::tof::Zone>) -> Span<
                 }
                 Some(kinematics::tof::Zone::TooClose) => {
                     return Span::raw(format!("{:>4.2} ", metres.min(9.99))).dim();
+                }
+                // A block, not a ramp colour: the ramp's near end is red too.
+                Some(kinematics::tof::Zone::Drop { .. }) => {
+                    return Span::styled(
+                        format!("{:>4.2} ", metres.min(9.99)),
+                        Style::new().fg(Color::Black).bg(Color::Red),
+                    );
                 }
                 _ => {}
             }
@@ -1909,8 +1917,9 @@ impl View {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         // The depth frame rides along as contact points — yellow for obstacles,
-        // green for confirmed floor — so what the sensor sees is drawn where it
-        // sees it, and the view zooms out just enough to keep them in frame.
+        // green for confirmed floor, red for an edge — so what the sensor sees is
+        // drawn where it sees it, and the view zooms out just enough to keep them
+        // in frame.
         let markers = self.tof_markers();
         self.duck.draw(
             model,
@@ -2735,9 +2744,9 @@ impl View {
     }
 
     /// The depth frame as contact points for the 3D view: yellow for a thing,
-    /// green for confirmed floor — the same colours the grid uses. Empty when
-    /// the frame is stale, because points hanging where the sensor no longer
-    /// looks would be a lie.
+    /// green for confirmed floor, red where a beam went over an edge — the same
+    /// colours the grid uses. Empty when the frame is stale, because points
+    /// hanging where the sensor no longer looks would be a lie.
     fn tof_markers(&self) -> Vec<duck::Marker> {
         if self.tof_arrived.is_none_or(|at| at.elapsed() > TOF_STALE) {
             return Vec::new();
@@ -2751,6 +2760,7 @@ impl View {
                 let (point, rgb) = match zone {
                     kinematics::tof::Zone::Hit { point, .. } => (point, [225, 200, 70]),
                     kinematics::tof::Zone::Floor { point } => (point, [70, 160, 80]),
+                    kinematics::tof::Zone::Drop { edge, .. } => (edge, [220, 60, 60]),
                     _ => return None,
                 };
                 Some(duck::Marker {
