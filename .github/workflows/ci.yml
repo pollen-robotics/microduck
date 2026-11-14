@@ -48,6 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test control stream framing
+        run: |
+          python3 -m venv "$RUNNER_TEMP/control-stream-tests"
+          "$RUNNER_TEMP/control-stream-tests/bin/python" -m pip install requests
+          "$RUNNER_TEMP/control-stream-tests/bin/python" -m unittest discover -s spaces/shared -p 'test_wire.py' -v
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
