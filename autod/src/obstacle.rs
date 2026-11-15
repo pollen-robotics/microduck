@@ -80,6 +80,8 @@ pub struct Obstacle {
     /// Gap from the beak to the nearest remembered hit in the walking corridor, metres;
     /// infinity when the corridor is clear.
     pub ahead_m: f64,
+    /// The same gap to the nearest drop in the corridor; infinity when there is none.
+    pub drop_m: f64,
     /// Which way to turn to get away: +1 left, −1 right. Toward the clearer side.
     pub away: f64,
     /// Seconds since the walking path was last observed.
@@ -398,7 +400,7 @@ impl Model {
             (now - seen.t_s).max(0.0)
         };
 
-        let mut ahead_m = f64::INFINITY;
+        let (mut ahead_m, mut drop_m) = (f64::INFINITY, f64::INFINITY);
         // The nearest hazard on each side within a wider fan, to know which way is clearer.
         let (mut left, mut right) = (f64::INFINITY, f64::INFINITY);
         for h in self.hazards.iter().filter(|h| now - h.t_s <= STALE_S) {
@@ -407,7 +409,11 @@ impl Model {
                 continue;
             }
             if y.abs() < HALF_WIDTH_M {
-                ahead_m = ahead_m.min((x - BEAK_M).max(0.0));
+                let gap = (x - BEAK_M).max(0.0);
+                ahead_m = ahead_m.min(gap);
+                if h.drop {
+                    drop_m = drop_m.min(gap);
+                }
             }
             if !h.steer {
                 continue;
@@ -421,6 +427,7 @@ impl Model {
         }
         Some(Obstacle {
             ahead_m,
+            drop_m,
             away: if left >= right { 1.0 } else { -1.0 },
             age_s,
         })
@@ -519,6 +526,7 @@ mod tests {
             "ahead {} for a wall ~0.5 m from the head",
             o.ahead_m
         );
+        assert_eq!(o.drop_m, f64::INFINITY, "a wall is not a drop");
     }
 
     /// Steep forward zones of a level head, returning from `below` metres under the floor.
@@ -647,12 +655,14 @@ mod tests {
         let at = upright(1000 * MS, [1.0, 0.0, 0.0]);
         let edge_x = 1.35;
         let at = twice(&mut model, &at, |t| edge_at(t, at.pose, edge_x, 0.10));
-        let ahead = model.summary(&at).unwrap().ahead_m;
+        let o = model.summary(&at).unwrap();
         assert!(
-            ahead <= STOP_M,
-            "ahead {ahead:.3} m with the edge {:.3} m past the beak",
+            o.ahead_m <= STOP_M,
+            "ahead {:.3} m with the edge {:.3} m past the beak",
+            o.ahead_m,
             edge_x - 1.0 - BEAK_M
         );
+        assert_eq!(o.drop_m, o.ahead_m, "and it is the drop that stops it");
     }
 
     /// Looking down, the edge goes past the floor the steeper rows saw, not at the sensor.
@@ -688,6 +698,19 @@ mod tests {
             "ahead {ahead:.3} m, the edge {:.3} m past the beak",
             edge_x - BEAK_M
         );
+
+        // Something nearer than the drop does not hide it.
+        let at = twice(&mut model, &at, |t| {
+            let mut f = edge_ahead(t, at.pose, head, edge_x, 0.10);
+            for i in (0..64).filter(|i| (3..5).contains(&(i % 8))) {
+                if f.status[i] == NO_TARGET {
+                    (f.distance_mm[i], f.status[i]) = (120, 5);
+                }
+            }
+            f
+        });
+        let o = model.summary(&at).unwrap();
+        assert!(o.ahead_m < ahead && o.drop_m == ahead, "{o:?}");
     }
 
     /// Every steep zone of a level head at `pose`, with a step of `depth` along the floor at
