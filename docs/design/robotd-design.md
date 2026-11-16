@@ -331,6 +331,15 @@ a `robotd` restart takes the write too. New settings are written with torque off
 next torque on, without a reboot: on V3, each restart's hold current and taper showed in the very
 next walk on lavandiere (2026-11-05); on V4, the gear bench's first shot after the write ran them.
 
+**Goal PWM can follow the battery.** With `bus.battery_voltage_based_pwm_limit` on (off by
+default), every 10 s the loop writes Goal PWM (100, RAM) on every servo at `6 V / battery EMA`
+out of 885, the factory PWM Limit: 648 (73 %) on a full 8.2 V pack, 856 at 6.2 V, 885 below
+6 V. The motor then sees ~6 V whatever the charge (`duck_control::model::goal_pwm_for`). It is
+Goal PWM and not PWM Limit (36, EEPROM) because PWM Limit reaches Goal PWM only at boot. It is
+rewritten even when unchanged, and the first apply after a servo reboot writes it again. Off
+writes 885 once at startup: Goal PWM survives a `robotd` restart, so without that a cap from an
+earlier run would stay in place.
+
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
 averaged in as if the pack were half flat. Temperature is *not* averaged — the caller gets
