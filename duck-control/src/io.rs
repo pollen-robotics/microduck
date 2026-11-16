@@ -144,6 +144,16 @@ pub trait RobotIo {
     /// a running value of 200.
     fn set_gain(&mut self, kp: u16) -> Result<()>;
 
+    /// Set Goal PWM (register 100, RAM) on every joint: the duty-cycle cap, out of
+    /// [`crate::model::GOAL_PWM_MAX`], that keeps the motor at
+    /// [`crate::model::MOTOR_MAX_V`] whatever the pack's charge ([`crate::model::goal_pwm_for`]).
+    ///
+    /// Defaulted to a no-op because only real servos have a pack behind them: the simulator's
+    /// motors are already modelled at the voltage the policy was trained on.
+    fn set_goal_pwm(&mut self, _pwm: u16) -> Result<()> {
+        Ok(())
+    }
+
     /// Torque on or off, every joint.
     ///
     /// On the trait — rather than only on the bus — because bringing the robot up is now something
@@ -268,6 +278,8 @@ pub struct FakeIo {
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
     pub last_gain: Option<u16>,
+    /// Every Goal PWM commanded, in order, so a test can tell "refreshed" from "written once".
+    pub goal_pwms: Vec<u16>,
     /// Whether the orientation filter reports converged. False models the first seconds after
     /// startup, when projected gravity is not yet a measurement.
     pub imu_ready: bool,
@@ -320,6 +332,7 @@ impl FakeIo {
             reads: 0,
             writes: 0,
             last_gain: None,
+            goal_pwms: Vec::new(),
             imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
@@ -411,6 +424,11 @@ impl RobotIo for FakeIo {
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
         self.last_gain = Some(kp);
+        Ok(())
+    }
+
+    fn set_goal_pwm(&mut self, pwm: u16) -> Result<()> {
+        self.goal_pwms.push(pwm);
         Ok(())
     }
 

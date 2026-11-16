@@ -300,6 +300,7 @@ async fn main() -> ExitCode {
 
     tokio::spawn(configd::indicator::run(Arc::clone(&net), Arc::clone(&pads)));
     tokio::spawn(pad_reconnect_loop(Arc::clone(&pads)));
+    tokio::spawn(configd::wifi_ssh::run());
 
     let service = Arc::new(Service {
         net,

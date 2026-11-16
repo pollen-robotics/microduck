@@ -3052,6 +3052,12 @@ pub struct Bus {
     /// values, the gear-breakage bench's, made a walking robot fall. Changing them is how a robot
     /// test looks for a guard that keeps the gears whole and still lets the policy walk.
     pub impact_guard: bool,
+    /// Cap Goal PWM at `6 V / battery` so the motors see at most ~6 V whatever the charge: 73 %
+    /// on a full 8.2 V pack, nearly 100 % on a flat one. Follows the battery EMA every ten
+    /// seconds; written to Goal PWM (RAM) rather than PWM Limit (EEPROM), which would need a
+    /// reboot per servo. **Off by default**, and off writes Goal PWM back to 100 % once at
+    /// startup, so a cap left by an earlier run does not outlive the setting.
+    pub battery_voltage_based_pwm_limit: bool,
     /// V Min, rad/s: an impact counts only while the servo moves toward its goal faster.
     pub impact_guard_v_min: u8,
     /// Brake Time, ms: how long the H-bridge is shorted after an impact.
@@ -3183,6 +3189,7 @@ impl Default for Bus {
             port: "/dev/ttyS2".into(),
             fast_sync_read: true,
             impact_guard: false,
+            battery_voltage_based_pwm_limit: false,
             impact_guard_v_min: 6,
             impact_guard_brake_ms: 20,
             impact_guard_decel: 400,
@@ -3198,7 +3205,7 @@ impl Default for Control {
         Self {
             hz: 50,
             cmd_alpha: 0.2,
-            head_alpha: 0.1,
+            head_alpha: 0.2,
             publish_velocity_and_load: true,
         }
     }
@@ -5328,6 +5335,10 @@ mod tests {
         assert_eq!(from_file.bus.port, built_in.bus.port);
         assert_eq!(from_file.bus.fast_sync_read, built_in.bus.fast_sync_read);
         assert_eq!(from_file.bus.impact_guard, built_in.bus.impact_guard);
+        assert_eq!(
+            from_file.bus.battery_voltage_based_pwm_limit,
+            built_in.bus.battery_voltage_based_pwm_limit
+        );
         let guard = |b: &Bus| {
             (
                 b.impact_guard_v_min,
@@ -5452,7 +5463,7 @@ mod tests {
     fn command_smoothing_defaults_match_the_prototype() {
         let c = Control::default();
         assert_eq!(c.cmd_alpha, 0.2);
-        assert_eq!(c.head_alpha, 0.1);
+        assert_eq!(c.head_alpha, 0.2);
     }
 
     /// One line — `mode = "roller"` — must reproduce the prototype's whole roller preset,

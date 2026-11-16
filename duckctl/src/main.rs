@@ -42,6 +42,7 @@
 #[cfg(target_os = "linux")]
 mod agent;
 mod console;
+mod qr_scan;
 mod setup_code;
 mod udp_pad;
 
@@ -575,9 +576,10 @@ fn ssh_refusal(address: &str) -> Result<(), String> {
     match std::net::TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Err(format!(
             "{address} refused ssh. A shipping image answers ssh only over the head's USB-C link \
-             (microduck@192.168.42.1), on purpose: reaching it means opening the robot. Over that \
-             link, `sudo touch /run/microduck-ssh-wifi` opens wifi ssh until the next reboot; the \
-             dev image has it open always."
+             (microduck@192.168.42.1), on purpose. Holding the face button 5 s opens wifi \
+             ssh for 30 minutes (the network LED blinks blue); over the USB link, \
+             `sudo touch /run/microduck-ssh-wifi` opens it until the next reboot; the dev image \
+             has it open always."
         )),
         _ => Ok(()),
     }
@@ -1105,7 +1107,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SetupCodeCmd {
-    /// Store a robot's setup code, read on stdin: paste `md1:<robot id>:<key>`, or the QR's text.
+    /// Store a robot's setup code: scan the QR on the robot's label with this computer's camera,
+    /// or paste `md1:<robot id>:<key>` (or the QR's text). It asks which; scanning is the default.
+    ///
+    /// Piped, it reads the code on stdin and asks nothing.
     ///
     /// `duckctl ssh -- sudo robotctl system setup-code` prints it. On stdin so the key is in no
     /// command line or shell history. Filed under the robot id in the code, and under `--name` (or
@@ -2665,6 +2670,43 @@ fn open_line(
     Ok(String::from_utf8(plain)?)
 }
 
+/// `setup-code add` with a person at the keyboard: scan the label's QR, or paste the code.
+///
+/// Scanning is the default, since the label is what a new robot comes with. A scan that cannot
+/// happen — no camera, access refused, Esc — falls through to the paste prompt rather than ending
+/// the command, so the other way in is one step away. A code pasted at the first question is taken
+/// as it is, for whoever has it on the clipboard already.
+fn ask_setup_code() -> Result<setup_code::SetupCode, Box<dyn std::error::Error>> {
+    eprint!(
+        "Scan the QR on the robot's label with this computer's camera [S], or paste the code [p]? "
+    );
+    let answer = read_answer()?;
+    if answer.contains("md1:") {
+        return Ok(setup_code::SetupCode::parse(&answer)?);
+    }
+    if !answer.eq_ignore_ascii_case("p") {
+        // `block_in_place` because the camera blocks between frames, and this is on the runtime.
+        match tokio::task::block_in_place(qr_scan::scan) {
+            Ok(code) => {
+                eprintln!("read the setup code for {} from its QR", code.id);
+                return Ok(code);
+            }
+            Err(why) => eprintln!("{why}"),
+        }
+    }
+    eprintln!("Paste the setup code (md1:<robot id>:<key>, or the QR's text) and press Enter:");
+    Ok(setup_code::SetupCode::parse(&read_answer()?)?)
+}
+
+/// One line from the person, trimmed. End of input is an answer nobody gave, so it ends the command.
+fn read_answer() -> Result<String, Box<dyn std::error::Error>> {
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Err("no answer — nothing stored".into());
+    }
+    Ok(line.trim().to_owned())
+}
+
 /// `duckctl setup-code …`: the file of codes, and nothing on the radio.
 fn setup_code_command(
     action: &SetupCodeCmd,
@@ -2673,14 +2715,13 @@ fn setup_code_command(
     match action {
         SetupCodeCmd::Add => {
             use std::io::IsTerminal as _;
-            if std::io::stdin().is_terminal() {
-                eprintln!(
-                    "Paste the setup code (md1:<robot id>:<key>, or the QR's text) and press Enter:"
-                );
-            }
-            let mut text = String::new();
-            std::io::stdin().read_line(&mut text)?;
-            let code = setup_code::SetupCode::parse(&text)?;
+            let code = if std::io::stdin().is_terminal() {
+                ask_setup_code()?
+            } else {
+                let mut text = String::new();
+                std::io::stdin().read_line(&mut text)?;
+                setup_code::SetupCode::parse(&text)?
+            };
             let mut names = vec![code.id.as_str()];
             if let Some(wanted) = target.wanted().filter(|wanted| *wanted != code.id) {
                 names.push(wanted);

@@ -11,7 +11,8 @@ sockets exactly as `robotctl` would.
 
 ## The tags
 
-Every tag holds **one text (or URI) record**, and the text is the whole message: surrounding spaces are
+Every tag holds **one text (or URI) record** — a MIME `text/plain` record, which NFC Tools shows as
+*Media : text/plain*, reads as text too — and the text is the whole message: surrounding spaces are
 ignored, case is not. A tag that merely *contains* one of these texts among others does nothing.
 
 | Text on the tag | What the robot does | Same as |

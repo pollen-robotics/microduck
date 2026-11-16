@@ -550,6 +550,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
 /// refused by name; nothing else on the wire changed.
 ///
+/// Since daemon 0.22, a 5 s hold of the face button (behind a hole, so it takes a pin) opens it
+/// for 30 minutes too: hands on the robot, which is the line BLE crossed. `configd::wifi_ssh` owns
+/// it; it is not on the wire, so the API version is unchanged.
+///
 /// # v56 — writing a tag
 ///
 /// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
@@ -611,16 +615,22 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
 /// else on the wire changed.
 ///
-/// # v62 — a phase-encoded skill
+/// # v62 — the battery's PWM cap
+///
+/// [`HealthResult::goal_pwm`]: the Goal PWM `robotd` writes when
+/// `bus.battery_voltage_based_pwm_limit` is on. Optional and absent when off, so a v61 client
+/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing.
+///
+/// # v63 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v61 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v62 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 62;
+pub const API_VERSION: u32 = 63;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4671,6 +4681,12 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
+    /// The Goal PWM `robotd` last wrote to every servo, out of 885 (100 % duty), when
+    /// `bus.battery_voltage_based_pwm_limit` is on: it follows the battery so the motors see
+    /// ~6 V. Absent when the switch is off, before the first write, and from an older `robotd`.
+    /// Reported, never judged — same rule as the battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_pwm: Option<u16>,
     /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
     /// never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4910,6 +4926,12 @@ impl Battery {
     /// so `robotctl monitor` and `duckctl udp-pad` cannot disagree about the same pack.
     pub const LOW_PCT: f64 = 30.0;
     pub const CRITICAL_PCT: f64 = 15.0;
+}
+
+impl HealthResult {
+    /// [`Self::goal_pwm`] at 100 % duty: the XL330's factory PWM Limit, which
+    /// `duck_control::model::GOAL_PWM_MAX` also names — that crate does not depend on this one.
+    pub const GOAL_PWM_FULL: u16 = 885;
 }
 
 /// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].
@@ -7301,7 +7323,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v61 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v62 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {

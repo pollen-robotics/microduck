@@ -62,6 +62,14 @@ port = "/dev/ttyS2"
 # more often than any other (2026-11-09).
 # impact_guard = false
 
+# Cap every servo's Goal PWM at 6 V / battery voltage, so the motors see at most ~6 V whatever
+# the charge: 73 % of full duty on a full 8.2 V pack, 97 % at 6.2 V, 100 % below 6 V. It
+# follows the smoothed battery voltage (the same one the percentage comes from) every 10 s.
+# Goal PWM is RAM and is rewritten each time, so it survives a servo reboot. OFF writes Goal PWM
+# back to 100 % once at startup, so a cap from an earlier run does not linger in the servos.
+# Needs a robotd restart.
+# battery_voltage_based_pwm_limit = false
+
 # What ON writes, in the registers' units. These defaults come from a robot test: ROBOTIS's
 # factory values, the gear bench's (V Min 1, brake 50, hold 500 mA, 50 % at 9 rad/s), tripped
 # the brake on nearly every step and their hold softened the stance leg, so the robot fell.
@@ -99,7 +107,7 @@ hz = 50
 # follow. 1.0 is pass-through. `cmd_alpha` covers the velocity twist; `head_alpha` covers
 # head targets and the body pose.
 # cmd_alpha = 0.2
-# head_alpha = 0.1
+# head_alpha = 0.2
 
 # Whether the state stream carries measured joint velocity and load — `velocities` and
 # `currents_ma` on `robot.state`. The servos report both in the same twelve-byte read as

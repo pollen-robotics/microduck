@@ -755,6 +755,15 @@ impl RobotIo for DynamixelIo {
         Ok(())
     }
 
+    /// One `sync_write` to every joint. Goal PWM is RAM and writable with torque on, so this
+    /// lands at once, mid-walk, without a reboot — which is why it is Goal PWM and not the
+    /// EEPROM PWM Limit, which only reaches Goal PWM at boot.
+    fn set_goal_pwm(&mut self, pwm: u16) -> Result<()> {
+        self.controller
+            .sync_write_goal_pwm(&JOINT_IDS, &[pwm; NUM_JOINTS])
+            .map_err(|e| IoError::Bus(format!("sync_write goal_pwm {pwm}: {e}")))
+    }
+
     /// Supply voltage and case temperatures, in one `sync_read` over registers 144–146.
     ///
     /// Voltage is averaged because all 15 servos sit on one pack: a single reading is the
