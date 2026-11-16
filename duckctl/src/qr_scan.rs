@@ -1,4 +1,4 @@
-//! `duckctl setup-code add --scan`: the robot's setup-code QR, read with this computer's camera.
+//! `duckctl setup-code add`: the robot's setup-code QR, read with this computer's camera.
 //!
 //! The label's QR carries `<label serial>:md1:<robot id>:<64 hex>` — the line the phone app scans
 //! and `SetupCode::parse` already accepts pasted. Typing it is what this replaces.
@@ -76,7 +76,7 @@ fn decode(width: usize, height: usize, pixel: impl FnMut(usize, usize) -> u8) ->
 pub fn scan() -> Result<SetupCode, String> {
     use std::io::IsTerminal as _;
     if !std::io::stdout().is_terminal() {
-        return Err("--scan draws the camera in the terminal, and this output is not one".into());
+        return Err("the scan draws the camera in the terminal, and this output is not one".into());
     }
     allow_camera()?;
     let cameras = nokhwa::query(ApiBackend::Auto).map_err(|e| format!("no camera list: {e}"))?;
@@ -98,10 +98,10 @@ pub fn scan() -> Result<SetupCode, String> {
             }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    return Err("cancelled — nothing stored".into());
+                    return Err("scan cancelled".into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Err("cancelled — nothing stored".into());
+                    return Err("scan cancelled".into());
                 }
                 KeyCode::Char('c') if cameras.len() > 1 => {
                     drop(camera);
