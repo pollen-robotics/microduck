@@ -56,15 +56,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let Ok(permit) = capacity.clone().try_acquire_owned() else {
-            tracing::debug!(%peer, "gateway capacity reached");
+            tracing::warn!(%peer, sessions = MAX_SESSIONS, "gateway full; refusing a connection");
             continue;
         };
         let credential = credential.clone();
         let mediad = args.mediad;
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = serve_one(stream, credential, mediad).await {
-                tracing::debug!(%peer, %error, "gateway session closed");
+            // Each way a session ends gets its own level, because "the phone says No answer" has
+            // three causes that look identical from the phone, and this journal is the only place
+            // that can tell them apart. Before this, all three were `debug` and a failed drive
+            // left no trace on the robot at all.
+            match serve_one(stream, credential, mediad).await {
+                Ok(()) => tracing::debug!(%peer, "gateway session ended"),
+                Err(Ended::Authentication(error)) => tracing::warn!(
+                    %peer, %error,
+                    "a peer reached the gateway but did not prove the setup code; wrong or stale code?"
+                ),
+                Err(Ended::Mediad(error)) => tracing::warn!(
+                    %peer, %error, %mediad,
+                    "authenticated, but mediad's signalling is unreachable"
+                ),
+                Err(Ended::Session(error)) => {
+                    tracing::debug!(%peer, %error, "gateway session closed")
+                }
             }
         });
     }
@@ -76,19 +91,33 @@ fn imported_key() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Where a session stopped, so the journal can say which of the three it was.
+#[derive(Debug)]
+enum Ended {
+    Authentication(std::io::Error),
+    Mediad(std::io::Error),
+    Session(std::io::Error),
+}
+
 async fn serve_one(
     mut remote: TcpStream,
     credential: ProvisionedKey,
     mediad: SocketAddr,
-) -> std::io::Result<()> {
+) -> Result<(), Ended> {
+    let peer = remote.peer_addr().ok();
     let session = tokio::time::timeout(
         Duration::from_secs(10),
         tcp::robot_handshake(&mut remote, credential.key(), credential.robot_id()),
     )
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "authentication timed out"))??;
-    let local = TcpStream::connect(mediad).await?;
-    tcp::proxy(local, remote, session).await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "authentication timed out"))
+    .and_then(|handshake| handshake)
+    .map_err(Ended::Authentication)?;
+    let local = TcpStream::connect(mediad).await.map_err(Ended::Mediad)?;
+    tracing::info!(?peer, "authenticated media session opened");
+    tcp::proxy(local, remote, session)
+        .await
+        .map_err(Ended::Session)
 }
 
 #[cfg(test)]

@@ -346,6 +346,7 @@ cp "$BIN"/duck-gateway staged/
 cp "$BIN"/padd staged/
 # netpadd is padd fed by UDP; an ExecCondition on `[netpad] enabled` picks which of the two runs.
 cp "$BIN"/netpadd staged/
+cp "$BIN"/autod staged/
 # The WebRTC gateway. Its unit ships with an `[Install]` section, so postinstall enables and starts
 # it and `on_apply` restarts it, exactly as for every other daemon here.
 cp "$BIN"/mediad staged/
@@ -359,6 +360,7 @@ cp "$BIN"/pet-features staged/
 cp "$BIN"/tofd staged/
 # The NFC reader daemon, the same way: a board with no reader runs it, and it says so.
 cp "$BIN"/nfcd staged/
+cp "$BIN"/mapd staged/
 
 # No `--base-url`: the manifest `LocalDir` reads names the artifact by bare filename, and
 # `package` leaves it bare when no base is given.
@@ -398,12 +400,16 @@ cargo run -p xtask -- package \
     --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
     --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
     --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
+    --include "autod/systemd/autod.service=systemd/autod.service" \
+    --include "autod/systemd/sysusers.d/autod.conf=systemd/sysusers.d/autod.conf" \
     --include "mediad/systemd/mediad.service=systemd/mediad.service" \
     --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
     --include "tof/systemd/tofd.service=systemd/tofd.service" \
     --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
     --include "nfc/systemd/nfcd.service=systemd/nfcd.service" \
     --include "nfc/systemd/sysusers.d/nfcd.conf=systemd/sysusers.d/nfcd.conf" \
+    --include "mapd/systemd/mapd.service=systemd/mapd.service" \
+    --include "mapd/systemd/sysusers.d/mapd.conf=systemd/sysusers.d/mapd.conf" \
     --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
     --include "docs/design/architecture.md=docs/architecture.md" \
     --include "docs/design/updater-design.md=docs/updater-design.md" \
@@ -511,7 +517,8 @@ echo "    current -> $want"
 # no socket at all, so for that one it is the only answer available.
 deadline=$(($(date +%s) + 30))
 stale=""
-for svc in robotd configd padd updaterd btd mediad tofd nfcd; do
+for svc in robotd configd padd updaterd btd mediad tofd nfcd mapd; do
+for svc in robotd configd padd autod updaterd btd mediad tofd; do
     while :; do
         if [ ! -f "/run/${svc}/identity.json" ]; then
             state="silent"

@@ -107,6 +107,7 @@ mod tests {
             config: "/tmp/no-configd-secure-timeout.sock".into(),
             robot: "/tmp/no-robotd-secure-timeout.sock".into(),
             updater: "/tmp/no-updaterd-secure-timeout.sock".into(),
+            nfc: "/tmp/no-nfcd-secure-timeout.sock".into(),
         };
         let (link, _to_robot, mut from_robot) = Link::pair(20, "silent phone");
         let task = tokio::spawn(run(link, sockets, config));
@@ -144,6 +145,7 @@ mod tests {
             config: "/tmp/no-configd-secure-test.sock".into(),
             robot: "/tmp/no-robotd-secure-test.sock".into(),
             updater: "/tmp/no-updaterd-secure-test.sock".into(),
+            nfc: "/tmp/no-nfcd-secure-test.sock".into(),
         };
         let (link, to_robot, mut from_robot) = Link::pair(20, "test phone");
         let task = tokio::spawn(run(link, sockets.clone(), config.clone()));

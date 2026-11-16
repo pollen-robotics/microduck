@@ -109,7 +109,7 @@ adapter.
 To make it a working robot again:
 
 ```bash
-sudo systemctl enable --now updaterd robotd configd btd padd
+sudo systemctl enable --now updaterd robotd configd btd padd autod
 ```
 
 Name it, if you want a name:

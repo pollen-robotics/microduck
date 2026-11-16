@@ -111,6 +111,8 @@ fn apply_for(key: &str) -> Option<Apply> {
     let (section, name) = key.split_once('.')?;
     Some(match section {
         "media" | "duck_detector" => Apply::Restart("mediad"),
+        // `mapd` reads `[map]` once, at startup; restarting it saves the map on the way down.
+        "map" => Apply::Restart("mapd"),
         // `updaterd` reads the board before every check, for the hardware revision a release is
         // checked against (`robotd_params::board::Board::declared`). Nothing else reads it yet.
         "board" => Apply::Live("updaterd"),
@@ -136,6 +138,10 @@ fn apply_for(key: &str) -> Option<Apply> {
         "head_imu" => Apply::Restart(robotd_params::HeadImuParams::reader(
             robotd_params::board::Board::detected().unwrap_or_default(),
         )),
+        // `enabled` is only where `robotd`'s switch starts at boot — `robotctl autonomous on`, or
+        // an NFC tag, switches it now — and `padd` re-reads `pad_idle_s` with `[pad]`.
+        "autonomous" if name == "pad_idle_s" => Apply::Live("padd"),
+        "autonomous" => Apply::NextBoot("robotd"),
         // `[policy]` is the one section a running daemon takes back: `PolicyChange::Reload`
         // re-reads it whole and rebuilds the controller from it, which is how `robotctl policy
         // add` lands a skill without a restart. Two keys are not in that promise:
@@ -161,6 +167,8 @@ fn apply_for(key: &str) -> Option<Apply> {
         // tuning it is many small edits, and each must not drop the robot. `enabled` included:
         // an edit to it switches tracking there and then.
         "laser" => Apply::Live("robotd"),
+        // The same, for autonomous soccer's reader and `[soccer]`.
+        "soccer" => Apply::Live("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
@@ -1346,6 +1354,20 @@ mod tests {
             "the controller's IMU is padd's, and padd re-reads it"
         );
         assert!(plan.restart.is_empty(), "and it needs no restart");
+    }
+
+    /// The autonomy switch in the file is where it starts at boot — `robotctl autonomous` is the
+    /// switch for now — so nothing is restarted for it, and the idle time is `padd`'s, live.
+    #[test]
+    fn the_autonomy_switch_is_a_boot_default() {
+        let mut m = model("");
+        m.edit(entry("autonomous.enabled"), "true").expect("valid");
+        let plan = plan_for(&m);
+        assert!(plan.restart.is_empty());
+        assert_eq!(plan.next_boot, vec!["robotd"]);
+        let mut m = model("");
+        m.edit(entry("autonomous.pad_idle_s"), "10").expect("valid");
+        assert_eq!(plan_for(&m).live, vec!["padd"]);
     }
 
     /// Controller sections are live: padd re-reads them, so there is nothing to offer.

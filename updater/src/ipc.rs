@@ -884,6 +884,8 @@ impl Server {
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
             | Call::RobotLaserTrack(_)
+            | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)
@@ -953,12 +955,29 @@ impl Server {
                 ),
             ),
 
+            // And again for the map: `mapd` owns it.
+            Call::MapStatus | Call::MapStream | Call::MapGrid(_) | Call::MapWipe => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "map.* is served by mapd, on /run/mapd/map.sock",
+                ),
+            ),
+
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
             Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "tof.stream is served by tofd, on /run/tofd/tof.sock; head_imu.stream by tofd on a zero3 and by robotd (/run/robotd.sock) on a beta",
+                ),
+            ),
+
+            Call::NfcWrite(_) | Call::NfcRead(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

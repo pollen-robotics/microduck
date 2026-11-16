@@ -447,6 +447,7 @@ mod tests {
             robot: dir.join(robot),
             // Not exercised by these tests; `configd` gets its own once it has a fake.
             config: dir.join("configd.sock"),
+            nfc: dir.join("nfc.sock"),
         }
     }
 

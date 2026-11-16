@@ -298,8 +298,9 @@ async fn main() -> ExitCode {
     }
     tracing::info!(label_serial = ?label_serial, "label");
 
-    tokio::spawn(configd::indicator::run(Arc::clone(&net)));
+    tokio::spawn(configd::indicator::run(Arc::clone(&net), Arc::clone(&pads)));
     tokio::spawn(pad_reconnect_loop(Arc::clone(&pads)));
+    tokio::spawn(configd::wifi_ssh::run());
 
     let service = Arc::new(Service {
         net,

@@ -16,9 +16,9 @@
 //! The socket is group-readable like the other observation sockets: whoever may watch
 //! `robot.state` may ask for a picture.
 //!
-//! It also serves `media.laser` ([`crate::laser`]): a subscription rather than a request, so the
-//! connection that asks for it leaves the five-second bound every other request lives under and
-//! stays open for as long as the subscriber does.
+//! It also serves `media.laser` ([`crate::laser`]) and `media.ball` ([`crate::ball`]): each a
+//! subscription rather than a request, so the connection that asks for one leaves the five-second
+//! bound every other request lives under and stays open for as long as the subscriber does.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -126,10 +126,11 @@ pub async fn serve(
                         handle(stream, frames.clone(), rotate),
                     )
                     .await;
-                    if let Ok(Ok(Some(subscription))) = asked
-                        && let Err(error) = subscribe_laser(subscription, frames, &laser).await
-                    {
-                        tracing::info!(error = %format!("{error:#}"), "media.laser ended");
+                    if let Ok(Ok(Some(subscription))) = asked {
+                        let method = subscription.method();
+                        if let Err(error) = subscribe(subscription, frames, &laser).await {
+                            tracing::info!(error = %format!("{error:#}"), method, "subscription ended");
+                        }
                     }
                 });
             }
@@ -138,22 +139,57 @@ pub async fn serve(
     }
 }
 
-/// A connection that asked for `media.laser`, handed back out of [`handle`] so the subscription
-/// can outlive the bound a request is served under.
-pub(crate) struct LaserSubscription {
+/// A connection that asked for `media.laser` or `media.ball`, handed back out of [`handle`] so
+/// the subscription can outlive the bound a request is served under.
+pub(crate) struct Subscription {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     write: tokio::net::unix::OwnedWriteHalf,
     id: Option<proto::Id>,
-    params: proto::LaserDetectParams,
+    detector: Detector,
 }
 
-async fn subscribe_laser(
-    LaserSubscription {
+/// Which detector a subscription asked for, with its params.
+pub(crate) enum Detector {
+    Laser(proto::LaserDetectParams),
+    Ball(proto::BallDetectParams),
+}
+
+impl Subscription {
+    fn method(&self) -> &'static str {
+        match self.detector {
+            Detector::Laser(_) => proto::method::MEDIA_LASER,
+            Detector::Ball(_) => proto::method::MEDIA_BALL,
+        }
+    }
+}
+
+/// A detector's params from a request, or the answer refusing them. The refusal is the answer
+/// itself, sent once per subscribe, so its size is no cost worth boxing for.
+#[allow(clippy::result_large_err)]
+fn detector_params<T: serde::de::DeserializeOwned + Default>(
+    request: &proto::Request,
+) -> std::result::Result<T, proto::Response> {
+    match request
+        .params
+        .clone()
+        .map(serde_json::from_value::<T>)
+        .transpose()
+    {
+        Ok(params) => Ok(params.unwrap_or_default()),
+        Err(error) => Err(proto::Response::err(
+            request.id.clone(),
+            proto::Error::new(proto::code::INVALID_PARAMS, error.to_string()),
+        )),
+    }
+}
+
+async fn subscribe(
+    Subscription {
         reader,
         mut write,
         id,
-        params,
-    }: LaserSubscription,
+        detector,
+    }: Subscription,
     frames: Frames,
     laser: &crate::laser::Hub,
 ) -> Result<()> {
@@ -165,8 +201,8 @@ async fn subscribe_laser(
                 proto::Error::new(
                     proto::code::INTERNAL_ERROR,
                     "no camera geometry: the sensor is not in a mode whose field of view is known, \
-                     and [media.intrinsics] carries no calibration — a dot cannot be turned into a \
-                     direction",
+                     and [media.intrinsics] carries no calibration — a sighting cannot be turned \
+                     into a direction",
                 ),
             ),
         )
@@ -174,14 +210,17 @@ async fn subscribe_laser(
         return Ok(());
     };
     write_response(&mut write, proto::Response::ok(id, &())).await?;
-    crate::laser::serve(reader, write, frames, geometry, params, laser.dots.clone()).await
+    match detector {
+        Detector::Laser(params) => {
+            crate::laser::serve(reader, write, frames, geometry, params, laser.dots.clone()).await
+        }
+        Detector::Ball(params) => {
+            crate::ball::serve(reader, write, frames, geometry, params, laser.balls.clone()).await
+        }
+    }
 }
 
-async fn handle(
-    stream: UnixStream,
-    frames: Frames,
-    rotate: u32,
-) -> Result<Option<LaserSubscription>> {
+async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<Option<Subscription>> {
     let (read, mut write) = stream.into_split();
     // Bounded *before* the line is buffered. Checking the length afterwards would mean a client
     // could make this process hold an arbitrarily long line first, which is the thing the cap is
@@ -238,32 +277,27 @@ async fn handle(
             .await?;
             continue;
         }
-        if request.method == proto::method::MEDIA_LASER {
-            let params = match request
-                .params
-                .clone()
-                .map(serde_json::from_value::<proto::LaserDetectParams>)
-                .transpose()
-            {
-                Ok(params) => params.unwrap_or_default(),
-                Err(error) => {
-                    write_response(
-                        &mut write,
-                        proto::Response::err(
-                            request.id,
-                            proto::Error::new(proto::code::INVALID_PARAMS, error.to_string()),
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
-            return Ok(Some(LaserSubscription {
-                reader,
-                write,
-                id: request.id,
-                params,
-            }));
+        let detector = if request.method == proto::method::MEDIA_LASER {
+            Some(detector_params(&request).map(Detector::Laser))
+        } else if request.method == proto::method::MEDIA_BALL {
+            Some(detector_params(&request).map(Detector::Ball))
+        } else {
+            None
+        };
+        match detector {
+            Some(Ok(detector)) => {
+                return Ok(Some(Subscription {
+                    reader,
+                    write,
+                    id: request.id,
+                    detector,
+                }));
+            }
+            Some(Err(refusal)) => {
+                write_response(&mut write, refusal).await?;
+                continue;
+            }
+            None => {}
         }
         if request.method != proto::method::MEDIA_FRAME {
             write_response(

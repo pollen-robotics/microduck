@@ -427,6 +427,8 @@ pub fn capture(socket: &Path, within: Duration) -> Result<Vec<u8>, String> {
         proto::Id::Number(1),
         &proto::Call::Hello(proto::HelloParams {
             api_version: proto::API_VERSION,
+            // Unnamed: `mediad` keeps no record of who asked, and a name is not sent at all.
+            client: None,
         }),
     );
     send(&mut stream, &hello).map_err(fail)?;

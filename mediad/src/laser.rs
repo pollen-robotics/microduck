@@ -251,15 +251,17 @@ pub fn dot(
     }
 }
 
-/// Where the laser detector's answers are shared, beyond the subscriber that asked for them.
+/// Where the detectors' answers are shared, beyond the subscriber that asked for them.
 ///
-/// The geometry `main` fills in once the intrinsics are known, and a broadcast of every look, so a
-/// console watching the video can draw what the detector is seeing. A look is only ever taken for a
-/// subscriber — `robotd` while tracking is on — so with tracking off this carries nothing, and a
-/// console with nobody to listen costs the detector a failed `send`.
+/// The geometry `main` fills in once the intrinsics are known, and a broadcast of every look —
+/// the laser's and the ball's — so a console watching the video can draw what the detector is
+/// seeing. A look is only ever taken for a subscriber — `robotd` while tracking is on — so with
+/// tracking off these carry nothing, and a console with nobody to listen costs the detector a
+/// failed `send`.
 pub struct Hub {
     pub geometry: std::sync::OnceLock<Geometry>,
     pub dots: tokio::sync::broadcast::Sender<std::sync::Arc<LaserDot>>,
+    pub balls: tokio::sync::broadcast::Sender<std::sync::Arc<duck_ipc_proto::BallSeen>>,
 }
 
 impl Default for Hub {
@@ -268,6 +270,7 @@ impl Default for Hub {
             geometry: std::sync::OnceLock::new(),
             // A handful: a console that falls behind wants the newest dot, not a queue of old ones.
             dots: tokio::sync::broadcast::channel(4).0,
+            balls: tokio::sync::broadcast::channel(4).0,
         }
     }
 }
@@ -284,15 +287,11 @@ pub fn notification(dot: &LaserDot) -> String {
 }
 
 /// The local subscription: answer, then one [`duck_ipc_proto::method::MEDIA_LASER_DOT`] per look
-/// until the subscriber hangs up.
-///
-/// The looking runs on a thread of its own — waiting for a capture blocks, and the scan is
-/// milliseconds of arithmetic that has no business on the runtime that serves WebRTC signalling —
-/// and stops on the first answer it cannot hand over, which is what a closed connection becomes.
+/// until the subscriber hangs up. [`serve_looks`] is how.
 #[cfg(any(target_os = "linux", feature = "gstreamer"))]
 pub async fn serve<R>(
-    mut reader: R,
-    mut write: tokio::net::unix::OwnedWriteHalf,
+    reader: R,
+    write: tokio::net::unix::OwnedWriteHalf,
     frames: crate::pipeline::Frames,
     geometry: Geometry,
     params: LaserDetectParams,
@@ -301,23 +300,82 @@ pub async fn serve<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
+    tracing::info!(?params, "laser: looking");
+    let looks = Looks {
+        name: "laser",
+        search_hz: params.search_hz,
+        track_hz: params.track_hz,
+        seen: |d: &LaserDot| d.seen,
+        notification,
+    };
+    serve_looks(
+        reader,
+        write,
+        frames,
+        looks,
+        watchers,
+        move |data, w, h, hz| {
+            let started = std::time::Instant::now();
+            let found = find(data, w, h, &params);
+            let took_ms = started.elapsed().as_secs_f64() * 1e3;
+            dot(&found, &geometry, w, h, hz, took_ms)
+        },
+    )
+    .await
+}
+
+/// What [`serve_looks`] needs to know about one detector beyond the scan itself.
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
+pub(crate) struct Looks<T> {
+    /// For the thread's name and the journal.
+    pub name: &'static str,
+    pub search_hz: f64,
+    pub track_hz: f64,
+    /// Whether a look found its thing — which is what moves the rate to `track_hz`.
+    pub seen: fn(&T) -> bool,
+    /// The look as a line for the subscriber.
+    pub notification: fn(&T) -> String,
+}
+
+/// A detector's subscription: one scan per look, paced, until the subscriber hangs up.
+///
+/// The looking runs on a thread of its own — waiting for a capture blocks, and the scan is
+/// milliseconds of arithmetic that has no business on the runtime that serves WebRTC signalling —
+/// and stops on the first answer it cannot hand over, which is what a closed connection becomes.
+/// It looks at `search_hz` until something is seen and at `track_hz` for [`TRACK_HOLD`] after.
+#[cfg(any(target_os = "linux", feature = "gstreamer"))]
+pub(crate) async fn serve_looks<R, T, F>(
+    mut reader: R,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    frames: crate::pipeline::Frames,
+    looks: Looks<T>,
+    watchers: tokio::sync::broadcast::Sender<std::sync::Arc<T>>,
+    mut scan: F,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    T: Clone + Send + Sync + 'static,
+    F: FnMut(&[u8], usize, usize, f64) -> T + Send + 'static,
+{
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<LaserDot>(4);
-    tracing::info!(?params, "laser: looking");
+    let Looks {
+        name,
+        search_hz,
+        track_hz,
+        seen,
+        notification,
+    } = looks;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<T>(4);
     std::thread::Builder::new()
-        .name("laser".into())
+        .name(name.into())
         .spawn(move || {
             let mut last_seen: Option<Instant> = None;
             let mut next = Instant::now();
             loop {
                 let tracking = last_seen.is_some_and(|at| at.elapsed() < TRACK_HOLD);
-                let hz = if tracking {
-                    params.track_hz
-                } else {
-                    params.search_hz
-                };
+                let hz = if tracking { track_hz } else { search_hz };
                 let now = Instant::now();
                 if next > now {
                     std::thread::sleep(next - now);
@@ -330,13 +388,10 @@ where
                     if frame.format != crate::pipeline::CAPTURE_FORMAT {
                         return None;
                     }
-                    let started = Instant::now();
                     let (w, h) = (frame.width as usize, frame.height as usize);
-                    let found = find(&frame.data, w, h, &params);
-                    let took_ms = started.elapsed().as_secs_f64() * 1e3;
-                    Some(dot(&found, &geometry, w, h, hz, took_ms))
+                    Some(scan(&frame.data, w, h, hz))
                 });
-                let Some(Some(dot)) = looked else {
+                let Some(Some(look)) = looked else {
                     // No frame in the capture timeout, or a format this does not know: say
                     // nothing, so the subscriber's own staleness check is what lets go.
                     if tx.is_closed() {
@@ -344,13 +399,13 @@ where
                     }
                     continue;
                 };
-                if dot.seen {
+                if seen(&look) {
                     last_seen = Some(Instant::now());
                 }
                 // Nobody watching is the ordinary case, and not an error.
-                let _ = watchers.send(std::sync::Arc::new(dot.clone()));
-                if tx.blocking_send(dot).is_err() {
-                    tracing::info!("laser: subscriber gone, stopping");
+                let _ = watchers.send(std::sync::Arc::new(look.clone()));
+                if tx.blocking_send(look).is_err() {
+                    tracing::info!(detector = name, "subscriber gone, stopping");
                     return;
                 }
             }
@@ -359,9 +414,9 @@ where
     let mut scratch = [0u8; 256];
     loop {
         tokio::select! {
-            dot = rx.recv() => {
-                let Some(dot) = dot else { return Ok(()) };
-                let mut line = notification(&dot);
+            look = rx.recv() => {
+                let Some(look) = look else { return Ok(()) };
+                let mut line = notification(&look);
                 line.push('\n');
                 write.write_all(line.as_bytes()).await?;
             }
