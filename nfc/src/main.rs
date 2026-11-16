@@ -318,11 +318,29 @@ fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
     tracing::info!(?antenna, on = ?args.on, "waiting for a display");
     let until = Instant::now() + Duration::from_secs(args.find_within);
     let outcome = loop {
-        match Link::open(&mut chip, args.fwi) {
+        let e = match Link::open(&mut chip, args.fwi) {
             Ok(link) => break Ok(link),
-            Err(e) if e.is_tag() && Instant::now() < until => sleep(Duration::from_millis(100)),
-            Err(e) => break Err(format!("no display: {e}")),
+            Err(e) => e,
+        };
+        if Instant::now() >= until {
+            break Err(format!("no display: {e}"));
         }
+        if e.is_tag() {
+            tracing::debug!(error = %e, "no display yet");
+        } else if matches!(e, Error::Desync(_)) {
+            // What the daemon's poll does with it: a soft reset, the antenna chosen again.
+            tracing::info!(error = %e, "reader out of step; reset");
+            let reset = chip.begin().and_then(|()| match &mut chip {
+                Chip::Spi(c) => c.set_proto(Proto::A).and_then(|()| c.set_antenna(antenna)),
+                Chip::Usb(_) => Ok(()),
+            });
+            if let Err(e) = reset {
+                break Err(format!("the reader did not come back: {e}"));
+            }
+        } else {
+            break Err(format!("no display: {e}"));
+        }
+        sleep(Duration::from_millis(100));
     };
     let mut link = match outcome {
         Ok(link) => link,
