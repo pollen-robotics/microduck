@@ -767,6 +767,10 @@ struct RobotState {
     motor_mean_c: AtomicU64,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
+    /// The Goal PWM last written while `bus.battery_voltage_based_pwm_limit` is on, for
+    /// `robot.health`. Zero means *not written* — off, or before the first write — since a
+    /// written Goal PWM is never 0.
+    goal_pwm: AtomicU32,
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
     /// kernel with no thermal sysfs ([`soc`]).
     cpu_temp_c: AtomicU64,
@@ -943,6 +947,7 @@ impl RobotState {
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
+            goal_pwm: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
             imu_stale_blocks: AtomicU64::new(0),
@@ -1003,6 +1008,10 @@ impl RobotState {
                 degraded,
                 reason,
                 battery: self.battery(),
+                goal_pwm: match self.goal_pwm.load(Ordering::Relaxed) {
+                    0 => None,
+                    pwm => Some(pwm as u16),
+                },
                 motors: self.motor_thermal(),
                 cpu_temp_c: {
                     // Zero is "never read", the same sentinel the battery uses: a board at
@@ -4690,7 +4699,11 @@ async fn control_loop<T: RobotIo>(
             {
                 last_goal_pwm = Some(Instant::now());
                 let previous = safety.goal_pwm();
-                match safety.set_goal_pwm(pwm) {
+                let result = safety.set_goal_pwm(pwm);
+                if pwm_follows_battery && result.is_ok() {
+                    state.goal_pwm.store(u32::from(pwm), Ordering::Relaxed);
+                }
+                match result {
                     Ok(()) if previous.is_none() => tracing::info!(
                         goal_pwm = pwm,
                         battery_v = format!("{volts:.2}"),
