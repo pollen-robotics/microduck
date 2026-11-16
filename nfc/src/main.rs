@@ -80,16 +80,15 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const PAIR_ANSWER: Duration = Duration::from_secs(40);
 const QUICK_ANSWER: Duration = Duration::from_secs(5);
 
-/// Where the ST25R100's two antennas are: RFO2 under the top of the head, RFO1 in the beak. Found
-/// on duck-d556 (2026-11-16) twice over: an e-ink display written with `nfcd eink write`, and a
-/// tag touched to each, `tag in the field` saying which antenna saw it.
+/// Where the ST25R100's two antennas are: RFO1 under the top of the head, RFO2 in the beak. Found
+/// by touching a tag to each (`tag in the field` names the antenna) on a face-board-v1 and on
+/// another robot (2026-11-16), and `nfc-test` on duck-d325 wrote a display on the head with RFO1.
 ///
-/// **One robot so far.** The first reading, on an earlier face-board-v1, had them the other way
-/// round, and so did a `nfc-test` run on duck-d325 (`NFC_ANT=1`, RFO1, wrote a display taken to
-/// be on the head). Whether boards differ is still to be checked on others: touch each antenna
-/// with `nfcd` running and read `antenna=` in that line.
-const HEAD: Antenna = Antenna::Two;
-const BEAK: Antenna = Antenna::One;
+/// **duck-d556 has them the other way round** — a tag in its beak is seen on RFO1, and a display
+/// on its head written on RFO2 (2026-11-16). One robot against three: taken to be its antenna
+/// cables swapped at assembly, a question for the hardware team, not a second wiring to support.
+const HEAD: Antenna = Antenna::One;
+const BEAK: Antenna = Antenna::Two;
 
 #[derive(Parser, Debug)]
 #[command(
