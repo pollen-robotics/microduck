@@ -839,7 +839,7 @@ impl Brain {
         } else if self.back_v > BACK_V / 2.0 {
             self.backing_logged = false;
         }
-        if backing && self.state != State::Brace && self.wall_behind(REAR_M) {
+        if backing && !world.sitting && self.state != State::Brace && self.wall_behind(REAR_M) {
             tracing::warn!(state = ?self.state, "backing into a wall — stopping, stepping away");
             self.enter(State::Brace);
         }
