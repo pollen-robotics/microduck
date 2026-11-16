@@ -638,8 +638,8 @@ daemon does that itself. Whenever the policy takes the robot (this hand-back, or
 floor) it has `limp_fall_standup_ms` (3 s) to have it up — inside the tilt gate for
 `limp_fall_arm_ms`, the predictor's own arming test. If not, the sequence's pose ramp puts it
 back into the standing pose and hands over again, up to `limp_fall_standup_retries` (3) times in
-a row. A disable, a skill or a sit drops the watch. Out of retries, the robot is parked: stiff at
-the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
+a row. A disable, a skill or a sit drops the watch. Out of retries, the robot honks (the bank's
+`alarm`, once) and is parked: stiff at the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
 upright and still for `limp_fall_standup_resume_ms` (1 s), which is somebody standing it on its
 feet and letting go, and then the policy takes it back. Start twice also ends the park.
 

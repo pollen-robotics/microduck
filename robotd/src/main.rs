@@ -3755,6 +3755,12 @@ async fn control_loop<T: RobotIo>(
                             };
                             falling.reset();
                             standup_parked = Some(Parked::default());
+                            // The alarm, the loudest sound in the bank: the robot has given up
+                            // and will not move again until somebody stands it on its feet, so
+                            // somebody has to hear that without watching a log.
+                            if let Some(voice) = voice.as_mut() {
+                                voice.play("alarm", false);
+                            }
                         }
                     }
                 }
