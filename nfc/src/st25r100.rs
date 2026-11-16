@@ -20,6 +20,8 @@ use crate::{Error, Result};
 mod reg {
     pub const OPERATION: u8 = 0x00;
     pub const GENERAL: u8 = 0x01;
+    pub const REGULATOR: u8 = 0x02;
+    pub const TX_DRIVER: u8 = 0x03;
     pub const TX_MOD: u8 = 0x04;
     pub const RX_ANA2: u8 = 0x07;
     pub const RX_DIG: u8 = 0x08;
@@ -61,6 +63,11 @@ const OP_RX_EN: u8 = 1 << 4;
 /// with it off, as it always has.
 const OP_AM_EN: u8 = 1 << 3;
 const OP_EN: u8 = 1 << 1;
+/// TX driver register (§5.13.4): `d_res<3:0>`, the drivers' output resistance, 0 the lowest — the
+/// strongest field. ST's reader library sets 0 at initialisation, and `nfc-test`, which redraws an
+/// e-ink display in the beak, runs on it; this driver had left the power-on value, and the same
+/// display browned out mid-redraw (cream-dvt-coco, 2026-11-16).
+const TX_D_RES_MASK: u8 = 0x0f;
 // General register (§5.13.2): single-ended driving on the RFO/RFI pair `rfo2` names.
 const GEN_SINGLE: u8 = 1 << 5;
 const GEN_RFO2: u8 = 1 << 4;
@@ -161,6 +168,9 @@ pub enum Antenna {
     One,
     /// RFO2/RFI2.
     Two,
+    /// Both pairs driven differentially, the chip's power-on mode and `nfc-test`'s default: a
+    /// bench comparison, not where `nfcd` looks for tags.
+    Both,
 }
 
 /// Which protocol the transceiver frames: the operation mode, the modulation and the receiver
@@ -177,11 +187,11 @@ pub enum Proto {
 
 impl Antenna {
     fn general(self) -> u8 {
-        GEN_SINGLE
-            | match self {
-                Antenna::One => 0,
-                Antenna::Two => GEN_RFO2,
-            }
+        match self {
+            Antenna::One => GEN_SINGLE,
+            Antenna::Two => GEN_SINGLE | GEN_RFO2,
+            Antenna::Both => 0,
+        }
     }
 }
 
@@ -254,6 +264,8 @@ impl<B: Bus> St25r100<B> {
             return Err(Error::WrongChip(id));
         }
         self.write(reg::GENERAL, &[self.antenna.general()])?;
+        let tx_driver = self.read(reg::TX_DRIVER)?;
+        self.write(reg::TX_DRIVER, &[tx_driver & !TX_D_RES_MASK])?;
         self.write(reg::OPERATION, &[OP_EN])?;
         self.wait(
             Duration::from_millis(20),
@@ -274,6 +286,14 @@ impl<B: Bus> St25r100<B> {
         if let Err(e) = adjusted {
             tracing::warn!(error = %e, "carrying on with the power-on regulator setting");
         }
+        let regulator = self.read(reg::REGULATOR)?;
+        let display1 = self.read(reg::DISPLAY1)?;
+        tracing::debug!(
+            tx_driver_was = format!("{tx_driver:02x}"),
+            regulator = format!("{regulator:02x}"),
+            display1 = format!("{display1:02x}"),
+            "powered up, drivers at full strength"
+        );
         // The receiver's decoder, set for ISO 14443A at 106 kbit/s. The power-on correlator
         // settings do not decode it: on the board a tag's ATQA raised I_subc_start every time and
         // never I_rxs. With these two it decoded every time (2026-10-06).
@@ -609,6 +629,19 @@ mod tests {
         assert_eq!(chip.bus.0[reg::OPERATION as usize] & OP_AM_EN, 0);
     }
 
+    /// Full strength, as ST's library sets it: `d_res` 0, the register's other bits kept.
+    #[test]
+    fn begin_drives_the_antenna_at_full_strength() {
+        let mut regs = [0u8; 0x40];
+        regs[reg::IC_IDENTITY as usize] = 0xa9;
+        regs[reg::DISPLAY1 as usize] = OSC_OK;
+        regs[reg::IRQ_STATUS1 as usize + 2] = I_DCT;
+        regs[reg::TX_DRIVER as usize] = 0x52;
+        let mut chip = St25r100::new(Registers(regs), Antenna::One);
+        chip.begin().unwrap();
+        assert_eq!(chip.bus.0[reg::TX_DRIVER as usize], 0x50);
+    }
+
     #[test]
     fn a_protocol_switch_before_begin_is_refused() {
         let mut chip = St25r100::new(Registers([0; 0x40]), Antenna::One);
@@ -640,6 +673,7 @@ mod tests {
     fn antennas_are_single_ended_on_either_pair() {
         assert_eq!(Antenna::One.general(), 0x20);
         assert_eq!(Antenna::Two.general(), 0x30);
+        assert_eq!(Antenna::Both.general(), 0x00);
     }
 
     /// REQA/WUPA: zero bytes and seven bits (§5.10.1).

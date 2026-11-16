@@ -187,6 +187,8 @@ struct EinkWrite {
 enum Place {
     Head,
     Beak,
+    /// Both antennas driven together, as `nfc-test` does without NFC_ANT.
+    Both,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -314,6 +316,7 @@ fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
     let antenna = match args.on {
         Place::Head => HEAD,
         Place::Beak => BEAK,
+        Place::Both => Antenna::Both,
     };
     if let Chip::Spi(c) = &mut chip
         && let Err(e) = c.set_proto(Proto::A).and_then(|()| c.set_antenna(antenna))
@@ -584,6 +587,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
             let place = match antenna {
                 Some(HEAD) => "head",
                 Some(BEAK) => "beak",
+                Some(_) => "both",
                 None => "reader",
             };
             tracing::warn!(tag = %id, ?tech, ?antenna, place, "tag in the field");
