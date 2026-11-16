@@ -170,6 +170,8 @@ pub struct Writer {
     wrote_from: Option<Instant>,
     drew_from: Option<Instant>,
     polls: u32,
+    /// The last answer that said the display is still drawing, so a new one is logged once.
+    drawing: Option<Vec<u8>>,
 }
 
 impl Writer {
@@ -186,6 +188,7 @@ impl Writer {
             wrote_from: None,
             drew_from: None,
             polls: 0,
+            drawing: None,
         }
     }
 
@@ -311,13 +314,26 @@ impl Writer {
                     ));
                 }
                 self.polls += 1;
-                match card.apdu(&BUSY) {
-                    Ok(answer) if answer.len() >= 3 && answer[0] == 0x00 && sw_ok(&answer) => {
+                // Only a `90 00` is an answer about the redraw: anything else — a display that
+                // browned out and lost its application, say — is as good as none.
+                let asked = card.apdu(&BUSY).and_then(|answer| {
+                    if sw_ok(&answer) {
+                        Ok(answer)
+                    } else {
+                        Err(Error::Tag(format!("it answered {}", hex(&answer))))
+                    }
+                });
+                match asked {
+                    Ok(answer) if answer.len() >= 3 && answer[0] == 0x00 => {
                         let took = self.drew_from.map(|at| now.saturating_duration_since(at));
                         tracing::info!(polls = self.polls, ?took, "refresh done");
                         State::Done
                     }
-                    Ok(_) => {
+                    Ok(answer) => {
+                        if self.drawing.as_ref() != Some(&answer) {
+                            tracing::info!(answer = hex(&answer), "drawing");
+                            self.drawing = Some(answer);
+                        }
                         self.wait(now, POLL_EVERY);
                         State::Poll { until, errors: 0 }
                     }
@@ -329,9 +345,11 @@ impl Writer {
                             State::Poll { until, errors }
                         } else {
                             tracing::warn!(error = %e, "the display stopped answering while drawing; selecting it again");
+                            // Its application selected again too: one that browned out has
+                            // forgotten it, and answers nothing else.
                             State::Rejoin {
                                 then: Box::new(State::Poll { until, errors: 0 }),
-                                select: false,
+                                select: true,
                                 until,
                             }
                         }
@@ -715,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_display_that_drops_out_while_drawing_is_rejoined_without_a_select() {
+    fn a_display_that_drops_out_while_drawing_is_rejoined_and_its_application_selected() {
         let mut display = Display::default();
         let mut writer = Writer::new(picture(), Settings::default());
         let mut now = Instant::now();
@@ -728,7 +746,7 @@ mod tests {
         assert_eq!(display.rejoins, 1);
         assert_eq!(
             display.got.iter().filter(|a| **a == SELECT).count(),
-            selects
+            selects + 1
         );
     }
 
@@ -750,6 +768,21 @@ mod tests {
         display.answers.push_back(Ok(vec![0x6d, 0x00]));
         let mut writer = Writer::new(picture(), Settings::default());
         assert!(run(&mut writer, &mut display).unwrap_err().contains("6d00"));
+    }
+
+    /// After a brown-out the display was asked for five minutes and never said done. An error
+    /// status is no answer, and the display is selected again.
+    #[test]
+    fn an_error_status_while_drawing_is_no_answer() {
+        let mut display = Display::default();
+        let mut writer = Writer::new(picture(), Settings::default());
+        let mut now = Instant::now();
+        until_refresh_sent(&mut writer, &mut display, now);
+        display.answers.extend((0..6).map(|_| Ok(vec![0x6d, 0x00])));
+        while writer.step(&mut display, now).unwrap() != Progress::Done {
+            now += writer.idle(now).max(Duration::from_millis(1));
+        }
+        assert_eq!(display.rejoins, 1);
     }
 
     #[test]
