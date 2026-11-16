@@ -1,0 +1,22 @@
+# Onboard mapping and localization from the head ToF and the legs.
+#
+# A library like `odometry`: no sockets, no systemd, nothing starts it. The service that feeds it
+# `robot.state` and `tof.frame` and answers `map.*` is a separate crate, so the algorithm runs
+# unchanged in the replay bench, the synthetic tests and on the robot.
+#
+# Second design. The first (`origin/maploc`, 2026-08) inked submaps from raw odometry and
+# corrected them by loop closure only; its audit is the reason this one is shaped around stops —
+# see the crate doc.
+[package]
+name = "maploc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+kinematics = { path = "../kinematics" }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true

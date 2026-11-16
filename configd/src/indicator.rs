@@ -1,10 +1,14 @@
-//! The network LED: green on wifi, blue once the robot is reachable from outside its network.
+//! The network LED: green on wifi, blue when a Bluetooth gamepad is connected and wifi is not.
 //! Which LED it is, and why this daemon owns it, is `architecture.md` §3.2.
 //!
-//! Blue is a fact `mediad` holds — its relay is what registers with the rendezvous service — and
-//! it publishes it at [`proto::remote_status_path`] for readers like this one. The LED stays one
-//! writer's all the same: green and blue on two daemons would show both at once, and a robot on
-//! wifi *and* reachable from outside should say the second, which is the one that took more.
+//! Both facts are this daemon's own — NetworkManager for wifi, BlueZ for the pad — so the LED
+//! reads nothing another daemon publishes. Wifi wins when both hold: one LED shows one thing, and
+//! a robot on wifi is the more useful thing to know from across the room. Blue is the robot that
+//! is off any network and still being driven by the pad in someone's hands.
+//!
+//! Above both: **blinking blue while ssh is open on wifi** ([`crate::wifi_ssh`]). It is the answer
+//! to a press of the face button, and a robot with a root-capable login on the network should say
+//! so from across the room.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,34 +17,30 @@ use duck_ipc_proto as proto;
 use duck_ipc_proto::led::{Led, Light, name};
 
 use crate::net::Net;
+use crate::pad::Pads;
 
-/// How often the LED catches up. NetworkManager is asked over D-Bus, which is cheap at this rate.
+/// How often the LED catches up. NetworkManager and BlueZ are asked over D-Bus, which is cheap at
+/// this rate.
 const PERIOD: Duration = Duration::from_secs(2);
 
-/// A registration whose last heartbeat is older than this is a relay that has stopped, whatever
-/// the file says: the heartbeat runs at most a minute apart (`relay.rs`).
-const STALE_HEARTBEAT_S: i64 = 90;
-
-/// Green, then blue.
-pub fn lights(wifi: proto::NetState, remote: Option<&proto::RemoteStatus>, now: i64) -> [Light; 2] {
-    let reachable = matches!(
-        remote.map(|r| &r.link),
-        Some(proto::RemoteLink::Registered { last_heartbeat, .. })
-            if now - last_heartbeat <= STALE_HEARTBEAT_S
-    );
-    if reachable {
-        return [Light::Off, Light::On];
+/// Green, then blue. `pad` is a bonded gamepad connected right now; `ssh` is ssh open on wifi.
+pub fn lights(wifi: proto::NetState, pad: bool, ssh: bool) -> [Light; 2] {
+    if ssh {
+        return [Light::Off, Light::Blink];
     }
     match wifi {
         proto::NetState::Connected => [Light::On, Light::Off],
         proto::NetState::Connecting => [Light::Blink, Light::Off],
+        proto::NetState::Disconnected | proto::NetState::Unavailable if pad => {
+            [Light::Off, Light::On]
+        }
         proto::NetState::Disconnected | proto::NetState::Unavailable => [Light::Off, Light::Off],
     }
 }
 
 /// Keep the network LED in step for as long as the daemon runs. Returns at once on a board
 /// without one.
-pub async fn run(net: Arc<dyn Net>) {
+pub async fn run(net: Arc<dyn Net>, pads: Arc<dyn Pads>) {
     let (Some(mut green), Some(mut blue)) = (
         Led::open(name::NETWORK_GREEN),
         Led::open(name::NETWORK_BLUE),
@@ -56,10 +56,14 @@ pub async fn run(net: Arc<dyn Net>) {
             .status()
             .await
             .map_or(proto::NetState::Unavailable, |s| s.state);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let [g, b] = lights(wifi, proto::read_remote_status().as_ref(), now);
+        // A BlueZ that cannot answer is no pad, as an unanswering NetworkManager is no wifi.
+        let pad = pads
+            .status()
+            .await
+            .is_ok_and(|pads| pads.iter().any(|p| p.connected));
+        let ssh = crate::wifi_ssh::state(std::path::Path::new(crate::wifi_ssh::SWITCH))
+            != crate::wifi_ssh::State::Closed;
+        let [g, b] = lights(wifi, pad, ssh);
         // Off before on, so a change of colour never shows the mix.
         let mut order = [(&mut green, g), (&mut blue, b)];
         order.sort_by_key(|(_, light)| *light != Light::Off);
@@ -74,49 +78,30 @@ pub async fn run(net: Arc<dyn Net>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto::NetState::*;
 
-    fn registered(last_heartbeat: i64) -> proto::RemoteStatus {
-        proto::RemoteStatus {
-            service: "https://example".into(),
-            since: 0,
-            link: proto::RemoteLink::Registered {
-                account: None,
-                peer_id: "p".into(),
-                last_heartbeat,
-            },
+    #[test]
+    fn green_on_wifi_whether_or_not_a_pad_is_connected() {
+        assert_eq!(lights(Connected, false, false), [Light::On, Light::Off]);
+        assert_eq!(lights(Connected, true, false), [Light::On, Light::Off]);
+        assert_eq!(lights(Connecting, false, false), [Light::Blink, Light::Off]);
+        assert_eq!(lights(Connecting, true, false), [Light::Blink, Light::Off]);
+    }
+
+    #[test]
+    fn blue_for_a_pad_without_wifi_and_off_with_neither() {
+        assert_eq!(lights(Disconnected, true, false), [Light::Off, Light::On]);
+        assert_eq!(lights(Unavailable, true, false), [Light::Off, Light::On]);
+        assert_eq!(lights(Disconnected, false, false), [Light::Off, Light::Off]);
+        assert_eq!(lights(Unavailable, false, false), [Light::Off, Light::Off]);
+    }
+
+    #[test]
+    fn blinking_blue_while_ssh_is_open_on_wifi_whatever_else_holds() {
+        for wifi in [Connected, Connecting, Disconnected, Unavailable] {
+            for pad in [false, true] {
+                assert_eq!(lights(wifi, pad, true), [Light::Off, Light::Blink]);
+            }
         }
-    }
-
-    #[test]
-    fn green_on_wifi_blue_when_reachable_from_outside() {
-        use proto::NetState::*;
-        assert_eq!(lights(Disconnected, None, 0), [Light::Off, Light::Off]);
-        assert_eq!(lights(Connecting, None, 0), [Light::Blink, Light::Off]);
-        assert_eq!(lights(Connected, None, 0), [Light::On, Light::Off]);
-        assert_eq!(
-            lights(Connected, Some(&registered(100)), 110),
-            [Light::Off, Light::On]
-        );
-    }
-
-    #[test]
-    fn a_relay_that_stopped_heartbeating_is_not_reachable() {
-        let stale = registered(100);
-        assert_eq!(
-            lights(
-                proto::NetState::Connected,
-                Some(&stale),
-                100 + STALE_HEARTBEAT_S + 1
-            ),
-            [Light::On, Light::Off]
-        );
-        let signed_out = proto::RemoteStatus {
-            link: proto::RemoteLink::SignedOut,
-            ..stale
-        };
-        assert_eq!(
-            lights(proto::NetState::Connected, Some(&signed_out), 100),
-            [Light::On, Light::Off]
-        );
     }
 }

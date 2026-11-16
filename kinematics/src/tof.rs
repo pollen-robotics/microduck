@@ -51,9 +51,15 @@ pub enum Zone {
     Hit {
         /// The return, in the trunk frame, metres.
         point: [f64; 3],
-        /// Horizontal distance from the trunk origin's vertical axis — the
-        /// number obstacle avoidance compares against a stop threshold.
+        /// Horizontal distance from the *sensor*, in the gravity-levelled
+        /// frame — what [`Reprojector::MIN_RANGE_M`] is compared against. Not
+        /// a distance from the trunk: avoidance that wants one measures it
+        /// from `point`.
         range: f64,
+        /// Height above the floor, metres, in the gravity-levelled frame. It
+        /// is what tells a chair leg from a table top the robot can walk
+        /// under.
+        height: f64,
     },
 }
 
@@ -164,7 +170,8 @@ impl Reprojector {
         // straight down, so the filter's Z axis is the world's.
         let level = level_from_gravity(posture.gravity);
         let sensor_level = level.rotate(sensor.pos);
-        let above_floor = sensor_level[2] + posture.trunk_height_m.unwrap_or(self.trunk_height_m);
+        let trunk_height = posture.trunk_height_m.unwrap_or(self.trunk_height_m);
+        let above_floor = sensor_level[2] + trunk_height;
         let floor_threshold = above_floor * Self::FLOOR_SAFETY;
 
         let mut zones = [Zone::Empty; N_ZONES];
@@ -191,6 +198,7 @@ impl Reprojector {
             zones[i] = Zone::Hit {
                 point,
                 range: horizontal,
+                height: level.rotate(point)[2] + trunk_height,
             };
         }
         zones
@@ -253,7 +261,7 @@ mod tests {
     fn a_forward_return_lands_a_metre_ahead() {
         let rp = Reprojector::alpha();
         let zones = rp.project(&one_return(CENTRE, 1.0), LEVEL, &Posture::default());
-        let Zone::Hit { point, range } = zones[CENTRE] else {
+        let Zone::Hit { point, range, .. } = zones[CENTRE] else {
             panic!("expected a hit, got {:?}", zones[CENTRE]);
         };
         let sensor = rp.sensor_in_trunk(LEVEL);
@@ -261,6 +269,28 @@ mod tests {
         assert!(point[1].abs() < 0.3, "y: {point:?}");
         assert!((point[2] - sensor.pos[2]).abs() < 0.3, "z: {point:?}");
         assert!((0.8..=1.05).contains(&range), "range: {range}");
+    }
+
+    /// A hit's height is measured from the floor, not from the trunk: obstacle avoidance drops
+    /// returns above the duck (a table it can walk under), and a height in the trunk frame would
+    /// be off by the whole trunk height.
+    #[test]
+    fn a_hit_knows_its_height_above_the_floor() {
+        let rp = Reprojector::alpha();
+        let posture = Posture {
+            gravity: [0.0, 0.0, -1.0],
+            trunk_height_m: Some(0.2),
+        };
+        let zones = rp.project(&one_return(CENTRE, 1.0), LEVEL, &posture);
+        let Zone::Hit { point, height, .. } = zones[CENTRE] else {
+            panic!("expected a hit, got {:?}", zones[CENTRE]);
+        };
+        assert!(
+            (height - (point[2] + 0.2)).abs() < 1e-9,
+            "upright: height {height} for a point at z {} in the trunk",
+            point[2]
+        );
+        assert!(height > 0.1, "above the floor: {height}");
     }
 
     /// Head pitched down: a bottom-row beam at floor distance is the floor;

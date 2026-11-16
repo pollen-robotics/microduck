@@ -25,7 +25,8 @@
 //! NV12 because that is what the rkisp capture path emits and what `mpph264enc` takes, so nothing
 //! *converts* anywhere: no `videoconvert`, and no RGA pass, between capture and either consumer.
 //!
-//! **Nothing converts and nothing rotates.** The head camera is mounted a quarter turn off, and for
+//! **Nothing converts and nothing rotates.** The Zero 3W's head camera is mounted a quarter turn
+//! off (the beta boards' is upright — `robotd_params::board` owns the mount), and for
 //! one afternoon this pipeline fixed that with a `videoflip` before the tee — which broke
 //! `mpph264enc`'s zero-copy path to the 2D engine and had MPP converting every frame in software:
 //! 97 °C, the CPU throttled to 408 MHz, 8 fps out of a 30 fps camera. Rotation is now the
@@ -114,8 +115,8 @@ use tokio::sync::mpsc;
 /// lost by `v4l2src` in one session, and 8 fps out of a 30 fps camera. The boot before that change
 /// had zero RGA failures and zero lost frames.
 ///
-/// So the pipeline no longer rotates pixels. The camera is still mounted a quarter turn off, and the
-/// consumer that has to care rotates for itself, for free: the console does it with a CSS transform
+/// So the pipeline no longer rotates pixels. Where the camera is mounted off upright — a quarter
+/// turn on the Zero 3W — the consumer that has to care rotates for itself, for free: the console does it with a CSS transform
 /// on the GPU, and a perception consumer folds the turn into the resampling it already does.
 /// [`Settings::rotation`] stays for a consumer that genuinely needs an upright *encoded* stream —
 /// `--flip-in-pipeline` — and now that its cost is written down, that is a choice rather than a
@@ -124,7 +125,7 @@ use tokio::sync::mpsc;
 pub enum Rotation {
     /// Leave the frame as the sensor delivered it.
     None,
-    /// A quarter turn clockwise: what this robot's mount needs.
+    /// A quarter turn clockwise: what the Zero 3W's mount needs. The beta boards' is `None`.
     Cw90,
     Cw180,
     /// A quarter turn anticlockwise, for a head assembled the other way round.

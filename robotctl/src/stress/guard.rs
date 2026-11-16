@@ -18,7 +18,7 @@ pub fn nearest_ahead(zones: &[Zone], half_width: f64) -> Option<f64> {
     zones
         .iter()
         .filter_map(|zone| match zone {
-            Zone::Hit { point, range } if point[0] > 0.0 && point[1].abs() <= half_width => {
+            Zone::Hit { point, range, .. } if point[0] > 0.0 && point[1].abs() <= half_width => {
                 Some(*range)
             }
             _ => None,
@@ -33,9 +33,15 @@ pub fn nearest_left(zones: &[Zone], half_width: f64) -> Option<f64> {
         .iter()
         .map(|zone| match zone {
             // A quarter turn clockwise: left becomes ahead.
-            Zone::Hit { point, range } => Zone::Hit {
+            // A turn about the vertical: the height above the floor is unchanged.
+            Zone::Hit {
+                point,
+                range,
+                height,
+            } => Zone::Hit {
                 point: [point[1], -point[0], point[2]],
                 range: *range,
+                height: *height,
             },
             other => *other,
         })
@@ -98,6 +104,7 @@ mod tests {
         Zone::Hit {
             point: [x, y, 0.0],
             range: x.hypot(y),
+            height: 0.1,
         }
     }
 

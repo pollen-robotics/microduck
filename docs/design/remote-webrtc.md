@@ -1,5 +1,12 @@
 # WebRTC: sessions, signalling, and the control channel
 
+> **Security update (production candidate):** `mediad` now binds its signalling,
+> control and HTTP console/snapshot listeners to `127.0.0.1` by default. The
+> authenticated remote relay still connects to that local signaller. Direct LAN
+> WebRTC and `http://<robot>:8080/` no longer work with the secure default; the
+> local-mode design below describes the previous behavior. Do not bind a LAN
+> address until an authenticated local gateway is implemented and tested.
+
 How a phone, a browser or a server-side program drives and observes the robot over WebRTC.
 [`architecture.md`](architecture.md) §5 states the requirement; this owns the mechanism.
 

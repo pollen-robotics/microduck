@@ -55,26 +55,11 @@ its old bond and pairs it again, so there is no `pad forget` or `bluetoothctl re
 
 ### With an NFC tag
 
-On a robot with an NFC reader — the beta board's own, or a CLRC663 board on USB (`/dev/ttyACM0`)
-on a prototype — a pairing tag does what `robotctl pad pair` does with nothing typed: put the pad in
-pairing mode, touch the tag to the reader. The robot quacks when it has read the tag, and greets — a different sound,
-often a double "wak-wak" — once the pad is paired; a refusal gets no second sound. `nfcd.service` is
-always running and picks a reader up within thirty seconds of it being plugged in.
-
-- **A pad already connected wins.** If one is driving, a touch does nothing, so a tag brushed against
-  the robot never hands the bond to someone else's pad.
-- **One attempt per touch.** If it did not pair, lift the tag and touch again.
-- **Every pairing tag is the same.** It holds one text (or URI) record reading exactly
-  `microduck_gamepad_pairing`, and names no pad: the robot takes the one in pairing mode, and refuses
-  if it finds two, as `robotctl pad pair` does. From a laptop with the reader plugged in, winnie's
-  tool writes one: `ntag write --text microduck_gamepad_pairing`. A tag with an address on it, as
-  the first ones had, no longer pairs anything.
-- It is an **NTAG** (NFC Forum Type 2, ISO 14443A), or on the beta board's reader also an **ISO
-  15693 tag** (NFC Forum Type 5: ICODE SLIX, ST25TV). Any NFC phone writes either — NFC Tools,
-  *Write* → *Add a record* → *Text*. A Type 5 tag that is not NDEF-formatted yet needs its maker's
-  app first (NXP TagWriter, ST25 NFC Tap). The USB reader reads NTAGs only.
-
-What it did is in `journalctl -u nfcd -b`.
+On a robot with an NFC reader, a tag reading `microduck_gamepad_pairing` does what `robotctl pad
+pair` does with nothing typed: put the pad in pairing mode, touch the tag to the head. The robot
+quacks when it has read the tag and greets once the pad is paired. What the tag must hold, which
+tags the reader takes, how to write one (`robotctl nfc-flash`, `duckctl nfc-flash`) and the mode
+tags are all in [`nfc-tags.md`](nfc-tags.md).
 
 ## Check it
 

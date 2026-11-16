@@ -316,8 +316,10 @@ servo is in. That is a transaction of its own (~1 ms), so it is read only on tic
 same with or without it — and only from a robot where at least one servo runs that firmware. The
 firmware is read once a start with the vet book's identity read, and every servo on another one is
 named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
-(40–43 and 56–59), asserted by the same startup check as the registers above: the six
-`bus.impact_guard_*` settings, by default what a microduck walks with (a short brake on fast
+(40–43 and 56–59), asserted by the same startup check as the registers above. `bus.impact_guard`
+is off by default, until it is understood why the stress test robot on it fell on its own far more
+often than any other (2026-11-09); on, it writes the six `bus.impact_guard_*` settings, by default
+what a microduck walks with (a short brake on fast
 arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
 with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
 draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
@@ -629,6 +631,17 @@ sequence takes the fall away from the policy: limp at `gain_limp` following the 
 wait for the gyro to go quiet, ramp back to the standing pose over ~1 s, hand over. The
 hand-back is nothing more than that — the twist has been held at zero throughout, so command
 magnitude selects the standing network, and that is the stand-up.
+
+A stand-up can still stall: from the back the policy sometimes gets half-way and holds a pose
+it never gets out of, and the human cure is Start twice — policy off, home pose, policy on. The
+daemon does that itself. Whenever the policy takes the robot (this hand-back, or an enable on the
+floor) it has `limp_fall_standup_ms` (3 s) to have it up — inside the tilt gate for
+`limp_fall_arm_ms`, the predictor's own arming test. If not, the sequence's pose ramp puts it
+back into the standing pose and hands over again, up to `limp_fall_standup_retries` (3) times in
+a row. A disable, a skill or a sit drops the watch. Out of retries, the robot is parked: stiff at
+the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
+upright and still for `limp_fall_standup_resume_ms` (1 s), which is somebody standing it on its
+feet and letting go, and then the policy takes it back. Start twice also ends the park.
 
 It runs off the policy's path by construction: `driving` is false for the whole sequence
 (§1.4), so the targets come from the sequence rather than the controller, and they reach the
@@ -995,7 +1008,11 @@ can reach the requested pose.
 
 D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
 `head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
-Smoothing remains in `robotd`'s `[control]` settings. `--deadzone` and `--max-head`, on either
+Smoothing remains in `robotd`'s `[control]` settings, with one pad-only addition: the head
+sticks go through `[pad_head] expo`, a response curve that spends the stick's centre on fine
+movements, and `max_speed`, a cap in rad/s on how fast they move the head target — a full snap
+glides at that speed rather than jumping and then crawling in on `head_alpha`. Neither applies to
+the IMU head. `--deadzone` and `--max-head`, on either
 daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
@@ -1065,6 +1082,8 @@ intents the loop already arbitrates.
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `laser.rs` | a laser dot from `mediad`'s `media.laser` (a ray, not a pixel) → a place on the floor through head FK, IMU and odometry → a head pose and a twist, each taken only while no client wants that half | the module header; the detector is `mediad/src/laser.rs` |
+| `soccer.rs` | soccer mode's two switches (`robot.soccer`, read back in `robot.mode` for the pads); autonomous play: the purple ball from `media.ball`, projected as the laser's dot but a radius above the floor → walk to it, line a foot up, queue the kick | the module header; the detector is `mediad/src/ball.rs`, the pad's half `pad-map/src/mapper.rs` |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `emotion.rs` | an emotion = keyframes and a wav, shipped in the release with `[emotions] dir` on top, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
@@ -1077,11 +1096,14 @@ behind `RobotIo`, because it has to keep answering when the motor bus does not.
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[laser tracking], [soccer].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[laser tracking]: ../robot/cheatsheet.md#follow-a-laser-dot
+[soccer]: ../robot/cheatsheet.md#play-soccer
 
 ## 5. Why it exists, and where it came from
 

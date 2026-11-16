@@ -27,7 +27,44 @@
 
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::board::Board;
+
+/// The prefix every first name carries.
+///
+/// Hardcoded rather than built from the hostname, which would give `radxa-zero3-7f3a` — longer
+/// than what it replaces and no more meaningful. The robot is a duck.
+const NAME_PREFIX: &str = "duck";
+
+/// The name a robot answers to before anyone has renamed it: `duck-7f3a`.
+///
+/// It is `configd`'s default name, and also the robot's id in its `md1:` setup code, which binds
+/// the secure handshake to this robot (`app-path-design.md` §5.4). Both read it from here, so the
+/// QR printed for a robot and the id `btd` answers with cannot disagree, and a rename changes
+/// neither.
+///
+/// **Hashed rather than sliced.** Taking the last four characters of the serial would assume that
+/// is where two chips differ, and nothing guarantees it — a vendor is free to make any part of the
+/// value sequential, or constant. A digest spreads whatever entropy the serial has across the
+/// whole output.
+///
+/// **SHA-256 rather than [`std::hash::DefaultHasher`]**, whose output is explicitly not stable
+/// across Rust releases. A `rustup update` would silently rename every robot in the field, and
+/// nobody would ever connect the two.
+///
+/// Four hex characters, so 65 536 possibilities: three robots in a room share a name about once in
+/// 22 000 times. Distinguishable, not unique — and uniqueness is not what the setup code needs
+/// from it, since the key, not the id, is what authenticates.
+pub fn first_name(serial: &str) -> String {
+    let digest = Sha256::digest(serial.as_bytes());
+    format!("{NAME_PREFIX}-{:02x}{:02x}", digest[0], digest[1])
+}
+
+/// This robot's [`first_name`], or `None` on a board with no SoC serial to derive it from.
+pub fn this_first_name() -> Option<String> {
+    soc_serial().map(|serial| first_name(&serial))
+}
 
 /// Where U-Boot leaves its serial.
 pub const DEVICE_TREE_PATH: &str = "/proc/device-tree/serial-number";

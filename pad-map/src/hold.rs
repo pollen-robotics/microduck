@@ -18,6 +18,12 @@ pub const REST_HOLD: Duration = Duration::from_secs(2);
 /// ended and then powers off. The release after it does nothing.
 pub const SHUTDOWN_HOLD: Duration = Duration::from_secs(4);
 
+/// Home released before this long toggles the flashlight; held longer, it does nothing. Holding
+/// Home is how most pads turn themselves off, and that hold must not light the robot up on its
+/// way out — a pad can report Home's release as it powers down. A tap is well under a second, and
+/// no pad's power-off hold is.
+pub const FLASHLIGHT_TAP: Duration = Duration::from_secs(1);
+
 /// A button that does different things depending on how long it is held.
 ///
 /// Each threshold fires once, on the tick the hold crosses it, so a longer hold walks through
