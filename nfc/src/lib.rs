@@ -8,12 +8,14 @@
 //!
 //! Layered as the Python is: [`transport`] frames register accesses over the serial link,
 //! [`clrc663`] and [`st25r100`] are the chips, [`tag`] is ISO-14443A selection and the Type 2
-//! reads, [`vtag`] the ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
+//! reads, [`isodep`] the ISO 14443-4 blocks an e-ink display ([`eink`]) is written in, [`vtag`] the
+//! ISO 15693 inventory and the Type 5 reads, [`ndef`] is pure parsing.
 //! [`pairing`], [`modes`] and [`photo`] are what `nfcd` does with a tag, and are the part worth
 //! testing on a laptop.
 
 pub mod clrc663;
 pub mod eink;
+pub mod isodep;
 pub mod modes;
 pub mod ndef;
 pub mod pairing;

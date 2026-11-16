@@ -49,6 +49,9 @@ mod cmd {
 // SPI addressing (§5.8.2, Table 3): bit 7 is read, the FIFO is 0x5F.
 const READ: u8 = 0x80;
 const FIFO: u8 = 0x5f;
+/// The FIFO's size (§5.6): a frame is loaded whole, so this is the longest one sent. An ISO
+/// 14443-4 block of the 256 bytes the displays accept is 254 before its CRC, which the chip adds.
+const FIFO_DEPTH: usize = 256;
 
 // Operation register (§5.13.1).
 const OP_TX_EN: u8 = 1 << 5;
@@ -135,6 +138,10 @@ const NFCV_REGS: [u8; 7] = [
 const IC_TYPE_ST25R100: u8 = 0b10101;
 /// The no-response timer's step at `nrt_step = 0`: 64 periods of 13.56 MHz.
 const NRT_STEP_US: f64 = 64.0 / 13.56;
+/// `nrt_step` in the NRT GPT config register (§5.13.30): steps of 4096 periods, 302 µs, for an
+/// exchange longer than the 309 ms that 64-period steps count to — an ISO 14443-4 card may ask
+/// for seconds (`FWI` 14 is 4.9 s).
+const NRT_STEP_4096FC: u8 = 1 << 0;
 /// ISO 14443A: the field must be on this long before the first command (§5.10).
 const GUARD: Duration = Duration::from_millis(5);
 /// Field off this long puts every tag back in IDLE (the CLRC663 driver measured 10 ms).
@@ -386,6 +393,18 @@ fn nrt_ticks(timeout_ms: u64) -> u16 {
     ((timeout_ms as f64 * 1000.0 / NRT_STEP_US).ceil() as u64).clamp(1, 0xffff) as u16
 }
 
+/// The NRT GPT config value and the count for `timeout_ms`: 4.72 µs steps while they reach it,
+/// 302 µs ones beyond, as ST's reader library switches. 19.8 s is the most either counts.
+fn nrt(timeout_ms: u64) -> (u8, u16) {
+    let fine = timeout_ms as f64 * 1000.0 / NRT_STEP_US;
+    if fine <= f64::from(u16::MAX) {
+        (0x00, nrt_ticks(timeout_ms))
+    } else {
+        let coarse = (fine / 64.0).ceil() as u64;
+        (NRT_STEP_4096FC, coarse.clamp(1, 0xffff) as u16)
+    }
+}
+
 /// What a finished exchange's IRQ bits mean, if they mean it is over.
 fn outcome(irq: [u8; 3]) -> Option<Result<()>> {
     let [i1, i2, _] = irq;
@@ -424,6 +443,12 @@ impl<B: Bus> Reader for St25r100<B> {
     /// The transceive sequence of §5.10: stop, clear the gain, frame it, load the FIFO,
     /// transmit, then read the IRQ status until the reception ends or the timer says nothing came.
     fn transceive(&mut self, data: &[u8], exchange: Exchange) -> Result<Vec<u8>> {
+        if data.len() > FIFO_DEPTH {
+            return Err(Error::Tag(format!(
+                "a frame of {} bytes: the FIFO holds {FIFO_DEPTH}",
+                data.len()
+            )));
+        }
         self.command(cmd::STOP_ALL)?;
         self.command(cmd::CLEAR_RX_GAIN)?;
         let tx = TX_PARITY | if exchange.crc { TX_CRC } else { 0 };
@@ -436,10 +461,11 @@ impl<B: Bus> Reader for St25r100<B> {
         }
         self.write(reg::PROTOCOL_TX1, &[tx])?;
         self.write(reg::PROTOCOL_RX1, &[rx])?;
-        let ticks = nrt_ticks(exchange.timeout_ms).to_be_bytes();
-        // NRT GPT config, then NRT1 (MSB) and NRT2 (LSB), auto-incremented: nrt_step 0
-        // (4.72 µs), normal mode.
-        self.write(reg::NRT_GPT_CONFIG, &[0x00, ticks[0], ticks[1]])?;
+        let (step, ticks) = nrt(exchange.timeout_ms);
+        let ticks = ticks.to_be_bytes();
+        // NRT GPT config, then NRT1 (MSB) and NRT2 (LSB), auto-incremented: the step, normal
+        // mode.
+        self.write(reg::NRT_GPT_CONFIG, &[step, ticks[0], ticks[1]])?;
         let (ntx, nbtx) = frame_length(data.len(), exchange.tx_bits);
         self.write(reg::TX_FRAME1, &tx_frame(ntx, nbtx))?;
         self.write(FIFO, data)?;
@@ -624,6 +650,26 @@ mod tests {
         assert_eq!(nrt_ticks(5), 1060);
         assert_eq!(nrt_ticks(80), 16_950);
         assert_eq!(nrt_ticks(1_000), 0xffff, "309 ms is the most it can count");
+    }
+
+    #[test]
+    fn a_long_exchange_counts_in_302_us() {
+        assert_eq!(nrt(80), (0x00, 16_950));
+        assert_eq!(nrt(309), (0x00, 65_470));
+        // FWI 14: 4.95 s, which 64-period steps cannot reach.
+        assert_eq!(nrt(4_950), (NRT_STEP_4096FC, 16_388));
+        assert_eq!(nrt(60_000), (NRT_STEP_4096FC, 0xffff), "19.8 s is the cap");
+    }
+
+    #[test]
+    fn a_frame_longer_than_the_fifo_is_refused() {
+        let mut chip = St25r100::new(Scripted::default(), Antenna::One);
+        let frame = vec![0u8; FIFO_DEPTH + 1];
+        assert!(matches!(
+            chip.transceive(&frame, Exchange::framed(5)),
+            Err(Error::Tag(_))
+        ));
+        assert!(chip.bus.sent.is_empty(), "nothing on the bus");
     }
 
     #[test]
