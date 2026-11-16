@@ -366,7 +366,8 @@ impl Writer {
                             tracing::warn!(error = %e, "the display stopped answering while drawing; selecting it again");
                             // Not its application: selected again mid-redraw, the display answers
                             // every ask `68 CA` from then on (cream-dvt-coco, 2026-11-16).
-                            self.dropped_at.get_or_insert(now);
+                            // The real time, not the step's start: the asks that failed took seconds.
+                            self.dropped_at.get_or_insert_with(Instant::now);
                             State::Rejoin {
                                 then: Box::new(State::Poll { until, errors: 0 }),
                                 select: false,
