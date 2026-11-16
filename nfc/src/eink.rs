@@ -67,6 +67,8 @@ pub const PACKET: usize = 250;
 /// else, and the pause between two.
 const SELECT_TRIES: u32 = 10;
 const SELECT_AGAIN: Duration = Duration::from_millis(50);
+/// Unanswered selects in a row before the display is selected again at the ISO 14443 level.
+const SELECT_REJOIN_EVERY: u32 = 3;
 /// How many times one packet is sent before the write fails, and every how many the display is
 /// selected again.
 const PACKET_TRIES: u32 = 40;
@@ -248,13 +250,29 @@ impl Writer {
                 answer => {
                     let tries = tries + 1;
                     if tries >= SELECT_TRIES {
-                        return Err(format!(
-                            "not a display, or not one this speaks: its application select answered {}",
-                            said(&answer)
-                        ));
+                        let what = if answer.is_ok() {
+                            "not a display, or not one this speaks: its application select answered"
+                        } else {
+                            "the display stopped answering:"
+                        };
+                        return Err(format!("{what} {}", said(&answer)));
                     }
-                    self.wait(now, SELECT_AGAIN);
-                    State::Select { tries }
+                    // No answer is a display out of reach, not a wrong one: selected again every
+                    // few, as a packet that goes unanswered is.
+                    if answer.is_err() && tries.is_multiple_of(SELECT_REJOIN_EVERY) {
+                        tracing::warn!(
+                            tries,
+                            "the display does not answer the select; selecting it again"
+                        );
+                        State::Rejoin {
+                            then: Box::new(State::Select { tries }),
+                            select: false,
+                            until: now + self.settings.rejoin_within,
+                        }
+                    } else {
+                        self.wait(now, SELECT_AGAIN);
+                        State::Select { tries }
+                    }
                 }
             },
             State::Write {
@@ -656,6 +674,26 @@ mod tests {
             writer.step(&mut display, Instant::now()).is_err(),
             "and stays failed"
         );
+    }
+
+    #[test]
+    fn an_unanswered_select_rejoins_the_display_and_a_refused_one_does_not() {
+        let mut display = Display {
+            answers: (0..4).map(|_| Err(Error::NoTag)).collect(),
+            ..Display::default()
+        };
+        let mut writer = Writer::new(picture(), Settings::default());
+        run(&mut writer, &mut display).unwrap();
+        assert_eq!(display.rejoins, 1);
+
+        let mut display = Display {
+            answers: (0..10).map(|_| Err(Error::NoTag)).collect(),
+            ..Display::default()
+        };
+        let mut writer = Writer::new(picture(), Settings::default());
+        let why = run(&mut writer, &mut display).unwrap_err();
+        assert!(why.contains("stopped answering"), "{why}");
+        assert_eq!(display.rejoins, 3);
     }
 
     #[test]
