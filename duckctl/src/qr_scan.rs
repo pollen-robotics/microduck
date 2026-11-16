@@ -33,6 +33,9 @@ pub enum Seen {
     Nothing,
     /// A QR, but not a setup code.
     NotACode,
+    /// A QR carrying `md1:`, that `SetupCode::parse` refuses, and why — never the key itself.
+    /// Worth its own message: a code one character short is a misprinted label, not the wrong QR.
+    BadCode(String),
     Code(SetupCode),
 }
 
@@ -47,10 +50,13 @@ pub fn look(width: usize, height: usize, luma: &[u8]) -> Seen {
     if texts.is_empty() {
         return Seen::Nothing;
     }
-    texts
-        .iter()
-        .find_map(|text| SetupCode::parse(text).ok())
-        .map_or(Seen::NotACode, Seen::Code)
+    if let Some(code) = texts.iter().find_map(|text| SetupCode::parse(text).ok()) {
+        return Seen::Code(code);
+    }
+    match texts.iter().find(|text| text.contains("md1:")) {
+        Some(text) => Seen::BadCode(SetupCode::parse(text).unwrap_err()),
+        None => Seen::NotACode,
+    }
 }
 
 fn decode(width: usize, height: usize, pixel: impl FnMut(usize, usize) -> u8) -> Vec<String> {
@@ -116,7 +122,7 @@ pub fn scan() -> Result<SetupCode, String> {
             Seen::Code(code) => return Ok(code),
             // A frame without a QR does not clear "that is not a setup code" straight away: the
             // label wobbles in and out of focus, and the message would flicker.
-            Seen::Nothing if seen == Seen::NotACode => {}
+            Seen::Nothing => {}
             other => seen = other,
         }
 
@@ -134,10 +140,15 @@ pub fn scan() -> Result<SetupCode, String> {
                     },
                     preview,
                 );
-                let hint = if seen == Seen::NotACode {
-                    "That QR is not a duck setup code — show the one on the duck's label.".yellow()
-                } else {
-                    "Hold the QR on your duck's label up to the camera.".bold()
+                let hint = match &seen {
+                    Seen::NotACode => {
+                        "That QR is not a duck setup code — show the one on the duck's label."
+                            .yellow()
+                    }
+                    Seen::BadCode(why) => {
+                        format!("That QR is a setup code that does not read: {why}.").red()
+                    }
+                    _ => "Hold the QR on your duck's label up to the camera.".bold(),
                 };
                 let mut keys = "Esc to cancel".to_owned();
                 if cameras.len() > 1 {
@@ -308,6 +319,16 @@ mod tests {
     fn another_qr_is_not_a_code() {
         let (side, luma) = render("https://example.com/receipt", 4);
         assert_eq!(look(side, side, &luma), Seen::NotACode);
+    }
+
+    /// One hex character short, as a misprinted label would be: said so, rather than "not a code".
+    #[test]
+    fn a_malformed_code_says_why() {
+        let (side, luma) = render(&LABEL[..LABEL.len() - 1], 4);
+        let Seen::BadCode(why) = look(side, side, &luma) else {
+            panic!("a short key read as something else");
+        };
+        assert!(why.contains("63"), "{why}");
     }
 
     #[test]
