@@ -42,6 +42,7 @@
 #[cfg(target_os = "linux")]
 mod agent;
 mod console;
+mod qr_scan;
 mod setup_code;
 mod udp_pad;
 
@@ -1106,12 +1107,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SetupCodeCmd {
-    /// Store a robot's setup code, read on stdin: paste `md1:<robot id>:<key>`, or the QR's text.
+    /// Store a robot's setup code: paste `md1:<robot id>:<key>` (or the QR's text) on stdin, or
+    /// press Enter alone to scan the QR on the robot's label with this computer's camera.
     ///
     /// `duckctl ssh -- sudo robotctl system setup-code` prints it. On stdin so the key is in no
     /// command line or shell history. Filed under the robot id in the code, and under `--name` (or
     /// `DUCK_ROBOT`) as well when that names the robot differently — a renamed one.
-    Add,
+    Add {
+        /// Go straight to the camera: a live preview in the terminal, and the first setup-code QR
+        /// it sees is stored. Esc cancels.
+        #[arg(long)]
+        scan: bool,
+    },
     /// The robots this laptop holds a code for, by name and id. Never the keys.
     List,
     /// Forget a robot's code, under every name it was filed under.
@@ -2666,22 +2673,44 @@ fn open_line(
     Ok(String::from_utf8(plain)?)
 }
 
+/// The setup code off the robot's label QR, through this computer's camera (`qr_scan.rs`).
+///
+/// `block_in_place` because the camera blocks between frames, and this runs on the runtime.
+fn scan_setup_code() -> Result<setup_code::SetupCode, Box<dyn std::error::Error>> {
+    let code = tokio::task::block_in_place(qr_scan::scan)?;
+    eprintln!("read the setup code for {} from its QR", code.id);
+    Ok(code)
+}
+
 /// `duckctl setup-code …`: the file of codes, and nothing on the radio.
 fn setup_code_command(
     action: &SetupCodeCmd,
     target: &Target,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        SetupCodeCmd::Add => {
+        SetupCodeCmd::Add { scan } => {
             use std::io::IsTerminal as _;
-            if std::io::stdin().is_terminal() {
-                eprintln!(
-                    "Paste the setup code (md1:<robot id>:<key>, or the QR's text) and press Enter:"
-                );
-            }
-            let mut text = String::new();
-            std::io::stdin().read_line(&mut text)?;
-            let code = setup_code::SetupCode::parse(&text)?;
+            let terminal = std::io::stdin().is_terminal();
+            let code = if *scan {
+                scan_setup_code()?
+            } else {
+                if terminal {
+                    eprintln!(
+                        "Paste the setup code (md1:<robot id>:<key>, or the QR's text) and press \
+                         Enter — or press Enter alone to scan the QR on the robot's label with \
+                         this computer's camera:"
+                    );
+                }
+                let mut text = String::new();
+                std::io::stdin().read_line(&mut text)?;
+                // An empty line from a person is a request for the camera; from a pipe it is a
+                // missing code, which `parse` names.
+                if terminal && text.trim().is_empty() {
+                    scan_setup_code()?
+                } else {
+                    setup_code::SetupCode::parse(&text)?
+                }
+            };
             let mut names = vec![code.id.as_str()];
             if let Some(wanted) = target.wanted().filter(|wanted| *wanted != code.id) {
                 names.push(wanted);

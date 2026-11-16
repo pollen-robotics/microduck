@@ -81,7 +81,10 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --locked --out ${{ github.workspace }}/wheels
-          before-script-linux: dnf install -y systemd-devel
+          # systemd-devel for gilrs's libudev (above); clang-devel and kernel-headers for the V4L2
+          # bindings `setup-code add --scan` reads the camera through, which bindgen generates at
+          # build time (`duckctl/Cargo.toml`).
+          before-script-linux: dnf install -y systemd-devel clang-devel kernel-headers
 
       - name: Package the binary out of the wheel
         run: |
