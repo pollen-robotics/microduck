@@ -13,6 +13,10 @@
 //! a picture taken with `mediad`'s camera and kept in `/var/lib/robot/photos`; the sequence is
 //! [`nfc::photo`].
 //!
+//! `nfcd eink write` is the bench's: a picture written to an e-ink display on one antenna, with
+//! `nfcd` itself stopped, since it holds the reader. It is how the write ([`nfc::eink`]) is tried
+//! on a robot before the photo sequence does it.
+//!
 //! ## Why its own daemon
 //!
 //! The reader is a device someone has to own, and nothing else here wants it: `configd` is in the
@@ -32,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
 use nfc::modes::{self, Driver, ModeTag};
@@ -92,6 +96,78 @@ struct Args {
     /// Where the photo tag's pictures are kept, one JPEG each, named for the local time.
     #[arg(long, default_value = "/var/lib/robot/photos")]
     photo_dir: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// An e-ink display, from the bench. Stop the `nfcd` service first: it holds the reader.
+    #[command(subcommand)]
+    Eink(EinkCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum EinkCommand {
+    /// Write a picture to the display on one antenna, and redraw it. Keep the display still
+    /// until `refresh done`.
+    Write(EinkWrite),
+}
+
+#[derive(clap::Args, Debug)]
+struct EinkWrite {
+    /// A JPEG or a PNG: its centre square, scaled to 240 × 240. None, the six-ink test pattern.
+    image: Option<PathBuf>,
+
+    /// The antenna the display is on.
+    #[arg(long, value_enum, default_value_t = Place::Beak)]
+    on: Place,
+
+    /// The refresh's P1, hex: the panel's power-up before it draws, in 100 ms. `nfc-test`'s
+    /// NFC_REFRESH_P1.
+    #[arg(long, default_value = "85", value_parser = hex_byte)]
+    p1: u8,
+
+    /// Between two packets at first, in ms; a slow packet raises it. `nfc-test`'s
+    /// NFC_D2_DELAY_MS.
+    #[arg(long, default_value_t = 0)]
+    pace_ms: u64,
+
+    /// The time the display has to answer each block: FWT at this FWI, 14 being 4.9 s.
+    #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u8).range(0..=14))]
+    fwi: u8,
+
+    #[arg(long, value_enum, default_value_t = DitherArg::Atkinson)]
+    dither: DitherArg,
+
+    /// A box blur of this radius before the dither. `nfc-test`'s NFC_BLUR.
+    #[arg(long, default_value_t = 0)]
+    blur: u32,
+
+    /// How long to wait for a display on the antenna, in seconds.
+    #[arg(long, default_value_t = 10)]
+    find_within: u64,
+
+    /// How long the redraw may take, in seconds.
+    #[arg(long, default_value_t = 300)]
+    refresh_within: u64,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Place {
+    Head,
+    Beak,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum DitherArg {
+    Atkinson,
+    None,
+}
+
+fn hex_byte(s: &str) -> Result<u8, String> {
+    u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("{s:?}: {e}"))
 }
 
 fn main() -> std::process::ExitCode {
@@ -103,6 +179,10 @@ fn main() -> std::process::ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+    if let Some(Command::Eink(EinkCommand::Write(write))) = &args.command {
+        let device = args.device.clone().unwrap_or_else(default_device);
+        return eink_write(&device, write);
+    }
     duck_ipc_proto::log_startup_identity!("nfcd");
 
     if !(args.hz > 0.0 && args.hz <= 20.0) {
@@ -141,6 +221,91 @@ fn main() -> std::process::ExitCode {
                 backoff = (backoff * 2).min(RETRY_MAX);
             }
         }
+    }
+}
+
+/// `nfcd eink write`: the picture rendered, the display found on the antenna, written step by
+/// step, the field off at the end.
+fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
+    use nfc::eink::{Link, Progress, Settings, Writer, picture};
+    let fail = |why: String| {
+        tracing::error!(%why, "not written");
+        std::process::ExitCode::FAILURE
+    };
+    let image = match &args.image {
+        Some(path) => match image::open(path) {
+            Ok(image) => image.to_rgb8(),
+            Err(e) => return fail(format!("{}: {e}", path.display())),
+        },
+        None => {
+            tracing::info!("no picture given: the test pattern");
+            picture::test_pattern()
+        }
+    };
+    let dither = match args.dither {
+        DitherArg::Atkinson => picture::Dither::Atkinson,
+        DitherArg::None => picture::Dither::None,
+    };
+    let packed = picture::render(&image, dither, args.blur);
+
+    let mut chip = match open(device) {
+        Ok(chip) => chip,
+        Err(e) => return fail(format!("{}: {e}", device.display())),
+    };
+    let antenna = match args.on {
+        Place::Head => HEAD,
+        Place::Beak => BEAK,
+    };
+    if let Chip::Spi(c) = &mut chip
+        && let Err(e) = c.set_proto(Proto::A).and_then(|()| c.set_antenna(antenna))
+    {
+        return fail(e.to_string());
+    }
+    tracing::info!(?antenna, on = ?args.on, "waiting for a display");
+    let until = Instant::now() + Duration::from_secs(args.find_within);
+    let outcome = loop {
+        match Link::open(&mut chip, args.fwi) {
+            Ok(link) => break Ok(link),
+            Err(e) if e.is_tag() && Instant::now() < until => sleep(Duration::from_millis(100)),
+            Err(e) => break Err(format!("no display: {e}")),
+        }
+    };
+    let mut link = match outcome {
+        Ok(link) => link,
+        Err(why) => return fail(why),
+    };
+    tracing::info!(fwi = args.fwi, "display found");
+
+    let settings = Settings {
+        refresh_p1: args.p1,
+        pace: Duration::from_millis(args.pace_ms),
+        refresh_within: Duration::from_secs(args.refresh_within),
+        ..Settings::default()
+    };
+    let mut writer = Writer::new(packed, settings);
+    let started = Instant::now();
+    let mut shown = None;
+    let result = loop {
+        match writer.step(&mut link, Instant::now()) {
+            Ok(Progress::Done) => break Ok(()),
+            Ok(progress) => {
+                let stage = std::mem::discriminant(&progress);
+                if shown != Some(stage) {
+                    tracing::info!(?progress, "…");
+                    shown = Some(stage);
+                }
+                sleep(writer.idle(Instant::now()));
+            }
+            Err(why) => break Err(why),
+        }
+    };
+    let _ = chip.field_off();
+    match result {
+        Ok(()) => {
+            tracing::info!(took = ?started.elapsed(), "written and drawn");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(why) => fail(why),
     }
 }
 

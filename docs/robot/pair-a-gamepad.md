@@ -92,10 +92,17 @@ standing and opens its beak a little. It waits up to a minute for a display in i
 on it for five seconds, rolling its head side to side in small quick moves with a few short
 quacks, then lowers its head and opens its beak wide to let it fall with a tiny cute retch (the
 `bwep` sound), and brings its head back up. The idle look-around is held off throughout. The
-picture is kept in `/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how a display is recognised
-(any ISO 14443-4 card, for now) in `nfc/src/eink.rs`. A display starts it from the top of the head
-only; in the beak it starts nothing, and is what the sequence waits for. Every touch logs where it
-was seen (`tag in the field`, `place="head"`).
+picture is kept in `/var/lib/robot/photos`, named for the local time. The sequence is in
+`nfc/src/photo.rs`, and how a display is recognised (any ISO 14443-4 card) and written in
+`nfc/src/eink.rs`. A display starts it from the top of the head only; in the beak it starts nothing,
+and is what the sequence waits for. Every touch logs where it was seen (`tag in the field`,
+`place="head"`).
+
+The sequence does not write the photo to the display yet. From the bench it can be done by hand:
+with the service stopped (`sudo systemctl stop nfcd`, it holds the reader),
+`sudo /opt/robot/daemon/current/bin/nfcd eink write picture.jpg --on beak` writes a JPEG or PNG to
+the display in the beak (`--on head` for the top of the head; no picture, a test pattern) and
+redraws it. Keep the display still until it logs `written and drawn`, then start the service again.
 
 ## Check it
 
