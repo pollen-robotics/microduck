@@ -2332,6 +2332,15 @@ impl View {
             None => Span::raw("batt not read yet").dim(),
         });
 
+        // The PWM cap the battery sets, beside the battery it comes from — only when
+        // `bus.battery_voltage_based_pwm_limit` is on, which is the only time robotd sends it.
+        if let Some(pwm) = health.goal_pwm {
+            said.push(Span::raw(format!(
+                " · pwm {:.0}% ({pwm})",
+                f64::from(pwm) * 100.0 / f64::from(proto::HealthResult::GOAL_PWM_FULL)
+            )));
+        }
+
         // Said early, because it qualifies everything after it: these are the numbers from the
         // last answer, and this is how long ago that answer was.
         if let Some(age) = self.health_age() {
@@ -3912,6 +3921,27 @@ mod tests {
             .find(|line| line.contains(" power "))
             .expect("the row is drawn");
         assert!(!power.contains("motors"), "{screen}");
+    }
+
+    /// The battery's PWM cap sits beside the battery when robotd sends it, and is not mentioned
+    /// at all when it does not — the switch is off, which is the default.
+    #[test]
+    fn the_pwm_cap_shows_only_when_robotd_sends_it() {
+        let power_row = |health| {
+            draw_with_health(110, 32, &a_state(), health)
+                .lines()
+                .find(|line| line.contains(" power "))
+                .expect("the row is drawn")
+                .to_owned()
+        };
+        let on = power_row(proto::HealthResult {
+            goal_pwm: Some(718),
+            ..a_health()
+        });
+        assert!(on.contains("batt 7.66 V 66% · pwm 81% (718)"), "{on}");
+
+        let off = power_row(a_health());
+        assert!(!off.contains("pwm"), "{off}");
     }
 
     /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in

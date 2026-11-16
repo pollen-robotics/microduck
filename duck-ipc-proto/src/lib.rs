@@ -614,7 +614,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`method::NFC_READ`]: `nfcd` reads the next tag touched and says what is on it, on the same
 /// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
 /// else on the wire changed.
-pub const API_VERSION: u32 = 61;
+///
+/// # v62 — the battery's PWM cap
+///
+/// [`HealthResult::goal_pwm`]: the Goal PWM `robotd` writes when
+/// `bus.battery_voltage_based_pwm_limit` is on. Optional and absent when off, so a v61 client
+/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing.
+pub const API_VERSION: u32 = 62;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -4661,6 +4667,12 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
+    /// The Goal PWM `robotd` last wrote to every servo, out of 885 (100 % duty), when
+    /// `bus.battery_voltage_based_pwm_limit` is on: it follows the battery so the motors see
+    /// ~6 V. Absent when the switch is off, before the first write, and from an older `robotd`.
+    /// Reported, never judged — same rule as the battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_pwm: Option<u16>,
     /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
     /// never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4900,6 +4912,12 @@ impl Battery {
     /// so `robotctl monitor` and `duckctl udp-pad` cannot disagree about the same pack.
     pub const LOW_PCT: f64 = 30.0;
     pub const CRITICAL_PCT: f64 = 15.0;
+}
+
+impl HealthResult {
+    /// [`Self::goal_pwm`] at 100 % duty: the XL330's factory PWM Limit, which
+    /// `duck_control::model::GOAL_PWM_MAX` also names — that crate does not depend on this one.
+    pub const GOAL_PWM_FULL: u16 = 885;
 }
 
 /// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].

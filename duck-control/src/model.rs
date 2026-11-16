@@ -278,6 +278,38 @@ pub fn battery_percent(volts: f64) -> f64 {
     ((volts - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V)).clamp(0.0, 1.0) * 100.0
 }
 
+// ── voltage-compensated PWM ──────────────────────────────────────────────────
+//
+// The servos drive their motor with PWM straight off the pack, so a full 8.2 V pack puts
+// 8.2 V across the motor at 100 % duty, where a nearly flat one puts 6.2 V. Capping Goal PWM
+// at `MOTOR_MAX_V / pack` keeps the most the motor ever sees at about 6 V whatever the charge:
+// the robot behaves the same at the top of the pack as near the bottom, and the gears are not
+// asked for the extra torque a fresh pack would otherwise hand them.
+//
+// Goal PWM (100, RAM) rather than PWM Limit (36, EEPROM): PWM Limit only reaches Goal PWM at
+// boot, so changing it would need a reboot per servo. Goal PWM takes effect at once and is
+// itself capped by PWM Limit, which nothing here writes and so stays at its factory 885.
+
+/// Goal PWM at 100 % duty: the XL330's factory PWM Limit.
+pub const GOAL_PWM_MAX: u16 = 885;
+
+/// The most the motor should see, in volts. Goal PWM is set to this fraction of the pack.
+pub const MOTOR_MAX_V: f64 = 6.0;
+
+/// Goal PWM that puts at most [`MOTOR_MAX_V`] across the motor on a pack at `volts`.
+///
+/// 8.2 V (full) gives 648, 73 %; 6.2 V gives 856, 97 %; at or below 6 V, 885. `None` for a
+/// non-finite or non-positive reading — "no answer from the bus", the same meaning
+/// [`battery_percent`] gives it — so the caller leaves the servos where they are rather than
+/// guessing a pack.
+pub fn goal_pwm_for(volts: f64) -> Option<u16> {
+    if !volts.is_finite() || volts <= 0.0 {
+        return None;
+    }
+    let fraction = (MOTOR_MAX_V / volts).min(1.0);
+    Some((fraction * GOAL_PWM_MAX as f64).round() as u16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +466,30 @@ mod tests {
 
     /// A bus that did not answer arrives here as 0.0, and NaN is what a mean over an empty
     /// set produces. Both must be 0 rather than a wild number a caller might print.
+    #[test]
+    fn goal_pwm_holds_the_motor_at_six_volts() {
+        assert_eq!(goal_pwm_for(BATTERY_FULL_V), Some(648));
+        assert_eq!(goal_pwm_for(6.2), Some(856));
+        assert_eq!(goal_pwm_for(MOTOR_MAX_V), Some(GOAL_PWM_MAX));
+        // A pack below the motor's voltage cannot be compensated for: full duty, never more.
+        assert_eq!(goal_pwm_for(5.0), Some(GOAL_PWM_MAX));
+        for v in [6.5, 7.0, 7.4, 8.0, 8.4] {
+            let pwm = goal_pwm_for(v).unwrap();
+            let motor_v = v * pwm as f64 / GOAL_PWM_MAX as f64;
+            assert!(
+                (motor_v - MOTOR_MAX_V).abs() < 0.01,
+                "{v} V → {pwm} → {motor_v} V"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_pwm_is_not_guessed_without_a_reading() {
+        assert_eq!(goal_pwm_for(0.0), None);
+        assert_eq!(goal_pwm_for(-1.0), None);
+        assert_eq!(goal_pwm_for(f64::NAN), None);
+    }
+
     #[test]
     fn battery_percent_treats_no_reading_as_zero() {
         assert_eq!(battery_percent(0.0), 0.0);
