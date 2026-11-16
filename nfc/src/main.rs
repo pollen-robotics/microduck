@@ -80,13 +80,13 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const PAIR_ANSWER: Duration = Duration::from_secs(40);
 const QUICK_ANSWER: Duration = Duration::from_secs(5);
 
-/// Where the ST25R100's two antennas are: RFO2 under the top of the head, RFO1 in the beak, as an
-/// e-ink display written with `nfcd eink write` found them on duck-d556 (2026-11-16).
+/// Where the ST25R100's two antennas are: RFO2 under the top of the head, RFO1 in the beak. Found
+/// on two robots (2026-11-16): an e-ink display written with `nfcd eink write` on duck-d556, and a
+/// tag touched to each on cream-dvt-usine, `tag in the field` saying which antenna saw it.
 ///
-/// **Not settled.** A face-board-v1 touched with a tag earlier read the other way round, and so
-/// did `nfc-test` on duck-d325 (`NFC_ANT=1`, RFO1, wrote a display on the head). Whether boards
-/// differ or one of those readings was wrong is still to be checked on other robots: touch each
-/// antenna with `nfcd` running and read `place=` in `tag in the field`.
+/// The first reading, on an earlier face-board-v1, had them the other way round, and so did a
+/// `nfc-test` run on duck-d325 (`NFC_ANT=1`, RFO1, wrote a display taken to be on the head). If a
+/// robot disagrees, touch each antenna with `nfcd` running and read `antenna=` in that line.
 const HEAD: Antenna = Antenna::Two;
 const BEAK: Antenna = Antenna::One;
 
