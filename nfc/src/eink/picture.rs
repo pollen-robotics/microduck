@@ -159,6 +159,13 @@ pub fn render(image: &RgbImage, dither: Dither, blur_radius: u32) -> Vec<u8> {
     pack(&quantize(&fitted, dither))
 }
 
+/// A JPEG — the photo the sequence took — as the display takes it, dithered.
+pub fn from_jpeg(jpeg: &[u8]) -> Result<Vec<u8>, String> {
+    let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("the photo does not decode: {e}"))?;
+    Ok(render(&image.to_rgb8(), Dither::Atkinson, 0))
+}
+
 /// `nfc-test`'s picture when it is given none: the six inks as vertical bars in a 4-pixel black
 /// frame, which shows every colour and every edge of the panel.
 pub fn test_pattern() -> RgbImage {

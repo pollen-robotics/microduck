@@ -286,7 +286,7 @@ fn main() -> std::process::ExitCode {
 /// `nfcd eink write`: the picture rendered, the display found on the antenna, written step by
 /// step, the field off at the end.
 fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
-    use nfc::eink::{Link, Progress, Settings, Writer, picture};
+    use nfc::eink::{Joined, Progress, Settings, Writer, picture};
     let fail = |why: String| {
         tracing::error!(%why, "not written");
         std::process::ExitCode::FAILURE
@@ -323,8 +323,8 @@ fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
     tracing::info!(?antenna, on = ?args.on, "waiting for a display");
     let until = Instant::now() + Duration::from_secs(args.find_within);
     let outcome = loop {
-        let e = match Link::open(&mut chip, args.fwi) {
-            Ok(link) => break Ok(link),
+        let e = match Joined::open(&mut chip, args.fwi) {
+            Ok(joined) => break Ok(joined),
             Err(e) => e,
         };
         if Instant::now() >= until {
@@ -347,8 +347,8 @@ fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
         }
         sleep(Duration::from_millis(100));
     };
-    let mut link = match outcome {
-        Ok(link) => link,
+    let mut joined = match outcome {
+        Ok(joined) => joined,
         Err(why) => return fail(why),
     };
     tracing::info!(fwi = args.fwi, "display found");
@@ -363,7 +363,7 @@ fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
     let started = Instant::now();
     let mut shown = None;
     let result = loop {
-        match writer.step(&mut link, Instant::now()) {
+        match writer.step(&mut joined.on(&mut chip), Instant::now()) {
             Ok(Progress::Done) => break Ok(()),
             Ok(progress) => {
                 let stage = std::mem::discriminant(&progress);
@@ -594,10 +594,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
                     tracing::warn!(tag = %id, "e-ink in the beak — it starts nothing there");
                 } else {
                     tracing::warn!(tag = %id, "e-ink on the head — hold still");
-                    report_photo(photo::on_touch(&mut Session {
-                        sockets: &mut *robot,
-                        chip: &mut *chip,
-                    }));
+                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
                 }
                 continue_after(period, start);
                 continue;
@@ -615,10 +612,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
                 Ok(Ok(records)) if photo::in_records(&records) => {
                     tracing::warn!(tag = %id, "photo tag touched — hold still");
-                    report_photo(photo::on_touch(&mut Session {
-                        sockets: &mut *robot,
-                        chip: &mut *chip,
-                    }));
+                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
                 }
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
                     match ModeTag::in_records(&records) {
@@ -1162,7 +1156,29 @@ impl Driver for Sockets {
 struct Session<'a> {
     sockets: &'a mut Sockets,
     chip: &'a mut Chip,
+    /// The photo being written to the display in the beak, once begun.
+    writing: Option<(eink::Writer, eink::Joined)>,
+    started: Instant,
 }
+
+impl<'a> Session<'a> {
+    fn new(sockets: &'a mut Sockets, chip: &'a mut Chip) -> Self {
+        Session {
+            sockets,
+            chip,
+            writing: None,
+            started: Instant::now(),
+        }
+    }
+}
+
+/// The time the display has for each block while the sequence writes it: FWT at FWI 11, 619 ms.
+/// Not the bench's 14 (4.9 s): one exchange blocks the head, and a display gone silent is asked
+/// three times before the step fails — under two seconds at 11, the most the idle look-around
+/// lets the head go unsent before it takes it back and yawns, beak open.
+const SEQUENCE_FWI: u8 = 11;
+/// How long the display may take to redraw in the sequence: it took ~50 s on the bench.
+const SEQUENCE_REFRESH_WITHIN: Duration = Duration::from_secs(75);
 
 impl photo::Driver for Session<'_> {
     fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
@@ -1250,8 +1266,35 @@ impl photo::Driver for Session<'_> {
         photo::save(&self.sockets.photos, &name, jpeg)
     }
 
+    fn eink_begin(&mut self, jpeg: &[u8]) -> Result<(), String> {
+        let picture = eink::picture::from_jpeg(jpeg)?;
+        if let Chip::Spi(c) = &mut *self.chip {
+            c.set_proto(Proto::A)
+                .and_then(|()| c.set_antenna(BEAK))
+                .map_err(|e| e.to_string())?;
+        }
+        let joined = eink::Joined::open(&mut *self.chip, SEQUENCE_FWI)
+            .map_err(|e| format!("the display: {e}"))?;
+        let settings = eink::Settings {
+            refresh_within: SEQUENCE_REFRESH_WITHIN,
+            ..eink::Settings::default()
+        };
+        self.writing = Some((eink::Writer::new(picture, settings), joined));
+        Ok(())
+    }
+
+    fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
+        let (writer, joined) = self.writing.as_mut().ok_or("no write begun")?;
+        let progress = writer.step(&mut joined.on(&mut *self.chip), Instant::now())?;
+        Ok((progress, writer.idle(Instant::now())))
+    }
+
     fn sleep(&mut self, d: Duration) {
         sleep(d);
+    }
+
+    fn now(&mut self) -> Duration {
+        self.started.elapsed()
     }
 }
 

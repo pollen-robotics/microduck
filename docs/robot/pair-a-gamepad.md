@@ -66,20 +66,21 @@ picture: it starts the robot if Start was not pressed, stays still, standing or 
 lifts its head (higher when seated), counts down five seconds with the flashlight blinking dimly (3
 %) and faster and faster, flashes at 20 % with a quack as it takes the photo, then sits if it was
 standing and opens its beak a little. It waits up to a minute for a display in its beak, closes it
-on it for five seconds, rolling its head side to side in small quick moves with a few short
-quacks, then lowers its head and opens its beak wide to let it fall with a tiny cute retch (the
-`bwep` sound), and brings its head back up. The idle look-around is held off throughout. The
-picture is kept in `/var/lib/robot/photos`, named for the local time. The sequence is in
-`nfc/src/photo.rs`, and how a display is recognised (any ISO 14443-4 card) and written in
-`nfc/src/eink.rs`. A display starts it from the top of the head only; in the beak it starts nothing,
-and is what the sequence waits for. Every touch logs where it was seen (`tag in the field`,
-`place="head"`).
+on it, and writes the photo to it: its head rolls side to side in small quick moves with a few
+short quacks while the picture goes over, then holds still with a soft coo now and then while the
+display redraws — about a minute in all. Then it lowers its head and opens its beak wide to let it
+fall with a tiny cute retch (the `bwep` sound; a low tock if the photo did not make it), and brings
+its head back up. The idle look-around is held off throughout. The picture is kept in
+`/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how
+a display is recognised (any ISO 14443-4 card) and written in `nfc/src/eink.rs`. A display starts
+it from the top of the head only; in the beak it starts nothing, and is what the sequence waits
+for. Every touch logs where it was seen (`tag in the field`, `place="head"`).
 
-The sequence does not write the photo to the display yet. From the bench it can be done by hand:
-with the service stopped (`sudo systemctl stop nfcd`, it holds the reader),
-`sudo /opt/robot/daemon/current/bin/nfcd eink write picture.jpg --on beak` writes a JPEG or PNG to
-the display in the beak (`--on head` for the top of the head; no picture, a test pattern) and
-redraws it. Keep the display still until it logs `written and drawn`, then start the service again.
+From the bench, a picture can be written by hand: with the service stopped (`sudo systemctl stop
+nfcd`, it holds the reader), `sudo /opt/robot/daemon/current/bin/nfcd eink write picture.jpg --on
+beak` writes a JPEG or PNG to the display in the beak (`--on head` for the top of the head; no
+picture, a test pattern) and redraws it. Keep the display still until it logs `written and drawn`,
+then start the service again.
 
 ## Check it
 

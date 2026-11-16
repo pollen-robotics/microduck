@@ -26,12 +26,15 @@
 //!    ([`TAKE_OPEN`]): enough for the display, and no more.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
-//! 8. It holds it [`KEEP`], rolling its head side to side in small quick moves with a short
-//!    quack now and then ([`wiggle`]): where the photo will be written to it, which is not done
-//!    yet.
-//! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch,
-//!    closes it [`DROP`] later, and brings its head back up to the centre.
-//!    No display in time, and it just closes its beak.
+//! 8. It writes the photo to the display ([`crate::eink`]), a step at a time ([`write`]). While
+//!    the picture goes over, it rolls its head side to side in small quick moves with a short
+//!    quack now and then; while the display redraws, which is most of the time and when it has
+//!    the least power to spare, the head holds still and a soft [`HUM`] comes every [`HUM_EVERY`].
+//!    It gives up after [`WRITE_WITHIN`]. With no photo to write, it only rolls its head for
+//!    [`KEEP`].
+//! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch —
+//!    or a [`LET_GO_FAILED`] when the write failed — closes it [`DROP`] later, and brings its head
+//!    back up to the centre. No display in time, and it just closes its beak.
 //!
 //! **The idle look-around is kept off from the first look to the end.** It starts after two
 //! seconds without a `robot.head`, and it is what yawns: a yawn opens the beak, and a glance moves
@@ -50,6 +53,7 @@ use std::time::Duration;
 
 use duck_ipc_proto as proto;
 
+use crate::eink;
 use crate::ndef::Record;
 
 /// What the tag is written with.
@@ -80,8 +84,13 @@ pub const LOOK_DOWN: proto::LookParams = proto::LookParams {
 pub const EINK_WITHIN: Duration = Duration::from_secs(60);
 /// How often the beak's antenna is asked meanwhile.
 const EINK_POLL: Duration = Duration::from_millis(300);
-/// The display held in the closed beak: where the photo will be written.
+/// The display held in the closed beak, rolling, when there is no photo to write to it.
 pub const KEEP: Duration = Duration::from_secs(5);
+/// The most a write may take, the redraw included: about 55 s on the bench (2026-11-16).
+pub const WRITE_WITHIN: Duration = Duration::from_secs(90);
+/// While the display redraws: a drowsy, breathy coo, now and then.
+pub const HUM: proto::SoundTag = proto::SoundTag::Coo;
+pub const HUM_EVERY: Duration = Duration::from_secs(6);
 /// How far the head rolls each side while it holds the display, radians (about 8°).
 const ROLL: f64 = 0.14;
 /// One roll left and back right.
@@ -93,6 +102,8 @@ const ROLL_QUACK: proto::SoundTag = proto::SoundTag::Chirp;
 const QUACK_EVERY_SIDES: u32 = 5;
 /// The sound as the beak lets the display go: a tiny cute retch.
 const LET_GO: proto::SoundTag = proto::SoundTag::Bwep;
+/// The sound as the beak lets go of a display the photo did not reach: a low tock.
+const LET_GO_FAILED: proto::SoundTag = proto::SoundTag::Peck;
 /// After the beak starts opening wide, before [`LET_GO`]: for the beak's motor to stop.
 const LET_GO_AFTER: Duration = Duration::from_millis(300);
 /// How far the beak opens for the display to go in: a share of wide open.
@@ -198,8 +209,16 @@ pub trait Driver {
     fn eink_in_beak(&mut self) -> Result<bool, String>;
     /// Keep the picture; where it went.
     fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String>;
+    /// Start writing `jpeg` to the display in the beak, just found there.
+    fn eink_begin(&mut self, jpeg: &[u8]) -> Result<(), String>;
+    /// One step of that write — an exchange with the display, unless it is not yet time for the
+    /// next: where the write is, and how long until it has something to do.
+    fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String>;
     /// Wait. A method so a test can run the sequence without waiting through it.
     fn sleep(&mut self, d: Duration);
+    /// Time since any fixed point, which moves on with [`Driver::sleep`] and with the work
+    /// between: what paces the head while the display is written.
+    fn now(&mut self) -> Duration;
 }
 
 /// How a touch ended, for the journal and the tests.
@@ -282,9 +301,13 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     let shot = robot.capture();
     let _ = robot.flashlight(0.0);
 
-    let outcome = match shot.and_then(|jpeg| robot.save(&jpeg)) {
-        Ok(path) => Outcome::Taken(path),
-        Err(why) => Outcome::NoPhoto(why),
+    // An unsaved photo is still written to the display; no photo, and there is nothing to write.
+    let (outcome, photo) = match shot {
+        Ok(jpeg) => match robot.save(&jpeg) {
+            Ok(path) => (Outcome::Taken(path), Some(jpeg)),
+            Err(why) => (Outcome::NoPhoto(why), Some(jpeg)),
+        },
+        Err(why) => (Outcome::NoPhoto(why), None),
     };
 
     // Sit, then the beak wide open. The head is held throughout, so the look-around stays off.
@@ -322,12 +345,22 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     }
     tracing::warn!("e-ink in the beak");
     let _ = robot.mouth(0.0);
-    wiggle(robot, head, KEEP);
-    // TEMPORARY, to compare: the same sound with the head up, the beak shut and nothing moving.
-    if robot.sound(LET_GO).is_ok() {
-        tracing::warn!(sound = LET_GO.as_str(), "test: the let-go sound, head up");
-    }
-    hold(robot, head, Duration::from_millis(1500));
+    let let_go = match &photo {
+        Some(jpeg) => match write(robot, head, jpeg) {
+            Ok(took) => {
+                tracing::warn!(?took, "the photo is on the e-ink");
+                LET_GO
+            }
+            Err(why) => {
+                tracing::error!(%why, "the photo is not on the e-ink");
+                LET_GO_FAILED
+            }
+        },
+        None => {
+            wiggle(robot, head, KEEP);
+            LET_GO
+        }
+    };
 
     // Head down, beak open: the display falls. Then the beak closes and the head comes straight
     // back up to the centre, before it is let go.
@@ -339,9 +372,9 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     let _ = robot.mouth(1.0);
     // The beak's motor first, then the sound: started together, the motor drowns most of it.
     hold(robot, down, LET_GO_AFTER);
-    match robot.sound(LET_GO) {
-        Ok(()) => tracing::warn!(sound = LET_GO.as_str(), "letting the e-ink go"),
-        Err(why) => tracing::warn!(%why, sound = LET_GO.as_str(), "letting the e-ink go, silently"),
+    match robot.sound(let_go) {
+        Ok(()) => tracing::warn!(sound = let_go.as_str(), "letting the e-ink go"),
+        Err(why) => tracing::warn!(%why, sound = let_go.as_str(), "letting the e-ink go, silently"),
     }
     hold(robot, down, DROP - LET_GO_AFTER);
     let _ = robot.mouth(0.0);
@@ -349,29 +382,46 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     outcome
 }
 
-/// Roll the head side to side around `head` for `d`, [`ROLL`] each way every [`ROLL_PERIOD`],
-/// then settle it back on `head`, with a [`ROLL_QUACK`] every [`QUACK_EVERY_SIDES`] sides. Sent
-/// every [`ROLL_STEP`], so the look-around stays off too.
-fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
-    let mut t = Duration::ZERO;
-    let mut sides = 0;
-    while t < d {
+/// The head rolling side to side around a pose, [`ROLL`] each way every [`ROLL_PERIOD`], with a
+/// [`ROLL_QUACK`] every [`QUACK_EVERY_SIDES`] sides it reaches.
+#[derive(Default)]
+struct Roll {
+    sides: u32,
+}
+
+impl Roll {
+    /// The head `t` into the roll, quacking when a quack is due.
+    fn at(
+        &mut self,
+        robot: &mut dyn Driver,
+        head: proto::HeadParams,
+        t: Duration,
+    ) -> proto::HeadParams {
         let turns = t.as_secs_f64() / ROLL_PERIOD.as_secs_f64();
         // A side is reached at a quarter turn, then every half turn.
         let side = (2.0 * turns + 0.5).floor() as u32;
-        if side > sides {
-            sides = side;
+        if side > self.sides {
+            self.sides = side;
             if (side - 1).is_multiple_of(QUACK_EVERY_SIDES)
                 && let Err(why) = robot.sound(ROLL_QUACK)
             {
                 tracing::info!(%why, "robot.sound");
             }
         }
-        let phase = std::f64::consts::TAU * turns;
-        let rolled = proto::HeadParams {
-            head_roll: head.head_roll + ROLL * phase.sin(),
+        proto::HeadParams {
+            head_roll: head.head_roll + ROLL * (std::f64::consts::TAU * turns).sin(),
             ..head
-        };
+        }
+    }
+}
+
+/// Roll the head around `head` for `d`, then settle it back on `head`. Sent every [`ROLL_STEP`],
+/// so the look-around stays off too.
+fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
+    let mut roll = Roll::default();
+    let mut t = Duration::ZERO;
+    while t < d {
+        let rolled = roll.at(robot, head, t);
         if let Err(why) = robot.head(rolled) {
             tracing::info!(%why, "robot.head");
         }
@@ -382,6 +432,56 @@ fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
     if let Err(why) = robot.head(head) {
         tracing::info!(%why, "robot.head");
     }
+}
+
+/// Write `jpeg` to the display in the beak, the head around `head` between the steps: rolling
+/// while the picture goes over, still while the display draws, with a [`HUM`] now and then. Sent
+/// every [`ROLL_STEP`] at most, and between two steps — never in the middle of one, so a step is
+/// never made longer for it. How long it took, or why it failed.
+fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result<Duration, String> {
+    robot.eink_begin(jpeg)?;
+    let start = robot.now();
+    let mut roll = Roll::default();
+    let mut sent: Option<Duration> = None;
+    let mut hummed: Option<Duration> = None;
+    let result = loop {
+        let (progress, idle) = match robot.eink_step() {
+            Ok((eink::Progress::Done, _)) => break Ok(robot.now() - start),
+            Ok(step) => step,
+            Err(why) => break Err(why),
+        };
+        let now = robot.now();
+        let t = now - start;
+        if t >= WRITE_WITHIN {
+            break Err(format!("not done after {WRITE_WITHIN:?}"));
+        }
+        let pose = if progress == eink::Progress::Refreshing {
+            if hummed.is_none_or(|at| now - at >= HUM_EVERY) {
+                hummed = Some(now);
+                if let Err(why) = robot.sound(HUM) {
+                    tracing::info!(%why, "robot.sound");
+                }
+            }
+            head
+        } else {
+            roll.at(robot, head, t)
+        };
+        if sent.is_none_or(|at| now - at >= ROLL_STEP) {
+            sent = Some(now);
+            if let Err(why) = robot.head(pose) {
+                tracing::info!(%why, "robot.head");
+            }
+        }
+        // Idle until the write has something to do, but never past the next head.
+        let wait = idle.min(ROLL_STEP);
+        if !wait.is_zero() {
+            robot.sleep(wait);
+        }
+    };
+    if let Err(why) = robot.head(head) {
+        tracing::info!(%why, "robot.head");
+    }
+    result
 }
 
 /// Resend the head for `d`, often enough that the idle look-around never starts.
@@ -589,7 +689,23 @@ mod tests {
         looks: Vec<f64>,
         /// The roll of every `robot.head`.
         rolls: Vec<f64>,
+        /// Every sound, in order.
+        sounds: Vec<proto::SoundTag>,
+        /// The clock: every sleep, and every exchange with the display.
+        clock: Duration,
+        /// The write: steps taken, when the next may ask, and the step it fails at, if any.
+        steps: usize,
+        next_ask: Duration,
+        write_fails_at: Option<usize>,
+        /// The roll of every `robot.head` sent while the display was drawing.
+        rolls_drawing: Vec<f64>,
+        drawing: bool,
     }
+
+    /// The bench's write: 116 packets of ~30 ms, then a redraw asked about every 500 ms for 20 s.
+    const PACKETS: usize = 116;
+    const PACKET_TAKES: Duration = Duration::from_millis(30);
+    const ASKS: usize = 40;
 
     impl Default for Fake {
         fn default() -> Self {
@@ -608,13 +724,32 @@ mod tests {
                 sit_refused: None,
                 looks: Vec::new(),
                 rolls: Vec::new(),
+                sounds: Vec::new(),
+                clock: Duration::ZERO,
+                steps: 0,
+                next_ask: Duration::ZERO,
+                write_fails_at: None,
+                rolls_drawing: Vec::new(),
+                drawing: false,
             }
         }
     }
 
+    impl Fake {
+        fn pass(&mut self, d: Duration) {
+            self.clock += d;
+            if !self.holding {
+                return;
+            }
+            self.since_head += d;
+            self.head_gap = self.head_gap.max(self.since_head);
+        }
+    }
+
     impl Driver for Fake {
-        fn sound(&mut self, _: proto::SoundTag) -> Result<(), String> {
+        fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
             self.calls.push("quack".into());
+            self.sounds.push(tag);
             Ok(())
         }
         fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
@@ -655,6 +790,9 @@ mod tests {
         fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
             self.calls.push("head".into());
             self.rolls.push(head.head_roll);
+            if self.drawing {
+                self.rolls_drawing.push(head.head_roll);
+            }
             self.since_head = Duration::ZERO;
             Ok(())
         }
@@ -686,13 +824,38 @@ mod tests {
             self.calls.push("save".into());
             Ok("/photos/now.jpg".into())
         }
+        fn eink_begin(&mut self, jpeg: &[u8]) -> Result<(), String> {
+            assert_eq!(jpeg, b"jpeg");
+            self.calls.push("write".into());
+            Ok(())
+        }
+        fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
+            if self.write_fails_at == Some(self.steps) {
+                return Err("the display stopped answering".into());
+            }
+            if self.steps < PACKETS {
+                self.steps += 1;
+                self.pass(PACKET_TAKES);
+                return Ok((eink::Progress::Writing { sent: 0 }, Duration::ZERO));
+            }
+            self.drawing = true;
+            if self.clock < self.next_ask {
+                return Ok((eink::Progress::Refreshing, self.next_ask - self.clock));
+            }
+            self.steps += 1;
+            if self.steps > PACKETS + ASKS {
+                self.drawing = false;
+                return Ok((eink::Progress::Done, Duration::ZERO));
+            }
+            self.next_ask = self.clock + Duration::from_millis(500);
+            Ok((eink::Progress::Refreshing, Duration::from_millis(500)))
+        }
         fn sleep(&mut self, d: Duration) {
             self.slept += d;
-            if !self.holding {
-                return;
-            }
-            self.since_head += d;
-            self.head_gap = self.head_gap.max(self.since_head);
+            self.pass(d);
+        }
+        fn now(&mut self) -> Duration {
+            self.clock
         }
     }
 
@@ -757,6 +920,7 @@ mod tests {
                 "mouth 0.35",
                 "eink",
                 "mouth 0",
+                "write",
                 "quacks",
                 "look",
                 "mouth 1",
@@ -853,24 +1017,75 @@ mod tests {
 
     /// The display held in the beak: the head rolls both ways, never past [`ROLL`], and ends level.
     #[test]
-    fn the_head_rolls_while_it_holds_the_display() {
-        let mut robot = Fake::default();
+    fn with_no_photo_the_head_rolls_while_it_holds_the_display() {
+        let mut robot = Fake {
+            camera: Err("no camera".into()),
+            ..Fake::default()
+        };
         on_touch(&mut robot);
+        assert!(!robot.calls.contains(&"write".to_string()));
         let max = robot.rolls.iter().cloned().fold(f64::MIN, f64::max);
         let min = robot.rolls.iter().cloned().fold(f64::MAX, f64::min);
         assert!((ROLL * 0.9..=ROLL).contains(&max), "{max}");
         assert!((-ROLL..=-ROLL * 0.9).contains(&min), "{min}");
         assert_eq!(*robot.rolls.last().unwrap(), 0.0);
-        // A few quacks, besides the first quack, the shutter's and the two retches.
-        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 4;
+        // A few quacks, besides the first quack, the shutter's and the retch.
+        let quacks = robot.calls.iter().filter(|c| *c == "quack").count() - 3;
         assert_eq!(quacks, 4);
         // No display, no rolling.
         let mut robot = Fake {
             eink_after: None,
+            camera: Err("no camera".into()),
             ..Fake::default()
         };
         on_touch(&mut robot);
         assert!(robot.rolls.iter().all(|r| *r == 0.0));
+    }
+
+    /// The photo goes onto the display: the head rolls while the picture goes over, holds still
+    /// with a coo now and then while it draws, and the beak lets it go with the retch.
+    #[test]
+    fn the_photo_is_written_to_the_display_in_the_beak() {
+        let mut robot = Fake::default();
+        assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
+        assert_eq!(robot.steps, PACKETS + ASKS + 1, "written to the end");
+        let max = robot.rolls.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(max > ROLL * 0.9, "it rolled while writing: {max}");
+        assert!(
+            robot.rolls_drawing.iter().all(|r| *r == 0.0),
+            "still while drawing"
+        );
+        let hums = robot.sounds.iter().filter(|s| **s == HUM).count();
+        // 20 s of drawing, one every 6 s from its start.
+        assert_eq!(hums, 4);
+        assert_eq!(*robot.sounds.last().unwrap(), LET_GO);
+        assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    /// The head goes out between two steps, not on a timer of its own: a 30 ms packet is followed
+    /// by the next one straight away, and the head only every 50 ms of them.
+    #[test]
+    fn the_head_does_not_slow_the_write() {
+        let mut robot = Fake::default();
+        on_touch(&mut robot);
+        let heads_writing = robot.rolls.len() - robot.rolls_drawing.len();
+        // ~3.5 s of packets: about 70 heads, not one a packet.
+        assert!(heads_writing < PACKETS, "{heads_writing}");
+    }
+
+    #[test]
+    fn a_failed_write_still_lets_the_display_go_with_a_tock() {
+        let mut robot = Fake {
+            write_fails_at: Some(50),
+            ..Fake::default()
+        };
+        assert!(matches!(on_touch(&mut robot), Outcome::Taken(_)));
+        assert_eq!(*robot.sounds.last().unwrap(), LET_GO_FAILED);
+        let shape = shape(&robot.calls);
+        assert_eq!(
+            &shape[shape.len() - 4..],
+            ["look", "mouth 1", "quack", "mouth 0"]
+        );
     }
 
     /// On the robot the sit was refused, and the sequence stopped with the beak open and the

@@ -473,21 +473,32 @@ fn said(answer: &Result<Vec<u8>>) -> String {
     }
 }
 
-/// A display on a reader: selected, in ISO 14443-4, every block given [`crate::isodep::fwt`] of
-/// `fwi`.
-pub struct Link<'a, R: Reader + ?Sized> {
-    chip: &'a mut R,
+/// A display selected and in ISO 14443-4, every block given [`crate::isodep::fwt`] of `fwi`. It
+/// holds no reader, so it can be kept between two [`Writer::step`]s while the reader is lent out
+/// for each: [`Joined::on`] is the [`Card`] a step talks to.
+pub struct Joined {
     dep: IsoDep,
     fwi: u8,
 }
 
-impl<'a, R: Reader + ?Sized> Link<'a, R> {
+impl Joined {
     /// The display in the field, selected with the field reset first, as any tag is.
-    pub fn open(chip: &'a mut R, fwi: u8) -> Result<Self> {
+    pub fn open<R: Reader + ?Sized>(chip: &mut R, fwi: u8) -> Result<Self> {
         let found = tag::select_tag(chip)?;
         let dep = join(chip, found.sak, fwi)?;
-        Ok(Link { chip, dep, fwi })
+        Ok(Joined { dep, fwi })
     }
+
+    /// This display on `chip`, for one step.
+    pub fn on<'a, R: Reader + ?Sized>(&'a mut self, chip: &'a mut R) -> Link<'a, R> {
+        Link { chip, joined: self }
+    }
+}
+
+/// A [`Joined`] display and the reader it is on: the [`Card`] [`Writer`] talks to.
+pub struct Link<'a, R: Reader + ?Sized> {
+    chip: &'a mut R,
+    joined: &'a mut Joined,
 }
 
 fn join<R: Reader + ?Sized>(chip: &mut R, sak: u8, fwi: u8) -> Result<IsoDep> {
@@ -503,15 +514,15 @@ fn join<R: Reader + ?Sized>(chip: &mut R, sak: u8, fwi: u8) -> Result<IsoDep> {
 
 impl<R: Reader + ?Sized> Card for Link<'_, R> {
     fn apdu(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
-        self.dep.exchange(&mut *self.chip, apdu)
+        self.joined.dep.exchange(&mut *self.chip, apdu)
     }
 
     fn rejoin(&mut self) -> Result<()> {
         // A display that browned out has forgotten the session and will not answer this; one that
         // only lost a frame goes to HALT, which the WUPA wakes it from.
-        let _ = self.dep.deselect(&mut *self.chip);
+        let _ = self.joined.dep.deselect(&mut *self.chip);
         let found = tag::select_in_field(&mut *self.chip)?;
-        self.dep = join(&mut *self.chip, found.sak, self.fwi)?;
+        self.joined.dep = join(&mut *self.chip, found.sak, self.joined.fwi)?;
         Ok(())
     }
 }
