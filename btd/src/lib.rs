@@ -31,10 +31,13 @@
 //! that decodes it.
 
 #[cfg(target_os = "linux")]
+pub mod agent;
+#[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod chorale;
 pub mod link;
 pub mod pairing;
 pub mod route;
+pub mod secure;
 pub mod session;
 pub mod upstream;

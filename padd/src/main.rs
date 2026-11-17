@@ -30,17 +30,19 @@
 //! ```text
 //! A (South)       sit ↔ stand
 //! B (East)        ground pick
-//! X / Y, LB / RB  nothing, until a skill is bound there
+//! LB / RB        yes / no (emotions)
+//! Y (North)       excited (emotion)
+//! X (West)        nothing, until a skill is bound there
 //! RT / LT         mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! D-pad up        head mode — the sticks pose the head, the body holds still
 //! D-pad right     head + move — left stick walks and turns, right stick looks around
 //! D-pad left      move — the sticks walk, strafe and turn
 //! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
-//! Home            flashlight on / off (a board with one)
+//! Home            tap: flashlight on / off (a board with one); held does nothing
 //! Start           first press stands up, then toggles the policy
 //! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
-//! Select, 2–4 s   let go: sit, rest pose, then torque off and every servo rebooted
-//! Select, 4 s     sit, rest pose, then power off
+//! Select, 2 s     still held: sit, rest pose, then torque off and every servo rebooted
+//! Select, 4 s     still held: power off once that rest has ended
 //! ```
 //!
 //! The D-pad *selects* a mode rather than toggling one, so a press always lands where its arrow
@@ -48,16 +50,20 @@
 //! active — a robot that keeps walking because you started posing its head is a bad surprise —
 //! and leaving a mode puts back what it moved: the body snaps to nominal, the head re-centres.
 //!
-//! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), not here: this
-//! process sends raw targets, so every client gets the same feel.
+//! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), so every client gets the
+//! same feel. One exception is the pad's own: the head sticks go through `[pad_head] expo` (a
+//! response curve, for fine movements) and `max_speed` (a cap on how fast they move the head
+//! target, so a full snap glides rather than jumps) in `pad-map`, because that is how a thumb on
+//! a stick should feel, not how every client's head should.
 //!
 //! ## Roller mode
 //!
 //! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
 //! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
-//! heading — and B triggers the crouch that lives in the ground-pick slot. The other
-//! skills ride along on wheels, as the rebased roller line has them. Switching between walk and
-//! roller is `robot.setMode`; it is no longer on the pad.
+//! heading — and B triggers the crouch that lives in the ground-pick slot. A and X run nothing
+//! on wheels, whatever `[pad]` binds to them; the other skills ride along, as the rebased roller
+//! line has them. Switching between walk and roller is `robot.setMode`; it is no longer on the
+//! pad.
 //!
 //! ## On the robot, this runs itself
 //!
@@ -101,6 +107,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs};
+use pad_map::engage::{Engage, Engagement};
 use pad_map::{
     BINDINGS_POLL, Buttons, Config, Continuous, Mapper, Out, Overrides, PadFrame, PadLoss,
     PadLossAction,
@@ -278,23 +285,39 @@ fn main() -> std::process::ExitCode {
 
     let mut next_id = 1u64;
 
+    // Named, so `robot.state.move.source` says when the pad is the one driving — which is how the
+    // autonomous brain knows to step aside (`docs/design/autonomous.md` §3). A robot too old to
+    // take the name refuses the hello; that is logged and changes nothing about driving.
+    let hello = proto::Call::Hello(proto::HelloParams {
+        api_version: proto::API_VERSION,
+        client: Some("padd".to_owned()),
+    });
+    if let Err(e) = request(&mut stream, &mut next_id, &hello) {
+        tracing::error!(error = %e, "cannot reach robotd");
+        return std::process::ExitCode::FAILURE;
+    }
+
     // Which robot is this? A roller duck wants the roller stick shaping. Asked at startup and then
     // again with the config check below, so a `robot.setMode` from anywhere — the pad no longer
     // switches modes itself — changes the stick shaping within a second.
-    let roller = match ask_roller(&mut stream, &mut next_id) {
-        Ok(roller) => roller.unwrap_or(false),
+    let mode = match ask_mode(&mut stream, &mut next_id) {
+        Ok(mode) => mode.unwrap_or_default(),
         Err(e) => {
             tracing::error!(error = %e, "mode request failed");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let roller = mode.mode == "roller";
+    // The duck on its own: while it is on, the pad keeps quiet until touched. `robot.mode` says,
+    // so an NFC tag switching it is heard within a second, like soccer mode.
+    let mut autonomy_on = mode.autonomous;
     tracing::warn!(
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
         "driving — A sit, B ground pick, triggers mouth; D-pad up head, \
          right head + move, left move, down body + head; Start stands up then toggles the policy, \
-         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
+         Start (1.5s) home pose; Select (2s) rest, Select (4s) power off"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -315,10 +338,13 @@ fn main() -> std::process::ExitCode {
     // What the pad means: the mode, the holds, the trigger edges and whether the robot is up.
     // `pad_map`, so that `netpadd` maps a pad exactly as this does.
     let mut mapper = Mapper::new();
+    mapper.set_soccer(mode.soccer);
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     // A driving pad that went away: the robot sits after a second — see `pad_map::loss`.
     let mut pad_loss = PadLoss::default();
+    // With `[autonomous] enabled`, whether the pad is the one driving — see `pad_map::engage`.
+    let mut engagement = Engagement::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -341,15 +367,27 @@ fn main() -> std::process::ExitCode {
                     tracing::warn!("controller settings reloaded");
                 }
             }
-            match ask_roller(&mut stream, &mut next_id) {
-                Ok(Some(now)) if now != config.roller => {
-                    config.roller = now;
-                    tracing::warn!(
-                        roller = config.roller,
-                        "drive mode changed — stick shaping follows"
-                    );
+            match ask_mode(&mut stream, &mut next_id) {
+                Ok(Some(mode)) => {
+                    let now = mode.mode == "roller";
+                    if now != config.roller {
+                        config.roller = now;
+                        tracing::warn!(
+                            roller = config.roller,
+                            "drive mode changed — stick shaping follows"
+                        );
+                    }
+                    // Soccer mode changes what the buttons do, and an NFC tag switches it.
+                    mapper.set_soccer(mode.soccer);
+                    if mode.autonomous != autonomy_on {
+                        tracing::warn!(
+                            on = mode.autonomous,
+                            "the duck on its own switched — the pad keeps quiet until touched while it is on"
+                        );
+                        autonomy_on = mode.autonomous;
+                    }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "mode request failed");
                     return std::process::ExitCode::FAILURE;
@@ -397,7 +435,12 @@ fn main() -> std::process::ExitCode {
                     pad_map::loss::PAD_LOST_SIT
                 );
                 driving = false;
-                pad_loss.lost(tick);
+                // A pad nobody was touching was not holding the robot — the duck's own brain was.
+                // Losing it is no reason to sit the robot down.
+                if engagement.engaged() || !autonomy_on {
+                    pad_loss.lost(tick);
+                }
+                engagement.reset();
             }
             // Heard, because whoever lost the pad is looking at the robot, not the journal — but only
             // once the loss has lasted to the sit: a blip on bad Wi-Fi is not worth a quack.
@@ -484,6 +527,39 @@ fn main() -> std::process::ExitCode {
             has_imu: tap.as_ref().is_some_and(|t| t.has_imu()),
         };
 
+        // With the duck's own brain on, the pad says nothing until somebody touches it, and lets go
+        // `pad_idle_s` after the last touch. A press is a touch, so it engages the pad in the same
+        // tick it is mapped.
+        let touch = pad_map::engage::touched(&frame_in, config.axes.deadzone);
+        match engagement.tick(touch, tick, autonomy_on, &config.autonomy) {
+            Engage::Drive => {}
+            Engage::LetGo => {
+                // Stop on the pad's word rather than the deadman, and close the beak; then the
+                // next engagement goes out on its first tick rather than waiting out a heartbeat.
+                mapper.pad_gone();
+                continuous = Continuous::default();
+                for call in [
+                    proto::Call::RobotMove(proto::MoveParams::default()),
+                    proto::Call::RobotMouth(proto::MouthParams { open: 0.0 }),
+                ] {
+                    if let Err(e) = notify(&mut stream, &call) {
+                        tracing::error!(error = %e, call = call.method(), "send failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+                if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+                continue;
+            }
+            Engage::Silent => {
+                if let Some(remaining) = period.checked_sub(tick.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+                continue;
+            }
+        }
+
         // The mapping says what to send; this sends it, in its order. A failed write ends the
         // process as it always has, and systemd brings back a `padd` with a fresh connection.
         mapper.tick(&frame_in, &config, tick, &mut out, &mut frame);
@@ -519,13 +595,15 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Whether this robot is on wheels, by asking it. `None` for an answer that did not say.
-fn ask_roller(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<Option<bool>> {
+/// The robot's mode — on wheels or not, and soccer mode — by asking it. `None` for an answer
+/// that did not say.
+fn ask_mode(
+    stream: &mut UnixStream,
+    next_id: &mut u64,
+) -> std::io::Result<Option<proto::ModeResult>> {
     let answer = request(stream, next_id, &proto::Call::RobotMode)?;
     pad_map::report(&proto::Call::RobotMode, answer.as_ref());
-    Ok(answer
-        .and_then(|answer| answer.result_as::<proto::ModeResult>().ok())
-        .map(|mode| mode.mode == "roller"))
+    Ok(answer.and_then(|answer| answer.result_as::<proto::ModeResult>().ok()))
 }
 
 /// Play one of the robot's sounds, best effort: a cue, not something worth stopping for.

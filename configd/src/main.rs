@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use configd::net::{FakeNet, Net};
@@ -190,6 +191,37 @@ fn hostname() -> String {
         .unwrap_or_else(|| "robot".to_owned())
 }
 
+/// How often bonded-but-disconnected pads are re-paged while there is reason to think they are
+/// in reach. A classic `Connect()` against a pad that is off burns its ~5 s page timeout, so this
+/// cannot be much tighter.
+const PAD_RECONNECT_INTERVAL: Duration = Duration::from_secs(12);
+
+/// Where the interval stops doubling once pages keep missing.
+///
+/// A pad left switched off in a drawer is the steady state, and every page holds the radio for
+/// its timeout — on a chip that carries the Wi-Fi too, so it comes out of the video. Doubling to
+/// two minutes leaves that at a few percent of airtime. Nothing is lost by the wait: a classic
+/// pad switched back on pages the robot by itself, which is what resets this to the floor.
+const PAD_RECONNECT_MAX_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Pairing bonds a pad but nothing chases the link afterwards: a classic pad that drops right
+/// after pairing — the Pro Controller clone does — would stay down until someone paged it by
+/// hand. This sweep is the someone.
+async fn pad_reconnect_loop(pads: Arc<dyn Pads>) {
+    let mut interval = PAD_RECONNECT_INTERVAL;
+    loop {
+        tokio::time::sleep(interval).await;
+        interval = match pads.reconnect_bonded().await {
+            Ok(true) => (interval * 2).min(PAD_RECONNECT_MAX_INTERVAL),
+            Ok(false) => PAD_RECONNECT_INTERVAL,
+            Err(e) => {
+                tracing::debug!(error = %e, "pad reconnect sweep failed");
+                PAD_RECONNECT_INTERVAL
+            }
+        };
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -250,12 +282,30 @@ async fn main() -> ExitCode {
     };
     tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
-    tokio::spawn(configd::indicator::run(Arc::clone(&net)));
+    // The label serial and the PIN a user reads off it. Absent on a Zero 3W and on an unprogrammed
+    // beta, which keep the factory PIN — said at `warn`, because that PIN is public.
+    let mut store = Store::new(args.state_dir.join("config.json"), default_name);
+    let label_serial = configd::identity::label_serial();
+    match label_serial
+        .as_deref()
+        .and_then(configd::identity::default_pin)
+    {
+        Some(pin) => store = store.with_default_pin(pin),
+        None => tracing::warn!(
+            path = configd::identity::LABEL_EEPROM_PATH,
+            "no label serial in the ID EEPROM; the default pairing PIN is the public factory one"
+        ),
+    }
+    tracing::info!(label_serial = ?label_serial, "label");
+
+    tokio::spawn(configd::indicator::run(Arc::clone(&net), Arc::clone(&pads)));
+    tokio::spawn(pad_reconnect_loop(Arc::clone(&pads)));
+    tokio::spawn(configd::wifi_ssh::run());
 
     let service = Arc::new(Service {
         net,
         pads,
-        store: Store::new(args.state_dir.join("config.json"), default_name),
+        store,
         serial,
         simulated,
         policy: PeerPolicy {

@@ -113,6 +113,12 @@ impl Bus for Spidev {
         if done < 0 {
             return Err(io::Error::last_os_error());
         }
+        // What actually went out on the wire, for the arguments about it: `RUST_LOG=nfc::spi=trace`.
+        tracing::trace!(
+            tx = ?&tx[..tx.len().min(12)],
+            rx = ?&back[tx.len()..][..rx.len().min(12)],
+            "spi"
+        );
         rx.copy_from_slice(&back[tx.len()..]);
         Ok(())
     }

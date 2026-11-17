@@ -46,6 +46,8 @@ pub struct Sockets {
     pub config: PathBuf,
     pub pad: PathBuf,
     pub tof: PathBuf,
+    pub nfc: PathBuf,
+    pub map: PathBuf,
 }
 
 impl Default for Sockets {
@@ -56,6 +58,8 @@ impl Default for Sockets {
             config: proto::socket::CONFIG.into(),
             pad: proto::socket::PAD.into(),
             tof: proto::socket::TOF.into(),
+            nfc: proto::socket::NFC.into(),
+            map: proto::socket::MAP.into(),
         }
     }
 }
@@ -68,6 +72,8 @@ impl Sockets {
             proto::Service::Config => &self.config,
             proto::Service::Pad => &self.pad,
             proto::Service::Tof => &self.tof,
+            proto::Service::Nfc => &self.nfc,
+            proto::Service::Map => &self.map,
         }
     }
 }
@@ -256,6 +262,8 @@ mod tests {
             config: dir.path().join("configd.sock"),
             pad: dir.path().join("padd.sock"),
             tof: dir.path().join("tofd.sock"),
+            nfc: dir.path().join("nfcd.sock"),
+            map: dir.path().join("mapd.sock"),
         };
         let (replies, mut forwarded) = mpsc::channel(8);
         let mut pool = Pool::new(sockets, replies);

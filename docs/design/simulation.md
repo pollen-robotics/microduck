@@ -18,7 +18,7 @@ One command to get a duck. After that it is a robot, and you already know the co
 
 ```
 scripts/duck-sim               # a window opens, the duck stands up, and it is yours
-scripts/duck-sim drive         # walk it forward, then stop
+scripts/duck-sim drive         # walk it forward, then stop — and say how far it really went
 scripts/duck-sim ctl health    # or anything else robotctl does
 scripts/duck-sim log
 scripts/duck-sim down
@@ -324,14 +324,16 @@ more than N fifteen-DoF bodies, so cameras should be opt-in per duck. The 45 Hz 
 both a hard edge rather than a soft one — too many ducks and they do not get slow, they go
 *unhealthy* and the updater starts rolling releases back.
 
-## 11. Three ways to pick the wrong model
+## 11. Ways to pick the wrong model
 
-Each of these presents as "the duck is on its back", and each cost an hour.
+The first three present as "the duck is on its back", and each cost an hour. The last two present as
+nothing at all — a duck that stands, healthy at 50 Hz, and never takes a step — which is worse.
 
 **`scene_walk.xml` has no collisions.** It includes the model the RL work trains against, whose
 actuator default classes carry `contype="0" conaffinity="0"`. The duck sinks through a floor the
 scene really does contain — trunk z from 0.120 to -0.105 in a second — and the daemon reports a robot
-lying down, correctly. `scene.xml` includes `robot_allcollisions.xml`, and is what a twin wants.
+lying down, correctly. The scenes that include `robot_groundcontact*.xml` or
+`robot_allcollisions.xml` stand on it.
 
 **`qpos0` is not a pose.** Every joint at zero is a shape this robot is never in; the daemon measured
 0.41 rad from its home frame and quite reasonably tried to stand up a robot that was already folded.
@@ -345,6 +347,24 @@ simulator that starts limp has its duck on the floor before the first read.
 
 The boot the daemon is actually written for is `--keyframe SIT`: a duck found folded, which it
 recognises and stands up with the sitstand policy.
+
+**The walk policy is velstand, not `alpha_walking`.** A robot's own defaults (`deploy/robotd.toml`)
+are `walk = velstand.onnx` with `stand` off, from policy set v5 on. `duck-sim` kept naming the
+pre-v5 `alpha_walking` + `alpha_stand` pair, and that pair does not walk in MuJoCo at all: asked
+for 0.15 m/s it stands, in `microduck_rl`'s own `scripts/infer_policy.py` as much as under `robotd`.
+
+**velstand needs the robot with backlash.** It was trained as `Mjlab-VelStand-Rough-Backlash`, and
+on `robot_groundcontact.xml` — what `scene.xml` includes — it does not take a step either, with or
+without the BAM actuators. On `robot_groundcontact_backlash.xml` (`scene_backlash.xml`) it walks
+and turns, so that is `duck-sim`'s default scene. Measured with `scripts/duck-sim drive`, which
+reports the simulator's own trunk travel rather than the daemon's odometry: 0.15 m/s forward gives
+0.06; 0.8 rad/s on the spot gives 50°/s; 0.1 m/s with 0.5 rad/s gives 24°/s. The forward shortfall
+is still open — the body server runs the MJCF's position actuators, not the BAM model the policy
+was trained against, and that is the first suspect. The other built-in scenes, the apartment among
+them, carry robots without backlash, so a duck walks in them only once they gain it.
+
+The check that would have caught both: "still upright after walking" is not walking. `drive` now
+says how far the duck went, and says so loudly when it is under a quarter of what was asked.
 
 ## 12. Known material to reuse
 

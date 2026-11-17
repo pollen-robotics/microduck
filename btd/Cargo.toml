@@ -18,6 +18,9 @@ duck-ipc-proto = { path = "../duck-ipc-proto" }
 # It used to live here, which made a phone app depend on a daemon to agree
 # about chunking — see that crate's manifest.
 duck-ble = { path = "../duck-ble" }
+duck-auth = { path = "../duck-auth" }
+# The robot id in the setup code is its first name, derived from the SoC serial.
+robotd-params = { path = "../robotd-params" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
 clap.workspace = true
@@ -45,8 +48,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 bluer = { version = "=0.17.4", features = ["bluetoothd"] }
 dbus = { version = "0.9", features = ["vendored"] }
 futures = "0.3"
+zbus = "5"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # `every_call()`, shared rather than copied — see `src/route.rs`'s test module.
 duck-ipc-proto = { path = "../duck-ipc-proto", features = ["test-support"] }
 tempfile = "3.27.0"

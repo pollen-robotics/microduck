@@ -1,0 +1,18 @@
+[package]
+name = "duck-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Opt-in authenticated local tunnel to mediad for the development app"
+
+[dependencies]
+duck-auth = { path = "../duck-auth" }
+# The robot id in the setup code is its first name, derived from the SoC serial.
+robotd-params = { path = "../robotd-params" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,7 +1,7 @@
 # The NFC reader, and the daemon that pairs a gamepad from a tag.
 #
-# A tag carrying a pad's Bluetooth address, touched to the reader, pairs that pad — the same
-# `pad.pair` `robotctl pad pair <mac>` sends, without anyone typing the address. `nfcd` owns the
+# A pairing tag — every one reads `microduck_gamepad_pairing` — touched to the reader pairs the pad
+# in pairing mode: the same `pad.pair` `robotctl pad pair` sends, without anyone typing. `nfcd` owns the
 # reader and is a client of `configd` and `robotd` for everything else, so it holds no Bluetooth
 # access of its own.
 #

@@ -247,6 +247,12 @@ release before publishing it.
 
 ### Making it a dev board, so `--ref <branch>` works
 
+On a board that is already installed, this is one command —
+`sudo robotctl configure --allow-dev-daemon on` — and the rest of this section is not needed
+([`install-dev.md`](../docs/robot/install-dev.md#making-an-existing-board-take-dev-builds);
+[`updater-design.md`](../docs/design/updater-design.md) §5.4 owns the mechanism). What follows is
+the provisioning-time path, which also works with an `updaterd` that predates that switch.
+
 The same two conditions gate a build pushed straight from a laptop with
 `scripts/dev-push.sh` — it is signed with the same dev key, so a board that refuses branch
 builds refuses those too.
