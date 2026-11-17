@@ -628,7 +628,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`SoundTag::Bwep`]: a tiny cute retch, which the photo sequence plays as the robot lets go of
 /// the e-ink display in its beak. An older `robotd` refuses the tag as unknown; its voice bank is
 /// re-rendered on install (bank v6) so the robot has the sound in its own voice.
-pub const API_VERSION: u32 = 63;
+///
+/// # v64 — `photo.list`, `photo.get`, `photo.delete`
+///
+/// [`method::PHOTO_LIST`], [`method::PHOTO_GET`] and [`method::PHOTO_DELETE`]: the photos the photo
+/// sequence keeps in `/var/lib/robot/photos`, listed, read a chunk at a time — the picture or a
+/// small preview of it — and deleted, so a phone can show and keep them. Answered by `nfcd`,
+/// which takes them. An older `nfcd` answers METHOD_NOT_FOUND, by name.
+pub const API_VERSION: u32 = 64;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -708,7 +715,9 @@ pub mod socket {
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
 
-    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and nothing else. Under `/run/nfcd/`, its
+    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and the photos it
+    /// takes: [`super::method::PHOTO_LIST`], [`super::method::PHOTO_GET`],
+    /// [`super::method::PHOTO_DELETE`]. Under `/run/nfcd/`, its
     /// `RuntimeDirectory=`, for the same reason as the pad's.
     pub const NFC: &str = "/run/nfcd/nfc.sock";
 }
@@ -976,6 +985,16 @@ pub mod method {
     /// While a read waits, the tag touched is read rather than acted on: reading a pairing tag
     /// does not pair, reading a mode tag does not switch the mode.
     pub const NFC_READ: &str = "nfc.read";
+    /// The photos the photo sequence has kept, newest first: a name, a size and when each was
+    /// taken; see [`super::PhotoListResult`]. Answered by `nfcd`, from its photo directory, while
+    /// a sequence runs too. No params.
+    pub const PHOTO_LIST: &str = "photo.list";
+    /// A chunk of one photo, base64, at an offset: the picture as kept, or with `preview` a small
+    /// JPEG of it made on first asking. At most [`super::PhotoGetParams::MAX_LEN`] bytes a call, so
+    /// a reply fits a BLE line; see [`super::PhotoChunk`]. Answered by `nfcd`.
+    pub const PHOTO_GET: &str = "photo.get";
+    /// Delete one photo, and its preview. Answered by `nfcd`; see [`super::PhotoDeleteResult`].
+    pub const PHOTO_DELETE: &str = "photo.delete";
     /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
     /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
     ///
@@ -1535,6 +1554,12 @@ pub enum Call {
     NfcWrite(NfcWriteParams),
     /// Read the next tag touched; see [`method::NFC_READ`]. Answered by `nfcd`.
     NfcRead(NfcReadParams),
+    /// The photos kept; see [`method::PHOTO_LIST`]. Answered by `nfcd`.
+    PhotoList,
+    /// A chunk of one photo; see [`method::PHOTO_GET`]. Answered by `nfcd`.
+    PhotoGet(PhotoGetParams),
+    /// Delete one photo; see [`method::PHOTO_DELETE`]. Answered by `nfcd`.
+    PhotoDelete(PhotoDeleteParams),
     /// Answered by `mapd`; see [`method::MAP_STATUS`].
     MapStatus,
     MapStream,
@@ -1632,6 +1657,9 @@ impl Call {
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::NfcWrite(_) => method::NFC_WRITE,
             Call::NfcRead(_) => method::NFC_READ,
+            Call::PhotoList => method::PHOTO_LIST,
+            Call::PhotoGet(_) => method::PHOTO_GET,
+            Call::PhotoDelete(_) => method::PHOTO_DELETE,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
@@ -1925,6 +1953,9 @@ impl Call {
             // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
             // own lane.
             Call::NfcWrite(_) | Call::NfcRead(_) => (Nfc, Operation),
+            // A directory listing and a file read: milliseconds, and a preview's first making is
+            // one JPEG decoded and shrunk, well under a second.
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => (Nfc, Prompt),
             // ── mapd ────────────────────────────────────────────────────────
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
@@ -2004,6 +2035,8 @@ impl Call {
             Call::RobotLaserTrack(p) => encode(p),
             Call::NfcWrite(p) => encode(p),
             Call::NfcRead(p) => encode(p),
+            Call::PhotoGet(p) => encode(p),
+            Call::PhotoDelete(p) => encode(p),
             Call::RobotSoccer(p) => encode(p),
             Call::RobotAutonomous(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -2058,6 +2091,7 @@ impl Call {
             | Call::MapStatus
             | Call::MapStream
             | Call::MapWipe
+            | Call::PhotoList
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
             Call::MapGrid(p) => encode(p),
         }
@@ -2111,6 +2145,9 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::NfcRead(decode(params.or(Some(&empty)))?)
             }
+            method::PHOTO_LIST => Call::PhotoList,
+            method::PHOTO_GET => Call::PhotoGet(decode(params)?),
+            method::PHOTO_DELETE => Call::PhotoDelete(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
             method::ROBOT_AUTONOMOUS => Call::RobotAutonomous(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
@@ -2417,6 +2454,16 @@ pub mod test_support {
             }),
             Call::NfcRead(NfcReadParams {
                 timeout_s: Some(30),
+            }),
+            Call::PhotoList,
+            Call::PhotoGet(PhotoGetParams {
+                name: "2026-11-11_14-03-27".into(),
+                preview: true,
+                offset: 16384,
+                len: Some(4096),
+            }),
+            Call::PhotoDelete(PhotoDeleteParams {
+                name: "2026-11-11_14-03-27-2".into(),
             }),
             Call::MapStatus,
             Call::MapStream,
@@ -3052,6 +3099,95 @@ pub struct NfcReadResult {
     /// holds no NDEF message: a blank tag, one lifted during a write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Answer to [`Call::PhotoList`]: every photo kept, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoListResult {
+    pub photos: Vec<Photo>,
+}
+
+/// One photo the photo sequence kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Photo {
+    /// The file's name without `.jpg`: the robot's local time it was taken at,
+    /// `2026-11-11_14-03-27`, with `-2`, `-3`, … for a second one in the same second. What
+    /// [`Call::PhotoGet`] and [`Call::PhotoDelete`] name it by, and what a phone keeps it under.
+    pub name: String,
+    /// The picture's size in bytes, which is what reading it to the end takes.
+    pub bytes: u64,
+    /// When it was written, in seconds since the epoch: the file's modification time. A robot
+    /// that had no clock yet when it took the photo says so with a time in 1970, and the name has
+    /// the same wrong time in it.
+    pub taken_s: u64,
+}
+
+/// See [`method::PHOTO_GET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoGetParams {
+    /// A [`Photo::name`] from [`Call::PhotoList`]. Anything that is not one — a path, a `..` — is
+    /// refused rather than looked for.
+    pub name: String,
+    /// The small preview rather than the picture: a JPEG [`PhotoGetParams::PREVIEW_SIDE`] pixels
+    /// on its longer side, about a single chunk. Made on first asking and kept beside the photo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+    /// Where to start, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub offset: u64,
+    /// How many bytes, at most. Absent, or more than [`PhotoGetParams::MAX_LEN`], is that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u32>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl PhotoGetParams {
+    /// The most one call answers with. 16 KiB is about 22 KB of base64, well inside a BLE reply
+    /// line (`duck_ble::framing::MAX_REPLY_LINE`, 64 KiB) and a second or so on the air at a
+    /// phone's MTU, so a long download stays a series of short answers that each say how far it
+    /// got.
+    pub const MAX_LEN: u32 = 16 * 1024;
+    /// The preview's longer side, in pixels: a grid tile on a phone at 3x.
+    pub const PREVIEW_SIDE: u32 = 360;
+
+    /// The length this asks for, defaulted and capped.
+    pub fn chunk_len(&self) -> u32 {
+        self.len.unwrap_or(Self::MAX_LEN).clamp(1, Self::MAX_LEN)
+    }
+}
+
+/// Answer to [`Call::PhotoGet`]: one chunk of the file, and how big the whole of it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoChunk {
+    pub name: String,
+    /// The whole file's size — the picture's, or the preview's — so a reader knows when it is
+    /// done and how far along it is.
+    pub total: u64,
+    /// Where this chunk starts, as asked.
+    pub offset: u64,
+    /// The bytes, base64 (standard alphabet, padded). Empty at or past the end.
+    pub data: String,
+}
+
+/// See [`method::PHOTO_DELETE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoDeleteParams {
+    /// A [`Photo::name`]; refused as [`PhotoGetParams::name`] is.
+    pub name: String,
+}
+
+/// Answer to [`Call::PhotoDelete`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoDeleteResult {
+    /// False when there was no such photo — already deleted, say — which is not an error.
+    pub deleted: bool,
 }
 
 /// One NDEF record on a tag, as a person wrote it: `{"type": "text", "value": "walk_mode"}`.
@@ -7195,7 +7331,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            85,
+            88,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

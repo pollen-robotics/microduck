@@ -59,6 +59,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
+use nfc::gallery;
 use nfc::modes::{self, Driver, ModeTag};
 use nfc::pairing::{self, Outcome, Robot, Touches};
 use nfc::photo;
@@ -916,11 +917,24 @@ fn client(
                     Ok(proto::Call::NfcRead(params)) => {
                         proto::Response::ok(id, &read_when_touched(params, asked, reader_up, robot))
                     }
+                    // The photos are files, read here on this connection's thread: no reader and
+                    // no poll loop involved, so they are answered mid-sequence too.
+                    Ok(proto::Call::PhotoList) => answer(id, gallery::list(&robot.photos)),
+                    Ok(proto::Call::PhotoGet(params)) => {
+                        answer(id, gallery::get(&robot.photos, &params))
+                    }
+                    Ok(proto::Call::PhotoDelete(params)) => {
+                        let deleted = gallery::delete(&robot.photos, &params.name);
+                        if let Ok(proto::PhotoDeleteResult { deleted: true }) = deleted {
+                            tracing::info!(photo = %params.name, "photo deleted, as asked");
+                        }
+                        answer(id, deleted)
+                    }
                     Ok(_) => proto::Response::err(
                         id,
                         proto::Error::new(
                             proto::code::METHOD_NOT_FOUND,
-                            "nfcd serves nfc.write and nfc.read, and nothing else",
+                            "nfcd serves nfc.write, nfc.read and photo.*, and nothing else",
                         ),
                     ),
                     Err(e) => proto::Response::err(id, e),
@@ -930,6 +944,17 @@ fn client(
         let mut out = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
         out.push(b'\n');
         stream.write_all(&out)?;
+    }
+}
+
+/// A result as a response: the value, or the error it carries.
+fn answer<T: serde::Serialize>(
+    id: Option<proto::Id>,
+    result: Result<T, proto::Error>,
+) -> proto::Response {
+    match result {
+        Ok(value) => proto::Response::ok(id, &value),
+        Err(e) => proto::Response::err(id, e),
     }
 }
 
