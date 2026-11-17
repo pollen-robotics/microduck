@@ -898,6 +898,8 @@ impl Server {
             | Call::RobotVetbook
             | Call::RobotVetbookNote(_)
             | Call::RobotVetbookTally(_)
+            | Call::RobotVolume
+            | Call::RobotSetVolume(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(

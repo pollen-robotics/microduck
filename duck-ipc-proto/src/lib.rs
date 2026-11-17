@@ -648,7 +648,14 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// and absent when unknown — a pad that is not a Nintendo one, a `padd` too old to ask, a reading
 /// gone stale — so a v64 client reading a v65 robot ignores it, and a v65 client reading a v64
 /// robot shows nothing.
-pub const API_VERSION: u32 = 65;
+///
+/// # v66 — the speaker volume
+///
+/// `robot.volume` reads the speaker level and `robot.setVolume` sets it ([`VolumeParams`],
+/// [`VolumeResult`]): a percentage, written to `[audio] volume` and to the codec's mixer at once,
+/// so it is heard as it is set and kept across a restart. An older `robotd` answers
+/// METHOD_NOT_FOUND, by name.
+pub const API_VERSION: u32 = 66;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1072,6 +1079,11 @@ pub mod method {
     /// [`crate::vetbook::VetbookTallyParams`]. Local daemons only.
     pub const ROBOT_VETBOOK_TALLY: &str = "robot.vetbookTally";
 
+    /// The speaker level, percent — see [`VolumeResult`]. A read.
+    pub const ROBOT_VOLUME: &str = "robot.volume";
+    /// Set the speaker level: heard at once, and kept in `[audio] volume`.
+    pub const ROBOT_SET_VOLUME: &str = "robot.setVolume";
+
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
     /// Answered like [`ROBOT_SET_MODE`] and for the same reason: the swap happens at the home
@@ -1471,6 +1483,10 @@ pub enum Call {
     RobotVetbookNote(vetbook::VetbookNoteParams),
     /// Add another daemon's counts to it; see [`method::ROBOT_VETBOOK_TALLY`].
     RobotVetbookTally(vetbook::VetbookTallyParams),
+    /// The speaker level; see [`method::ROBOT_VOLUME`].
+    RobotVolume,
+    /// Set it; see [`method::ROBOT_SET_VOLUME`].
+    RobotSetVolume(VolumeParams),
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -1687,6 +1703,8 @@ impl Call {
             Call::RobotVetbook => method::ROBOT_VETBOOK,
             Call::RobotVetbookNote(_) => method::ROBOT_VETBOOK_NOTE,
             Call::RobotVetbookTally(_) => method::ROBOT_VETBOOK_TALLY,
+            Call::RobotVolume => method::ROBOT_VOLUME,
+            Call::RobotSetVolume(_) => method::ROBOT_SET_VOLUME,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1887,6 +1905,8 @@ impl Call {
             Call::RobotVetbookNote(_) => (Robot, Prompt),
             // A merge into the book under its lock, and nothing else.
             Call::RobotVetbookTally(_) => (Robot, Prompt),
+            // A read of the config, and a small write to it plus two `amixer` calls.
+            Call::RobotVolume | Call::RobotSetVolume(_) => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
             Call::RobotMove(_)
@@ -2044,6 +2064,7 @@ impl Call {
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
             Call::RobotVetbookTally(p) => encode(p),
+            Call::RobotSetVolume(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
             Call::NfcWrite(p) => encode(p),
@@ -2080,6 +2101,7 @@ impl Call {
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
+            | Call::RobotVolume
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::DetectorCheck
@@ -2175,6 +2197,8 @@ impl Call {
             method::ROBOT_VETBOOK => Call::RobotVetbook,
             method::ROBOT_VETBOOK_NOTE => Call::RobotVetbookNote(decode(params)?),
             method::ROBOT_VETBOOK_TALLY => Call::RobotVetbookTally(decode(params)?),
+            method::ROBOT_VOLUME => Call::RobotVolume,
+            method::ROBOT_SET_VOLUME => Call::RobotSetVolume(decode(params)?),
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -2372,6 +2396,8 @@ pub mod test_support {
             Call::RobotVetbookNote(vetbook::VetbookNoteParams {
                 text: "reglued the beak".into(),
             }),
+            Call::RobotVolume,
+            Call::RobotSetVolume(VolumeParams { volume: 40 }),
             Call::RobotVetbookTally(vetbook::VetbookTallyParams {
                 tallies: [(vetbook::key::PHOTOS.to_owned(), 1.0)].into(),
                 ..Default::default()
@@ -6036,6 +6062,24 @@ pub struct SkillsResult {
     pub built_in: Vec<String>,
 }
 
+/// Parameters for [`Call::RobotSetVolume`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeParams {
+    /// Percent: 100 is the codec's full level, 0 mutes the speaker. Over 100 is refused.
+    pub volume: u8,
+}
+
+/// Answer to [`Call::RobotVolume`] and [`Call::RobotSetVolume`]: the level as stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeResult {
+    /// Percent, 0–100.
+    pub volume: u8,
+    /// Whether this board has the mixer the level is written to. False on a board playing on
+    /// ALSA's `default` (not the AIC3104): the level is kept, and changes nothing it can hear.
+    pub applies: bool,
+}
+
 /// Parameters for [`Call::PadBind`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7565,7 +7609,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            88,
+            90,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
