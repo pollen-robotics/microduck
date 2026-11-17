@@ -640,7 +640,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// sequence keeps in `/var/lib/robot/photos`, listed, read a chunk at a time — the picture or a
 /// small preview of it — and deleted, so a phone can show and keep them. Answered by `nfcd`,
 /// which takes them. An older `nfcd` answers METHOD_NOT_FOUND, by name.
-pub const API_VERSION: u32 = 64;
+///
+/// # v65 — the pad's battery
+///
+/// [`Pad::battery`]: how full the connected pad's battery is, and whether it is charging, on
+/// `pad.status`. `padd` asks the pad and writes [`pad_battery::FILE`]; `configd` reads it. Optional
+/// and absent when unknown — a pad that is not a Nintendo one, a `padd` too old to ask, a reading
+/// gone stale — so a v64 client reading a v65 robot ignores it, and a v65 client reading a v64
+/// robot shows nothing.
+pub const API_VERSION: u32 = 65;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -5671,6 +5679,126 @@ pub struct Pad {
     pub trusted: bool,
     /// Connected right now. This is the one that answers "why is the robot not moving".
     pub connected: bool,
+    /// How full its battery is, when the robot knows: a connected pad `padd` could ask, read
+    /// recently. Absent otherwise — which is most pads, and says nothing about the battery. (v65)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<PadBattery>,
+}
+
+/// A pad's battery, as the pad reports it: a level, not a percentage.
+///
+/// A Switch pad says one of five levels in every subcommand reply, and a clone answers nothing
+/// finer — the voltage query that a genuine one answers comes back empty. So the steps are the
+/// pad's own and nothing here pretends to more precision than it gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadBattery {
+    pub level: PadBatteryLevel,
+    /// On a cable and charging.
+    pub charging: bool,
+}
+
+/// See [`PadBattery`]. The names are the levels the pad reports, from the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadBatteryLevel {
+    Full,
+    Medium,
+    Low,
+    Critical,
+    Empty,
+}
+
+impl PadBatteryLevel {
+    /// From the high nibble of a Switch report's battery byte with its charging bit (the lowest)
+    /// cleared: 8, 6, 4, 2, 0. An odd step a pad never sends is read as the one below it.
+    pub fn from_switch(step: u8) -> Self {
+        match step & 0x0e {
+            8.. => Self::Full,
+            6 => Self::Medium,
+            4 => Self::Low,
+            2 => Self::Critical,
+            _ => Self::Empty,
+        }
+    }
+
+    /// Worth telling someone about before the pad dies mid-drive.
+    pub fn is_low(self) -> bool {
+        matches!(self, Self::Low | Self::Critical | Self::Empty)
+    }
+
+    /// As a person would say it: "full", "low".
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Critical => "critical",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl PadBattery {
+    /// From a Switch report's battery byte (byte 2 of a `0x21` or `0x30` input report): the high
+    /// nibble is the level, its lowest bit charging; the low nibble is connection info, ignored.
+    pub fn from_switch_byte(byte: u8) -> Self {
+        let high = byte >> 4;
+        Self {
+            level: PadBatteryLevel::from_switch(high),
+            charging: high & 1 == 1,
+        }
+    }
+}
+
+/// How a pad's battery gets from `padd`, which can ask the pad, to `configd`, which answers
+/// `pad.status` — and to `robotctl monitor`, on the robot.
+///
+/// **A file, because `configd` cannot ask the pad itself.** It runs with `PrivateDevices=yes`: its
+/// `/dev` is made once when it starts, and a pad's hidraw node appears when the pad connects. `padd`
+/// is already following the pad from connect to disconnect, so it asks, and writes what it heard
+/// here; a reader takes it only while it is fresh ([`read_fresh`]).
+pub mod pad_battery {
+    use super::PadBattery;
+    use serde::{Deserialize, Serialize};
+
+    /// Under `padd`'s `RuntimeDirectory=`, so it is gone with the daemon and with the boot.
+    pub const FILE: &str = "/run/padd/pad-battery.json";
+
+    /// How old a reading may be and still be shown. `padd` asks every minute; five missed answers
+    /// is a `padd` that stopped, or a pad that stopped answering, and a level from then is a guess.
+    pub const STALE_S: u64 = 300;
+
+    /// What [`FILE`] holds.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Reading {
+        /// The pad's address, as BlueZ writes it: `98:B6:E9:5E:BB:DB`. What a reader matches the
+        /// reading to its pad by.
+        pub mac: String,
+        #[serde(flatten)]
+        pub battery: PadBattery,
+        /// When the pad said it, in seconds since the epoch.
+        pub read_s: u64,
+    }
+
+    /// The reading in `path`, if there is one, it parses, and it is no older than [`STALE_S`] at
+    /// `now_s`. A reading from the future — a clock that stepped back — is taken: refusing it would
+    /// hide the battery until the clock caught up, for no better answer.
+    pub fn read_fresh(path: &std::path::Path, now_s: u64) -> Option<Reading> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let reading: Reading = serde_json::from_str(&text).ok()?;
+        (now_s.saturating_sub(reading.read_s) <= STALE_S).then_some(reading)
+    }
+
+    /// `pads` with the reading put on the connected pad it is about, if any.
+    pub fn attach(pads: &mut [super::Pad], reading: Option<&Reading>) {
+        let Some(reading) = reading else { return };
+        if let Some(pad) = pads
+            .iter_mut()
+            .find(|p| p.connected && p.mac.eq_ignore_ascii_case(&reading.mac))
+        {
+            pad.battery = Some(reading.battery);
+        }
+    }
 }
 
 /// Whether one of the robot's units is running, as systemd sees it.
@@ -7342,6 +7470,95 @@ mod tests {
         let blank: NfcReadResult =
             serde_json::from_value(serde_json::json!({"read": true, "reason": "blank"})).unwrap();
         assert!(blank.records.is_empty());
+    }
+
+    /// The byte the Pro Controller on duck-d556 answered with, and the others it can send.
+    #[test]
+    fn a_switch_battery_byte_is_a_level_and_a_charging_bit() {
+        let read = PadBattery::from_switch_byte;
+        assert_eq!(
+            read(0x80),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: false
+            }
+        );
+        assert_eq!(
+            read(0x91),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: true
+            }
+        );
+        assert_eq!(read(0x6e).level, PadBatteryLevel::Medium);
+        assert_eq!(read(0x40).level, PadBatteryLevel::Low);
+        assert_eq!(read(0x20).level, PadBatteryLevel::Critical);
+        assert_eq!(read(0x0e).level, PadBatteryLevel::Empty);
+        assert!(read(0x40).level.is_low() && !read(0x60).level.is_low());
+    }
+
+    #[test]
+    fn a_pad_without_a_battery_says_nothing_about_one() {
+        let pad = Pad {
+            mac: "98:B6:E9:5E:BB:DB".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            battery: None,
+        };
+        let wire = serde_json::to_value(&pad).unwrap();
+        assert!(wire.get("battery").is_none());
+        // And a v64 robot's answer reads as no battery.
+        let old: Pad = serde_json::from_value(serde_json::json!({
+            "mac": "98:B6:E9:5E:BB:DB", "name": "Pro Controller",
+            "paired": true, "trusted": true, "connected": true
+        }))
+        .unwrap();
+        assert_eq!(old, pad);
+    }
+
+    #[test]
+    fn a_battery_reading_is_taken_while_fresh_and_for_its_own_pad() {
+        let dir = std::env::temp_dir().join(format!("pad-battery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pad-battery.json");
+        std::fs::write(
+            &file,
+            r#"{"mac":"98:b6:e9:5e:bb:db","level":"low","charging":false,"read_s":1000}"#,
+        )
+        .unwrap();
+
+        assert!(pad_battery::read_fresh(&file, 1000 + pad_battery::STALE_S).is_some());
+        assert!(pad_battery::read_fresh(&file, 1001 + pad_battery::STALE_S).is_none());
+        assert!(
+            pad_battery::read_fresh(&file, 10).is_some(),
+            "a clock stepped back"
+        );
+        assert!(pad_battery::read_fresh(&dir.join("absent.json"), 1000).is_none());
+
+        let reading = pad_battery::read_fresh(&file, 1000).unwrap();
+        let pad = |mac: &str, connected| Pad {
+            mac: mac.into(),
+            name: String::new(),
+            paired: true,
+            trusted: true,
+            connected,
+            battery: None,
+        };
+        let mut pads = vec![
+            pad("78:86:2E:BB:13:28", true),
+            pad("98:B6:E9:5E:BB:DB", true),
+        ];
+        pad_battery::attach(&mut pads, Some(&reading));
+        assert_eq!(pads[0].battery, None);
+        assert_eq!(pads[1].battery.unwrap().level, PadBatteryLevel::Low);
+
+        // The pad it is about, switched off: a reading from before is not shown on it.
+        let mut off = vec![pad("98:B6:E9:5E:BB:DB", false)];
+        pad_battery::attach(&mut off, Some(&reading));
+        assert_eq!(off[0].battery, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

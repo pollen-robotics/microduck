@@ -193,6 +193,7 @@ jobs:
             --include "btd/systemd/sysusers.d/btd.conf=systemd/sysusers.d/btd.conf" \
             --include "padd/systemd/padd.service=systemd/padd.service" \
             --include "padd/systemd/sysusers.d/padd.conf=systemd/sysusers.d/padd.conf" \
+            --include "padd/systemd/udev/70-robot-pad-hidraw.rules=systemd/udev/70-robot-pad-hidraw.rules" \
             --include "netpadd/systemd/netpadd.service=systemd/netpadd.service" \
             --include "netpadd/systemd/sysusers.d/netpadd.conf=systemd/sysusers.d/netpadd.conf" \
             --include "autod/systemd/autod.service=systemd/autod.service" \

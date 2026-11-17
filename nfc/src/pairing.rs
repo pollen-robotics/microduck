@@ -126,6 +126,7 @@ mod tests {
             paired: true,
             trusted: true,
             connected,
+            battery: None,
         }
     }
 

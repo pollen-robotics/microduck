@@ -158,6 +158,10 @@ const PAD_RETRY: Duration = Duration::from_secs(2);
 /// faster poll would redraw the same number.
 const HEALTH_POLL: Duration = Duration::from_secs(2);
 
+/// How often the pad's battery file is read. `padd` rewrites it once a minute; this only has to
+/// notice within a few seconds of a pad connecting.
+const PAD_BATTERY_POLL: Duration = Duration::from_secs(5);
+
 /// How long a health answer may be the newest one before the row says how old it is.
 ///
 /// Three polls. `robotd` closing the socket is reported by the poller itself; this catches the
@@ -309,6 +313,9 @@ enum Update {
     MapGrid(Box<proto::MapGridResult>),
     /// `mapd` is not answering. Not fatal: mapping is optional, and off by default.
     MapLost(String),
+    /// The connected pad's battery, as `padd` last read it, or `None` when there is no fresh
+    /// reading — no pad, a pad that is not a Nintendo one, or a `padd` that stopped asking.
+    PadBattery(Option<proto::pad_battery::Reading>),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -365,6 +372,7 @@ pub fn run(
     let tx_for_tof = tx.clone();
     let health_tx = tx.clone();
     let map_tx = tx.clone();
+    let battery_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
 
     // Held for as long as the view lives, not dropped: it is the write half of the subscription,
@@ -398,6 +406,11 @@ pub fn run(
     // and the reason why is on this answer and nowhere else.
     let health_socket = robot_socket.to_path_buf();
     thread::spawn(move || poll_health(&health_socket, &health_tx));
+
+    // Not a socket: the file `padd` keeps and `configd` serves on `pad.status`, read the same way
+    // and with the same freshness rule, so this and the phone never disagree about a pad. Absent
+    // on a monitor not running on the robot, which then shows no battery.
+    thread::spawn(move || poll_pad_battery(Path::new(proto::pad_battery::FILE), &battery_tx));
 
     // A fifth: `mapd`, polled like the health. Its absence draws the odometry track instead.
     let map_socket = map_socket.to_path_buf();
@@ -770,6 +783,35 @@ fn poll_health(socket: &Path, tx: &mpsc::Sender<Update>) {
     }
 }
 
+/// Read the pad's battery file every [`PAD_BATTERY_POLL`], sending only what changed.
+fn poll_pad_battery(file: &Path, tx: &mpsc::Sender<Update>) {
+    let mut last: Option<proto::pad_battery::Reading> = None;
+    let mut first = true;
+    loop {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let reading = proto::pad_battery::read_fresh(file, now_s);
+        // `read_s` moves every minute with the level unchanged; that is not worth a repaint.
+        let same = |a: &Option<proto::pad_battery::Reading>,
+                    b: &Option<proto::pad_battery::Reading>| {
+            match (a, b) {
+                (Some(a), Some(b)) => a.mac == b.mac && a.battery == b.battery,
+                (None, None) => true,
+                _ => false,
+            }
+        };
+        if first || !same(&last, &reading) {
+            first = false;
+            if tx.send(Update::PadBattery(reading.clone())).is_err() {
+                return; // the UI is gone
+            }
+            last = reading;
+        }
+        thread::sleep(PAD_BATTERY_POLL);
+    }
+}
+
 /// One connection, polled until something ends it.
 ///
 /// The connection is kept open across polls rather than reopened per poll: a connect, a
@@ -1119,6 +1161,9 @@ fn terminal_failure(e: std::io::Error) -> Failure {
 /// still looks like a driver with a hand on the stick from everywhere downstream.
 #[derive(Default)]
 struct PadView {
+    /// The pad's battery, from `padd`'s file, while fresh. Shown in the title only when it is about
+    /// the pad on screen: the reading names its pad, and so does the device.
+    battery: Option<proto::pad_battery::Reading>,
     /// Why there is nothing to show, when there is nothing: no tap on this robot, `padd` stopped,
     /// or a pad that has gone away. Never left blank — a pad block that is simply empty is the one
     /// failure mode a debug view must not have.
@@ -1649,6 +1694,10 @@ impl View {
             Update::CameraLost(why) => {
                 self.camera.lost(why);
                 Ok(self.show_camera)
+            }
+            Update::PadBattery(reading) => {
+                self.pad.battery = reading;
+                Ok(self.show_pad)
             }
             Update::Health(health) => {
                 self.health = Some(*health);
@@ -2937,6 +2986,9 @@ impl View {
                 Style::new().fg(Color::Yellow),
             ));
         }
+        if let Some(battery) = self.pad_battery(device) {
+            title.extend(battery);
+        }
         if self.pad.imu.is_some() {
             // Loud on purpose: a pad with an IMU is news, and the block below has just grown.
             title.push(Span::styled(
@@ -2945,6 +2997,37 @@ impl View {
             ));
         }
         title
+    }
+
+    /// The battery, for the title: `· battery full ` in a colour that says whether to worry, and
+    /// `charging` when it is. Nothing when there is no reading about this pad — a pad whose battery
+    /// is unknown is not drawn as one whose battery is empty.
+    fn pad_battery(&self, device: &proto::PadInputDevice) -> Option<Vec<Span<'static>>> {
+        let reading = self.pad.battery.as_ref()?;
+        if let Some(unique) = device.unique.as_deref()
+            && !unique.eq_ignore_ascii_case(&reading.mac)
+        {
+            return None;
+        }
+        let level = reading.battery.level;
+        let colour = match level {
+            proto::PadBatteryLevel::Full | proto::PadBatteryLevel::Medium => Color::Green,
+            proto::PadBatteryLevel::Low => Color::Yellow,
+            proto::PadBatteryLevel::Critical | proto::PadBatteryLevel::Empty => Color::Red,
+        };
+        let mut style = Style::new().fg(colour);
+        if level.is_low() {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let mut spans = vec![
+            Span::raw("· battery ").dim(),
+            Span::styled(level.word(), style),
+        ];
+        if reading.battery.charging {
+            spans.push(Span::styled(" charging", Style::new().fg(Color::Cyan)));
+        }
+        spans.push(Span::raw(" "));
+        Some(spans)
     }
 
     /// What the trace is drawn to, and how much of a link is behind it.
@@ -5086,6 +5169,40 @@ mod tests {
 
         let screen = render_to(&mut view, 110, 32);
         assert!(screen.contains("no radio here"), "{screen}");
+    }
+
+    /// The battery `padd` read is on the title of the pad it is about, and only that one: a reading
+    /// for another pad is not this pad's battery, and no reading is drawn as nothing at all.
+    #[test]
+    fn the_pad_title_says_its_battery_when_padd_read_one() {
+        let reading = |mac: &str| proto::pad_battery::Reading {
+            mac: mac.to_owned(),
+            battery: proto::PadBattery {
+                level: proto::PadBatteryLevel::Low,
+                charging: true,
+            },
+            read_s: 0,
+        };
+        let mut view = watching_a_pad();
+        // "battery low", not "battery": the robot's own battery is on screen elsewhere.
+        let none = render_to(&mut view, 110, 32);
+        assert!(!none.contains("battery low"), "{none}");
+
+        // `a_device` is on 78:86:2e:bb:13:28; the reading's case is BlueZ's, the device's the
+        // kernel's.
+        feed(
+            &mut view,
+            Update::PadBattery(Some(reading("78:86:2E:BB:13:28"))),
+        );
+        let ours = render_to(&mut view, 110, 32);
+        assert!(ours.contains("battery low charging"), "{ours}");
+
+        feed(
+            &mut view,
+            Update::PadBattery(Some(reading("98:B6:E9:5E:BB:DB"))),
+        );
+        let theirs = render_to(&mut view, 110, 32);
+        assert!(!theirs.contains("battery low"), "{theirs}");
     }
 
     /// The buttons are named as the kernel names them, and an untouched pad says "none" rather than
