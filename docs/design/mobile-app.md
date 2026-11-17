@@ -26,6 +26,7 @@ over the same radio, with the same reply.
 |---|---|
 | pick a robot | the advertisement — name and IPv4 — then `hello` and `system.authenticate` |
 | the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors`, `robot.volume`, `robot.setVolume` |
+| home | `robot.sound`, `robot.theremin`, `robot.flashlight`, `robot.laserTrack`, `robot.soccer`, `robot.autonomous`, `robot.mode`, `robot.policies`, `robot.enable` |
 | drive | WebRTC: video, `robot.move`, `robot.subscribe` |
 | moves | `robot.skills`, `robot.do`, `robot.policies`, `robot.loadPolicy`, `policy.check`, `policy.search`, `policy.fetch`, `policy.install` |
 | wifi | `net.status`, `net.scan`, `net.connect`, `net.forget` |
@@ -35,9 +36,10 @@ over the same radio, with the same reply.
 
 Anything it turns out to need that is not routed is a one-line change to `route.rs` and a decision
 about whether it belongs on a radio — which is the property §3.1 exists to give us. The app has now
-tested that property five times: `update.rollback` and `update.select`, then `robot.init`, then
-`robot.enable`, then `robot.rebootMotors`, each opened because using the app found the refusal
-costing something the refusal's own reasoning had not accounted for.
+tested that property seven times: `update.rollback` and `update.select`, then `robot.init`, then
+`robot.enable`, then `robot.rebootMotors`, then `robot.theremin` and `robot.flashlight`, then the games and `robot.mode`, each opened
+because using the app found the refusal costing something the refusal's own reasoning had not
+accounted for.
 
 ### 1.1 It is the robot's interface, not a settings utility
 

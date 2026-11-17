@@ -656,16 +656,35 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// so it is heard as it is set and kept across a restart. An older `robotd` answers
 /// METHOD_NOT_FOUND, by name.
 ///
-/// # v67 — a phase-encoded skill
+/// # v67 — every switch in `robot.mode`, and the play modes over Bluetooth
+///
+/// [`ModeResult::laser`], [`ModeResult::theremin`] and [`ModeResult::flashlight`]: `robot.mode`
+/// says which of the robot's switches are on, so a phone on Bluetooth — which has no
+/// `robot.state` stream — can show the one game the duck is playing. Absent while off, so a v66
+/// client reading a v67 robot ignores them, and a v67 client reading a v66 robot reads them off.
+///
+/// `btd` now routes `robot.mode`, `robot.laserTrack`, `robot.soccer` and `robot.autonomous`, as
+/// well as `robot.theremin` and `robot.flashlight`. A route opening, not a wire change: an older
+/// `btd` refuses them with PERMISSION_DENIED, by name, which is how the app tells.
+///
+/// # v68 — `photo.take`
+///
+/// [`method::PHOTO_TAKE`]: the photo sequence asked for from a phone — the pose, the flashlight
+/// countdown and the picture, kept with the others in `/var/lib/robot/photos`, without the e-ink
+/// display the tag's sequence ends with. No params; [`IntentResult`] once it has started, so a
+/// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
+/// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
+///
+/// # v69 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v66 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v68 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 67;
+pub const API_VERSION: u32 = 69;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1025,6 +1044,16 @@ pub mod method {
     pub const PHOTO_GET: &str = "photo.get";
     /// Delete one photo, and its preview. Answered by `nfcd`; see [`super::PhotoDeleteResult`].
     pub const PHOTO_DELETE: &str = "photo.delete";
+    /// Take a photo: the photo tag's pose, flashlight countdown and picture, without the e-ink
+    /// display — the head back to the centre after, the robot left standing or seated as it was.
+    /// No params; the answer is [`super::IntentResult`], given once the sequence has started, not
+    /// once the picture is kept: the picture shows up in [`PHOTO_LIST`] about seven seconds later.
+    ///
+    /// Refused while a photo is being taken (asked, or a tag's), when `robotd` cannot be asked,
+    /// and when the robot is busy with something it would be wrong to interrupt — a skill, a
+    /// ground pick, a rest — the tag's own rule. A robot that is not driving is started first,
+    /// as for the tag. Answered by `nfcd`, which takes them. (v68)
+    pub const PHOTO_TAKE: &str = "photo.take";
     /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
     /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
     ///
@@ -1599,6 +1628,8 @@ pub enum Call {
     PhotoGet(PhotoGetParams),
     /// Delete one photo; see [`method::PHOTO_DELETE`]. Answered by `nfcd`.
     PhotoDelete(PhotoDeleteParams),
+    /// Take a photo; see [`method::PHOTO_TAKE`]. Answered by `nfcd`.
+    PhotoTake,
     /// Answered by `mapd`; see [`method::MAP_STATUS`].
     MapStatus,
     MapStream,
@@ -1699,6 +1730,7 @@ impl Call {
             Call::PhotoList => method::PHOTO_LIST,
             Call::PhotoGet(_) => method::PHOTO_GET,
             Call::PhotoDelete(_) => method::PHOTO_DELETE,
+            Call::PhotoTake => method::PHOTO_TAKE,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
@@ -1999,6 +2031,9 @@ impl Call {
             // A directory listing and a file read: milliseconds, and a preview's first making is
             // one JPEG decoded and shrunk, well under a second.
             Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => (Nfc, Prompt),
+            // Answered once the sequence has started — one `robot.state` read to see the robot is
+            // free — not once the picture is kept.
+            Call::PhotoTake => (Nfc, Prompt),
             // ── mapd ────────────────────────────────────────────────────────
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
@@ -2137,6 +2172,7 @@ impl Call {
             | Call::MapStream
             | Call::MapWipe
             | Call::PhotoList
+            | Call::PhotoTake
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
             Call::MapGrid(p) => encode(p),
         }
@@ -2191,6 +2227,7 @@ impl Call {
                 Call::NfcRead(decode(params.or(Some(&empty)))?)
             }
             method::PHOTO_LIST => Call::PhotoList,
+            method::PHOTO_TAKE => Call::PhotoTake,
             method::PHOTO_GET => Call::PhotoGet(decode(params)?),
             method::PHOTO_DELETE => Call::PhotoDelete(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
@@ -2514,6 +2551,7 @@ pub mod test_support {
             Call::PhotoDelete(PhotoDeleteParams {
                 name: "2026-11-11_14-03-27-2".into(),
             }),
+            Call::PhotoTake,
             Call::MapStatus,
             Call::MapStream,
             Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
@@ -3621,6 +3659,17 @@ pub struct ModeResult {
     /// quiet until its pad is touched. Absent while off. (v60)
     #[serde(default, skip_serializing_if = "not")]
     pub autonomous: bool,
+    /// Laser tracking is switched on ([`method::ROBOT_LASER_TRACK`]), whether or not a dot is in
+    /// sight. Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub laser: bool,
+    /// A theremin is up ([`method::ROBOT_THEREMIN`]): armed or playing. Absent while down — the
+    /// loop puts it down by itself when the robot walks or goes over. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub theremin: bool,
+    /// The flashlight is lit ([`method::ROBOT_FLASHLIGHT`]). Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub flashlight: bool,
 }
 
 /// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
@@ -7635,7 +7684,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            90,
+            91,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -7742,7 +7791,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v66 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v68 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {
@@ -8292,7 +8341,7 @@ mod tests {
         let off = serde_json::to_string(&ModeResult {
             mode: "walk".into(),
             soccer: None,
-            autonomous: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(off, r#"{"mode":"walk"}"#);

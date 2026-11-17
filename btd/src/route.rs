@@ -300,22 +300,27 @@ fn permits(call: &proto::Call) -> bool {
         // `[audio] volume` so the level survives a restart. Trivially undone from the same phone.
         RobotVolume | RobotSetVolume(_) => true,
 
-        // Harmless and rather charming from a phone — but they ride the same refusal as the
-        // rest of robot.* until the app path exists to want them: opening a call to the radio
-        // ahead of a client that can use it buys nothing and widens the surface.
-        //
-        // The theremin sits here rather than with motor control even though it moves the
-        // mouth, because what it is is a sound: the mouth is following the note. Same
-        // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotTheremin(_) | RobotChorale(_) => false,
-        // Motor control by another name: the dot walks the robot, and the radio is not a control transport.
-        RobotLaserTrack(_) => false,
-        // The same, for a ball: autonomous soccer walks the robot. An NFC tag is local, not the radio.
-        RobotSoccer(_) => false,
-        // The same again: the duck on its own walks the robot. An NFC tag switches it locally.
-        RobotAutonomous(_) => false,
-        // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
-        RobotFlashlight(_) => false,
+        // The theremin is a sound, and sounds are routed above. It moves the mouth, but the mouth
+        // is following the note, which is `robot.sound`'s mouth-on-a-quack by another name; it
+        // walks nothing. It waited here for "an app that can play the duck", and the app's home
+        // screen is now that: Sing beside Quack, which without this needed the video connection,
+        // and so wifi, for an instrument whose whole input is a hand ten centimetres from the beak.
+        RobotTheremin(_) => true,
+        // The chorale stays refused: it starts the robot listening for other ducks, and the
+        // animation that follows was asked for by none of the people in the room.
+        RobotChorale(_) => false,
+        // The games: laser chase, soccer, the duck on its own. They walk the robot, and that was
+        // the reason to refuse them — "the radio is not a control transport". But none of them is
+        // a stream from the phone: each is one switch, and what walks the robot afterwards is the
+        // robot's own camera and its own brain, exactly as when an NFC mode tag switches it —
+        // with no bond, no PIN, nobody's phone at all. A PIN-bonded phone in radio range is more
+        // of a someone than a card touched to the head. What the phone does not get is the
+        // steering: `robot.move` and its stream stay on the video connection. The app's home
+        // screen switches them here, one game at a time, the way a mode tag does.
+        RobotLaserTrack(_) | RobotSoccer(_) | RobotAutonomous(_) => true,
+        // The face light, on the same reasoning as the theremin: an LED is no more consequential
+        // from a phone than a quack, and the app that was waited for now has a Light button.
+        RobotFlashlight(_) => true,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a
@@ -327,10 +332,11 @@ fn permits(call: &proto::Call) -> bool {
         // robot, and that is `robotctl` or the pad's long-press, deliberately.
         RobotShutdown => false,
 
-        // Only a stick-mapping hint for local clients like `padd`. An app gets the same answer
-        // through `system.info` territory when it ever needs one; no reason to open another read
-        // to the radio today.
-        RobotMode => false,
+        // Which switches are on: the mode, soccer, the duck on its own, the laser, the theremin, the
+        // light (v67). Read once a few seconds by the app's home screen so its game tiles say what
+        // the duck is doing rather than what this phone last asked — a tag, the pad or `autod`
+        // switch them too. A read of a few bytes; it was refused only for having no client.
+        RobotMode => true,
 
         // Switching modes means the robot goes home, loads other policies and drives differently
         // — and the reason to switch is that somebody just put wheels on it. That is a decision
@@ -559,6 +565,12 @@ fn permits(call: &proto::Call) -> bool {
         // for a whole one, a second for its preview, and a phone shows the previews first.
         // Deleting one is the owner tidying their own pictures, from the app they keep them in.
         PhotoList | PhotoGet(_) | PhotoDelete(_) => true,
+        // **Taking one is a quack with a pose.** Asked from the room, by the person the duck is
+        // about to look at: it quacks, lifts its head and counts down with its light for five
+        // seconds before the picture, so nobody in front of it is surprised — and the picture is
+        // read back over this same link. It moves the robot no more than the photo tag does, and
+        // a robot busy with a skill is refused, as the tag leaves it alone.
+        PhotoTake => true,
         // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
         // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
         // reason to forward `map.status` — not yet one anybody has.
@@ -802,6 +814,53 @@ mod tests {
             hold: None,
         });
         assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
+    }
+
+    /// **A photo is asked for from the phone that reads it back.** `nfcd` takes it, as it takes
+    /// the photo tag's, and its lane is the gallery's: answered once the pose has started.
+    #[test]
+    fn a_phone_can_ask_for_a_photo() {
+        assert_eq!(
+            destination_for(&proto::Call::PhotoTake),
+            Some((Upstream::Nfc, Lane::Prompt))
+        );
+    }
+
+    /// **Sing and light, beside the quack.** The app's home screen offers them next to its
+    /// sounds; refused here, they needed the video connection and so wifi. The chorale, their
+    /// neighbour on the refused list, stays there.
+    #[test]
+    fn sing_and_light_reach_robotd_and_the_chorale_does_not() {
+        let sing = proto::Call::RobotTheremin(proto::ThereminParams { active: true });
+        let light = proto::Call::RobotFlashlight(proto::FlashlightParams {
+            toggle: true,
+            ..Default::default()
+        });
+        assert_eq!(upstream_for(&sing), Some(Upstream::Robot));
+        assert_eq!(upstream_for(&light), Some(Upstream::Robot));
+        let chorale = proto::Call::RobotChorale(proto::ChoraleParams {
+            active: true,
+            piece: None,
+        });
+        assert_eq!(route_for(&chorale), Route::Refused);
+    }
+
+    /// **The games are switches a phone may throw, and `robot.mode` says which are thrown.**
+    /// The steering is not among them: the robot walks to the dot or the ball on its own.
+    #[test]
+    fn games_are_switched_over_bluetooth_and_read_back() {
+        let games = [
+            proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
+            proto::Call::RobotSoccer(proto::SoccerParams {
+                active: true,
+                autonomous: true,
+            }),
+            proto::Call::RobotAutonomous(proto::AutonomyParams { active: true }),
+            proto::Call::RobotMode,
+        ];
+        for call in &games {
+            assert_eq!(upstream_for(call), Some(Upstream::Robot), "{call:?}");
+        }
     }
 
     /// **A phone can ask for a skill, see what the robot has, and change what it runs.**

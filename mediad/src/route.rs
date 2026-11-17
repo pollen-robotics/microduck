@@ -253,6 +253,11 @@ fn permits(call: &proto::Call) -> bool {
         // them. `btd` carries them, after the setup code. A remote gallery is a decision about the
         // remote path's authorisation, not a line here.
         PhotoList | PhotoGet(_) | PhotoDelete(_) => false,
+        // Taking one shows a peer nothing it does not already have: a session here *is* the
+        // camera, live. The picture lands with the others and is read back over `btd`, which is
+        // where the authorisation to see the gallery lives; and the pose and countdown are the
+        // photo tag's, nothing a peer that may stand the robot up cannot already do.
+        PhotoTake => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -497,6 +502,14 @@ mod tests {
     /// Named individually rather than checked as a group: this is the list that a later widening
     /// of the subset must not quietly grow past, and a test that says "some things are refused"
     /// would not notice.
+    /// A peer that has the camera live may ask the duck to take a picture; it still cannot read
+    /// the gallery, which is `btd`'s, behind the setup code.
+    #[test]
+    fn a_watching_peer_can_take_a_photo_but_not_read_them() {
+        assert!(permits(&proto::Call::PhotoTake));
+        assert!(!permits(&proto::Call::PhotoList));
+    }
+
     #[test]
     fn the_pin_and_the_factory_reset_are_never_available() {
         for call in proto::test_support::every_call() {

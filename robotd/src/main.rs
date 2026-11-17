@@ -878,6 +878,11 @@ struct RobotState {
     /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
     /// feature that silently does nothing.
     theremin_ready: AtomicBool,
+    /// Whether laser tracking is switched on, and whether a theremin is up — the loop's own
+    /// knowledge, republished every tick for `robot.mode`, which is what a phone on Bluetooth
+    /// reads to know which game the duck is playing (it has no `robot.state` stream).
+    laser_on: AtomicBool,
+    theremin_on: AtomicBool,
     /// Whether `[theremin] enabled` allows an instrument at all, and there is a voice to play
     /// it in. Read once at startup, like the policies — and kept separate from
     /// [`State::theremin_ready`] so that the refusal can name the switch. Off is the default,
@@ -979,6 +984,8 @@ impl RobotState {
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             emotions: emotion::Library::load_release(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
+            laser_on: AtomicBool::new(false),
+            theremin_on: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
@@ -4558,6 +4565,11 @@ async fn control_loop<T: RobotIo>(
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
 
+        state.laser_on.store(laser.active(), Ordering::Relaxed);
+        state
+            .theremin_on
+            .store(theremin_state.is_some(), Ordering::Relaxed);
+
         vettally.tick(&vetbook::Facts {
             dt,
             torqued: bringup != Bringup::Limp && !powered_off,
@@ -6423,6 +6435,9 @@ fn dispatch(
                     .to_owned(),
                 soccer: Some(intents.soccer()).filter(|s| s.active),
                 autonomous: intents.autonomous(),
+                laser: state.laser_on.load(Ordering::Relaxed),
+                theremin: state.theremin_on.load(Ordering::Relaxed),
+                flashlight: state.flashlight.load(Ordering::Relaxed) != 0,
             },
         ),
 
