@@ -404,8 +404,8 @@ mode = "walk"
 
 # Speaker level, percent. robotd writes it to the codec's mixer at startup (over the full level
 # aic3104-init.sh sets); 0 mutes the speaker, and the scale spans the codec's audible 45 dB.
-# `robotctl configure` has it as a slider at the top, heard live as it moves. Only the AIC3104
-# has these controls: a board on ALSA's `default` keeps its own mixer's level.
+# `robotctl configure` has it as a slider at the top, heard live as it moves. Written to the
+# HAT's AIC3104, or the beta and face boards' RK809; another codec keeps its own mixer's level.
 # volume = 100
 
 # Quack once as the control loop comes up — on a headless board that greet is the audible

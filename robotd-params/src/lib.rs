@@ -1846,7 +1846,7 @@ pub struct AudioParams {
     pub pet_exit_threshold: f32,
     /// Speaker level, percent: 100 is the codec's full digital level, 0 mutes the speaker.
     /// `robotd` writes it to the mixer at startup, and `robotctl configure` writes it as its
-    /// slider moves ([`set_speaker_volume`]).
+    /// slider moves ([`set_speaker_volume`]), on the AIC3104 or the RK809 ([`SpeakerCodec`]).
     pub volume: u8,
 }
 
@@ -1917,13 +1917,21 @@ impl AudioParams {
         }
     }
 
-    /// The card whose mixer [`Self::volume`] is written to: the one the configured device names,
-    /// when this board has it. `None` on a board that fell back to ALSA's `default` — its codec
-    /// is not the AIC3104 and has none of the controls [`set_speaker_volume`] writes.
-    pub fn mixer_card(&self, cards: &[String]) -> Option<String> {
-        named_card(&self.device)
-            .filter(|card| cards.iter().any(|c| c == card))
-            .map(str::to_owned)
+    /// Where [`Self::volume`] is written on a board whose ALSA cards are `cards`: the card the
+    /// configured device names when the board has it, and otherwise — the same fallback
+    /// [`Self::resolve_devices`] takes to ALSA's `default` — the board's own codec, the first
+    /// card that is one [`SpeakerCodec`] knows. `None` for a codec it does not know.
+    pub fn speaker_mixer(&self, cards: &[String]) -> Option<SpeakerMixer> {
+        let mixer = |card: &str| {
+            SpeakerCodec::of_card(card).map(|codec| SpeakerMixer {
+                card: card.to_owned(),
+                codec,
+            })
+        };
+        match named_card(&self.device) {
+            Some(card) if cards.iter().any(|c| c == card) => mixer(card),
+            _ => cards.iter().find_map(|card| mixer(card)),
+        }
     }
 
     /// The classifier path, or `None` when disabled with the `"none"` sentinel.
@@ -3770,36 +3778,71 @@ pub struct ResolvedAudio {
     pub missing_card: Option<String>,
 }
 
-/// How much of the AIC3104's DAC attenuation the volume scale spans: 45 dB, in the register's
-/// half-dB steps. The register goes to −63.5 dB, but a linear walk over all of it puts half the
-/// scale below anything audible across a room; 1 % at −45 dB is quiet and still there.
-const VOLUME_SPAN_HALF_DB: u32 = 90;
-
-/// The `PCM Playback Volume` register value for `percent` (127 = 0 dB, one step per 0.5 dB),
-/// and whether the line output stays unmuted. 0 % mutes the output stage outright rather than
-/// leaving the bottom of the attenuation audible.
-pub fn volume_register(percent: u8) -> (u8, bool) {
-    let percent = u32::from(percent.min(100));
-    if percent == 0 {
-        return (0, false);
-    }
-    let down = ((100 - percent) * VOLUME_SPAN_HALF_DB + 50) / 100;
-    ((127 - down) as u8, true)
+/// A speaker codec this crate knows how to set the level of, and the controls it does it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerCodec {
+    /// The Zero 3W HAT's TLV320AIC3104 (card `aic3104`): `PCM Playback Volume`, 0–127, 0.5 dB
+    /// a step with 127 at 0 dB, and `Line Playback Switch` on the output stage.
+    Aic3104,
+    /// The RK809 on the beta and face boards (card `rockchiprk809`): `DAC Playback Volume`,
+    /// 0–255 over −95 to −1.1 dB, about 0.37 dB a step.
+    Rk809,
 }
 
-/// Write `percent` to the AIC3104 mixer on `card`, through `amixer` as `aic3104-init.sh` does.
-///
-/// The level is the DAC's digital volume; the line stage gain that script sets stays where it
-/// is. Effective immediately, on whatever is playing.
-pub fn set_speaker_volume(card: &str, percent: u8) -> Result<(), String> {
-    let (register, on) = volume_register(percent);
-    for (control, value) in [
-        ("PCM Playback Volume", format!("{register},{register}")),
-        (
-            "Line Playback Switch",
-            if on { "on,on" } else { "off,off" }.to_owned(),
-        ),
-    ] {
+impl SpeakerCodec {
+    /// The codec behind an ALSA card id, if it is one of these.
+    pub fn of_card(card: &str) -> Option<Self> {
+        match card {
+            "aic3104" => Some(Self::Aic3104),
+            "rockchiprk809" => Some(Self::Rk809),
+            _ => None,
+        }
+    }
+
+    /// The `amixer cset` writes that put the speaker at `percent`.
+    ///
+    /// Both scales span the codec's top 45 dB rather than its whole range: a linear walk over
+    /// all of it puts half the slider below anything audible across a room, and 1 % at −45 dB
+    /// is quiet and still there. 0 % is a real mute — the output stage off on the AIC3104, the
+    /// DAC at its floor (−95 dB) on the RK809, which has no mute of its own on this path.
+    pub fn writes(self, percent: u8) -> Vec<(&'static str, String)> {
+        let percent = u32::from(percent.min(100));
+        // (register at full, register steps in 45 dB)
+        let (top, span) = match self {
+            Self::Aic3104 => (127, 90),
+            Self::Rk809 => (255, 122),
+        };
+        let register = if percent == 0 {
+            0
+        } else {
+            top - ((100 - percent) * span + 50) / 100
+        };
+        let pair = format!("{register},{register}");
+        match self {
+            Self::Aic3104 => vec![
+                ("PCM Playback Volume", pair),
+                (
+                    "Line Playback Switch",
+                    if percent == 0 { "off,off" } else { "on,on" }.to_owned(),
+                ),
+            ],
+            Self::Rk809 => vec![("DAC Playback Volume", pair)],
+        }
+    }
+}
+
+/// Where the speaker level is written: a card, and which codec it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerMixer {
+    pub card: String,
+    pub codec: SpeakerCodec,
+}
+
+/// Write `percent` to the speaker's mixer, through `amixer` as `aic3104-init.sh` does.
+/// Effective immediately, on whatever is playing.
+pub fn set_speaker_volume(mixer: &SpeakerMixer, percent: u8) -> Result<(), String> {
+    let card = &mixer.card;
+    for (control, value) in mixer.codec.writes(percent) {
         let output = std::process::Command::new("amixer")
             .args(["-q", "-c", card, "cset", &format!("name={control}"), &value])
             .output()
@@ -5087,16 +5130,51 @@ mod tests {
         let path = write(dir.path(), "[audio]\nvolume = 40\n");
         assert_eq!(Params::load(&path, true).expect("valid").audio.volume, 40);
 
+        use SpeakerCodec::{Aic3104, Rk809};
+        let w = |codec: SpeakerCodec, p| codec.writes(p);
+        let pair = |v: &str| {
+            vec![
+                ("PCM Playback Volume", format!("{v},{v}")),
+                ("Line Playback Switch", "on,on".to_owned()),
+            ]
+        };
+        assert_eq!(w(Aic3104, 100), pair("127"), "full is the codec's 0 dB");
+        assert_eq!(w(Aic3104, 1), pair("38"), "1 % is −44.5 dB, still on");
+        assert_eq!(w(Aic3104, 250), pair("127"));
+        assert_eq!(w(Aic3104, 0)[1].1, "off,off", "0 % mutes the output stage");
         assert_eq!(
-            volume_register(100),
-            (127, true),
-            "full is the codec's 0 dB"
+            w(Rk809, 100),
+            vec![("DAC Playback Volume", "255,255".to_owned())]
         );
-        assert_eq!(volume_register(1), (38, true), "1 % is −44.5 dB, still on");
-        assert_eq!(volume_register(0), (0, false), "0 % mutes the output stage");
-        assert_eq!(volume_register(250), (127, true));
-        let steps: Vec<u8> = (1..=100).map(|p| volume_register(p).0).collect();
-        assert!(steps.windows(2).all(|w| w[0] <= w[1]), "monotonic");
+        assert_eq!(w(Rk809, 1)[0].1, "134,134", "about −45 dB");
+        assert_eq!(w(Rk809, 0)[0].1, "0,0", "the DAC's floor");
+    }
+
+    /// The speaker's mixer is the configured card where the board has it, and the board's own
+    /// codec where it does not — the face board names no card and plays on `default`, and its
+    /// RK809 is where its level goes.
+    #[test]
+    fn the_speaker_mixer_follows_the_card_the_board_has() {
+        let cards = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let audio = AudioParams::default();
+        let zero3 = audio.speaker_mixer(&cards(&["aic3104"])).unwrap();
+        assert_eq!(
+            (zero3.card.as_str(), zero3.codec),
+            ("aic3104", SpeakerCodec::Aic3104)
+        );
+        let face = audio
+            .speaker_mixer(&cards(&["rockchiprk809", "facemic"]))
+            .unwrap();
+        assert_eq!(
+            (face.card.as_str(), face.codec),
+            ("rockchiprk809", SpeakerCodec::Rk809)
+        );
+        assert_eq!(
+            audio.speaker_mixer(&cards(&["facemic"])),
+            None,
+            "a mic is not a speaker"
+        );
+        assert_eq!(audio.speaker_mixer(&[]), None);
     }
 
     /// A stale limit at or past the deadman would keep re-sending a stalled client's last stick

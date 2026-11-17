@@ -6075,8 +6075,9 @@ pub struct VolumeParams {
 pub struct VolumeResult {
     /// Percent, 0–100.
     pub volume: u8,
-    /// Whether this board has the mixer the level is written to. False on a board playing on
-    /// ALSA's `default` (not the AIC3104): the level is kept, and changes nothing it can hear.
+    /// Whether this board has a speaker mixer the level is written to — the Zero 3W HAT's
+    /// AIC3104, or the beta and face boards' RK809. False on any other codec: the level is kept,
+    /// and changes nothing it can hear.
     pub applies: bool,
 }
 

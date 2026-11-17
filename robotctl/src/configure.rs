@@ -443,9 +443,10 @@ fn with_volume_row(items: Vec<Item>, rows: &[Row]) -> Vec<Item> {
     out
 }
 
-/// The card whose mixer the slider moves on this machine, if any: the configured playback
-/// device's, when this board has it. `None` off a robot, where the slider only edits the file.
-fn mixer_card(rows: &[Row]) -> Option<String> {
+/// The speaker mixer the slider moves on this machine, if any — the HAT's AIC3104 or the face
+/// board's RK809 ([`robotd_params::AudioParams::speaker_mixer`]). `None` off a robot, where the
+/// slider only edits the file.
+fn speaker_mixer(rows: &[Row]) -> Option<robotd_params::SpeakerMixer> {
     let device = rows.iter().find(|row| row.entry.key == "audio.device")?;
     let audio = robotd_params::AudioParams {
         device: device.effective().to_owned(),
@@ -454,7 +455,7 @@ fn mixer_card(rows: &[Row]) -> Option<String> {
     let cards = robotd_params::alsa_card_ids(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
     );
-    audio.mixer_card(&cards)
+    audio.speaker_mixer(&cards)
 }
 
 /// The header the dev-board switch sits under, at the top of the list.
@@ -541,7 +542,7 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
     );
     // The mixer the slider moves, and the level last written to it — the file's to begin with,
     // which is what robotd set at startup.
-    let mixer = mixer_card(&model.rows());
+    let mixer = speaker_mixer(&model.rows());
     let mut mixer_level = volume_of(&model.rows());
     // First key, not the first header.
     let mut cursor = items
@@ -560,10 +561,10 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
         let rows = model.rows();
         // Whatever moved the level — an arrow, a typed value, `u` — it is heard now.
         let level = volume_of(&rows);
-        if let Some(card) = &mixer
+        if let Some(speaker) = &mixer
             && level != mixer_level
         {
-            match robotd_params::set_speaker_volume(card, level) {
+            match robotd_params::set_speaker_volume(speaker, level) {
                 Ok(()) => mixer_level = level,
                 Err(e) => status = Some(format!("speaker not changed live: {e}")),
             }
@@ -786,9 +787,9 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
     // rows saying exactly that, saved or not — nothing reads `pending` past this point.
     model.pending.remove(VOLUME_KEY);
     let kept = volume_of(&model.rows());
-    if let Some(card) = &mixer
+    if let Some(speaker) = &mixer
         && kept != mixer_level
-        && let Err(e) = robotd_params::set_speaker_volume(card, kept)
+        && let Err(e) = robotd_params::set_speaker_volume(speaker, kept)
     {
         eprintln!("could not put the speaker back to {kept} %: {e}");
     }

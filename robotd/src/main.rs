@@ -2625,14 +2625,18 @@ async fn control_loop<T: RobotIo>(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
     );
     let audio = params.audio.resolve_devices(&cards);
-    // The speaker level, over whatever `aic3104-init.service` left (it runs before this unit and
-    // sets the codec's full level). Only on the codec the controls belong to; a board on ALSA's
-    // `default` keeps its own mixer's level.
+    // The speaker level, over whatever the board left (`aic3104-init.service` runs before this unit
+    // and sets the HAT codec's full level). On the configured card, or the board's own codec where
+    // it fell back to `default` — the face board's RK809 (`SpeakerCodec`).
     if params.audio.enabled
-        && let Some(card) = params.audio.mixer_card(&cards)
+        && let Some(mixer) = params.audio.speaker_mixer(&cards)
     {
-        match robotd_params::set_speaker_volume(&card, params.audio.volume) {
-            Ok(()) => tracing::info!(volume = params.audio.volume, %card, "speaker level set"),
+        match robotd_params::set_speaker_volume(&mixer, params.audio.volume) {
+            Ok(()) => tracing::info!(
+                volume = params.audio.volume,
+                card = %mixer.card,
+                "speaker level set"
+            ),
             Err(e) => tracing::warn!(error = %e, "could not set the speaker level"),
         }
     }
@@ -5704,12 +5708,12 @@ fn volume_now(config: &std::path::Path) -> Result<proto::VolumeResult, String> {
     })
 }
 
-/// This board's AIC3104 card, when it has one and audio is on.
-fn speaker_mixer(audio: &params::AudioParams) -> Option<String> {
+/// This board's speaker mixer, when it has one this build can drive and audio is on.
+fn speaker_mixer(audio: &params::AudioParams) -> Option<params::SpeakerMixer> {
     if !audio.enabled {
         return None;
     }
-    audio.mixer_card(&robotd_params::alsa_card_ids(
+    audio.speaker_mixer(&robotd_params::alsa_card_ids(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
     ))
 }
@@ -5729,15 +5733,15 @@ fn set_volume_request(
     }
     params::edit::set_key(config, "audio.volume", &p.volume.to_string())?;
     let loaded = params::Params::load(config, false).map_err(|e| e.to_string())?;
-    let card = speaker_mixer(&loaded.audio);
-    if let Some(card) = &card
-        && let Err(e) = robotd_params::set_speaker_volume(card, loaded.audio.volume)
+    let mixer = speaker_mixer(&loaded.audio);
+    if let Some(speaker) = &mixer
+        && let Err(e) = robotd_params::set_speaker_volume(speaker, loaded.audio.volume)
     {
         tracing::warn!(error = %e, "speaker level stored but not applied");
     }
     let now = proto::VolumeResult {
         volume: loaded.audio.volume,
-        applies: card.is_some(),
+        applies: mixer.is_some(),
     };
     Ok(now)
 }
