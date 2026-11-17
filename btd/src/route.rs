@@ -295,6 +295,11 @@ fn permits(call: &proto::Call) -> bool {
         // radio's version of `robotctl quack`. One request, not a stream, and it moves nothing.
         RobotSound(_) => true,
 
+        // The speaker level, read and set. Asked from the room by whoever is listening to the
+        // duck, and set from the app's settings: the same class as a quack, plus a write to
+        // `[audio] volume` so the level survives a restart. Trivially undone from the same phone.
+        RobotVolume | RobotSetVolume(_) => true,
+
         // Harmless and rather charming from a phone — but they ride the same refusal as the
         // rest of robot.* until the app path exists to want them: opening a call to the radio
         // ahead of a client that can use it buys nothing and widens the surface.

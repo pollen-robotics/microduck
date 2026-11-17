@@ -65,6 +65,10 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // And how loud they are. §4 applies as it does to `pad.bind`: the level is written to the
+        // config file, so a LAN peer changes something that outlives the session — a level, set
+        // back from the same page.
+        RobotVolume | RobotSetVolume(_) => true,
         // Somebody watching the camera is exactly who would want to wave a laser for it.
         RobotLaserTrack(_) => true,
         // And somebody watching the camera is who would roll a ball for it.

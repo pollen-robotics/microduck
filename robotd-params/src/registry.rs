@@ -926,6 +926,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "…and ends below this one (hysteresis)",
     ),
+    entry(
+        "audio.volume",
+        Kind::Integer,
+        "Speaker level, 0–100 % (0 mutes) — ←→ on the slider at the top of this editor",
+    ),
     // ── [emotions] ───────────────────────────────────────────────────────────
     entry(
         "emotions.dir",

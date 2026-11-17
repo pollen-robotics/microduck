@@ -2621,9 +2621,25 @@ async fn control_loop<T: RobotIo>(
     // spawned when configured, with its own retry loop when arecord flaps.
     //
     // A configured card this board lacks means ALSA's `default` instead (resolve_devices).
-    let audio = params.audio.resolve_devices(&robotd_params::alsa_card_ids(
+    let cards = robotd_params::alsa_card_ids(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
-    ));
+    );
+    let audio = params.audio.resolve_devices(&cards);
+    // The speaker level, over whatever the board left (`aic3104-init.service` runs before this unit
+    // and sets the HAT codec's full level). On the configured card, or the board's own codec where
+    // it fell back to `default` — the face board's RK809 (`SpeakerCodec`).
+    if params.audio.enabled
+        && let Some(mixer) = params.audio.speaker_mixer(&cards)
+    {
+        match robotd_params::set_speaker_volume(&mixer, params.audio.volume) {
+            Ok(()) => tracing::info!(
+                volume = params.audio.volume,
+                card = %mixer.card,
+                "speaker level set"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not set the speaker level"),
+        }
+    }
     if params.audio.enabled
         && let Some(card) = &audio.missing_card
     {
@@ -5683,6 +5699,53 @@ fn pad_bindings_report(config: &std::path::Path, state: &RobotState) -> proto::P
 /// The name is checked against the skills this robot has, which is the reason this call is served
 /// here rather than beside the rest of `pad.*` in `configd`. A refusal naming the real skills is
 /// worth much more than a button that turns out to do nothing.
+/// The speaker level in the config, and whether this board has the mixer it is written to.
+fn volume_now(config: &std::path::Path) -> Result<proto::VolumeResult, String> {
+    let params = params::Params::load(config, false).map_err(|e| e.to_string())?;
+    Ok(proto::VolumeResult {
+        volume: params.audio.volume,
+        applies: speaker_mixer(&params.audio).is_some(),
+    })
+}
+
+/// This board's speaker mixer, when it has one this build can drive and audio is on.
+fn speaker_mixer(audio: &params::AudioParams) -> Option<params::SpeakerMixer> {
+    if !audio.enabled {
+        return None;
+    }
+    audio.speaker_mixer(&robotd_params::alsa_card_ids(
+        &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
+    ))
+}
+
+/// `robot.setVolume`: written to `[audio] volume` — through the same editor and validation
+/// `robotctl configure` uses — then to the mixer, so it is heard at once and kept.
+///
+/// The file first: a level that could not be kept is refused rather than heard until the next
+/// restart quietly undoes it. A mixer that will not take it is logged, not refused — the level is
+/// stored, and `applies` already tells a client whether this board can hear it.
+fn set_volume_request(
+    p: &proto::VolumeParams,
+    config: &std::path::Path,
+) -> Result<proto::VolumeResult, String> {
+    if p.volume > 100 {
+        return Err(format!("volume {} is over 100 %", p.volume));
+    }
+    params::edit::set_key(config, "audio.volume", &p.volume.to_string())?;
+    let loaded = params::Params::load(config, false).map_err(|e| e.to_string())?;
+    let mixer = speaker_mixer(&loaded.audio);
+    if let Some(speaker) = &mixer
+        && let Err(e) = robotd_params::set_speaker_volume(speaker, loaded.audio.volume)
+    {
+        tracing::warn!(error = %e, "speaker level stored but not applied");
+    }
+    let now = proto::VolumeResult {
+        volume: loaded.audio.volume,
+        applies: mixer.is_some(),
+    };
+    Ok(now)
+}
+
 fn bind_pad_request(p: &proto::PadBindParams, state: &RobotState) -> proto::IntentResult {
     let defaults = params::PadParams::default();
     if defaults.skill(&p.button).is_none() {
@@ -6160,6 +6223,18 @@ fn dispatch(
             state.vetbook.tally(p);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
+        proto::Call::RobotVolume => match volume_now(&state.config_path) {
+            Ok(result) => proto::Response::ok(Some(id), &result),
+            Err(e) => {
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
+            }
+        },
+        proto::Call::RobotSetVolume(p) => match set_volume_request(p, &state.config_path) {
+            Ok(result) => proto::Response::ok(Some(id), &result),
+            Err(e) => {
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INVALID_PARAMS, e))
+            }
+        },
         proto::Call::RobotVetbookNote(p) => {
             let result = match state.vetbook.note(&p.text) {
                 Ok(()) => proto::IntentResult::accepted(),
