@@ -982,11 +982,11 @@ impl Server {
                     "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
-            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => Response::err(
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) | Call::PhotoTake => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
-                    "photo.list, photo.get and photo.delete are served by nfcd, on /run/nfcd/nfc.sock",
+                    "photo.* is served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

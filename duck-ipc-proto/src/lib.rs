@@ -666,7 +666,15 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// `btd` now routes `robot.mode`, `robot.laserTrack`, `robot.soccer` and `robot.autonomous`, as
 /// well as `robot.theremin` and `robot.flashlight`. A route opening, not a wire change: an older
 /// `btd` refuses them with PERMISSION_DENIED, by name, which is how the app tells.
-pub const API_VERSION: u32 = 67;
+///
+/// # v68 — `photo.take`
+///
+/// [`method::PHOTO_TAKE`]: the photo sequence asked for from a phone — the pose, the flashlight
+/// countdown and the picture, kept with the others in `/var/lib/robot/photos`, without the e-ink
+/// display the tag's sequence ends with. No params; [`IntentResult`] once it has started, so a
+/// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
+/// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
+pub const API_VERSION: u32 = 68;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -1026,6 +1034,16 @@ pub mod method {
     pub const PHOTO_GET: &str = "photo.get";
     /// Delete one photo, and its preview. Answered by `nfcd`; see [`super::PhotoDeleteResult`].
     pub const PHOTO_DELETE: &str = "photo.delete";
+    /// Take a photo: the photo tag's pose, flashlight countdown and picture, without the e-ink
+    /// display — the head back to the centre after, the robot left standing or seated as it was.
+    /// No params; the answer is [`super::IntentResult`], given once the sequence has started, not
+    /// once the picture is kept: the picture shows up in [`PHOTO_LIST`] about seven seconds later.
+    ///
+    /// Refused while a photo is being taken (asked, or a tag's), when `robotd` cannot be asked,
+    /// and when the robot is busy with something it would be wrong to interrupt — a skill, a
+    /// ground pick, a rest — the tag's own rule. A robot that is not driving is started first,
+    /// as for the tag. Answered by `nfcd`, which takes them. (v68)
+    pub const PHOTO_TAKE: &str = "photo.take";
     /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
     /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
     ///
@@ -1600,6 +1618,8 @@ pub enum Call {
     PhotoGet(PhotoGetParams),
     /// Delete one photo; see [`method::PHOTO_DELETE`]. Answered by `nfcd`.
     PhotoDelete(PhotoDeleteParams),
+    /// Take a photo; see [`method::PHOTO_TAKE`]. Answered by `nfcd`.
+    PhotoTake,
     /// Answered by `mapd`; see [`method::MAP_STATUS`].
     MapStatus,
     MapStream,
@@ -1700,6 +1720,7 @@ impl Call {
             Call::PhotoList => method::PHOTO_LIST,
             Call::PhotoGet(_) => method::PHOTO_GET,
             Call::PhotoDelete(_) => method::PHOTO_DELETE,
+            Call::PhotoTake => method::PHOTO_TAKE,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
@@ -2000,6 +2021,9 @@ impl Call {
             // A directory listing and a file read: milliseconds, and a preview's first making is
             // one JPEG decoded and shrunk, well under a second.
             Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => (Nfc, Prompt),
+            // Answered once the sequence has started — one `robot.state` read to see the robot is
+            // free — not once the picture is kept.
+            Call::PhotoTake => (Nfc, Prompt),
             // ── mapd ────────────────────────────────────────────────────────
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
@@ -2138,6 +2162,7 @@ impl Call {
             | Call::MapStream
             | Call::MapWipe
             | Call::PhotoList
+            | Call::PhotoTake
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
             Call::MapGrid(p) => encode(p),
         }
@@ -2192,6 +2217,7 @@ impl Call {
                 Call::NfcRead(decode(params.or(Some(&empty)))?)
             }
             method::PHOTO_LIST => Call::PhotoList,
+            method::PHOTO_TAKE => Call::PhotoTake,
             method::PHOTO_GET => Call::PhotoGet(decode(params)?),
             method::PHOTO_DELETE => Call::PhotoDelete(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
@@ -2515,6 +2541,7 @@ pub mod test_support {
             Call::PhotoDelete(PhotoDeleteParams {
                 name: "2026-11-11_14-03-27-2".into(),
             }),
+            Call::PhotoTake,
             Call::MapStatus,
             Call::MapStream,
             Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
@@ -7632,7 +7659,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            90,
+            91,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

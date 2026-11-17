@@ -565,6 +565,12 @@ fn permits(call: &proto::Call) -> bool {
         // for a whole one, a second for its preview, and a phone shows the previews first.
         // Deleting one is the owner tidying their own pictures, from the app they keep them in.
         PhotoList | PhotoGet(_) | PhotoDelete(_) => true,
+        // **Taking one is a quack with a pose.** Asked from the room, by the person the duck is
+        // about to look at: it quacks, lifts its head and counts down with its light for five
+        // seconds before the picture, so nobody in front of it is surprised — and the picture is
+        // read back over this same link. It moves the robot no more than the photo tag does, and
+        // a robot busy with a skill is refused, as the tag leaves it alone.
+        PhotoTake => true,
         // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
         // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
         // reason to forward `map.status` — not yet one anybody has.
@@ -808,6 +814,16 @@ mod tests {
             hold: None,
         });
         assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
+    }
+
+    /// **A photo is asked for from the phone that reads it back.** `nfcd` takes it, as it takes
+    /// the photo tag's, and its lane is the gallery's: answered once the pose has started.
+    #[test]
+    fn a_phone_can_ask_for_a_photo() {
+        assert_eq!(
+            destination_for(&proto::Call::PhotoTake),
+            Some((Upstream::Nfc, Lane::Prompt))
+        );
     }
 
     /// **Sing and light, beside the quack.** The app's home screen offers them next to its

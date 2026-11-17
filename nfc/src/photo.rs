@@ -44,6 +44,12 @@
 //! the angle the camera is mounted at, turned upright here. A robot without a camera running still
 //! sits and opens its beak — the pose is half of what the person was promised — and the journal
 //! says why there is no picture.
+//!
+//! **Asked for from a phone (`photo.take`), it is steps 1 to 5 and no more** ([`on_ask`]): the
+//! pose, the countdown, the picture, kept — then the head back to the centre, the robot left
+//! standing or seated as it was. Sitting and opening the beak are for the display, and a person
+//! with a phone in their hand has no display to give it; a duck that sat down after every photo
+//! asked from the app would have to be stood up again for the next one.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -224,7 +230,7 @@ pub trait Driver {
 /// How a touch ended, for the journal and the tests.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The picture is saved, and the robot sat down with its beak open.
+    /// The picture is saved: from a tag, and the robot sat down with its beak open.
     Taken(PathBuf),
     /// The pose ran, there is no picture, and why.
     NoPhoto(String),
@@ -235,79 +241,26 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Whether a sequence would go ahead with the robot in `policy`: standing, seated, rising, or not
+/// driving and so started first. Anything else — a skill, a ground pick, a rest — is the robot
+/// busy, left alone. What `photo.take` asks before it answers, so a phone hears the refusal.
+pub fn may_start(policy: &str) -> bool {
+    matches!(
+        policy,
+        "walk" | "stand" | "sit" | "rise" | "held" | "homing"
+    )
+}
+
+/// The touch of a display or a photo tag: the whole sequence, display included.
 pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
-    if let Err(why) = robot.sound(HEARD) {
-        tracing::info!(%why, "the robot would not quack for the tag");
-    }
-
-    // Standing, still. Laser tracking off first: it walks the robot to the dot.
-    match robot.laser_track(false) {
-        Ok(r) if r.accepted => {}
-        Ok(r) => tracing::info!(reason = ?r.reason, "laser tracking not switched off"),
-        Err(why) => tracing::info!(%why, "laser tracking not switched off"),
-    }
-    if let Err(why) = asked("robot.stop", robot.stop()) {
-        return Outcome::Failed(why);
-    }
-    let mut policy = match robot.policy() {
-        Ok(p) => p,
-        Err(why) => return Outcome::Failed(format!("robot.state: {why}")),
-    };
-    if matches!(policy.as_str(), "held" | "homing") {
-        if let Err(why) = asked("robot.enable", robot.start()) {
-            return Outcome::Failed(why);
-        }
-        let mut waited = Duration::ZERO;
-        while !matches!(policy.as_str(), "walk" | "stand") && waited < START_WITHIN {
-            robot.sleep(START_POLL);
-            waited += START_POLL;
-            policy = match robot.policy() {
-                Ok(p) => p,
-                Err(why) => return Outcome::Failed(format!("robot.state: {why}")),
-            };
-        }
-    }
-    let seated = match policy.as_str() {
-        "walk" | "stand" => false,
-        "sit" => true,
-        "rise" => {
-            robot.sleep(RISE);
-            false
-        }
-        _ => return Outcome::NotStanding(policy),
-    };
-    robot.sleep(STILL);
-
-    // The head up, held through the countdown.
-    let head = match robot.look(if seated { LOOK_UP_SEATED } else { LOOK_UP }) {
-        Ok(r) => r.head,
-        Err(why) => return Outcome::Failed(format!("robot.look: {why}")),
-    };
-    hold(robot, head, LIFT);
-    for period in blinks(COUNTDOWN) {
-        for brightness in [BLINK, 0.0] {
-            if let Err(why) = asked("robot.flashlight", robot.flashlight(brightness)) {
-                // A board without a light still takes the picture, only without the countdown.
-                tracing::info!(%why, "no flashlight for the countdown");
-            }
-            hold(robot, head, period / 2);
-        }
-    }
-    let _ = robot.flashlight(FLASH_AT);
-    if let Err(why) = robot.sound(SHUTTER) {
-        tracing::info!(%why, "no shutter quack");
-    }
-    hold(robot, head, FLASH);
-    let shot = robot.capture();
-    let _ = robot.flashlight(0.0);
-
-    // An unsaved photo is still written to the display; no photo, and there is nothing to write.
-    let (outcome, photo) = match shot {
-        Ok(jpeg) => match robot.save(&jpeg) {
-            Ok(path) => (Outcome::Taken(path), Some(jpeg)),
-            Err(why) => (Outcome::NoPhoto(why), Some(jpeg)),
-        },
-        Err(why) => (Outcome::NoPhoto(why), None),
+    let Shot {
+        seated,
+        head,
+        outcome,
+        photo,
+    } = match pose_and_shoot(robot) {
+        Ok(shot) => shot,
+        Err(outcome) => return outcome,
     };
 
     // Sit, then the beak wide open. The head is held throughout, so the look-around stays off.
@@ -380,6 +333,109 @@ pub fn on_touch(robot: &mut dyn Driver) -> Outcome {
     let _ = robot.mouth(0.0);
     hold(robot, proto::HeadParams::default(), BACK_UP);
     outcome
+}
+
+/// `photo.take`: the pose, the countdown and the picture, kept — no sitting, no beak, no display.
+/// The head goes back to the centre, and the robot stays standing or seated as it was.
+pub fn on_ask(robot: &mut dyn Driver) -> Outcome {
+    let shot = match pose_and_shoot(robot) {
+        Ok(shot) => shot,
+        Err(outcome) => return outcome,
+    };
+    hold(robot, proto::HeadParams::default(), BACK_UP);
+    shot.outcome
+}
+
+/// What the pose and the picture leave for what comes after: how the robot is, where its head is
+/// held, how the picture went, and the picture, saved or not.
+struct Shot {
+    seated: bool,
+    head: proto::HeadParams,
+    outcome: Outcome,
+    photo: Option<Vec<u8>>,
+}
+
+/// Steps 1 to 5, which a tag and an ask share. `Err` is how the sequence ended early.
+fn pose_and_shoot(robot: &mut dyn Driver) -> Result<Shot, Outcome> {
+    if let Err(why) = robot.sound(HEARD) {
+        tracing::info!(%why, "the robot would not quack for the tag");
+    }
+
+    // Standing, still. Laser tracking off first: it walks the robot to the dot.
+    match robot.laser_track(false) {
+        Ok(r) if r.accepted => {}
+        Ok(r) => tracing::info!(reason = ?r.reason, "laser tracking not switched off"),
+        Err(why) => tracing::info!(%why, "laser tracking not switched off"),
+    }
+    if let Err(why) = asked("robot.stop", robot.stop()) {
+        return Err(Outcome::Failed(why));
+    }
+    let mut policy = match robot.policy() {
+        Ok(p) => p,
+        Err(why) => return Err(Outcome::Failed(format!("robot.state: {why}"))),
+    };
+    if matches!(policy.as_str(), "held" | "homing") {
+        if let Err(why) = asked("robot.enable", robot.start()) {
+            return Err(Outcome::Failed(why));
+        }
+        let mut waited = Duration::ZERO;
+        while !matches!(policy.as_str(), "walk" | "stand") && waited < START_WITHIN {
+            robot.sleep(START_POLL);
+            waited += START_POLL;
+            policy = match robot.policy() {
+                Ok(p) => p,
+                Err(why) => return Err(Outcome::Failed(format!("robot.state: {why}"))),
+            };
+        }
+    }
+    let seated = match policy.as_str() {
+        "walk" | "stand" => false,
+        "sit" => true,
+        "rise" => {
+            robot.sleep(RISE);
+            false
+        }
+        _ => return Err(Outcome::NotStanding(policy)),
+    };
+    robot.sleep(STILL);
+
+    // The head up, held through the countdown.
+    let head = match robot.look(if seated { LOOK_UP_SEATED } else { LOOK_UP }) {
+        Ok(r) => r.head,
+        Err(why) => return Err(Outcome::Failed(format!("robot.look: {why}"))),
+    };
+    hold(robot, head, LIFT);
+    for period in blinks(COUNTDOWN) {
+        for brightness in [BLINK, 0.0] {
+            if let Err(why) = asked("robot.flashlight", robot.flashlight(brightness)) {
+                // A board without a light still takes the picture, only without the countdown.
+                tracing::info!(%why, "no flashlight for the countdown");
+            }
+            hold(robot, head, period / 2);
+        }
+    }
+    let _ = robot.flashlight(FLASH_AT);
+    if let Err(why) = robot.sound(SHUTTER) {
+        tracing::info!(%why, "no shutter quack");
+    }
+    hold(robot, head, FLASH);
+    let shot = robot.capture();
+    let _ = robot.flashlight(0.0);
+
+    // An unsaved photo is still written to the display; no photo, and there is nothing to write.
+    let (outcome, photo) = match shot {
+        Ok(jpeg) => match robot.save(&jpeg) {
+            Ok(path) => (Outcome::Taken(path), Some(jpeg)),
+            Err(why) => (Outcome::NoPhoto(why), Some(jpeg)),
+        },
+        Err(why) => (Outcome::NoPhoto(why), None),
+    };
+    Ok(Shot {
+        seated,
+        head,
+        outcome,
+        photo,
+    })
 }
 
 /// The head rolling side to side around a pose, [`ROLL`] each way every [`ROLL_PERIOD`], with a
@@ -915,6 +971,46 @@ mod tests {
                 "mouth 0"
             ]
         );
+    }
+
+    /// `photo.take`: the same pose and picture, then nothing the display needs — no sitting, no
+    /// beak, no antenna asked.
+    #[test]
+    fn asked_from_a_phone_it_shoots_and_stays_as_it_was() {
+        let mut robot = Fake::default();
+        assert_eq!(on_ask(&mut robot), Outcome::Taken("/photos/now.jpg".into()));
+        assert_eq!(
+            shape(&robot.calls),
+            [
+                "quack",
+                "laser off",
+                "stop",
+                "look",
+                "blinks",
+                "light 0.2",
+                "quack",
+                "capture",
+                "light 0",
+                "save",
+            ]
+        );
+        assert_eq!(robot.asked_beak, 0);
+        // The head is let go at the centre rather than left looking up.
+        assert_eq!(robot.calls.last().unwrap(), "head");
+        assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
+    }
+
+    #[test]
+    fn asked_from_a_phone_a_busy_robot_is_left_alone() {
+        let mut robot = Fake {
+            policy: "skill".into(),
+            ..Fake::default()
+        };
+        assert_eq!(on_ask(&mut robot), Outcome::NotStanding("skill".into()));
+        assert!(!may_start("skill"));
+        for policy in ["walk", "stand", "sit", "rise", "held", "homing"] {
+            assert!(may_start(policy), "{policy}");
+        }
     }
 
     #[test]

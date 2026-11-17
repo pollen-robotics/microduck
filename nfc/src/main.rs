@@ -240,6 +240,8 @@ fn main() -> std::process::ExitCode {
     };
 
     let reader_up = Arc::new(AtomicBool::new(false));
+    // One photo sequence at a time, whether a tag or `photo.take` started it.
+    let posing = Arc::new(AtomicBool::new(false));
     let (asked, jobs) = mpsc::channel();
     let asker = Sockets {
         config: args.config_socket.clone(),
@@ -247,7 +249,13 @@ fn main() -> std::process::ExitCode {
         media: args.media_socket.clone(),
         photos: args.photo_dir.clone(),
     };
-    if let Err(e) = serve(&args.socket, asked, reader_up.clone(), asker) {
+    if let Err(e) = serve(
+        &args.socket,
+        asked,
+        reader_up.clone(),
+        posing.clone(),
+        asker,
+    ) {
         // Tags are still acted on; only writing and reading one on request is gone.
         tracing::warn!(socket = %args.socket.display(), error = %e, "not serving nfc.write");
     }
@@ -268,7 +276,7 @@ fn main() -> std::process::ExitCode {
                 said = None;
                 backoff = RETRY_MIN;
                 reader_up.store(true, Ordering::Release);
-                let why = watch(&mut chip, period, &mut robot, &mut waiting);
+                let why = watch(&mut chip, period, &mut robot, &mut waiting, &posing);
                 reader_up.store(false, Ordering::Release);
                 tracing::warn!(device = %device.display(), error = %why, "reader lost");
             }
@@ -528,7 +536,13 @@ fn open(device: &Path) -> nfc::Result<Chip> {
 }
 
 /// Poll until the reader stops answering, acting on every touch. Returns why it stopped.
-fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut Jobs) -> Error {
+fn watch(
+    chip: &mut Chip,
+    period: Duration,
+    robot: &mut Sockets,
+    waiting: &mut Jobs,
+    posing: &Arc<AtomicBool>,
+) -> Error {
     let mut touches = Touches::default();
     loop {
         let start = Instant::now();
@@ -598,7 +612,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
                     tracing::warn!(tag = %id, "e-ink in the beak — it starts nothing there");
                 } else {
                     tracing::warn!(tag = %id, "e-ink on the head — hold still");
-                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
+                    photo_by_tag(posing, robot, chip);
                 }
                 continue_after(period, start);
                 continue;
@@ -616,7 +630,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
                 Ok(Ok(records)) if photo::in_records(&records) => {
                     tracing::warn!(tag = %id, "photo tag touched — hold still");
-                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
+                    photo_by_tag(posing, robot, chip);
                 }
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
                     match ModeTag::in_records(&records) {
@@ -839,6 +853,7 @@ fn serve(
     socket: &Path,
     asked: mpsc::Sender<Job>,
     reader_up: Arc<AtomicBool>,
+    posing: Arc<AtomicBool>,
     robot: Sockets,
 ) -> std::io::Result<()> {
     if let Some(parent) = socket.parent() {
@@ -859,9 +874,10 @@ fn serve(
                 Ok(stream) => {
                     let asked = asked.clone();
                     let reader_up = reader_up.clone();
+                    let posing = posing.clone();
                     let mut robot = robot.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = client(stream, &asked, &reader_up, &mut robot) {
+                        if let Err(e) = client(stream, &asked, &reader_up, &posing, &mut robot) {
                             tracing::debug!(error = %e, "nfc.write client ended");
                         }
                     });
@@ -881,6 +897,7 @@ fn client(
     stream: UnixStream,
     asked: &mpsc::Sender<Job>,
     reader_up: &AtomicBool,
+    posing: &Arc<AtomicBool>,
     robot: &mut Sockets,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -930,6 +947,11 @@ fn client(
                         }
                         answer(id, deleted)
                     }
+                    // Answered once started: the sequence runs on a thread of its own, and the
+                    // picture turns up in `photo.list`.
+                    Ok(proto::Call::PhotoTake) => {
+                        proto::Response::ok(id, &take_when_asked(posing, robot))
+                    }
                     Ok(_) => proto::Response::err(
                         id,
                         proto::Error::new(
@@ -945,6 +967,61 @@ fn client(
         out.push(b'\n');
         stream.write_all(&out)?;
     }
+}
+
+/// Held while a photo sequence runs; let go when dropped, however the sequence ended.
+struct Posing(Arc<AtomicBool>);
+
+impl Posing {
+    /// The sequence's turn, or `None` while another one runs.
+    fn hold(flag: &Arc<AtomicBool>) -> Option<Posing> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Posing(flag.clone()))
+    }
+}
+
+impl Drop for Posing {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// A display or a photo tag touched: the whole sequence, unless a photo is already being taken —
+/// then the touch starts nothing, as a second touch mid-sequence never could.
+fn photo_by_tag(posing: &Arc<AtomicBool>, robot: &mut Sockets, chip: &mut Chip) {
+    let Some(_turn) = Posing::hold(posing) else {
+        tracing::warn!("a photo is already being taken — the touch starts nothing");
+        return;
+    };
+    report_photo(photo::on_touch(&mut Session::new(robot, chip)));
+}
+
+/// `photo.take`: refused while a photo is being taken or the robot is busy, else the sequence
+/// started on a thread of its own and the acceptance given at once. No reader needed — the
+/// sequence asked for never looks for a display — so a robot whose reader is down still takes it.
+fn take_when_asked(posing: &Arc<AtomicBool>, robot: &Sockets) -> proto::IntentResult {
+    let Some(turn) = Posing::hold(posing) else {
+        return proto::IntentResult::refused("a photo is already being taken");
+    };
+    let policy = match state_policy(&robot.robot, QUICK_ANSWER) {
+        Ok(policy) => policy,
+        Err(why) => {
+            return proto::IntentResult::refused(format!("the robot did not answer: {why}"));
+        }
+    };
+    if !photo::may_start(&policy) {
+        return proto::IntentResult::refused(format!(
+            "the duck is busy ({policy}) — try again once it is standing or sitting"
+        ));
+    }
+    tracing::warn!(%policy, "photo asked for — hold still");
+    let mut sockets = robot.clone();
+    std::thread::spawn(move || {
+        let _turn = turn;
+        report_photo(photo::on_ask(&mut Session::without_reader(&mut sockets)));
+    });
+    proto::IntentResult::accepted()
 }
 
 /// A result as a response: the value, or the error it carries.
@@ -1183,7 +1260,8 @@ impl Driver for Sockets {
 /// in the beak.
 struct Session<'a> {
     sockets: &'a mut Sockets,
-    chip: &'a mut Chip,
+    /// The reader, for the display in the beak; `None` for `photo.take`, which asks for none.
+    chip: Option<&'a mut Chip>,
     /// The photo being written to the display in the beak, once begun.
     writing: Option<(eink::Writer, eink::Joined)>,
     started: Instant,
@@ -1244,8 +1322,16 @@ impl Drop for Roller {
 impl<'a> Session<'a> {
     fn new(sockets: &'a mut Sockets, chip: &'a mut Chip) -> Self {
         Session {
+            chip: Some(chip),
+            ..Session::without_reader(sockets)
+        }
+    }
+
+    /// For `photo.take`: no display is looked for, so no reader is held.
+    fn without_reader(sockets: &'a mut Sockets) -> Self {
+        Session {
             sockets,
-            chip,
+            chip: None,
             writing: None,
             started: Instant::now(),
             roller: None,
@@ -1338,7 +1424,10 @@ impl photo::Driver for Session<'_> {
     }
 
     fn eink_in_beak(&mut self) -> Result<bool, String> {
-        self.chip.eink_at(BEAK).map_err(|e| e.to_string())
+        match self.chip.as_deref_mut() {
+            Some(chip) => chip.eink_at(BEAK).map_err(|e| e.to_string()),
+            None => Ok(false),
+        }
     }
 
     fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String> {
@@ -1348,12 +1437,16 @@ impl photo::Driver for Session<'_> {
 
     fn eink_begin(&mut self, jpeg: &[u8], head: proto::HeadParams) -> Result<(), String> {
         let picture = eink::picture::from_photo(jpeg)?;
-        if let Chip::Spi(c) = &mut *self.chip {
+        let chip = self
+            .chip
+            .as_deref_mut()
+            .ok_or("no reader to write a display with")?;
+        if let Chip::Spi(c) = &mut *chip {
             c.set_proto(Proto::A)
                 .and_then(|()| c.set_antenna(BEAK))
                 .map_err(|e| e.to_string())?;
         }
-        let joined = eink::Joined::open(&mut *self.chip, SEQUENCE_FWI)
+        let joined = eink::Joined::open(&mut *chip, SEQUENCE_FWI)
             .map_err(|e| format!("the display: {e}"))?;
         let settings = eink::Settings {
             refresh_within: SEQUENCE_REFRESH_WITHIN,
@@ -1366,7 +1459,11 @@ impl photo::Driver for Session<'_> {
 
     fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
         let (writer, joined) = self.writing.as_mut().ok_or("no write begun")?;
-        let progress = writer.step(&mut joined.on(&mut *self.chip), Instant::now())?;
+        let chip = self
+            .chip
+            .as_deref_mut()
+            .ok_or("no reader to write a display with")?;
+        let progress = writer.step(&mut joined.on(chip), Instant::now())?;
         Ok((progress, writer.idle(Instant::now())))
     }
 
