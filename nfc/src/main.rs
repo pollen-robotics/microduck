@@ -52,7 +52,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -1162,6 +1162,63 @@ struct Session<'a> {
     /// The photo being written to the display in the beak, once begun.
     writing: Option<(eink::Writer, eink::Joined)>,
     started: Instant,
+    /// The last head sent, and when: what [`Keeper`] sends again while a step blocks.
+    last_head: Arc<Mutex<Option<(proto::HeadParams, Instant)>>>,
+    keeper: Option<Keeper>,
+}
+
+/// Sends the last head again while the display is being written, whenever the sequence has not
+/// for [`KEEP_HEAD_AFTER`]: one exchange with the display can hold the sequence for seconds — a
+/// display gone silent is asked three times over a 4.9 s FWT, and one may ask for more time — and
+/// two seconds without a head start the idle look-around, which moves the head and yawns, beak
+/// open, the display in it. On a thread of its own so nothing the reader does can hold it.
+struct Keeper {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How long without a head before [`Keeper`] sends it again, and how often it looks.
+const KEEP_HEAD_AFTER: Duration = Duration::from_millis(300);
+const KEEP_HEAD_EVERY: Duration = Duration::from_millis(100);
+
+impl Keeper {
+    fn start(socket: PathBuf, last: Arc<Mutex<Option<(proto::HeadParams, Instant)>>>) -> Keeper {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                sleep(KEEP_HEAD_EVERY);
+                let due = {
+                    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+                    match last.as_mut() {
+                        Some((pose, at)) if at.elapsed() >= KEEP_HEAD_AFTER => {
+                            *at = Instant::now();
+                            Some(*pose)
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(pose) = due
+                    && let Err(why) = notify(&socket, &proto::Call::RobotHead(pose))
+                {
+                    tracing::info!(%why, "robot.head, kept");
+                }
+            }
+        });
+        Keeper {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl<'a> Session<'a> {
@@ -1171,15 +1228,16 @@ impl<'a> Session<'a> {
             chip,
             writing: None,
             started: Instant::now(),
+            last_head: Arc::new(Mutex::new(None)),
+            keeper: None,
         }
     }
 }
 
-/// The time the display has for each block while the sequence writes it: FWT at FWI 11, 619 ms.
-/// Not the bench's 14 (4.9 s): one exchange blocks the head, and a display gone silent is asked
-/// three times before the step fails — under two seconds at 11, the most the idle look-around
-/// lets the head go unsent before it takes it back and yawns, beak open.
-const SEQUENCE_FWI: u8 = 11;
+/// The time the display has for each block while the sequence writes it: FWT at FWI 14, 4.9 s,
+/// as on the bench, where it works. A block that long blocks the sequence, and [`Keeper`] holds the
+/// head meanwhile.
+const SEQUENCE_FWI: u8 = 14;
 /// How long the display may take to redraw in the sequence: it took ~50 s on the bench.
 const SEQUENCE_REFRESH_WITHIN: Duration = Duration::from_secs(75);
 
@@ -1232,6 +1290,7 @@ impl photo::Driver for Session<'_> {
     }
 
     fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
+        *self.last_head.lock().unwrap_or_else(|e| e.into_inner()) = Some((head, Instant::now()));
         notify(&self.sockets.robot, &proto::Call::RobotHead(head))
     }
 
@@ -1283,13 +1342,21 @@ impl photo::Driver for Session<'_> {
             ..eink::Settings::default()
         };
         self.writing = Some((eink::Writer::new(picture, settings), joined));
+        self.keeper = Some(Keeper::start(
+            self.sockets.robot.clone(),
+            self.last_head.clone(),
+        ));
         Ok(())
     }
 
     fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
         let (writer, joined) = self.writing.as_mut().ok_or("no write begun")?;
-        let progress = writer.step(&mut joined.on(&mut *self.chip), Instant::now())?;
-        Ok((progress, writer.idle(Instant::now())))
+        let step = writer.step(&mut joined.on(&mut *self.chip), Instant::now());
+        // Done or failed, the sequence is back in charge of the head.
+        if !matches!(step, Ok(p) if p != eink::Progress::Done) {
+            self.keeper = None;
+        }
+        Ok((step?, writer.idle(Instant::now())))
     }
 
     fn sleep(&mut self, d: Duration) {
