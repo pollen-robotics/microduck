@@ -395,7 +395,7 @@ them, and every owner does nothing on a board without its LED.
 
 | LED | sysfs | Owner | Shows |
 |---|---|---|---|
-| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
+| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours, at a brightness (full unless asked; a PWM board dims, the beta's GPIO cannot). The pad's Home button toggles it. |
 | Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
 | Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
 | Network | `gb:{green,blue}` | `configd` | Green on wifi, blinking green while joining. Without wifi, blue while a bonded Bluetooth gamepad is connected; off with neither. Wifi wins: a robot on wifi with a pad connected shows green. Above all of it, blinking blue while ssh is open on wifi (`configd::wifi_ssh`: the face button's 30 minutes, or `/run/microduck-ssh-wifi` touched over USB). |

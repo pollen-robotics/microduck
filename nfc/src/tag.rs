@@ -45,8 +45,15 @@ pub fn select<R: Reader>(chip: &mut R) -> Result<Vec<u8>> {
 ///
 /// Resets the field first: see [`crate::clrc663::Clrc663::reset_field`] for why that is what makes a second read
 /// in a session work.
-pub fn select_tag<R: Reader>(chip: &mut R) -> Result<Selected> {
+pub fn select_tag<R: Reader + ?Sized>(chip: &mut R) -> Result<Selected> {
     chip.reset_field()?;
+    select_in_field(chip)
+}
+
+/// [`select_tag`] with the field left as it is: for a card that dropped out of a session and is
+/// selected again while it is still powered — an e-ink display halfway through a refresh, which a
+/// field reset would cut short.
+pub fn select_in_field<R: Reader + ?Sized>(chip: &mut R) -> Result<Selected> {
     let atqa = chip.transceive(&[CMD_WUPA], Exchange::bare(5, 7))?;
     if atqa.len() != 2 {
         return Err(Error::Tag(format!(

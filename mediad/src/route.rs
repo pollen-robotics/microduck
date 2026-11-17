@@ -244,6 +244,11 @@ fn permits(call: &proto::Call) -> bool {
         NfcWrite(_) => false,
         // Reading one too: it needs the same person at the head, holding the same tag.
         NfcRead(_) => false,
+        // The photos are the owner's pictures of their home, and a LAN peer on the legacy direct
+        // path is not authenticated (`policy-channel-design.md`): anyone on the wifi could read
+        // them. `btd` carries them, after the setup code. A remote gallery is a decision about the
+        // remote path's authorisation, not a line here.
+        PhotoList | PhotoGet(_) | PhotoDelete(_) => false,
 
         // ── reading the robot's software ─────────────────────────────────────
         //

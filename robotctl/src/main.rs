@@ -249,6 +249,9 @@ enum Namespace {
         /// white, red, green, blue, yellow, cyan or magenta.
         #[arg(long, default_value = "white")]
         color: String,
+        /// How bright, 0 to 1 of full (`--brightness 0.1`). Full when not given.
+        #[arg(long)]
+        brightness: Option<f64>,
     },
 
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
@@ -853,7 +856,12 @@ fn run_nfc_read(socket: &Path, timeout: u32, json: bool) -> Result<(), Failure> 
 }
 
 /// `robotctl flashlight` — ask `robotd` to switch the flashlight.
-fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure> {
+fn run_flashlight(
+    socket: &Path,
+    state: &str,
+    color: &str,
+    brightness: Option<f64>,
+) -> Result<(), Failure> {
     let color: proto::FlashlightColor =
         serde_json::from_value(serde_json::Value::String(color.to_owned())).map_err(|_| {
             Failure::new(
@@ -868,6 +876,7 @@ fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure
             on: state == "on",
             toggle: state == "toggle",
             color,
+            brightness,
         },
     ))?)?;
     let outcome: proto::IntentResult = decode(&result)?;
@@ -5920,8 +5929,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::NfcRead { timeout, json } => {
             return run_nfc_read(&cli.nfc_socket, timeout, json);
         }
-        Namespace::Flashlight { state, color } => {
-            return run_flashlight(&cli.robot_socket, &state, &color);
+        Namespace::Flashlight {
+            state,
+            color,
+            brightness,
+        } => {
+            return run_flashlight(&cli.robot_socket, &state, &color, brightness);
         }
         Namespace::HeadImu => {
             return run_head_imu(&cli.robot_socket);

@@ -21,9 +21,9 @@ User=nfcd
 Group=nfcd
 # dialout — /dev/ttyACM* is root:dialout mode 0660, which is the whole of this daemon's
 #           privileged access
-# robot   — configd's and robotd's 0660 sockets. Asking configd to *pair* takes more than the
-#           group: configd.service names this user in `--allow-user`. Also the group nfcd hands
-#           its own socket to.
+# robot   — configd's, robotd's and mediad's 0660 sockets, mediad's for the photo tag's frame.
+#           Asking configd to *pair* takes more than the group: configd.service names this
+#           user in `--allow-user`. Also the group nfcd hands its own socket to.
 SupplementaryGroups=dialout robot
 Restart=always
 RestartSec=5s
@@ -52,6 +52,8 @@ StandardOutput=journal
 StandardError=journal
 # identity.json, for `robotctl health` and updaterd's startup check, and nfc.sock.
 RuntimeDirectory=nfcd
+# The photo tag's pictures, /var/lib/robot/photos, kept across reboots and updates.
+StateDirectory=robot/photos
 
 [Install]
 WantedBy=multi-user.target

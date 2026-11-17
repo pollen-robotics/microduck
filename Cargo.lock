@@ -3546,14 +3546,17 @@ dependencies = [
 name = "nfc"
 version = "0.21.1"
 dependencies = [
+ "base64",
  "clap",
  "duck-ipc-proto",
+ "image",
  "libc",
  "robotd-params",
  "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "uyvy",
 ]
 
 [[package]]

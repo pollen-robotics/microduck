@@ -61,6 +61,27 @@ quacks when it has read the tag and greets once the pad is paired. What the tag 
 tags the reader takes, how to write one (`robotctl nfc-flash`, `duckctl nfc-flash`) and the mode
 tags are all in [`nfc-tags.md`](nfc-tags.md).
 
+An e-ink display touched to the reader, or a tag written `take_photo`, poses the robot for a
+picture: it starts the robot if Start was not pressed, stays still, standing or seated as it was,
+lifts its head (higher when seated), counts down five seconds with the flashlight blinking dimly (3
+%) and faster and faster, flashes at 20 % with a quack as it takes the photo, then sits if it was
+standing and opens its beak a little. It waits up to a minute for a display in its beak, closes it
+on it, and writes the photo to it, turned the right way up for the beak: its head rolls side to
+side in small quick moves with a short quack now and then until the display has redrawn — about
+a minute in all. Then it lowers its head and opens its beak wide to let it
+fall with a tiny cute retch (the `bwep` sound; a low tock if the photo did not make it), and brings
+its head back up. The idle look-around is held off throughout. The picture is kept in
+`/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how
+a display is recognised (any ISO 14443-4 card) and written in `nfc/src/eink.rs`. A display starts
+it from the top of the head only; in the beak it starts nothing, and is what the sequence waits
+for. Every touch logs where it was seen (`tag in the field`, `place="head"`).
+
+From the bench, a picture can be written by hand: with the service stopped (`sudo systemctl stop
+nfcd`, it holds the reader), `sudo /opt/robot/daemon/current/bin/nfcd eink write picture.jpg --on
+beak` writes a JPEG or PNG to the display in the beak (`--on head` for the top of the head; no
+picture, a test pattern) and redraws it. Keep the display still until it logs `written and drawn`,
+then start the service again.
+
 ## Check it
 
 ```bash
