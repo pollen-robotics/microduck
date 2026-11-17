@@ -83,10 +83,6 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 const POLL_AGAIN: Duration = Duration::from_millis(300);
 /// Failed asks in a row that are waited out before the display is selected again.
 const POLL_ERRORS: u32 = 5;
-/// How long a display that dropped out while drawing is still asked whether it is done. Once one
-/// has lost power mid-redraw it says "drawing" (`01 90 00`) for good — five minutes of it on
-/// cream-dvt-coco, its panel showing half a picture — so the redraw is given up on.
-const AFTER_DROPOUT: Duration = Duration::from_secs(15);
 /// Between two attempts to select a display that dropped out.
 const REJOIN_AGAIN: Duration = Duration::from_millis(50);
 
@@ -176,8 +172,6 @@ pub struct Writer {
     polls: u32,
     /// The last answer that said the display is still drawing, so a new one is logged once.
     drawing: Option<Vec<u8>>,
-    /// When the display first dropped out while drawing.
-    dropped_at: Option<Instant>,
 }
 
 impl Writer {
@@ -195,7 +189,6 @@ impl Writer {
             drew_from: None,
             polls: 0,
             drawing: None,
-            dropped_at: None,
         }
     }
 
@@ -314,18 +307,6 @@ impl Writer {
                 }
             }
             State::Poll { until, errors } => {
-                if let Some(at) = self.dropped_at
-                    && now.saturating_duration_since(at) >= AFTER_DROPOUT
-                {
-                    let into = self
-                        .drew_from
-                        .map(|from| at.saturating_duration_since(from))
-                        .unwrap_or_default();
-                    return Err(format!(
-                        "the display lost power {into:.0?} into the redraw and never said it \
-                         finished: what it shows is likely incomplete"
-                    ));
-                }
                 if now >= until {
                     return Err(format!(
                         "the display was still drawing after {:?}",
@@ -365,9 +346,9 @@ impl Writer {
                         } else {
                             tracing::warn!(error = %e, "the display stopped answering while drawing; selecting it again");
                             // Not its application: selected again mid-redraw, the display answers
-                            // every ask `68 CA` from then on (cream-dvt-coco, 2026-11-16).
-                            // The real time, not the step's start: the asks that failed took seconds.
-                            self.dropped_at.get_or_insert_with(Instant::now);
+                            // every ask `68 CA` from then on (cream-dvt-coco, 2026-11-16). A
+                            // display silent while it draws is ordinary, and given its time: one
+                            // given up on 15 s after it fell silent was drawing the photo fine.
                             State::Rejoin {
                                 then: Box::new(State::Poll { until, errors: 0 }),
                                 select: false,
@@ -804,27 +785,6 @@ mod tests {
             now += writer.idle(now).max(Duration::from_millis(1));
         }
         assert_eq!(display.rejoins, 1);
-    }
-
-    #[test]
-    fn a_display_still_drawing_long_after_a_dropout_is_given_up_on() {
-        let mut display = Display {
-            drawing: usize::MAX,
-            ..Display::default()
-        };
-        let mut writer = Writer::new(picture(), Settings::default());
-        let mut now = Instant::now();
-        until_refresh_sent(&mut writer, &mut display, now);
-        let from = now;
-        display.answers.extend((0..6).map(|_| Err(Error::NoTag)));
-        let why = loop {
-            match writer.step(&mut display, now) {
-                Ok(_) => now += writer.idle(now).max(Duration::from_millis(1)),
-                Err(why) => break why,
-            }
-        };
-        assert!(why.contains("lost power"), "{why}");
-        assert!(now - from < Duration::from_secs(20), "{:?}", now - from);
     }
 
     #[test]

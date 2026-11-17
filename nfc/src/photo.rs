@@ -29,7 +29,7 @@
 //! 8. It writes the photo to the display ([`crate::eink`]), a step at a time ([`write`]). While
 //!    the picture goes over, it rolls its head side to side in small quick moves with a short
 //!    quack now and then; while the display redraws, which is most of the time and when it has
-//!    the least power to spare, the head holds still and a soft [`HUM`] comes every [`HUM_EVERY`].
+//!    the least power to spare, the head holds still, and quietly.
 //!    It gives up after [`WRITE_WITHIN`]. With no photo to write, it only rolls its head for
 //!    [`KEEP`].
 //! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch —
@@ -88,9 +88,6 @@ const EINK_POLL: Duration = Duration::from_millis(300);
 pub const KEEP: Duration = Duration::from_secs(5);
 /// The most a write may take, the redraw included: about 55 s on the bench (2026-11-16).
 pub const WRITE_WITHIN: Duration = Duration::from_secs(90);
-/// While the display redraws: a drowsy, breathy coo, now and then.
-pub const HUM: proto::SoundTag = proto::SoundTag::Coo;
-pub const HUM_EVERY: Duration = Duration::from_secs(6);
 /// How far the head rolls each side while it holds the display, radians (about 8°).
 const ROLL: f64 = 0.14;
 /// One roll left and back right.
@@ -435,7 +432,7 @@ fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
 }
 
 /// Write `jpeg` to the display in the beak, the head around `head` between the steps: rolling
-/// while the picture goes over, still while the display draws, with a [`HUM`] now and then. Sent
+/// while the picture goes over, still and quiet while the display draws. Sent
 /// every [`ROLL_STEP`] at most, and between two steps — never in the middle of one, so a step is
 /// never made longer for it. How long it took, or why it failed.
 fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result<Duration, String> {
@@ -443,7 +440,6 @@ fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result
     let start = robot.now();
     let mut roll = Roll::default();
     let mut sent: Option<Duration> = None;
-    let mut hummed: Option<Duration> = None;
     let result = loop {
         let (progress, idle) = match robot.eink_step() {
             Ok((eink::Progress::Done, _)) => break Ok(robot.now() - start),
@@ -456,12 +452,6 @@ fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result
             break Err(format!("not done after {WRITE_WITHIN:?}"));
         }
         let pose = if progress == eink::Progress::Refreshing {
-            if hummed.is_none_or(|at| now - at >= HUM_EVERY) {
-                hummed = Some(now);
-                if let Err(why) = robot.sound(HUM) {
-                    tracing::info!(%why, "robot.sound");
-                }
-            }
             head
         } else {
             roll.at(robot, head, t)
@@ -1055,9 +1045,15 @@ mod tests {
             robot.rolls_drawing.iter().all(|r| *r == 0.0),
             "still while drawing"
         );
-        let hums = robot.sounds.iter().filter(|s| **s == HUM).count();
-        // 20 s of drawing, one every 6 s from its start.
-        assert_eq!(hums, 4);
+        // Quiet while drawing: the roll's quacks, then only the retch.
+        assert!(
+            robot
+                .sounds
+                .iter()
+                .all(|s| [HEARD, SHUTTER, ROLL_QUACK, LET_GO].contains(s)),
+            "{:?}",
+            robot.sounds
+        );
         assert_eq!(*robot.sounds.last().unwrap(), LET_GO);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }

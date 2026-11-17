@@ -67,7 +67,7 @@ lifts its head (higher when seated), counts down five seconds with the flashligh
 %) and faster and faster, flashes at 20 % with a quack as it takes the photo, then sits if it was
 standing and opens its beak a little. It waits up to a minute for a display in its beak, closes it
 on it, and writes the photo to it: its head rolls side to side in small quick moves with a few
-short quacks while the picture goes over, then holds still with a soft coo now and then while the
+short quacks while the picture goes over, then holds still and quiet while the
 display redraws — about a minute in all. Then it lowers its head and opens its beak wide to let it
 fall with a tiny cute retch (the `bwep` sound; a low tock if the photo did not make it), and brings
 its head back up. The idle look-around is held off throughout. The picture is kept in
