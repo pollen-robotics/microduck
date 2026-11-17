@@ -980,6 +980,13 @@ impl Server {
                     "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "photo.list, photo.get and photo.delete are served by nfcd, on /run/nfcd/nfc.sock",
+                ),
+            ),
 
             // Answered by the transport that received it — `btd` checks the PIN itself and never
             // forwards this. Reaching updaterd means a client sent it to the wrong socket, or over

@@ -159,6 +159,24 @@ tag does not switch the mode — the way to check a tag without it acting.
 It is `nfc.read` on `/run/nfcd/nfc.sock`; an `nfcd` older than it answers that it serves
 `nfc.write` and nothing else: update the daemon.
 
+## The photos
+
+The photo sequence (a `take_photo` tag, or an e-ink display touched to the head) keeps each picture
+as a JPEG in `/var/lib/robot/photos`, named for the robot's local time: `2026-11-11_14-03-27.jpg`.
+Nothing leaves the robot on its own. The phone app's gallery reads them over Bluetooth, after the
+setup code, with three calls `nfcd` answers on `/run/nfcd/nfc.sock`:
+
+- `photo.list` lists every photo, newest first, with its size and when it was taken.
+- `photo.get {"name", "preview", "offset", "len"}` returns up to 16 KiB of the photo, base64, at an
+  offset, plus the photo's `total` size. With `"preview": true` it returns a 360-pixel JPEG of it
+  instead, made the first time it is asked for and kept in `/var/lib/robot/photos/.previews`.
+- `photo.delete {"name"}` deletes the photo and its preview.
+
+They are not allowed on the WebRTC datachannel: someone on the same wifi using the legacy direct
+path is not authenticated, and these are pictures of someone's home. `nfcd` answers them while a
+photo sequence is running too. An `nfcd` older than API v64 answers that it serves `nfc.write` and
+`nfc.read` and nothing else.
+
 ## What happened
 
 ```bash

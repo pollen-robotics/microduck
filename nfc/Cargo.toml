@@ -33,6 +33,8 @@ libc = "0.2"
 # display, a PNG as well as a JPEG for the bench command.
 uyvy = { path = "../uyvy" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# `photo.get` answers a JSON line, and a chunk of a JPEG travels in it as base64.
+base64 = "0.22"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
