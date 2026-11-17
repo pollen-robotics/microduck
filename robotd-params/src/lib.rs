@@ -2633,13 +2633,18 @@ impl PolicyParams {
     ///
     /// For `updaterd`, before every fetch, the way it reads the board
     /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
-    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
-    /// — the default, and the answer that downloads nothing.
+    /// that is invalid somewhere else still answers. Both layers, the user's winning — that is
+    /// where `robotctl configure` writes it. Missing, unreadable or not a bool is `false` — the
+    /// default, and the answer that downloads nothing.
     pub fn community_allowed(path: &Path) -> bool {
-        let Some(text) = std::fs::read_to_string(path).ok() else {
+        let Ok(text) = layered_text(path) else {
             return false;
         };
-        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+        Self::community_allowed_in(&text)
+    }
+
+    fn community_allowed_in(text: &str) -> bool {
+        let Ok(table) = toml::from_str::<toml::Table>(text) else {
             return false;
         };
         table
@@ -5612,6 +5617,28 @@ mod tests {
         assert!(!read("not toml ["));
         std::fs::remove_file(&path).expect("remove");
         assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// `robotctl configure` writes the user layer, so that is where the answer has to come from:
+    /// reading the base alone kept refusing community fetches after the user had turned them on.
+    #[test]
+    fn community_allowed_lets_the_user_layer_win() {
+        let layered = |base: &str, user: &str| {
+            let merged = merge_layers(base.parse().unwrap(), user.parse().unwrap()).to_string();
+            PolicyParams::community_allowed_in(&merged)
+        };
+        assert!(layered(
+            "[policy]\nwalk = \"x\"\n",
+            "[policy]\nallow_community = true\n"
+        ));
+        assert!(layered(
+            "[policy]\nallow_community = false\n",
+            "[policy]\nallow_community = true\n"
+        ));
+        assert!(!layered(
+            "[policy]\nallow_community = true\n",
+            "[policy]\nallow_community = false\n"
+        ));
     }
 
     /// `updaterd` asks this before every revert, so it must answer from a file `robotd` would
