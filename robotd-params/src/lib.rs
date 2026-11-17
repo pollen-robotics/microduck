@@ -5627,7 +5627,10 @@ mod tests {
             let merged = merge_layers(base.parse().unwrap(), user.parse().unwrap()).to_string();
             PolicyParams::community_allowed_in(&merged)
         };
-        assert!(layered("[policy]\nwalk = \"x\"\n", "[policy]\nallow_community = true\n"));
+        assert!(layered(
+            "[policy]\nwalk = \"x\"\n",
+            "[policy]\nallow_community = true\n"
+        ));
         assert!(layered(
             "[policy]\nallow_community = false\n",
             "[policy]\nallow_community = true\n"
