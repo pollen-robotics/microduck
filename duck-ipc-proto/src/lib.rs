@@ -655,7 +655,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// [`VolumeResult`]): a percentage, written to `[audio] volume` and to the codec's mixer at once,
 /// so it is heard as it is set and kept across a restart. An older `robotd` answers
 /// METHOD_NOT_FOUND, by name.
-pub const API_VERSION: u32 = 66;
+///
+/// # v67 — every switch in `robot.mode`, and the play modes over Bluetooth
+///
+/// [`ModeResult::laser`], [`ModeResult::theremin`] and [`ModeResult::flashlight`]: `robot.mode`
+/// says which of the robot's switches are on, so a phone on Bluetooth — which has no
+/// `robot.state` stream — can show the one game the duck is playing. Absent while off, so a v66
+/// client reading a v67 robot ignores them, and a v67 client reading a v66 robot reads them off.
+///
+/// `btd` now routes `robot.mode`, `robot.laserTrack`, `robot.soccer` and `robot.autonomous`, as
+/// well as `robot.theremin` and `robot.flashlight`. A route opening, not a wire change: an older
+/// `btd` refuses them with PERMISSION_DENIED, by name, which is how the app tells.
+pub const API_VERSION: u32 = 67;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3611,6 +3622,17 @@ pub struct ModeResult {
     /// quiet until its pad is touched. Absent while off. (v60)
     #[serde(default, skip_serializing_if = "not")]
     pub autonomous: bool,
+    /// Laser tracking is switched on ([`method::ROBOT_LASER_TRACK`]), whether or not a dot is in
+    /// sight. Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub laser: bool,
+    /// A theremin is up ([`method::ROBOT_THEREMIN`]): armed or playing. Absent while down — the
+    /// loop puts it down by itself when the robot walks or goes over. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub theremin: bool,
+    /// The flashlight is lit ([`method::ROBOT_FLASHLIGHT`]). Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub flashlight: bool,
 }
 
 /// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
@@ -8232,7 +8254,7 @@ mod tests {
         let off = serde_json::to_string(&ModeResult {
             mode: "walk".into(),
             soccer: None,
-            autonomous: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(off, r#"{"mode":"walk"}"#);
