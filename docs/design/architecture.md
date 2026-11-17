@@ -99,6 +99,7 @@ Where the state lives, and what survives an update:
 |---|---|
 | `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration as the image or the installer wrote it. The installer writes it once and never overwrites it; an OS image replaces it with every OS update. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
 | `/var/lib/robot/robotd.toml` | the keys somebody changed on this robot, over the one above key by key — every writer (`robotctl configure`, `policy`, `pad`, and `robotd` serving the phone) writes here and only here (below) |
+| `/run/padd/pad-battery.json` | the connected pad's battery, written by `padd` (it can open the pad; `configd`'s private `/dev` cannot) and read by `configd` for `pad.status` and by `robotctl monitor`; gone with `padd` and with the boot ([`pair-a-gamepad.md`](../robot/pair-a-gamepad.md#the-pads-battery)) |
 | `/var/lib/robot/hf-token` | the Hugging Face sign-in, written by `updaterd` and read by `mediad` ([`remote-access-design.md`](remote-access-design.md) §2.5) |
 | `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
 | `/var/lib/robot/vetbook.json` | the vet book — the robot's lifetime record, owned by `robotd` (`robotd/src/vetbook.rs`) |

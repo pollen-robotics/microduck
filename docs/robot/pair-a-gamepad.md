@@ -96,6 +96,25 @@ padd    active — driving whatever pad connects
 Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
 working robot ignoring you.
 
+### The pad's battery
+
+A Nintendo pad (a Pro Controller, or a clone of one) also says how full its battery is:
+
+```
+pad     Pro Controller 98:B6:E9:5E:BB:DB  connected · battery full
+```
+
+The pad reports one of five levels (full, medium, low, critical, empty), plus whether it is
+charging. That is all a clone answers, so there is no percentage. The same reading is in the
+pad block's title in `robotctl monitor`, and on the Gamepad tile in the phone app.
+
+`padd` asks the pad on its hidraw node once a minute and keeps the answer in
+`/run/padd/pad-battery.json`, which `configd` reads for `pad.status`. A reading older than
+five minutes is not shown. No battery on the line means the robot does not know, not that the
+battery is empty: any pad that is not a Nintendo one, or a pad that does not answer. In that
+case `sudo journalctl -u padd -b | grep battery` says why. `permission denied` there means
+the udev rule (`/etc/udev/rules.d/70-robot-pad-hidraw.rules`) is missing; an update installs it.
+
 A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
 beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel
 that appears only when the pad has one: a wireframe pad posed like the real one, pitch and roll

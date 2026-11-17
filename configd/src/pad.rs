@@ -241,6 +241,7 @@ pub fn unpaired(mac: &str, name: &str) -> proto::Pad {
         paired: false,
         trusted: false,
         connected: false,
+        battery: None,
     }
 }
 
@@ -252,6 +253,7 @@ pub fn bonded(mac: &str, name: &str) -> proto::Pad {
         paired: true,
         trusted: true,
         connected: true,
+        battery: None,
     }
 }
 
