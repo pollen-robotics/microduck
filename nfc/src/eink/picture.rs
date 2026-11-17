@@ -159,11 +159,14 @@ pub fn render(image: &RgbImage, dither: Dither, blur_radius: u32) -> Vec<u8> {
     pack(&quantize(&fitted, dither))
 }
 
-/// A JPEG — the photo the sequence took — as the display takes it, dithered.
-pub fn from_jpeg(jpeg: &[u8]) -> Result<Vec<u8>, String> {
+/// The photo the sequence took, a JPEG, as the display takes it in the beak: dithered, and turned
+/// half a turn, since the beak holds the display upside down to how [`render`] draws it (seen on
+/// the robot, 2026-11-17).
+pub fn from_photo(jpeg: &[u8]) -> Result<Vec<u8>, String> {
     let image = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
         .map_err(|e| format!("the photo does not decode: {e}"))?;
-    Ok(render(&image.to_rgb8(), Dither::Atkinson, 0))
+    let turned = imageops::rotate180(&image.to_rgb8());
+    Ok(render(&turned, Dither::Atkinson, 0))
 }
 
 /// `nfc-test`'s picture when it is given none: the six inks as vertical bars in a 4-pixel black
@@ -233,6 +236,28 @@ mod tests {
             fnv(&render(&test_pattern(), Dither::Atkinson, 0)),
             0x5e71_2632_6b23_20c5
         );
+    }
+
+    /// The photo is turned for the beak: its top-left corner ends bottom right.
+    #[test]
+    fn the_photo_is_turned_half_a_turn() {
+        let image = RgbImage::from_fn(SIDE, SIDE, |x, y| {
+            image::Rgb(if x < 8 && y < 8 {
+                [255, 0, 0]
+            } else {
+                [255, 255, 255]
+            })
+        });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode_image(&image)
+            .unwrap();
+        let turned = from_photo(&jpeg).unwrap();
+        let straight = render(&image, Dither::Atkinson, 0);
+        // Packed bottom row first, left to right: byte 119 ends the bottom row.
+        assert_eq!(turned[119] & 0x0f, 0x03, "red, bottom right");
+        assert_eq!(straight[119] & 0x0f, 0x01, "white there unturned");
+        assert_eq!(turned[BYTES - 120] >> 4, 0x01, "white, top left");
     }
 
     #[test]

@@ -26,11 +26,10 @@
 //!    ([`TAKE_OPEN`]): enough for the display, and no more.
 //! 7. It waits up to [`EINK_WITHIN`] for an e-ink display in its beak — the reader asked on the
 //!    beak's antenna alone — and closes the beak on it.
-//! 8. It writes the photo to the display ([`crate::eink`]), a step at a time ([`write`]). While
-//!    the picture goes over, it rolls its head side to side in small quick moves with a short
-//!    quack now and then; while the display redraws, which is most of the time and when it has
-//!    the least power to spare, the head holds still, and quietly.
-//!    It gives up after [`WRITE_WITHIN`]. With no photo to write, it only rolls its head for
+//! 8. It writes the photo to the display ([`crate::eink`]), a step at a time ([`write`]), rolling
+//!    its head side to side in small quick moves with a short quack now and then the whole time:
+//!    while the picture goes over and while the display redraws. It gives up after
+//!    [`WRITE_WITHIN`]. With no photo to write, it only rolls its head for
 //!    [`KEEP`].
 //! 9. It lowers its head, opens its beak to let the display go with a little [`LET_GO`] retch —
 //!    or a [`LET_GO_FAILED`] when the write failed — closes it [`DROP`] later, and brings its head
@@ -431,8 +430,8 @@ fn wiggle(robot: &mut dyn Driver, head: proto::HeadParams, d: Duration) {
     }
 }
 
-/// Write `jpeg` to the display in the beak, the head around `head` between the steps: rolling
-/// while the picture goes over, still and quiet while the display draws. Sent
+/// Write `jpeg` to the display in the beak, the head rolling around `head` between the steps, to
+/// the end of the redraw. Sent
 /// every [`ROLL_STEP`] at most, and between two steps — never in the middle of one, so a step is
 /// never made longer for it. How long it took, or why it failed.
 fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result<Duration, String> {
@@ -441,9 +440,9 @@ fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result
     let mut roll = Roll::default();
     let mut sent: Option<Duration> = None;
     let result = loop {
-        let (progress, idle) = match robot.eink_step() {
+        let idle = match robot.eink_step() {
             Ok((eink::Progress::Done, _)) => break Ok(robot.now() - start),
-            Ok(step) => step,
+            Ok((_, idle)) => idle,
             Err(why) => break Err(why),
         };
         let now = robot.now();
@@ -451,11 +450,7 @@ fn write(robot: &mut dyn Driver, head: proto::HeadParams, jpeg: &[u8]) -> Result
         if t >= WRITE_WITHIN {
             break Err(format!("not done after {WRITE_WITHIN:?}"));
         }
-        let pose = if progress == eink::Progress::Refreshing {
-            head
-        } else {
-            roll.at(robot, head, t)
-        };
+        let pose = roll.at(robot, head, t);
         if sent.is_none_or(|at| now - at >= ROLL_STEP) {
             sent = Some(now);
             if let Err(why) = robot.head(pose) {
@@ -1032,8 +1027,8 @@ mod tests {
         assert!(robot.rolls.iter().all(|r| *r == 0.0));
     }
 
-    /// The photo goes onto the display: the head rolls while the picture goes over, holds still
-    /// with a coo now and then while it draws, and the beak lets it go with the retch.
+    /// The photo goes onto the display: the head rolls with a quack now and then until it is
+    /// drawn, and the beak lets it go with the retch.
     #[test]
     fn the_photo_is_written_to_the_display_in_the_beak() {
         let mut robot = Fake::default();
@@ -1041,19 +1036,11 @@ mod tests {
         assert_eq!(robot.steps, PACKETS + ASKS + 1, "written to the end");
         let max = robot.rolls.iter().cloned().fold(f64::MIN, f64::max);
         assert!(max > ROLL * 0.9, "it rolled while writing: {max}");
-        assert!(
-            robot.rolls_drawing.iter().all(|r| *r == 0.0),
-            "still while drawing"
-        );
-        // Quiet while drawing: the roll's quacks, then only the retch.
-        assert!(
-            robot
-                .sounds
-                .iter()
-                .all(|s| [HEARD, SHUTTER, ROLL_QUACK, LET_GO].contains(s)),
-            "{:?}",
-            robot.sounds
-        );
+        let drawing = robot.rolls_drawing.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(drawing > ROLL * 0.9, "and while drawing: {drawing}");
+        // Quacks through the redraw too: 20 s of it.
+        let quacks = robot.sounds.iter().filter(|s| **s == ROLL_QUACK).count();
+        assert!(quacks > 15, "{quacks}");
         assert_eq!(*robot.sounds.last().unwrap(), LET_GO);
         assert!(robot.head_gap <= HOLD_EVERY, "{:?}", robot.head_gap);
     }

@@ -1270,7 +1270,7 @@ impl photo::Driver for Session<'_> {
     }
 
     fn eink_begin(&mut self, jpeg: &[u8]) -> Result<(), String> {
-        let picture = eink::picture::from_jpeg(jpeg)?;
+        let picture = eink::picture::from_photo(jpeg)?;
         if let Chip::Spi(c) = &mut *self.chip {
             c.set_proto(Proto::A)
                 .and_then(|()| c.set_antenna(BEAK))
