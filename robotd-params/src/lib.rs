@@ -1844,6 +1844,10 @@ pub struct AudioParams {
     /// Probability above which petting starts, and below which it ends (hysteresis).
     pub pet_enter_threshold: f32,
     pub pet_exit_threshold: f32,
+    /// Speaker level, percent: 100 is the codec's full digital level, 0 mutes the speaker.
+    /// `robotd` writes it to the mixer at startup, and `robotctl configure` writes it as its
+    /// slider moves ([`set_speaker_volume`]).
+    pub volume: u8,
 }
 
 impl Default for AudioParams {
@@ -1857,6 +1861,7 @@ impl Default for AudioParams {
             pet_model: None,
             pet_enter_threshold: 0.95,
             pet_exit_threshold: 0.85,
+            volume: 100,
         }
     }
 }
@@ -1910,6 +1915,15 @@ impl AudioParams {
                 missing_card: None,
             },
         }
+    }
+
+    /// The card whose mixer [`Self::volume`] is written to: the one the configured device names,
+    /// when this board has it. `None` on a board that fell back to ALSA's `default` — its codec
+    /// is not the AIC3104 and has none of the controls [`set_speaker_volume`] writes.
+    pub fn mixer_card(&self, cards: &[String]) -> Option<String> {
+        named_card(&self.device)
+            .filter(|card| cards.iter().any(|c| c == card))
+            .map(str::to_owned)
     }
 
     /// The classifier path, or `None` when disabled with the `"none"` sentinel.
@@ -3263,6 +3277,8 @@ pub enum ParamsError {
     },
     #[error("{path}: {reason}")]
     Netpad { path: String, reason: String },
+    #[error("{path}: {reason}")]
+    Audio { path: String, reason: String },
     #[error(
         "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
@@ -3549,6 +3565,12 @@ impl Params {
         // Refused rather than clamped, like `control.hz`: the editor should say which value it
         // was not going to guess at. The floor is 10 because netpadd's 100 ms fallback tick must
         // not be faster than the cap, and below a few Hz a held stick would outrun robotd's deadman.
+        if self.audio.volume > 100 {
+            return Err(ParamsError::Audio {
+                path: path.display().to_string(),
+                reason: format!("audio.volume ({}) must be 0–100", self.audio.volume),
+            });
+        }
         if !(10..=100).contains(&self.netpad.max_hz) {
             return Err(ParamsError::Netpad {
                 path: path.display().to_string(),
@@ -3746,6 +3768,50 @@ pub struct ResolvedAudio {
     pub capture: String,
     /// The card the configured device named and this board lacks, when the fallback was taken.
     pub missing_card: Option<String>,
+}
+
+/// How much of the AIC3104's DAC attenuation the volume scale spans: 45 dB, in the register's
+/// half-dB steps. The register goes to −63.5 dB, but a linear walk over all of it puts half the
+/// scale below anything audible across a room; 1 % at −45 dB is quiet and still there.
+const VOLUME_SPAN_HALF_DB: u32 = 90;
+
+/// The `PCM Playback Volume` register value for `percent` (127 = 0 dB, one step per 0.5 dB),
+/// and whether the line output stays unmuted. 0 % mutes the output stage outright rather than
+/// leaving the bottom of the attenuation audible.
+pub fn volume_register(percent: u8) -> (u8, bool) {
+    let percent = u32::from(percent.min(100));
+    if percent == 0 {
+        return (0, false);
+    }
+    let down = ((100 - percent) * VOLUME_SPAN_HALF_DB + 50) / 100;
+    ((127 - down) as u8, true)
+}
+
+/// Write `percent` to the AIC3104 mixer on `card`, through `amixer` as `aic3104-init.sh` does.
+///
+/// The level is the DAC's digital volume; the line stage gain that script sets stays where it
+/// is. Effective immediately, on whatever is playing.
+pub fn set_speaker_volume(card: &str, percent: u8) -> Result<(), String> {
+    let (register, on) = volume_register(percent);
+    for (control, value) in [
+        ("PCM Playback Volume", format!("{register},{register}")),
+        (
+            "Line Playback Switch",
+            if on { "on,on" } else { "off,off" }.to_owned(),
+        ),
+    ] {
+        let output = std::process::Command::new("amixer")
+            .args(["-q", "-c", card, "cset", &format!("name={control}"), &value])
+            .output()
+            .map_err(|e| format!("cannot run amixer: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "amixer -c {card} {control}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The card id an ALSA device string names, when it names one by id: `plughw:aic3104`,
@@ -5008,6 +5074,29 @@ mod tests {
                 good
             );
         }
+    }
+
+    /// The volume is a percentage: over 100 is refused, and the register mapping spans the
+    /// audible part of the codec's range with 0 a real mute rather than the bottom of it.
+    #[test]
+    fn the_volume_is_a_percentage_and_zero_mutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[audio]\nvolume = 101\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("audio.volume"), "{error}");
+        let path = write(dir.path(), "[audio]\nvolume = 40\n");
+        assert_eq!(Params::load(&path, true).expect("valid").audio.volume, 40);
+
+        assert_eq!(
+            volume_register(100),
+            (127, true),
+            "full is the codec's 0 dB"
+        );
+        assert_eq!(volume_register(1), (38, true), "1 % is −44.5 dB, still on");
+        assert_eq!(volume_register(0), (0, false), "0 % mutes the output stage");
+        assert_eq!(volume_register(250), (127, true));
+        let steps: Vec<u8> = (1..=100).map(|p| volume_register(p).0).collect();
+        assert!(steps.windows(2).all(|w| w[0] <= w[1]), "monotonic");
     }
 
     /// A stale limit at or past the deadman would keep re-sending a stalled client's last stick

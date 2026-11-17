@@ -2621,9 +2621,21 @@ async fn control_loop<T: RobotIo>(
     // spawned when configured, with its own retry loop when arecord flaps.
     //
     // A configured card this board lacks means ALSA's `default` instead (resolve_devices).
-    let audio = params.audio.resolve_devices(&robotd_params::alsa_card_ids(
+    let cards = robotd_params::alsa_card_ids(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
-    ));
+    );
+    let audio = params.audio.resolve_devices(&cards);
+    // The speaker level, over whatever `aic3104-init.service` left (it runs before this unit and
+    // sets the codec's full level). Only on the codec the controls belong to; a board on ALSA's
+    // `default` keeps its own mixer's level.
+    if params.audio.enabled
+        && let Some(card) = params.audio.mixer_card(&cards)
+    {
+        match robotd_params::set_speaker_volume(&card, params.audio.volume) {
+            Ok(()) => tracing::info!(volume = params.audio.volume, %card, "speaker level set"),
+            Err(e) => tracing::warn!(error = %e, "could not set the speaker level"),
+        }
+    }
     if params.audio.enabled
         && let Some(card) = &audio.missing_card
     {

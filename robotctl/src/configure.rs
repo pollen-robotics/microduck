@@ -52,6 +52,14 @@
 //! ([`crate::dev_daemon`]), so it is not a [`Row`] and the model never sees it. It saves with
 //! everything else and adds `updaterd` to the restart offer. Absent where there is no
 //! `updater.toml` to find that directory from.
+//!
+//! ## The speaker slider
+//!
+//! `audio.volume` is an ordinary key, drawn as a slider under `[speaker]` at the very top rather
+//! than in `[audio]`: ←→ move it, and every step is written to the codec's mixer as it happens, so
+//! the level is heard while it is chosen. Saving writes the key, which `robotd` applies at its next
+//! start — so a volume change offers no restart. Leaving without saving puts the mixer back to the
+//! level in the file.
 
 use std::path::Path;
 
@@ -169,6 +177,9 @@ fn apply_for(key: &str) -> Option<Apply> {
         "laser" => Apply::Live("robotd"),
         // The same, for autonomous soccer's reader and `[soccer]`.
         "soccer" => Apply::Live("robotd"),
+        // The editor writes the mixer as the slider moves, and robotd re-applies the saved level
+        // at its next start: nothing to restart for it.
+        "audio" if name == "volume" => Apply::Live("the speaker"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
         | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
@@ -389,6 +400,61 @@ enum Item {
     Header(&'static str),
     Key(usize),
     DevDaemon,
+    /// `audio.volume`, drawn as a slider at the top — a [`Row`] like any key, at this index.
+    Volume(usize),
+}
+
+/// The header the speaker slider sits under, at the very top of the list.
+const VOLUME_HEADER: &str = "speaker";
+
+/// The key the slider edits.
+const VOLUME_KEY: &str = "audio.volume";
+
+/// How far one ←/→ moves the slider, percent.
+const VOLUME_STEP: u8 = 5;
+
+/// The slider's width in cells: one per [`VOLUME_STEP`].
+const SLIDER_CELLS: usize = 20;
+
+/// The level `rows` say, pending edits included. The default where the value does not parse,
+/// which the model's validation makes unreachable for anything it wrote.
+fn volume_of(rows: &[Row]) -> u8 {
+    rows.iter()
+        .find(|row| row.entry.key == VOLUME_KEY)
+        .and_then(|row| row.effective().parse().ok())
+        .unwrap_or(robotd_params::AudioParams::default().volume)
+}
+
+/// Move the slider by `delta` percent, clamped to 0–100, as a pending edit.
+fn nudge_volume(model: &mut Model, delta: i16) -> Result<(), String> {
+    let now = i16::from(volume_of(&model.rows()));
+    let next = (now + delta).clamp(0, 100);
+    let entry = robotd_params::registry::entry_for(VOLUME_KEY).expect("a registry key");
+    model.edit(entry, &next.to_string())
+}
+
+/// The list with the speaker slider at the very top.
+fn with_volume_row(items: Vec<Item>, rows: &[Row]) -> Vec<Item> {
+    let Some(index) = rows.iter().position(|row| row.entry.key == VOLUME_KEY) else {
+        return items;
+    };
+    let mut out = vec![Item::Header(VOLUME_HEADER), Item::Volume(index)];
+    out.extend(items);
+    out
+}
+
+/// The card whose mixer the slider moves on this machine, if any: the configured playback
+/// device's, when this board has it. `None` off a robot, where the slider only edits the file.
+fn mixer_card(rows: &[Row]) -> Option<String> {
+    let device = rows.iter().find(|row| row.entry.key == "audio.device")?;
+    let audio = robotd_params::AudioParams {
+        device: device.effective().to_owned(),
+        ..Default::default()
+    };
+    let cards = robotd_params::alsa_card_ids(
+        &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
+    );
+    audio.mixer_card(&cards)
 }
 
 /// The header the dev-board switch sits under, at the top of the list.
@@ -469,7 +535,14 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
     }
     let mut model = Model::load(path)?;
     let mut dev = crate::dev_daemon::Switch::load(updater_config);
-    let items = with_dev_row(layout_items(&model), dev.as_ref());
+    let items = with_volume_row(
+        with_dev_row(layout_items(&model), dev.as_ref()),
+        &model.rows(),
+    );
+    // The mixer the slider moves, and the level last written to it — the file's to begin with,
+    // which is what robotd set at startup.
+    let mixer = mixer_card(&model.rows());
+    let mut mixer_level = volume_of(&model.rows());
     // First key, not the first header.
     let mut cursor = items
         .iter()
@@ -485,6 +558,16 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
     let mut terminal = ratatui::init();
     let outcome = loop {
         let rows = model.rows();
+        // Whatever moved the level — an arrow, a typed value, `u` — it is heard now.
+        let level = volume_of(&rows);
+        if let Some(card) = &mixer
+            && level != mixer_level
+        {
+            match robotd_params::set_speaker_volume(card, level) {
+                Ok(()) => mixer_level = level,
+                Err(e) => status = Some(format!("speaker not changed live: {e}")),
+            }
+        }
         if let Err(e) = terminal.draw(|frame| {
             draw(
                 frame,
@@ -518,13 +601,25 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
                 }
                 KeyCode::Up | KeyCode::Char('k') => cursor = step(&items, cursor, -1),
                 KeyCode::Down | KeyCode::Char('j') => cursor = step(&items, cursor, 1),
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                    if matches!(items[cursor], Item::Volume(_)) =>
+                {
+                    let step = i16::from(VOLUME_STEP);
+                    let delta = match key.code {
+                        KeyCode::Left | KeyCode::Char('h') => -step,
+                        _ => step,
+                    };
+                    if let Err(e) = nudge_volume(&mut model, delta) {
+                        status = Some(e);
+                    }
+                }
                 KeyCode::Char(' ') | KeyCode::Enter if matches!(items[cursor], Item::DevDaemon) => {
                     if let Some(switch) = dev.as_mut() {
                         switch.toggle();
                     }
                 }
                 KeyCode::Char(' ') => {
-                    if let Item::Key(index) = items[cursor] {
+                    if let Item::Key(index) | Item::Volume(index) = items[cursor] {
                         let row = &rows[index];
                         match model.toggled(row) {
                             Some(next) => {
@@ -543,7 +638,7 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
                     }
                 }
                 KeyCode::Enter => {
-                    if let Item::Key(index) = items[cursor] {
+                    if let Item::Key(index) | Item::Volume(index) = items[cursor] {
                         focus = Focus::Editing {
                             buffer: shown_value(&rows[index]).to_owned(),
                             error: None,
@@ -558,7 +653,7 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
                     };
                 }
                 KeyCode::Char('u') | KeyCode::Char('d') => match items[cursor] {
-                    Item::Key(index) => {
+                    Item::Key(index) | Item::Volume(index) => {
                         model.pending.insert(rows[index].entry.key, Edit::Clear);
                     }
                     Item::DevDaemon => {
@@ -573,7 +668,7 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
             Focus::Editing { buffer, error } => match key.code {
                 KeyCode::Esc => focus = Focus::List,
                 KeyCode::Enter => {
-                    if let Item::Key(index) = items[cursor] {
+                    if let Item::Key(index) | Item::Volume(index) = items[cursor] {
                         match model.edit(rows[index].entry, buffer) {
                             Ok(()) => focus = Focus::List,
                             Err(e) => *error = Some(e),
@@ -687,6 +782,17 @@ pub fn run(path: &Path, robot_socket: &Path, updater_config: &Path) -> Result<()
     let edited = model.written().to_vec();
     ratatui::restore();
 
+    // A level tried and not saved goes back to the file's. Dropping the pending edit leaves the
+    // rows saying exactly that, saved or not — nothing reads `pending` past this point.
+    model.pending.remove(VOLUME_KEY);
+    let kept = volume_of(&model.rows());
+    if let Some(card) = &mixer
+        && kept != mixer_level
+        && let Err(e) = robotd_params::set_speaker_volume(card, kept)
+    {
+        eprintln!("could not put the speaker back to {kept} %: {e}");
+    }
+
     let saved = outcome?;
     if !saved {
         return Ok(());
@@ -788,7 +894,7 @@ fn layout_items(model: &Model) -> Vec<Item> {
             .enumerate()
             .filter(|(_, row)| {
                 let (s, _) = row.entry.key.split_once('.').expect("section.key");
-                s == section && !row.entry.feature
+                s == section && !row.entry.feature && row.entry.key != VOLUME_KEY
             })
             .map(|(index, _)| index)
             .collect();
@@ -834,7 +940,7 @@ fn search(items: &[Item], rows: &[Row], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(at, item)| match item {
-            Item::Key(index) => Some((row_score(&rows[*index], query)?, at)),
+            Item::Key(index) | Item::Volume(index) => Some((row_score(&rows[*index], query)?, at)),
             Item::DevDaemon => Some((dev_score(query)?, at)),
             Item::Header(_) => None,
         })
@@ -961,7 +1067,7 @@ fn draw(
             .rev()
             .find_map(|item| match item {
                 Item::Header(section) => Some(*section == "features"),
-                Item::Key(_) | Item::DevDaemon => None,
+                Item::Key(_) | Item::DevDaemon | Item::Volume(_) => None,
             })
             .unwrap_or(false)
     };
@@ -973,6 +1079,43 @@ fn draw(
                     format!("[{section}]"),
                     Style::new().add_modifier(Modifier::BOLD).cyan(),
                 )));
+            }
+            Item::Volume(index) => {
+                let row = &rows[*index];
+                let level = volume_of(rows);
+                let marker = if model.pending.contains_key(row.entry.key) {
+                    "*"
+                } else if row.differs() {
+                    "•"
+                } else {
+                    " "
+                };
+                let filled = (usize::from(level) * SLIDER_CELLS + 50) / 100;
+                let label = match level {
+                    0 => "muted".to_owned(),
+                    _ => format!("{level:>3} %"),
+                };
+                let mut spans = vec![
+                    Span::raw(format!(" {marker} ")),
+                    Span::raw(format!("{:<30}", "volume")),
+                    Span::styled("◀ ", Style::new().dim()),
+                    Span::styled("█".repeat(filled), Style::new().cyan()),
+                    Span::styled("░".repeat(SLIDER_CELLS - filled), Style::new().dim()),
+                    Span::styled(" ▶ ", Style::new().dim()),
+                ];
+                spans.push(if row.differs() {
+                    Span::styled(
+                        format!("{label} (default {} %)", row.default),
+                        Style::new().yellow(),
+                    )
+                } else {
+                    Span::styled(label, Style::new().dim())
+                });
+                let mut line = Line::from(spans);
+                if at == cursor {
+                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+                lines.push(line);
             }
             Item::DevDaemon => {
                 let Some(switch) = dev else { continue };
@@ -1107,7 +1250,7 @@ fn draw(
         }
         Focus::Search { .. } => {
             let doc = match items.get(cursor) {
-                Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::Key(index) | Item::Volume(index)) => rows[*index].entry.doc,
                 Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
                 _ => "",
             };
@@ -1118,7 +1261,7 @@ fn draw(
         }
         Focus::List => {
             let doc = match items.get(cursor) {
-                Some(Item::Key(index)) => rows[*index].entry.doc,
+                Some(Item::Key(index) | Item::Volume(index)) => rows[*index].entry.doc,
                 Some(Item::DevDaemon) => crate::dev_daemon::Switch::DOC,
                 _ => "",
             };
@@ -1127,7 +1270,11 @@ fn draw(
                     Some(s) => Span::styled(s.to_owned(), Style::new().red()),
                     None => Span::raw(doc),
                 }),
-                Line::from("↑↓ move · SPACE toggle · ENTER edit · u default · ^f search · q quit"),
+                Line::from(if matches!(items.get(cursor), Some(Item::Volume(_))) {
+                    "←→ volume · ↑↓ move · ENTER type a level · u default · ^f search · q quit"
+                } else {
+                    "↑↓ move · SPACE toggle · ENTER edit · u default · ^f search · q quit"
+                }),
             ]
         }
     };
@@ -1234,7 +1381,9 @@ mod tests {
         let items = layout_items(&m);
         let name_of = |at: usize| match items[at] {
             Item::Key(index) => rows[index].entry.key,
-            Item::Header(_) | Item::DevDaemon => unreachable!("headers are never hits"),
+            Item::Header(_) | Item::DevDaemon | Item::Volume(_) => {
+                unreachable!("headers are never hits")
+            }
         };
         let hits = search(&items, &rows, "nominal_volt");
         assert_eq!(name_of(hits[0]), "policy.nominal_voltage");
@@ -1641,6 +1790,60 @@ mod tests {
         );
     }
 
+    /// The speaker slider heads the list, moves in steps and stops at the ends, draws as a bar,
+    /// and is not drawn a second time under `[audio]`. Saving it offers no restart.
+    #[test]
+    fn the_volume_slider_is_the_first_row_and_moves_in_steps() {
+        let mut m = model("[audio]\nvolume = 60\n");
+        let items = with_volume_row(layout_items(&m), &m.rows());
+        assert!(matches!(items[0], Item::Header(VOLUME_HEADER)));
+        assert!(matches!(items[1], Item::Volume(_)));
+        let rows = m.rows();
+        let under_audio = items
+            .iter()
+            .filter(|item| match item {
+                Item::Key(index) | Item::Volume(index) => rows[*index].entry.key == VOLUME_KEY,
+                _ => false,
+            })
+            .count();
+        assert_eq!(under_audio, 1, "one volume row, the slider");
+        assert!(matches!(
+            items[search(&items, &rows, "volume")[0]],
+            Item::Volume(_)
+        ));
+
+        nudge_volume(&mut m, -5).unwrap();
+        assert_eq!(volume_of(&m.rows()), 55);
+        for _ in 0..30 {
+            nudge_volume(&mut m, 5).unwrap();
+        }
+        assert_eq!(volume_of(&m.rows()), 100, "clamped at the top");
+        for _ in 0..30 {
+            nudge_volume(&mut m, -5).unwrap();
+        }
+        assert_eq!(volume_of(&m.rows()), 0, "and at the bottom");
+
+        m.edit(entry(VOLUME_KEY), "50").unwrap();
+        let rows = m.rows();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &m, &rows, &items, 1, &Focus::List, None, None))
+            .expect("draws");
+        let screen = format!("{:?}", terminal.backend().buffer());
+        assert!(screen.contains("[speaker]"), "{screen}");
+        assert!(
+            screen.contains(&format!("{}{}", "█".repeat(10), "░".repeat(10))),
+            "{screen}"
+        );
+        assert!(screen.contains("50 % (default 100 %)"), "{screen}");
+        assert!(screen.contains("←→ volume"), "{screen}");
+
+        let plan = plan_for(&m);
+        assert!(plan.is_quiet(), "{plan:?}");
+        assert_eq!(plan.live, vec!["the speaker"]);
+    }
+
     /// A section whose only key is a feature switch draws no header.
     ///
     /// `[chorale]` is exactly that — one opt-in bool — and it appeared on the board as a bare
@@ -1654,7 +1857,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 Item::Header(h) => Some(*h),
-                Item::Key(_) | Item::DevDaemon => None,
+                Item::Key(_) | Item::DevDaemon | Item::Volume(_) => None,
             })
             .collect();
         assert!(
@@ -1675,7 +1878,7 @@ mod tests {
         assert!(
             items.iter().any(|item| match item {
                 Item::Key(index) => rows[*index].entry.key == "chorale.accept",
-                Item::Header(_) | Item::DevDaemon => false,
+                Item::Header(_) | Item::DevDaemon | Item::Volume(_) => false,
             }),
             "chorale.accept must still be editable"
         );
