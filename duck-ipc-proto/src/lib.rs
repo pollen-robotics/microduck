@@ -615,22 +615,57 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
 /// else on the wire changed.
 ///
-/// # v62 — the battery's PWM cap
+/// # v62 — the flashlight's brightness, and the battery's PWM cap
+///
+/// [`FlashlightParams::brightness`]: how bright, 0 to 1 of the LED's full brightness, so the light
+/// can be on without dazzling the person it points at. Absent is full, as before, and is not sent:
+/// a client that does not set it still works against an older `robotd`, which refuses the field by
+/// name when one does. A board whose LEDs are on/off only (the beta's GPIO expander) lights any
+/// brightness above zero fully.
 ///
 /// [`HealthResult::goal_pwm`]: the Goal PWM `robotd` writes when
 /// `bus.battery_voltage_based_pwm_limit` is on. Optional and absent when off, so a v61 client
-/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing.
+/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing. (Numbered
+/// v62 on `main` and on the photo branch both; merged here under one heading.)
 ///
-/// # v63 — a phase-encoded skill
+/// # v63 — `bwep`
+///
+/// [`SoundTag::Bwep`]: a tiny cute retch, which the photo sequence plays as the robot lets go of
+/// the e-ink display in its beak. An older `robotd` refuses the tag as unknown; its voice bank is
+/// re-rendered on install (bank v6) so the robot has the sound in its own voice.
+///
+/// # v64 — `photo.list`, `photo.get`, `photo.delete`
+///
+/// [`method::PHOTO_LIST`], [`method::PHOTO_GET`] and [`method::PHOTO_DELETE`]: the photos the photo
+/// sequence keeps in `/var/lib/robot/photos`, listed, read a chunk at a time — the picture or a
+/// small preview of it — and deleted, so a phone can show and keep them. Answered by `nfcd`,
+/// which takes them. An older `nfcd` answers METHOD_NOT_FOUND, by name.
+///
+/// # v65 — the pad's battery
+///
+/// [`Pad::battery`]: how full the connected pad's battery is, and whether it is charging, on
+/// `pad.status`. `padd` asks the pad and writes [`pad_battery::FILE`]; `configd` reads it. Optional
+/// and absent when unknown — a pad that is not a Nintendo one, a `padd` too old to ask, a reading
+/// gone stale — so a v64 client reading a v65 robot ignores it, and a v65 client reading a v64
+/// robot shows nothing.
+///
+/// # v66 — the speaker volume
+///
+/// `robot.volume` reads the speaker level and `robot.setVolume` sets it ([`VolumeParams`],
+/// [`VolumeResult`]): a percentage, written to `[audio] volume` and to the codec's mixer at once,
+/// so it is heard as it is set and kept across a restart. An older `robotd` answers
+/// METHOD_NOT_FOUND, by name.
+///
+/// # v67 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v62 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v66 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 63;
+pub const API_VERSION: u32 = 67;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -710,7 +745,9 @@ pub mod socket {
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
 
-    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and nothing else. Under `/run/nfcd/`, its
+    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and the photos it
+    /// takes: [`super::method::PHOTO_LIST`], [`super::method::PHOTO_GET`],
+    /// [`super::method::PHOTO_DELETE`]. Under `/run/nfcd/`, its
     /// `RuntimeDirectory=`, for the same reason as the pad's.
     pub const NFC: &str = "/run/nfcd/nfc.sock";
 }
@@ -978,6 +1015,16 @@ pub mod method {
     /// While a read waits, the tag touched is read rather than acted on: reading a pairing tag
     /// does not pair, reading a mode tag does not switch the mode.
     pub const NFC_READ: &str = "nfc.read";
+    /// The photos the photo sequence has kept, newest first: a name, a size and when each was
+    /// taken; see [`super::PhotoListResult`]. Answered by `nfcd`, from its photo directory, while
+    /// a sequence runs too. No params.
+    pub const PHOTO_LIST: &str = "photo.list";
+    /// A chunk of one photo, base64, at an offset: the picture as kept, or with `preview` a small
+    /// JPEG of it made on first asking. At most [`super::PhotoGetParams::MAX_LEN`] bytes a call, so
+    /// a reply fits a BLE line; see [`super::PhotoChunk`]. Answered by `nfcd`.
+    pub const PHOTO_GET: &str = "photo.get";
+    /// Delete one photo, and its preview. Answered by `nfcd`; see [`super::PhotoDeleteResult`].
+    pub const PHOTO_DELETE: &str = "photo.delete";
     /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
     /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
     ///
@@ -1041,6 +1088,11 @@ pub mod method {
     /// Another daemon's counts and records since its last report, for the vet book — see
     /// [`crate::vetbook::VetbookTallyParams`]. Local daemons only.
     pub const ROBOT_VETBOOK_TALLY: &str = "robot.vetbookTally";
+
+    /// The speaker level, percent — see [`VolumeResult`]. A read.
+    pub const ROBOT_VOLUME: &str = "robot.volume";
+    /// Set the speaker level: heard at once, and kept in `[audio] volume`.
+    pub const ROBOT_SET_VOLUME: &str = "robot.setVolume";
 
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
@@ -1441,6 +1493,10 @@ pub enum Call {
     RobotVetbookNote(vetbook::VetbookNoteParams),
     /// Add another daemon's counts to it; see [`method::ROBOT_VETBOOK_TALLY`].
     RobotVetbookTally(vetbook::VetbookTallyParams),
+    /// The speaker level; see [`method::ROBOT_VOLUME`].
+    RobotVolume,
+    /// Set it; see [`method::ROBOT_SET_VOLUME`].
+    RobotSetVolume(VolumeParams),
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -1537,6 +1593,12 @@ pub enum Call {
     NfcWrite(NfcWriteParams),
     /// Read the next tag touched; see [`method::NFC_READ`]. Answered by `nfcd`.
     NfcRead(NfcReadParams),
+    /// The photos kept; see [`method::PHOTO_LIST`]. Answered by `nfcd`.
+    PhotoList,
+    /// A chunk of one photo; see [`method::PHOTO_GET`]. Answered by `nfcd`.
+    PhotoGet(PhotoGetParams),
+    /// Delete one photo; see [`method::PHOTO_DELETE`]. Answered by `nfcd`.
+    PhotoDelete(PhotoDeleteParams),
     /// Answered by `mapd`; see [`method::MAP_STATUS`].
     MapStatus,
     MapStream,
@@ -1634,6 +1696,9 @@ impl Call {
             Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
             Call::NfcWrite(_) => method::NFC_WRITE,
             Call::NfcRead(_) => method::NFC_READ,
+            Call::PhotoList => method::PHOTO_LIST,
+            Call::PhotoGet(_) => method::PHOTO_GET,
+            Call::PhotoDelete(_) => method::PHOTO_DELETE,
             Call::RobotSoccer(_) => method::ROBOT_SOCCER,
             Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
@@ -1648,6 +1713,8 @@ impl Call {
             Call::RobotVetbook => method::ROBOT_VETBOOK,
             Call::RobotVetbookNote(_) => method::ROBOT_VETBOOK_NOTE,
             Call::RobotVetbookTally(_) => method::ROBOT_VETBOOK_TALLY,
+            Call::RobotVolume => method::ROBOT_VOLUME,
+            Call::RobotSetVolume(_) => method::ROBOT_SET_VOLUME,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1848,6 +1915,8 @@ impl Call {
             Call::RobotVetbookNote(_) => (Robot, Prompt),
             // A merge into the book under its lock, and nothing else.
             Call::RobotVetbookTally(_) => (Robot, Prompt),
+            // A read of the config, and a small write to it plus two `amixer` calls.
+            Call::RobotVolume | Call::RobotSetVolume(_) => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
             Call::RobotMove(_)
@@ -1927,6 +1996,9 @@ impl Call {
             // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
             // own lane.
             Call::NfcWrite(_) | Call::NfcRead(_) => (Nfc, Operation),
+            // A directory listing and a file read: milliseconds, and a preview's first making is
+            // one JPEG decoded and shrunk, well under a second.
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => (Nfc, Prompt),
             // ── mapd ────────────────────────────────────────────────────────
             //
             // Status and grid are lookups of what the mapper already holds; the grid is rendered
@@ -2002,10 +2074,13 @@ impl Call {
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
             Call::RobotVetbookTally(p) => encode(p),
+            Call::RobotSetVolume(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotLaserTrack(p) => encode(p),
             Call::NfcWrite(p) => encode(p),
             Call::NfcRead(p) => encode(p),
+            Call::PhotoGet(p) => encode(p),
+            Call::PhotoDelete(p) => encode(p),
             Call::RobotSoccer(p) => encode(p),
             Call::RobotAutonomous(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -2036,6 +2111,7 @@ impl Call {
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
+            | Call::RobotVolume
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::DetectorCheck
@@ -2060,6 +2136,7 @@ impl Call {
             | Call::MapStatus
             | Call::MapStream
             | Call::MapWipe
+            | Call::PhotoList
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
             Call::MapGrid(p) => encode(p),
         }
@@ -2113,6 +2190,9 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::NfcRead(decode(params.or(Some(&empty)))?)
             }
+            method::PHOTO_LIST => Call::PhotoList,
+            method::PHOTO_GET => Call::PhotoGet(decode(params)?),
+            method::PHOTO_DELETE => Call::PhotoDelete(decode(params)?),
             method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
             method::ROBOT_AUTONOMOUS => Call::RobotAutonomous(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
@@ -2127,6 +2207,8 @@ impl Call {
             method::ROBOT_VETBOOK => Call::RobotVetbook,
             method::ROBOT_VETBOOK_NOTE => Call::RobotVetbookNote(decode(params)?),
             method::ROBOT_VETBOOK_TALLY => Call::RobotVetbookTally(decode(params)?),
+            method::ROBOT_VOLUME => Call::RobotVolume,
+            method::ROBOT_SET_VOLUME => Call::RobotSetVolume(decode(params)?),
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -2313,6 +2395,7 @@ pub mod test_support {
                 on: true,
                 toggle: false,
                 color: FlashlightColor::Cyan,
+                brightness: Some(0.25),
             }),
             Call::RobotShutdown,
             Call::RobotAutonomous(AutonomyParams { active: true }),
@@ -2323,6 +2406,8 @@ pub mod test_support {
             Call::RobotVetbookNote(vetbook::VetbookNoteParams {
                 text: "reglued the beak".into(),
             }),
+            Call::RobotVolume,
+            Call::RobotSetVolume(VolumeParams { volume: 40 }),
             Call::RobotVetbookTally(vetbook::VetbookTallyParams {
                 tallies: [(vetbook::key::PHOTOS.to_owned(), 1.0)].into(),
                 ..Default::default()
@@ -2418,6 +2503,16 @@ pub mod test_support {
             }),
             Call::NfcRead(NfcReadParams {
                 timeout_s: Some(30),
+            }),
+            Call::PhotoList,
+            Call::PhotoGet(PhotoGetParams {
+                name: "2026-11-11_14-03-27".into(),
+                preview: true,
+                offset: 16384,
+                len: Some(4096),
+            }),
+            Call::PhotoDelete(PhotoDeleteParams {
+                name: "2026-11-11_14-03-27-2".into(),
             }),
             Call::MapStatus,
             Call::MapStream,
@@ -2814,6 +2909,8 @@ pub enum SoundTag {
     Coo,
     /// The held joy ride: start → loop while held → end.
     Wheee,
+    /// A tiny cute retch and a bubble — letting go of what the beak held. (v63)
+    Bwep,
 }
 
 impl SoundTag {
@@ -2827,6 +2924,7 @@ impl SoundTag {
             SoundTag::Chirp => "chirp",
             SoundTag::Coo => "coo",
             SoundTag::Wheee => "wheee",
+            SoundTag::Bwep => "bwep",
         }
     }
 }
@@ -2874,13 +2972,17 @@ impl FlashlightColor {
 
 /// See [`method::ROBOT_FLASHLIGHT`]. Shaped like [`EnableParams`]: `toggle` wins over `on`, so a
 /// button that does not know the light's state can still flip it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlashlightParams {
     pub on: bool,
     pub toggle: bool,
     /// The colour it lights in. Ignored when the call switches it off.
     pub color: FlashlightColor,
+    /// How bright, 0 to 1 of the LED's full brightness, clamped by the robot. Absent is full.
+    /// Ignored when the call switches it off. (v62)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<f64>,
 }
 
 /// See [`method::ROBOT_THEREMIN`].
@@ -3046,6 +3148,95 @@ pub struct NfcReadResult {
     /// holds no NDEF message: a blank tag, one lifted during a write.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Answer to [`Call::PhotoList`]: every photo kept, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoListResult {
+    pub photos: Vec<Photo>,
+}
+
+/// One photo the photo sequence kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Photo {
+    /// The file's name without `.jpg`: the robot's local time it was taken at,
+    /// `2026-11-11_14-03-27`, with `-2`, `-3`, … for a second one in the same second. What
+    /// [`Call::PhotoGet`] and [`Call::PhotoDelete`] name it by, and what a phone keeps it under.
+    pub name: String,
+    /// The picture's size in bytes, which is what reading it to the end takes.
+    pub bytes: u64,
+    /// When it was written, in seconds since the epoch: the file's modification time. A robot
+    /// that had no clock yet when it took the photo says so with a time in 1970, and the name has
+    /// the same wrong time in it.
+    pub taken_s: u64,
+}
+
+/// See [`method::PHOTO_GET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoGetParams {
+    /// A [`Photo::name`] from [`Call::PhotoList`]. Anything that is not one — a path, a `..` — is
+    /// refused rather than looked for.
+    pub name: String,
+    /// The small preview rather than the picture: a JPEG [`PhotoGetParams::PREVIEW_SIDE`] pixels
+    /// on its longer side, about a single chunk. Made on first asking and kept beside the photo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+    /// Where to start, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub offset: u64,
+    /// How many bytes, at most. Absent, or more than [`PhotoGetParams::MAX_LEN`], is that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u32>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl PhotoGetParams {
+    /// The most one call answers with. 16 KiB is about 22 KB of base64, well inside a BLE reply
+    /// line (`duck_ble::framing::MAX_REPLY_LINE`, 64 KiB) and a second or so on the air at a
+    /// phone's MTU, so a long download stays a series of short answers that each say how far it
+    /// got.
+    pub const MAX_LEN: u32 = 16 * 1024;
+    /// The preview's longer side, in pixels: a grid tile on a phone at 3x.
+    pub const PREVIEW_SIDE: u32 = 360;
+
+    /// The length this asks for, defaulted and capped.
+    pub fn chunk_len(&self) -> u32 {
+        self.len.unwrap_or(Self::MAX_LEN).clamp(1, Self::MAX_LEN)
+    }
+}
+
+/// Answer to [`Call::PhotoGet`]: one chunk of the file, and how big the whole of it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoChunk {
+    pub name: String,
+    /// The whole file's size — the picture's, or the preview's — so a reader knows when it is
+    /// done and how far along it is.
+    pub total: u64,
+    /// Where this chunk starts, as asked.
+    pub offset: u64,
+    /// The bytes, base64 (standard alphabet, padded). Empty at or past the end.
+    pub data: String,
+}
+
+/// See [`method::PHOTO_DELETE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoDeleteParams {
+    /// A [`Photo::name`]; refused as [`PhotoGetParams::name`] is.
+    pub name: String,
+}
+
+/// Answer to [`Call::PhotoDelete`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoDeleteResult {
+    /// False when there was no such photo — already deleted, say — which is not an error.
+    pub deleted: bool,
 }
 
 /// One NDEF record on a tag, as a person wrote it: `{"type": "text", "value": "walk_mode"}`.
@@ -5528,6 +5719,126 @@ pub struct Pad {
     pub trusted: bool,
     /// Connected right now. This is the one that answers "why is the robot not moving".
     pub connected: bool,
+    /// How full its battery is, when the robot knows: a connected pad `padd` could ask, read
+    /// recently. Absent otherwise — which is most pads, and says nothing about the battery. (v65)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<PadBattery>,
+}
+
+/// A pad's battery, as the pad reports it: a level, not a percentage.
+///
+/// A Switch pad says one of five levels in every subcommand reply, and a clone answers nothing
+/// finer — the voltage query that a genuine one answers comes back empty. So the steps are the
+/// pad's own and nothing here pretends to more precision than it gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadBattery {
+    pub level: PadBatteryLevel,
+    /// On a cable and charging.
+    pub charging: bool,
+}
+
+/// See [`PadBattery`]. The names are the levels the pad reports, from the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadBatteryLevel {
+    Full,
+    Medium,
+    Low,
+    Critical,
+    Empty,
+}
+
+impl PadBatteryLevel {
+    /// From the high nibble of a Switch report's battery byte with its charging bit (the lowest)
+    /// cleared: 8, 6, 4, 2, 0. An odd step a pad never sends is read as the one below it.
+    pub fn from_switch(step: u8) -> Self {
+        match step & 0x0e {
+            8.. => Self::Full,
+            6 => Self::Medium,
+            4 => Self::Low,
+            2 => Self::Critical,
+            _ => Self::Empty,
+        }
+    }
+
+    /// Worth telling someone about before the pad dies mid-drive.
+    pub fn is_low(self) -> bool {
+        matches!(self, Self::Low | Self::Critical | Self::Empty)
+    }
+
+    /// As a person would say it: "full", "low".
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Critical => "critical",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl PadBattery {
+    /// From a Switch report's battery byte (byte 2 of a `0x21` or `0x30` input report): the high
+    /// nibble is the level, its lowest bit charging; the low nibble is connection info, ignored.
+    pub fn from_switch_byte(byte: u8) -> Self {
+        let high = byte >> 4;
+        Self {
+            level: PadBatteryLevel::from_switch(high),
+            charging: high & 1 == 1,
+        }
+    }
+}
+
+/// How a pad's battery gets from `padd`, which can ask the pad, to `configd`, which answers
+/// `pad.status` — and to `robotctl monitor`, on the robot.
+///
+/// **A file, because `configd` cannot ask the pad itself.** It runs with `PrivateDevices=yes`: its
+/// `/dev` is made once when it starts, and a pad's hidraw node appears when the pad connects. `padd`
+/// is already following the pad from connect to disconnect, so it asks, and writes what it heard
+/// here; a reader takes it only while it is fresh ([`read_fresh`]).
+pub mod pad_battery {
+    use super::PadBattery;
+    use serde::{Deserialize, Serialize};
+
+    /// Under `padd`'s `RuntimeDirectory=`, so it is gone with the daemon and with the boot.
+    pub const FILE: &str = "/run/padd/pad-battery.json";
+
+    /// How old a reading may be and still be shown. `padd` asks every minute; five missed answers
+    /// is a `padd` that stopped, or a pad that stopped answering, and a level from then is a guess.
+    pub const STALE_S: u64 = 300;
+
+    /// What [`FILE`] holds.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Reading {
+        /// The pad's address, as BlueZ writes it: `98:B6:E9:5E:BB:DB`. What a reader matches the
+        /// reading to its pad by.
+        pub mac: String,
+        #[serde(flatten)]
+        pub battery: PadBattery,
+        /// When the pad said it, in seconds since the epoch.
+        pub read_s: u64,
+    }
+
+    /// The reading in `path`, if there is one, it parses, and it is no older than [`STALE_S`] at
+    /// `now_s`. A reading from the future — a clock that stepped back — is taken: refusing it would
+    /// hide the battery until the clock caught up, for no better answer.
+    pub fn read_fresh(path: &std::path::Path, now_s: u64) -> Option<Reading> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let reading: Reading = serde_json::from_str(&text).ok()?;
+        (now_s.saturating_sub(reading.read_s) <= STALE_S).then_some(reading)
+    }
+
+    /// `pads` with the reading put on the connected pad it is about, if any.
+    pub fn attach(pads: &mut [super::Pad], reading: Option<&Reading>) {
+        let Some(reading) = reading else { return };
+        if let Some(pad) = pads
+            .iter_mut()
+            .find(|p| p.connected && p.mac.eq_ignore_ascii_case(&reading.mac))
+        {
+            pad.battery = Some(reading.battery);
+        }
+    }
 }
 
 /// Whether one of the robot's units is running, as systemd sees it.
@@ -5774,6 +6085,25 @@ pub struct SkillsResult {
     /// listing what a robot can do needs both, and neither can be edited here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub built_in: Vec<String>,
+}
+
+/// Parameters for [`Call::RobotSetVolume`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeParams {
+    /// Percent: 100 is the codec's full level, 0 mutes the speaker. Over 100 is refused.
+    pub volume: u8,
+}
+
+/// Answer to [`Call::RobotVolume`] and [`Call::RobotSetVolume`]: the level as stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeResult {
+    /// Percent, 0–100.
+    pub volume: u8,
+    /// Whether this board has a speaker mixer the level is written to — the Zero 3W HAT's
+    /// AIC3104, or the beta and face boards' RK809. False on any other codec: the level is kept,
+    /// and changes nothing it can hear.
+    pub applies: bool,
 }
 
 /// Parameters for [`Call::PadBind`].
@@ -7212,11 +7542,100 @@ mod tests {
         assert!(blank.records.is_empty());
     }
 
+    /// The byte the Pro Controller on duck-d556 answered with, and the others it can send.
+    #[test]
+    fn a_switch_battery_byte_is_a_level_and_a_charging_bit() {
+        let read = PadBattery::from_switch_byte;
+        assert_eq!(
+            read(0x80),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: false
+            }
+        );
+        assert_eq!(
+            read(0x91),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: true
+            }
+        );
+        assert_eq!(read(0x6e).level, PadBatteryLevel::Medium);
+        assert_eq!(read(0x40).level, PadBatteryLevel::Low);
+        assert_eq!(read(0x20).level, PadBatteryLevel::Critical);
+        assert_eq!(read(0x0e).level, PadBatteryLevel::Empty);
+        assert!(read(0x40).level.is_low() && !read(0x60).level.is_low());
+    }
+
+    #[test]
+    fn a_pad_without_a_battery_says_nothing_about_one() {
+        let pad = Pad {
+            mac: "98:B6:E9:5E:BB:DB".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            battery: None,
+        };
+        let wire = serde_json::to_value(&pad).unwrap();
+        assert!(wire.get("battery").is_none());
+        // And a v64 robot's answer reads as no battery.
+        let old: Pad = serde_json::from_value(serde_json::json!({
+            "mac": "98:B6:E9:5E:BB:DB", "name": "Pro Controller",
+            "paired": true, "trusted": true, "connected": true
+        }))
+        .unwrap();
+        assert_eq!(old, pad);
+    }
+
+    #[test]
+    fn a_battery_reading_is_taken_while_fresh_and_for_its_own_pad() {
+        let dir = std::env::temp_dir().join(format!("pad-battery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pad-battery.json");
+        std::fs::write(
+            &file,
+            r#"{"mac":"98:b6:e9:5e:bb:db","level":"low","charging":false,"read_s":1000}"#,
+        )
+        .unwrap();
+
+        assert!(pad_battery::read_fresh(&file, 1000 + pad_battery::STALE_S).is_some());
+        assert!(pad_battery::read_fresh(&file, 1001 + pad_battery::STALE_S).is_none());
+        assert!(
+            pad_battery::read_fresh(&file, 10).is_some(),
+            "a clock stepped back"
+        );
+        assert!(pad_battery::read_fresh(&dir.join("absent.json"), 1000).is_none());
+
+        let reading = pad_battery::read_fresh(&file, 1000).unwrap();
+        let pad = |mac: &str, connected| Pad {
+            mac: mac.into(),
+            name: String::new(),
+            paired: true,
+            trusted: true,
+            connected,
+            battery: None,
+        };
+        let mut pads = vec![
+            pad("78:86:2E:BB:13:28", true),
+            pad("98:B6:E9:5E:BB:DB", true),
+        ];
+        pad_battery::attach(&mut pads, Some(&reading));
+        assert_eq!(pads[0].battery, None);
+        assert_eq!(pads[1].battery.unwrap().level, PadBatteryLevel::Low);
+
+        // The pad it is about, switched off: a reading from before is not shown on it.
+        let mut off = vec![pad("98:B6:E9:5E:BB:DB", false)];
+        pad_battery::attach(&mut off, Some(&reading));
+        assert_eq!(off[0].battery, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            85,
+            90,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -7323,7 +7742,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v62 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v66 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {

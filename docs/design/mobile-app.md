@@ -25,7 +25,7 @@ over the same radio, with the same reply.
 | screen | calls |
 |---|---|
 | pick a robot | the advertisement — name and IPv4 — then `hello` and `system.authenticate` |
-| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors` |
+| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors`, `robot.volume`, `robot.setVolume` |
 | drive | WebRTC: video, `robot.move`, `robot.subscribe` |
 | moves | `robot.skills`, `robot.do`, `robot.policies`, `robot.loadPolicy`, `policy.check`, `policy.search`, `policy.fetch`, `policy.install` |
 | wifi | `net.status`, `net.scan`, `net.connect`, `net.forget` |

@@ -5,7 +5,8 @@
 //! beta board's expander and from the Awinic PWM drivers on face-board-v1, and switching it is a
 //! write to `brightness` or `trigger`. On is [`name::lit_level`], capped at the LED's own
 //! `max_brightness`: on an on/off LED that is always `1`, on a PWM one it is a level picked by eye
-//! so the face does not glare.
+//! so the face does not glare. [`Light::Dim`] is a share of `max_brightness` instead, which only a
+//! PWM LED can show.
 //!
 //! Here rather than in each daemon because three of them write LEDs and they must agree on two
 //! things that are easy to get subtly wrong: that a blinking LED is switched on by dropping its
@@ -63,6 +64,10 @@ pub mod name {
 pub enum Light {
     Off,
     On,
+    /// Lit at this many thousandths of `max_brightness`, rounded up so a dim LED is never dark: on
+    /// an LED whose `max_brightness` is 1 (a GPIO), anything above zero is fully on. What the
+    /// flashlight's brightness asks for; [`name::lit_level`] does not apply.
+    Dim(u16),
     /// The kernel's `timer` trigger at its default 500/500 ms. Another rate needs root
     /// (`delay_on` is root's), and one rate is all the LEDs need.
     Blink,
@@ -84,6 +89,8 @@ pub struct Led {
     /// What [`Light::On`] and [`Light::Blink`] light it at: [`name::lit_level`] within the LED's
     /// `max_brightness`.
     full: String,
+    /// The LED's `max_brightness`, which [`Light::Dim`] is a share of.
+    max: u32,
     shown: Option<Light>,
 }
 
@@ -111,6 +118,7 @@ impl Led {
         Some(Led {
             path,
             full,
+            max,
             shown: None,
         })
     }
@@ -131,6 +139,11 @@ impl Led {
             Light::On => {
                 self.write("trigger", "none")?;
                 self.write("brightness", &self.full)
+            }
+            Light::Dim(thousandths) => {
+                self.write("trigger", "none")?;
+                let level = (u64::from(self.max) * u64::from(thousandths.min(1000))).div_ceil(1000);
+                self.write("brightness", &level.to_string())
             }
             // The timer blinks at the brightness the LED has when it starts, or at
             // `max_brightness` from off — so light it at its level first.
@@ -213,6 +226,22 @@ mod tests {
         // The beta's gpio-leds: max_brightness 1, so every level is on.
         let mut cam = Led::open_in(dir.path(), name::CAMERA).unwrap();
         cam.set(Light::On).unwrap();
+        assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
+    }
+
+    #[test]
+    fn dim_is_a_share_of_max_and_never_dark() {
+        let dir = fake(&[name::FLASHLIGHT_RED, name::CAMERA]);
+        let max = dir.path().join(name::FLASHLIGHT_RED).join("max_brightness");
+        std::fs::write(&max, "255\n").unwrap();
+        let mut pwm = Led::open_in(dir.path(), name::FLASHLIGHT_RED).unwrap();
+        pwm.set(Light::Dim(100)).unwrap();
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "26");
+        pwm.set(Light::Dim(1)).unwrap();
+        assert_eq!(read(dir.path(), name::FLASHLIGHT_RED, "brightness"), "1");
+        // An on/off LED has no half: dim is on.
+        let mut gpio = Led::open_in(dir.path(), name::CAMERA).unwrap();
+        gpio.set(Light::Dim(100)).unwrap();
         assert_eq!(read(dir.path(), name::CAMERA, "brightness"), "1");
     }
 

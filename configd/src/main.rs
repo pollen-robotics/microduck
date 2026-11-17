@@ -592,13 +592,25 @@ async fn dispatch(
             }
         }
         proto::Call::PadStatus => match service.pads.status().await {
-            Ok(pads) => proto::Response::ok(
-                Some(id),
-                &proto::PadStatusResult {
-                    pads,
-                    driver: units::state(units::PADD).await,
-                },
-            ),
+            Ok(mut pads) => {
+                // The battery is `padd`'s to read — it can open the pad, and this daemon's private
+                // /dev cannot — so it is taken from the file `padd` keeps, while fresh.
+                let now_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let reading = proto::pad_battery::read_fresh(
+                    std::path::Path::new(proto::pad_battery::FILE),
+                    now_s,
+                );
+                proto::pad_battery::attach(&mut pads, reading.as_ref());
+                proto::Response::ok(
+                    Some(id),
+                    &proto::PadStatusResult {
+                        pads,
+                        driver: units::state(units::PADD).await,
+                    },
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "backend failed");
                 proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))

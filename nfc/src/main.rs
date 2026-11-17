@@ -8,7 +8,13 @@
 //! `configd` is asked to pair whichever pad is in pairing mode — with a quack from `robotd` when
 //! the tag is read and a different sound once the pad is paired. The rule and why it is that rule
 //! are in [`nfc::pairing`]. A tag naming a mode instead — `walk_mode`, `roller_skating_mode`, … —
-//! asks `robotd` to switch to it; which names there are is [`nfc::modes`].
+//! asks `robotd` to switch to it; which names there are is [`nfc::modes`]. An e-ink display
+//! ([`nfc::eink`]), or a `take_photo` tag, poses the robot for a picture taken with `mediad`'s
+//! camera and kept in `/var/lib/robot/photos`; the sequence is [`nfc::photo`].
+//!
+//! `nfcd eink write` is the bench's: a picture written to an e-ink display on one antenna, with
+//! `nfcd` itself stopped, since it holds the reader. It is how the write ([`nfc::eink`]) is tried
+//! on a robot before the photo sequence does it.
 //!
 //! ## Writing a tag
 //!
@@ -50,16 +56,18 @@ use std::sync::{Arc, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use duck_ipc_proto as proto;
 use nfc::clrc663::Clrc663;
+use nfc::gallery;
 use nfc::modes::{self, Driver, ModeTag};
 use nfc::pairing::{self, Outcome, Robot, Touches};
+use nfc::photo;
 use nfc::reader::{Exchange, Reader};
 use nfc::serial::Serial;
 use nfc::spi::Spidev;
 use nfc::st25r100::{Antenna, Proto, St25r100};
-use nfc::{Error, ndef, tag, vtag};
+use nfc::{Error, eink, ndef, tag, vtag};
 
 /// Between attempts to open a reader that is not there, doubling to the cap.
 ///
@@ -72,6 +80,15 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// this only has to outlast that, so a wedged `configd` does not stop the reader for good.
 const PAIR_ANSWER: Duration = Duration::from_secs(40);
 const QUICK_ANSWER: Duration = Duration::from_secs(5);
+
+/// Where the ST25R100's two antennas are: RFO2 under the top of the head, RFO1 in the beak.
+///
+/// **Not the same on every robot** (2026-11-17): some have them the other way round — RFO1 on
+/// the head — which is how the first face-board-v1 and duck-d325 read. This is the wiring of the
+/// robots the e-ink is being tried on. Which a robot has: touch each antenna with `nfcd` running
+/// and read `antenna=` in `tag in the field`.
+const HEAD: Antenna = Antenna::Two;
+const BEAK: Antenna = Antenna::One;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +117,88 @@ struct Args {
     /// Where `nfc.write` is served.
     #[arg(long, default_value = proto::socket::NFC)]
     socket: PathBuf,
+
+    /// `mediad`'s local frame socket, where the photo tag's picture comes from.
+    #[arg(long, default_value = proto::socket::MEDIA)]
+    media_socket: PathBuf,
+
+    /// Where the photo tag's pictures are kept, one JPEG each, named for the local time.
+    #[arg(long, default_value = "/var/lib/robot/photos")]
+    photo_dir: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// An e-ink display, from the bench. Stop the `nfcd` service first: it holds the reader.
+    #[command(subcommand)]
+    Eink(EinkCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum EinkCommand {
+    /// Write a picture to the display on one antenna, and redraw it. Keep the display still
+    /// until `refresh done`.
+    Write(EinkWrite),
+}
+
+#[derive(clap::Args, Debug)]
+struct EinkWrite {
+    /// A JPEG or a PNG: its centre square, scaled to 240 × 240. None, the six-ink test pattern.
+    image: Option<PathBuf>,
+
+    /// The antenna the display is on.
+    #[arg(long, value_enum, default_value_t = Place::Beak)]
+    on: Place,
+
+    /// The refresh's P1, hex: the panel's power-up before it draws, in 100 ms. `nfc-test`'s
+    /// NFC_REFRESH_P1.
+    #[arg(long, default_value = "85", value_parser = hex_byte)]
+    p1: u8,
+
+    /// Between two packets at first, in ms; a slow packet raises it. `nfc-test`'s
+    /// NFC_D2_DELAY_MS.
+    #[arg(long, default_value_t = 0)]
+    pace_ms: u64,
+
+    /// The time the display has to answer each block: FWT at this FWI, 14 being 4.9 s.
+    #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u8).range(0..=14))]
+    fwi: u8,
+
+    #[arg(long, value_enum, default_value_t = DitherArg::Atkinson)]
+    dither: DitherArg,
+
+    /// A box blur of this radius before the dither. `nfc-test`'s NFC_BLUR.
+    #[arg(long, default_value_t = 0)]
+    blur: u32,
+
+    /// How long to wait for a display on the antenna, in seconds.
+    #[arg(long, default_value_t = 10)]
+    find_within: u64,
+
+    /// How long the redraw may take, in seconds.
+    #[arg(long, default_value_t = 300)]
+    refresh_within: u64,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Place {
+    Head,
+    Beak,
+    /// Both antennas driven together, as `nfc-test` does without NFC_ANT.
+    Both,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum DitherArg {
+    Atkinson,
+    None,
+}
+
+fn hex_byte(s: &str) -> Result<u8, String> {
+    u8::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("{s:?}: {e}"))
 }
 
 /// Who may ask for a tag to be written or read: the group that may drive the robot. `btd` is in it, which
@@ -122,6 +221,10 @@ fn main() -> std::process::ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
+    if let Some(Command::Eink(EinkCommand::Write(write))) = &args.command {
+        let device = args.device.clone().unwrap_or_else(default_device);
+        return eink_write(&device, write);
+    }
     duck_ipc_proto::log_startup_identity!("nfcd");
 
     if !(args.hz > 0.0 && args.hz <= 20.0) {
@@ -132,6 +235,8 @@ fn main() -> std::process::ExitCode {
     let mut robot = Sockets {
         config: args.config_socket.clone(),
         robot: args.robot_socket.clone(),
+        media: args.media_socket.clone(),
+        photos: args.photo_dir.clone(),
     };
 
     let reader_up = Arc::new(AtomicBool::new(false));
@@ -139,6 +244,8 @@ fn main() -> std::process::ExitCode {
     let asker = Sockets {
         config: args.config_socket.clone(),
         robot: args.robot_socket.clone(),
+        media: args.media_socket.clone(),
+        photos: args.photo_dir.clone(),
     };
     if let Err(e) = serve(&args.socket, asked, reader_up.clone(), asker) {
         // Tags are still acted on; only writing and reading one on request is gone.
@@ -178,6 +285,110 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// `nfcd eink write`: the picture rendered, the display found on the antenna, written step by
+/// step, the field off at the end.
+fn eink_write(device: &Path, args: &EinkWrite) -> std::process::ExitCode {
+    use nfc::eink::{Joined, Progress, Settings, Writer, picture};
+    let fail = |why: String| {
+        tracing::error!(%why, "not written");
+        std::process::ExitCode::FAILURE
+    };
+    let image = match &args.image {
+        Some(path) => match image::open(path) {
+            Ok(image) => image.to_rgb8(),
+            Err(e) => return fail(format!("{}: {e}", path.display())),
+        },
+        None => {
+            tracing::info!("no picture given: the test pattern");
+            picture::test_pattern()
+        }
+    };
+    let dither = match args.dither {
+        DitherArg::Atkinson => picture::Dither::Atkinson,
+        DitherArg::None => picture::Dither::None,
+    };
+    let packed = picture::render(&image, dither, args.blur);
+
+    let mut chip = match open(device) {
+        Ok(chip) => chip,
+        Err(e) => return fail(format!("{}: {e}", device.display())),
+    };
+    let antenna = match args.on {
+        Place::Head => HEAD,
+        Place::Beak => BEAK,
+        Place::Both => Antenna::Both,
+    };
+    if let Chip::Spi(c) = &mut chip
+        && let Err(e) = c.set_proto(Proto::A).and_then(|()| c.set_antenna(antenna))
+    {
+        return fail(e.to_string());
+    }
+    tracing::info!(?antenna, on = ?args.on, "waiting for a display");
+    let until = Instant::now() + Duration::from_secs(args.find_within);
+    let outcome = loop {
+        let e = match Joined::open(&mut chip, args.fwi) {
+            Ok(joined) => break Ok(joined),
+            Err(e) => e,
+        };
+        if Instant::now() >= until {
+            break Err(format!("no display: {e}"));
+        }
+        if e.is_tag() {
+            tracing::debug!(error = %e, "no display yet");
+        } else if matches!(e, Error::Desync(_)) {
+            // What the daemon's poll does with it: a soft reset, the antenna chosen again.
+            tracing::info!(error = %e, "reader out of step; reset");
+            let reset = chip.begin().and_then(|()| match &mut chip {
+                Chip::Spi(c) => c.set_proto(Proto::A).and_then(|()| c.set_antenna(antenna)),
+                Chip::Usb(_) => Ok(()),
+            });
+            if let Err(e) = reset {
+                break Err(format!("the reader did not come back: {e}"));
+            }
+        } else {
+            break Err(format!("no display: {e}"));
+        }
+        sleep(Duration::from_millis(100));
+    };
+    let mut joined = match outcome {
+        Ok(joined) => joined,
+        Err(why) => return fail(why),
+    };
+    tracing::info!(fwi = args.fwi, "display found");
+
+    let settings = Settings {
+        refresh_p1: args.p1,
+        pace: Duration::from_millis(args.pace_ms),
+        refresh_within: Duration::from_secs(args.refresh_within),
+        ..Settings::default()
+    };
+    let mut writer = Writer::new(packed, settings);
+    let started = Instant::now();
+    let mut shown = None;
+    let result = loop {
+        match writer.step(&mut joined.on(&mut chip), Instant::now()) {
+            Ok(Progress::Done) => break Ok(()),
+            Ok(progress) => {
+                let stage = std::mem::discriminant(&progress);
+                if shown != Some(stage) {
+                    tracing::info!(?progress, "…");
+                    shown = Some(stage);
+                }
+                sleep(writer.idle(Instant::now()));
+            }
+            Err(why) => break Err(why),
+        }
+    };
+    let _ = chip.field_off();
+    match result {
+        Ok(()) => {
+            tracing::info!(took = ?started.elapsed(), "written and drawn");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(why) => fail(why),
+    }
+}
+
 /// The reader this board has, when nobody named one.
 fn default_device() -> PathBuf {
     match robotd_params::board::Board::detected() {
@@ -203,12 +414,16 @@ enum Tech {
     Classic,
     /// ISO 15693: a Type 5 tag (ST25TV, ICODE), read a block at a time.
     V,
+    /// ISO 14443-4 by its SAK: an e-ink display, as far as [`nfc::eink`] can tell. Not read.
+    Eink,
 }
 
 impl Tech {
     /// What an ISO 14443A tag is, from the SAK it selected with.
     fn of(found: tag::Selected) -> (Vec<u8>, Tech) {
-        let tech = if tag::is_mifare_classic(found.sak) {
+        let tech = if eink::is_eink(found.sak) {
+            Tech::Eink
+        } else if tag::is_mifare_classic(found.sak) {
             Tech::Classic
         } else {
             Tech::A
@@ -234,10 +449,13 @@ impl Chip {
 
     /// Look for a tag on every antenna in turn, asking as ISO 14443A first and then as ISO
     /// 15693; the first one seen wins, and the field stays on that antenna for whatever is read
-    /// next.
-    fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech)> {
+    /// next. Which antenna saw it, on the board that has two.
+    fn select(&mut self) -> nfc::Result<(Vec<u8>, Tech, Option<Antenna>)> {
         let Chip::Spi(c) = self else {
-            return tag::select_tag(self).map(Tech::of);
+            return tag::select_tag(self).map(|found| {
+                let (uid, tech) = Tech::of(found);
+                (uid, tech, None)
+            });
         };
         // Whatever the last touch left the chip framing, the 14443A ask starts from its own.
         c.set_proto(Proto::A)?;
@@ -245,7 +463,10 @@ impl Chip {
         for antenna in [Antenna::One, Antenna::Two] {
             c.set_antenna(antenna)?;
             match tag::select_tag(c) {
-                Ok(found) => return Ok(Tech::of(found)),
+                Ok(found) => {
+                    let (uid, tech) = Tech::of(found);
+                    return Ok((uid, tech, Some(antenna)));
+                }
                 Err(e) if !e.is_tag() => return Err(e),
                 _ => {}
             }
@@ -254,13 +475,29 @@ impl Chip {
             c.set_proto(Proto::V)?;
             c.reset_field()?;
             match vtag::inventory(c) {
-                Ok(uid) => return Ok((uid, Tech::V)),
+                Ok(uid) => return Ok((uid, Tech::V, Some(antenna))),
                 Err(e) if e.is_tag() => last = e,
                 Err(e) => return Err(e),
             }
             c.set_proto(Proto::A)?;
         }
         Err(last)
+    }
+}
+
+impl Chip {
+    /// Whether an e-ink display ([`eink::is_eink`]) answers on `antenna` alone. The bench reader
+    /// has one antenna, so it is asked there whatever `antenna` says.
+    fn eink_at(&mut self, antenna: Antenna) -> nfc::Result<bool> {
+        if let Chip::Spi(c) = self {
+            c.set_proto(Proto::A)?;
+            c.set_antenna(antenna)?;
+        }
+        match tag::select_tag(self) {
+            Ok(found) => Ok(eink::is_eink(found.sak)),
+            Err(e) if e.is_tag() => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -310,7 +547,7 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
             }
         };
 
-        if let Some((uid, tech)) = touched.as_ref()
+        if let Some((uid, tech, _)) = touched.as_ref()
             && let Some(job) = waiting.take()
         {
             let lost = match job.ask {
@@ -341,11 +578,31 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
             if let Some(e) = lost {
                 return e;
             }
-        } else if let Some((uid, tech)) =
-            touched.as_ref().map(|(uid, tech)| (uid.as_slice(), *tech))
+        } else if let Some((uid, tech, antenna)) = touched
+            .as_ref()
+            .map(|(uid, tech, antenna)| (uid.as_slice(), *tech, *antenna))
             && touches.seen(Some(uid))
         {
             let id = hex(uid);
+            let place = match antenna {
+                Some(HEAD) => "head",
+                Some(BEAK) => "beak",
+                Some(_) => "both",
+                None => "reader",
+            };
+            tracing::warn!(tag = %id, ?tech, ?antenna, place, "tag in the field");
+            // On the head, a display starts the photo; in the beak, it is what the sequence waits
+            // for, and starts nothing. The bench reader has one antenna, the head's.
+            if tech == Tech::Eink {
+                if antenna == Some(BEAK) {
+                    tracing::warn!(tag = %id, "e-ink in the beak — it starts nothing there");
+                } else {
+                    tracing::warn!(tag = %id, "e-ink on the head — hold still");
+                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
+                }
+                continue_after(period, start);
+                continue;
+            }
             match read_ndef(chip, uid, tech) {
                 Err(e) if !e.is_tag() => return e,
                 // The same answer every time it is asked: said once, until the tag is lifted.
@@ -357,6 +614,10 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
                     touches.unread();
                 }
                 Ok(Err(why)) => tracing::warn!(tag = %id, %why, "tag holds no readable NDEF"),
+                Ok(Ok(records)) if photo::in_records(&records) => {
+                    tracing::warn!(tag = %id, "photo tag touched — hold still");
+                    report_photo(photo::on_touch(&mut Session::new(&mut *robot, &mut *chip)));
+                }
                 Ok(Ok(records)) if !ndef::asks_to_pair(&records) => {
                     match ModeTag::in_records(&records) {
                         Some(mode) => {
@@ -382,9 +643,14 @@ fn watch(chip: &mut Chip, period: Duration, robot: &mut Sockets, waiting: &mut J
             touches.seen(None);
         }
 
-        if let Some(rest) = period.checked_sub(start.elapsed()) {
-            sleep(rest);
-        }
+        continue_after(period, start);
+    }
+}
+
+/// The rest of this poll's period.
+fn continue_after(period: Duration, start: Instant) {
+    if let Some(rest) = period.checked_sub(start.elapsed()) {
+        sleep(rest);
     }
 }
 
@@ -401,6 +667,9 @@ fn read_ndef(
             "a MIFARE Classic card: not read here — use an NTAG (Type 2) or a Type 5 tag".into(),
         )),
         Tech::V => vtag::read_ndef_area(chip, uid),
+        Tech::Eink => Err(Error::Unreadable(
+            "an e-ink display: it holds a picture, not NDEF".into(),
+        )),
     }?;
     Ok(ndef::parse(&data))
 }
@@ -539,6 +808,9 @@ fn write_touched(
             Tech::Classic => Err(Error::Tag(
                 "a MIFARE Classic card: only NTAG and Type 5 tags are written".into(),
             )),
+            Tech::Eink => Err(Error::Tag(
+                "an e-ink display: only NTAG and Type 5 tags are written".into(),
+            )),
         });
     match written {
         Ok(()) => {
@@ -645,11 +917,24 @@ fn client(
                     Ok(proto::Call::NfcRead(params)) => {
                         proto::Response::ok(id, &read_when_touched(params, asked, reader_up, robot))
                     }
+                    // The photos are files, read here on this connection's thread: no reader and
+                    // no poll loop involved, so they are answered mid-sequence too.
+                    Ok(proto::Call::PhotoList) => answer(id, gallery::list(&robot.photos)),
+                    Ok(proto::Call::PhotoGet(params)) => {
+                        answer(id, gallery::get(&robot.photos, &params))
+                    }
+                    Ok(proto::Call::PhotoDelete(params)) => {
+                        let deleted = gallery::delete(&robot.photos, &params.name);
+                        if let Ok(proto::PhotoDeleteResult { deleted: true }) = deleted {
+                            tracing::info!(photo = %params.name, "photo deleted, as asked");
+                        }
+                        answer(id, deleted)
+                    }
                     Ok(_) => proto::Response::err(
                         id,
                         proto::Error::new(
                             proto::code::METHOD_NOT_FOUND,
-                            "nfcd serves nfc.write and nfc.read, and nothing else",
+                            "nfcd serves nfc.write, nfc.read and photo.*, and nothing else",
                         ),
                     ),
                     Err(e) => proto::Response::err(id, e),
@@ -659,6 +944,17 @@ fn client(
         let mut out = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
         out.push(b'\n');
         stream.write_all(&out)?;
+    }
+}
+
+/// A result as a response: the value, or the error it carries.
+fn answer<T: serde::Serialize>(
+    id: Option<proto::Id>,
+    result: Result<T, proto::Error>,
+) -> proto::Response {
+    match result {
+        Ok(value) => proto::Response::ok(id, &value),
+        Err(e) => proto::Response::err(id, e),
     }
 }
 
@@ -770,6 +1066,21 @@ fn report(outcome: Outcome) {
     }
 }
 
+fn report_photo(outcome: photo::Outcome) {
+    match outcome {
+        photo::Outcome::Taken(path) => {
+            tracing::warn!(photo = %path.display(), "photo taken — sitting, beak open")
+        }
+        photo::Outcome::NoPhoto(why) => {
+            tracing::error!(%why, "no photo — sitting, beak open, all the same")
+        }
+        photo::Outcome::NotStanding(policy) => {
+            tracing::warn!(policy, "the robot did not stand, or is busy — no photo")
+        }
+        photo::Outcome::Failed(why) => tracing::error!(%why, "the photo sequence stopped"),
+    }
+}
+
 fn report_mode(tag: ModeTag, outcome: modes::Outcome) {
     let tag = tag.text();
     match outcome {
@@ -800,6 +1111,8 @@ fn hex(bytes: &[u8]) -> String {
 struct Sockets {
     config: PathBuf,
     robot: PathBuf,
+    media: PathBuf,
+    photos: PathBuf,
 }
 
 impl Robot for Sockets {
@@ -864,6 +1177,255 @@ impl Driver for Sockets {
             QUICK_ANSWER,
         )
     }
+}
+
+/// A photo sequence's view of the robot: the sockets, and the reader, which it asks for the display
+/// in the beak.
+struct Session<'a> {
+    sockets: &'a mut Sockets,
+    chip: &'a mut Chip,
+    /// The photo being written to the display in the beak, once begun.
+    writing: Option<(eink::Writer, eink::Joined)>,
+    started: Instant,
+    /// The head rolling on its own while the display is written.
+    roller: Option<Roller>,
+}
+
+/// Rolls the head side to side with a quack now and then ([`photo::Roll`]) on a thread of its
+/// own, from the first packet to the end of the redraw. Not between two steps of the write, as
+/// it was: one exchange with the display can take seconds — a display silent while it draws is
+/// asked three times over a 4.9 s FWT — and the head stood still for most of the redraw, or, two
+/// seconds without a head, the idle look-around took it and yawned with the display in the beak.
+struct Roller {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Roller {
+    fn start(socket: PathBuf, head: proto::HeadParams) -> Roller {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let from = Instant::now();
+            let mut roll = photo::Roll::default();
+            while !stopping.load(Ordering::Acquire) {
+                let (pose, quack) = roll.at(head, from.elapsed());
+                if quack {
+                    let sound = proto::Call::RobotSound(proto::SoundParams {
+                        tag: photo::ROLL_QUACK,
+                        hold: None,
+                    });
+                    if let Err(why) = call::<proto::IntentResult>(&socket, &sound, QUICK_ANSWER) {
+                        tracing::info!(%why, "robot.sound");
+                    }
+                }
+                if let Err(why) = notify(&socket, &proto::Call::RobotHead(pose)) {
+                    tracing::info!(%why, "robot.head");
+                }
+                sleep(photo::ROLL_STEP);
+            }
+        });
+        Roller {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Roller {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl<'a> Session<'a> {
+    fn new(sockets: &'a mut Sockets, chip: &'a mut Chip) -> Self {
+        Session {
+            sockets,
+            chip,
+            writing: None,
+            started: Instant::now(),
+            roller: None,
+        }
+    }
+}
+
+/// The time the display has for each block while the sequence writes it: FWT at FWI 14, 4.9 s,
+/// as on the bench, where it works. A block that long blocks the sequence; [`Roller`] moves the
+/// head meanwhile.
+const SEQUENCE_FWI: u8 = 14;
+/// How long the display may take to redraw in the sequence: it took ~50 s on the bench.
+const SEQUENCE_REFRESH_WITHIN: Duration = Duration::from_secs(75);
+
+impl photo::Driver for Session<'_> {
+    fn sound(&mut self, tag: proto::SoundTag) -> Result<(), String> {
+        Robot::sound(&mut *self.sockets, tag)
+    }
+
+    fn laser_track(&mut self, active: bool) -> Result<proto::LaserTrackResult, String> {
+        Driver::laser_track(&mut *self.sockets, active)
+    }
+
+    fn stop(&mut self) -> Result<proto::IntentResult, String> {
+        call(&self.sockets.robot, &proto::Call::RobotStop, QUICK_ANSWER)
+    }
+
+    fn policy(&mut self) -> Result<String, String> {
+        state_policy(&self.sockets.robot, QUICK_ANSWER)
+    }
+
+    fn start(&mut self) -> Result<proto::IntentResult, String> {
+        let params = proto::EnableParams {
+            on: true,
+            toggle: false,
+        };
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotEnable(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn sit_toggle(&mut self) -> Result<proto::IntentResult, String> {
+        let params = proto::DoParams {
+            skill: "sit_toggle".into(),
+        };
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotDo(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn look(&mut self, at: proto::LookParams) -> Result<proto::LookResult, String> {
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotLook(at),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
+        notify(&self.sockets.robot, &proto::Call::RobotHead(head))
+    }
+
+    fn flashlight(&mut self, brightness: f64) -> Result<proto::IntentResult, String> {
+        let params = proto::FlashlightParams {
+            on: brightness > 0.0,
+            toggle: false,
+            color: proto::FlashlightColor::White,
+            brightness: (brightness > 0.0).then_some(brightness),
+        };
+        call(
+            &self.sockets.robot,
+            &proto::Call::RobotFlashlight(params),
+            QUICK_ANSWER,
+        )
+    }
+
+    fn mouth(&mut self, open: f64) -> Result<(), String> {
+        notify(
+            &self.sockets.robot,
+            &proto::Call::RobotMouth(proto::MouthParams { open }),
+        )
+    }
+
+    fn capture(&mut self) -> Result<Vec<u8>, String> {
+        photo::capture(&self.sockets.media, QUICK_ANSWER)
+    }
+
+    fn eink_in_beak(&mut self) -> Result<bool, String> {
+        self.chip.eink_at(BEAK).map_err(|e| e.to_string())
+    }
+
+    fn save(&mut self, jpeg: &[u8]) -> Result<PathBuf, String> {
+        let name = photo::local_name(std::time::SystemTime::now());
+        photo::save(&self.sockets.photos, &name, jpeg)
+    }
+
+    fn eink_begin(&mut self, jpeg: &[u8], head: proto::HeadParams) -> Result<(), String> {
+        let picture = eink::picture::from_photo(jpeg)?;
+        if let Chip::Spi(c) = &mut *self.chip {
+            c.set_proto(Proto::A)
+                .and_then(|()| c.set_antenna(BEAK))
+                .map_err(|e| e.to_string())?;
+        }
+        let joined = eink::Joined::open(&mut *self.chip, SEQUENCE_FWI)
+            .map_err(|e| format!("the display: {e}"))?;
+        let settings = eink::Settings {
+            refresh_within: SEQUENCE_REFRESH_WITHIN,
+            ..eink::Settings::default()
+        };
+        self.writing = Some((eink::Writer::new(picture, settings), joined));
+        self.roller = Some(Roller::start(self.sockets.robot.clone(), head));
+        Ok(())
+    }
+
+    fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
+        let (writer, joined) = self.writing.as_mut().ok_or("no write begun")?;
+        let progress = writer.step(&mut joined.on(&mut *self.chip), Instant::now())?;
+        Ok((progress, writer.idle(Instant::now())))
+    }
+
+    fn eink_end(&mut self) {
+        self.roller = None;
+        self.writing = None;
+    }
+
+    fn sleep(&mut self, d: Duration) {
+        sleep(d);
+    }
+
+    fn now(&mut self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// A continuous intent, sent as the notification it is: no answer to wait for.
+fn notify(socket: &Path, call: &proto::Call) -> Result<(), String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", socket.display());
+    let mut stream = UnixStream::connect(socket).map_err(fail)?;
+    let mut request = proto::Request::call(proto::Id::Number(1), call);
+    request.id = None;
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.write_all(&line).map_err(fail)
+}
+
+/// The `policy` of the first `robot.state` frame on a `robot.subscribe` connection. Read as a bare
+/// field rather than the whole `RobotState`, so a frame from another version still answers.
+fn state_policy(socket: &Path, answer_within: Duration) -> Result<String, String> {
+    let fail = |e: std::io::Error| format!("{}: {e}", socket.display());
+    let mut stream = UnixStream::connect(socket).map_err(fail)?;
+    stream.set_read_timeout(Some(answer_within)).map_err(fail)?;
+    let subscribe = proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) });
+    let request = proto::Request::call(proto::Id::Number(1), &subscribe);
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stream.write_all(&line).map_err(fail)?;
+    let deadline = Instant::now() + answer_within;
+    let mut lines = BufReader::new(stream).lines();
+    while Instant::now() < deadline {
+        let line = lines
+            .next()
+            .ok_or("robotd closed the subscription")?
+            .map_err(fail)?;
+        let message: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("unparsable frame: {e}"))?;
+        if let Some(error) = message.get("error") {
+            return Err(error["message"].as_str().unwrap_or("refused").to_owned());
+        }
+        if message["method"] == proto::method::ROBOT_STATE {
+            return message["params"]["policy"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "a robot.state frame without a policy".into());
+        }
+    }
+    Err("no robot.state frame".into())
 }
 
 fn call<T: for<'de> serde::Deserialize<'de>>(

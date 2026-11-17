@@ -470,6 +470,7 @@ impl Intents {
             SoundTag::Peck,
             SoundTag::Chirp,
             SoundTag::Coo,
+            SoundTag::Bwep,
         ]
         .into_iter()
         .filter(|tag| bits & (1u32 << (*tag as u32)) != 0)

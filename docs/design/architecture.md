@@ -99,6 +99,7 @@ Where the state lives, and what survives an update:
 |---|---|
 | `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration as the image or the installer wrote it. The installer writes it once and never overwrites it; an OS image replaces it with every OS update. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
 | `/var/lib/robot/robotd.toml` | the keys somebody changed on this robot, over the one above key by key — every writer (`robotctl configure`, `policy`, `pad`, and `robotd` serving the phone) writes here and only here (below) |
+| `/run/padd/pad-battery.json` | the connected pad's battery, written by `padd` (it can open the pad; `configd`'s private `/dev` cannot) and read by `configd` for `pad.status` and by `robotctl monitor`; gone with `padd` and with the boot ([`pair-a-gamepad.md`](../robot/pair-a-gamepad.md#the-pads-battery)) |
 | `/var/lib/robot/hf-token` | the Hugging Face sign-in, written by `updaterd` and read by `mediad` ([`remote-access-design.md`](remote-access-design.md) §2.5) |
 | `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
 | `/var/lib/robot/vetbook.json` | the vet book — the robot's lifetime record, owned by `robotd` (`robotd/src/vetbook.rs`) |
@@ -395,7 +396,7 @@ them, and every owner does nothing on a board without its LED.
 
 | LED | sysfs | Owner | Shows |
 |---|---|---|---|
-| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
+| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours, at a brightness (full unless asked; a PWM board dims, the beta's GPIO cannot). The pad's Home button toggles it. |
 | Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
 | Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
 | Network | `gb:{green,blue}` | `configd` | Green on wifi, blinking green while joining. Without wifi, blue while a bonded Bluetooth gamepad is connected; off with neither. Wifi wins: a robot on wifi with a pad connected shows green. Above all of it, blinking blue while ssh is open on wifi (`configd::wifi_ssh`: the face button's 30 minutes, or `/run/microduck-ssh-wifi` touched over USB). |

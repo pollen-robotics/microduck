@@ -65,6 +65,10 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // And how loud they are. §4 applies as it does to `pad.bind`: the level is written to the
+        // config file, so a LAN peer changes something that outlives the session — a level, set
+        // back from the same page.
+        RobotVolume | RobotSetVolume(_) => true,
         // Somebody watching the camera is exactly who would want to wave a laser for it.
         RobotLaserTrack(_) => true,
         // And somebody watching the camera is who would roll a ball for it.
@@ -244,6 +248,11 @@ fn permits(call: &proto::Call) -> bool {
         NfcWrite(_) => false,
         // Reading one too: it needs the same person at the head, holding the same tag.
         NfcRead(_) => false,
+        // The photos are the owner's pictures of their home, and a LAN peer on the legacy direct
+        // path is not authenticated (`policy-channel-design.md`): anyone on the wifi could read
+        // them. `btd` carries them, after the setup code. A remote gallery is a decision about the
+        // remote path's authorisation, not a line here.
+        PhotoList | PhotoGet(_) | PhotoDelete(_) => false,
 
         // ── reading the robot's software ─────────────────────────────────────
         //

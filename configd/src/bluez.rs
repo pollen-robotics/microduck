@@ -533,6 +533,8 @@ impl Snapshot {
             paired: self.paired,
             trusted: self.trusted,
             connected: self.connected,
+            // BlueZ does not know it; `pad.status` adds what `padd` read (`pad_battery`).
+            battery: None,
         }
     }
 }

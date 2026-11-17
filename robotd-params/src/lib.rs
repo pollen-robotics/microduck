@@ -1844,6 +1844,10 @@ pub struct AudioParams {
     /// Probability above which petting starts, and below which it ends (hysteresis).
     pub pet_enter_threshold: f32,
     pub pet_exit_threshold: f32,
+    /// Speaker level, percent: 100 is the codec's full digital level, 0 mutes the speaker.
+    /// `robotd` writes it to the mixer at startup, and `robotctl configure` writes it as its
+    /// slider moves ([`set_speaker_volume`]), on the AIC3104 or the RK809 ([`SpeakerCodec`]).
+    pub volume: u8,
 }
 
 impl Default for AudioParams {
@@ -1857,6 +1861,7 @@ impl Default for AudioParams {
             pet_model: None,
             pet_enter_threshold: 0.95,
             pet_exit_threshold: 0.85,
+            volume: 100,
         }
     }
 }
@@ -1909,6 +1914,23 @@ impl AudioParams {
                 capture: self.capture_device(),
                 missing_card: None,
             },
+        }
+    }
+
+    /// Where [`Self::volume`] is written on a board whose ALSA cards are `cards`: the card the
+    /// configured device names when the board has it, and otherwise — the same fallback
+    /// [`Self::resolve_devices`] takes to ALSA's `default` — the board's own codec, the first
+    /// card that is one [`SpeakerCodec`] knows. `None` for a codec it does not know.
+    pub fn speaker_mixer(&self, cards: &[String]) -> Option<SpeakerMixer> {
+        let mixer = |card: &str| {
+            SpeakerCodec::of_card(card).map(|codec| SpeakerMixer {
+                card: card.to_owned(),
+                codec,
+            })
+        };
+        match named_card(&self.device) {
+            Some(card) if cards.iter().any(|c| c == card) => mixer(card),
+            _ => cards.iter().find_map(|card| mixer(card)),
         }
     }
 
@@ -2660,13 +2682,18 @@ impl PolicyParams {
     ///
     /// For `updaterd`, before every fetch, the way it reads the board
     /// ([`board::Board::declared`]): so `robotctl configure` applies without a restart, and a file
-    /// that is invalid somewhere else still answers. Missing, unreadable or not a bool is `false`
-    /// — the default, and the answer that downloads nothing.
+    /// that is invalid somewhere else still answers. Both layers, the user's winning — that is
+    /// where `robotctl configure` writes it. Missing, unreadable or not a bool is `false` — the
+    /// default, and the answer that downloads nothing.
     pub fn community_allowed(path: &Path) -> bool {
-        let Some(text) = std::fs::read_to_string(path).ok() else {
+        let Ok(text) = layered_text(path) else {
             return false;
         };
-        let Ok(table) = toml::from_str::<toml::Table>(&text) else {
+        Self::community_allowed_in(&text)
+    }
+
+    fn community_allowed_in(text: &str) -> bool {
+        let Ok(table) = toml::from_str::<toml::Table>(text) else {
             return false;
         };
         table
@@ -3285,6 +3312,8 @@ pub enum ParamsError {
     },
     #[error("{path}: {reason}")]
     Netpad { path: String, reason: String },
+    #[error("{path}: {reason}")]
+    Audio { path: String, reason: String },
     #[error(
         "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
@@ -3571,6 +3600,12 @@ impl Params {
         // Refused rather than clamped, like `control.hz`: the editor should say which value it
         // was not going to guess at. The floor is 10 because netpadd's 100 ms fallback tick must
         // not be faster than the cap, and below a few Hz a held stick would outrun robotd's deadman.
+        if self.audio.volume > 100 {
+            return Err(ParamsError::Audio {
+                path: path.display().to_string(),
+                reason: format!("audio.volume ({}) must be 0–100", self.audio.volume),
+            });
+        }
         if !(10..=100).contains(&self.netpad.max_hz) {
             return Err(ParamsError::Netpad {
                 path: path.display().to_string(),
@@ -3768,6 +3803,85 @@ pub struct ResolvedAudio {
     pub capture: String,
     /// The card the configured device named and this board lacks, when the fallback was taken.
     pub missing_card: Option<String>,
+}
+
+/// A speaker codec this crate knows how to set the level of, and the controls it does it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeakerCodec {
+    /// The Zero 3W HAT's TLV320AIC3104 (card `aic3104`): `PCM Playback Volume`, 0–127, 0.5 dB
+    /// a step with 127 at 0 dB, and `Line Playback Switch` on the output stage.
+    Aic3104,
+    /// The RK809 on the beta and face boards (card `rockchiprk809`): `DAC Playback Volume`,
+    /// 0–255 over −95 to −1.1 dB, about 0.37 dB a step.
+    Rk809,
+}
+
+impl SpeakerCodec {
+    /// The codec behind an ALSA card id, if it is one of these.
+    pub fn of_card(card: &str) -> Option<Self> {
+        match card {
+            "aic3104" => Some(Self::Aic3104),
+            "rockchiprk809" => Some(Self::Rk809),
+            _ => None,
+        }
+    }
+
+    /// The `amixer cset` writes that put the speaker at `percent`.
+    ///
+    /// Both scales span the codec's top 45 dB rather than its whole range: a linear walk over
+    /// all of it puts half the slider below anything audible across a room, and 1 % at −45 dB
+    /// is quiet and still there. 0 % is a real mute — the output stage off on the AIC3104, the
+    /// DAC at its floor (−95 dB) on the RK809, which has no mute of its own on this path.
+    pub fn writes(self, percent: u8) -> Vec<(&'static str, String)> {
+        let percent = u32::from(percent.min(100));
+        // (register at full, register steps in 45 dB)
+        let (top, span) = match self {
+            Self::Aic3104 => (127, 90),
+            Self::Rk809 => (255, 122),
+        };
+        let register = if percent == 0 {
+            0
+        } else {
+            top - ((100 - percent) * span + 50) / 100
+        };
+        let pair = format!("{register},{register}");
+        match self {
+            Self::Aic3104 => vec![
+                ("PCM Playback Volume", pair),
+                (
+                    "Line Playback Switch",
+                    if percent == 0 { "off,off" } else { "on,on" }.to_owned(),
+                ),
+            ],
+            Self::Rk809 => vec![("DAC Playback Volume", pair)],
+        }
+    }
+}
+
+/// Where the speaker level is written: a card, and which codec it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeakerMixer {
+    pub card: String,
+    pub codec: SpeakerCodec,
+}
+
+/// Write `percent` to the speaker's mixer, through `amixer` as `aic3104-init.sh` does.
+/// Effective immediately, on whatever is playing.
+pub fn set_speaker_volume(mixer: &SpeakerMixer, percent: u8) -> Result<(), String> {
+    let card = &mixer.card;
+    for (control, value) in mixer.codec.writes(percent) {
+        let output = std::process::Command::new("amixer")
+            .args(["-q", "-c", card, "cset", &format!("name={control}"), &value])
+            .output()
+            .map_err(|e| format!("cannot run amixer: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "amixer -c {card} {control}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The card id an ALSA device string names, when it names one by id: `plughw:aic3104`,
@@ -5067,6 +5181,64 @@ mod tests {
         }
     }
 
+    /// The volume is a percentage: over 100 is refused, and the register mapping spans the
+    /// audible part of the codec's range with 0 a real mute rather than the bottom of it.
+    #[test]
+    fn the_volume_is_a_percentage_and_zero_mutes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[audio]\nvolume = 101\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("audio.volume"), "{error}");
+        let path = write(dir.path(), "[audio]\nvolume = 40\n");
+        assert_eq!(Params::load(&path, true).expect("valid").audio.volume, 40);
+
+        use SpeakerCodec::{Aic3104, Rk809};
+        let w = |codec: SpeakerCodec, p| codec.writes(p);
+        let pair = |v: &str| {
+            vec![
+                ("PCM Playback Volume", format!("{v},{v}")),
+                ("Line Playback Switch", "on,on".to_owned()),
+            ]
+        };
+        assert_eq!(w(Aic3104, 100), pair("127"), "full is the codec's 0 dB");
+        assert_eq!(w(Aic3104, 1), pair("38"), "1 % is −44.5 dB, still on");
+        assert_eq!(w(Aic3104, 250), pair("127"));
+        assert_eq!(w(Aic3104, 0)[1].1, "off,off", "0 % mutes the output stage");
+        assert_eq!(
+            w(Rk809, 100),
+            vec![("DAC Playback Volume", "255,255".to_owned())]
+        );
+        assert_eq!(w(Rk809, 1)[0].1, "134,134", "about −45 dB");
+        assert_eq!(w(Rk809, 0)[0].1, "0,0", "the DAC's floor");
+    }
+
+    /// The speaker's mixer is the configured card where the board has it, and the board's own
+    /// codec where it does not — the face board names no card and plays on `default`, and its
+    /// RK809 is where its level goes.
+    #[test]
+    fn the_speaker_mixer_follows_the_card_the_board_has() {
+        let cards = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let audio = AudioParams::default();
+        let zero3 = audio.speaker_mixer(&cards(&["aic3104"])).unwrap();
+        assert_eq!(
+            (zero3.card.as_str(), zero3.codec),
+            ("aic3104", SpeakerCodec::Aic3104)
+        );
+        let face = audio
+            .speaker_mixer(&cards(&["rockchiprk809", "facemic"]))
+            .unwrap();
+        assert_eq!(
+            (face.card.as_str(), face.codec),
+            ("rockchiprk809", SpeakerCodec::Rk809)
+        );
+        assert_eq!(
+            audio.speaker_mixer(&cards(&["facemic"])),
+            None,
+            "a mic is not a speaker"
+        );
+        assert_eq!(audio.speaker_mixer(&[]), None);
+    }
+
     /// A stale limit at or past the deadman would keep re-sending a stalled client's last stick
     /// until robotd stops the robot anyway — it would protect nothing. The client counts as gone
     /// no sooner than it is stopped. Only checked when netpad is on: robotd loads this file too,
@@ -5674,6 +5846,28 @@ mod tests {
         assert!(!read("not toml ["));
         std::fs::remove_file(&path).expect("remove");
         assert!(!PolicyParams::community_allowed(&path));
+    }
+
+    /// `robotctl configure` writes the user layer, so that is where the answer has to come from:
+    /// reading the base alone kept refusing community fetches after the user had turned them on.
+    #[test]
+    fn community_allowed_lets_the_user_layer_win() {
+        let layered = |base: &str, user: &str| {
+            let merged = merge_layers(base.parse().unwrap(), user.parse().unwrap()).to_string();
+            PolicyParams::community_allowed_in(&merged)
+        };
+        assert!(layered(
+            "[policy]\nwalk = \"x\"\n",
+            "[policy]\nallow_community = true\n"
+        ));
+        assert!(layered(
+            "[policy]\nallow_community = false\n",
+            "[policy]\nallow_community = true\n"
+        ));
+        assert!(!layered(
+            "[policy]\nallow_community = true\n",
+            "[policy]\nallow_community = false\n"
+        ));
     }
 
     /// `updaterd` asks this before every revert, so it must answer from a file `robotd` would

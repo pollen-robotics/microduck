@@ -898,6 +898,8 @@ impl Server {
             | Call::RobotVetbook
             | Call::RobotVetbookNote(_)
             | Call::RobotVetbookTally(_)
+            | Call::RobotVolume
+            | Call::RobotSetVolume(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
@@ -978,6 +980,13 @@ impl Server {
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
+                ),
+            ),
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "photo.list, photo.get and photo.delete are served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 

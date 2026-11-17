@@ -114,7 +114,26 @@ use pad_map::{
 };
 
 #[cfg(target_os = "linux")]
+mod battery;
+#[cfg(target_os = "linux")]
 mod tap;
+
+/// The pad's battery, on a platform with no hidraw to ask: nothing is read and no file written,
+/// so `pad.status` shows no battery, which is the truth.
+#[cfg(not(target_os = "linux"))]
+mod battery {
+    pub struct Battery;
+
+    impl Battery {
+        pub fn start(_file: std::path::PathBuf) -> Self {
+            Self
+        }
+
+        pub fn watch(&self, _pad: &gilrs::Gamepad<'_>) {}
+
+        pub fn idle(&self) {}
+    }
+}
 
 /// The raw tap, on a platform with no evdev to read.
 ///
@@ -193,6 +212,12 @@ struct Args {
     /// `padd` says so once and drives anyway.
     #[arg(long, default_value = proto::socket::PAD)]
     tap_socket: PathBuf,
+
+    /// Where to keep the connected pad's battery, for `configd`'s `pad.status` and `robotctl
+    /// monitor`. Only a Nintendo pad has one read (`src/battery.rs`); nothing on the driving path
+    /// depends on it.
+    #[arg(long, default_value = proto::pad_battery::FILE)]
+    battery_file: PathBuf,
 }
 
 /// How long to wait between checks when there is no pad.
@@ -274,6 +299,8 @@ fn main() -> std::process::ExitCode {
             None
         }
     };
+
+    let battery = battery::Battery::start(args.battery_file.clone());
 
     let mut stream = match UnixStream::connect(&args.socket) {
         Ok(stream) => stream,
@@ -473,6 +500,7 @@ fn main() -> std::process::ExitCode {
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
+            battery.idle();
             std::thread::sleep(if pad_loss.pending() {
                 pad_map::loss::PAD_LOST_POLL
             } else {
@@ -492,6 +520,8 @@ fn main() -> std::process::ExitCode {
         // Every tick rather than on the transition above: a pad that drops and comes back between
         // two ticks never clears `driving`, and it comes back as a different event node often
         // enough that a tap following the old one would report the rest of the session as silence.
+        // Every tick, for the tap's reason: the pad can come back on another node between two.
+        battery.watch(&pad);
         if let Some(tap) = tap.as_ref() {
             tap.watch(&pad);
             // Every tick, like the bindings: switching the feature on in the config has to start

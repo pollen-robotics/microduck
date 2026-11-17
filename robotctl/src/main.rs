@@ -249,6 +249,9 @@ enum Namespace {
         /// white, red, green, blue, yellow, cyan or magenta.
         #[arg(long, default_value = "white")]
         color: String,
+        /// How bright, 0 to 1 of full (`--brightness 0.1`). Full when not given.
+        #[arg(long)]
+        brightness: Option<f64>,
     },
 
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
@@ -853,7 +856,12 @@ fn run_nfc_read(socket: &Path, timeout: u32, json: bool) -> Result<(), Failure> 
 }
 
 /// `robotctl flashlight` — ask `robotd` to switch the flashlight.
-fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure> {
+fn run_flashlight(
+    socket: &Path,
+    state: &str,
+    color: &str,
+    brightness: Option<f64>,
+) -> Result<(), Failure> {
     let color: proto::FlashlightColor =
         serde_json::from_value(serde_json::Value::String(color.to_owned())).map_err(|_| {
             Failure::new(
@@ -868,6 +876,7 @@ fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure
             on: state == "on",
             toggle: state == "toggle",
             color,
+            brightness,
         },
     ))?)?;
     let outcome: proto::IntentResult = decode(&result)?;
@@ -5567,7 +5576,25 @@ fn render_pad_status(result: &serde_json::Value, udp: bool) -> Result<String, Fa
             (false, true) => "paired, not connected — switch the pad on".to_owned(),
             (false, false) => "paired but NOT trusted — re-run:  sudo robotctl pad pair".to_owned(),
         };
-        let _ = writeln!(out, "pad     {} {}  {}", pad.name, pad.mac, state);
+        // The battery when `padd` could read it (a Nintendo pad), after the state: absent is
+        // "unknown", and is not printed as anything.
+        let battery = pad.battery.map_or(String::new(), |b| {
+            format!(
+                " · battery {}{}{}",
+                b.level.word(),
+                if b.charging { ", charging" } else { "" },
+                if b.level.is_low() {
+                    " — charge it soon"
+                } else {
+                    ""
+                }
+            )
+        });
+        let _ = writeln!(
+            out,
+            "pad     {} {}  {}{}",
+            pad.name, pad.mac, state, battery
+        );
     }
 
     let driver = match status.driver {
@@ -5996,8 +6023,12 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::NfcRead { timeout, json } => {
             return run_nfc_read(&cli.nfc_socket, timeout, json);
         }
-        Namespace::Flashlight { state, color } => {
-            return run_flashlight(&cli.robot_socket, &state, &color);
+        Namespace::Flashlight {
+            state,
+            color,
+            brightness,
+        } => {
+            return run_flashlight(&cli.robot_socket, &state, &color, brightness);
         }
         Namespace::HeadImu => {
             return run_head_imu(&cli.robot_socket);
@@ -6415,6 +6446,46 @@ mod tests {
             "{udp}"
         );
         assert!(udp.contains("udp-pad.md"), "{udp}");
+    }
+
+    /// The pad line carries the battery when `padd` read one, says to charge it when it is low,
+    /// and says nothing about a pad whose battery is unknown.
+    #[test]
+    fn pad_status_says_the_battery_when_there_is_one() {
+        let pad = |battery| proto::Pad {
+            mac: "98:B6:E9:5E:BB:DB".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            battery,
+        };
+        let render = |pads| {
+            let status = serde_json::to_value(proto::PadStatusResult {
+                pads,
+                driver: proto::UnitState::Active,
+            })
+            .unwrap();
+            render_pad_status(&status, false).unwrap_or_else(|e| panic!("{}", e.message))
+        };
+
+        let full = render(vec![pad(Some(proto::PadBattery {
+            level: proto::PadBatteryLevel::Full,
+            charging: false,
+        }))]);
+        assert!(full.contains("connected · battery full\n"), "{full}");
+
+        let low = render(vec![pad(Some(proto::PadBattery {
+            level: proto::PadBatteryLevel::Critical,
+            charging: true,
+        }))]);
+        assert!(
+            low.contains("battery critical, charging — charge it soon"),
+            "{low}"
+        );
+
+        let unknown = render(vec![pad(None)]);
+        assert!(!unknown.contains("battery"), "{unknown}");
     }
 
     // ── robotctl policy ──────────────────────────────────────────────────
