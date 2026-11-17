@@ -300,22 +300,24 @@ fn permits(call: &proto::Call) -> bool {
         // `[audio] volume` so the level survives a restart. Trivially undone from the same phone.
         RobotVolume | RobotSetVolume(_) => true,
 
-        // Harmless and rather charming from a phone — but they ride the same refusal as the
-        // rest of robot.* until the app path exists to want them: opening a call to the radio
-        // ahead of a client that can use it buys nothing and widens the surface.
-        //
-        // The theremin sits here rather than with motor control even though it moves the
-        // mouth, because what it is is a sound: the mouth is following the note. Same
-        // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotTheremin(_) | RobotChorale(_) => false,
+        // The theremin is a sound, and sounds are routed above. It moves the mouth, but the mouth
+        // is following the note, which is `robot.sound`'s mouth-on-a-quack by another name; it
+        // walks nothing. It waited here for "an app that can play the duck", and the app's home
+        // screen is now that: Sing beside Quack, which without this needed the video connection,
+        // and so wifi, for an instrument whose whole input is a hand ten centimetres from the beak.
+        RobotTheremin(_) => true,
+        // The chorale stays refused: it starts the robot listening for other ducks, and the
+        // animation that follows was asked for by none of the people in the room.
+        RobotChorale(_) => false,
         // Motor control by another name: the dot walks the robot, and the radio is not a control transport.
         RobotLaserTrack(_) => false,
         // The same, for a ball: autonomous soccer walks the robot. An NFC tag is local, not the radio.
         RobotSoccer(_) => false,
         // The same again: the duck on its own walks the robot. An NFC tag switches it locally.
         RobotAutonomous(_) => false,
-        // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
-        RobotFlashlight(_) => false,
+        // The face light, on the same reasoning as the theremin: an LED is no more consequential
+        // from a phone than a quack, and the app that was waited for now has a Light button.
+        RobotFlashlight(_) => true,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a
@@ -802,6 +804,25 @@ mod tests {
             hold: None,
         });
         assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
+    }
+
+    /// **Sing and light, beside the quack.** The app's home screen offers them next to its
+    /// sounds; refused here, they needed the video connection and so wifi. The chorale, their
+    /// neighbour on the refused list, stays there.
+    #[test]
+    fn sing_and_light_reach_robotd_and_the_chorale_does_not() {
+        let sing = proto::Call::RobotTheremin(proto::ThereminParams { active: true });
+        let light = proto::Call::RobotFlashlight(proto::FlashlightParams {
+            toggle: true,
+            ..Default::default()
+        });
+        assert_eq!(upstream_for(&sing), Some(Upstream::Robot));
+        assert_eq!(upstream_for(&light), Some(Upstream::Robot));
+        let chorale = proto::Call::RobotChorale(proto::ChoraleParams {
+            active: true,
+            piece: None,
+        });
+        assert_eq!(route_for(&chorale), Route::Refused);
     }
 
     /// **A phone can ask for a skill, see what the robot has, and change what it runs.**
