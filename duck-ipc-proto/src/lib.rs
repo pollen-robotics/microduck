@@ -615,13 +615,18 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
 /// else on the wire changed.
 ///
-/// # v62 — the flashlight's brightness
+/// # v62 — the flashlight's brightness, and the battery's PWM cap
 ///
 /// [`FlashlightParams::brightness`]: how bright, 0 to 1 of the LED's full brightness, so the light
 /// can be on without dazzling the person it points at. Absent is full, as before, and is not sent:
 /// a client that does not set it still works against an older `robotd`, which refuses the field by
 /// name when one does. A board whose LEDs are on/off only (the beta's GPIO expander) lights any
 /// brightness above zero fully.
+///
+/// [`HealthResult::goal_pwm`]: the Goal PWM `robotd` writes when
+/// `bus.battery_voltage_based_pwm_limit` is on. Optional and absent when off, so a v61 client
+/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing. (Numbered
+/// v62 on `main` and on the photo branch both; merged here under one heading.)
 ///
 /// # v63 — `bwep`
 ///
@@ -4819,6 +4824,12 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
+    /// The Goal PWM `robotd` last wrote to every servo, out of 885 (100 % duty), when
+    /// `bus.battery_voltage_based_pwm_limit` is on: it follows the battery so the motors see
+    /// ~6 V. Absent when the switch is off, before the first write, and from an older `robotd`.
+    /// Reported, never judged — same rule as the battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_pwm: Option<u16>,
     /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
     /// never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5058,6 +5069,12 @@ impl Battery {
     /// so `robotctl monitor` and `duckctl udp-pad` cannot disagree about the same pack.
     pub const LOW_PCT: f64 = 30.0;
     pub const CRITICAL_PCT: f64 = 15.0;
+}
+
+impl HealthResult {
+    /// [`Self::goal_pwm`] at 100 % duty: the XL330's factory PWM Limit, which
+    /// `duck_control::model::GOAL_PWM_MAX` also names — that crate does not depend on this one.
+    pub const GOAL_PWM_FULL: u16 = 885;
 }
 
 /// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].

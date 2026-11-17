@@ -278,9 +278,18 @@ it refuses the PIN and serves only a client that proves the code's key, in the h
 it by the robot's name:
 
 ```bash
+duckctl setup-code add                           # scan the label's QR with the camera, or paste
 duckctl ssh -- sudo robotctl system setup-code   # prints md1:<robot id>:<key>, and the QR
-duckctl setup-code add                           # paste it; read on stdin, kept out of history
 ```
+
+`add` asks whether to scan or paste, and Enter scans: the camera shows in the terminal and the first
+setup-code QR it sees is stored — the one on the robot's label, or the one `robotctl system
+setup-code` draws. Esc, or a computer with no camera, falls back to pasting; a code pasted at the
+first question is taken as it is. Piped, `add` reads the code on stdin and asks nothing, so the key
+stays out of any command line or shell history either way. While scanning, `c` moves to the next
+camera when there is more than one. On macOS the first scan asks for camera access for the
+terminal app, and a refusal stays refused until it is allowed in System Settings › Privacy &
+Security › Camera.
 
 `duckctl ssh` needs no code, since the address comes from the advertisement — so a robot already on
 a network is where to copy it from. The text under the QR works too, label serial and all. Given
