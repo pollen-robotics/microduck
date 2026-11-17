@@ -1520,6 +1520,7 @@ version = "0.22.0"
 dependencies = [
  "clap",
  "duck-auth",
+ "duck-ipc-proto",
  "robotd-params",
  "tempfile",
  "tokio",

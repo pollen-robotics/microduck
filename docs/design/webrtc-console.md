@@ -42,7 +42,8 @@ nothing else to run.
 
 > **Since daemon 0.19 that address is the robot's loopback, not the LAN** (`b23644e5`, "Default
 > media and BLE listeners to secure access"). The page and its signalling were unauthenticated, so
-> `mediad` binds `127.0.0.1` and the only door a LAN has is `duck-gateway` on 9443, which admits a
+> `mediad` binds `127.0.0.1` and the only media door a LAN has is `duck-gateway` on 9443 (its other door, 9444, is `btd`'s wifi lane —
+> `mobile-app.md` §1.3), which admits a
 > peer that proves the robot's setup code through a Noise handshake. A browser cannot do that, so
 > from a laptop the page now arrives through `duckctl open`'s local bridge (§2.2). The rest of this
 > section is the page's design, which is unchanged; only where it is served from moved.
