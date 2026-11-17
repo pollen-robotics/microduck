@@ -52,7 +52,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -1162,57 +1162,52 @@ struct Session<'a> {
     /// The photo being written to the display in the beak, once begun.
     writing: Option<(eink::Writer, eink::Joined)>,
     started: Instant,
-    /// The last head sent, and when: what [`Keeper`] sends again while a step blocks.
-    last_head: Arc<Mutex<Option<(proto::HeadParams, Instant)>>>,
-    keeper: Option<Keeper>,
+    /// The head rolling on its own while the display is written.
+    roller: Option<Roller>,
 }
 
-/// Sends the last head again while the display is being written, whenever the sequence has not
-/// for [`KEEP_HEAD_AFTER`]: one exchange with the display can hold the sequence for seconds — a
-/// display gone silent is asked three times over a 4.9 s FWT, and one may ask for more time — and
-/// two seconds without a head start the idle look-around, which moves the head and yawns, beak
-/// open, the display in it. On a thread of its own so nothing the reader does can hold it.
-struct Keeper {
+/// Rolls the head side to side with a quack now and then ([`photo::Roll`]) on a thread of its
+/// own, from the first packet to the end of the redraw. Not between two steps of the write, as
+/// it was: one exchange with the display can take seconds — a display silent while it draws is
+/// asked three times over a 4.9 s FWT — and the head stood still for most of the redraw, or, two
+/// seconds without a head, the idle look-around took it and yawned with the display in the beak.
+struct Roller {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// How long without a head before [`Keeper`] sends it again, and how often it looks.
-const KEEP_HEAD_AFTER: Duration = Duration::from_millis(300);
-const KEEP_HEAD_EVERY: Duration = Duration::from_millis(100);
-
-impl Keeper {
-    fn start(socket: PathBuf, last: Arc<Mutex<Option<(proto::HeadParams, Instant)>>>) -> Keeper {
+impl Roller {
+    fn start(socket: PathBuf, head: proto::HeadParams) -> Roller {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let thread = std::thread::spawn(move || {
+            let from = Instant::now();
+            let mut roll = photo::Roll::default();
             while !stopping.load(Ordering::Acquire) {
-                sleep(KEEP_HEAD_EVERY);
-                let due = {
-                    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
-                    match last.as_mut() {
-                        Some((pose, at)) if at.elapsed() >= KEEP_HEAD_AFTER => {
-                            *at = Instant::now();
-                            Some(*pose)
-                        }
-                        _ => None,
+                let (pose, quack) = roll.at(head, from.elapsed());
+                if quack {
+                    let sound = proto::Call::RobotSound(proto::SoundParams {
+                        tag: photo::ROLL_QUACK,
+                        hold: None,
+                    });
+                    if let Err(why) = call::<proto::IntentResult>(&socket, &sound, QUICK_ANSWER) {
+                        tracing::info!(%why, "robot.sound");
                     }
-                };
-                if let Some(pose) = due
-                    && let Err(why) = notify(&socket, &proto::Call::RobotHead(pose))
-                {
-                    tracing::info!(%why, "robot.head, kept");
                 }
+                if let Err(why) = notify(&socket, &proto::Call::RobotHead(pose)) {
+                    tracing::info!(%why, "robot.head");
+                }
+                sleep(photo::ROLL_STEP);
             }
         });
-        Keeper {
+        Roller {
             stop,
             thread: Some(thread),
         }
     }
 }
 
-impl Drop for Keeper {
+impl Drop for Roller {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
@@ -1228,14 +1223,13 @@ impl<'a> Session<'a> {
             chip,
             writing: None,
             started: Instant::now(),
-            last_head: Arc::new(Mutex::new(None)),
-            keeper: None,
+            roller: None,
         }
     }
 }
 
 /// The time the display has for each block while the sequence writes it: FWT at FWI 14, 4.9 s,
-/// as on the bench, where it works. A block that long blocks the sequence, and [`Keeper`] holds the
+/// as on the bench, where it works. A block that long blocks the sequence; [`Roller`] moves the
 /// head meanwhile.
 const SEQUENCE_FWI: u8 = 14;
 /// How long the display may take to redraw in the sequence: it took ~50 s on the bench.
@@ -1290,7 +1284,6 @@ impl photo::Driver for Session<'_> {
     }
 
     fn head(&mut self, head: proto::HeadParams) -> Result<(), String> {
-        *self.last_head.lock().unwrap_or_else(|e| e.into_inner()) = Some((head, Instant::now()));
         notify(&self.sockets.robot, &proto::Call::RobotHead(head))
     }
 
@@ -1328,7 +1321,7 @@ impl photo::Driver for Session<'_> {
         photo::save(&self.sockets.photos, &name, jpeg)
     }
 
-    fn eink_begin(&mut self, jpeg: &[u8]) -> Result<(), String> {
+    fn eink_begin(&mut self, jpeg: &[u8], head: proto::HeadParams) -> Result<(), String> {
         let picture = eink::picture::from_photo(jpeg)?;
         if let Chip::Spi(c) = &mut *self.chip {
             c.set_proto(Proto::A)
@@ -1342,21 +1335,19 @@ impl photo::Driver for Session<'_> {
             ..eink::Settings::default()
         };
         self.writing = Some((eink::Writer::new(picture, settings), joined));
-        self.keeper = Some(Keeper::start(
-            self.sockets.robot.clone(),
-            self.last_head.clone(),
-        ));
+        self.roller = Some(Roller::start(self.sockets.robot.clone(), head));
         Ok(())
     }
 
     fn eink_step(&mut self) -> Result<(eink::Progress, Duration), String> {
         let (writer, joined) = self.writing.as_mut().ok_or("no write begun")?;
-        let step = writer.step(&mut joined.on(&mut *self.chip), Instant::now());
-        // Done or failed, the sequence is back in charge of the head.
-        if !matches!(step, Ok(p) if p != eink::Progress::Done) {
-            self.keeper = None;
-        }
-        Ok((step?, writer.idle(Instant::now())))
+        let progress = writer.step(&mut joined.on(&mut *self.chip), Instant::now())?;
+        Ok((progress, writer.idle(Instant::now())))
+    }
+
+    fn eink_end(&mut self) {
+        self.roller = None;
+        self.writing = None;
     }
 
     fn sleep(&mut self, d: Duration) {
