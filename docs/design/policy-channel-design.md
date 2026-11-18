@@ -514,9 +514,10 @@ axes, every field, what each one changes on the robot. It is not repeated here, 
 is only the reasoning for the mechanism existing at all.
 
 The one thing worth restating, because it is what the mechanism is *for*: `kind` and
-`command.encoding` are two axes, and an episodic policy becomes a skill only on a constant
-command. A `phase` or `posture_flag` entry contributes timing to an arm the daemon drives instead
-— which is how a retrained ground pick with a longer cycle is a tag rather than a daemon release.
+`command.encoding` are two axes. An episodic policy on a constant command becomes a skill; one on
+a phase command does too, if it is added with `policy add` — the daemon writes the same
+`[cos 2πφ, sin 2πφ, 0]` the ground pick already writes. A set's own phase entry is still the
+ground pick, and `posture_flag` is still the sit↔stand.
 
 **The per-policy fields are the same ones a single-policy repo uses**, plus `file`. That is what
 makes the ask to a community publisher "add these fields" rather than "adopt our format", and it
@@ -593,10 +594,11 @@ them to hand back to. `sitstand` is latched and driven internally by the shutdow
 by a button — `scripted`, in the manifest's word. `ground_pick`
 writes a phase rather than a constant. None of the four is a generic one-shot, and a set entry
 may not answer to `ground_pick` or `sit_toggle` — a second network behind either name would be
-fed an all-zero command it never trained on. The guard is on the encoding as well as the name: a
-`phase` or `posture_flag` entry is never loaded as a skill however it is called. What the set
-*does* get to say about these arms is their timing (§9.3) — the pick's cycle and cutoff, the
-rise and the seat's settle — since those are properties of the trained network, not of the build.
+fed an all-zero command it never trained on. The set never auto-loads a `phase` or `posture_flag`
+entry as a skill; those encodings belong to the ground pick and the sit↔stand. `policy add` is
+the other path, and it will take a phase policy as a skill. What the set *does* get to say about
+these arms is their timing (§9.3) — the pick's cycle and cutoff, the rise and the seat's settle
+— since those are properties of the trained network, not of the build.
 
 **A running skill has the fall reflex off** for its whole duration: the limp-fall predictor is
 only consulted while the controller is not `busy()`, and any active skill makes it busy. That was
@@ -743,7 +745,7 @@ its meaning for the things that genuinely are models and not control policies, s
 | Reload is a third thing, not reset-all | They look identical from outside and conflating them discards every override (§9.1) |
 | One-shot skills are config, not code | Kicks and roulade were the same arm with different numbers; a community one is a fifth set (§10) |
 | `kind` says who ends a policy, not how long | An episodic one returns itself; a perpetual one needs the daemon to drive it back; a scripted one is episodic but interruptible (§9.3, §10.1) |
-| `command.encoding` says what the daemon feeds it | Constant → a skill; `phase` → the ground pick; `posture_flag` → the sit↔stand. Only the first is loadable as a one-shot (§9.3) |
+| `command.encoding` says what the daemon feeds it | Constant → a skill; `phase` → a skill the daemon clocks (`policy add`), or the ground pick of a set; `posture_flag` → the sit↔stand (§9.3) |
 | The set carries its own timing | The pick's cycle and cutoff, the rise and the seat's settle are properties of the trained network, not literals in a build; `[policy]` keys still win (§9.3) |
 | Skills leave walk, stand, sitstand and ground_pick alone | The fallback pair, one driven internally, one phase-driven — none is a generic one-shot (§10.2) |
 | Buttons are config; Start and Select are not | The button that stops a robot is the one worth not being able to lose (§10.3) |
