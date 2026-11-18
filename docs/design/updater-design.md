@@ -726,8 +726,14 @@ With it off, the gate still runs and still decides. A release that fails stays l
 outcome is `Stuck` with a reason that names the command that reverts it
 (`robotctl update rollback <component>`). The trial is cleared, so the boot counter does not ask
 again. The update log records it as `Stuck`, not rolled back, so `known_bad` does not blacklist a
-release nobody reverted. `updaterd` reads the key through `Config::robotd_config`, both layers,
-on every decision. Missing, unreadable or not a bool reads as off.
+release nobody reverted. Once the robot is moved to a release that sorts older, by that command,
+a `select` or any other install, it counts as known bad like a release the gate rolled back, so
+neither the unattended path nor a later `rollback` puts it back. Moving to a newer release reverts
+nothing and leaves it out, so with `keep_previous = 1`, which prunes the release before it, a
+`rollback` can still land on it. Once reverted, the same prune keeps it as the one older release,
+and `rollback` refuses, as it does after a release the gate rolled back.
+`updaterd` reads the key through `Config::robotd_config`, both layers, on every decision. Missing,
+unreadable or not a bool reads as off.
 
 - After apply, the new `robotd` must clear a **healthy flag** within a
   per-component timeout (motors ack, model loads, media pipeline inits).
@@ -811,19 +817,20 @@ known-bad guard below, because an operator retrying a release may have fixed the
 An external timer would inherit that bypass and lose the protection — the wrong half of
 each — and reintroduce exactly the loop the next paragraph exists to prevent.
 
-**The unattended path refuses a candidate this robot already rolled back from**, whatever
-the policy and even when the release is mandatory. Without that guard, a broken release is
-a fleet-wide trap with no exit: check says available → apply → gate fails → roll back →
-wait `check_interval` → repeat. Each cycle re-downloads the artifact, rewrites the eMMC and
-restarts `robotd`, so every robot is both unusable and wearing out, on battery, with no
-client involved to notice. Nothing in the loop converges.
+**The unattended path refuses a candidate this robot already rolled back from**, or
+reverted by hand after it was left `Stuck`, whatever the policy and even when the release
+is mandatory. Without that guard, a broken release is a fleet-wide trap with no exit: check
+says available → apply → gate fails → roll back → wait `check_interval` → repeat. Each
+cycle re-downloads the artifact, rewrites the eMMC and restarts `robotd`, so every robot is
+both unusable and wearing out, on battery, with no client involved to notice. Nothing in
+the loop converges.
 
-The guard is `known_bad`, derived from the journal's *latest* outcome per version, so it
-self-clears if the release ever does succeed. It applies **only** to the unattended path:
-an explicit `robotctl update apply` still retries, because an operator may have fixed the
-cause and refusing them would remove the obvious way to check. When the guard fires it
-logs at `error` — a robot stuck below a mandatory floor needs a fixed release, and that
-should be loud.
+The guard is `known_bad`, derived from the journal's *latest* outcome per version (for a
+`Stuck` release, with a later move to an older one), so it self-clears if the release ever
+does succeed. It applies **only** to the unattended path: an explicit `robotctl update
+apply` still retries, because an operator may have fixed the cause and refusing them would
+remove the obvious way to check. When the guard fires it logs at `error` — a robot stuck
+below a mandatory floor needs a fixed release, and that should be loud.
 
 The test for this counts attempts in the journal rather than checking the live version: after
 every cycle the symlink is back on the good release, so the robot's *state* looks correct even
