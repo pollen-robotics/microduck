@@ -727,6 +727,14 @@ fn laser_switch(active: bool) -> proto::Call {
     proto::Call::RobotLaserTrack(proto::LaserTrackParams { active })
 }
 
+/// Whether to ask `robotd` to switch laser tracking to `want` now. A change of mind goes out at
+/// once; only the same request, not taken, waits [`SWITCH_RETRY`] to be asked again. Holding a
+/// change back would leave `robotd` following the dot through a brace or a petting that starts
+/// within [`SWITCH_RETRY`] of the laser coming on.
+fn ask_laser(asked: Option<(bool, Instant)>, want: bool, now: Instant) -> bool {
+    asked.is_none_or(|(was, at)| was != want || now.duration_since(at) > SWITCH_RETRY)
+}
+
 fn soccer_switch(on: bool) -> proto::Call {
     proto::Call::RobotSoccer(proto::SoccerParams {
         active: on,
@@ -768,8 +776,9 @@ fn drive(
     // somebody else started (the pad's D-pad down) is theirs, and the brain stands aside for it.
     let mut soccer_mine = false;
     let mut external_soccer = false;
-    // When each switch was last asked for, so a refusal is not asked again fifty times a second.
-    let mut laser_asked: Option<Instant> = None;
+    // When each switch was last asked for (and, for the laser, which way), so a refusal is not
+    // asked again fifty times a second.
+    let mut laser_asked: Option<(bool, Instant)> = None;
     let mut soccer_asked: Option<Instant> = None;
     // After a fall: watching the get-up, or resetting it. See [`Recovery`].
     let mut recovery = Recovery::Idle;
@@ -1073,10 +1082,11 @@ fn drive(
             }
             soccer_mine = false;
         }
-        if step.laser != state.laser.on && !step.soccer && retry(laser_asked) {
+        if step.laser != state.laser.on && !step.soccer && ask_laser(laser_asked, step.laser, tick)
+        {
             tracing::info!(on = step.laser, "laser tracking");
             switch(commands, next_id, laser_switch(step.laser))?;
-            laser_asked = Some(tick);
+            laser_asked = Some((step.laser, tick));
         }
 
         // One write for the tick's continuous intents: they describe one instant.
@@ -1212,6 +1222,27 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Switching the laser off a moment after switching it on goes out at once. Held back by
+    /// [`SWITCH_RETRY`] as every switch was, a brace or a petting just after the laser came on
+    /// was left with `robotd` following the dot. Asking for the same thing again, not taken, still
+    /// waits.
+    #[test]
+    fn a_changed_mind_is_asked_at_once_a_refusal_after_the_wait() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(ask_laser(None, true, t0), "the first ask");
+        let asked = Some((true, t0));
+        assert!(
+            ask_laser(asked, false, t0 + ms(20)),
+            "off at once, just after on"
+        );
+        assert!(!ask_laser(asked, true, t0 + ms(1000)), "on again waits");
+        assert!(
+            ask_laser(asked, true, t0 + SWITCH_RETRY + ms(1)),
+            "and is asked after it"
+        );
+    }
 
     /// The marker is per boot and per `robotd`: the same pair is remembered; a new boot, or a
     /// `robotd` restarted since (an update), stands up again; and a machine that cannot say which

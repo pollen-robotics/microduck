@@ -173,13 +173,14 @@ reads as nobody asking, rather than going silent and leaving its last command wi
 goes stale. `robotd` runs one of the two at a time, and switching soccer on switches the laser off.
 
 - **The laser is on whenever the duck could chase**: not tired, not being petted (a dot would walk
-  it out from under the hand), not playing ball. A dot being followed interrupts any standing or
-  walking state with an excited quack, and **wakes a napping duck**: it stands up at once, no
-  stretch, and goes after the dot (or looks for it, if it went). The nap that follows a chase is
-  the exception: the duck is tired then, the laser is off, and no dot is seen. The chase ends 2 s after the dot goes, into
-  a look around for it. Chasing burns energy at twice a walk's rate (one unit per 50 s). Below 0.2
-  the duck has had enough: the laser goes off and it naps (or chills, with no sit/stand policy).
-  It comes back on only above 0.45, which a nap gets to.
+  it out from under the hand), not playing ball, not braced against a wall. A dot being followed
+  interrupts any standing or walking state, a survey among them, with an excited quack, and
+  **wakes a napping duck**: it stands up at once, no stretch, and goes after the dot (or looks for
+  it, if it went). The nap that follows a chase is the exception: the duck is tired then, the
+  laser is off, and no dot is seen. The chase ends 2 s after the dot goes, into a look around for
+  it. Chasing burns energy at twice a walk's rate (one unit per 50 s). Below 0.2 the duck has had
+  enough: the laser goes off and it naps (or chills, with no sit/stand policy). It comes back on
+  only above 0.45, which a nap gets to.
 - **The ball is something the duck goes looking for**, picked from the standing pool like any other
   state when its energy is above 0.35 and no cooldown is running, with a weight that falls with
   energy and with boredom. It switches autonomous soccer on and stands aside.
@@ -290,8 +291,8 @@ without it nothing knows what is behind, and backing up is only logged:
 - **Backing up is stopped.** Odometry's forward speed, smoothed over 0.4 s, below −4 cm/s is
   walking backwards: logged once per stretch with what was moving the robot (`walking backwards`,
   with the brain's state, its command, the body pose and the ball). With a wall within 35 cm
-  behind, the duck braces: whatever it was doing ends (a ball game with it), the body pose is let
-  go, and it steps forward for a second if the ToF shows clear floor ahead, or stands.
+  behind, the duck braces: whatever it was doing ends (a chase or a ball game with it), the body
+  pose is let go, and it steps forward for a second if the ToF shows clear floor ahead, or stands.
 
 ## 6. The map
 
