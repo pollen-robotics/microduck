@@ -761,6 +761,19 @@ impl Engine {
 
         Self::check_channel(&manifest, component)?;
 
+        // A named version is exempt from the downgrade guard below because the operator named it,
+        // so what the source served under that name has to be it. A signed manifest for another
+        // version under the right tag is a mis-built or reverted release, not the one asked for.
+        if let crate::proto::Target::Exact(asked) | crate::proto::Target::StagingExact(asked) =
+            &target
+            && manifest.version != *asked
+        {
+            return Err(Error::Corrupt(format!(
+                "asked for {asked}, but the source's manifest for it is version {}",
+                manifest.version
+            )));
+        }
+
         // The source answered with its latest, signed and for this component: what a `check`
         // records. Not a `--from` directory, which says nothing about the source, and not an exact
         // version, which a source that has stopped moving still serves.
