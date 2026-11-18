@@ -16,7 +16,8 @@
 # something else and replacing it would silently undo that on the next unrelated daemon update.
 # One from our repo is moved up to the pin when it is *below* it — the daemon's defaults name
 # files a newer set carries, and a board that updates the daemon but keeps an old set would
-# otherwise fail to load its gait and roll the update back — and left alone otherwise.
+# otherwise fail to load its gait and roll the update back. An incomplete seed at the pin is
+# retried too: a fallback download is not evidence that the revision's whole set arrived.
 #
 # Nothing here is signed and that is deliberate: a policy is not a binary. `robotd` holds the only
 # write handle to the bus behind joint clamps, a fall reflex and an intent deadman, and refuses
@@ -100,10 +101,9 @@ live="$(readlink "${POLICY_ROOT}/current" 2>/dev/null || true)"
 # when the daemon's default gait became a file only v5 carries, a board on v4 updating the
 # daemon could not load its walk, reported unhealthy, and rolled the release back.
 #
-# So the version decides. The record beside the set says what it is; a set from our repo whose
-# version is a lower number than the pin is replaced by the pin (below), and everything else is
-# left alone: a newer set, a set from another repo, a set that says nothing about itself, or one
-# whose version is not a plain number. A board seeded before the record existed has it
+# So the version decides. An official set below the pin moves up; an incomplete seed at the
+# pin is repaired. A newer set, a set from another repo, or an explicitly nonnumeric version
+# is left alone. A board seeded before the record existed has it
 # back-filled from the directory name, because `policy check` cannot ask about a set that will
 # not say where it came from — and so that this comparison can read it next time.
 number_of() {
@@ -113,10 +113,25 @@ number_of() {
         *) echo "" ;;
     esac
 }
+manifest_files() {
+    # An unreadable manifest is unavailable, not a failed daemon install.
+    sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" || true
+}
+complete_set() {
+    [ -f "$1/manifest.json" ] || return 1
+    files="$(manifest_files "$1/manifest.json")"
+    [ -n "$files" ] || return 1
+    for name in $files; do
+        case "$name" in */*|*\\*|.*) continue ;; esac
+        [ -s "$1/$name" ] || return 1
+    done
+}
+repair=no
 if [ -n "$live" ]; then
     case "$live" in
         releases/*)
-            write_source "${POLICY_ROOT}/${live}" "${live#releases/seed-}" ;;
+            seed_version="${live#releases/seed-}"
+            write_source "${POLICY_ROOT}/${live}" "${seed_version%-repair}" ;;
         *)
             echo "seed-policies: ${POLICY_ROOT}/current is not ours; leaving it alone" >&2
             exit 0 ;;
@@ -124,13 +139,26 @@ if [ -n "$live" ]; then
     record="${POLICY_ROOT}/${live}/.source"
     have_repo="$(sed -n 's/^repo=//p' "$record" 2>/dev/null | head -n 1)"
     have_version="$(sed -n 's/^version=//p' "$record" 2>/dev/null | head -n 1)"
+    # Missing versions fall back to the seed name. Tool directories retain their releases/
+    # prefix, which number_of refuses; an explicit custom version still takes precedence.
+    have_version="${have_version:-${seed_version%-repair}}"
     have="$(number_of "$have_version")"
     want="$(number_of "$POLICY_VERSION")"
     if [ "$have_repo" != "$POLICY_REPO" ] || [ -z "$have" ] || [ -z "$want" ] \
-        || [ "$have" -ge "$want" ]; then
+        || [ "$have" -gt "$want" ]; then
         exit 0
     fi
-    echo "seed-policies: ${have_version} is below the ${POLICY_VERSION} this daemon needs; moving up" >&2
+    if [ "$have" -eq "$want" ]; then
+        case "$live" in
+            "$target"|"$target-repair") ;;
+            *) exit 0 ;;
+        esac
+        complete_set "${POLICY_ROOT}/${live}" && exit 0
+        repair=yes
+        echo "seed-policies: ${have_version} seed is incomplete; retrying its manifest" >&2
+    else
+        echo "seed-policies: ${have_version} is below the ${POLICY_VERSION} this daemon needs; moving up" >&2
+    fi
 fi
 
 staging="${POLICY_ROOT}/releases/.staging"
@@ -143,15 +171,28 @@ ok=yes
 # The manifest, and the file list from it. Fetched into staging like everything else, so it is
 # installed beside the policies it describes and `robotd` can read what it says.
 # shellcheck disable=SC2086
-if curl $CURL_OPTS -o "${staging}/manifest.json" "${POLICY_BASE_URL}/manifest.json"; then
-    POLICY_FILES="$(sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "${staging}/manifest.json" | tr '\n' ' ')"
+if manifest_status=$(curl $CURL_OPTS --write-out '%{http_code}' \
+    -o "${staging}/manifest.json" "${POLICY_BASE_URL}/manifest.json"); then
+    POLICY_FILES="$(manifest_files "${staging}/manifest.json")"
 else
-    rm -f "${staging}/manifest.json"
+    if [ "$manifest_status" = 404 ]; then
+        echo "seed-policies: ${POLICY_VERSION} has no manifest (HTTP 404)" >&2
+    else
+        echo "seed-policies: could not fetch the manifest for ${POLICY_VERSION}; will retry" >&2
+    fi
     POLICY_FILES=""
 fi
 if [ -z "$POLICY_FILES" ]; then
-    echo "seed-policies: no manifest in ${POLICY_VERSION}; taking the set this release knows" >&2
+    # A legacy tag's 404 and a temporary failure both allow a first fallback install, but
+    # neither proves completeness. On a repair, keep the working fallback until a manifest
+    # and every file it names arrive. No persistent marker is needed: its absence is enough.
+    if [ "$repair" = yes ]; then
+        rm -rf "$staging"
+        echo "seed-policies: manifest unavailable; keeping the installed set for a later retry" >&2
+        exit 0
+    fi
+    rm -f "${staging}/manifest.json"
+    echo "seed-policies: taking the set this release knows" >&2
     POLICY_FILES="$FALLBACK_FILES"
 fi
 
@@ -189,6 +230,11 @@ chmod 644 "$staging"/*.onnx 2>/dev/null || true
 
 write_source "$staging" "${POLICY_VERSION}"
 
+# A same-version repair must not remove the directory `current` still points at. Alternate
+# between two seed destinations so the predecessor survives until the complete set is linked.
+if [ "$live" = "$target" ]; then
+    target="$target-repair"
+fi
 rm -rf "${POLICY_ROOT:?}/${target}"
 mv "$staging" "${POLICY_ROOT}/${target}" \
     || { echo "seed-policies: cannot install into ${target}" >&2; exit 0; }
