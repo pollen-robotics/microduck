@@ -612,6 +612,11 @@ Two limits, both from the service rather than from us:
   notifications on this lane (`relay::Budget`), and a client calls at the rate of a behaviour
   rather than of a joystick.
 
+The robot posts one line at a time, each a round trip to the service, so a stream can outrun the
+lane. Answers go ahead of notifications, and while the lane is behind a `robot.state`,
+`tof.frame` or `head_imu.frame` is kept only at its newest (`relay::Outbox`), so a call is
+answered with depth streaming. Events such as `pad.report` keep their order.
+
 ## 4. The rendezvous is the one `reachy_mini` uses — **decided**
 
 `pollen-robotics-reachy-mini-central.hf.space`, the Space the mini's fleet already registers
