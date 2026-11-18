@@ -49,6 +49,10 @@
 //!  - Filtering happens in the host rather than the controller, so the byte pattern is applied by
 //!    [`beacon_in`] after the fact instead of before the wakeup.
 //!
+//! Each listening session owns its scan and each scan owns its device followers. Stopping the
+//! session (including a lost robot socket or adapter) cancels those subscriptions. A new session
+//! gets a fresh sighting queue, so buffered events from the old one cannot cross the restart.
+//!
 //! Either way the discriminator is the same: manufacturer-data on company id `0xFFFF` beginning
 //! with [`ChoraleBeacon::TAG`]. That tag is why the *other* advertising instance's four bytes of
 //! IPv4 address are not delivered here as a beat.
@@ -185,6 +189,29 @@ mod radio {
         adapter: &bluer::Adapter,
         robot_socket: &std::path::Path,
     ) -> std::io::Result<()> {
+        run_with(
+            robot_socket,
+            |beacon| async move { broadcast(adapter, &beacon).await },
+            |tx| {
+                let adapter = adapter.clone();
+                async move { watch(&adapter, tx).await }
+            },
+        )
+        .await
+    }
+
+    // Keep the socket session real in tests; only advertising and discovery need a radio.
+    async fn run_with<A, B, BF, W, WF>(
+        robot_socket: &std::path::Path,
+        mut advertise: B,
+        mut watch: W,
+    ) -> std::io::Result<()>
+    where
+        B: FnMut(ChoraleBeacon) -> BF,
+        BF: std::future::Future<Output = bluer::Result<A>>,
+        W: FnMut(mpsc::Sender<Sighting>) -> WF,
+        WF: std::future::Future<Output = bluer::Result<()>> + Send + 'static,
+    {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let stream = tokio::net::UnixStream::connect(robot_socket).await?;
@@ -203,9 +230,11 @@ mod radio {
         // advertising instance halves the first one's rate, and a monitor costs the controller.
         // Held only to be dropped: an `AdvertisementHandle` stops advertising when it goes, which
         // is exactly how the instance is released the moment `robotd` says to stop.
-        let mut _advertisement: Option<bluer::adv::AdvertisementHandle> = None;
-        let mut listening: Option<tokio::task::JoinHandle<()>> = None;
-        let (heard_tx, mut heard_rx) = mpsc::channel::<Sighting>(64);
+        let mut _advertisement: Option<A> = None;
+        // Dropping the session aborts the scan, including on socket errors or adapter cancellation.
+        // Each scan gets its own queue so a restart cannot forward its predecessor's sightings.
+        let mut listening = tokio::task::JoinSet::new();
+        let mut heard_rx: Option<mpsc::Receiver<Sighting>> = None;
 
         loop {
             tokio::select! {
@@ -219,7 +248,7 @@ mod radio {
                     };
                     // Advertise what was asked for, and nothing when nothing was.
                     _advertisement = match &want.beacon {
-                        Some(beacon) => match broadcast(adapter, beacon).await {
+                        Some(beacon) => match advertise(beacon.clone()).await {
                             Ok(handle) => Some(handle),
                             Err(e) => {
                                 tracing::warn!(error = %e, "chorale: cannot advertise the beacon");
@@ -228,28 +257,47 @@ mod radio {
                         },
                         None => None,
                     };
+                    // Advertising awaits BlueZ. Reap a scan that ended during that await before
+                    // deciding whether this request needs to start a replacement.
+                    if let Some(result) = listening.try_join_next() {
+                        heard_rx = None;
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "chorale: the scan task stopped");
+                        }
+                    }
                     // And scan only while asked to. Restarting the monitor on every beat would be
                     // absurd, so the task is started once and kept until listening stops.
-                    match (want.listening, listening.is_some()) {
+                    match (want.listening, !listening.is_empty()) {
                         (true, false) => {
-                            let adapter = adapter.clone();
-                            let tx = heard_tx.clone();
-                            listening = Some(tokio::spawn(async move {
-                                if let Err(e) = watch(&adapter, tx).await {
+                            let (tx, rx) = mpsc::channel::<Sighting>(64);
+                            heard_rx = Some(rx);
+                            let scan = watch(tx);
+                            listening.spawn(async move {
+                                if let Err(e) = scan.await {
                                     tracing::warn!(error = %e, "chorale: the scan stopped");
                                 }
-                            }));
+                            });
                         }
                         (false, true) => {
-                            if let Some(task) = listening.take() {
-                                task.abort();
-                            }
+                            heard_rx = None;
+                            listening.shutdown().await;
                             tracing::warn!("chorale: no longer listening");
                         }
                         _ => {}
                     }
                 }
-                Some(sighting) = heard_rx.recv() => {
+                Some(result) = listening.join_next(), if !listening.is_empty() => {
+                    heard_rx = None;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "chorale: the scan task stopped");
+                    }
+                }
+                Some(sighting) = async {
+                    match heard_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     // An *age*, not a timestamp: the two daemons share a machine but not an epoch,
                     // and an age survives the trip down a socket in a way another process's clock
                     // reading does not.
@@ -295,7 +343,7 @@ mod radio {
     /// The good path: the controller matches the pattern and only wakes us for beacons.
     async fn monitor(adapter: &bluer::Adapter, tx: mpsc::Sender<Sighting>) -> bluer::Result<()> {
         let manager = adapter.monitor().await?;
-        let mut monitor = manager
+        let monitor = manager
             .register(Monitor {
                 monitor_type: bluer::monitor::Type::OrPatterns,
                 patterns: Some(vec![Pattern {
@@ -311,14 +359,22 @@ mod radio {
             .await?;
         tracing::warn!(pattern = ?scan_pattern(), "chorale: listening (monitor)");
 
-        while let Some(event) = monitor.next().await {
-            let MonitorEvent::DeviceFound(found) = event else {
-                continue;
-            };
-            if let Ok(device) = adapter.device(found.device) {
-                spawn_follow(device, tx.clone());
+        let devices = monitor.filter_map(|event| async move {
+            match event {
+                MonitorEvent::DeviceFound(found) => Some(found.device),
+                _ => None,
             }
-        }
+        });
+        follow_devices(devices, |address| {
+            let device = adapter.device(address);
+            let tx = tx.clone();
+            async move {
+                if let Ok(device) = device {
+                    follow(device, tx).await;
+                }
+            }
+        })
+        .await;
         Ok(())
     }
 
@@ -334,71 +390,473 @@ mod radio {
                 ..Default::default()
             })
             .await?;
-        let mut events = adapter.discover_devices_with_changes().await?;
+        let events = adapter.discover_devices_with_changes().await?;
         tracing::warn!("chorale: listening (discovery)");
 
-        while let Some(event) = events.next().await {
-            let bluer::AdapterEvent::DeviceAdded(address) = event else {
-                continue;
-            };
-            if let Ok(device) = adapter.device(address) {
-                spawn_follow(device, tx.clone());
+        let devices = events.filter_map(|event| async move {
+            match event {
+                bluer::AdapterEvent::DeviceAdded(address) => Some(address),
+                _ => None,
             }
-        }
+        });
+        follow_devices(devices, |address| {
+            let device = adapter.device(address);
+            let tx = tx.clone();
+            async move {
+                if let Ok(device) = device {
+                    follow(device, tx).await;
+                }
+            }
+        })
+        .await;
         Ok(())
     }
 
-    /// Watch one duck's advertisement for as long as it keeps changing.
-    ///
-    /// One task per duck heard: whichever way it was found, the *payload* arriving repeatedly is a
-    /// property change on the device, and that is what carries the beat.
-    fn spawn_follow(device: bluer::Device, tx: mpsc::Sender<Sighting>) {
-        tokio::spawn(async move {
-            let address = device.address();
-            // Whatever it was already advertising when it was found — the first beat is otherwise
-            // missed while waiting for a change that has already happened.
-            if let Ok(Some(data)) = device.manufacturer_data().await
-                && let Some(beacon) = beacon_in(&data)
-                && tx
-                    .send(Sighting {
-                        beacon,
-                        from: address,
-                        at: Instant::now(),
-                    })
-                    .await
-                    .is_err()
+    // Both discovery paths own their followers: cancelling a scan must cancel its subscriptions,
+    // and repeated DeviceFound events must not multiply delivery of the same beacon.
+    async fn follow_devices<S, F, Fut>(devices: S, mut follow: F)
+    where
+        S: futures::Stream<Item = bluer::Address>,
+        F: FnMut(bluer::Address) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        futures::pin_mut!(devices);
+        let mut followers = tokio::task::JoinSet::new();
+        let mut active = std::collections::HashMap::new();
+        loop {
+            tokio::select! {
+                // Reap before rediscovery, so a completed subscription can be opened again.
+                biased;
+                Some(result) = followers.join_next(), if !followers.is_empty() => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "chorale: a device follower failed");
+                    }
+                    // Keep failures local to one device, just as normal subscription completion.
+                    active.retain(|_, task: &mut tokio::task::AbortHandle| !task.is_finished());
+                }
+                address = devices.next() => {
+                    let Some(address) = address else { break };
+                    if let std::collections::hash_map::Entry::Vacant(entry) = active.entry(address) {
+                        entry.insert(followers.spawn(follow(address)));
+                    }
+                }
+            }
+        }
+        followers.shutdown().await;
+    }
+
+    /// Watch one device's initial advertisement and subsequent manufacturer-data updates.
+    async fn follow(device: bluer::Device, tx: mpsc::Sender<Sighting>) {
+        let address = device.address();
+        // Whatever it was already advertising when it was found — the first beat is otherwise
+        // missed while waiting for a change that has already happened.
+        if let Ok(Some(data)) = device.manufacturer_data().await
+            && let Some(beacon) = beacon_in(&data)
+            && tx
+                .send(Sighting {
+                    beacon,
+                    from: address,
+                    at: Instant::now(),
+                })
+                .await
+                .is_err()
+        {
+            return;
+        }
+        let Ok(mut events) = device.events().await else {
+            return;
+        };
+        while let Some(event) = events.next().await {
+            let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(data)) =
+                event
+            else {
+                continue;
+            };
+            // Stamped here, as early as this process can: everything after is jitter the phase
+            // average has to absorb.
+            let at = Instant::now();
+            let Some(beacon) = beacon_in(&data) else {
+                continue;
+            };
+            if tx
+                .send(Sighting {
+                    beacon,
+                    from: address,
+                    at,
+                })
+                .await
+                .is_err()
             {
                 return;
             }
-            let Ok(mut events) = device.events().await else {
-                return;
-            };
-            while let Some(event) = events.next().await {
-                let bluer::DeviceEvent::PropertyChanged(bluer::DeviceProperty::ManufacturerData(
-                    data,
-                )) = event
-                else {
-                    continue;
-                };
-                // Stamped here, as early as this process can: everything after is jitter the phase
-                // average has to absorb.
-                let at = Instant::now();
-                let Some(beacon) = beacon_in(&data) else {
-                    continue;
-                };
-                if tx
-                    .send(Sighting {
-                        beacon,
-                        from: address,
-                        at,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
+        }
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        /// Aborting discovery must also drop the device subscriptions it created.
+        #[tokio::test]
+        async fn stopping_discovery_stops_device_followers() {
+            let (devices_tx, devices_rx) = mpsc::channel(4);
+            let devices = device_stream(devices_rx);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (stopped_tx, stopped_rx) = oneshot::channel::<()>();
+            let mut signals = Some((started_tx, stopped_tx));
+            let scan = tokio::spawn(follow_devices(devices, move |_| {
+                let (started, stopped) = signals.take().unwrap();
+                async move {
+                    let _stopped = stopped;
+                    started.send(()).unwrap();
+                    std::future::pending::<()>().await;
                 }
+            }));
+            devices_tx
+                .send(bluer::Address::new([1, 2, 3, 4, 5, 6]))
+                .await
+                .unwrap();
+            started_rx.await.unwrap();
+            scan.abort();
+            assert!(scan.await.unwrap_err().is_cancelled());
+            assert!(
+                timeout(Duration::from_secs(1), stopped_rx).await.is_ok(),
+                "a device follower survived the end of discovery"
+            );
+        }
+
+        fn device_stream(
+            rx: mpsc::Receiver<bluer::Address>,
+        ) -> impl futures::Stream<Item = bluer::Address> {
+            futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|address| (address, rx))
+            })
+        }
+
+        /// A repeated discovery must not duplicate a subscription; a finished one can be reopened.
+        #[tokio::test]
+        async fn discovery_deduplicates_active_followers_and_reopens_finished_ones() {
+            let (devices_tx, devices_rx) = mpsc::channel(4);
+            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+            let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
+            let scan = tokio::spawn(follow_devices(device_stream(devices_rx), move |address| {
+                let started = started_tx.clone();
+                let finished = finished_tx.clone();
+                async move {
+                    let (finish_tx, finish_rx) = oneshot::channel();
+                    started.send((address, finish_tx)).unwrap();
+                    let _ = finish_rx.await;
+                    finished.send(address).unwrap();
+                }
+            }));
+            let first = bluer::Address::new([1, 2, 3, 4, 5, 6]);
+            let other = bluer::Address::new([6, 5, 4, 3, 2, 1]);
+            devices_tx.send(first).await.unwrap();
+            let (address, finish) = started_rx.recv().await.unwrap();
+            assert_eq!(address, first);
+            devices_tx.send(first).await.unwrap();
+            devices_tx.send(other).await.unwrap();
+            let (address, _keep_other_alive) = started_rx.recv().await.unwrap();
+            assert_eq!(address, other, "rediscovery started a duplicate follower");
+            finish.send(()).unwrap();
+            assert_eq!(finished_rx.recv().await.unwrap(), first);
+            devices_tx.send(first).await.unwrap();
+            let (address, _keep_first_alive) = timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(address, first);
+            drop(devices_tx);
+            timeout(Duration::from_secs(1), scan)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                started_rx.recv().await.is_none(),
+                "followers outlived discovery EOF"
+            );
+        }
+
+        /// One failed device subscription must not stop discovery or cancel unrelated followers.
+        #[tokio::test]
+        async fn a_panicking_follower_does_not_stop_discovery() {
+            let (devices_tx, devices_rx) = mpsc::channel(4);
+            let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+            let failed = bluer::Address::new([1, 2, 3, 4, 5, 6]);
+            let healthy = bluer::Address::new([6, 5, 4, 3, 2, 1]);
+            let mut first_attempt = true;
+            let scan = tokio::spawn(follow_devices(device_stream(devices_rx), move |address| {
+                let started = started_tx.clone();
+                let fail = address == failed && std::mem::take(&mut first_attempt);
+                async move {
+                    let (release, released) = oneshot::channel::<()>();
+                    started.send((address, release)).unwrap();
+                    assert!(!fail, "injected device follower failure");
+                    let _ = released.await;
+                }
+            }));
+            devices_tx.send(healthy).await.unwrap();
+            let (_, healthy_release) = started_rx.recv().await.unwrap();
+            devices_tx.send(failed).await.unwrap();
+            let (_, mut failed_release) = started_rx.recv().await.unwrap();
+            failed_release.closed().await;
+            devices_tx
+                .send(failed)
+                .await
+                .expect("one failed follower stopped discovery");
+            let restarted = timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .unwrap();
+            assert!(
+                restarted.is_some(),
+                "one failed follower stopped all discovery"
+            );
+            assert!(
+                !healthy_release.is_closed(),
+                "the healthy follower was cancelled"
+            );
+            scan.abort();
+            let _ = scan.await;
+        }
+
+        /// Off/on must discard the old queue, not turn old sightings into a new session's input.
+        #[tokio::test]
+        async fn stopping_and_restarting_listening_replaces_the_sighting_queue() {
+            restarting_listening_replaces_queue(false).await;
+        }
+
+        /// A scan that returns must be reaped, so the next request can start discovery again.
+        #[tokio::test]
+        async fn a_finished_scan_can_be_restarted() {
+            restarting_listening_replaces_queue(true).await;
+        }
+
+        async fn restarting_listening_replaces_queue(finish_scan: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("robot.sock");
+            let server = tokio::net::UnixListener::bind(&path).unwrap();
+            let (scans_tx, mut scans_rx) = mpsc::unbounded_channel();
+            let session = tokio::spawn(async move {
+                run_with(
+                    &path,
+                    |_| async { Ok(()) },
+                    move |tx| {
+                        let scans = scans_tx.clone();
+                        async move {
+                            let (finish_tx, finish_rx) = oneshot::channel();
+                            scans.send((tx, finish_tx)).unwrap();
+                            let _ = finish_rx.await;
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            });
+            let (socket, _) = server.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap();
+            set_listening(&mut write, true).await;
+            let (old, finish) = timeout(Duration::from_secs(1), scans_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if finish_scan {
+                finish.send(()).unwrap();
+            } else {
+                set_listening(&mut write, false).await;
             }
-        });
+            timeout(Duration::from_secs(1), old.closed()).await.unwrap();
+            set_listening(&mut write, true).await;
+            let (current, _keep_scan_running) = timeout(Duration::from_secs(1), scans_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(old.is_closed());
+            current
+                .send(Sighting {
+                    beacon: ChoraleBeacon {
+                        piece: 2,
+                        beat: 91,
+                        register: 56,
+                        id: 0x3D,
+                        roster: vec![],
+                    },
+                    from: bluer::Address::new([1, 2, 3, 4, 5, 6]),
+                    at: Instant::now(),
+                })
+                .await
+                .unwrap();
+            let line = timeout(Duration::from_secs(1), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let request: duck_ipc_proto::Request = serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                request.as_call().unwrap(),
+                duck_ipc_proto::Call::ChoraleHeard(_)
+            ));
+            drop(lines);
+            drop(write);
+            timeout(Duration::from_secs(1), session)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(1), current.closed())
+                .await
+                .unwrap();
+        }
+
+        /// Advertising awaits BlueZ; a scan that finishes during that await must not hide a restart.
+        #[tokio::test]
+        async fn a_scan_finishing_during_advertising_does_not_swallow_the_start_request() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("robot.sock");
+            let server = tokio::net::UnixListener::bind(&path).unwrap();
+            let (scans_tx, mut scans_rx) = mpsc::unbounded_channel();
+            let (ads_tx, mut ads_rx) = mpsc::unbounded_channel();
+            let session = tokio::spawn(async move {
+                run_with(
+                    &path,
+                    move |_| {
+                        let ads = ads_tx.clone();
+                        async move {
+                            let (resume_tx, resume_rx) = oneshot::channel();
+                            ads.send(resume_tx).unwrap();
+                            resume_rx.await.unwrap();
+                            Ok(())
+                        }
+                    },
+                    move |tx| {
+                        let scans = scans_tx.clone();
+                        async move {
+                            let (finish_tx, finish_rx) = oneshot::channel();
+                            let (done_tx, done_rx) = oneshot::channel();
+                            scans.send((tx, finish_tx, done_rx)).unwrap();
+                            let _ = finish_rx.await;
+                            let _ = done_tx.send(());
+                            Ok(())
+                        }
+                    },
+                )
+                .await
+            });
+            let (socket, _) = server.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap();
+            set_listening(&mut write, true).await;
+            let (_old, finish, done) = timeout(Duration::from_secs(1), scans_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let request = duck_ipc_proto::Request::notify(&duck_ipc_proto::Call::ChoraleBeaconSet(
+                duck_ipc_proto::ChoraleAdvertise {
+                    beacon: Some(ChoraleBeacon {
+                        piece: 2,
+                        beat: 91,
+                        register: 56,
+                        id: 0x3D,
+                        roster: vec![],
+                    }),
+                    listening: true,
+                },
+            ));
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let resume = timeout(Duration::from_secs(1), ads_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            finish.send(()).unwrap();
+            done.await.unwrap();
+            resume.send(()).unwrap();
+            let restarted = timeout(Duration::from_secs(1), scans_rx.recv()).await;
+            session.abort();
+            let _ = session.await;
+            assert!(
+                restarted.is_ok(),
+                "a finished scan swallowed the start request while advertising"
+            );
+        }
+
+        async fn set_listening(write: &mut tokio::net::unix::OwnedWriteHalf, listening: bool) {
+            let request = duck_ipc_proto::Request::notify(&duck_ipc_proto::Call::ChoraleBeaconSet(
+                duck_ipc_proto::ChoraleAdvertise {
+                    beacon: None,
+                    listening,
+                },
+            ));
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// Reconnecting robotd must not leave the old radio scan running behind its new session.
+        #[tokio::test]
+        async fn robot_disconnect_stops_the_listener() {
+            ending_robot_session_stops_listener(false).await;
+        }
+
+        /// Adapter bring-up cancels this session externally; Drop must clean up that path too.
+        #[tokio::test]
+        async fn cancelling_robot_session_stops_the_listener() {
+            ending_robot_session_stops_listener(true).await;
+        }
+
+        async fn ending_robot_session_stops_listener(cancel: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("robot.sock");
+            let server = tokio::net::UnixListener::bind(&path).unwrap();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (stopped_tx, stopped_rx) = oneshot::channel::<()>();
+            let mut signals = Some((started_tx, stopped_tx));
+            let session = tokio::spawn(async move {
+                run_with(
+                    &path,
+                    |_| async { Ok(()) },
+                    move |_| {
+                        let (started, stopped) = signals.take().unwrap();
+                        async move {
+                            let _stopped = stopped;
+                            started.send(()).unwrap();
+                            std::future::pending::<bluer::Result<()>>().await
+                        }
+                    },
+                )
+                .await
+            });
+            let (socket, _) = server.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap(); // chorale.subscribe
+            set_listening(&mut write, true).await;
+            started_rx.await.unwrap();
+            if cancel {
+                session.abort();
+                assert!(session.await.unwrap_err().is_cancelled());
+            } else {
+                drop(lines);
+                drop(write);
+                timeout(Duration::from_secs(1), session)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(
+                timeout(Duration::from_secs(1), stopped_rx).await.is_ok(),
+                "the radio listener survived the robot socket disconnect"
+            );
+        }
     }
 }
 
