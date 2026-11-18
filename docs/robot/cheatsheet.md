@@ -76,10 +76,10 @@ all just numbers in the joints table; every one of them is obvious here. It is o
 appears whenever the terminal is wide enough (about 110 columns — the tables come first, and the
 robot takes what is spare). **`d`** turns it off; **`[`** and **`]`**, or `←`/`→`, orbit it.
 
-Whenever the ToF is delivering frames, what it sees is drawn into the same scene — yellow for a
-hit, green for floor — depth-tested against the robot's own body, so a point behind the beak is
-hidden by it. That is what makes "is it seeing my hand, or is it seeing itself" answerable. It
-needs no key: the points appear when frames arrive and go when they stop.
+Whenever the ToF is delivering frames, what it sees is drawn into the same scene — yellow for a hit,
+green for floor, red where a beam went over an edge — depth-tested against the robot's own body, so
+a point behind the beak is hidden by it. That is what makes "is it seeing my hand, or is it seeing
+itself" answerable. It needs no key: the points appear when frames arrive and go when they stop.
 
 Under it, when the column is tall enough, **a map of where the robot has been**: odometry's track
 from the foot contacts and the IMU, in braille. The panel never grows — the world zooms out as the

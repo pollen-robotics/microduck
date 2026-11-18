@@ -239,6 +239,13 @@ const GOAL_SLOW_M: f64 = 0.4;
 /// wall from the same side.
 const BLOCKED_S: f64 = 300.0;
 const BLOCKED_M: f64 = 0.4;
+/// Where a drop stopped the duck is remembered this long (s, behaviour clock). Within
+/// `EDGE_NEAR_M` of such a spot the duck takes no step within `EDGE_FACING_RAD` of it, or
+/// `EDGE_CORNER_RAD` in a corner: the ToF only sees ahead, and a turn in place drifts.
+const EDGE_S: f64 = 60.0;
+const EDGE_NEAR_M: f64 = 0.45;
+const EDGE_FACING_RAD: f64 = 1.3;
+const EDGE_CORNER_RAD: f64 = 1.0;
 
 /// The slowest forward command the gait actually walks at, m/s. Below it the walking policy
 /// stands still with its label still saying `walk` — measured on the twin: legs at rest under
@@ -429,6 +436,8 @@ pub struct Brain {
     goal: Option<[f64; 2]>,
     /// Where obstacles stopped the duck, `(point, clock)`, so goals avoid them.
     blocked: Vec<([f64; 2], f64)>,
+    /// Where drops stopped the duck, `(point, clock)`, in odometry's frame.
+    edges: Vec<([f64; 2], f64)>,
     /// What this bout did, for the line logged when it ends.
     bout: Bout,
     /// Wander glances: true while a brief side glance is held, and the countdown to toggling.
@@ -536,6 +545,7 @@ impl Brain {
             wander_wz: 0.0,
             goal: None,
             blocked: Vec::new(),
+            edges: Vec::new(),
             bout: Bout::default(),
             glancing: false,
             glance_in: 0.0,
@@ -592,6 +602,34 @@ impl Brain {
         } else {
             0.0
         }
+    }
+
+    /// Bearings, off the nose, of the drops that stopped the duck lately and are still close.
+    fn edges_near(&self) -> Vec<f64> {
+        let [x, y, yaw] = self.last_pose;
+        let bearing = |(p, at): &([f64; 2], f64)| {
+            let (dx, dy) = (p[0] - x, p[1] - y);
+            (self.clock - at <= EDGE_S && dx.hypot(dy) < EDGE_NEAR_M)
+                .then(|| wrap_angle(dy.atan2(dx) - yaw))
+        };
+        let mut near: Vec<f64> = self.edges.iter().filter_map(bearing).collect();
+        near.sort_by(f64::total_cmp);
+        near
+    }
+
+    /// A step `bearing` off the nose is a step toward a drop that stopped the duck.
+    fn toward_edge(&self, bearing: f64) -> bool {
+        let near = self.edges_near();
+        // Half the widest gap between them, less a margin, is all there is to keep off each.
+        let gap = (0..near.len())
+            .map(|i| match near.get(i + 1) {
+                Some(next) => next - near[i],
+                None => near[0] + std::f64::consts::TAU - near[i],
+            })
+            .fold(0.0, f64::max);
+        let keep_off = (gap / 2.0 - 0.25).clamp(EDGE_CORNER_RAD, EDGE_FACING_RAD);
+        near.iter()
+            .any(|b| wrap_angle(b - bearing).abs() < keep_off)
     }
 
     /// A wall the map knows, or a spot where the ToF stopped the duck, within `d` behind it. Never
@@ -1022,10 +1060,18 @@ impl Brain {
                     self.t_state = self.state_dur;
                 }
                 let heading_delta = wrap_angle(dy.atan2(dx) - here[2]);
-                let pivoting = heading_delta.abs() > 0.7;
+                if self.toward_edge(heading_delta) {
+                    tracing::info!(
+                        left_m = distance,
+                        "the goal is by an edge — giving up on it"
+                    );
+                    self.t_state = self.state_dur;
+                }
+                let pivoting = heading_delta.abs() > 0.7 || self.toward_edge(0.0);
                 self.wander_wz = if pivoting {
-                    // Far off the goal's bearing: pivot first, walk after. Crawling the turn at
-                    // the walking yaw clamp wasted seconds at the start of every bout.
+                    // Far off the goal's bearing, or facing an edge: pivot first, walk after.
+                    // Crawling the turn at the walking yaw clamp wasted seconds at the start of
+                    // every bout.
                     0.9 * self.max_turn * heading_delta.signum()
                 } else {
                     (1.2 * heading_delta).clamp(-0.6, 0.6)
@@ -1098,6 +1144,9 @@ impl Brain {
                     self.apply_obstacle_gate(self.max_speed, self.wander_wz, &world.obstacle);
                 let vx = self.walkable(vx, dt);
                 self.cmd = [vx, 0.0, wz];
+                if self.state == State::Zoomies && self.toward_edge(0.0) {
+                    self.t_state = self.state_dur;
+                }
             }
             State::Stretch => {
                 // Rise → climax (full extension, yawning, one contented coo) → release → a quick
@@ -1572,9 +1621,10 @@ impl Brain {
                 State::GroundPick | State::Nap | State::Laser | State::BallPlay
             )
         {
-            let can_zoom = world
-                .obstacle
-                .is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > 1.2);
+            let can_zoom = !self.toward_edge(0.0)
+                && world
+                    .obstacle
+                    .is_some_and(|o| o.age_s <= FRESH_S && o.ahead_m > 1.2);
             let can_nap = world.can_sit_stand && !world.sitting;
             let can_ball = self.clock >= self.ball_next_try && self.energy > BALL_MIN_E;
             let next = if std::mem::take(&mut self.survey_next) {
@@ -1686,12 +1736,13 @@ impl Brain {
         for k in 0..GOAL_DIRECTIONS {
             let heading = offset + std::f64::consts::TAU * k as f64 / GOAL_DIRECTIONS as f64;
             let (s, c) = heading.sin_cos();
+            let edge = self.toward_edge(heading - yaw);
             for d in GOAL_DISTANCES {
                 // Dwell along the path, sampled every quarter metre: the duck walks the whole of
                 // it, so the whole of it is what is new or not.
                 let steps = (d / 0.25) as usize;
                 let mut dwell = 0.0f64;
-                let mut shut = false;
+                let mut shut = edge;
                 for i in 1..=steps {
                     let r = d * i as f64 / steps as f64;
                     let (px, py) = (x + r * c, y + r * s);
@@ -1722,8 +1773,9 @@ impl Brain {
     }
 
     /// A forward command the gait will act on: zero, or at least `MIN_WALK_VX`, and full speed for
-    /// the first `START_KICK_S` of a walk.
+    /// the first `START_KICK_S` of a walk. Always zero toward an edge that stopped the duck.
     fn walkable(&mut self, vx: f64, dt: f64) -> f64 {
+        let vx = if self.toward_edge(0.0) { 0.0 } else { vx };
         // `self.cmd` is still last tick's here. Whatever stopped the walk — a pivot, a gate, or a
         // whole other state — the next forward command is a start, and gets the kick.
         if vx <= 0.01 || self.cmd[0] <= 0.01 {
@@ -1761,9 +1813,23 @@ impl Brain {
                 if aging {
                     vx *= 0.5;
                 }
-                let away = o.away;
+                let mut away = o.away;
                 if o.ahead_m < STOP_M {
                     tracing::info!(ahead_m = o.ahead_m, "obstacle ahead — turning away");
+                    let side: f64 = self.edges_near().iter().map(|b| b.sin()).sum();
+                    if side.abs() > 0.2 {
+                        away = -side.signum();
+                    }
+                    if o.drop_m < STOP_M {
+                        // Just past the beak, in odometry's frame: the map's corrections must not
+                        // move an edge the duck is standing at.
+                        let [x, y, yaw] = self.last_pose;
+                        let reach = crate::obstacle::BEAK_M + o.drop_m;
+                        let now = self.clock;
+                        self.edges.retain(|(_, at)| now - at <= EDGE_S);
+                        self.edges
+                            .push(([x + reach * yaw.cos(), y + reach * yaw.sin()], now));
+                    }
                     if self.state == State::Wander {
                         // Remember where the way was shut, so the next goal is not behind the same
                         // wall. Just past the beak, along the heading the duck was walking.
@@ -2054,6 +2120,7 @@ mod tests {
     fn clear_ahead() -> Option<Obstacle> {
         Some(Obstacle {
             ahead_m: f64::INFINITY,
+            drop_m: f64::INFINITY,
             away: 1.0,
             age_s: 0.0,
         })
@@ -2277,6 +2344,7 @@ mod tests {
         let mut w = world([0.0; 3]);
         w.obstacle = Some(Obstacle {
             ahead_m: 0.10,
+            drop_m: f64::INFINITY,
             away: -1.0,
             age_s: 0.0,
         });
@@ -2751,6 +2819,215 @@ mod tests {
         let (mut brain, w) = by_the_wall(2.5);
         brain.enter(State::TurnInPlace);
         assert_eq!(brain.step(0.02, &w).cmd[0], 0.0);
+    }
+
+    /// A brain wandering at `pose` to a goal 2 m off, `goal` off its nose, with drops having
+    /// stopped it a moment ago at each of `edges`.
+    fn wandering_by(edges: &[[f64; 2]], pose: [f64; 3], goal: f64) -> (Brain, World) {
+        let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 16);
+        brain.edges = edges.iter().map(|&p| (p, 0.0)).collect();
+        brain.last_pose = pose;
+        brain.enter(State::Wander);
+        let h = pose[2] + goal;
+        brain.goal = Some([pose[0] + 2.0 * h.cos(), pose[1] + 2.0 * h.sin()]);
+        (brain, world(pose))
+    }
+
+    /// Something `ahead_m` past the beak and a drop `drop_m` past it, the ToF's clear side `away`.
+    fn stopped_by(ahead_m: f64, drop_m: f64, away: f64) -> Option<Obstacle> {
+        Some(Obstacle {
+            ahead_m,
+            drop_m,
+            away,
+            age_s: 0.0,
+        })
+    }
+
+    /// A drop that stops the duck is remembered just past its beak, in odometry's frame, and for
+    /// `EDGE_S`. A wall is not.
+    #[test]
+    fn a_drop_that_stops_the_duck_is_remembered() {
+        let (mut brain, mut w) = wandering_by(&[], [1.0, 2.0, 0.5], 0.0);
+        w.map = MapFix::Known([5.0, -3.0, 1.0]);
+        w.obstacle = stopped_by(0.05, f64::INFINITY, 1.0);
+        brain.step(0.02, &w);
+        assert_eq!(brain.state(), State::TurnInPlace);
+        assert!(brain.edges.is_empty(), "a wall: {:?}", brain.edges);
+
+        // A drop 10 cm past the beak, behind something nearer.
+        brain.enter(State::Wander);
+        w.obstacle = stopped_by(0.05, 0.10, 1.0);
+        brain.step(0.02, &w);
+        let reach = crate::obstacle::BEAK_M + 0.10;
+        let [p] = brain.edges[..] else {
+            panic!("{:?}", brain.edges)
+        };
+        assert!(
+            (p.0[0] - (1.0 + reach * 0.5f64.cos())).abs() < 1e-9,
+            "{p:?}"
+        );
+        assert!(
+            (p.0[1] - (2.0 + reach * 0.5f64.sin())).abs() < 1e-9,
+            "{p:?}"
+        );
+
+        // One too far past whatever stopped the duck is not what stopped it.
+        brain.enter(State::Wander);
+        w.obstacle = stopped_by(0.05, 0.30, 1.0);
+        brain.step(0.02, &w);
+        assert_eq!(brain.edges.len(), 1);
+
+        // Zoomies stop for it the same, and turn away.
+        brain.enter(State::Zoomies);
+        w.obstacle = stopped_by(0.0, 0.0, 1.0);
+        brain.step(0.02, &w);
+        assert_eq!(brain.state(), State::TurnInPlace);
+        assert_eq!(brain.edges.len(), 2);
+
+        // The next one, after `EDGE_S`, finds them forgotten.
+        brain.clock += EDGE_S + 1.0;
+        brain.enter(State::Wander);
+        brain.step(0.02, &w);
+        assert_eq!(brain.edges.len(), 1);
+    }
+
+    /// The ToF sees floor again once the duck has turned a little, and the edge is still right
+    /// there: no step until it is `EDGE_FACING_RAD` off the nose, within `EDGE_NEAR_M`, for
+    /// `EDGE_S`. The map moving its frame does not move the edge.
+    #[test]
+    fn no_step_toward_an_edge_that_stopped_it() {
+        let steps = |edges: &[[f64; 2]], yaw: f64, later: f64| {
+            let (mut brain, mut w) = wandering_by(edges, [0.0, 0.0, yaw], 0.0);
+            brain.clock = later;
+            w.map = MapFix::Known([5.0, -3.0, 1.0]);
+            brain.step(0.02, &w).cmd[0] > 0.0
+        };
+        assert!(steps(&[], 0.0, 0.0));
+        for (yaw, free) in [(0.0, false), (1.25, false), (-1.25, false), (1.35, true)] {
+            assert_eq!(steps(&[[0.3, 0.0]], yaw, 0.0), free, "edge {yaw} rad off");
+        }
+        assert!(!steps(&[[0.44, 0.0]], 0.0, 0.0));
+        assert!(steps(&[[0.46, 0.0]], 0.0, 0.0), "out of reach");
+        assert!(!steps(&[[0.3, 0.0]], 0.0, EDGE_S - 1.0));
+        assert!(steps(&[[0.3, 0.0]], 0.0, EDGE_S + 1.0), "forgotten");
+        // Edges on both sides, as on a plank: along it is free.
+        let plank = [[0.0, 0.3], [0.0, -0.3]];
+        assert!(steps(&plank, 0.0, 0.0));
+        assert!(!steps(&plank, 0.4, 0.0));
+        // Stops all along both edges of a corner: only the way straight out of it is free.
+        let corner = [-1.11, 0.0, 0.785, 1.57, 2.68].map(|a: f64| [0.3 * a.cos(), 0.3 * a.sin()]);
+        assert!(steps(&corner, -2.2, 0.0));
+        assert!(!steps(&corner, -2.06, 0.0));
+        // A wider one keeps the duck further off each side of it.
+        let wide = [-1.0, 0.5, 2.48].map(|a: f64| [0.3 * a.cos(), 0.3 * a.sin()]);
+        assert!(steps(&wide, -2.2, 0.0));
+        assert!(!steps(&wide, -2.1, 0.0));
+        // A tighter one leaves less, and no less than `EDGE_CORNER_RAD` off each.
+        let tight = [-1.4, 0.0, 1.3, 2.68].map(|a: f64| [0.3 * a.cos(), 0.3 * a.sin()]);
+        assert!(steps(&tight, -2.5, 0.0));
+        assert!(!steps(&tight, -2.35, 0.0));
+    }
+
+    /// Facing an edge with a goal away from it, a wander pivots to the goal before it walks. A
+    /// goal past the edge is given up, and the next one is not picked there.
+    #[test]
+    fn by_an_edge_a_wander_goes_for_a_goal_away_from_it() {
+        // The edge 0.8 rad to the right of a duck facing 2 rad.
+        let pose = [0.0, 0.0, 2.0];
+        let edge = [[0.3 * 1.2f64.cos(), 0.3 * 1.2f64.sin()]];
+        let (mut brain, w) = wandering_by(&edge, pose, 0.6);
+        let out = brain.step(0.02, &w);
+        assert_eq!(out.cmd[0], 0.0);
+        assert_eq!(out.cmd[2], 0.9 * MAX_TURN, "pivoting left, to the goal");
+        assert_eq!(brain.state(), State::Wander);
+
+        // The same in the map's frame, wherever that puts the duck.
+        let (mut brain, mut w) = wandering_by(&edge, pose, -0.3);
+        w.map = MapFix::Known([5.0, -3.0, 1.0]);
+        assert_eq!(brain.step(0.02, &w).cmd[0], 0.0);
+        let [x, y, yaw] = brain.here();
+        let off_the_nose = |g: [f64; 2]| (g[1] - y).atan2(g[0] - x) - yaw;
+        let goal = brain.goal.unwrap();
+        assert!(
+            brain.state() != State::Wander || !brain.toward_edge(off_the_nose(goal)),
+            "gave up on it: {:?} {goal:?}",
+            brain.state()
+        );
+        for _ in 0..200 {
+            let goal = brain.pick_goal();
+            assert!(!brain.toward_edge(off_the_nose(goal)), "{goal:?}");
+        }
+    }
+
+    /// Stopped with an edge remembered to one side, by a drop or by a wall, the duck turns to the
+    /// other, whatever the ToF says of the sides. With that edge straight ahead the ToF picks.
+    #[test]
+    fn a_stop_by_an_edge_turns_away_from_it() {
+        let turn = |edge_off: f64, drop_m: f64, away: f64| {
+            let edge = [[0.3 * edge_off.cos(), 0.3 * edge_off.sin()]];
+            let (mut brain, mut w) = wandering_by(&edge, [0.0; 3], 0.0);
+            w.obstacle = stopped_by(0.0, drop_m, away);
+            let out = brain.step(0.02, &w);
+            assert_eq!(brain.state(), State::TurnInPlace);
+            out.cmd[2].signum()
+        };
+        assert_eq!(turn(1.5, 0.0, 1.0), -1.0, "edge on the left: right");
+        assert_eq!(turn(-1.5, 0.0, -1.0), 1.0, "edge on the right: left");
+        assert_eq!(turn(0.3, 0.0, 1.0), -1.0);
+        assert_eq!(turn(0.1, 0.0, 1.0), 1.0, "edge ahead: the ToF's side");
+        assert_eq!(turn(1.5, f64::INFINITY, 1.0), -1.0, "and for a wall");
+
+        // One on the left and four ahead: still right.
+        let ahead = [1.5, 0.0, 0.05, -0.05, 0.02].map(|a: f64| [0.3 * a.cos(), 0.3 * a.sin()]);
+        let (mut brain, mut w) = wandering_by(&ahead, [0.0; 3], 0.0);
+        w.obstacle = stopped_by(0.0, 0.0, 1.0);
+        assert!(brain.step(0.02, &w).cmd[2] < 0.0);
+
+        // One on each side: the ToF's side again.
+        for away in [1.0, -1.0] {
+            let sides = [[0.0, 0.3], [0.0, -0.3]];
+            let (mut brain, mut w) = wandering_by(&sides, [0.0; 3], 0.0);
+            w.obstacle = stopped_by(0.0, 0.0, away);
+            assert_eq!(brain.step(0.02, &w).cmd[2].signum(), away);
+        }
+    }
+
+    /// Nothing else steps toward the edge either: not a turn's creep by a wall, not a brace, not
+    /// zoomies, which end there and do not start.
+    #[test]
+    fn no_state_steps_toward_an_edge() {
+        for edge in [false, true] {
+            let by_the_edge = |brain: &mut Brain, w: &World| {
+                if edge {
+                    brain.edges = vec![([w.pose[0] + 0.3, w.pose[1]], brain.clock)];
+                }
+            };
+            let (mut brain, w) = by_the_wall(0.35);
+            by_the_edge(&mut brain, &w);
+            for state in [State::TurnInPlace, State::Brace, State::Zoomies] {
+                brain.enter(state);
+                let out = brain.step(0.02, &w);
+                assert_eq!(out.cmd[0] > 0.0, !edge, "{state:?} {:?}", out.cmd);
+            }
+            assert_eq!(
+                brain.state() == State::Zoomies,
+                !edge,
+                "{:?}",
+                brain.state()
+            );
+
+            let mut brain = Brain::new(MAX_SPEED, MAX_TURN, 18);
+            let w = world([0.0; 3]);
+            by_the_edge(&mut brain, &w);
+            brain.energy = 1.0;
+            let mut zoomed = false;
+            for _ in 0..50 * 600 {
+                brain.step(0.02, &w);
+                brain.edges.iter_mut().for_each(|(_, at)| *at = brain.clock);
+                zoomed |= brain.state() == State::Zoomies;
+            }
+            assert_eq!(zoomed, !edge);
+        }
     }
 
     /// The map checking the duck after it sat by itself is one survey, not the stay-put of a duck
