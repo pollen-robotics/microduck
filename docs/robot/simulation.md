@@ -59,6 +59,13 @@ user did not exist, so its unit never started — a class `up` cannot see at all
 
 ## One duck, no container
 
+**Before the first run:** clone `microduck_rl` beside this repo and run `uv sync` in it. The
+script finds `../microduck_rl` on its own; anywhere else, set `DUCK_SIM_RL=/path/to/microduck_rl`.
+It builds the daemons with your `rustc`, which needs to be at least the workspace's
+`rust-version` (1.89 today). Run `rustup update stable` to install a current compiler; if a
+rustup override still selects an older one, run `RUSTUP_TOOLCHAIN=stable scripts/duck-sim`.
+An older or broken compiler is refused before stopping a running duck or building dependencies.
+
 ```sh
 scripts/duck-sim                # a MuJoCo window opens, the duck stands up, and it is yours
 scripts/duck-sim status         # health, and whether it is standing
@@ -80,6 +87,10 @@ sockets, which is the only thing that is different from a robot: on a board the 
 To talk to it from your own tools, the sockets are `~/.cache/duck-sim/duck-a.sock` (robotd; `duck.sock`
 is a link to whichever duck `ctl` talks to) and `~/.cache/duck-sim/duck-a-tof.sock`, and the body is
 on TCP port 7801.
+
+`status` exits nonzero when the body is down, cannot be read, is not standing, or the daemon's
+health command fails. `simlog` follows the body log while the simulator is running. When stopped,
+it shows the last 50 lines (if a log exists) and exits 1; with no log it prints how to start the sim.
 
 ## Several ducks, each a machine you log into
 
@@ -158,7 +169,7 @@ Environment variables, all optional:
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DUCK_SIM_RL` | `~/Pollen/microduck_rl` | Where `duck-body`, the scenes and the ONNX runtime are. |
+| `DUCK_SIM_RL` | sibling `../microduck_rl`, then `~/Pollen/microduck_rl` | A nonempty override wins. Where `duck-body`, the scenes and the ONNX runtime are. |
 | `DUCK_SIM_STATE` | `~/.cache/duck-sim` | Sockets, logs, params, the rootfs and the ducks' overlays. Short on purpose: a unix socket path is capped at about 108 bytes. |
 | `DUCK_SIM_DUCKS` | `1` | How many ducks; `boot N` sets it too. |
 | `DUCK_SIM_SCENE` | bare floor | A scene name (`apartment`) or a path. |
