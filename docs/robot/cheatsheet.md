@@ -1036,7 +1036,9 @@ it: a pushed stick wins over the dot, and with no dot in sight the robot does wh
 so it can be left on while driving. An NFC tag reading `laser_mode` switches it on, and the walk,
 roller and soccer tags off — [`nfc-tags.md`](nfc-tags.md). The video stream is untouched; `mediad` scans the frames it
 already has, once a second while searching and ~15 times once it sees a dot. Measured on a
-face-board-v1: searching costs about 1% of one core, tracking about 15%.
+face-board-v1: searching costs about 1% of one core, and tracking was about 15% while every look
+scanned the whole frame, 8 points of it the scan. A tracking look scans around the dot, about 4%
+of the frame, and the whole frame once a second.
 
 `on`/`off` do not write the config. `[laser] enabled` in `robotctl configure` is whether it starts
 on at boot — and, like every `[laser]` key, an edit to it applies within a second, no restart.
