@@ -264,9 +264,11 @@ is one. On a board whose release predates that check, the same mistake reads as
 `no manifest for version <version> in <dir>` — for a directory whose `ls` lists exactly that
 manifest.
 
-**`verification failed: signature did not verify against any of N usable trusted key(s)`** — reads
-like a corrupt release, and usually means the board is not a dev board, which leaves the dev key
-out of the usable set. On the board:
+**`if you are trying to install a non-stable version of the daemon, …`** — the build
+is signed with the dev key and the board is not a dev board, which leaves that key out of the usable
+set. A board whose release predates this message says `verification failed: … did not verify against
+any of N usable trusted key(s)`, which reads like a corrupt release and usually means the same
+thing. On the board:
 
 ```bash
 sudo robotctl configure --allow-dev-daemon on
