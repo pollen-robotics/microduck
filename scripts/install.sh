@@ -481,7 +481,7 @@ EOF
 # Taken from the installed release rather than from the repository, so it is the copy a
 # signature was checked against.
 create_group() {
-    say "creating the robot group and the service accounts"
+    say "creating the robot groups and the service accounts"
 
     # Every sysusers file the release ships, read from the directory rather than named one by
     # one. `hooks/postinstall` already installs them this way on update, and the two lists
@@ -520,6 +520,12 @@ create_group() {
     fi
     if ! getent group robot >/dev/null; then
         die "the robot group could not be created; updaterd.service will not start without it"
+    fi
+    if ! getent group robot-account >/dev/null; then
+        groupadd --system robot-account
+    fi
+    if ! getent group robot-account >/dev/null; then
+        die "the robot-account group could not be created; mediad.service will not start without it"
     fi
 
     add_operator_to_group
