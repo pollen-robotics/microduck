@@ -16,16 +16,19 @@ policy, safety, fall detection, kinematics, odometry, the whole IPC surface — 
 runs, unchanged and unable to tell. `tofd --sim` gets its 8×8 depth frames from the same simulator;
 `mediad --sim-camera` gets a rendered head-camera image, mounted a quarter turn off like the real one.
 `configd` and `updaterd` run too, unchanged, which is what gives a simulated duck a serial, a name
-and a Hugging Face account it can be reached through from off this network.
+and a Hugging Face account it can be reached through from off this network. Under `up`, `mapd` and
+`autod` run too, idle until autonomy is switched on: `scripts/duck-sim ctl autonomous on` is the
+duck on its own, mapping as it goes, and `~/.cache/duck-sim/duck-a-auto.log` says what its brain
+is doing.
 
 The MuJoCo half lives in [`microduck_rl`](https://github.com/pollen-robotics/microduck_rl) as
 `duck-body`: one process, one window, N duck bodies in one scene, with the BAM actuator models the
 policies were trained against.
 
 **What it is good for:** anything in the daemons and their clients — IPC, `robotctl`, the console,
-the updater, the chorale, policies standing and walking, mapping. **What it cannot tell you:**
-anything in a driver. The Dynamixel bus, the BLE radio, the camera ISP, the NPU and the hardware
-encoder are absent, not modelled; a bug in one of those is only visible on a robot.
+the updater, the chorale, policies standing and walking, mapping, autonomy. **What it cannot tell
+you:** anything in a driver. The Dynamixel bus, the BLE radio, the camera ISP, the NPU and the
+hardware encoder are absent, not modelled; a bug in one of those is only visible on a robot.
 
 ## What you need
 
@@ -206,16 +209,27 @@ target/debug/configd --socket /tmp/d/duck-a-config.sock --state-dir /tmp/d/duck-
     --simulated sim-duck-a --fake-net --fake-pads
 target/debug/updaterd --config /tmp/d/updater.toml --socket /tmp/d/duck-a-updater.sock \
     --token /tmp/d/duck-a/hf-token
+# the duck on its own: the map and the brain (systemd makes autod's state directory on a robot)
+mkdir -p /tmp/d/duck-a/autod
+target/debug/mapd --config <params.toml> --map /tmp/d/duck-a/map.json \
+    --socket /tmp/d/duck-a-map.sock --robot-socket /tmp/d/duck-a.sock \
+    --tof-socket /tmp/d/duck-a-tof.sock
+target/debug/autod --socket /tmp/d/duck-a.sock --tof-socket /tmp/d/duck-a-tof.sock \
+    --map-socket /tmp/d/duck-a-map.sock --config <params.toml> --state-dir /tmp/d/duck-a/autod
 # a camera, if duck-body was started with --cameras a
 printf '[media]\nquality = "360p30"\n' > /tmp/d/mediad.toml
 target/debug/mediad --sim-camera 127.0.0.1:7901 --config /tmp/d/mediad.toml \
     --robot-socket /tmp/d/duck-a.sock --tof-socket /tmp/d/duck-a-tof.sock \
     --config-socket /tmp/d/duck-a-config.sock --updater-socket /tmp/d/duck-a-updater.sock \
-    --token /tmp/d/duck-a/hf-token
+    --frame-socket /tmp/d/duck-a-frame.sock --token /tmp/d/duck-a/hf-token
 ```
 
 Off Linux, `mediad` wants building with its pipeline: `cargo build -p mediad --features gstreamer`.
 Without the feature it starts, says so, and exits.
+
+`mediad` answers laser and ball sightings on its `--frame-socket`, and `robotd` finds it through
+`[laser] socket` and `[soccer] socket` in its params: put `/tmp/d/duck-a-frame.sock` in both, as
+`scripts/duck-sim` does, or laser tracking and soccer look for the board's `/run/mediad/media.sock`.
 
 `--token` names the same file on both daemons — `updaterd` writes the credential there and `mediad`
 reads it. Point them at different files and the duck signs in and never registers.
