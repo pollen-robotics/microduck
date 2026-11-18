@@ -1284,8 +1284,13 @@ async fn tree(client: &reqwest::Client, repo: &str, revision: &str) -> Result<Ve
 }
 
 /// The commit a revision points at, so a moving branch can be noticed later.
-async fn commit_of(client: &reqwest::Client, repo: &str, revision: &str) -> Option<String> {
-    let url = format!("https://huggingface.co/api/models/{repo}/revision/{revision}");
+async fn commit_of(
+    client: &reqwest::Client,
+    repo: &str,
+    revision: &str,
+    hub: &str,
+) -> Option<String> {
+    let url = format!("{hub}/api/models/{repo}/revision/{revision}");
     let bytes = http::get_bytes(client, &url, None).await.ok()?;
     let info: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     info.get("sha")?.as_str().map(str::to_owned)
@@ -1327,6 +1332,27 @@ pub async fn fetch(
     expected: Expectations,
     in_use: Option<&[String]>,
 ) -> Result<crate::proto::PolicyFetchResult, Error> {
+    fetch_at(
+        library,
+        repo,
+        revision,
+        file,
+        expected,
+        in_use,
+        "https://huggingface.co",
+    )
+    .await
+}
+
+async fn fetch_at(
+    library: &Path,
+    repo: &str,
+    revision: Option<&str>,
+    file: Option<&str>,
+    expected: Expectations,
+    in_use: Option<&[String]>,
+    hub: &str,
+) -> Result<crate::proto::PolicyFetchResult, Error> {
     // A repo is `org/name`, and nothing else. Checked before it is pasted into a URL and before
     // any of it becomes a directory name.
     let Some((org, name)) = repo.split_once('/') else {
@@ -1351,7 +1377,7 @@ pub async fn fetch(
 
     // The manifest first, so a policy that says it cannot work here costs one small request
     // rather than a download and a refusal from the control loop.
-    let manifest_url = format!("https://huggingface.co/{repo}/resolve/{revision}/manifest.json");
+    let manifest_url = format!("{hub}/{repo}/resolve/{revision}/manifest.json");
     let manifest: PolicyManifest = match http::get_bytes(&client, &manifest_url, None).await {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         // No manifest is not a fault. Plenty of repos will not have one, and the shape gate at
@@ -1395,9 +1421,14 @@ pub async fn fetch(
     // Staged beside the destination, so a download interrupted halfway is never a file a slot
     // could be pointed at.
     let staged = dir.join(format!("{file}.part"));
+    // A killed fetch leaves the partial, and `download_to` resumes it. This URL is a branch:
+    // the bytes behind it change, and unlike a release artifact nothing hashes them afterwards.
+    // Resuming would splice the old prefix onto today's file and rename that into the library.
+    // The set installer deletes its staging directory first, for the same reason.
+    let _ = std::fs::remove_file(&staged);
     let (progress, mut drain) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move { while drain.recv().await.is_some() {} });
-    let url = format!("https://huggingface.co/{repo}/resolve/{revision}/{file}");
+    let url = format!("{hub}/{repo}/resolve/{revision}/{file}");
     http::download_to(&client, &url, &staged, None, &progress)
         .await
         .inspect_err(|_| {
@@ -1411,7 +1442,7 @@ pub async fn fetch(
 
     prune_library(&library.join(org).join(name), revision, in_use);
 
-    let commit = commit_of(&client, repo, revision).await;
+    let commit = commit_of(&client, repo, revision, hub).await;
     let record = format!(
         "repo={repo}\nversion={revision}\ncommit={}\nfile={file}\nfetched={}\n",
         commit.as_deref().unwrap_or("unknown"),
@@ -1713,4 +1744,71 @@ fn preview_in(files: &[String]) -> Option<&String> {
             .filter(|f| ends_with_any(f, &[".gif"]))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use axum::Router;
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+
+    /// Not a prefix of anything a resumed download would append.
+    const STALE: &[u8] = b"STALE!!";
+    const FRESH: &[u8] = b"fresh-policy-weights-from-the-retrained-main";
+
+    async fn onnx(headers: HeaderMap) -> impl IntoResponse {
+        let full = FRESH.to_vec();
+        let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+            return (StatusCode::OK, full).into_response();
+        };
+        let start: usize = range
+            .trim_start_matches("bytes=")
+            .trim_end_matches('-')
+            .parse()
+            .unwrap_or(0);
+        (
+            StatusCode::PARTIAL_CONTENT,
+            full[start.min(full.len())..].to_vec(),
+        )
+            .into_response()
+    }
+
+    /// A fetch that died left `walk.onnx.part`. `main` has since been retrained, and the server
+    /// answers `Range` with the new tail. The installed file must be the new policy, not the old
+    /// prefix with the new tail spliced on.
+    #[tokio::test]
+    async fn a_leftover_partial_is_not_spliced_onto_the_new_policy() {
+        let app = Router::new().route("/org/gait/resolve/main/walk.onnx", get(onnx));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let library = tempfile::tempdir().unwrap();
+        let staged = library.path().join("org/gait/main/walk.onnx.part");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, STALE).unwrap();
+        assert_ne!(&FRESH[..STALE.len()], STALE);
+
+        let result = fetch_at(
+            library.path(),
+            "org/gait",
+            Some("main"),
+            Some("walk.onnx"),
+            Expectations::here(None),
+            None,
+            &format!("http://{addr}"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&result.path).unwrap(),
+            FRESH,
+            "the installed policy is the old prefix plus the new tail"
+        );
+    }
 }
