@@ -390,6 +390,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
+    feature(
+        "safety.limp_fall_standup",
+        Kind::Bool,
+        "Re-pose and retry a stand-up that stalls; off for robotctl stress",
+    ),
     entry(
         "safety.limp_fall_standup_ms",
         Kind::Integer,
@@ -1688,6 +1693,7 @@ mod tests {
                 "policy.allow_community",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
+                "safety.limp_fall_standup",
                 "duck_detector.enabled",
                 "chorale.accept",
                 "idle.enabled",

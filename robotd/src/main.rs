@@ -4225,6 +4225,7 @@ async fn control_loop<T: RobotIo>(
             // standing passes in `limp_fall_arm_ms`. Kept, not restarted, across a retry's own
             // hand-back, or the retries would never run out.
             if params.safety.limp_fall
+                && params.safety.limp_fall_standup
                 && params.safety.limp_fall_standup_retries > 0
                 && standup.is_none()
             {

@@ -371,6 +371,11 @@ mode = "walk"
 # Out of retries, the robot is parked: stiff at the home pose, policy off, nothing grinding.
 # Stand it on its feet and let go — upright and still (under `limp_fall_still_rate`) for
 # `limp_fall_standup_resume_ms` — and the policy takes it back by itself. Start twice works too.
+#
+# `limp_fall_standup = false` turns all of it off. Do that on a robot running `robotctl stress`:
+# the stress test has its own get-up timeout (7 s) and reset, and with both on, every slow or
+# failed get-up also gets re-posed from the floor every 3 s on top of the test's own reset.
+# limp_fall_standup = true
 # limp_fall_standup_ms = 3000
 # limp_fall_standup_retries = 3
 # limp_fall_standup_resume_ms = 1000

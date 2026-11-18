@@ -642,6 +642,8 @@ a row. A disable, a skill or a sit drops the watch. Out of retries, the robot ho
 `alarm`, once) and is parked: stiff at the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
 upright and still for `limp_fall_standup_resume_ms` (1 s), which is somebody standing it on its
 feet and letting go, and then the policy takes it back. Start twice also ends the park.
+`limp_fall_standup = false` turns the watch off; a robot under `robotctl stress` wants it off,
+since the test runs its own get-up timeout and reset and the two would stack.
 
 It runs off the policy's path by construction: `driving` is false for the whole sequence
 (§1.4), so the targets come from the sequence rather than the controller, and they reach the
