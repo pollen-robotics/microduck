@@ -759,6 +759,12 @@ pub mod socket {
     /// [`super::method::PHOTO_DELETE`]. Under `/run/nfcd/`, its
     /// `RuntimeDirectory=`, for the same reason as the pad's.
     pub const NFC: &str = "/run/nfcd/nfc.sock";
+
+    /// `btd`'s wifi lane: a `btd` session — Bluetooth's routing table, word for word — for a phone
+    /// on the robot's network. Not for clients on the robot: `duck-gateway` is the only one, and
+    /// it connects only after the phone has proved the setup code. Under `/run/btd/`, `btd`'s
+    /// `RuntimeDirectory=`, mode 0600, owned by `btd`, which `duck-gateway` also runs as.
+    pub const BTD_LANE: &str = "/run/btd/lane.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
