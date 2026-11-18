@@ -1,0 +1,10 @@
+# The offline tools that turn microduck_rl's model and the official policies into app assets.
+# Versions are microduck_rl's uv.lock, so the motions are recorded against the same physics and
+# actuator model the policies were trained on.
+mujoco==3.10.0
+onnxruntime==1.24.4
+better-actuator-models==1.0.1
+numpy==2.4.1
+# Decimation for the meshes: the CAD export draws ~740k triangles, which a phone should not.
+# export_model.py says why this one and not fast-simplification.
+meshoptimizer==0.2.30a0
