@@ -82,6 +82,9 @@ ExecStopPost=-/bin/sh -c 'cd /sys/class/leds 2>/dev/null || exit 0; for l in fac
 # The startup identity line (version, revision, exe path) is at `warn`, so it survives even
 # RUST_LOG=warn. See deploy/README.md for log retention.
 Environment=RUST_LOG=info
+# The runtime library's versioned name, not `ort`'s default `libonnxruntime.so`: a bare `.so` is
+# the -dev symlink, which an OS image does not ship. hooks/preinstall and setup-board.sh make it.
+Environment=ORT_DYLIB_PATH=libonnxruntime.so.1
 StandardOutput=journal
 StandardError=journal
 

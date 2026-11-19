@@ -30,6 +30,7 @@ set -eu
 ONNX_FLOOR="@ONNX_FLOOR@"
 ONNX_TARGET="@ONNX_TARGET@"
 ONNX_LIB_DIR=/usr/local/lib
+ONNX_STAMP=/usr/lib/libonnxruntime.version
 
 # Below the updater's 120s ceiling on a hook, so a slow network produces our message naming
 # the fix rather than a bare "timed out after 120s".
@@ -40,10 +41,16 @@ die() { printf 'preinstall: %s\n' "$*" >&2; exit 1; }
 
 # The version ONNX Runtime is installed at, or empty.
 #
-# The tarball lays down `libonnxruntime.so.<version>` with the bare name as a symlink, so the
-# resolved target names the version without running anything. Asking the library itself would
-# mean dlopening it, which is what we are trying to avoid doing unsafely.
+# The OS image's package writes its version to ONNX_STAMP, as it does for librknnrt. A board
+# without one (Armbian, set up by this hook or setup-board.sh) has the tarball's
+# `libonnxruntime.so.<version>` with the bare name as a symlink, so the resolved target names the
+# version. Either way nothing is run: asking the library itself would mean dlopening it, which is
+# what we are trying to avoid doing unsafely.
 installed_onnx() {
+    if [ -r "$ONNX_STAMP" ]; then
+        tr -d ' \n' < "$ONNX_STAMP"
+        return
+    fi
     resolved="$(readlink -f "${ONNX_LIB_DIR}/libonnxruntime.so" 2>/dev/null || true)"
     case "$resolved" in
         */libonnxruntime.so.*) printf '%s' "${resolved##*/libonnxruntime.so.}" ;;
@@ -109,6 +116,9 @@ install_onnx() {
 
     install -m 0644 "$found" "${ONNX_LIB_DIR}/$(basename "$found")"
     ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so"
+    # The name robotd and mediad load (ORT_DYLIB_PATH in their units). ldconfig would make it
+    # from the SONAME too, but not on a board without ldconfig.
+    ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so.1"
 
     # ldconfig lives in /usr/sbin, which a hook's minimal PATH does include — but check
     # anyway, because a freshly copied library that dlopen cannot find is the same failure
