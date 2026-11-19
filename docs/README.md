@@ -70,6 +70,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | [`slice-2-bringup.md`](project/slice-2-bringup.md) | What a real Radxa Zero 3W did with slice 2. |
 | [`update-over-ble.md`](project/update-over-ble.md) | Driving the update path from a phone: what it turned up, and what rollback over a radio was decided on. |
 | [`media-bringup.md`](project/media-bringup.md) | What a Radxa Zero 3W does about video: the VPU, what MPP needs, and the two plugins that have to be built. |
+| [`ble-robustness-review.md`](project/ble-robustness-review.md) | The BLE stack from Yocto to the phone app, read for how it fails: what can move the robot or leave it unreachable, what degrades, and what nothing tests. |
 | [`pad-minimal-pairing.md`](project/pad-minimal-pairing.md) | The smallest board configuration a gamepad will bond under, found by taking one away at a time. |
 | [`idle-cpu.md`](project/idle-cpu.md) | What the daemons do when nobody is asking them to: four things that stopped, two that were measured and left alone, and what still wants a board. |
 | [`tof-on-demand.md`](project/tof-on-demand.md) | `tofd`'s idle 5% is nine parts head IMU to one part depth, and the IMU has no consumer. Why the laser and the unit were left alone and the IMU got a switch. |
