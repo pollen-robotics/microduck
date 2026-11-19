@@ -324,6 +324,8 @@ install_onnxruntime() {
 
     install -m 0644 "$found" "${ONNX_LIB_DIR}/$(basename "$found")"
     ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so"
+    # The name robotd and mediad load (ORT_DYLIB_PATH in their units).
+    ln -sf "$(basename "$found")" "${ONNX_LIB_DIR}/libonnxruntime.so.1"
 
     # ldconfig lives in /usr/sbin, often absent from a login PATH, so `command -v` would
     # report it missing and skip the refresh — leaving the freshly copied library

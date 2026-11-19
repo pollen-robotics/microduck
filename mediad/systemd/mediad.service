@@ -114,6 +114,8 @@ ExecStopPost=-/bin/sh -c 'cd /sys/class/leds 2>/dev/null || exit 0; for l in fac
 # and webrtcsink do not exist, and the daemon says so and exits.
 Environment=GST_PLUGIN_PATH=/usr/local/lib/gstreamer-1.0
 Environment=RUST_LOG=info
+# The duck detector's CPU fallback loads ONNX Runtime. Versioned name, as in robotd.service.
+Environment=ORT_DYLIB_PATH=libonnxruntime.so.1
 StandardOutput=journal
 StandardError=journal
 

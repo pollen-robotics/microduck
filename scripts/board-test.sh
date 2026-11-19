@@ -713,6 +713,15 @@ grep -q "1.20.1 is below 1.23" /tmp/hook2.log
 grep -q "cannot download ONNX Runtime" /tmp/hook2.log
 echo "    [ok] preinstall refuses an old runtime it cannot replace, naming the fix"
 
+# The OS image: no /usr/local/lib link at all, only the package's version stamp. curl fails, so
+# passing proves the hook read the stamp instead of trying to download.
+rm -f /usr/local/lib/libonnxruntime.so*
+echo 1.28.0 > /usr/lib/libonnxruntime.version
+PATH="/stubfail:$PATH" /tmp/preinstall > /tmp/hook3.log 2>&1
+grep -q "1.28.0 satisfies" /tmp/hook3.log
+rm -f /usr/lib/libonnxruntime.version
+echo "    [ok] preinstall reads the OS image's version stamp"
+
 # ── installing a real artifact: scripts/install.sh and hooks/postinstall ──
 #
 # The gap docs/project/install-path-gap.md option B names. Everything above drives the engine, which
