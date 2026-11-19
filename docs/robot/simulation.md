@@ -62,7 +62,7 @@ user did not exist, so its unit never started — a class `up` cannot see at all
 ```sh
 scripts/duck-sim                # a MuJoCo window opens, the duck stands up, and it is yours
 scripts/duck-sim status         # health, and whether it is standing
-scripts/duck-sim drive          # walk forward for 8 s (args: vx vyaw, default 0.15 0)
+scripts/duck-sim drive 0.20 0   # walk forward for 8 s with policy set v10
 scripts/duck-sim ctl health     # anything robotctl does, aimed at this duck
 scripts/duck-sim monitor        # robotctl monitor: joints, IMU, ToF, sticks
 scripts/duck-sim log            # robotd's log
@@ -71,7 +71,11 @@ scripts/duck-sim realtime       # how fast the world is running (see below)
 scripts/duck-sim down
 ```
 
-Without an argument the script builds the daemons from the branch you are on, writes a params file
+`drive` defaults to 0.15 m/s forward and zero turn. With policy set v10 that command barely
+moves the duck in the default scene. See the
+[walking and turning measurements](../design/simulation.md#11-ways-to-pick-the-wrong-model).
+
+`scripts/duck-sim up` builds the daemons from the branch you are on, writes a params file
 naming the policies in this repo, starts `duck-body`, `tofd --sim` and `robotd --sim` under
 `~/.cache/duck-sim`, and enables the standing policy. `ctl` is `robotctl` pointed at that duck's
 sockets, which is the only thing that is different from a robot: on a board the sockets are under
