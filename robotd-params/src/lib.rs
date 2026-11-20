@@ -2139,6 +2139,20 @@ pub struct SkillDef {
     #[serde(default)]
     pub chain: bool,
 
+    /// Whether it may start from the seat. **Off by default, and off for every built-in.**
+    ///
+    /// A seated robot refuses every move but standing up, because a kick or a roll started from
+    /// the seat throws it over — and a pad button pressed by accident while the duck sits is
+    /// exactly how that used to happen. A policy trained *from* the seat — the MicroDock v2's
+    /// scoot, which shuffles on its seat and starts from the pose `alpha_sitstand` sits in — is
+    /// the one thing that wants the opposite, so it says so here, one skill at a time.
+    ///
+    /// Started from the seat, it hands back to the seat: when its window ends, the sitstand
+    /// network holds the seat again, as it did before. Started standing it runs like any other
+    /// skill — the flag allows the seat, it does not require it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub from_seat: bool,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
@@ -2491,6 +2505,7 @@ fn fallback_skills() -> Vec<SkillDef> {
         path: Some(PathBuf::from(POLICY_DIR).join(file)),
         duration: 0.5,
         chain: false,
+        from_seat: false,
         command: [0.0; 3],
         unwind: [0.0; 3],
         unwind_s: 0.0,
@@ -2505,6 +2520,7 @@ fn fallback_skills() -> Vec<SkillDef> {
             // Holding the button chains rolls, which is how the prototype maps a held trigger
             // onto a one-shot.
             chain: true,
+            from_seat: false,
             command: [0.0; 3],
             unwind: [0.0; 3],
             unwind_s: 0.0,
@@ -3693,6 +3709,10 @@ impl Params {
 fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String>) {
     fields.retain(|key, value| {
         let path = format!("{prefix}.{key}");
+        if path == "policy.skill" {
+            prune_skills(value, ignored);
+            return true;
+        }
         if registry::entry_for(&path).is_some() {
             return true;
         }
@@ -3708,6 +3728,62 @@ fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String
         ignored.push(path);
         false
     });
+}
+
+/// Every key a `[[policy.skill]]` entry may carry, and its `params` table's — [`SkillDef`] and
+/// [`SkillOverrides`] as serde names them. Pinned to the structs by
+/// `skill_keys_are_every_skill_field`.
+const SKILL_KEYS: &[&str] = &[
+    "name",
+    "path",
+    "duration",
+    "command",
+    "unwind",
+    "unwind_s",
+    "chain",
+    "from_seat",
+    "params",
+];
+const SKILL_PARAMS_KEYS: &[&str] = &["action_scale", "gain_ratio"];
+
+/// [`prune_fields`] for the skill table, which the registry knows only as one entry.
+///
+/// **A skill entry is where a newer build's key is likeliest to land**, because `robotctl policy
+/// add` writes it there: `from_seat`, written by a build that has it, used to make an older build
+/// refuse the whole file — and a `robotd` that will not start, over a skill nobody pressed.
+/// Dropped and named instead, the skill still loads with what this build understands of it.
+fn prune_skills(value: &mut toml::Value, ignored: &mut Vec<String>) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let Some(fields) = entry.as_table_mut() else {
+            continue;
+        };
+        let name = fields
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("?")
+            .to_owned();
+        fields.retain(|key, value| {
+            if key == "params"
+                && let Some(params) = value.as_table_mut()
+            {
+                params.retain(|k, _| {
+                    let known = SKILL_PARAMS_KEYS.contains(&k);
+                    if !known {
+                        ignored.push(format!("policy.skill[{name}].params.{k}"));
+                    }
+                    known
+                });
+            }
+            let known = SKILL_KEYS.contains(&key);
+            if !known {
+                ignored.push(format!("policy.skill[{name}].{key}"));
+            }
+            known
+        });
+    }
 }
 
 /// Re-parse a file that `deny_unknown_fields` rejected, dropping the keys this build has no
@@ -4248,6 +4324,58 @@ mod tests {
         assert_eq!(pad.y, "excited");
         assert_eq!(pad.lb, "yes");
         assert_eq!(pad.rb, "no");
+    }
+
+    /// **A key a newer build wrote into a skill entry is dropped, not fatal** — the skill loads
+    /// with what this build knows of it, and the rest of the file with it.
+    #[test]
+    fn an_unknown_key_in_a_skill_entry_drops_the_key_not_the_file() {
+        let text = "[control]\nhz = 50\n\n[[policy.skill]]\nname = \"scoot\"\nduration = 2.5\n\
+                    from_seat = true\nsomething_newer = 3\n[policy.skill.params]\ngain_ratio = 0.5\n\
+                    later = 1\n";
+        let (params, ignored) = Params::parse(text).expect("parses");
+        assert_eq!(
+            ignored,
+            vec![
+                "policy.skill[scoot].params.later".to_owned(),
+                "policy.skill[scoot].something_newer".to_owned(),
+            ]
+        );
+        let scoot = &params.policy.skills[0];
+        assert!(scoot.from_seat && scoot.duration == 2.5);
+        assert_eq!(scoot.params.gain_ratio, Some(0.5));
+    }
+
+    /// The pruner's list of skill keys is every field serde knows, and nothing else — or a key a
+    /// build *does* understand would be pruned, or one it does not would still be fatal.
+    #[test]
+    fn skill_keys_are_every_skill_field() {
+        let full = SkillDef {
+            name: "x".into(),
+            path: Some(PathBuf::from("/x.onnx")),
+            duration: 1.0,
+            command: [1.0; 3],
+            unwind: [1.0; 3],
+            unwind_s: 1.0,
+            chain: true,
+            from_seat: true,
+            params: SkillOverrides {
+                action_scale: Some(1.0),
+                gain_ratio: Some(1.0),
+            },
+        };
+        let table = toml::Table::try_from(&full).expect("serialises");
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut expected = SKILL_KEYS.to_vec();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+        let params = table["params"].as_table().expect("params");
+        let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        let mut expected = SKILL_PARAMS_KEYS.to_vec();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is

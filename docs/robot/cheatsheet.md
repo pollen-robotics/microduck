@@ -392,6 +392,14 @@ when you do, since removing the entry only removes the override.
 The robot must be driving for a skill to run — press **Start** on the pad first, or the request
 is refused saying so.
 
+A seated robot refuses every skill — a kick from the seat throws it over. A policy trained *from*
+the seat is the exception, and has to be allowed explicitly; it ends seated, and standing up is
+still A:
+
+```
+sudo robotctl policy add scoot scoot_dock.onnx --hold 2.5 --command -0.05,0,0 --from-seat
+```
+
 #### Putting a skill on a button
 
 ```
@@ -771,7 +779,7 @@ the thumb:
 | **Select**, held 4 s | power off (`robot.shutdown`): kept by the robot until the rest it started at 2 s has ended, then the board switches off. The release afterwards does nothing more |
 
 **One move at a time.** A kick, a pick or a sit is refused while another is running, and a
-seated robot only accepts A (stand up). Stopping the policy while it sits keeps it seated; cutting
+seated robot only accepts A (stand up) — and a skill added `--from-seat`. Stopping the policy while it sits keeps it seated; cutting
 torque or rebooting the servos forgets the seat entirely.
 
 The D-pad selects rather than toggles: a press lands in the mode its arrow names, whatever mode

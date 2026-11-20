@@ -1617,6 +1617,11 @@ enum PolicyCommand {
         /// The twist fed while it unwinds. Zeros unless given.
         #[arg(long, value_name = "X,Y,Z")]
         unwind_command: Option<String>,
+        /// Allow it to start while the robot sits, for a policy trained from the seat. When it
+        /// ends, the robot is seated again. Without this a seated robot refuses it, as it refuses
+        /// every move but standing up.
+        #[arg(long)]
+        from_seat: bool,
         #[arg(long)]
         json: bool,
     },
@@ -4662,6 +4667,7 @@ fn run_policy_skill(
         unwind,
         command: command_spec,
         unwind_command,
+        from_seat,
         json,
     } = command
     else {
@@ -4734,6 +4740,10 @@ fn run_policy_skill(
         // Whether a held button chains another run is the policy's to say — the roulade does,
         // a kick does not — and the manifest is where it says it.
         chain: from_manifest.as_ref().is_some_and(|m| m.chain),
+        // Only on the command line. A manifest's `entry_pose` says where a policy was trained
+        // from, but letting a downloaded file switch off the seat's guard is a decision to take
+        // at the robot, by the person watching it.
+        from_seat: *from_seat,
         command: command_spec
             .as_deref()
             .map(twist_of)
@@ -4766,6 +4776,9 @@ fn run_policy_skill(
         return Ok(());
     }
     println!("{name} added, {duration}s");
+    if skill.from_seat {
+        println!("  allowed from the seat: started sitting, it ends sitting");
+    }
     if skill.unwind_s > 0.0 {
         println!(
             "  then {}s coming back before the gait takes over",

@@ -34,7 +34,8 @@
 //!
 //! A second: **one move at a time, and none from the seat** ([`Controller::move_blocked`]). The
 //! prototype let a pick preempt a kick's tail and a chaining skill roll out of a kick or the seat;
-//! here each is refused, and a seated robot accepts only standing up.
+//! here each is refused, and a seated robot accepts only standing up — and a skill configured
+//! `from_seat`, which runs in the seat's place and hands the seat back when it ends.
 
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
@@ -349,7 +350,11 @@ impl Controller {
     /// One move at a time, and none from the seat: a kick or a pick from a sitting robot
     /// throws it over, and one move started inside another hands the second network a robot
     /// mid-pose it was never trained from.
-    fn move_blocked(&self) -> Option<&'static str> {
+    ///
+    /// `from_seat` is the one exception to the second rule, for a skill trained from the seat
+    /// ([`robotd_params::SkillDef::from_seat`]). Only from a *settled* seat: on the way down the
+    /// robot is still travelling, and a seat about to rise by itself is about to be a stand.
+    fn move_blocked(&self, from_seat: bool) -> Option<&'static str> {
         if self.ground_pick.is_some() {
             return Some("a ground pick is running");
         }
@@ -357,7 +362,10 @@ impl Controller {
             return Some("a scripted move is already running");
         }
         match self.sit {
-            Sit::Sitting => Some("the robot is sitting — stand it up first"),
+            Sit::Sitting if !from_seat => Some("the robot is sitting — stand it up first"),
+            Sit::Sitting if self.sit_settle > 0.0 => Some("still sitting down"),
+            Sit::Sitting if self.auto_rise => Some("the robot is standing up"),
+            Sit::Sitting => None,
             Sit::Rising { .. } => Some("the robot is standing up"),
             Sit::Up => None,
         }
@@ -392,7 +400,7 @@ impl Controller {
         if !self.policy.has_ground_pick() {
             return Err("no ground-pick policy loaded");
         }
-        if let Some(reason) = self.move_blocked() {
+        if let Some(reason) = self.move_blocked(false) {
             return Err(reason);
         }
         self.ground_pick = Some(0.0);
@@ -418,11 +426,15 @@ impl Controller {
     /// running skill accepts is a request for itself when it chains: that is the button being
     /// held, not a second move. The prototype also let a chaining skill preempt a kick's tail or
     /// roll out of the seat; both were a move started from a pose it was not trained from.
+    ///
+    /// A skill configured `from_seat` may start from a settled seat. Nothing about the seat
+    /// changes: the skill outranks the sitstand network while it runs, and when it ends the seat
+    /// is still the seat, so the sitstand network holds it again.
     pub fn start_skill(&mut self, index: usize) -> Result<bool, &'static str> {
         let Some(def) = self.skills.skills.get(index) else {
             return Err("no such skill on this robot");
         };
-        let (duration, chains) = (def.duration, def.chain);
+        let (duration, chains, from_seat) = (def.duration, def.chain, def.from_seat);
 
         if let Some(active) = &mut self.active
             && active.index == index
@@ -431,7 +443,7 @@ impl Controller {
             active.chain = CHAIN_WINDOW;
             return Ok(false);
         }
-        if let Some(reason) = self.move_blocked() {
+        if let Some(reason) = self.move_blocked(from_seat) {
             return Err(reason);
         }
         self.active = Some(ActiveSkill {
@@ -859,7 +871,8 @@ mod tests {
     }
 
     /// A controller with every slot loaded — the feedforward fixture stands in for each net, which
-    /// is all the gating needs — and two skills: a kick that does not chain and a roll that does.
+    /// is all the gating needs — and three skills: a kick that does not chain, a roll that does,
+    /// and a scoot allowed from the seat.
     fn full_controller() -> Controller {
         let net = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../duck-control/tests/fixtures/feedforward.onnx");
@@ -868,7 +881,7 @@ mod tests {
                 walk: net.clone(),
                 sitstand: Some(net.clone()),
                 ground_pick: Some(net.clone()),
-                skills: vec![net.clone(), net],
+                skills: vec![net.clone(), net.clone(), net],
                 ..Default::default()
             },
             0.05,
@@ -884,7 +897,14 @@ mod tests {
             policy,
             Tuning::default(),
             SkillTuning {
-                skills: vec![skill("kick_left", 0.5, false), skill("roulade", 1.0, true)],
+                skills: vec![
+                    skill("kick_left", 0.5, false),
+                    skill("roulade", 1.0, true),
+                    robotd_params::SkillDef {
+                        from_seat: true,
+                        ..skill("scoot", 1.0, false)
+                    },
+                ],
                 ..SkillTuning::default()
             },
         )
@@ -918,6 +938,45 @@ mod tests {
         assert!(c.start_ground_pick().is_err(), "not while it rises");
         tick(&mut c, 1.1);
         assert_eq!(c.start_ground_pick(), Ok(()), "standing again, it may");
+    }
+
+    /// **A skill configured `from_seat` starts from a settled seat and ends in it.** Not on the
+    /// way down, and the seat is the seat again afterwards — the sitstand network holds it, and
+    /// standing up is still the sit toggle's.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_from_seat_skill_runs_from_the_seat_and_hands_it_back() {
+        let mut c = full_controller();
+        assert_eq!(c.sit_toggle(), Ok("sit"));
+        tick(&mut c, 1.0);
+        assert!(c.start_skill(2).is_err(), "not while still sitting down");
+        tick(&mut c, 2.0);
+
+        assert_eq!(c.start_skill(2), Ok(true), "from the settled seat");
+        assert!(
+            c.start_skill(0).is_err(),
+            "and it is still one move at a time"
+        );
+        assert!(c.sit_toggle().is_err(), "no standing up out of it");
+        tick(&mut c, 0.1);
+        assert_eq!(c.driving(), Some(Driving::Skill("scoot".into())));
+        assert!(c.is_sitting() && c.busy());
+
+        tick(&mut c, 1.0);
+        assert!(!c.busy(), "it has ended");
+        assert_eq!(c.driving(), Some(Driving::Seated), "back in the seat");
+        assert!(c.start_skill(0).is_err(), "which still refuses a kick");
+        assert_eq!(c.sit_toggle(), Ok("stand"));
+    }
+
+    /// The flag allows the seat; it does not require it. Standing, a from-seat skill is a skill.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_from_seat_skill_still_runs_standing() {
+        let mut c = full_controller();
+        assert_eq!(c.start_skill(2), Ok(true));
+        tick(&mut c, 1.1);
+        assert!(!c.busy() && !c.is_sitting(), "and hands back to the gait");
     }
 
     /// The glide down into the seat is a move too: standing up halfway down is refused.

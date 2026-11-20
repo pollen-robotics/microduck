@@ -484,6 +484,9 @@ struct PolicyNames {
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
     skills: Vec<String>,
+    /// The ones of those configured `from_seat` — the only skills a seated robot will start, so
+    /// the only ones `robot.do` accepts while it sits.
+    from_seat: Vec<String>,
 }
 
 impl PolicyNames {
@@ -499,6 +502,12 @@ impl PolicyNames {
             sitstand: name(&policy.sitstand),
             ground_pick: name(&policy.ground_pick),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
+            from_seat: policy
+                .skills
+                .iter()
+                .filter(|s| s.from_seat)
+                .map(|s| s.name.clone())
+                .collect(),
         }
     }
 }
@@ -5578,6 +5587,10 @@ fn set_skill_request(
             .chain
             .or(existing.as_ref().map(|s| s.chain))
             .unwrap_or(false),
+        // Not on the wire: `robot.setSkill` keeps whatever the table says. Allowing a skill from
+        // the seat is a decision taken at the robot (`robotctl policy add --from-seat`), and an
+        // edit of its duration from an app must not quietly take it back.
+        from_seat: existing.as_ref().is_some_and(|s| s.from_seat),
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale
@@ -5953,6 +5966,31 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     names
 }
 
+/// Why a seated robot will not start `skill`, or `None` when the seat is no obstacle.
+///
+/// The loop refuses every move from the seat but standing up and a skill configured `from_seat`
+/// ([`control::Controller::start_skill`]), and says so only in the journal at debug level — it
+/// cannot do more, because a held pad button lands there fifty times a second. A request is the
+/// one place a caller is waiting for an answer, so it is refused here, with the loop's own words.
+///
+/// What this side cannot see is the glide down into a seat that was just asked for, which the
+/// loop also refuses; that window is two seconds after a sit, and a request in it is still
+/// "queued" and dropped. Emotions are left to the loop, which already sits for the ones that sit.
+fn seat_refusal(state: &RobotState, skill: &str) -> Option<String> {
+    if !state.sitting.load(Ordering::Relaxed) {
+        return None;
+    }
+    let policies = state.policies.load();
+    let is_move = skill == "ground_pick" || policies.skills.iter().any(|s| s == skill);
+    if !is_move || policies.from_seat.iter().any(|s| s == skill) {
+        return None;
+    }
+    Some(format!(
+        "the robot is sitting — stand it up first (`robotctl robot do sit_toggle`); \
+         {skill:?} is not allowed from the seat"
+    ))
+}
+
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     let policies = state.policies.load();
     match skill {
@@ -6042,6 +6080,8 @@ fn dispatch(
                 proto::IntentResult::refused(
                     "the robot is still going to its home pose; try again in a moment",
                 )
+            } else if let Some(reason) = seat_refusal(state, &p.skill) {
+                proto::IntentResult::refused(reason)
             } else if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
             } else {
@@ -7997,6 +8037,64 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+    }
+
+    /// **A seated robot refuses a move at the door**, with the loop's reason, rather than
+    /// answering "queued" and having the loop drop it into the debug log. The exceptions are
+    /// standing up, and a skill configured `from_seat`.
+    #[test]
+    fn robot_do_refuses_a_move_from_the_seat_unless_the_skill_allows_it() {
+        let mut params = Params::default();
+        params.policy.skills.push(params::SkillDef {
+            name: "scoot".into(),
+            duration: 2.5,
+            from_seat: true,
+            ..Default::default()
+        });
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Intents::new();
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
+        s.sitting.store(true, Ordering::Relaxed);
+        let ask = |skill: &str| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotDo(proto::DoParams {
+                    skill: skill.into(),
+                }),
+            )
+            .result_as()
+            .unwrap()
+        };
+
+        for skill in ["kick_left", "roulade", "ground_pick"] {
+            let refused = ask(skill);
+            assert!(!refused.accepted, "{skill} from the seat must be refused");
+            assert!(
+                refused.reason.as_deref().unwrap().contains("sitting"),
+                "and say why: {:?}",
+                refused.reason
+            );
+        }
+        let queued = intents.take_skills();
+        assert_eq!(queued.skills, 0, "a refusal must not queue");
+        assert!(!queued.ground_pick);
+
+        assert!(ask("sit_toggle").accepted, "standing up is the way out");
+        assert!(ask("scoot").accepted, "a from-seat skill is allowed");
+        assert!(intents.take_skills().skills != 0, "and queued");
+
+        // Standing, the flag changes nothing: every skill is accepted as before.
+        s.sitting.store(false, Ordering::Relaxed);
+        assert!(ask("kick_left").accepted);
+        assert!(ask("scoot").accepted);
     }
 
     /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the
