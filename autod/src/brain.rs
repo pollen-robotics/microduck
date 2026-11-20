@@ -14,6 +14,11 @@
 //! **Head pitch is "positive = look up"** here, the runtime's v1.5 convention. The alpha's
 //! `+head_pitch` looks down, and `main.rs` flips it on the way out.
 
+use std::time::{Duration, Instant};
+
+use kinematics::hand::Hand;
+use kinematics::offer::{self, Event as OfferEvent, Jaw};
+
 use crate::map::{self, Grid, Se2};
 use crate::obstacle::{FRESH_S, Obstacle, REACT_M, STALE_S, STOP_M};
 
@@ -31,6 +36,10 @@ pub enum Heard {
 pub enum Sound {
     Chirp,
     Coo,
+    /// The rising question: something is being offered.
+    Inquire,
+    /// The little retch of letting go of what the beak held.
+    Bwep,
 }
 
 /// Laser tracking, as `robot.state` reports it.
@@ -71,6 +80,18 @@ pub enum MapFix {
     Known(Se2),
 }
 
+/// What taking an offered object needs, once a tick (see [`kinematics::offer`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct OfferInput {
+    /// The nearest thing in front of the beak, from the head ToF ([`kinematics::hand`]).
+    pub hand: Option<Hand>,
+    /// The jaw's measured angle, and what it was commanded to, radians.
+    pub jaw_rad: Option<f64>,
+    pub jaw_target_rad: Option<f64>,
+    /// The jaw's current, mA.
+    pub jaw_ma: Option<f64>,
+}
+
 /// Everything the brain reads, once a tick.
 #[derive(Debug, Clone, Copy)]
 pub struct World {
@@ -93,6 +114,7 @@ pub struct World {
     pub laser: Laser,
     pub ball: Ball,
     pub map: MapFix,
+    pub offer: OfferInput,
 }
 
 /// One tick's output. Targets are smoothed by `robotd` (and by `head_alpha`); events are edges.
@@ -315,6 +337,31 @@ const BRACE_S: f64 = 1.0;
 const CREEP_REAR_M: f64 = 0.45;
 
 /// Wrap an angle to (-π, π].
+/// The mouth's commanded angle at "closed" is −5° (`duck_control::model::MOUTH_CLOSED`); a target
+/// at or below this is the beak commanded shut, and the jaw angle it settles at then is the
+/// empty-closed reference a grab is judged against.
+const JAW_SHUT_TARGET_RAD: f64 = -4.5 * std::f64::consts::PI / 180.0;
+/// How long the beak must have been commanded shut before its angle is believed as empty-closed.
+const JAW_SETTLE_S: f64 = 0.6;
+/// A gift still carried this long after the grab (the getaway was cut short) is dropped anyway (s).
+const HOLD_S: (f64, f64) = (10.0, 20.0);
+/// How far it runs once it has turned its back on the giver, by odometry (m).
+const RUN_M: (f64, f64) = (1.5, 2.5);
+/// A getaway that has not covered its distance in this long ends anyway (s).
+const RUN_MAX_S: f64 = 10.0;
+/// Dropping the gift, timed like the photo tag letting go of its e-ink display
+/// (`nfc/src/photo.rs`): head down, then the beak opens wide; the retch once the beak's motor has
+/// stopped (it drowns the sound otherwise); the beak shut again; the head back up.
+const DROP_LOWER_S: f64 = 0.8;
+const DROP_LET_GO_AFTER_S: f64 = 0.3;
+const DROP_OPEN_S: f64 = 1.2;
+const DROP_BACK_UP_S: f64 = 0.8;
+/// Where the head goes to drop, brain convention (pitch positive up), until `main.rs` hands over
+/// the joints `robot.look` solves for the photo tag's look-down point.
+const DROP_HEAD: [f64; 4] = [0.0, -0.7, 0.0, 0.0];
+/// An offer that has not resolved in this long is abandoned (the machine's own timeout is 8 s).
+const OFFERED_MAX_S: f64 = 15.0;
+
 pub fn wrap_angle(a: f64) -> f64 {
     (a + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
 }
@@ -390,6 +437,14 @@ pub enum State {
     /// Backing into a wall: everything stopped, body pose off, and a short step forward if the way
     /// ahead is clear.
     Brace,
+    /// Somebody is holding something out to the beak: stand still, beak open, and take it
+    /// ([`kinematics::offer`] decides when to close and whether it got it).
+    Offered,
+    /// Got it: spin away from the giver and scamper off with it, a couple of metres.
+    RunAway,
+    /// Let the gift go the way the photo tag lets go of its display: head down, beak wide, a
+    /// little retch. Then a sniff at it (a ground pick).
+    DropGift,
 }
 
 pub struct Brain {
@@ -508,6 +563,28 @@ pub struct Brain {
     backing_logged: bool,
     /// Last tick's body pose was active — for the log line that says why the duck backed up.
     was_posing: bool,
+    /// Taking an offered object: the shared state machine, run on the behaviour clock
+    /// (`epoch + clock`, so the soak test's time is its time).
+    offer: offer::Machine,
+    epoch: Instant,
+    /// The jaw's empty-closed angle, once measured; offers are not taken before.
+    jaw_closed: Option<f64>,
+    /// How long the beak has been commanded shut.
+    jaw_shut_for: f64,
+    /// RunAway: the heading away from the giver, whether it is still turning to it, and how long
+    /// it has run / will run once turned.
+    run_heading: f64,
+    run_turning: bool,
+    run_t: f64,
+    /// Where the run started (brain frame) and how far it goes.
+    run_from: [f64; 2],
+    run_m: f64,
+    /// How much longer a held gift is carried before it is dropped anyway (s).
+    hold_left: f64,
+    /// DropGift: the retch has played.
+    drop_sounded: bool,
+    /// The head for dropping, brain convention: [`DROP_HEAD`] until `main.rs` solves the real one.
+    drop_head: [f64; 4],
 }
 
 impl Brain {
@@ -580,7 +657,30 @@ impl Brain {
             back_v: 0.0,
             backing_logged: false,
             was_posing: false,
+            offer: offer::Machine::new(offer::Config::default(), 0.0),
+            epoch: Instant::now(),
+            jaw_closed: None,
+            jaw_shut_for: 0.0,
+            run_heading: 0.0,
+            run_turning: false,
+            run_t: 0.0,
+            run_from: [0.0; 2],
+            run_m: 0.0,
+            hold_left: 0.0,
+            drop_sounded: false,
+            drop_head: DROP_HEAD,
         }
+    }
+
+    /// The head joints for dropping a gift, brain convention (pitch positive up): what
+    /// `robot.look` answers for the photo tag's look-down point, so the two drops look the same.
+    pub fn set_drop_head(&mut self, head: [f64; 4]) {
+        self.drop_head = head;
+    }
+
+    /// The behaviour clock as an `Instant`, for the offer machine.
+    fn offer_now(&self) -> Instant {
+        self.epoch + Duration::from_secs_f64(self.clock)
     }
 
     /// A turn's forward speed: zero, except with a wall close behind and clear floor ahead, where
@@ -726,6 +826,8 @@ impl Brain {
         self.perk_until = -1.0;
         self.back_prev = None;
         self.back_v = 0.0;
+        // An offer under way is dropped (the pad has the robot); a gift in the beak is kept.
+        self.offer.cancel();
     }
 
     /// Advance by `dt` seconds.
@@ -785,7 +887,7 @@ impl Brain {
         // Energy: motion burns, rest restores. Continuous wandering drains a fresh duck in about
         // a minute and a half; a nap refills most of it.
         let de = match self.state {
-            State::Zoomies => -dt / 25.0,
+            State::Zoomies | State::RunAway => -dt / 25.0,
             State::Wander => -dt / 110.0,
             State::TurnInPlace => -dt / 70.0,
             State::Nap => dt / 40.0,
@@ -911,7 +1013,13 @@ impl Brain {
 
         // Petting, the best interrupt there is. A nap handles its own (a hand must not end a
         // seated nap).
-        if world.petting && !matches!(self.state, State::Petted | State::Nap) {
+        // Not while taking or carrying off a gift: the giving hand may brush the head.
+        if world.petting
+            && !matches!(
+                self.state,
+                State::Petted | State::Nap | State::Offered | State::RunAway | State::DropGift
+            )
+        {
             // Flavour by mood: tired → sleepy melt; fresh → often an excited wiggle.
             self.pet_flavor = if self.energy < 0.4 {
                 2
@@ -950,6 +1058,11 @@ impl Brain {
             self.start_quack_burst();
             sound = Some(Sound::Chirp);
         }
+
+        // Something held out to the beak. The machine runs every tick on the real hand and jaw;
+        // whether a new offer may open the beak is the brain's call: only standing still, and only
+        // once the empty-closed jaw is known.
+        let offer_mouth = self.offer_tick(dt, world, &mut sound);
 
         match self.state {
             State::Chill => {
@@ -1534,6 +1647,82 @@ impl Brain {
                     }
                 }
             }
+            State::Offered => {
+                // Hold still and keep looking where the hand was found: the ToF is in the head.
+                self.cmd = [0.0; 3];
+                if self.t_state > OFFERED_MAX_S {
+                    self.offer.cancel();
+                }
+                if !self.offer.engaged() {
+                    self.enter(State::Chill);
+                }
+            }
+            State::RunAway => {
+                let here = self.here();
+                let delta = wrap_angle(self.run_heading - here[2]);
+                if self.run_turning && delta.abs() < 0.4 {
+                    self.run_turning = false;
+                    self.run_t = 0.0;
+                    self.run_from = [here[0], here[1]];
+                }
+                if self.run_turning {
+                    // Turn its back on the giver first, head leading the turn.
+                    let side = delta.signum();
+                    let vx = self.creep(&world.obstacle, dt);
+                    self.cmd = [vx, 0.0, 0.9 * self.max_turn * side];
+                    self.head = [0.0, 0.10, 0.7 * side, 0.15 * side];
+                } else {
+                    // Then off it goes, steering to keep the heading, through the obstacle gate
+                    // like any other walk.
+                    self.run_t += dt;
+                    let wz = (1.2 * delta).clamp(-0.6, 0.6);
+                    let (vx, wz, gate) =
+                        self.apply_obstacle_gate(self.max_speed, wz, &world.obstacle);
+                    let vx = self.walkable(vx, dt);
+                    self.cmd = [vx, 0.0, wz];
+                    self.head = [0.0, -0.05, (0.5 * wz).clamp(-0.35, 0.35), 0.0];
+                    let run = (here[0] - self.run_from[0]).hypot(here[1] - self.run_from[1]);
+                    if run >= self.run_m || self.run_t >= RUN_MAX_S || gate == Gate::Stopped {
+                        // Far enough — or a wall said so: drop it here.
+                        tracing::info!(run_m = run, "far enough — dropping the gift");
+                        self.enter(State::DropGift);
+                    }
+                }
+            }
+            State::DropGift => {
+                self.cmd = [0.0; 3];
+                let t = self.t_state;
+                let open_at = DROP_LOWER_S;
+                let shut_at = open_at + DROP_OPEN_S;
+                if t < shut_at {
+                    self.head = self.drop_head;
+                    head_alpha = 0.3;
+                } else {
+                    self.head = [0.0; 4];
+                    head_alpha = 0.3;
+                }
+                if t >= open_at && self.offer.holding() {
+                    let now = self.offer_now();
+                    self.offer.release(now);
+                }
+                if t >= open_at + DROP_LET_GO_AFTER_S && !self.drop_sounded {
+                    self.drop_sounded = true;
+                    sound = Some(Sound::Bwep);
+                }
+                if t >= shut_at {
+                    // Shut, whatever the hand tracker sees: looking down, the floor is near.
+                    self.offer.cancel();
+                }
+                if t >= shut_at + DROP_BACK_UP_S {
+                    // A sniff at what it dropped.
+                    let next = if world.can_ground_pick {
+                        State::GroundPick
+                    } else {
+                        State::LookAround
+                    };
+                    self.enter(next);
+                }
+            }
             State::GroundPick => {
                 self.cmd = [0.0; 3];
                 self.head = [0.0; 4];
@@ -1587,7 +1776,9 @@ impl Brain {
                     State::Survey
                 }
             } else {
-                self.pick_next_state(world.can_ground_pick, can_zoom, can_nap, can_ball)
+                // The pick's beak would drop a gift.
+                let can_pick = world.can_ground_pick && !self.offer.holding();
+                self.pick_next_state(can_pick, can_zoom, can_nap, can_ball)
             };
             self.enter(next);
         }
@@ -1599,15 +1790,97 @@ impl Brain {
             head_alpha,
             body,
             body_active,
-            mouth: mouth_extra.max(self.mouth_now()).clamp(0.0, 1.0),
+            // While the offer has the beak (open for it, closed on a gift, letting go), it alone
+            // says where the beak is: a quack, a yawn or a breath would drop what is in it.
+            mouth: offer_mouth
+                .unwrap_or_else(|| mouth_extra.max(self.mouth_now()))
+                .clamp(0.0, 1.0),
             sound,
             ground_pick,
             sit_toggle,
-            wheee: self.state == State::Zoomies,
+            wheee: self.state == State::Zoomies
+                || (self.state == State::RunAway && !self.run_turning),
             laser: self.wants_laser(),
             soccer: self.state == State::BallPlay,
             hands_off: matches!(self.state, State::Laser | State::BallPlay),
         }
+    }
+
+    /// One tick of the offer machine. Returns the mouth it wants while it has the beak, and turns
+    /// its events into states and sounds: an offer stops the duck ([`State::Offered`]), a grab
+    /// sends it running ([`State::RunAway`]), and a gift carried long enough is dropped.
+    fn offer_tick(&mut self, dt: f64, world: &World, sound: &mut Option<Sound>) -> Option<f64> {
+        let now = self.offer_now();
+        let o = world.offer;
+        // The empty-closed jaw, measured whenever the beak has been commanded shut a while with
+        // nothing in it, smoothed so one odd sample does not move it.
+        match (o.jaw_rad, o.jaw_target_rad) {
+            (Some(angle), Some(target))
+                if target <= JAW_SHUT_TARGET_RAD && !self.offer.engaged() =>
+            {
+                self.jaw_shut_for += dt;
+                if self.jaw_shut_for >= JAW_SETTLE_S {
+                    let closed = match self.jaw_closed {
+                        Some(c) => c + 0.05 * (angle - c),
+                        None => {
+                            tracing::info!(
+                                deg = angle.to_degrees(),
+                                "empty-closed beak measured — taking offers"
+                            );
+                            angle
+                        }
+                    };
+                    self.jaw_closed = Some(closed);
+                    self.offer.set_closed(closed);
+                }
+            }
+            _ => self.jaw_shut_for = 0.0,
+        }
+        let accepting = self.jaw_closed.is_some()
+            && !world.sitting
+            && matches!(
+                self.state,
+                State::Chill | State::LookAround | State::Offered
+            );
+        let jaw = o.jaw_rad.map(|angle_rad| Jaw {
+            angle_rad,
+            current_ma: o.jaw_ma,
+        });
+        let step = self.offer.step(now, o.hand, jaw, accepting);
+        let event = step.event;
+
+        // Still carrying it, standing about (the getaway was cut short): drop it now.
+        if self.offer.holding() && matches!(self.state, State::Chill | State::LookAround) {
+            self.hold_left -= dt;
+            if self.hold_left <= 0.0 && event.is_none() {
+                tracing::info!("still carrying the gift — dropping it");
+                self.enter(State::DropGift);
+            }
+        }
+
+        match event {
+            Some(OfferEvent::Opened) => {
+                tracing::info!(
+                    range_m = o.hand.map(|h| h.range_m),
+                    "something offered — beak open"
+                );
+                self.enter(State::Offered);
+                *sound = Some(Sound::Inquire);
+            }
+            Some(OfferEvent::Grabbed) => {
+                tracing::info!("got it — running off with it");
+                self.hold_left = self.rng.range(HOLD_S.0, HOLD_S.1);
+                self.enter(State::RunAway);
+                *sound = Some(Sound::Chirp);
+            }
+            Some(OfferEvent::Released) => {
+                tracing::info!("letting go");
+                *sound = Some(Sound::Bwep);
+            }
+            Some(e) => tracing::info!(event = e.describe(), "offer"),
+            None => {}
+        }
+        self.offer.engaged().then_some(step.mouth)
     }
 
     /// Laser tracking is on whenever the duck could chase: not too tired, not being petted (a dot
@@ -1632,7 +1905,9 @@ impl Brain {
     fn head_out(&self) -> [f64; 4] {
         let mut h = self.head;
         h[1] += 0.35 * self.mouth_now();
-        if matches!(self.state, State::Wander | State::Zoomies) && self.cmd[0] > 0.02 {
+        if matches!(self.state, State::Wander | State::Zoomies | State::RunAway)
+            && self.cmd[0] > 0.02
+        {
             h[1] += 0.12 * (std::f64::consts::TAU * 2.2 * self.t_state).sin();
         }
         h
@@ -1917,6 +2192,28 @@ impl Brain {
             }
             State::Survey => self.rng.range(SURVEY_S.0, SURVEY_S.1),
             State::Brace => BRACE_S,
+            State::Offered => {
+                // All ears: no spontaneous quack while it waits for the gift.
+                self.next_quack_in = self.next_quack_in.max(OFFERED_MAX_S);
+                OFFERED_MAX_S + 1.0
+            }
+            State::RunAway => {
+                self.run_heading = self.here()[2] + std::f64::consts::PI + self.rng.sym(0.5);
+                self.run_turning = true;
+                self.run_t = 0.0;
+                self.run_m = self.rng.range(RUN_M.0, RUN_M.1);
+                // The wheee is the getaway's soundtrack; a quack would cut it.
+                self.next_quack_in = self.next_quack_in.max(RUN_MAX_S + 6.0);
+                // Ends in a drop when the run is over (see `step`); the cap covers a turn that
+                // never ends, and a gift still held after it is dropped from Chill.
+                RUN_MAX_S + 4.0
+            }
+            State::DropGift => {
+                self.drop_sounded = false;
+                self.next_quack_in = self.next_quack_in.max(6.0);
+                // Ends by itself (see `step`); the cap is a safety net.
+                DROP_LOWER_S + DROP_OPEN_S + DROP_BACK_UP_S + 2.0
+            }
             State::BallPlay => {
                 self.ball_seen_at = None;
                 self.ball_kicks_from = None;
@@ -1962,6 +2259,16 @@ impl Brain {
                     State::Wander
                 } else if r < 0.80 {
                     State::LookAround
+                } else {
+                    State::Chill
+                }
+            }
+            // Made off with it: a look back, a shake of the feathers, or a sit-tight.
+            State::RunAway => {
+                if r < 0.4 {
+                    State::LookAround
+                } else if r < 0.7 {
+                    State::Ruffle
                 } else {
                     State::Chill
                 }
@@ -2072,6 +2379,7 @@ mod tests {
             laser: Laser::default(),
             ball: Ball::default(),
             map: MapFix::Off,
+            offer: OfferInput::default(),
         }
     }
 
@@ -2124,6 +2432,117 @@ mod tests {
             }
             out
         }
+    }
+
+    /// The jaw and the hand as a robot would report them: the jaw follows the commanded mouth
+    /// (−5° commanded closed, stopping at −3° on nothing), and stops at +9° on a gift.
+    fn offer_input(hand: Option<f64>, mouth: f64, in_beak: bool) -> OfferInput {
+        let target = (-5.0 + 35.0 * mouth).to_radians();
+        let mut angle = target.max((-3.0f64).to_radians());
+        if in_beak {
+            angle = angle.max(9.0f64.to_radians());
+        }
+        OfferInput {
+            hand: hand.map(|range_m| Hand {
+                range_m,
+                closeness: 0.5,
+                zones: 10,
+                held: false,
+            }),
+            jaw_rad: Some(angle),
+            jaw_target_rad: Some(target),
+            jaw_ma: Some(20.0),
+        }
+    }
+
+    /// The whole gift: offered while standing, taken, carried off a couple of metres with the beak
+    /// shut, dropped head-down with a retch, then sniffed with a ground pick.
+    #[test]
+    fn an_offered_gift_is_taken_carried_off_dropped_and_sniffed() {
+        let mut bench = Bench::new(7);
+        bench.brain.enter(State::LookAround);
+        bench.brain.state_dur = 1_000.0;
+        let mut mouth = 0.0;
+        let sounds = std::cell::RefCell::new(Vec::new());
+        let mut run = |bench: &mut Bench, secs: f64, hand: Option<f64>, in_beak: bool| {
+            let mut states = Vec::new();
+            for _ in 0..(secs * 50.0) as usize {
+                let out = bench.tick(|w| w.offer = offer_input(hand, mouth, in_beak));
+                mouth = out.mouth;
+                sounds.borrow_mut().extend(out.sound);
+                states.push((bench.brain.state(), out));
+            }
+            states
+        };
+
+        // Standing about with the beak shut: the empty-closed jaw gets measured.
+        run(&mut bench, 1.5, None, false);
+        assert!(bench.brain.jaw_closed.is_some(), "jaw calibrated");
+        // A hand arrives and stays: it stops, beak open, a questioning quack.
+        let s = run(&mut bench, 1.0, Some(0.15), false);
+        assert_eq!(bench.brain.state(), State::Offered);
+        assert_eq!(s.last().unwrap().1.mouth, 1.0);
+        assert!(sounds.borrow().contains(&Sound::Inquire));
+        assert!(
+            s.iter()
+                .all(|(st, out)| *st != State::Offered || out.cmd == [0.0; 3])
+        );
+        // The object held still in the beak: it closes on it, and runs.
+        run(&mut bench, 1.0, Some(0.12), false);
+        let s = run(&mut bench, 1.0, None, true);
+        assert!(
+            s.iter().any(|(st, _)| *st == State::RunAway),
+            "got it, off it goes"
+        );
+        let start = bench.pose;
+        // The getaway: beak shut all the way, until it drops it.
+        let mut dropped_at = None;
+        let mut saw = std::collections::HashSet::new();
+        for i in 0..(30 * 50) {
+            let in_beak = dropped_at.is_none();
+            let s = run(&mut bench, 0.02, None, in_beak);
+            let (state, out) = s[0];
+            saw.insert(state);
+            if state == State::RunAway {
+                assert_eq!(out.mouth, 0.0, "a quack must not drop it");
+            }
+            if state == State::DropGift && out.mouth > 0.5 && dropped_at.is_none() {
+                dropped_at = Some(i);
+                let away = (bench.pose[0] - start[0]).hypot(bench.pose[1] - start[1]);
+                assert!(away >= 1.2, "ran {away:.2} m before dropping it");
+            }
+            if state == State::GroundPick {
+                break;
+            }
+        }
+        assert!(dropped_at.is_some(), "it dropped the gift");
+        assert!(
+            sounds.borrow().contains(&Sound::Bwep),
+            "with the little retch"
+        );
+        assert!(saw.contains(&State::DropGift));
+        assert_eq!(bench.brain.state(), State::GroundPick, "and sniffs it");
+        assert!(!bench.brain.offer.holding());
+    }
+
+    /// No offer is taken while walking: the hand in front of a walking duck is an obstacle.
+    #[test]
+    fn a_walking_duck_takes_no_offers() {
+        let mut bench = Bench::new(9);
+        bench.brain.enter(State::LookAround);
+        for _ in 0..75 {
+            bench.tick(|w| w.offer = offer_input(None, 0.0, false));
+        }
+        bench.brain.enter(State::Wander);
+        bench.brain.state_dur = 1_000.0;
+        for _ in 0..100 {
+            bench.tick(|w| w.offer = offer_input(None, 0.0, false));
+        }
+        for _ in 0..100 {
+            bench.tick(|w| w.offer = offer_input(Some(0.15), 0.0, false));
+            assert!(!bench.brain.offer.engaged(), "{:?}", bench.brain.state());
+        }
+        assert_ne!(bench.brain.state(), State::Offered);
     }
 
     /// Ten minutes at 50 Hz: everything stays in range, and the duck actually does things —

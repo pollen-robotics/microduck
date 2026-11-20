@@ -151,6 +151,9 @@ states come over:
 | Petted | melt, excited wiggle, or sleepy melt that can fall asleep into a nap |
 | Laser | chasing a dot: `robotd` drives (below), the duck quacks and tires |
 | BallPlay | playing with the ball: autonomous soccer on, `robotd` drives (below) |
+| Offered | something held out to the beak: stands still, beak open, takes it (below) |
+| RunAway | got it: turns its back on the giver and scampers off a couple of metres, wheee |
+| DropGift | lets it go like the photo tag lets go of its display, then sniffs it (a ground pick) |
 
 Across all states:
 
@@ -191,6 +194,34 @@ goes stale. `robotd` runs one of the two at a time, and switching soccer on swit
     70 s.
   - **Boredom**, 0 to 1, fills over 5 minutes of play (half as fast while only searching) and
     wears off over 20 minutes of not playing.
+
+**Gifts.** Hold a small object out in front of the beak and the duck takes it, runs off with
+it, drops it and sniffs it. The decisions are [`kinematics::offer`](../../kinematics/src/offer.rs),
+the same state machine `robotctl object-offer` runs on the bench (the
+[cheat sheet](../robot/cheatsheet.md) has the gesture and its thresholds). `autod` feeds it the
+theremin's hand tracker over the depth frames it already reads, and the jaw's measured and
+commanded angle from `robot.state`.
+
+- **Only standing still.** A new offer opens the beak only in Chill and LookAround, not seated. A
+  hand in front of a walking duck is an obstacle, not an offer. Offers are taken only once the
+  empty-closed jaw has been measured: the jaw's angle after the beak has been commanded shut for
+  0.6 s with nothing in it, smoothed. Whether a grab got something is judged against that angle.
+- **Offered.** It stops and keeps the head where it found the hand, with no spontaneous quacks.
+  The machine says when to close, whether it got something, and when to give up. Petting is
+  ignored from here until the drop, because the giving hand may brush the head.
+- **RunAway.** A grab turns the duck about 180° (± 0.5 rad) and runs 1.5 to 2.5 m by odometry
+  at full speed, through the obstacle gate like any walk, with the wheee playing.
+- **DropGift.** Timed like the photo tag letting go of its e-ink display (`nfc/src/photo.rs`):
+  head down for 0.8 s, then the beak wide open, the `bwep` 0.3 s later, the beak shut 1.2 s after
+  opening, and the head back up for 0.8 s. The head goes to the joints `robot.look` solves for the
+  photo tag's look-down point, asked once per session. Then a ground pick sniffs the dropped
+  object, or a look around without a ground-pick policy. A run stopped by a wall drops it there.
+  A gift still held 10–20 s after the grab (the getaway was cut short) is dropped from Chill or
+  LookAround.
+- **The beak is the offer's while it has it.** From the open beak to the drop, the machine alone
+  sets the mouth. A quack, a yawn or the breathing mouth would drop the gift. While a gift is
+  held, no ground pick is picked (its beak would drop it). A pad taking over abandons an offer
+  under way but keeps a gift in the beak shut.
 
 There is no obstacle avoidance while `robotd` drives the dot or the ball: the ToF gate is the
 brain's, and the brain is standing aside. Both are games somebody is watching.

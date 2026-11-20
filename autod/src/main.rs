@@ -147,6 +147,8 @@ struct Shared {
     map: Option<(brain::MapFix, Instant)>,
     /// The newest grid, and a counter bumped with each, so the loop hands each one over once.
     grid: Option<(Arc<map::Grid>, u64)>,
+    /// The newest depth frame, raw, and when it came: what the offer's hand tracker reads.
+    depth: Option<(Vec<i16>, Vec<u8>, Instant)>,
 }
 
 /// The fields of a `robot.state` frame the tick loop reads.
@@ -167,7 +169,24 @@ struct Latest {
     /// When this `robotd` started, whole seconds of `CLOCK_MONOTONIC`: which `robotd` it is. A new
     /// one comes up with the robot limp, which nobody chose.
     robotd_started_s: i64,
+    /// The jaw: measured angle, commanded angle (radians) and current (mA), when reported.
+    jaw_rad: Option<f64>,
+    jaw_target_rad: Option<f64>,
+    jaw_ma: Option<f64>,
 }
+
+/// Index of the mouth in `robot.state`'s joint arrays.
+const MOUTH: usize = 9;
+/// A depth frame older than this is no hand.
+const DEPTH_STALE: Duration = Duration::from_millis(500);
+/// Where the head looks to drop a gift: the photo tag's `LOOK_DOWN` (`nfc/src/photo.rs`), down
+/// and just ahead of the feet, so both drops look the same.
+const LOOK_DOWN: proto::LookParams = proto::LookParams {
+    x: 0.4,
+    y: 0.0,
+    z: -0.4,
+    neck_pitch: 0.0,
+};
 
 /// What the robot has, from the subscribe ack.
 #[derive(Debug, Clone, Copy)]
@@ -363,6 +382,9 @@ fn subscribe(
                 ),
                 soccer_mode: state.soccer.is_some(),
                 robotd_started_s: (state.t_ns as f64 / 1e9 - state.t).round() as i64,
+                jaw_rad: state.joints.get(MOUTH).copied(),
+                jaw_target_rad: state.targets.get(MOUTH).copied(),
+                jaw_ma: state.currents_ma.get(MOUTH).copied(),
             };
             let mut shared = shared.lock().unwrap_or_else(|p| p.into_inner());
             shared.history.push(latest.sample);
@@ -433,6 +455,7 @@ fn depth(socket: &Path, shared: &Mutex<Shared>) -> std::io::Result<()> {
         if let Some(at) = shared.history.nearest(frame.t_ns) {
             shared.model.observe(&frame, &at);
         }
+        shared.depth = Some((frame.distance_mm, frame.status, Instant::now()));
     }
 }
 
@@ -785,6 +808,23 @@ fn drive(
         brain.restore_visits(restored);
     }
     let mut visits_saved = Instant::now();
+    // Taking an offered object: the theremin's hand tracker over the head ToF, and the head the
+    // photo tag drops its display with, solved once by `robotd`'s IK.
+    let mut hand_tracker = kinematics::hand::Tracker::new(kinematics::offer::tracker_config(0.50));
+    match request(commands, next_id, &proto::Call::RobotLook(LOOK_DOWN)) {
+        Ok(Some(response)) => match response.result_as::<proto::LookResult>() {
+            Ok(look) => brain.set_drop_head([
+                look.head.neck_pitch,
+                // The brain's pitch is "positive = up"; the alpha's +head_pitch looks down.
+                -look.head.head_pitch,
+                look.head.head_yaw,
+                look.head.head_roll,
+            ]),
+            Err(e) => tracing::info!(error = %e, "no look-down head — dropping with the default"),
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
 
     loop {
         let tick = Instant::now();
@@ -1037,6 +1077,14 @@ fn drive(
                 save_visits(&visits_path, visits);
             }
         }
+        let hand = {
+            let shared = shared.lock().unwrap_or_else(|p| p.into_inner());
+            shared
+                .depth
+                .as_ref()
+                .filter(|(_, _, at)| tick.duration_since(*at) < DEPTH_STALE)
+                .and_then(|(distance, status, _)| hand_tracker.track(distance, status, tick))
+        };
         let world = brain::World {
             busy,
             petting: state.hearing.is_some_and(|h| h.petting),
@@ -1049,6 +1097,12 @@ fn drive(
             laser: state.laser,
             ball: state.ball,
             map: fix,
+            offer: brain::OfferInput {
+                hand,
+                jaw_rad: state.jaw_rad,
+                jaw_target_rad: state.jaw_target_rad,
+                jaw_ma: state.jaw_ma,
+            },
         };
         let step = brain.step(dt, &world);
 
@@ -1124,6 +1178,8 @@ fn drive(
                 tag: match sound {
                     brain::Sound::Chirp => proto::SoundTag::Chirp,
                     brain::Sound::Coo => proto::SoundTag::Coo,
+                    brain::Sound::Inquire => proto::SoundTag::Inquire,
+                    brain::Sound::Bwep => proto::SoundTag::Bwep,
                 },
                 hold: None,
             }))?;
