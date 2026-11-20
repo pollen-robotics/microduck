@@ -343,8 +343,8 @@ enum Namespace {
         /// No sounds.
         #[arg(long)]
         quiet: bool,
-        /// Leave the head to the idle look-around instead of holding it straight ahead. The
-        /// look-around yawns, which opens the beak.
+        /// Leave the head to the idle look-around even while holding something, instead of
+        /// holding it straight ahead. The look-around yawns, which opens the beak.
         #[arg(long)]
         free_head: bool,
     },

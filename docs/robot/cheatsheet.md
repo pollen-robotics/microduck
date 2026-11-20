@@ -1054,8 +1054,10 @@ be standing: robotd only moves the mouth while a policy is driving. The command 
 The live line shows the phase, the nearest return in front of the beak (range and zone
 count), how many zones report a valid range under 10 cm (below the tracker's floor and not used
 for any decision; it shows whether the sensor sees an object sitting in the beak), the jaw angle relative to closed, and its current. That line is how the thresholds get
-tuned. The head is held straight ahead the whole time, because the idle look-around yawns and a
-yawn would open the beak; `--free-head` turns that off.
+tuned. While it holds something the head is held straight ahead, because the idle look-around
+yawns and a yawn would drop the object; `--free-head` turns that off. While it waits for an offer
+it sends nothing, so other features that move the head or the beak (the photo tag) are not
+fought — an offer arriving during one of them still takes the beak.
 
 ### Follow a laser dot
 

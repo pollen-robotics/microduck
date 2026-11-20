@@ -247,6 +247,26 @@ impl Machine {
         matches!(self.phase, Phase::Holding { .. })
     }
 
+    /// Whether this mode has the beak: from the offer to the end of a release. Outside it the
+    /// mode sends nothing, so another client (the photo tag opening the beak for its display)
+    /// is not fought.
+    pub fn engaged(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Open { .. }
+                | Phase::Closing { .. }
+                | Phase::Holding { .. }
+                | Phase::Releasing { .. }
+        )
+    }
+
+    /// Whether the idle look-around must be kept away: its yawn opens the beak, which would drop
+    /// what is in it. Only then is the head steered, because steering it all the time fought
+    /// every other client that moves it (the photo tag's look-up oscillated against it).
+    pub fn guards_beak(&self) -> bool {
+        matches!(self.phase, Phase::Closing { .. } | Phase::Holding { .. })
+    }
+
     fn open_phase(&self, now: Instant, retries_left: u32) -> Phase {
         Phase::Open {
             since: now,
@@ -469,11 +489,11 @@ enum Update {
     Lost(String),
 }
 
-/// How often the head is resent: the idle look-around (which yawns, opening the beak) starts
-/// after two seconds without a `robot.head`.
+/// How often the head is resent while the beak holds something: the idle look-around (which
+/// yawns, opening the beak) starts after two seconds without a `robot.head`.
 const HOLD_HEAD_EVERY: Duration = Duration::from_millis(400);
-/// The mouth intent is resent this often even when unchanged, so a robotd restart mid-run picks
-/// it back up.
+/// While engaged, the mouth intent is resent this often even when unchanged, so a robotd restart
+/// mid-run picks it back up.
 const MOUTH_EVERY: Duration = Duration::from_millis(500);
 /// A depth frame older than this is no frame.
 const FRAME_STALE: Duration = Duration::from_millis(500);
@@ -483,7 +503,8 @@ const LET_GO_ON_EXIT: Duration = Duration::from_millis(1500);
 pub struct Options {
     pub config: Config,
     pub quiet: bool,
-    /// Keep the head straight ahead, which also keeps the idle look-around (and its yawn) away.
+    /// Keep the head straight ahead while holding something, which keeps the idle look-around
+    /// (and its yawn) away.
     pub hold_head: bool,
 }
 
@@ -524,9 +545,8 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
     let mut latest_state: Option<Box<proto::RobotState>> = None;
     let mut latest_frame: Option<(Box<proto::TofFrame>, Instant)> = None;
     let calibrate_until = Instant::now() + Duration::from_millis(800);
+    out.mouth(0.0, false)?;
     while Instant::now() < calibrate_until {
-        out.mouth(0.0)?;
-        out.head()?;
         drain(
             &rx,
             Duration::from_millis(50),
@@ -595,8 +615,8 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
         });
 
         let step = machine.step(now, hand, jaw);
-        out.mouth(step.mouth)?;
-        out.head()?;
+        out.mouth(step.mouth, machine.engaged())?;
+        out.head(machine.guards_beak())?;
         if let Some(event) = step.event {
             println!("\r{:<78}", event.describe());
             if let Some(tag) = event.sound() {
@@ -640,12 +660,14 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
         out.sound(proto::SoundTag::Bwep);
         let until = Instant::now() + LET_GO_ON_EXIT;
         while Instant::now() < until {
-            out.mouth(1.0)?;
+            out.mouth(1.0, true)?;
             thread::sleep(Duration::from_millis(100));
         }
     }
-    out.last_mouth = None;
-    out.mouth(0.0)?;
+    if machine.engaged() {
+        out.last_mouth = None;
+        out.mouth(0.0, false)?;
+    }
     Ok(())
 }
 
@@ -693,9 +715,10 @@ struct Out {
 }
 
 impl Out {
-    fn mouth(&mut self, open: f64) -> Result<(), Failure> {
+    /// Send the mouth when it changes; with `keep`, also resend it on [`MOUTH_EVERY`].
+    fn mouth(&mut self, open: f64, keep: bool) -> Result<(), Failure> {
         let due = match self.last_mouth {
-            Some((was, at)) => was != open || at.elapsed() >= MOUTH_EVERY,
+            Some((was, at)) => was != open || (keep && at.elapsed() >= MOUTH_EVERY),
             None => true,
         };
         if due {
@@ -708,8 +731,10 @@ impl Out {
         Ok(())
     }
 
-    fn head(&mut self) -> Result<(), Failure> {
-        if !self.hold_head
+    /// Hold the head straight ahead while `active`; send nothing otherwise.
+    fn head(&mut self, active: bool) -> Result<(), Failure> {
+        if !active
+            || !self.hold_head
             || self
                 .last_head
                 .is_some_and(|t| t.elapsed() < HOLD_HEAD_EVERY)
@@ -1032,6 +1057,20 @@ mod tests {
         rig.run(700, None, jaw(30.0));
         assert_eq!(rig.mouth, 0.0);
         assert!(matches!(rig.m.phase(), Phase::Arming { .. }));
+    }
+
+    /// Waiting for an offer, the mode leaves the head and beak to whoever else has them; it
+    /// steers the head only while something is in the beak.
+    #[test]
+    fn it_takes_the_beak_and_head_only_when_it_needs_them() {
+        let mut rig = Rig::new();
+        rig.run(600, None, jaw(0.0));
+        assert!(!rig.m.engaged() && !rig.m.guards_beak(), "ready");
+        let mut rig = rig.opened();
+        assert!(rig.m.engaged() && !rig.m.guards_beak(), "open");
+        rig = rig.inserted();
+        rig.run(800, None, jaw(12.0));
+        assert!(rig.m.holding() && rig.m.guards_beak(), "holding");
     }
 
     #[test]
