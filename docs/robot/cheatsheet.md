@@ -1023,6 +1023,37 @@ Note that `robotctl monitor`'s ToF grid is stricter than the theremin — it mar
 outside 5/9 as `x`, *could not measure*. A grid full of `x` does not mean the sensor is
 broken; it means it is being pessimistic about numbers it does have.
 
+### Give the duck something (prototype)
+
+```
+robotctl object-offer
+```
+
+Hold a small object out in front of the beak. The duck opens its beak, takes the object and
+closes on it. Runs until Ctrl-C, and lets go of anything it holds on the way out. The robot must
+be standing: robotd only moves the mouth while a policy is driving. The command is a client of
+`tofd` and `robotd`, so nothing in the daemons changes for it.
+
+1. **Offer.** Something arrives within `--offer-cm` (30) of the beak and stays `--dwell-ms`
+   (400). The beak opens with a rising quack. The space in front must have been clear first,
+   so a wall the duck is already facing never triggers it.
+2. **Give.** Bring the object into the beak. The sensor cannot see under about 10 cm, so the
+   beak closes once the hand has come within `--insert-cm` (16) and then vanished from view for
+   `--gone-ms` (300). A hand that backs off past `--leave-cm` (40) closes the beak without a
+   grab. With `--push-ma N` set, a push on the open jaw (its current rising N mA above baseline)
+   also closes it.
+3. **Check.** At start the beak closes on nothing and its angle is measured. A jaw that stops
+   more than `--hold-margin-deg` (4) short of that angle is holding something (chirp).
+   Otherwise it missed and reopens `--retries` (1) times.
+4. **Give back.** Take your hand away, then hold it in front of the beak for a second. The beak
+   opens ("bwep") and closes once you have gone. If the object is pulled out or falls, the jaw
+   notices and the duck re-arms.
+
+The live line shows the phase, the nearest return in front of the beak (range and zone
+count), the jaw angle relative to closed, and its current. That line is how the thresholds get
+tuned. The head is held straight ahead the whole time, because the idle look-around yawns and a
+yawn would open the beak; `--free-head` turns that off.
+
 ### Follow a laser dot
 
 ```
