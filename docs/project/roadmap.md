@@ -303,24 +303,28 @@ tried, and undone with `robotctl policy reset` — with the control loop never d
 control through any of it — and someone who did not train it can find it from the robot and try
 it.
 
-### M9 — The autonomous brain
+### M9 — The duck on its own, by default
 
-The biggest untracked gap: the runtime's `autonomous.rs` exists nowhere in the daemon and no
-design doc owns it. [`ideas/autonomous_behavior.md`](../ideas/autonomous_behavior.md) is the
-holding pen — a 16-state machine on an energy/mood model, novelty-grid exploration, ToF
-avoidance, startle, sound reactions, ball play, a nap cycle, petting.
+*Updated 2026-11-20.* The port has landed: `autod` is the runtime's brain as a daemon
+([`autonomous.md`](../design/autonomous.md)), with the map, the laser and the ball. It is
+off by default and underwhelming — a dice roll between animations, about nothing in particular,
+busy all day. The goal is now larger than parity: **the duck on its own becomes the default
+operating mode of a microduck**, a pet that lives in the house.
 
-Every input it needs now exists, and some it never had: ambient sound events, depth frames,
-classified trunk-frame obstacle points, voice tags, nearby ducks by stable id, a shared beat,
-RSSI as coarse distance, a live synth voice, hand distance from the ToF.
+[`ideas/autonomous-default.md`](../ideas/autonomous-default.md) is the plan: safe to leave on all
+day (rest, the walking budget, battery, stairs, quiet hours, any driver taking over), a brain with
+drives, a cat's curiosity and a personality you can see (`duck-life` from the `pet-life` branch),
+the detectors and the grasping policy to train, footsteps for precise positioning, a dock found by
+an ArUco tag, a map that handles many rooms reliably, and photos sent to the phone.
 
-**The shape matters more than the states.** Presence, mood and the beat are *inputs to one
+**The shape still matters more than the states.** Presence, mood and the beat are *inputs to one
 brain*, not modes beside it. The chorale and the theremin grew as explicit modes because there
 was no brain to hang them on — the chorale is 55 KB of `robotd` — and that is the pattern this
-milestone exists to stop repeating. It gets a design doc before it gets code.
+milestone exists to stop repeating.
 
-**Done when:** a duck left alone in a room does something worth watching for ten minutes, and
-the chorale is something it decides rather than something a command starts.
+**Done when** a duck left in a house for a week is worth watching, mostly rests, goes home to its
+dock, knows which room it is in, sends a few photos a day, has a character people can name, and is
+still switched on at the end of the week (the plan's opening section has the full list).
 
 ## The order of work
 
@@ -335,8 +339,9 @@ The numbers above are identifiers. This is the order.
 4. **M7** — an investigation with no date. It earns priority the first time a duck in someone
    else's hands develops a fault nobody can name, and the cheapest way to be ready is to decide
    it alongside #52 rather than after it.
-5. **M9, the brain** — later, deliberately. It is the largest piece of work left and the one
-   most likely to grow while being built.
+5. **M9, the duck on its own by default** — started 2026-11-20, planning first
+   ([`autonomous-default.md`](../ideas/autonomous-default.md) §8 has its own order). It is the
+   largest piece of work left and the one most likely to grow while being built.
 
 ## Decisions that shape work rather than follow it
 

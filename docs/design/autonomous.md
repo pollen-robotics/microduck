@@ -5,8 +5,9 @@ Status: draft · Date: 2026-11-12 · Owner: antoine
 The runtime's `autonomous.rs`, ported as a daemon of its own. It owns four things: what the duck
 does when nobody is driving it, when it chases a laser dot or plays with the ball, how it gets out
 of the way of a pad that is driving, and how it avoids walking into things with the head ToF. [`ideas/autonomous_behavior.md`](../ideas/autonomous_behavior.md)
-stays the holding pen for what comes after the port (the social and musical behaviours); this
-page is what exists.
+stays the holding pen for the social and musical behaviours, and
+[`ideas/autonomous-default.md`](../ideas/autonomous-default.md) is the plan for making the duck on
+its own the default mode; this page is what exists.
 
 ## 1. Shape
 
@@ -339,6 +340,9 @@ running rate (3 % per 30 s): yesterday's haunts are new again, the last hour's a
 at the first fix, when the map's frame is known to be the same one.
 
 ## 7. What is not here yet
+
+[`ideas/autonomous-default.md`](../ideas/autonomous-default.md) is the plan for all of it, and for
+what the default mode needs besides; the items below are the gaps in what exists.
 
 - **Going somewhere on purpose.** Planning a path on the grid around what the map knows — back to a
   favourite nap spot, to where the ball was last seen. Goals are still straight lines.

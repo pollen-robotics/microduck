@@ -1,7 +1,9 @@
 # The autonomous behavior stack — what it inherits, and ideas waiting for it
 
 > **The port has landed: [`design/autonomous.md`](../design/autonomous.md) owns `autod`** — what
-> came over, what was left behind and why. This page stays the holding pen for what comes next.
+> came over, what was left behind and why. [`autonomous-default.md`](autonomous-default.md) is the
+> plan for the brain these ideas hang on; this page stays the holding pen for the social and
+> musical ones.
 
 The brain is the biggest untracked gap in the [parity audit] (§03): the runtime's
 `autonomous.rs` exists nowhere in the daemon and no design doc owns it yet. This file is the

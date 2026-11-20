@@ -81,6 +81,7 @@ thinking is not lost and does not get mistaken for a decision.
 
 | | |
 |---|---|
+| [`autonomous-default.md`](ideas/autonomous-default.md) | The plan for the duck on its own as the default mode: safe all day, a brain with drives and a visible personality, the detectors and the grasp to train, footsteps, the dock, many rooms, photos to the phone. |
 | [`autonomous_behavior.md`](ideas/autonomous_behavior.md) | The behavior stack: what the runtime's brain has to give up, and the ideas the chorale and theremin work left behind. |
 
 ## Elsewhere

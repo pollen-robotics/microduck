@@ -293,3 +293,15 @@ stop to stop the real robot measured a few centimetres and ~1°, mostly from tur
   propose where a wide search should look and veto aliased candidates. Proposing, never measuring.
 - **Planning** on the grid (`go there`) — a client of `map.grid` and `map.status`, in the autonomy
   layer, not here.
+- **Many rooms, reliably** — what the duck on its own as the default mode needs
+  ([`ideas/autonomous-default.md`](../ideas/autonomous-default.md) §6.2), to be designed here:
+  - **A new room is new.** Switched on somewhere it has never mapped, the robot should say so and
+    map it from scratch. Today the stops become an island (§4) that is kept and not drawn; an
+    island needs to be able to become a room of its own.
+  - **Rooms as maps, stitched.** Several sessions, each with its own frame, joined when the robot
+    walks from one into the other — once, on strong repeated agreement, keeping the evidence, and
+    undoably. A wrong merge corrupts both rooms and is far worse than two rooms left apart.
+  - **A fixed landmark.** The dock's ArUco tag, seen by the camera, as the origin of its room and
+    an instant relocalization.
+  - **Benches** for exactly those kidnaps: carried while off to a known room, to an unknown one,
+    and back; two rooms mapped apart, then joined through the door.
