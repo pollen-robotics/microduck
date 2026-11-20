@@ -202,7 +202,9 @@ the same state machine `robotctl object-offer` runs on the bench (the
 theremin's hand tracker over the depth frames it already reads, and the jaw's measured and
 commanded angle from `robot.state`.
 
-- **Only standing still.** A new offer opens the beak only in Chill and LookAround, not seated. A
+- **Only standing still.** A new offer opens the beak only in Chill, LookAround and Survey, not
+  seated. Survey counts because a lost duck surveys for up to a minute and a half, and only
+  taking offers in Chill and LookAround made it deaf to them all that time. A
   hand in front of a walking duck is an obstacle, not an offer. Offers are taken only once the
   empty-closed jaw has been measured: the jaw's angle after the beak has been commanded shut for
   0.6 s with nothing in it, smoothed. Whether a grab got something is judged against that angle.
@@ -210,7 +212,11 @@ commanded angle from `robot.state`.
   The machine says when to close, whether it got something, and when to give up. Petting is
   ignored from here until the drop, because the giving hand may brush the head.
 - **RunAway.** A grab turns the duck about 180° (± 0.5 rad) and runs 1.5 to 2.5 m by odometry
-  at full speed, through the obstacle gate like any walk, with the wheee playing.
+  at full speed, through the obstacle gate like any walk, with the wheee playing. The turn ends on
+  odometry's yaw, or after 3 s regardless (the duck then runs from wherever it faces). A run under
+  30 cm after 3 s is stuck, and the gift is dropped there: on a robot the getaway once stalled for
+  its whole 14 s. A `getaway` line every second and a `getaway over` line (turn seconds, yaw
+  turned, metres run, obstacle-gate seconds) say what happened.
 - **DropGift.** Timed like the photo tag letting go of its e-ink display (`nfc/src/photo.rs`):
   head down for 0.8 s, then the beak wide open, the `bwep` 0.3 s later, the beak shut 1.2 s after
   opening, and the head back up for 0.8 s. The head goes to the joints `robot.look` solves for the

@@ -349,6 +349,13 @@ const HOLD_S: (f64, f64) = (10.0, 20.0);
 const RUN_M: (f64, f64) = (1.5, 2.5);
 /// A getaway that has not covered its distance in this long ends anyway (s).
 const RUN_MAX_S: f64 = 10.0;
+/// The turn away from the giver ends on odometry's yaw — or after this long regardless, running
+/// from wherever it faces: on a robot the getaway once stalled for its whole 14 s, the duck
+/// standing with its gift (s).
+const RUN_TURN_MAX_S: f64 = 3.0;
+/// A run that has covered less than `RUN_STALL_M` after `RUN_STALL_S` is stuck: drop it there.
+const RUN_STALL_S: f64 = 3.0;
+const RUN_STALL_M: f64 = 0.3;
 /// Dropping the gift, timed like the photo tag letting go of its e-ink display
 /// (`nfc/src/photo.rs`): head down, then the beak opens wide; the retch once the beak's motor has
 /// stopped (it drowns the sound otherwise); the beak shut again; the head back up.
@@ -579,6 +586,13 @@ pub struct Brain {
     /// Where the run started (brain frame) and how far it goes.
     run_from: [f64; 2],
     run_m: f64,
+    /// For the getaway's log: yaw turned (rad, summed), the last yaw, how long the turn took,
+    /// when progress was last logged, and what the obstacle gate did to the run.
+    run_yaw: f64,
+    run_prev_yaw: f64,
+    run_turn_s: f64,
+    run_logged_at: f64,
+    run_gate: Bout,
     /// How much longer a held gift is carried before it is dropped anyway (s).
     hold_left: f64,
     /// DropGift: the retch has played.
@@ -666,6 +680,11 @@ impl Brain {
             run_t: 0.0,
             run_from: [0.0; 2],
             run_m: 0.0,
+            run_yaw: 0.0,
+            run_prev_yaw: 0.0,
+            run_turn_s: 0.0,
+            run_logged_at: 0.0,
+            run_gate: Bout::default(),
             hold_left: 0.0,
             drop_sounded: false,
             drop_head: DROP_HEAD,
@@ -1659,11 +1678,29 @@ impl Brain {
             }
             State::RunAway => {
                 let here = self.here();
-                let delta = wrap_angle(self.run_heading - here[2]);
-                if self.run_turning && delta.abs() < 0.4 {
+                self.run_yaw += wrap_angle(here[2] - self.run_prev_yaw).abs();
+                self.run_prev_yaw = here[2];
+                let mut delta = wrap_angle(self.run_heading - here[2]);
+                if self.run_turning && (delta.abs() < 0.4 || self.t_state >= RUN_TURN_MAX_S) {
+                    if delta.abs() >= 0.4 {
+                        tracing::warn!(
+                            left_rad = format!("{delta:.2}"),
+                            turned_rad = format!("{:.2}", self.run_yaw),
+                            "the turn away is not finishing — running from here"
+                        );
+                        self.run_heading = here[2];
+                        delta = 0.0;
+                    }
                     self.run_turning = false;
+                    self.run_turn_s = self.t_state;
                     self.run_t = 0.0;
+                    self.run_logged_at = 0.0;
                     self.run_from = [here[0], here[1]];
+                    tracing::info!(
+                        turn_s = format!("{:.1}", self.t_state),
+                        turned_rad = format!("{:.2}", self.run_yaw),
+                        "turned its back on the giver — running"
+                    );
                 }
                 if self.run_turning {
                     // Turn its back on the giver first, head leading the turn.
@@ -1681,10 +1718,31 @@ impl Brain {
                     let vx = self.walkable(vx, dt);
                     self.cmd = [vx, 0.0, wz];
                     self.head = [0.0, -0.05, (0.5 * wz).clamp(-0.35, 0.35), 0.0];
+                    self.run_gate.count(gate, dt);
                     let run = (here[0] - self.run_from[0]).hypot(here[1] - self.run_from[1]);
-                    if run >= self.run_m || self.run_t >= RUN_MAX_S || gate == Gate::Stopped {
-                        // Far enough — or a wall said so: drop it here.
-                        tracing::info!(run_m = run, "far enough — dropping the gift");
+                    if self.run_t - self.run_logged_at >= 1.0 {
+                        self.run_logged_at = self.run_t;
+                        tracing::info!(
+                            run_m = format!("{run:.2}"),
+                            of_m = format!("{:.2}", self.run_m),
+                            cmd = format!("[{vx:.2}, {wz:.2}]"),
+                            gate = ?gate,
+                            "getaway"
+                        );
+                    }
+                    let why = if run >= self.run_m {
+                        Some("far enough")
+                    } else if gate == Gate::Stopped {
+                        Some("a wall ahead")
+                    } else if self.run_t >= RUN_STALL_S && run < RUN_STALL_M {
+                        Some("not getting anywhere")
+                    } else if self.run_t >= RUN_MAX_S {
+                        Some("out of time")
+                    } else {
+                        None
+                    };
+                    if let Some(why) = why {
+                        tracing::info!(why, run_m = format!("{run:.2}"), "dropping the gift here");
                         self.enter(State::DropGift);
                     }
                 }
@@ -1838,9 +1896,10 @@ impl Brain {
         }
         let accepting = self.jaw_closed.is_some()
             && !world.sitting
+            // Survey too: standing still, and a lost duck surveys for up to a minute and a half.
             && matches!(
                 self.state,
-                State::Chill | State::LookAround | State::Offered
+                State::Chill | State::LookAround | State::Survey | State::Offered
             );
         let jaw = o.jaw_rad.map(|angle_rad| Jaw {
             angle_rad,
@@ -1850,7 +1909,9 @@ impl Brain {
         let event = step.event;
 
         // Still carrying it, standing about (the getaway was cut short): drop it now.
-        if self.offer.holding() && matches!(self.state, State::Chill | State::LookAround) {
+        if self.offer.holding()
+            && matches!(self.state, State::Chill | State::LookAround | State::Survey)
+        {
             self.hold_left -= dt;
             if self.hold_left <= 0.0 && event.is_none() {
                 tracing::info!("still carrying the gift — dropping it");
@@ -2109,6 +2170,30 @@ impl Brain {
         if self.state == State::Wander {
             self.bout.log(self.here());
         }
+        if self.state == State::RunAway {
+            let here = self.here();
+            let g = self.run_gate;
+            let turn_s = if self.run_turning {
+                self.t_state
+            } else {
+                self.run_turn_s
+            };
+            tracing::info!(
+                turn_s = format!("{turn_s:.1}"),
+                turned_rad = format!("{:.2}", self.run_yaw),
+                still_turning = self.run_turning,
+                run_m = format!(
+                    "{:.2}",
+                    (here[0] - self.run_from[0]).hypot(here[1] - self.run_from[1])
+                ),
+                run_s = format!("{:.1}", self.run_t),
+                clear_s = format!("{:.1}", g.clear_s),
+                aging_s = format!("{:.1}", g.aging_s),
+                unseen_s = format!("{:.1}", g.unseen_s),
+                reacting_s = format!("{:.1}", g.reacting_s),
+                "getaway over"
+            );
+        }
         self.state = next;
         self.t_state = 0.0;
         self.retarget_in = 0.0;
@@ -2198,9 +2283,15 @@ impl Brain {
                 OFFERED_MAX_S + 1.0
             }
             State::RunAway => {
-                self.run_heading = self.here()[2] + std::f64::consts::PI + self.rng.sym(0.5);
+                let here = self.here();
+                self.run_heading = here[2] + std::f64::consts::PI + self.rng.sym(0.5);
                 self.run_turning = true;
                 self.run_t = 0.0;
+                self.run_yaw = 0.0;
+                self.run_prev_yaw = here[2];
+                self.run_turn_s = 0.0;
+                self.run_from = [here[0], here[1]];
+                self.run_gate = Bout::default();
                 self.run_m = self.rng.range(RUN_M.0, RUN_M.1);
                 // The wheee is the getaway's soundtrack; a quack would cut it.
                 self.next_quack_in = self.next_quack_in.max(RUN_MAX_S + 6.0);
@@ -2523,6 +2614,71 @@ mod tests {
         assert!(saw.contains(&State::DropGift));
         assert_eq!(bench.brain.state(), State::GroundPick, "and sniffs it");
         assert!(!bench.brain.offer.holding());
+    }
+
+    /// Drives a brain to holding a gift, through a real offer.
+    fn holding_a_gift(seed: u64) -> Bench {
+        let mut bench = Bench::new(seed);
+        bench.brain.enter(State::LookAround);
+        bench.brain.state_dur = 1_000.0;
+        let mut mouth = 0.0;
+        for (secs, hand, in_beak) in [
+            (1.5, None, false),
+            (1.0, Some(0.15), false),
+            (1.0, Some(0.12), false),
+            (0.5, None, true),
+        ] {
+            for _ in 0..(secs * 50.0) as usize {
+                mouth = bench
+                    .tick(|w| w.offer = offer_input(hand, mouth, in_beak))
+                    .mouth;
+            }
+        }
+        assert_eq!(bench.brain.state(), State::RunAway);
+        bench
+    }
+
+    /// On a robot the getaway once stalled for its whole 14 s. A robot that neither turns nor
+    /// moves (the bench pose frozen) still ends its getaway in a drop, within seconds.
+    #[test]
+    fn a_getaway_that_cannot_turn_or_move_still_ends_in_a_drop() {
+        let mut bench = holding_a_gift(11);
+        let frozen = bench.pose;
+        let mut ticks = 0;
+        for _ in 0..(10 * 50) {
+            bench.pose = frozen;
+            bench.tick(|w| w.offer = offer_input(None, 0.0, true));
+            ticks += 1;
+            if bench.brain.state() == State::DropGift {
+                break;
+            }
+        }
+        assert_eq!(bench.brain.state(), State::DropGift, "dropped, not frozen");
+        assert!(
+            f64::from(ticks) <= (RUN_TURN_MAX_S + RUN_STALL_S + 0.5) * 50.0,
+            "after {} s",
+            f64::from(ticks) / 50.0
+        );
+    }
+
+    /// A lost duck surveys; it still takes an offer then.
+    #[test]
+    fn a_surveying_duck_takes_offers() {
+        let mut bench = Bench::new(13);
+        bench.brain.enter(State::LookAround);
+        bench.brain.state_dur = 1_000.0;
+        for _ in 0..75 {
+            bench.tick(|w| w.offer = offer_input(None, 0.0, false));
+        }
+        bench.brain.enter(State::Survey);
+        bench.brain.state_dur = 1_000.0;
+        for _ in 0..30 {
+            bench.tick(|w| w.offer = offer_input(None, 0.0, false));
+        }
+        for _ in 0..40 {
+            bench.tick(|w| w.offer = offer_input(Some(0.15), 0.0, false));
+        }
+        assert_eq!(bench.brain.state(), State::Offered);
     }
 
     /// No offer is taken while walking: the hand in front of a walking duck is an obstacle.
