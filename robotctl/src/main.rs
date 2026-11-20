@@ -1612,10 +1612,10 @@ enum PolicyCommand {
         unwind: Option<f64>,
         /// The twist fed while it runs, as three comma-separated numbers. Zeros unless given,
         /// which is what every one-shot published so far expects.
-        #[arg(long, value_name = "X,Y,Z")]
+        #[arg(long, value_name = "X,Y,Z", allow_hyphen_values = true)]
         command: Option<String>,
         /// The twist fed while it unwinds. Zeros unless given.
-        #[arg(long, value_name = "X,Y,Z")]
+        #[arg(long, value_name = "X,Y,Z", allow_hyphen_values = true)]
         unwind_command: Option<String>,
         /// Allow it to start while the robot sits, for a policy trained from the seat. When it
         /// ends, the robot is seated again. Without this a seated robot refuses it, as it refuses
@@ -6325,6 +6325,45 @@ mod tests {
             (service.as_str(), lines, boot, json),
             ("robotd", 20, -1, false)
         );
+    }
+
+    // ── robotctl policy add ──────────────────────────────────────────────
+
+    /// A backward twist starts with a minus, which clap reads as a flag unless told otherwise —
+    /// and backing up is exactly what the scoot is for.
+    #[test]
+    fn a_negative_twist_parses_without_an_equals_sign() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "policy",
+            "add",
+            "scoot",
+            "scoot_dock.onnx",
+            "--hold",
+            "2.5",
+            "--command",
+            "-0.05,0,0",
+            "--unwind-command",
+            "-1,0,0",
+            "--from-seat",
+        ])
+        .expect("a negative --command must parse");
+        let Namespace::Policy {
+            command:
+                PolicyCommand::Add {
+                    command,
+                    unwind_command,
+                    from_seat,
+                    ..
+                },
+            ..
+        } = cli.namespace
+        else {
+            panic!("expected policy add, got {:?}", cli.namespace);
+        };
+        assert_eq!(command.as_deref(), Some("-0.05,0,0"));
+        assert_eq!(unwind_command.as_deref(), Some("-1,0,0"));
+        assert!(from_seat);
     }
 
     fn tail(lines: &[&str], truncated: bool) -> proto::LogsResult {
