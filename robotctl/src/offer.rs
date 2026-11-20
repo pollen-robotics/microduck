@@ -15,8 +15,10 @@
 //!    opens (with a rising "inquire").
 //! 3. *Open → Closing.* The sensor cannot see the last few centimetres (cover-glass crosstalk
 //!    below ~10 cm, see [`kinematics::hand::Config::near_m`]), so "the object is at the beak"
-//!    is the hand having come within [`Config::insert_m`] and then vanishing from the band for
-//!    [`Config::gone_after`]. A hand that recedes past [`Config::leave_m`] instead was not
+//!    is either the hand having come within [`Config::insert_m`] and then vanishing from the band
+//!    for [`Config::gone_after`], or the hand held still within `insert_m` (range moving less
+//!    than [`Config::still_m`]) for [`Config::still_for`] — a person holding the object in the
+//!    beak keeps their hand in view, so vanishing alone never fires for them. A hand that recedes past [`Config::leave_m`] instead was not
 //!    giving anything: the beak closes and the duck re-arms. Optionally, a load on the open jaw
 //!    (somebody pushing the object onto it) closes it at once — [`Config::push_ma`].
 //! 4. *Closing → Holding or missed.* The beak closes and, after [`Config::settle`], the jaw's
@@ -60,6 +62,10 @@ pub struct Config {
     pub dwell: Duration,
     /// How long a near hand must have vanished before the beak closes on what it left.
     pub gone_after: Duration,
+    /// How long a hand held still within `insert_m` closes the beak. Zero is off.
+    pub still_for: Duration,
+    /// How much the range may move and still count as still, metres.
+    pub still_m: f64,
     /// How long a hand that vanished from farther than `insert_m` is waited for.
     pub lost_after: Duration,
     /// The beak gives up and closes after being open this long.
@@ -81,12 +87,15 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            offer_m: 0.30,
+            // 30 cm fired on people walking past; an offer is close to the head.
+            offer_m: 0.20,
             insert_m: 0.16,
             leave_m: 0.40,
             clear_for: Duration::from_millis(500),
-            dwell: Duration::from_millis(400),
+            dwell: Duration::from_millis(500),
             gone_after: Duration::from_millis(300),
+            still_for: Duration::from_millis(800),
+            still_m: 0.02,
             lost_after: Duration::from_millis(1000),
             open_timeout: Duration::from_secs(8),
             settle: Duration::from_millis(600),
@@ -122,6 +131,8 @@ pub enum Phase {
         came_near: bool,
         /// When the hand stopped being seen, if it has.
         lost_since: Option<Instant>,
+        /// The range the hand has stayed near, and since when, while within `insert_m`.
+        still: Option<(f64, Instant)>,
         /// Jaw current once the open beak settled.
         baseline_ma: Option<f64>,
         retries_left: u32,
@@ -241,6 +252,7 @@ impl Machine {
             since: now,
             came_near: false,
             lost_since: None,
+            still: None,
             baseline_ma: None,
             retries_left,
         }
@@ -293,6 +305,7 @@ impl Machine {
                 since,
                 mut came_near,
                 lost_since,
+                still,
                 mut baseline_ma,
                 retries_left,
             } => {
@@ -312,8 +325,22 @@ impl Machine {
                 };
                 let lost_for = lost_since.map(|t| now.duration_since(t));
                 came_near |= near(c.insert_m);
+                // Held still near the beak: the range stays within `still_m` of where it
+                // settled. Any bigger move restarts the clock; leaving `insert_m` clears it.
+                let still = match hand.filter(|h| h.range_m <= c.insert_m) {
+                    None => None,
+                    Some(h) => match still {
+                        Some((at, t)) if (h.range_m - at).abs() <= c.still_m => Some((at, t)),
+                        _ => Some((h.range_m, now)),
+                    },
+                };
+                let held_still = !c.still_for.is_zero()
+                    && still.is_some_and(|(_, t)| now.duration_since(t) >= c.still_for);
 
-                if pushed || (came_near && lost_for.is_some_and(|d| d >= c.gone_after)) {
+                if pushed
+                    || held_still
+                    || (came_near && lost_for.is_some_and(|d| d >= c.gone_after))
+                {
                     event = Some(Event::Closing);
                     Phase::Closing {
                         since: now,
@@ -330,6 +357,7 @@ impl Machine {
                         since,
                         came_near,
                         lost_since,
+                        still,
                         baseline_ma,
                         retries_left,
                     }
@@ -550,6 +578,7 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
         let fresh = latest_frame
             .as_ref()
             .filter(|(_, at)| now.duration_since(*at) < FRAME_STALE);
+        let short = fresh.map_or(0, |(frame, _)| short_returns(frame));
         let hand =
             fresh.and_then(|(frame, _)| tracker.track(&frame.distance_mm, &frame.status, now));
         if fresh.is_none() && !no_frames_said {
@@ -598,7 +627,7 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
             };
             let policy = latest_state.as_ref().map_or("?", |s| s.policy.as_str());
             print!(
-                "\r  {:<9} {seen}  {beak}  policy {policy:<6}   ",
+                "\r  {:<9} {seen} <10cm {short:2}  {beak}  policy {policy:<6}   ",
                 machine.phase().name()
             );
             let _ = std::io::stdout().flush();
@@ -618,6 +647,18 @@ pub fn run(robot_socket: &Path, tof_socket: &Path, options: Options) -> Result<(
     out.last_mouth = None;
     out.mouth(0.0)?;
     Ok(())
+}
+
+/// Zones reporting a valid range under 10 cm — below the hand tracker's floor, so not part of any
+/// decision. Shown because whether the sensor sees an object sitting in the beak (rather than
+/// cover-glass crosstalk) is the open question for a better close trigger.
+fn short_returns(frame: &proto::TofFrame) -> usize {
+    frame
+        .distance_mm
+        .iter()
+        .zip(&frame.status)
+        .filter(|&(&mm, &code)| mm > 0 && mm < 100 && matches!(code, 5 | 9))
+        .count()
 }
 
 fn interrupted() -> bool {
@@ -838,7 +879,7 @@ mod tests {
         /// Clear, then a hand arriving and staying: the beak is open.
         fn opened(mut self) -> Self {
             self.run(600, None, jaw(0.0));
-            self.run(500, hand_at(0.25), jaw(30.0));
+            self.run(600, hand_at(0.18), jaw(30.0));
             assert_eq!(self.events, vec![Event::Opened]);
             assert_eq!(self.mouth, 1.0);
             self
@@ -871,7 +912,7 @@ mod tests {
     fn a_hand_passing_by_does_not_open_it() {
         let mut rig = Rig::new();
         rig.run(600, None, jaw(0.0));
-        rig.run(200, hand_at(0.25), jaw(0.0));
+        rig.run(200, hand_at(0.18), jaw(0.0));
         rig.run(600, None, jaw(0.0));
         assert!(rig.events.is_empty());
     }
@@ -886,6 +927,35 @@ mod tests {
         assert_eq!(rig.events.last(), Some(&Event::Grabbed));
         assert!(rig.m.holding());
         assert_eq!(rig.mouth, 0.0);
+    }
+
+    /// Holding the object in the beak keeps the hand in view: holding it still is the signal.
+    #[test]
+    fn a_hand_held_still_at_the_beak_closes_it() {
+        let mut rig = Rig::new().opened();
+        rig.run(700, hand_at(0.12), jaw(30.0));
+        assert_eq!(rig.events, vec![Event::Opened], "not yet");
+        rig.run(200, hand_at(0.125), jaw(30.0));
+        assert_eq!(rig.events.last(), Some(&Event::Closing));
+    }
+
+    #[test]
+    fn a_hand_moving_at_the_beak_does_not_close_it() {
+        let mut rig = Rig::new().opened();
+        for i in 0..10 {
+            let range = if i % 2 == 0 { 0.10 } else { 0.14 };
+            rig.run(300, hand_at(range), jaw(30.0));
+        }
+        assert_eq!(rig.events, vec![Event::Opened]);
+    }
+
+    /// The old default fired on people walking past at 25 cm.
+    #[test]
+    fn something_at_25_cm_is_not_an_offer() {
+        let mut rig = Rig::new();
+        rig.run(600, None, jaw(0.0));
+        rig.run(2_000, hand_at(0.25), jaw(0.0));
+        assert!(rig.events.is_empty());
     }
 
     #[test]

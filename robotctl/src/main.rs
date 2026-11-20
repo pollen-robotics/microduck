@@ -297,14 +297,14 @@ enum Namespace {
     ///
     /// A prototype built from the head ToF, the jaw's measured angle and the mouth intent; it runs
     /// until Ctrl-C (letting go of anything it holds on the way out). Hold an object within
-    /// `--offer-cm` of the beak for a moment and the beak opens; bring it into the beak and the
-    /// beak closes once the hand leaves the sensor's view. The jaw's angle says whether it got
+    /// `--offer-cm` of the beak for a moment and the beak opens; bring it into the beak and hold
+    /// still (or move the hand out of the sensor's view) and the beak closes. The jaw's angle says whether it got
     /// something — a miss reopens once. To get it back, take your hand away and hold it in front
     /// of the beak again for a second. The robot must be standing (a policy driving): robotd
     /// only moves the mouth then.
     ObjectOffer {
         /// An offer is something this close to the beak, cm.
-        #[arg(long, default_value_t = 30.0)]
+        #[arg(long, default_value_t = 20.0)]
         offer_cm: f64,
         /// A hand that came this close and then vanished put something in the beak, cm.
         #[arg(long, default_value_t = 16.0)]
@@ -313,11 +313,17 @@ enum Namespace {
         #[arg(long, default_value_t = 40.0)]
         leave_cm: f64,
         /// How long an offer must stay before the beak opens, ms.
-        #[arg(long, default_value_t = 400)]
+        #[arg(long, default_value_t = 500)]
         dwell_ms: u64,
         /// How long a near hand must have vanished before the beak closes, ms.
         #[arg(long, default_value_t = 300)]
         gone_ms: u64,
+        /// A hand held still within `--insert-cm` this long closes the beak, ms. 0 is off.
+        #[arg(long, default_value_t = 800)]
+        still_ms: u64,
+        /// How much the hand's range may move and still count as still, cm.
+        #[arg(long, default_value_t = 2.0)]
+        still_cm: f64,
         /// The beak gives up after being open this long, s.
         #[arg(long, default_value_t = 8.0)]
         open_timeout_s: f64,
@@ -6023,6 +6029,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
             leave_cm,
             dwell_ms,
             gone_ms,
+            still_ms,
+            still_cm,
             open_timeout_s,
             hold_margin_deg,
             open,
@@ -6037,6 +6045,8 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 leave_m: leave_cm / 100.0,
                 dwell: Duration::from_millis(dwell_ms),
                 gone_after: Duration::from_millis(gone_ms),
+                still_for: Duration::from_millis(still_ms),
+                still_m: still_cm / 100.0,
                 open_timeout: Duration::from_secs_f64(open_timeout_s.max(0.0)),
                 hold_margin_rad: hold_margin_deg.to_radians(),
                 open: open.clamp(0.0, 1.0),
