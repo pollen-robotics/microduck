@@ -4481,6 +4481,10 @@ fn run_policy_skill(
             .map(|m| m.canonicalize().unwrap_or_else(|_| m.clone())),
         // The default for its kind (on for a phase skill); a file edit says otherwise.
         fall_safety: None,
+        // Likewise file edits: a seated move, a heading hold, a target clamp.
+        seated: false,
+        hold_heading: None,
+        target_margin: None,
         params: robotd_params::SkillOverrides {
             action_scale: action_scale
                 .or_else(|| from_manifest.as_ref().and_then(|m| m.action_scale)),

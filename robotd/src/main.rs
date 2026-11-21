@@ -5084,6 +5084,9 @@ fn set_skill_request(
         sound: existing.as_ref().and_then(|s| s.sound.clone()),
         mouth: existing.as_ref().and_then(|s| s.mouth.clone()),
         fall_safety: existing.as_ref().and_then(|s| s.fall_safety),
+        seated: existing.as_ref().is_some_and(|s| s.seated),
+        hold_heading: existing.as_ref().and_then(|s| s.hold_heading),
+        target_margin: existing.as_ref().and_then(|s| s.target_margin),
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale
@@ -5455,6 +5458,17 @@ fn parse_grasp_target(text: &str) -> Option<[f64; 4]> {
 }
 
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
+    // One button, two moves: `standing|seated` runs the first half on a robot on its feet and the
+    // second on one in its seat — a pad binding like `angry|scoot`. Decided by the seat the loop
+    // published last tick; a seated move asked for mid-sit is refused there, as it would be anyway.
+    if let Some((standing, seated)) = skill.split_once('|') {
+        let name = if state.sitting.load(Ordering::Relaxed) {
+            seated
+        } else {
+            standing
+        };
+        return !name.trim().is_empty() && queue_skill(state, intents, name.trim());
+    }
     let policies = state.policies.load();
     match skill {
         "ground_pick" if policies.ground_pick.is_some() => {
@@ -7386,6 +7400,23 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+    }
+
+    /// `standing|seated` is one button with two moves: the first half on a robot on its feet, the
+    /// second in its seat, by the seat the loop last published.
+    #[test]
+    fn a_split_name_picks_its_half_by_the_seat() {
+        let s = state(); // default params: every walk-mode skill configured
+        let intents = Intents::new();
+        assert!(queue_skill(&s, &intents, "ground_pick|sit_toggle"));
+        let q = intents.take_skills();
+        assert!(q.ground_pick && !q.sit_toggle, "standing: the first half");
+        s.sitting.store(true, Ordering::Relaxed);
+        assert!(queue_skill(&s, &intents, "ground_pick|sit_toggle"));
+        let q = intents.take_skills();
+        assert!(q.sit_toggle && !q.ground_pick, "seated: the second half");
+        assert!(!queue_skill(&s, &intents, "ground_pick|nothing_called_that"));
+        assert!(!queue_skill(&s, &intents, "ground_pick|"), "an empty half is no move");
     }
 
     /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the

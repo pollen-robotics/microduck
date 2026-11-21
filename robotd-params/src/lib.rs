@@ -1738,6 +1738,25 @@ pub struct SkillDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fall_safety: Option<bool>,
 
+    /// Starts only from a settled seat, and hands back to it: a policy trained from the sitstand
+    /// seat, like a seated scoot. Refused on a standing robot. The seat stays latched while it runs,
+    /// so the sitstand network holds the seat again when it ends.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seated: bool,
+
+    /// Hold the heading the skill started with: ωz becomes `command[2] − hold_heading × yaw`,
+    /// the yaw integrated from the gyro about gravity since the first tick, clamped to
+    /// ±[`HOLD_HEADING_MAX_WZ`]. Radians per second per radian. For a policy that turns on its own
+    /// at zero ωz (the scoot's dock holds its heading at 0.03 rad/s per degree, 1.72 here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_heading: Option<f64>,
+
+    /// Clamp this skill's joint targets to each joint's travel in the MJCF, plus or minus this many
+    /// radians, before the low-pass. The safety layer only clamps to the servo's full turn, so a
+    /// policy that commands far past a stop would push the joint into it at full torque.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_margin: Option<f64>,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
@@ -1790,7 +1809,20 @@ impl SkillDef {
     pub fn guarded(&self) -> bool {
         self.fall_safety.unwrap_or(self.phase)
     }
+
+    /// `hold_heading`, when it is a usable gain: finite and positive. Anything else holds nothing.
+    pub fn heading_gain(&self) -> Option<f64> {
+        self.hold_heading.filter(|g| g.is_finite() && *g > 0.0)
+    }
+
+    /// `target_margin`, when it is a usable margin: finite and not negative.
+    pub fn clamp_margin(&self) -> Option<f64> {
+        self.target_margin.filter(|m| m.is_finite() && *m >= 0.0)
+    }
 }
+
+/// The largest ωz a heading hold asks for, rad/s: the scoot's trained turn range.
+pub const HOLD_HEADING_MAX_WZ: f64 = 0.3;
 
 /// What the official policy set says about itself, installed beside the `.onnx` files.
 ///
@@ -2104,6 +2136,9 @@ fn fallback_skills() -> Vec<SkillDef> {
         sound: None,
         mouth: None,
         fall_safety: None,
+        seated: false,
+        hold_heading: None,
+        target_margin: None,
         params: SkillOverrides::default(),
     };
     vec![
@@ -2122,6 +2157,9 @@ fn fallback_skills() -> Vec<SkillDef> {
             sound: None,
             mouth: None,
             fall_safety: None,
+            seated: false,
+            hold_heading: None,
+            target_margin: None,
             params: SkillOverrides::default(),
         },
         kick("kick_left", "ball_kick_left.onnx"),

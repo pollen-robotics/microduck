@@ -540,6 +540,20 @@ impl Model {
             entry["unwind"] = toml_edit::value(array_of(skill.unwind));
             entry["unwind_s"] = toml_edit::value(skill.unwind_s);
         }
+        // The keys only a file edit sets, kept when something rewrites the entry (`robot.setSkill`
+        // carries them over from the existing one) rather than silently dropped.
+        if let Some(on) = skill.fall_safety {
+            entry["fall_safety"] = toml_edit::value(on);
+        }
+        if skill.seated {
+            entry["seated"] = toml_edit::value(true);
+        }
+        if let Some(gain) = skill.hold_heading {
+            entry["hold_heading"] = toml_edit::value(gain);
+        }
+        if let Some(margin) = skill.target_margin {
+            entry["target_margin"] = toml_edit::value(margin);
+        }
 
         let mut overrides = toml_edit::Table::new();
         for (key, value) in [

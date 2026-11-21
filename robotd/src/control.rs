@@ -34,7 +34,8 @@
 //!
 //! A second: **one move at a time, and none from the seat** ([`Controller::move_blocked`]). The
 //! prototype let a pick preempt a kick's tail and a chaining skill roll out of a kick or the seat;
-//! here each is refused, and a seated robot accepts only standing up.
+//! here each is refused, and a seated robot accepts only standing up — or a skill whose entry says
+//! it is `seated`, trained from the seat (a scoot): it starts only there and hands back to it.
 
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
@@ -274,6 +275,18 @@ enum Sit {
     },
 }
 
+/// The joints' travel in the MJCF the policies train on, in wire order: what a skill's
+/// `target_margin` clamps against. `None` for a joint the model gives no range (the mouth).
+static JOINT_RANGES: std::sync::LazyLock<[Option<(f64, f64)>; NUM_JOINTS]> =
+    std::sync::LazyLock::new(|| {
+        let model = kinematics::Model::alpha();
+        std::array::from_fn(|j| {
+            model
+                .joint_index(duck_control::model::JOINT_NAMES[j])
+                .and_then(|i| model.joint_range(i))
+        })
+    });
+
 /// A one-shot skill mid-flight.
 #[derive(Debug, Clone, Copy)]
 struct ActiveSkill {
@@ -288,6 +301,10 @@ struct ActiveSkill {
     /// that lands while the skill runs, and positive at the end of a window means start
     /// another.
     chain: f64,
+    /// Heading turned since the skill started, radians, from the gyro about gravity — what a
+    /// `hold_heading` skill steers back to zero. Kept across a chained replay, so a held button
+    /// keeps the heading it started with.
+    yaw: f64,
 }
 
 /// Which half of a skill is running.
@@ -712,17 +729,23 @@ impl Controller {
     /// One move at a time, and none from the seat: a kick or a pick from a sitting robot
     /// throws it over, and one move started inside another hands the second network a robot
     /// mid-pose it was never trained from.
-    fn move_blocked(&self) -> Option<&'static str> {
+    ///
+    /// A `seated` move is the mirror image: trained from the seat, it starts only from a settled
+    /// one, and the seat stays latched under it so the sitstand network holds it again after.
+    fn move_blocked(&self, seated: bool) -> Option<&'static str> {
         if self.ground_pick.is_some() {
             return Some("a ground pick is running");
         }
         if self.active.is_some() {
             return Some("a scripted move is already running");
         }
-        match self.sit {
-            Sit::Sitting => Some("the robot is sitting — stand it up first"),
-            Sit::Rising { .. } => Some("the robot is standing up"),
-            Sit::Up => None,
+        match (self.sit, seated) {
+            (Sit::Sitting, false) => Some("the robot is sitting — stand it up first"),
+            (Sit::Sitting, true) if self.sit_settle > 0.0 => Some("still sitting down"),
+            (Sit::Sitting, true) => None,
+            (Sit::Rising { .. }, _) => Some("the robot is standing up"),
+            (Sit::Up, false) => None,
+            (Sit::Up, true) => Some("this move starts from the seat — sit the robot down first"),
         }
     }
 
@@ -756,9 +779,10 @@ impl Controller {
     }
 
     /// Whether the limp-fall and the pick-up pause may act: nothing is in flight but a guarded
-    /// skill (one move at a time, so nothing else can be), and the robot is not in a seat.
+    /// skill (one move at a time, so nothing else can be), and the robot is not in a seat — unless
+    /// that guarded skill is a seated one moving it, which a lift or a fall ends like any other.
     pub fn reflexes_on(&self) -> bool {
-        (!self.busy() || self.guarded_skill()) && !self.is_sitting()
+        (!self.busy() || self.guarded_skill()) && (!self.is_sitting() || self.guarded_skill())
     }
 
     /// Start a one-shot ground pick. Refused while any other move runs or the robot is
@@ -768,7 +792,7 @@ impl Controller {
         if !self.policy.has_ground_pick() {
             return Err("no ground-pick policy loaded");
         }
-        if let Some(reason) = self.move_blocked() {
+        if let Some(reason) = self.move_blocked(false) {
             return Err(reason);
         }
         self.ground_pick = Some(0.0);
@@ -805,7 +829,7 @@ impl Controller {
             }
             _ => {}
         }
-        if let Some(reason) = self.move_blocked() {
+        if let Some(reason) = self.move_blocked(false) {
             return Err(reason);
         }
         self.ground_pick = Some(0.0);
@@ -878,7 +902,7 @@ impl Controller {
         let Some(def) = self.skills.skills.get(index) else {
             return Err("no such skill on this robot");
         };
-        let (duration, chains) = (def.duration, def.chain);
+        let (duration, chains, seated) = (def.duration, def.chain, def.seated);
 
         if let Some(active) = &mut self.active
             && active.index == index
@@ -887,7 +911,7 @@ impl Controller {
             active.chain = CHAIN_WINDOW;
             return Ok(false);
         }
-        if let Some(reason) = self.move_blocked() {
+        if let Some(reason) = self.move_blocked(seated) {
             return Err(reason);
         }
         self.active = Some(ActiveSkill {
@@ -895,6 +919,7 @@ impl Controller {
             phase: SkillPhase::Holding,
             remaining: duration,
             chain: 0.0,
+            yaw: 0.0,
         });
         Ok(true)
     }
@@ -1004,7 +1029,21 @@ impl Controller {
             && active.remaining <= 0.0
         {
             let def = self.skills.skills.get(active.index);
+            let held = active.phase == SkillPhase::Holding
+                && def.is_some_and(|d| d.chain)
+                && active.chain > 0.0;
             self.active = match active.phase {
+                // Still held: a chaining skill drives on, and only comes back once let go — for one
+                // that also unwinds (a scoot held to keep scooting), unwinding between two windows
+                // would be a stop in the middle of a held button.
+                SkillPhase::Holding if held && def.is_some_and(|d| d.unwind_s > 0.0) => {
+                    self.policy.reset();
+                    Some(ActiveSkill {
+                        remaining: def.map_or(0.0, |d| d.duration),
+                        chain: 0.0,
+                        ..active
+                    })
+                }
                 // A skill that does not end itself comes back first, so walk never inherits a
                 // robot mid-pose. `unwind_s` of zero — the common case — skips straight past.
                 SkillPhase::Holding if def.is_some_and(|d| d.unwind_s > 0.0) => Some(ActiveSkill {
@@ -1054,7 +1093,13 @@ impl Controller {
             // exactly that. Only the twist differs, and for most skills it is zero too, which is
             // what made the kick and roulade arms the same arm.
             let def = self.skills.skills.get(active.index);
-            let twist = def.map_or([0.0; 3], |d| skill_twist(d, active.phase, active.remaining));
+            let mut twist = def.map_or([0.0; 3], |d| skill_twist(d, active.phase, active.remaining));
+            if active.phase == SkillPhase::Holding
+                && let Some(gain) = def.and_then(|d| d.heading_gain())
+            {
+                let max = robotd_params::HOLD_HEADING_MAX_WZ;
+                twist[2] = (twist[2] - gain * active.yaw).clamp(-max, max);
+            }
             let label = def.map_or(std::borrow::Cow::Borrowed("skill"), |d| {
                 std::borrow::Cow::Owned(match active.phase {
                     SkillPhase::Holding => d.name.clone(),
@@ -1201,6 +1246,15 @@ impl Controller {
         for joint in 0..NUM_JOINTS {
             targets[joint] = DEFAULT_POSITION[joint] + scale * offsets[joint];
         }
+        if let Net::Skill(index) = net
+            && let Some(margin) = self.skills.skills.get(index).and_then(|d| d.clamp_margin())
+        {
+            for (target, range) in targets.iter_mut().zip(JOINT_RANGES.iter()) {
+                if let Some((lo, hi)) = range {
+                    *target = target.clamp(lo - margin, hi + margin);
+                }
+            }
+        }
 
         if let Some(previous) = self.previous {
             if let Some(alpha) = self.tuning.head_lowpass {
@@ -1230,6 +1284,11 @@ impl Controller {
         if let Some(active) = self.active.as_mut() {
             active.remaining -= dt;
             active.chain = (active.chain - dt).max(0.0);
+            // The yaw rate about gravity: the trunk-frame gyro projected on "up", which is minus
+            // the projected gravity. Exact while the trunk is level, and close for a seat's tilt.
+            let g = sensors.imu.gravity;
+            let w = sensors.imu.gyro;
+            active.yaw -= (g[0] * w[0] + g[1] * w[1] + g[2] * w[2]) * dt;
         }
         if let Sit::Rising { remaining } = &mut self.sit {
             *remaining -= dt;
@@ -1814,6 +1873,146 @@ mod tests {
                 .enumerate()
                 .all(|(i, a)| i == 3 || *a == 0.0)
         );
+    }
+
+    /// A controller whose second skill is a seated scoot: from the seat only, back to it after.
+    fn seated_controller() -> Controller {
+        let mut c = full_controller();
+        let scoot = &mut c.skills.skills[1];
+        scoot.name = "scoot".into();
+        scoot.duration = 1.0;
+        scoot.chain = true;
+        scoot.seated = true;
+        scoot.command = [-0.05, 0.0, 0.0];
+        scoot.unwind_s = 0.5;
+        c
+    }
+
+    /// **A seated move starts only from a settled seat and ends in it.** Refused standing and on
+    /// the way down; once seated it drives, the seat stays latched under it, and the sitstand
+    /// network holds the seat again when it ends — from where standing up works as ever.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_seated_move_starts_from_the_seat_and_hands_back_to_it() {
+        let mut c = seated_controller();
+        assert!(c.start_skill(1).is_err(), "not from standing");
+        assert_eq!(c.sit_toggle(), Ok("sit"));
+        tick(&mut c, 1.0);
+        assert_eq!(c.start_skill(1), Err("still sitting down"));
+        tick(&mut c, 1.1);
+        assert!(c.start_skill(0).is_err(), "a kick still refuses the seat");
+        assert_eq!(c.start_skill(1), Ok(true));
+        tick(&mut c, 0.2);
+        assert_eq!(c.driving(), Some(Driving::Skill("scoot".into())));
+        assert!(c.is_sitting() && c.busy(), "seated, and moving");
+        assert!(c.sit_toggle().is_err(), "no stand-up cutting into it");
+        tick(&mut c, 1.0);
+        assert!(c.busy(), "unwinding");
+        tick(&mut c, 0.4);
+        assert!(!c.busy() && c.is_sitting(), "back in the seat");
+        assert_eq!(c.driving(), Some(Driving::Seated), "the sitstand network holds it");
+        assert_eq!(c.start_skill(1), Ok(true), "and again");
+        c.stop_moves();
+        assert!(c.is_sitting(), "a stop keeps the seat");
+        assert_eq!(c.sit_toggle(), Ok("stand"));
+    }
+
+    /// A held seated move drives on window after window, and unwinds only once let go.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_held_move_that_unwinds_keeps_going_until_let_go() {
+        let mut c = seated_controller();
+        c.enter_seat();
+        assert_eq!(c.start_skill(1), Ok(true));
+        for _ in 0..100 {
+            // 2 s, the button re-sent every tick: two windows and no unwind between them.
+            assert!(c.start_skill(1).is_ok());
+            tick(&mut c, 0.02);
+            let a = c.active.expect("still running");
+            assert_eq!(a.phase, SkillPhase::Holding, "held: no unwind");
+        }
+        // Let go: the last window runs out (its end is seen on the next tick), then it unwinds.
+        tick(&mut c, 1.06);
+        assert_eq!(c.active.map(|a| a.phase), Some(SkillPhase::Unwinding), "let go");
+        tick(&mut c, 0.5);
+        assert!(c.active.is_none() && c.is_sitting());
+    }
+
+    /// The heading is the gyro's yaw rate about gravity, integrated from the move's first tick,
+    /// and a hold steers ωz against it, within the trained turn range.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_heading_hold_turns_back_against_the_gyro() {
+        let mut c = seated_controller();
+        c.skills.skills[1].hold_heading = Some(1.72);
+        c.enter_seat();
+        assert_eq!(c.start_skill(1), Ok(true));
+        let mut sensors = duck_control::Sensors::default();
+        sensors.imu.gravity = [0.0, 0.0, -1.0];
+        sensors.imu.gyro = [0.0, 0.0, 0.2];
+        for _ in 0..10 {
+            c.step(&sensors, &Command::default(), false, 0.02, 1.0).unwrap();
+        }
+        let yaw = c.active.unwrap().yaw;
+        assert!((yaw - 0.04).abs() < 1e-9, "0.2 rad/s for 0.2 s: {yaw}");
+        let def = &c.skills.skills[1];
+        let wz = (def.command[2] - def.heading_gain().unwrap() * yaw)
+            .clamp(-robotd_params::HOLD_HEADING_MAX_WZ, robotd_params::HOLD_HEADING_MAX_WZ);
+        assert!(wz < 0.0, "turned left, steers right: {wz}");
+        assert_eq!(
+            robotd_params::SkillDef { hold_heading: Some(f64::NAN), ..Default::default() }.heading_gain(),
+            None,
+            "a bad gain holds nothing"
+        );
+    }
+
+    /// A target margin keeps every joint target within the MJCF travel plus the margin, however
+    /// far the network asks — the overrun robotd's safety (±π) would let through.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_target_margin_clamps_the_skill_to_the_joint_travel() {
+        let ranges = *JOINT_RANGES;
+        let knee = duck_control::model::JOINT_NAMES.iter().position(|n| *n == "left_knee").unwrap();
+        let (lo, hi) = ranges[knee].expect("the knee has a range");
+        assert!((lo + std::f64::consts::FRAC_PI_2).abs() < 1e-6 && (hi - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!(ranges[duck_control::model::MOUTH_INDEX].is_none(), "the mouth has none");
+
+        let mut c = seated_controller();
+        c.skills.skills[1].params.action_scale = Some(1000.0);
+        c.skills.skills[1].target_margin = Some(0.3);
+        c.enter_seat();
+        assert_eq!(c.start_skill(1), Ok(true));
+        let sensors = duck_control::Sensors::default();
+        let mut pushed = false;
+        for _ in 0..5 {
+            let step = c.step(&sensors, &Command::default(), false, 0.02, 1.0).unwrap();
+            for (j, range) in ranges.iter().enumerate() {
+                if let Some((lo, hi)) = range {
+                    let t = step.targets[j];
+                    assert!(t >= lo - 0.3 - 1e-9 && t <= hi + 0.3 + 1e-9, "joint {j}: {t}");
+                    pushed |= (t - (hi + 0.3)).abs() < 1e-6 || (t - (lo - 0.3)).abs() < 1e-6;
+                }
+            }
+        }
+        assert!(pushed, "the scale pushed some joint onto the clamp");
+    }
+
+    /// The reflexes stay off in a seat, but a guarded seated move keeps them, as a guarded move
+    /// standing does: a lift or a fall ends it.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn a_guarded_seated_move_keeps_the_reflexes() {
+        let mut c = seated_controller();
+        c.enter_seat();
+        assert!(!c.reflexes_on(), "a plain seat");
+        assert_eq!(c.start_skill(1), Ok(true));
+        assert!(!c.reflexes_on(), "an unguarded seated move");
+        c.stop_moves();
+        c.skills.skills[1].fall_safety = Some(true);
+        assert_eq!(c.start_skill(1), Ok(true));
+        assert!(c.reflexes_on(), "a guarded one");
+        c.stop_moves();
+        assert!(!c.reflexes_on(), "back to the plain seat");
     }
 
     /// A deliberate stop keeps the seat and drops the move in flight; a reset forgets both.
