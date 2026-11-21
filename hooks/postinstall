@@ -122,6 +122,26 @@ if [ -d systemd/sysusers.d ]; then
     fi
 fi
 
+# udev rules a daemon ships, after the accounts because a rule names a group: today padd's, which
+# hands it a Nintendo pad's hidraw node for the battery. Reloaded and re-triggered for hidraw now,
+# so a pad already connected is readable without reconnecting. Every failure a warning — a pad's
+# battery is not worth rolling an update back for, and padd says so in its journal if it cannot
+# open the node.
+if [ -d systemd/udev ]; then
+    for rule in systemd/udev/*.rules; do
+        [ -f "$rule" ] || continue
+        mkdir -p /etc/udev/rules.d
+        install -m 644 "$rule" "/etc/udev/rules.d/$(basename "$rule")" \
+            || echo "postinstall: cannot install $(basename "$rule")" >&2
+    done
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules \
+            || echo "postinstall: udev did not reload its rules; they apply at the next boot" >&2
+        udevadm trigger --subsystem-match=hidraw --action=change \
+            || echo "postinstall: hidraw not re-triggered; a pad applies the rule on reconnecting" >&2
+    fi
+fi
+
 # The unit files themselves.
 #
 # Overwritten rather than merged, matching what `install.sh` does: the unit file belongs to the

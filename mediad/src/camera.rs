@@ -43,8 +43,10 @@
 //! # Every number above is the IMX219's
 //!
 //! The field of view and the family solve belong to a sensor behind a lens, so they live on its
-//! [`Sensor`] entry rather than here. A sensor with neither — the beta board's GC2093, until someone
-//! calibrates it — publishes no geometry unless the robot carries its own `[media.intrinsics]`.
+//! [`Sensor`] entry rather than here. The GC2093 on Seeed's main board — `beta` and
+//! `face-board-v1` alike — carries its own family solve, [`robotd_params::CameraIntrinsics::beta`]
+//! (~85°), and is mounted upright. A sensor with neither a solve nor a field of view would publish
+//! no geometry unless the robot carries its own `[media.intrinsics]`.
 
 use crate::sensor::Sensor;
 
@@ -87,8 +89,9 @@ pub struct SensorMode {
 
 /// Where the optical axis is and how long the focal length is, in pixels of a delivered frame.
 ///
-/// **For the frame as it is sent**, which is not rotated: the camera is mounted a quarter turn off
-/// and nothing on the robot turns the pixels back (`pipeline`'s header says why). A consumer that
+/// **For the frame as it is sent**, which is not rotated: nothing on the robot turns the pixels
+/// (`pipeline`'s header says why), so on a board whose camera is mounted off upright — a quarter
+/// turn on the Zero 3W, none on the beta boards — these describe the sideways frame. A consumer that
 /// rotates the image has to rotate these too — `cx` and `cy` swap, and so do `fx` and `fy` — and
 /// the `rotate` field alongside these in `media.video` is what tells it by how much.
 /// Where a published calibration came from — so a consumer can tell *this* robot's own solve from

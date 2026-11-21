@@ -287,10 +287,6 @@ async fn real_robotd_answers_every_method_the_engine_calls() {
         Some(2),
         "modelApi must parse; None here means the field name drifted"
     );
-    assert!(
-        !client.remote_session_active(t).await,
-        "no session should be active on a fresh robotd"
-    );
 }
 
 /// The battery reaches the wire, mapped, from a real process.

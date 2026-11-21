@@ -23,7 +23,8 @@
 #                     running stable when a branch was asked for is worse than a clear stop.
 #                     Needs the branch build to exist, so give CI its minute or two first.
 #   --board BOARD     which electronic board this is: `zero3` (the default, the Radxa Zero 3W)
-#                     or `beta` (the custom board). Written to robotd.toml's `[board] version`,
+#                     `beta` (the custom board) or `face-board-v1` (the custom board with the
+#                     V1.0 face board). Written to robotd.toml's `[board] version`,
 #                     which decides the releases the robot can install. The bring-up itself
 #                     (setup-board.sh) is still the Zero 3W's on either.
 #   --name NAME       name the robot, at the end of provisioning: `--name Ducky`. Optional —
@@ -213,8 +214,8 @@ done
 # The names are `robotd_params::board::BOARD_LABELS`; install.sh checks again on the board.
 case "$BOARD" in
     ""|zero3) ;;
-    beta) warn "--board beta declares the board; setup-board.sh still brings up a Zero 3W" ;;
-    *) die "--board ${BOARD}: zero3 or beta" ;;
+    beta|face-board-v1) warn "--board ${BOARD} declares the board; setup-board.sh still brings up a Zero 3W" ;;
+    *) die "--board ${BOARD}: zero3, beta or face-board-v1" ;;
 esac
 
 command -v ssh >/dev/null 2>&1 || die "ssh is required"

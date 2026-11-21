@@ -24,6 +24,102 @@ pub trait Net: Send + Sync {
     async fn forget(&self, ssid: &str) -> NetResult<proto::ForgetResult>;
 }
 
+/// The `net.connect` in flight, as `net.status` reports it (`NetStatusResult::joining`).
+///
+/// Held by each backend and filled by its own `connect`, because the backend is the only thing that
+/// sees the steps: the scan before any profile changes, then NetworkManager's device transitions.
+/// Reading the device state from `status` alone was the cheaper option and the wrong one — it cannot
+/// see the scan, it reports the network being left as `connected` until the old profile drops, and
+/// it cannot tell this join from an autoconnect NM started by itself.
+///
+/// The slot is cleared by dropping the [`Join`] that [`JoinTracker::begin`] hands out, so every
+/// return from `connect` — success, refusal, `?` on a bus error — clears it without having to
+/// remember to.
+#[derive(Default)]
+pub struct JoinTracker {
+    slot: std::sync::Mutex<Option<Active>>,
+}
+
+struct Active {
+    /// Which `begin` filled the slot. Two joins can overlap — two BLE sessions, or BLE and
+    /// `robotctl` — and the later one wins the slot; this keeps the earlier one, finishing
+    /// afterwards, from clearing what is no longer its own.
+    generation: u64,
+    ssid: String,
+    step: proto::JoinStep,
+    started: std::time::Instant,
+    timeout: std::time::Duration,
+}
+
+impl JoinTracker {
+    /// Announce a join to `ssid`, starting at [`proto::JoinStep::Scanning`]. `timeout` is the
+    /// longest the caller will take, counted from now.
+    pub fn begin(&self, ssid: &str, timeout: std::time::Duration) -> Join<'_> {
+        let mut slot = self.lock();
+        let generation = slot.as_ref().map_or(0, |a| a.generation.wrapping_add(1));
+        *slot = Some(Active {
+            generation,
+            ssid: ssid.to_owned(),
+            step: proto::JoinStep::Scanning,
+            started: std::time::Instant::now(),
+            timeout,
+        });
+        Join {
+            tracker: self,
+            generation,
+        }
+    }
+
+    /// What `net.status` reports: the join in flight, if any.
+    pub fn snapshot(&self) -> Option<proto::Joining> {
+        self.lock().as_ref().map(|a| proto::Joining {
+            ssid: a.ssid.clone(),
+            step: a.step,
+            elapsed_seconds: seconds(a.started.elapsed()),
+            timeout_seconds: seconds(a.timeout),
+        })
+    }
+
+    /// A poisoned lock means a panic while holding it, and every write here is a single
+    /// assignment: the value inside is whole, so carrying on is correct.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Active>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+fn seconds(d: std::time::Duration) -> u32 {
+    u32::try_from(d.as_secs()).unwrap_or(u32::MAX)
+}
+
+/// One join's hold on a [`JoinTracker`]. Dropping it ends the join.
+pub struct Join<'a> {
+    tracker: &'a JoinTracker,
+    generation: u64,
+}
+
+impl Join<'_> {
+    /// Move to `step`. A no-op once a later join has taken the slot.
+    pub fn step(&self, step: proto::JoinStep) {
+        if let Some(active) = self.tracker.lock().as_mut()
+            && active.generation == self.generation
+        {
+            active.step = step;
+        }
+    }
+}
+
+impl Drop for Join<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.tracker.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|a| a.generation == self.generation)
+        {
+            *slot = None;
+        }
+    }
+}
+
 /// No wifi stack at all: every call answers, and every answer says why.
 ///
 /// What `configd` serves when it cannot reach the system bus. Refusing to start was the obvious
@@ -68,6 +164,8 @@ impl Net for UnavailableNet {
             ip6: None,
             mac: self.mac.clone(),
             iface: self.iface.clone(),
+            // `connect` refuses at once here, so there is never a join to report.
+            joining: None,
         })
     }
 
@@ -97,6 +195,9 @@ impl Net for UnavailableNet {
 /// access point, like a wrong passphrase.
 pub struct FakeNet {
     inner: tokio::sync::Mutex<FakeState>,
+    joins: JoinTracker,
+    /// A step at which `connect` waits to be released — see [`FakeNet::hold_joins_at`].
+    hold: std::sync::Mutex<Option<(proto::JoinStep, std::sync::Arc<tokio::sync::Notify>)>>,
 }
 
 struct FakeState {
@@ -138,9 +239,36 @@ impl FakeNet {
                 saved: Vec::new(),
                 connected: None,
             }),
+            joins: JoinTracker::default(),
+            hold: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Make every later `connect` stop on reaching `step` until the returned handle is notified.
+    ///
+    /// The fake answers instantly, so without this a test could never observe a join in flight —
+    /// which is the whole of what `joining` is for. A join that never reaches `step` (a wrong key
+    /// held at `addressing`) is not held.
+    pub fn hold_joins_at(&self, step: proto::JoinStep) -> std::sync::Arc<tokio::sync::Notify> {
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some((step, release.clone()));
+        release
+    }
+
+    async fn reach(&self, join: &Join<'_>, step: proto::JoinStep) {
+        join.step(step);
+        let release = match &*self.hold.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((held, release)) if *held == step => Some(release.clone()),
+            _ => None,
+        };
+        if let Some(release) = release {
+            release.notified().await;
         }
     }
 }
+
+/// What the fake says it will take at most: nothing it does waits on anything real.
+const FAKE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl Default for FakeNet {
     fn default() -> Self {
@@ -165,6 +293,7 @@ impl Net for FakeNet {
                 ip6: None,
                 mac: Some("50:37:cd:16:1b:92".into()),
                 iface: Some("wlan0".into()),
+                joining: self.joins.snapshot(),
             },
             None => proto::NetStatusResult {
                 state: proto::NetState::Disconnected,
@@ -174,6 +303,7 @@ impl Net for FakeNet {
                 ip6: None,
                 mac: Some("50:37:cd:16:1b:92".into()),
                 iface: Some("wlan0".into()),
+                joining: self.joins.snapshot(),
             },
         })
     }
@@ -192,11 +322,18 @@ impl Net for FakeNet {
         Ok(proto::NetScanResult { networks })
     }
 
+    /// Walks the same steps the NetworkManager backend reports, in the same order, so a client
+    /// built against `--fake` sees the progress a robot will show. The state lock is never held
+    /// across a step, or a held join would block the `net.status` asking about it.
     async fn connect(&self, ssid: &str, psk: Option<&str>) -> NetResult<proto::ConnectResult> {
-        let mut state = self.inner.lock().await;
+        let join = self.joins.begin(ssid, FAKE_JOIN_TIMEOUT);
+        self.reach(&join, proto::JoinStep::Scanning).await;
 
-        let Some((network, wanted)) = state.visible.iter().find(|(n, _)| n.ssid == ssid).cloned()
-        else {
+        let found = {
+            let state = self.inner.lock().await;
+            state.visible.iter().find(|(n, _)| n.ssid == ssid).cloned()
+        };
+        let Some((network, wanted)) = found else {
             return Ok(proto::ConnectResult::Failed {
                 reason: proto::ConnectFailure::NotFound,
                 detail: None,
@@ -215,13 +352,19 @@ impl Net for FakeNet {
                 detail: Some("this network needs a passphrase".into()),
             });
         }
+
+        self.reach(&join, proto::JoinStep::Associating).await;
+        self.reach(&join, proto::JoinStep::Authenticating).await;
         if wanted.is_some() && wanted.as_deref() != psk {
+            self.reach(&join, proto::JoinStep::KeyRejected).await;
             return Ok(proto::ConnectResult::Failed {
                 reason: proto::ConnectFailure::BadKey,
                 detail: None,
             });
         }
+        self.reach(&join, proto::JoinStep::Addressing).await;
 
+        let mut state = self.inner.lock().await;
         state.connected = Some(ssid.to_owned());
         if !state.saved.iter().any(|s| s == ssid) {
             state.saved.push(ssid.to_owned());
@@ -407,5 +550,98 @@ mod tests {
             networks.windows(2).all(|w| w[0].signal >= w[1].signal),
             "{networks:?}"
         );
+    }
+
+    /// Wait until `net` reports a join at `step`. The join runs on another task, so it needs the
+    /// scheduler to get there; a bounded number of yields keeps a broken hold from hanging the suite.
+    async fn joining_at(net: &FakeNet, step: proto::JoinStep) -> proto::Joining {
+        for _ in 0..1000 {
+            if let Some(joining) = net.status().await.unwrap().joining
+                && joining.step == step
+            {
+                return joining;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the join never reported {step:?}");
+    }
+
+    /// The contract `joining` exists for: a client polling `net.status` during a `net.connect` sees
+    /// the join and its step, and sees it gone once the call has answered.
+    #[tokio::test]
+    async fn a_join_in_flight_is_in_the_status_until_it_answers() {
+        let net = std::sync::Arc::new(FakeNet::new());
+        assert_eq!(net.status().await.unwrap().joining, None);
+
+        let release = net.hold_joins_at(proto::JoinStep::Authenticating);
+        let join = tokio::spawn({
+            let net = net.clone();
+            async move { net.connect("Pollen", Some("correct-key")).await }
+        });
+
+        let joining = joining_at(&net, proto::JoinStep::Authenticating).await;
+        assert_eq!(joining.ssid, "Pollen");
+        assert_eq!(joining.timeout_seconds, 45);
+        assert_eq!(
+            net.status().await.unwrap().state,
+            proto::NetState::Disconnected,
+            "the rest of the status describes the link as it is, not as it will be"
+        );
+
+        release.notify_one();
+        assert!(matches!(
+            join.await.unwrap().unwrap(),
+            proto::ConnectResult::Connected { .. }
+        ));
+        let status = net.status().await.unwrap();
+        assert_eq!(status.state, proto::NetState::Connected);
+        assert_eq!(status.joining, None);
+    }
+
+    /// A rejected key shows as such before the call answers, and a failed join clears the slot as
+    /// surely as a successful one.
+    #[tokio::test]
+    async fn a_rejected_key_shows_before_the_answer_and_then_clears() {
+        let net = std::sync::Arc::new(FakeNet::new());
+        let release = net.hold_joins_at(proto::JoinStep::KeyRejected);
+        let join = tokio::spawn({
+            let net = net.clone();
+            async move { net.connect("Pollen", Some("wrong")).await }
+        });
+
+        joining_at(&net, proto::JoinStep::KeyRejected).await;
+        release.notify_one();
+        assert!(matches!(
+            join.await.unwrap().unwrap(),
+            proto::ConnectResult::Failed {
+                reason: proto::ConnectFailure::BadKey,
+                ..
+            }
+        ));
+        assert_eq!(net.status().await.unwrap().joining, None);
+    }
+
+    /// Two overlapping joins: the later one owns the slot, and the earlier one finishing must not
+    /// clear it — or a client polling for the second join would see it vanish mid-flight.
+    #[test]
+    fn an_earlier_join_ending_leaves_a_later_one_in_place() {
+        let tracker = JoinTracker::default();
+        let first = tracker.begin("Pollen", std::time::Duration::from_secs(45));
+        let second = tracker.begin("Cafe", std::time::Duration::from_secs(45));
+
+        first.step(proto::JoinStep::Addressing);
+        drop(first);
+        let joining = tracker
+            .snapshot()
+            .expect("the second join is still in flight");
+        assert_eq!(joining.ssid, "Cafe");
+        assert_eq!(
+            joining.step,
+            proto::JoinStep::Scanning,
+            "the first join's step leaked"
+        );
+
+        drop(second);
+        assert_eq!(tracker.snapshot(), None);
     }
 }

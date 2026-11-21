@@ -25,7 +25,8 @@ over the same radio, with the same reply.
 | screen | calls |
 |---|---|
 | pick a robot | the advertisement — name and IPv4 — then `hello` and `system.authenticate` |
-| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors` |
+| the robot | `system.info`, `robot.health`, `system.services`, `system.setName`, `system.reboot`, `robot.init`, `robot.enable`, `robot.rebootMotors`, `robot.volume`, `robot.setVolume` |
+| home | `robot.sound`, `robot.theremin`, `robot.flashlight`, `robot.laserTrack`, `robot.soccer`, `robot.autonomous`, `robot.mode`, `robot.policies`, `robot.enable` |
 | drive | WebRTC: video, `robot.move`, `robot.subscribe` |
 | moves | `robot.skills`, `robot.do`, `robot.policies`, `robot.loadPolicy`, `policy.check`, `policy.search`, `policy.fetch`, `policy.install` |
 | wifi | `net.status`, `net.scan`, `net.connect`, `net.forget` |
@@ -35,9 +36,10 @@ over the same radio, with the same reply.
 
 Anything it turns out to need that is not routed is a one-line change to `route.rs` and a decision
 about whether it belongs on a radio — which is the property §3.1 exists to give us. The app has now
-tested that property five times: `update.rollback` and `update.select`, then `robot.init`, then
-`robot.enable`, then `robot.rebootMotors`, each opened because using the app found the refusal
-costing something the refusal's own reasoning had not accounted for.
+tested that property seven times: `update.rollback` and `update.select`, then `robot.init`, then
+`robot.enable`, then `robot.rebootMotors`, then `robot.theremin` and `robot.flashlight`, then the games and `robot.mode`, each opened
+because using the app found the refusal costing something the refusal's own reasoning had not
+accounted for.
 
 ### 1.1 It is the robot's interface, not a settings utility
 
@@ -71,6 +73,39 @@ change a setting could not fix the setting keeping the robot off the LAN.
 radio**. That is the two working as one thing rather than two: the transport that always works tells
 you how to reach the one that is fast. The robot's own console is not a competitor either — it needs
 an address, which means it needs a network, which means it needs whatever the app is for.
+
+### 1.3 The wifi lane: Bluetooth's rules, over wifi
+
+A third way in, and still not a rival: **the radio's session, reached over the network.** A phone on
+the robot's wifi opens TCP to `duck-gateway` on **9444**, proves the setup code with the same Noise
+handshake as the media door on 9443 (`duck-auth`'s `app_handshake`), and is joined to
+`/run/btd/lane.sock` — a `btd` session (`btd/src/lane.rs`). From there it is the radio's line format
+without the chunking: one JSON-RPC object per line, replies and notifications interleaved, sorted
+out by `id`, and closed by closing the connection (or after 60 s with no request, the secure BLE
+session's lease).
+
+**What it permits is exactly what Bluetooth permits**, because it is the same function: the lane
+calls `session::dispatch`, which consults `btd/src/route.rs`, and nothing about permissions is
+written anywhere else. No `robot.move`, no subscription to the 50 Hz state, no motor power beyond
+what the radio already allows. Adding a method to the BLE table adds it here; refusing one refuses
+it here. A test walks every call the protocol has and checks the two agree.
+
+**Why it exists.** Before it, the only wifi path was the video connection, and that came with a
+video stream and with `mediad`'s permissions, which include steering and power to the joints on the
+grounds that a peer holding the video is watching the robot (`mediad/src/route.rs`). A phone that
+wants to throw a switch, read `robot.mode` or fetch a photo is not watching and is not asking to
+steer. Over the lane it gets the radio's answer, faster — a photo is one burst rather than hundreds
+of 20-byte notifications — and from anywhere on the network rather than within a few metres.
+
+**Why it is no wider than Bluetooth.** The credential is the radio's: the setup code the secure BLE
+session checks. The socket behind the door is mode 0600 in `btd`'s `RuntimeDirectory=`, and the only
+process that runs as `btd` besides `btd` is the gateway, so nothing on the network or the robot
+reaches it without the handshake. The bytes on the network are Noise-encrypted; the plaintext
+exists only on that socket. It is served only in secure mode: a robot on the PIN path has no setup
+code, so the gateway has nothing to check a phone against and does not run.
+
+**Detecting it** needs no API version: a robot without the lane refuses the TCP connection on 9444
+at once, and a client falls back to the radio, which answers everything the lane would have.
 
 ## 2. `reachy_mini_mobile_app` is a reference, not a base
 
