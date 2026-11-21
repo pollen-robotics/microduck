@@ -296,8 +296,8 @@ pub fn spawn(
 /// What the video is, told to a peer once when its channel opens.
 ///
 /// **The rotation is the point of this.** Nothing rotates pixels any more, so the stream a browser
-/// receives is the picture the camera took — sideways, on a robot whose camera is mounted a quarter
-/// turn off. The page has to be told by how much, because it cannot infer it: a 180° mount looks
+/// receives is the picture the camera took — sideways on the Zero 3W, whose camera is mounted a
+/// quarter turn off, and upright on the beta boards. The page has to be told by how much, because it cannot infer it: a 180° mount looks
 /// exactly like an upright one from the aspect ratio alone.
 pub fn video_notification(width: u32, height: u32, rotate_degrees: u32) -> String {
     format!(

@@ -90,7 +90,8 @@ enum Command {
         #[arg(long)]
         min_supported: Option<semver::Version>,
 
-        /// Extra files to include, as `src=dest` (e.g. a post-install hook).
+        /// Extra files to include, as `src=dest` (e.g. a post-install hook). A directory is
+        /// every file directly in it, under `dest/`.
         #[arg(long = "include")]
         includes: Vec<String>,
 
@@ -355,7 +356,24 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0o644
             };
-            append_file(&mut builder, Path::new(src), dest, mode)?;
+            let src = Path::new(src);
+            if src.is_dir() {
+                // Sorted, so the same tree packs into the same archive.
+                let mut files: Vec<_> = std::fs::read_dir(src)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<Result<_, _>>()?;
+                files.retain(|p| p.is_file());
+                files.sort();
+                for file in files {
+                    let name = file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| format!("{}: not a UTF-8 file name", file.display()))?;
+                    append_file(&mut builder, &file, &format!("{dest}/{name}"), mode)?;
+                }
+            } else {
+                append_file(&mut builder, src, dest, mode)?;
+            }
         }
 
         // The preinstall hook, always, generated from its template.
@@ -1890,6 +1908,28 @@ mod tests {
         }
     }
 
+    /// The emotions ship inside the release, and robotd loads them from there
+    /// (`emotion::Library::load_release`). A site that forgets them produces robots on which every
+    /// pad button bound to an emotion is refused as an unknown skill.
+    #[test]
+    fn the_emotions_are_packaged_at_every_site() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            root.join("robotd/emotions/yes.json").exists(),
+            "the vendored emotions are gone"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("--include \"robotd/emotions=emotions\""),
+                "{site} does not package the emotions"
+            );
+        }
+    }
+
     /// The pick-up classifier ships inside the release like the petting one, for the same
     /// reasons: small, a detector rather than a policy, versioned with the loop that feeds it —
     /// its input is the loop's own feature layout, so a model from another release is the wrong
@@ -2031,6 +2071,47 @@ mod tests {
             }
         }
         assert!(found >= 2, "expected several sysusers files, found {found}");
+    }
+
+    /// A daemon's udev rule must be in the artifact too, or `hooks/postinstall` has nothing to
+    /// install and the daemon finds its device root-only — `padd` and a Nintendo pad's hidraw, whose
+    /// battery then never shows, with nothing failing anywhere but one line in `padd`'s journal.
+    /// Discovered from `<crate>/systemd/udev/*.rules`, like the sysusers files above.
+    #[test]
+    fn every_udev_rule_in_the_repo_is_packaged() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+
+        let mut found = 0;
+        for crate_dir in std::fs::read_dir(root).expect("the workspace root must be readable") {
+            let rules = crate_dir
+                .expect("readable entry")
+                .path()
+                .join("systemd/udev");
+            if !rules.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&rules).expect("readable udev").flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".rules") {
+                    continue;
+                }
+                found += 1;
+                for workflow in PACKAGING_SITES {
+                    let text = std::fs::read_to_string(root.join(workflow))
+                        .unwrap_or_else(|e| panic!("{workflow}: {e}"));
+                    assert!(
+                        text.contains(&format!("=systemd/udev/{name}")),
+                        "{workflow} does not package {name}, so hooks/postinstall cannot install it"
+                    );
+                }
+            }
+        }
+        assert!(
+            found >= 1,
+            "expected padd's hidraw rule, found {found} rules"
+        );
     }
 
     /// A hook that exists in the repository must be in the artifact.

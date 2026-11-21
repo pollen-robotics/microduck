@@ -199,6 +199,10 @@ pub enum Error {
     #[error("preflight check failed: {0}")]
     Preflight(String),
 
+    /// The only check that failed was the remote-session one: a WebRTC peer would be dropped.
+    #[error("{0}")]
+    SessionsConnected(String),
+
     #[error("hook {hook} failed: {detail}")]
     Hook { hook: String, detail: String },
 
@@ -308,6 +312,7 @@ impl Error {
             Error::WouldOrphanUnit(_) => code::INCOMPATIBLE,
             Error::ArchiveTooLarge(_) => code::ARCHIVE_TOO_LARGE,
             Error::Preflight(_) => code::PREFLIGHT_FAILED,
+            Error::SessionsConnected(_) => code::SESSIONS_CONNECTED,
             Error::Hook { .. } => code::HOOK_FAILED,
             Error::Health(_) => code::HEALTH_CHECK_FAILED,
             // Shares the health code rather than adding one: to a client this is the same class of

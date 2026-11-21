@@ -400,8 +400,11 @@ fn every_include_lands_where_the_workflow_says() {
         let entries = packaged_release(name);
 
         for (src, dest) in includes(&workflow) {
+            // A directory lands as the files in it, under `dest/`.
+            let landed = entries.contains_key(&dest)
+                || entries.keys().any(|p| p.starts_with(&format!("{dest}/")));
             assert!(
-                entries.contains_key(&dest),
+                landed,
                 "{name} includes {src:?} as {dest:?}, which is not in the artifact"
             );
         }

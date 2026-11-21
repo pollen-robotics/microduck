@@ -50,8 +50,10 @@ mod endurance;
 mod frame;
 mod imu_view;
 mod led;
+mod map;
 mod monitor;
 mod path_map;
+mod setup_code;
 mod show;
 mod vetbook;
 
@@ -101,6 +103,10 @@ struct Cli {
     #[arg(long, global = true, default_value = proto::socket::CONFIG)]
     config_socket: PathBuf,
 
+    /// Path to `nfcd`'s socket, where `nfc-flash` and `nfc-read` ask for a tag.
+    #[arg(long, global = true, default_value = proto::socket::NFC)]
+    nfc_socket: PathBuf,
+
     /// Path to `padd`'s raw input tap, which `monitor` reads the pad's own event stream from.
     ///
     /// Optional in the only sense that matters: nothing fails when it is absent. `monitor` says the
@@ -118,6 +124,10 @@ struct Cli {
     /// Local camera snapshot socket.
     #[arg(long, global = true, default_value = proto::socket::MEDIA)]
     media_socket: PathBuf,
+
+    /// Path to `mapd`'s socket, which `map` reads the map and the pose from.
+    #[arg(long, global = true, default_value = proto::socket::MAP)]
+    map_socket: PathBuf,
 
     #[command(subcommand)]
     namespace: Namespace,
@@ -172,10 +182,47 @@ enum Namespace {
     /// says so. Ctrl-C to stop.
     HeadImu,
 
+    /// The onboard map: where the robot is in its home, the map itself, and forgetting it.
+    /// Served by `mapd`. It maps where the robot stops and looks around.
+    Map {
+        #[command(subcommand)]
+        command: Option<map::MapCommand>,
+    },
+
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Write a text onto an NFC tag: run this, then touch a tag to the duck's head.
+    ///
+    /// The tag then reads as that text — `walk_mode`, `microduck_gamepad_pairing`, anything — in
+    /// the duck and in a phone app alike. A tag already on the reader is written too. The duck
+    /// quacks when it took, and the tag is read back before this says so. An NTAG or an ISO 15693
+    /// tag is written; anything else is refused with why, and left as it was.
+    NfcFlash {
+        /// What the tag will read.
+        text: String,
+        /// How long to wait for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+    },
+
+    /// Read an NFC tag: run this, then touch a tag to the duck's head.
+    ///
+    /// Prints the tag's UID and each text or URI record on it, one per line — what the duck
+    /// reads when the tag is touched. A tag already on the reader is read too. While this waits,
+    /// the tag is read and nothing else: a pairing tag does not pair, a mode tag does not switch
+    /// the mode. The duck quacks when it has read it. A blank tag reads as no records, and says
+    /// why.
+    NfcRead {
+        /// How long to wait for a tag, in seconds (at most 120).
+        #[arg(long, default_value_t = proto::NfcWriteParams::DEFAULT_TIMEOUT_S)]
+        timeout: u32,
+        /// The answer as JSON, exactly as `nfc.read` gives it.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// The duck's vet book: its whole life in numbers.
     ///
@@ -202,6 +249,9 @@ enum Namespace {
         /// white, red, green, blue, yellow, cyan or magenta.
         #[arg(long, default_value = "white")]
         color: String,
+        /// How bright, 0 to 1 of full (`--brightness 0.1`). Full when not given.
+        #[arg(long)]
+        brightness: Option<f64>,
     },
 
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
@@ -240,6 +290,49 @@ enum Namespace {
         /// client that went away.
         #[arg(long)]
         off: bool,
+    },
+
+    /// Follow a laser dot: the head looks at it and the robot walks to it.
+    ///
+    /// `on` and `off` switch it, and it stays as set — a pad still drives normally, and wins over
+    /// the dot whenever a stick is pushed. With no argument, or after `on`, this watches what the
+    /// camera sees until Ctrl-C (which leaves tracking as it is).
+    ///
+    /// The readout is how `[laser]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// colour of the reddest bright thing in the picture whether it passed or not — point the
+    /// laser, read it, and set y_min / v_min a little below and u_max a little above.
+    LaserTrack {
+        /// `on` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+    },
+
+    /// Soccer mode: the pad's bumpers kick, and D-pad down sets the robot playing by itself —
+    /// finding the purple ball, walking to it and kicking it.
+    ///
+    /// `on` is soccer mode by hand (what an NFC `soccer_mode` tag does), `auto` plays by itself,
+    /// `off` ends both. Any button on the pad takes autonomous play back to manual. With no
+    /// argument, or after `on`/`auto`, this watches until Ctrl-C (which leaves the mode as it is).
+    ///
+    /// The readout is how `[soccer]` is tuned (`robotctl configure`, applies live): `peak` is the
+    /// most purple thing in the picture whether it passed or not — hold the ball up, read it, and
+    /// set u_min / v_min a little below. `[soccer] walk = false` tunes it on a robot that stays put.
+    Soccer {
+        /// `on`, `auto` or `off`. Absent: just watch.
+        #[arg(value_parser = ["on", "auto", "off"])]
+        state: Option<String>,
+    },
+
+    /// The duck on its own (`autod`): it wanders, naps, chases a laser dot and plays with the
+    /// ball, and a touched pad takes over.
+    ///
+    /// Until the next boot, which starts from `[autonomous] enabled` again. What an NFC
+    /// `autonomous_mode` tag does. With no argument, says whether it is on.
+    /// `journalctl -u autod -f` is what it is thinking.
+    Autonomous {
+        /// `on` or `off`. Absent: just say.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
     },
 
     /// Edit robotd's config (/etc/robot/robotd.toml) without reading a wall of comments.
@@ -529,6 +622,15 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show the setup code — `md1:<first name>:<key>` — as text and as a QR for the phone app.
+    ///
+    /// From the ID EEPROM, where the factory writes it, or on a dev board from the key `install`
+    /// left. Needs root: the key is root's. It never generates a key, which is the factory's job
+    /// (`factory-provisioning.md`).
+    SetupCode {
+        #[command(subcommand)]
+        action: Option<SetupCodeAction>,
+    },
     /// Reboot, cleanly, through systemd.
     Reboot {
         /// Reboot without asking.
@@ -537,6 +639,24 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SetupCodeAction {
+    /// Install the 32-byte key, read on stdin as 64 hex characters. Needs root.
+    ///
+    /// On stdin so the key is in no command line or shell history. Refuses to replace an
+    /// existing key, which would invalidate the printed QR and every phone holding the old code.
+    Install {
+        /// Replace an existing key.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Leave the key where `btd` and `duck-gateway` import it. Needs root.
+    ///
+    /// Run by `configd.service` before it starts; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Export,
 }
 
 #[derive(Subcommand, Debug)]
@@ -667,8 +787,81 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `robotctl nfc-flash` — ask `nfcd` to write `text` onto the next tag touched.
+fn run_nfc_flash(socket: &Path, text: String, timeout: u32) -> Result<(), Failure> {
+    let mut client = Client::connect_to("nfcd", socket)?;
+    client.hello()?;
+    let params = proto::NfcWriteParams {
+        text,
+        timeout_s: Some(timeout),
+    };
+    eprintln!(
+        "Touch a tag to the duck's head (waiting {} s)…",
+        params.timeout().as_secs()
+    );
+    let text = params.text.clone();
+    let result = result_of(client.call(&proto::Call::NfcWrite(params))?)?;
+    let outcome: proto::NfcWriteResult = decode(&result)?;
+    let tag = outcome.uid.unwrap_or_else(|| "no tag".to_owned());
+    if !outcome.written {
+        let reason = outcome.reason.unwrap_or_else(|| "not written".to_owned());
+        return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
+    }
+    println!("{tag} now reads {text:?}");
+    Ok(())
+}
+
+/// `robotctl nfc-read` — ask `nfcd` to read the next tag touched, and print what it holds.
+fn run_nfc_read(socket: &Path, timeout: u32, json: bool) -> Result<(), Failure> {
+    let mut client = Client::connect_to("nfcd", socket)?;
+    client.hello()?;
+    let params = proto::NfcReadParams {
+        timeout_s: Some(timeout),
+    };
+    eprintln!(
+        "Touch a tag to the duck's head (waiting {} s)…",
+        params.timeout().as_secs()
+    );
+    let result = result_of(client.call(&proto::Call::NfcRead(params))?)?;
+    let outcome: proto::NfcReadResult = decode(&result)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&outcome).unwrap_or_default()
+        );
+    }
+    let tag = outcome.uid.clone().unwrap_or_else(|| "no tag".to_owned());
+    if !outcome.read {
+        let reason = outcome.reason.unwrap_or_else(|| "not read".to_owned());
+        return Err(Failure::new(exit::REFUSED, format!("{tag}: {reason}")));
+    }
+    if json {
+        return Ok(());
+    }
+    println!("{tag}");
+    for record in &outcome.records {
+        match record {
+            proto::NfcRecord::Text(text) => println!("  text {text:?}"),
+            proto::NfcRecord::Uri(uri) => println!("  uri  {uri:?}"),
+        }
+    }
+    if outcome.records.is_empty() {
+        let why = outcome
+            .reason
+            .as_deref()
+            .unwrap_or("no text or URI records");
+        println!("  (nothing: {why})");
+    }
+    Ok(())
+}
+
 /// `robotctl flashlight` — ask `robotd` to switch the flashlight.
-fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure> {
+fn run_flashlight(
+    socket: &Path,
+    state: &str,
+    color: &str,
+    brightness: Option<f64>,
+) -> Result<(), Failure> {
     let color: proto::FlashlightColor =
         serde_json::from_value(serde_json::Value::String(color.to_owned())).map_err(|_| {
             Failure::new(
@@ -683,6 +876,7 @@ fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure
             on: state == "on",
             toggle: state == "toggle",
             color,
+            brightness,
         },
     ))?)?;
     let outcome: proto::IntentResult = decode(&result)?;
@@ -807,6 +1001,286 @@ fn run_theremin(socket: &Path, off: bool) -> Result<(), Failure> {
         println!("theremin put down");
     }
     Ok(())
+}
+
+/// `robotctl laser-track` — switch laser tracking, and watch what the camera makes of the dot.
+///
+/// Unlike the theremin, Ctrl-C leaves the mode as it is: tracking is meant to be left on while
+/// the robot is driven, and this view is for tuning, not for holding the mode up.
+fn run_laser_track(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let active = state == "on";
+        let outcome: proto::LaserTrackResult = decode(&result_of(client.call(
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active }),
+        )?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        if !active {
+            println!("laser tracking off");
+            return Ok(());
+        }
+        println!("laser tracking on");
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (tracking stays as it is)");
+
+    let mut line = String::new();
+    let mut said_off = false;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let Some(laser) = state.laser else {
+            if !said_off {
+                print!("\r\x1b[K  laser tracking is off — `robotctl laser-track on`");
+                let _ = std::io::stdout().flush();
+                said_off = true;
+            }
+            continue;
+        };
+        said_off = false;
+        print!("\r\x1b[K  {}", laser_line(&laser));
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_laser_track`]: the dot, the colour it was judged on, where it is,
+/// and what the robot is doing about it.
+fn laser_line(laser: &proto::LaserTrackState) -> String {
+    let dot = match &laser.dot {
+        None => format!("{:<26}", laser.camera),
+        Some(dot) => {
+            let seen = match (dot.seen, dot.px, &dot.rejected) {
+                (true, Some([x, y]), _) => format!("DOT ({x:4.0},{y:4.0}) n={:<3}", dot.pixels),
+                (_, _, Some(why)) => format!("{why} (n={})", dot.pixels),
+                _ => "no dot".to_owned(),
+            };
+            let peak = dot
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", dot.hz)
+        }
+    };
+    let target = match laser.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            laser
+                .age_ms
+                .filter(|age| *age > 150)
+                .map(|age| format!(" ({age} ms ago)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let doing = match (laser.head, laser.walk, laser.twist) {
+        (_, true, Some([vx, _, vyaw])) => format!("walk {vx:.2} m/s {vyaw:+.2} rad/s"),
+        (true, false, _) => "looking".to_owned(),
+        (false, false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!("{dot}  {target:<24} {doing}")
+}
+
+/// `robotctl autonomous` — switch the duck on its own, or say whether it is on.
+fn run_autonomous(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let params = proto::AutonomyParams {
+            active: state == "on",
+        };
+        let outcome: proto::IntentResult = decode(&result_of(
+            client.call(&proto::Call::RobotAutonomous(params))?,
+        )?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+    }
+    let mode: proto::ModeResult = decode(&result_of(client.call(&proto::Call::RobotMode)?)?)?;
+    if mode.autonomous {
+        println!(
+            "the duck is on its own — touch the pad to take over; `journalctl -u autod -f` says what it is doing"
+        );
+    } else {
+        println!("the duck on its own is off");
+    }
+    Ok(())
+}
+
+/// `robotctl soccer` — switch soccer mode, and watch what autonomous play makes of the ball.
+/// Ctrl-C leaves the mode as it is, as `laser-track`'s does.
+fn run_soccer(socket: &Path, state: Option<&str>) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    if let Some(state) = state {
+        let params = proto::SoccerParams {
+            active: state != "off",
+            autonomous: state == "auto",
+        };
+        let outcome: proto::IntentResult =
+            decode(&result_of(client.call(&proto::Call::RobotSoccer(params))?)?)?;
+        if !outcome.accepted {
+            let reason = outcome.reason.unwrap_or_else(|| "refused".to_owned());
+            return Err(Failure::new(exit::REFUSED, reason));
+        }
+        match state {
+            "off" => {
+                println!("soccer mode off");
+                return Ok(());
+            }
+            "auto" => println!("soccer: playing by itself"),
+            _ => println!("soccer mode on — LB/RB kick, D-pad down plays by itself"),
+        }
+    }
+
+    // SAFETY: as in `run_theremin` — a handler whose whole body is one relaxed atomic store.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            note_interrupt as *const () as libc::sighandler_t,
+        );
+    }
+    let mut stream = Client::connect_to("robotd", socket)?;
+    stream.hello()?;
+    stream.send(&proto::Request::call(
+        proto::Id::Number(1),
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(10) }),
+    ))?;
+    println!("watching · Ctrl-C to stop watching (soccer stays as it is)");
+
+    let mut line = String::new();
+    let mut said: Option<&str> = None;
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        line.clear();
+        match stream.reader.read_line(&mut line) {
+            Err(e) => {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    format!("the state stream stopped: {e}"),
+                ));
+            }
+            Ok(0) => break,
+            Ok(_) => {}
+        }
+        let Some(state) = serde_json::from_str::<proto::Request>(&line)
+            .ok()
+            .and_then(|r| r.as_state())
+        else {
+            continue;
+        };
+        let quiet = match &state.soccer {
+            None => Some("soccer mode is off — `robotctl soccer on`"),
+            Some(s) if !s.autonomous => {
+                Some("soccer mode, by hand — D-pad down or `robotctl soccer auto` to play")
+            }
+            Some(_) => None,
+        };
+        match (quiet, &state.soccer) {
+            (Some(text), _) => {
+                if said != Some(text) {
+                    print!("\r\x1b[K  {text}");
+                    said = Some(text);
+                }
+            }
+            (None, Some(soccer)) => {
+                said = None;
+                print!("\r\x1b[K  {}", soccer_line(soccer));
+            }
+            (None, None) => {}
+        }
+        let _ = std::io::stdout().flush();
+    }
+    println!();
+    Ok(())
+}
+
+/// One readout line for [`run_soccer`]: the ball, the colour it was judged on, where it is by the
+/// floor and by its size, and what the robot is doing about it.
+fn soccer_line(soccer: &proto::SoccerState) -> String {
+    let ball = match &soccer.ball {
+        None => format!("{:<26}", soccer.camera),
+        Some(ball) => {
+            let seen = match (ball.seen, ball.px, ball.radius_px, &ball.rejected) {
+                (true, Some([x, y]), Some(r), _) => {
+                    format!("BALL ({x:4.0},{y:4.0}) r={r:<3.0}")
+                }
+                (_, _, _, Some(why)) => format!("{why} (n={})", ball.cells),
+                _ => "no ball".to_owned(),
+            };
+            let peak = ball
+                .peak_yuv
+                .map(|[y, u, v]| format!("peak Y{y:3} U{u:3} V{v:3}"))
+                .unwrap_or_default();
+            format!("{seen:<24} {peak}  {:2.0}Hz", ball.hz)
+        }
+    };
+    let target = match soccer.target_m {
+        Some([x, y]) => format!(
+            "→ {:.2} m {:+4.0}°{}",
+            x.hypot(y),
+            y.atan2(x).to_degrees(),
+            soccer
+                .size_range_m
+                .map(|r| format!(" (size {r:.2} m)"))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let foot = soccer
+        .foot
+        .as_deref()
+        .map(|f| format!(" {f}"))
+        .unwrap_or_default();
+    let spot = soccer
+        .spot_m
+        .map(|[x, y]| format!(" spot {x:+.3} {y:+.3}"))
+        .unwrap_or_default();
+    let doing = match (soccer.walk, soccer.twist) {
+        (true, Some([vx, vy, vyaw])) => format!("{vx:+.2} {vy:+.2} m/s {vyaw:+.2} rad/s"),
+        (false, Some(_)) => "pad has it".to_owned(),
+        _ => String::new(),
+    };
+    format!(
+        "{ball}  {target:<34} {}{foot}{spot} {doing}  kicks {}",
+        soccer.phase, soccer.kicks
+    )
 }
 
 /// `robotctl chorale` — go looking for other ducks to sing with, and watch what happens.
@@ -1581,6 +2055,7 @@ impl Client {
     fn hello_result(&mut self) -> Result<proto::HelloResult, Failure> {
         let response = self.call(&proto::Call::Hello(proto::HelloParams {
             api_version: proto::API_VERSION,
+            client: None,
         }))?;
         if let Some(error) = response.error {
             // Passed through unadorned. This side cannot add a remedy the daemon does not
@@ -1846,6 +2321,11 @@ struct HealthReport {
     /// GStreamer stack runs no `mediad`, and the units block is where that is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     camera: Option<proto::CameraStats>,
+    /// Seconds since `mediad` last rewrote [`HealthReport::camera`], set only when that is longer
+    /// than [`proto::CAMERA_STATS_MAX_AGE`]: the camera has stopped, and `camera.fps` is the rate
+    /// it had when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camera_stopped_secs: Option<u64>,
     /// What `mediad`'s relay last published about the rendezvous service. `None` for the camera's
     /// reasons, plus `--no-remote`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1994,6 +2474,9 @@ fn run_health(
         robot_error: None,
         software: collect_version_report(socket, robot_socket, config_socket),
         camera: proto::read_camera_stats(),
+        camera_stopped_secs: proto::camera_stats_age()
+            .filter(|age| *age > proto::CAMERA_STATS_MAX_AGE)
+            .map(|age| age.as_secs()),
         remote: proto::read_remote_status(),
         account: Client::connect(socket)
             .ok()
@@ -2221,7 +2704,15 @@ fn render_health(report: &HealthReport) -> String {
     // rather than about which release is installed. Omitted entirely when `mediad` has published
     // nothing — "camera unknown" on a board with no camera is noise, and a `mediad` that is not
     // running is already a line in the units block.
-    if let Some(camera) = &report.camera {
+    if let (Some(camera), Some(secs)) = (&report.camera, report.camera_stopped_secs) {
+        // A stopped camera first, in words: its file still holds the last rate it had, and
+        // printing that as current is how a dead camera read as "10.0 fps (target 30)".
+        let _ = writeln!(
+            out,
+            "camera    stopped — no frame for {secs}s (was {:.1} fps, {}x{} {})",
+            camera.fps, camera.width, camera.height, camera.format
+        );
+    } else if let Some(camera) = &report.camera {
         let rate = if camera.fps >= f64::from(camera.target_fps) * 0.9 {
             format!("{:.1} fps", camera.fps)
         } else {
@@ -3066,6 +3557,7 @@ impl Failure {
             code::BUSY => exit::BUSY,
             code::INCOMPATIBLE
             | code::PREFLIGHT_FAILED
+            | code::SESSIONS_CONNECTED
             | code::VERIFICATION_FAILED
             | code::WOULD_DOWNGRADE
             | code::NOT_INSTALLED
@@ -3368,6 +3860,14 @@ fn run_net(socket: &Path, command: NetCommand) -> Result<(), Failure> {
 }
 
 fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
+    // Local files only: no daemon is involved in showing or installing the key.
+    if let SystemCommand::SetupCode { action } = &command {
+        return match action {
+            None => setup_code::show(),
+            Some(SetupCodeAction::Install { force }) => setup_code::install(*force),
+            Some(SetupCodeAction::Export) => setup_code::export(),
+        };
+    }
     // Asked before connecting, so a robot is not disturbed by a command the operator then
     // aborts.
     if let SystemCommand::Reboot { yes: false, .. } = &command {
@@ -3392,6 +3892,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             *json,
         ),
         SystemCommand::Reboot { json, .. } => (proto::Call::SystemReboot, *json),
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     };
 
     let result = result_of(client.call(&call)?)?;
@@ -3444,6 +3945,7 @@ fn run_system(socket: &Path, command: SystemCommand) -> Result<(), Failure> {
             let reboot: proto::RebootResult = decode(&result)?;
             println!("rebooting in {}s", reboot.in_seconds);
         }
+        SystemCommand::SetupCode { .. } => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -4998,7 +5500,25 @@ fn render_pad_status(result: &serde_json::Value, udp: bool) -> Result<String, Fa
             (false, true) => "paired, not connected — switch the pad on".to_owned(),
             (false, false) => "paired but NOT trusted — re-run:  sudo robotctl pad pair".to_owned(),
         };
-        let _ = writeln!(out, "pad     {} {}  {}", pad.name, pad.mac, state);
+        // The battery when `padd` could read it (a Nintendo pad), after the state: absent is
+        // "unknown", and is not printed as anything.
+        let battery = pad.battery.map_or(String::new(), |b| {
+            format!(
+                " · battery {}{}{}",
+                b.level.word(),
+                if b.charging { ", charging" } else { "" },
+                if b.level.is_low() {
+                    " — charge it soon"
+                } else {
+                    ""
+                }
+            )
+        });
+        let _ = writeln!(
+            out,
+            "pad     {} {}  {}{}",
+            pad.name, pad.mac, state, battery
+        );
     }
 
     let driver = match status.driver {
@@ -5042,7 +5562,7 @@ fn report_pair(result: &serde_json::Value) -> Result<(), Failure> {
             }
             Ok(())
         }
-        proto::PadPairResult::Failed { reason, detail } => {
+        proto::PadPairResult::Failed { reason, detail, .. } => {
             let advice = match reason {
                 proto::PadPairFailure::NotFound => {
                     "no gamepad in pairing mode. On an Xbox pad: switch it on with a short press \
@@ -5098,6 +5618,13 @@ fn render_net_status(result: &serde_json::Value) -> Result<String, Failure> {
     if let Some(iface) = &status.iface {
         let mac = status.mac.as_deref().unwrap_or("unknown");
         let _ = writeln!(out, "iface   {iface}  {mac}");
+    }
+    if let Some(joining) = &status.joining {
+        let _ = writeln!(
+            out,
+            "joining {}  {:?}, {}s of at most {}s",
+            joining.ssid, joining.step, joining.elapsed_seconds, joining.timeout_seconds
+        );
     }
 
     // The one state worth explaining, because it is a provisioning mistake rather than a
@@ -5349,6 +5876,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 &cli.pad_socket,
                 &cli.tof_socket,
                 &cli.media_socket,
+                &cli.map_socket,
                 hz,
                 json,
             );
@@ -5413,17 +5941,39 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
-        Namespace::Flashlight { state, color } => {
-            return run_flashlight(&cli.robot_socket, &state, &color);
+        Namespace::NfcFlash { text, timeout } => {
+            return run_nfc_flash(&cli.nfc_socket, text, timeout);
+        }
+        Namespace::NfcRead { timeout, json } => {
+            return run_nfc_read(&cli.nfc_socket, timeout, json);
+        }
+        Namespace::Flashlight {
+            state,
+            color,
+            brightness,
+        } => {
+            return run_flashlight(&cli.robot_socket, &state, &color, brightness);
         }
         Namespace::HeadImu => {
             return run_head_imu(&cli.robot_socket);
+        }
+        Namespace::Map { command } => {
+            return map::run(&cli.map_socket, command);
         }
         Namespace::Led { command } => {
             return led::run(Path::new(led::LEDS_DIR), command);
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
+        }
+        Namespace::LaserTrack { state } => {
+            return run_laser_track(&cli.robot_socket, state.as_deref());
+        }
+        Namespace::Soccer { state } => {
+            return run_soccer(&cli.robot_socket, state.as_deref());
+        }
+        Namespace::Autonomous { state } => {
+            return run_autonomous(&cli.robot_socket, state.as_deref());
         }
         Namespace::Chorale { off, piece } => {
             return run_chorale(&cli.robot_socket, off, piece);
@@ -5820,6 +6370,46 @@ mod tests {
             "{udp}"
         );
         assert!(udp.contains("udp-pad.md"), "{udp}");
+    }
+
+    /// The pad line carries the battery when `padd` read one, says to charge it when it is low,
+    /// and says nothing about a pad whose battery is unknown.
+    #[test]
+    fn pad_status_says_the_battery_when_there_is_one() {
+        let pad = |battery| proto::Pad {
+            mac: "98:B6:E9:5E:BB:DB".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            battery,
+        };
+        let render = |pads| {
+            let status = serde_json::to_value(proto::PadStatusResult {
+                pads,
+                driver: proto::UnitState::Active,
+            })
+            .unwrap();
+            render_pad_status(&status, false).unwrap_or_else(|e| panic!("{}", e.message))
+        };
+
+        let full = render(vec![pad(Some(proto::PadBattery {
+            level: proto::PadBatteryLevel::Full,
+            charging: false,
+        }))]);
+        assert!(full.contains("connected · battery full\n"), "{full}");
+
+        let low = render(vec![pad(Some(proto::PadBattery {
+            level: proto::PadBatteryLevel::Critical,
+            charging: true,
+        }))]);
+        assert!(
+            low.contains("battery critical, charging — charge it soon"),
+            "{low}"
+        );
+
+        let unknown = render(vec![pad(None)]);
+        assert!(!unknown.contains("battery"), "{unknown}");
     }
 
     // ── robotctl policy ──────────────────────────────────────────────────
@@ -6695,6 +7285,7 @@ mod tests {
             robot_error: robot_error.map(str::to_owned),
             software: report(vec![service("robotd", "0.2.0")], Some("0.2.0")),
             camera: None,
+            camera_stopped_secs: None,
             remote: None,
             account: None,
             board: BoardReport {
@@ -6926,6 +7517,22 @@ mod tests {
             out.contains("camera    19.6 fps (target 30), 1280x720 UYVY, 412 dropped — 2 viewers"),
             "{out}"
         );
+    }
+
+    /// A camera whose stats have gone stale has stopped, and says so rather than repeating the
+    /// last rate it had — which is what a camera that died three seconds after boot looked like.
+    #[test]
+    fn health_renders_a_stopped_camera() {
+        let mut report = health_report(None, None);
+        report.camera = Some(camera_stats(10.0, 48, 0));
+        report.camera_stopped_secs = Some(312);
+        let out = render_health(&report);
+
+        assert!(
+            out.contains("camera    stopped — no frame for 312s (was 10.0 fps, 1280x720 UYVY)"),
+            "{out}"
+        );
+        assert!(!out.contains("target"), "{out}");
     }
 
     /// No `mediad`, no line. A robot that has never started it should not read as having a fault.

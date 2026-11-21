@@ -77,30 +77,28 @@ pub fn candidates(
         }];
     }
     let forced_i2c = bus.is_some() || address.is_some();
-    match board {
-        Board::Beta if !forced_i2c => vec![Link::Spi {
+    if board.is_beta_main_board() && !forced_i2c {
+        return vec![Link::Spi {
             device: PathBuf::from(BETA_SPI),
-        }],
-        Board::Zero3 | Board::Beta => {
-            let buses: Vec<PathBuf> = match bus {
-                Some(bus) => vec![bus.to_path_buf()],
-                None => BUS_CANDIDATES.iter().map(PathBuf::from).collect(),
-            };
-            let addresses: Vec<u8> = match address {
-                Some(address) => vec![address],
-                None => ADDRESS_CANDIDATES.to_vec(),
-            };
-            buses
-                .iter()
-                .flat_map(|bus| {
-                    addresses.iter().map(move |&address| Link::I2c {
-                        bus: bus.clone(),
-                        address,
-                    })
-                })
-                .collect()
-        }
+        }];
     }
+    let buses: Vec<PathBuf> = match bus {
+        Some(bus) => vec![bus.to_path_buf()],
+        None => BUS_CANDIDATES.iter().map(PathBuf::from).collect(),
+    };
+    let addresses: Vec<u8> = match address {
+        Some(address) => vec![address],
+        None => ADDRESS_CANDIDATES.to_vec(),
+    };
+    buses
+        .iter()
+        .flat_map(|bus| {
+            addresses.iter().map(move |&address| Link::I2c {
+                bus: bus.clone(),
+                address,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -123,12 +121,15 @@ mod tests {
 
     #[test]
     fn a_beta_looks_on_its_spi_bus_only() {
-        assert_eq!(
-            candidates(Board::Beta, None, None, None),
-            vec![Link::Spi {
-                device: BETA_SPI.into()
-            }]
-        );
+        for board in [Board::Beta, Board::FaceBoardV1] {
+            assert_eq!(
+                candidates(board, None, None, None),
+                vec![Link::Spi {
+                    device: BETA_SPI.into()
+                }],
+                "{board}"
+            );
+        }
     }
 
     /// The flags are for the bench, so they beat the board — either way round.

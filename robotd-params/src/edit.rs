@@ -826,6 +826,17 @@ pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
     model.save()
 }
 
+/// Set one key through the model — the same validation and atomic write as the editor — and save.
+pub fn set_key(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let mut model = Model::load(path)?;
+    let entry = REGISTRY
+        .iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
+    model.edit(entry, value)?;
+    model.save()
+}
+
 /// Declare the board, written out even when it is the default.
 ///
 /// Unlike every other edit, which clears a key set to its default: `zero3` is the default *and* a
@@ -1980,8 +1991,12 @@ mod tests {
                 "idle",
                 "pickup",
                 "theremin",
+                "laser",
+                "soccer",
                 "head_imu",
+                "map",
                 "audio",
+                "emotions",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
@@ -1992,7 +2007,8 @@ mod tests {
                 "pad_head",
                 "pad_body",
                 "pad_roller",
-                "netpad"
+                "netpad",
+                "autonomous"
             ]
         );
     }
