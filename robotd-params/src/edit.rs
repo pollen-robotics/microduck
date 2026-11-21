@@ -529,8 +529,8 @@ impl Model {
         if skill.chain {
             entry["chain"] = toml_edit::value(true);
         }
-        if skill.from_seat {
-            entry["from_seat"] = toml_edit::value(true);
+        if !skill.entry_pose.is_standing() {
+            entry["entry_pose"] = toml_edit::value(skill.entry_pose.as_str());
         }
         // Only what differs from a plain zero-command one-shot. A file full of explicit
         // defaults is the unreadable thing this whole editor exists to avoid.
@@ -2176,15 +2176,15 @@ mod tests {
         assert!(!written.contains("unwind"), "{written}");
         assert!(!written.contains("chain"), "{written}");
         assert!(
-            !written.contains("from_seat"),
-            "off is the default, and not written"
+            !written.contains("entry_pose"),
+            "standing is the default, and not written"
         );
     }
 
-    /// Allowed from the seat survives the round trip through the daemon's own loader — and only
-    /// for the skill that asked; the built-ins seeded beside it stay refused from the seat.
+    /// A seated skill survives the round trip through the daemon's own loader — and only the
+    /// skill that asked; the built-ins seeded beside it stay standing.
     #[test]
-    fn a_from_seat_skill_is_written_and_read_back() {
+    fn a_seated_skill_is_written_and_read_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("robotd.toml");
         std::fs::write(&config, "[policy]\n").expect("write");
@@ -2196,18 +2196,27 @@ mod tests {
                 path: Some(PathBuf::from("/srv/scoot.onnx")),
                 duration: 2.5,
                 command: [-0.05, 0.0, 0.0],
-                from_seat: true,
+                entry_pose: crate::EntryPose::Seated,
                 ..Default::default()
             },
         )
         .expect("added");
 
         let written = std::fs::read_to_string(&config).expect("read");
-        assert_eq!(written.matches("from_seat = true").count(), 1, "{written}");
+        assert_eq!(
+            written.matches("entry_pose = \"seated\"").count(),
+            1,
+            "{written}"
+        );
         let parsed = Params::load(&config, true).expect("robotd would accept it");
         let skills = parsed.policy.resolved().skills;
         for skill in &skills {
-            assert_eq!(skill.from_seat, skill.name == "scoot", "{}", skill.name);
+            assert_eq!(
+                skill.entry_pose == crate::EntryPose::Seated,
+                skill.name == "scoot",
+                "{}",
+                skill.name
+            );
         }
         assert!(skills.iter().any(|s| s.name == "scoot"));
     }
