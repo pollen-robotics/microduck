@@ -1016,4 +1016,78 @@ mod tests {
         let nearest = history.nearest(41 * 20 * MS + 3 * MS).unwrap();
         assert_eq!(nearest.pose[0], 41.0);
     }
+
+    #[derive(serde::Deserialize)]
+    struct Approach {
+        name: String,
+        drop_m: f64,
+        frames: Vec<Recorded>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Recorded {
+        t_ns: u64,
+        /// When the robot state paired with the frame was taken.
+        at_ns: u64,
+        distance_mm: Vec<i16>,
+        status: Vec<u8>,
+        head: [f64; 4],
+        gravity: [f64; 3],
+        trunk_height_m: f64,
+        pose: [f64; 3],
+        /// The beak's true distance to the edge, from the simulator; none on flat floor.
+        beak_gap_m: Option<f64>,
+    }
+
+    /// What the duck saw walking off a step in duck-sim (`tests/fixtures/edge_approach.py`).
+    #[test]
+    fn a_step_recorded_in_the_twin_reads_as_a_drop_short_of_its_edge() {
+        let cases: Vec<Approach> =
+            serde_json::from_str(include_str!("../tests/fixtures/edge_approach.json")).unwrap();
+        assert!(cases.iter().any(|c| c.drop_m == 0.0));
+        for case in &cases {
+            let mut model = Model::default();
+            let mut stop = None;
+            for f in &case.frames {
+                let sample = Sample {
+                    t_ns: f.at_ns,
+                    head: f.head,
+                    gravity: f.gravity,
+                    trunk_height_m: Some(f.trunk_height_m),
+                    pose: f.pose,
+                };
+                model.observe(
+                    &proto::TofFrame {
+                        seq: 0,
+                        at_us: 0,
+                        t_ns: f.t_ns,
+                        rows: 8,
+                        cols: 8,
+                        distance_mm: f.distance_mm.clone(),
+                        status: f.status.clone(),
+                    },
+                    &sample,
+                );
+                let drop_m = model.summary(&sample).map_or(f64::INFINITY, |o| o.drop_m);
+                if case.drop_m == 0.0 {
+                    assert_eq!(
+                        drop_m,
+                        f64::INFINITY,
+                        "{}: a drop on a flat floor",
+                        case.name
+                    );
+                } else if stop.is_none() && drop_m < STOP_M {
+                    stop = f.beak_gap_m;
+                }
+            }
+            if case.drop_m > 0.0 {
+                let gap = stop.unwrap_or_else(|| panic!("{}: walked over the edge", case.name));
+                assert!(
+                    gap > 0.10,
+                    "{}: stopped {gap:.2} m from the edge",
+                    case.name
+                );
+            }
+        }
+    }
 }
