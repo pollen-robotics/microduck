@@ -282,13 +282,30 @@ async fn main() -> ExitCode {
     };
     tracing::info!(serial = ?serial, %default_name, simulated, "identity");
 
-    tokio::spawn(configd::indicator::run(Arc::clone(&net)));
+    // The label serial and the PIN a user reads off it. Absent on a Zero 3W and on an unprogrammed
+    // beta, which keep the factory PIN — said at `warn`, because that PIN is public.
+    let mut store = Store::new(args.state_dir.join("config.json"), default_name);
+    let label_serial = configd::identity::label_serial();
+    match label_serial
+        .as_deref()
+        .and_then(configd::identity::default_pin)
+    {
+        Some(pin) => store = store.with_default_pin(pin),
+        None => tracing::warn!(
+            path = configd::identity::LABEL_EEPROM_PATH,
+            "no label serial in the ID EEPROM; the default pairing PIN is the public factory one"
+        ),
+    }
+    tracing::info!(label_serial = ?label_serial, "label");
+
+    tokio::spawn(configd::indicator::run(Arc::clone(&net), Arc::clone(&pads)));
     tokio::spawn(pad_reconnect_loop(Arc::clone(&pads)));
+    tokio::spawn(configd::wifi_ssh::run());
 
     let service = Arc::new(Service {
         net,
         pads,
-        store: Store::new(args.state_dir.join("config.json"), default_name),
+        store,
         serial,
         simulated,
         policy: PeerPolicy {
@@ -575,13 +592,25 @@ async fn dispatch(
             }
         }
         proto::Call::PadStatus => match service.pads.status().await {
-            Ok(pads) => proto::Response::ok(
-                Some(id),
-                &proto::PadStatusResult {
-                    pads,
-                    driver: units::state(units::PADD).await,
-                },
-            ),
+            Ok(mut pads) => {
+                // The battery is `padd`'s to read — it can open the pad, and this daemon's private
+                // /dev cannot — so it is taken from the file `padd` keeps, while fresh.
+                let now_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let reading = proto::pad_battery::read_fresh(
+                    std::path::Path::new(proto::pad_battery::FILE),
+                    now_s,
+                );
+                proto::pad_battery::attach(&mut pads, reading.as_ref());
+                proto::Response::ok(
+                    Some(id),
+                    &proto::PadStatusResult {
+                        pads,
+                        driver: units::state(units::PADD).await,
+                    },
+                )
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "backend failed");
                 proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))

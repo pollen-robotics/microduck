@@ -27,6 +27,10 @@ thiserror.workspace = true
 tracing.workspace = true
 # A board's last release, compared against the release being packaged (`board::min_hw_rev`).
 semver.workspace = true
+# The robot's first name, derived from the SoC serial (`serial::first_name`). A digest rather than
+# std's hasher because std's output is not stable across Rust releases, and a toolchain bump must
+# not rename every robot — nor change the id its setup code was printed with.
+sha2 = "0.11.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

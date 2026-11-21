@@ -51,9 +51,6 @@ impl RobotClient for FakeRobot {
     async fn model_api(&self, _t: Duration) -> Option<u32> {
         Some(1)
     }
-    async fn remote_session_active(&self, _t: Duration) -> bool {
-        false
-    }
     async fn reload_policies(&self, _timeout: Duration) -> bool {
         true
     }

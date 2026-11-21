@@ -63,9 +63,6 @@ impl RobotClient for DeadThenHealthy {
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         None
     }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
-    }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true
     }
@@ -85,9 +82,6 @@ impl RobotClient for DegradedRobot {
     }
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         None
-    }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
     }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true
@@ -129,9 +123,6 @@ impl RobotClient for StartingThenHealthy {
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         Some(1)
     }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
-    }
     async fn reload_policies(&self, _t: std::time::Duration) -> bool {
         true
     }
@@ -151,9 +142,6 @@ impl RobotClient for FakeRobot {
     }
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         self.model_api
-    }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
     }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true

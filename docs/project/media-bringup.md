@@ -355,6 +355,25 @@ puts the old behaviour back for a consumer that cannot rotate for itself and can
 
 The proper fix, if an upright stream is ever genuinely needed, is an RGA element in the plugin set:
 the 2D engine rotates for nothing, which is why the encoder can afford to use it.
+
+### The encoder that kept the camera's buffers
+
+On microduck OS 1.1.0 the camera stopped three seconds after `mediad` started, on every boot,
+before anyone had connected. `/proc/rkisp-vir0` read `frame:95 … frameloss:11182 bufcnt:0` while
+the ISP kept counting frames in: the sensor and the ISP were fine, and `mediad` had stopped
+returning capture buffers to the driver.
+
+That release pins gstreamer-rockchip at a tip where `mpph264enc` takes DMABuf input (JeffyCN/mirrors
+048e72f), so it holds the capture buffers themselves rather than RGA copies of them, and it may hold
+up to `max-pending` of them — sixteen by default. The capture pool is eight deep. `webrtcsink`'s
+codec-discovery pipeline encodes from those buffers, and an encoder allowed sixteen can hold all
+eight, which empties the pool for good.
+
+`mediad` sets `GST_MPP_ENC_MAX_PENDING=2` before `gst::init` (`cap_mpp_encoder_pending_frames`), which
+reaches every `mpph264enc` in the process, `webrtcsink`'s own included. Measured on the beta board:
+capture back at 30 fps, `bufcnt:7`, seven frames lost since start, and the same through a 30 s
+WebRTC session.
+
 ### The 3A engine has to be waiting before the stream starts
 
 `rkaiq_3A_server` attaches to the ISP and then waits for a **stream start** event — and it misses one
