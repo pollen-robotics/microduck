@@ -507,10 +507,25 @@ until the next walk; here scale and gain are recomputed from the active state ev
 
 **One move at a time, and none from the seat.** A ground pick, a skill, a sit or a rise is
 refused while any other is in flight — including the glide down into the seat — and only
-standing up is accepted from a seated robot. The one request a running skill takes is one for
+standing up — and a seated skill, below — is accepted from a seated robot. The one request a running skill takes is one for
 itself when it chains, which is the button being held. This is a second divergence: the
 prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
 network handed a pose it was not trained from.
+
+**Each skill starts only from the pose it was trained from: its `entry_pose`.** Standing — the
+default, and every skill before there was a choice — is refused from the seat, which is the rule
+above. Seated is the mirror: a policy trained *from* the seat, like the MicroDock's scoot that
+shuffles on its seat from the pose `alpha_sitstand` sits in, is refused standing, rising and on
+the glide down, and starts only from a settled seat. Nothing about the seat changes while it runs
+— the skill outranks the sitstand network, and when its window ends the seat is still the seat, so
+the sitstand network holds it again and standing up is still the sit toggle's. The pose comes from
+the manifest ([`policy-manifest.md`](../policy-manifest.md) owns the field), or `robotctl policy
+add --entry-pose`, and is written to the skill's `[[policy.skill]]` entry. A value this build does
+not know reads as standing rather than refusing the file.
+
+`robot.do` refuses a move in the wrong pose at the door, with the loop's reason, rather than
+answering "queued" for a loop that drops it into the debug log. The one window it cannot see is the
+two seconds of glide after a sit was asked for.
 
 The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
 flight and, on a seated robot, holds the seat where it is rather than sending the standing home

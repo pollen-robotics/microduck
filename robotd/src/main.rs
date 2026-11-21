@@ -484,6 +484,9 @@ struct PolicyNames {
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
     skills: Vec<String>,
+    /// The ones of those that start seated — the only skills a seated robot will start, and the
+    /// ones a standing robot will not. See [`params::EntryPose`].
+    seated: Vec<String>,
 }
 
 impl PolicyNames {
@@ -499,6 +502,12 @@ impl PolicyNames {
             sitstand: name(&policy.sitstand),
             ground_pick: name(&policy.ground_pick),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
+            seated: policy
+                .skills
+                .iter()
+                .filter(|s| s.entry_pose == params::EntryPose::Seated)
+                .map(|s| s.name.clone())
+                .collect(),
         }
     }
 }
@@ -5460,6 +5469,8 @@ fn skills_report(state: &RobotState) -> proto::SkillsResult {
                 chain: Some(skill.chain),
                 action_scale: skill.params.action_scale,
                 gain_ratio: skill.params.gain_ratio,
+                entry_pose: (!skill.entry_pose.is_standing())
+                    .then(|| skill.entry_pose.as_str().to_owned()),
                 overridden: overridden.contains(&skill.name),
             })
             .collect(),
@@ -5578,6 +5589,18 @@ fn set_skill_request(
             .chain
             .or(existing.as_ref().map(|s| s.chain))
             .unwrap_or(false),
+        entry_pose: match p.entry_pose.as_deref() {
+            Some(pose) => match params::EntryPose::from_manifest(pose) {
+                Some(pose) => pose,
+                None => {
+                    return proto::IntentResult::refused(format!(
+                        "entry_pose {pose:?} is not a pose a skill can start from: \
+                         \"standing\" or \"seated\""
+                    ));
+                }
+            },
+            None => existing.as_ref().map(|s| s.entry_pose).unwrap_or_default(),
+        },
         params: params::SkillOverrides {
             action_scale: p
                 .action_scale
@@ -5953,6 +5976,32 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     names
 }
 
+/// Why the robot's pose rules out `skill`, or `None` when it does not.
+///
+/// The loop starts each move only from the pose it was trained from — standing for every move but
+/// a seated skill, the seat for that ([`control::Controller::start_skill`]) — and says so only in
+/// the journal at debug level. It cannot do more, because a held pad button lands there fifty
+/// times a second. A request is the one place a caller is waiting for an answer, so it is refused
+/// here, with the loop's own words.
+///
+/// What this side cannot see is the glide down into a seat that was just asked for, which the
+/// loop also refuses; that window is two seconds after a sit, and a request in it is still
+/// "queued" and dropped. Emotions are left to the loop, which already sits for the ones that sit.
+fn pose_refusal(state: &RobotState, skill: &str) -> Option<&'static str> {
+    let policies = state.policies.load();
+    let seated = policies.seated.iter().any(|s| s == skill);
+    let standing =
+        !seated && (skill == "ground_pick" || policies.skills.iter().any(|s| s == skill));
+    let sitting = state.sitting.load(Ordering::Relaxed);
+    if sitting && standing {
+        Some(control::SITTING)
+    } else if !sitting && seated {
+        Some(control::STANDING)
+    } else {
+        None
+    }
+}
+
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     let policies = state.policies.load();
     match skill {
@@ -6042,6 +6091,8 @@ fn dispatch(
                 proto::IntentResult::refused(
                     "the robot is still going to its home pose; try again in a moment",
                 )
+            } else if let Some(reason) = pose_refusal(state, &p.skill) {
+                proto::IntentResult::refused(reason)
             } else if queue_skill(state, intents, &p.skill) {
                 proto::IntentResult::accepted()
             } else {
@@ -7997,6 +8048,71 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+    }
+
+    /// **A move in the wrong pose is refused at the door**, with the loop's reason, rather than
+    /// answering "queued" and having the loop drop it into the debug log: a standing move from the
+    /// seat, and a seated skill standing. Standing up is always the way out of the seat.
+    #[test]
+    fn robot_do_refuses_a_move_in_the_wrong_pose() {
+        let mut params = Params::default();
+        params.policy.skills.push(params::SkillDef {
+            name: "scoot".into(),
+            duration: 2.5,
+            entry_pose: params::EntryPose::Seated,
+            ..Default::default()
+        });
+        let s = RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        );
+        let intents = Intents::new();
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
+        s.sitting.store(true, Ordering::Relaxed);
+        let ask = |skill: &str| -> proto::IntentResult {
+            dispatch(
+                &s,
+                &intents,
+                proto::Id::Number(1),
+                &proto::Call::RobotDo(proto::DoParams {
+                    skill: skill.into(),
+                }),
+            )
+            .result_as()
+            .unwrap()
+        };
+
+        for skill in ["kick_left", "roulade", "ground_pick"] {
+            let refused = ask(skill);
+            assert!(!refused.accepted, "{skill} from the seat must be refused");
+            assert!(
+                refused.reason.as_deref().unwrap().contains("sitting"),
+                "and say why: {:?}",
+                refused.reason
+            );
+        }
+        let queued = intents.take_skills();
+        assert_eq!(queued.skills, 0, "a refusal must not queue");
+        assert!(!queued.ground_pick);
+
+        assert!(ask("sit_toggle").accepted, "standing up is the way out");
+        assert!(ask("scoot").accepted, "a seated skill is allowed");
+        assert!(intents.take_skills().skills != 0, "and queued");
+
+        // Standing, every standing skill is accepted as before, and the seated one is refused.
+        s.sitting.store(false, Ordering::Relaxed);
+        assert!(ask("kick_left").accepted);
+        let refused = ask("scoot");
+        assert!(!refused.accepted, "a seated skill standing must be refused");
+        assert_eq!(refused.reason.as_deref(), Some(control::STANDING));
+        assert_eq!(
+            intents.take_skills().skills.count_ones(),
+            1,
+            "only the kick was queued"
+        );
     }
 
     /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the

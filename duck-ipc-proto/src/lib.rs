@@ -674,7 +674,17 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// display the tag's sequence ends with. No params; [`IntentResult`] once it has started, so a
 /// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
 /// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
-pub const API_VERSION: u32 = 68;
+///
+/// # v69 — seated skills
+///
+/// [`SkillParams::entry_pose`] and [`PolicyFetchResult::entry_pose`]: the pose a skill starts
+/// from, `"standing"` or `"seated"`, and the only one the robot will start it in. A seated skill
+/// runs from the seat and hands the seat back; a standing one is refused from the seat as every
+/// skill was. Absent means standing on both, so a v68 client reading a v69 robot sees every skill
+/// as before, and a v69 client writing to a v68 robot is refused for the unknown field — by
+/// `deny_unknown_fields` on `SkillParams`, which names it — rather than seeing a seated skill
+/// silently stored as standing.
+pub const API_VERSION: u32 = 69;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3883,6 +3893,11 @@ pub struct PolicyFetchResult {
     pub chain: bool,
     /// The manifest's `schema_version`, so a client can say which convention it read.
     pub schema_version: Option<u32>,
+    /// The manifest's `entry_pose`, verbatim: `"standing"` or `"seated"` is the vocabulary, and
+    /// what decides which pose the robot will start the skill in. Verbatim rather than parsed, so
+    /// a client can tell "said nothing" from "said something this build does not understand" and
+    /// ask the publisher for the word. Absent from an older `updaterd`.
+    pub entry_pose: Option<String>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].
@@ -6092,6 +6107,11 @@ pub struct SkillParams {
     /// Servo gain relative to the gait's, when this skill wants its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_ratio: Option<f64>,
+    /// The pose it starts from, and the only one the robot starts it in: `"standing"` or
+    /// `"seated"`. Absent is standing on the way in and is what a standing skill answers; on a
+    /// `robot.setSkill` for a skill that exists, absent keeps what it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_pose: Option<String>,
     /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
     /// Ignored on the way in — a client cannot make a built-in an override by saying so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

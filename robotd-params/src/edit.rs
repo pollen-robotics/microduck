@@ -529,6 +529,9 @@ impl Model {
         if skill.chain {
             entry["chain"] = toml_edit::value(true);
         }
+        if !skill.entry_pose.is_standing() {
+            entry["entry_pose"] = toml_edit::value(skill.entry_pose.as_str());
+        }
         // Only what differs from a plain zero-command one-shot. A file full of explicit
         // defaults is the unreadable thing this whole editor exists to avoid.
         if skill.command != [0.0; 3] {
@@ -2172,6 +2175,50 @@ mod tests {
         assert!(!written.contains("command"), "{written}");
         assert!(!written.contains("unwind"), "{written}");
         assert!(!written.contains("chain"), "{written}");
+        assert!(
+            !written.contains("entry_pose"),
+            "standing is the default, and not written"
+        );
+    }
+
+    /// A seated skill survives the round trip through the daemon's own loader — and only the
+    /// skill that asked; the built-ins seeded beside it stay standing.
+    #[test]
+    fn a_seated_skill_is_written_and_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "scoot".into(),
+                path: Some(PathBuf::from("/srv/scoot.onnx")),
+                duration: 2.5,
+                command: [-0.05, 0.0, 0.0],
+                entry_pose: crate::EntryPose::Seated,
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert_eq!(
+            written.matches("entry_pose = \"seated\"").count(),
+            1,
+            "{written}"
+        );
+        let parsed = Params::load(&config, true).expect("robotd would accept it");
+        let skills = parsed.policy.resolved().skills;
+        for skill in &skills {
+            assert_eq!(
+                skill.entry_pose == crate::EntryPose::Seated,
+                skill.name == "scoot",
+                "{}",
+                skill.name
+            );
+        }
+        assert!(skills.iter().any(|s| s.name == "scoot"));
     }
 
     /// A policy that holds until told otherwise writes both halves, and what is written is

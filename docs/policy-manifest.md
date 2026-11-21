@@ -22,6 +22,19 @@ contract.
 | `perpetual` | runs until told otherwise — a gait, or a pose a person has to end | a slot's gait (`policy load`); or, with `unwind_s`, a skill with `--hold` |
 | `scripted` | episodic but interruptible: the daemon can change its command mid-flight | recorded; the daemon's own arm reads its timing |
 
+**`entry_pose` says where it starts** — and so the only pose the robot will start it in.
+
+| `entry_pose` | starts from | ends | refused when |
+| --- | --- | --- | --- |
+| `standing`, or absent | standing, as every skill always has | handed to the gait | the robot is sitting |
+| `seated` | the seat `alpha_sitstand` sits in, settled | back in the seat; standing up is still the sit toggle | the robot is standing, rising, or still sitting down |
+
+**Say it.** Absent is standing so that nothing published before the field changes, which means a
+seated policy that does not say is installed standing and refused from the seat — the one pose it
+works in. The two words are the vocabulary (`sitting` is read as `seated`); anything else,
+including a sentence, is a note for a person and is read as absent. `robotctl policy add` prints a
+line asking for the word whenever it had to assume.
+
 **`command.encoding` says what the daemon feeds it.**
 
 | `encoding` | the twist | who |
@@ -57,7 +70,7 @@ a policy only on a claim that is present and wrong.
 | `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits this plus 1 s, then eases into the rest pose |
 | `mode` | str | set | `walk` (default) or `roller`; which mode's ground pick a phase entry is |
 | `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `stand`, …), so `policy load <slot> <repo>` is the install line |
-| `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
+| `entry_pose` | str | skills | `standing` (default) or `seated`: the pose it starts from, and the only one the robot starts it in — see above |
 | `command.encoding` | str | skills | see above |
 | `command.idle` | [3] | skills | the twist that means "stop doing the thing" |
 | `command.period_s`, `command.end_phase` | float | ground pick | the phase cycle |
@@ -96,8 +109,8 @@ and offline rehearsal.
 ```
 
 The repo carries exactly one `.onnx`, named `policy.onnx`. `robotctl policy add polite-bow
-<user>/microduck-polite-bow` reads `duration_s`, `chain`, `action_scale`, `command.idle` and
-`unwind_s`, refuses on `obs_len`, `action_len`, `model_api`, `robot.model` or a non-constant
+<user>/microduck-polite-bow` reads `duration_s`, `chain`, `action_scale`, `command.idle`,
+`unwind_s` and `entry_pose`, refuses on `obs_len`, `action_len`, `model_api`, `robot.model` or a non-constant
 encoding, and writes the skill. `RemiFabre/microduck-flamingo-cycle` is a published `perpetual`
 example: no `duration_s`, so `--hold` is required, and its `command.idle` is what the unwind
 drives.
