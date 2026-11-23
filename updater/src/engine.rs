@@ -633,7 +633,8 @@ impl Engine {
         })
     }
 
-    /// Versions whose most recent recorded outcome was a rollback.
+    /// Versions whose most recent recorded outcome was a rollback, or `Stuck` on a release the
+    /// robot has since been moved back off ([`crate::journal::Journal::known_bad`]).
     ///
     /// Derived from the journal rather than stored, so it self-heals: a version that
     /// failed once and later succeeded drops off the list. Used to keep `rollback` off a
@@ -1146,7 +1147,9 @@ impl Engine {
                 // Pruning is best-effort — the update has already succeeded — but a
                 // failure must be visible, or a robot slowly filling its eMMC looks
                 // perfectly healthy.
-                match store.prune(cfg.keep_previous, cfg.golden.as_ref()) {
+                // Unreadable journal: prune by count alone, as before known-bad was considered.
+                let known_bad = self.journal.known_bad(component).unwrap_or_default();
+                match store.prune(cfg.keep_previous, cfg.golden.as_ref(), &known_bad) {
                     Ok(removed) if !removed.is_empty() => {
                         tracing::info!(?removed, "pruned old releases");
                         rec.say(format!(
@@ -1165,6 +1168,9 @@ impl Engine {
                     from: previous,
                     to: manifest.version.clone(),
                 })
+            }
+            Err(reason) if !self.config.auto_rollback() => {
+                self.keep_failed(component, &manifest.version, &reason.to_string(), rec)
             }
             Err(reason) => {
                 rec.phase(Phase::RollingBack, Some(reason.to_string()));
@@ -1238,8 +1244,8 @@ impl Engine {
     /// A failure here is [`Error::RollbackFailed`] — the most serious outcome, kept
     /// distinct so support sees it immediately rather than reading it as an
     /// ordinary failure.
-    /// Highest installed release strictly *older* than `current`, skipping any whose
-    /// most recent recorded outcome was a rollback.
+    /// Highest installed release strictly *older* than `current`, skipping any the journal
+    /// calls known bad ([`Self::known_bad`]).
     ///
     /// Two constraints, both learned the hard way:
     ///
@@ -1248,8 +1254,8 @@ impl Engine {
     ///    disk (the failure path deliberately doesn't prune). That would make
     ///    `rollback` — the one command a support engineer reaches for after a bad
     ///    update — reinstall the bad update.
-    ///  - **Not known-bad.** A release the journal recorded as rolled back is not a
-    ///    safe landing spot, even if it is the newest older one.
+    ///  - **Not known-bad.** A release the journal recorded as rolled back, or as `Stuck`
+    ///    and then reverted, is not a safe landing spot, even if it is the newest older one.
     fn rollback_target(
         &self,
         component: &str,
@@ -1277,6 +1283,39 @@ impl Engine {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "none".into())
             ))
+        })
+    }
+
+    /// A release that failed, left live because `[update_gate] auto_rollback` is off.
+    ///
+    /// The trial is cleared, as [`Self::rollback_to`] clears it when there is nothing to revert
+    /// to: left armed, the boot counter would ask the same question on every start and decide
+    /// the same way. `Stuck` rather than `RolledBack`, because nothing moved, and `known_bad`
+    /// leaves a `Stuck` release out until the robot is moved back off it. The reason names the
+    /// command that does what the robot did not.
+    fn keep_failed(
+        &self,
+        component: &str,
+        version: &semver::Version,
+        reason: &str,
+        rec: &Recorder,
+    ) -> Result<ApplyResult, Error> {
+        self.boot_counter.confirm(component)?;
+        tracing::warn!(
+            component,
+            %version,
+            reason,
+            "release failed; auto-rollback is off, so it stays live"
+        );
+        rec.say(format!(
+            "auto-rollback is off ([update_gate] auto_rollback), so {version} stays live"
+        ));
+        Ok(ApplyResult::Stuck {
+            version: version.clone(),
+            reason: format!(
+                "{reason}; auto-rollback is off, so {version} stays live — \
+                 `robotctl update rollback {component}` reverts it"
+            ),
         })
     }
 
@@ -1408,6 +1447,7 @@ impl Engine {
             required_bytes: 0,
             available_bytes: u64::MAX,
             interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: None,
         }
@@ -1419,11 +1459,7 @@ impl Engine {
             .filter(|r| network || r.check != preflight::Check::Clock)
             .find(|r| !r.passed);
         match failure {
-            Some(failure) => Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            ))),
+            Some(failure) => Err(preflight::refusal(failure)),
             None => Ok(()),
         }
     }
@@ -1694,6 +1730,9 @@ impl Engine {
                     from: from.clone(),
                     to: to.clone(),
                 })
+            }
+            Err(reason) if !self.config.auto_rollback() => {
+                self.keep_failed(component, to, &reason.to_string(), rec)
             }
             Err(reason) => {
                 rec.phase(Phase::RollingBack, Some(reason.to_string()));
@@ -1980,14 +2019,7 @@ impl Engine {
                 }
             }
 
-            tracing::warn!(
-                component = %pending.component,
-                version = %pending.version,
-                boots = pending.boots,
-                "pending update never confirmed healthy; reverting"
-            );
-
-            let store = self.store(&pending.component)?;
+            let auto_rollback = self.config.auto_rollback();
 
             // Its own run, and not a continuation of the apply that armed the trial — because it
             // is one. That apply ended when `updaterd` restarted itself, minutes and a reboot ago,
@@ -2000,7 +2032,11 @@ impl Engine {
                 &self.config.state_dir,
                 RunEvent::Began {
                     component: ComponentId::new(pending.component.clone()),
-                    target: format!("boot-counter revert from {}", pending.version),
+                    target: if auto_rollback {
+                        format!("boot-counter revert from {}", pending.version)
+                    } else {
+                        format!("boot-counter verdict on {}", pending.version)
+                    },
                     installed: Some(pending.version.clone()),
                     source: "already installed on this board".into(),
                     requested_by: None,
@@ -2010,6 +2046,32 @@ impl Engine {
                 "this release was armed for trial and never reported healthy across {} boots",
                 pending.boots
             ));
+
+            let reason = format!("never reported healthy across {} boots", pending.boots);
+
+            if !auto_rollback {
+                let outcome =
+                    self.keep_failed(&pending.component, &pending.version, &reason, &rec)?;
+                rec.finish(&Ok(outcome.clone()));
+                self.record(
+                    &pending.component,
+                    pending.previous.clone(),
+                    &Ok(outcome.clone()),
+                    rec.run(),
+                );
+                outcomes.push(outcome);
+                continue;
+            }
+
+            // `scripts/board-test.sh` greps for this line.
+            tracing::warn!(
+                component = %pending.component,
+                version = %pending.version,
+                boots = pending.boots,
+                "pending update never confirmed healthy; reverting"
+            );
+
+            let store = self.store(&pending.component)?;
 
             // §8.2's chain: previous → golden. Escalate past `previous` when it is
             // absent, gone from disk, or itself recorded as bad — otherwise a robot
@@ -2038,8 +2100,6 @@ impl Engine {
             let reverted = self
                 .rollback_to(&pending.component, &cfg, &store, target.as_ref(), &rec)
                 .await?;
-
-            let reason = format!("never reported healthy across {} boots", pending.boots);
 
             let outcome = match reverted {
                 Some(reverted) => ApplyResult::RolledBack {
@@ -2497,6 +2557,7 @@ impl Engine {
             required_bytes: required,
             available_bytes: available,
             interrupt_sessions: options.interrupt_sessions,
+            webrtc_peers: crate::proto::read_webrtc_peers(),
             robot_query_timeout: ROBOT_QUERY_TIMEOUT,
             from_dir: options.from_dir.as_deref(),
         }
@@ -2504,11 +2565,7 @@ impl Engine {
         .await?;
 
         if let Some(failure) = report.first_failure() {
-            return Err(Error::Preflight(format!(
-                "{:?}: {}",
-                failure.check,
-                failure.detail.clone().unwrap_or_default()
-            )));
+            return Err(preflight::refusal(failure));
         }
         Ok(())
     }
@@ -2818,8 +2875,8 @@ fn journal_outcome(
         ),
         Ok(ApplyResult::Stuck { version, reason }) => (
             Some(version.clone()),
-            Outcome::Aborted {
-                reason: format!("stuck on {version}: {reason}"),
+            Outcome::Stuck {
+                reason: reason.clone(),
             },
         ),
         Ok(ApplyResult::AlreadyCurrent { .. } | ApplyResult::DryRunPassed { .. }) => return None,

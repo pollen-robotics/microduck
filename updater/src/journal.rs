@@ -132,13 +132,22 @@ impl Journal {
     }
 
     /// Versions whose **most recent** recorded outcome for this component was a
-    /// rollback.
+    /// rollback, or `Stuck` with a later entry moving the robot back off it.
     ///
     /// Used to keep `rollback` from landing back on a release that already failed
     /// its gate. Latest-outcome rather than ever-failed, so a version that failed
     /// once and later succeeded is not blacklisted forever.
+    ///
+    /// `Stuck` is a release that failed its gate and stayed live: auto-rollback off, or
+    /// nothing to revert to. While it runs, nobody has reverted it. Once the robot is
+    /// moved to a release that sorts older (semver, the order `rollback` walks), by
+    /// `rollback` as its reason says, a `select` or any other install, it is as failed as
+    /// one the gate reverted. Moving to a newer one reverts nothing, so it stays out, and a
+    /// later `rollback` can still land on it as before.
     pub fn known_bad(&self, component: &str) -> Result<Vec<semver::Version>, Error> {
         let mut seen: Vec<(semver::Version, bool)> = Vec::new();
+        // Releases a newer entry moved the robot back off, for `Stuck`.
+        let mut left: Vec<semver::Version> = Vec::new();
         // Newest first: the first outcome seen for a version is its latest.
         for entry in self.read_all()?.into_iter().rev() {
             if entry.component.as_str() != component {
@@ -147,11 +156,22 @@ impl Journal {
             let Some(version) = entry.to.clone() else {
                 continue;
             };
-            if seen.iter().any(|(v, _)| *v == version) {
-                continue;
+            if !seen.iter().any(|(v, _)| *v == version) {
+                let bad = match entry.outcome {
+                    Outcome::RolledBack { .. } => true,
+                    Outcome::Stuck { .. } => left.contains(&version),
+                    _ => false,
+                };
+                seen.push((version.clone(), bad));
             }
-            let bad = matches!(entry.outcome, Outcome::RolledBack { .. });
-            seen.push((version, bad));
+            // Success and Stuck leave `to` live, so the robot left `from`. A rollback's `to`
+            // is the release that failed, which the robot did not stay on. Only a move to an
+            // older release reverts `from`.
+            if matches!(entry.outcome, Outcome::Success | Outcome::Stuck { .. })
+                && let Some(from) = entry.from.filter(|from| version < *from)
+            {
+                left.push(from);
+            }
         }
         Ok(seen
             .into_iter()
@@ -863,6 +883,73 @@ mod tests {
 
         let bad = journal.known_bad("daemon").unwrap();
         assert_eq!(bad, vec![semver::Version::new(1, 2, 0)], "{bad:?}");
+    }
+
+    /// A release left live after failing its gate (`Stuck`) is not bad while the robot runs it,
+    /// and is once a later entry moves the robot off it, like one the gate rolled back.
+    #[test]
+    fn a_stuck_release_is_known_bad_once_the_robot_moves_back_off_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path(), 100).unwrap();
+        let v = |s: &str| semver::Version::parse(s).unwrap();
+        let log = |from: &str, to: Option<&str>, outcome: Outcome| {
+            journal
+                .append(&LogEntry {
+                    at: 1_700_000_000,
+                    component: ComponentId::new("daemon"),
+                    from: Some(v(from)),
+                    to: to.map(v),
+                    outcome,
+                    run: None,
+                })
+                .unwrap();
+        };
+        let stuck = || Outcome::Stuck {
+            reason: "health".into(),
+        };
+        let bad = || journal.known_bad("daemon").unwrap();
+
+        log("1.0.0", Some("1.1.0"), stuck());
+        assert!(bad().is_empty(), "live, and nobody reverted it");
+        // Refused while on it: nothing moved.
+        log(
+            "1.1.0",
+            None,
+            Outcome::Aborted {
+                reason: "offline".into(),
+            },
+        );
+        assert!(bad().is_empty());
+        // `robotctl update rollback`, as the Stuck reason says.
+        log("1.1.0", Some("1.0.0"), Outcome::Success);
+        assert_eq!(bad(), vec![v("1.1.0")]);
+        // Applied again by hand and stuck again: live, so not bad yet.
+        log("1.0.0", Some("1.1.0"), stuck());
+        assert!(bad().is_empty());
+        // Then it passed: no longer bad either.
+        log("1.0.0", Some("1.1.0"), Outcome::Success);
+        assert!(bad().is_empty());
+        // Stuck on 1.3.0, then 1.4.0 tried from it and rolled back by the gate: the robot is back
+        // on 1.3.0, so only 1.4.0 is bad.
+        log("1.1.0", Some("1.3.0"), stuck());
+        log(
+            "1.3.0",
+            Some("1.4.0"),
+            Outcome::RolledBack {
+                reason: "health".into(),
+            },
+        );
+        assert_eq!(bad(), vec![v("1.4.0")]);
+        // Stuck on 1.5.0, then an update forward past it: that reverts nothing, so 1.5.0 stays
+        // out and a rollback from 1.6.0 can still land on it.
+        log("1.3.0", Some("1.5.0"), stuck());
+        log("1.5.0", Some("1.6.0"), Outcome::Success);
+        assert_eq!(bad(), vec![v("1.4.0")]);
+        // Stuck on 1.7.0, then reverted to 1.5.0, which fails its gate again: the revert still
+        // moved the robot back off 1.7.0, and 1.5.0 is live, so only 1.7.0 joins.
+        log("1.6.0", Some("1.7.0"), stuck());
+        log("1.7.0", Some("1.5.0"), stuck());
+        assert_eq!(bad(), vec![v("1.7.0"), v("1.4.0")]);
     }
 
     #[test]

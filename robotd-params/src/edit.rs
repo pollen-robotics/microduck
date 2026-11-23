@@ -338,6 +338,12 @@ impl Model {
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),
             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            "policy.accel_vx" | "policy.accel_vy" | "policy.accel_vyaw" => {
+                let axis = ["policy.accel_vx", "policy.accel_vy", "policy.accel_vyaw"]
+                    .iter()
+                    .position(|k| *k == key)?;
+                Some(policy.twist_accel[axis].map_or("none".to_owned(), |a| a.to_string()))
+            }
             "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
             "audio.pet_detect" => Some(
                 params
@@ -346,6 +352,7 @@ impl Model {
                     .to_string(),
             ),
             "audio.pet_model" => path(params.audio.pet_model_resolved()),
+            "idle.enabled" => Some(params.idle.enabled_in(params.policy.mode).to_string()),
             _ => None,
         }
     }
@@ -816,6 +823,17 @@ pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
         .find(|e| e.key == key)
         .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
     model.edit(entry, skill)?;
+    model.save()
+}
+
+/// Set one key through the model — the same validation and atomic write as the editor — and save.
+pub fn set_key(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let mut model = Model::load(path)?;
+    let entry = REGISTRY
+        .iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
+    model.edit(entry, value)?;
     model.save()
 }
 
@@ -1973,8 +1991,12 @@ mod tests {
                 "idle",
                 "pickup",
                 "theremin",
+                "laser",
+                "soccer",
                 "head_imu",
+                "map",
                 "audio",
+                "emotions",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
@@ -1985,7 +2007,8 @@ mod tests {
                 "pad_head",
                 "pad_body",
                 "pad_roller",
-                "netpad"
+                "netpad",
+                "autonomous"
             ]
         );
     }

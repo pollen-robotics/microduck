@@ -159,11 +159,11 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 mod tests {
     use super::*;
 
-    /// A tall frame fits inside the square with grey above and below, and nothing stretches.
+    /// A tall frame fits inside the square with grey left and right, and nothing stretches.
     ///
-    /// The camera is portrait after the daemon's quarter turn — 720×1280 — so this is the only case
-    /// that actually happens, and getting the padding wrong moves every box by a constant nobody
-    /// notices until the robot reaches for a duck that is not there.
+    /// The Zero 3W's frame is portrait once its quarter turn is undone — 720×1280 — and getting the
+    /// padding wrong moves every box by a constant nobody notices until the robot reaches for a
+    /// duck that is not there.
     #[test]
     fn a_portrait_frame_is_padded_left_and_right() {
         // 4×8 red, into a 8×8 square: scale 1.0, 2 columns of padding each side.
@@ -177,6 +177,26 @@ mod tests {
         assert_eq!(&out[2 * 3..2 * 3 + 3], &[255, 255, 255]);
         // And the last column is padding again.
         assert_eq!(&out[7 * 3..7 * 3 + 3], &[PAD, PAD, PAD]);
+    }
+
+    /// A wide frame fits with grey above and below — the beta boards' case: their camera is
+    /// upright, so the frame stays 1280×720 landscape.
+    #[test]
+    fn a_landscape_frame_is_padded_above_and_below() {
+        // 8×4 white, into an 8×8 square: scale 1.0, 2 rows of padding top and bottom.
+        let frame = vec![255u8; 8 * 4 * 3];
+        let mut out = Vec::new();
+        let fit = letterbox_rgb(&frame, 8, 4, 8, &mut out);
+        assert_eq!(out.len(), 8 * 8 * 3);
+        assert_eq!((fit.scale, fit.pad_x, fit.pad_y), (1.0, 0.0, 2.0));
+        // The first two rows are padding, the middle four the frame, the last two padding again.
+        let row = |r: usize| &out[r * 8 * 3..r * 8 * 3 + 3];
+        assert_eq!(row(0), &[PAD, PAD, PAD]);
+        assert_eq!(row(1), &[PAD, PAD, PAD]);
+        assert_eq!(row(2), &[255, 255, 255]);
+        assert_eq!(row(5), &[255, 255, 255]);
+        assert_eq!(row(6), &[PAD, PAD, PAD]);
+        assert_eq!(row(7), &[PAD, PAD, PAD]);
     }
 
     /// The layout of the head, which is the thing most likely to be read wrong.

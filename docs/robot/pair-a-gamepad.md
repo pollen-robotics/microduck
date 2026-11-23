@@ -50,22 +50,37 @@ robot prefers one in pairing mode; both stay paired afterwards and `padd` drives
 The cost is that re-running with nothing new in pairing mode waits out the whole search window
 before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
 
+**Nor does a pad paired here before.** Put it in pairing mode and run `pad pair`: the robot drops
+its old bond and pairs it again, so there is no `pad forget` or `bluetoothctl remove` to run first.
+
 ### With an NFC tag
 
-On a robot with an NFC reader plugged in (a CLRC663 board on USB, `/dev/ttyACM0`), a tag that
-carries the pad's address does the same thing with nothing typed: put the pad in pairing mode, touch
-the tag to the reader. The robot quacks when it has read the tag, and greets — a different sound,
-often a double "wak-wak" — once the pad is paired; a refusal gets no second sound. `nfcd.service` is
-always running and picks a reader up within thirty seconds of it being plugged in.
+On a robot with an NFC reader, a tag reading `microduck_gamepad_pairing` does what `robotctl pad
+pair` does with nothing typed: put the pad in pairing mode, touch the tag to the head. The robot
+quacks when it has read the tag and greets once the pad is paired. What the tag must hold, which
+tags the reader takes, how to write one (`robotctl nfc-flash`, `duckctl nfc-flash`) and the mode
+tags are all in [`nfc-tags.md`](nfc-tags.md).
 
-- **A pad already connected wins.** If one is driving, a touch does nothing, so a tag brushed against
-  the robot never hands the bond to someone else's pad.
-- **One attempt per touch.** If it did not pair, lift the tag and touch again.
-- The tag holds a text or URI record with the address in it — `98:B6:E9:28:06:09`, with `-` or no
-  separator also fine. From a laptop with the reader plugged in, winnie's tool writes one:
-  `ntag write --text 98:B6:E9:28:06:09`.
+An e-ink display touched to the reader, or a tag written `take_photo`, poses the robot for a
+picture: it starts the robot if Start was not pressed, stays still, standing or seated as it was,
+lifts its head (higher when seated), counts down five seconds with the flashlight blinking dimly (3
+%) and faster and faster, flashes at 20 % with a quack as it takes the photo, then sits if it was
+standing and opens its beak a little. It waits up to a minute for a display in its beak, closes it
+on it, and writes the photo to it, turned the right way up for the beak: its head rolls side to
+side in small quick moves with a short quack now and then until the display has redrawn — about
+a minute in all. Then it lowers its head and opens its beak wide to let it
+fall with a tiny cute retch (the `bwep` sound; a low tock if the photo did not make it), and brings
+its head back up. The idle look-around is held off throughout. The picture is kept in
+`/var/lib/robot/photos`, named for the local time. The sequence is in `nfc/src/photo.rs`, and how
+a display is recognised (any ISO 14443-4 card) and written in `nfc/src/eink.rs`. A display starts
+it from the top of the head only; in the beak it starts nothing, and is what the sequence waits
+for. Every touch logs where it was seen (`tag in the field`, `place="head"`).
 
-What it did is in `journalctl -u nfcd -b`.
+From the bench, a picture can be written by hand: with the service stopped (`sudo systemctl stop
+nfcd`, it holds the reader), `sudo /opt/robot/daemon/current/bin/nfcd eink write picture.jpg --on
+beak` writes a JPEG or PNG to the display in the beak (`--on head` for the top of the head; no
+picture, a test pattern) and redraws it. Keep the display still until it logs `written and drawn`,
+then start the service again.
 
 ## Check it
 
@@ -80,6 +95,25 @@ padd    active — driving whatever pad connects
 
 Two lines, because they fail separately: a connected pad with a dead driver looks exactly like a
 working robot ignoring you.
+
+### The pad's battery
+
+A Nintendo pad (a Pro Controller, or a clone of one) also says how full its battery is:
+
+```
+pad     Pro Controller 98:B6:E9:5E:BB:DB  connected · battery full
+```
+
+The pad reports one of five levels (full, medium, low, critical, empty), plus whether it is
+charging. That is all a clone answers, so there is no percentage. The same reading is in the
+pad block's title in `robotctl monitor`, and on the Gamepad tile in the phone app.
+
+`padd` asks the pad on its hidraw node once a minute and keeps the answer in
+`/run/padd/pad-battery.json`, which `configd` reads for `pad.status`. A reading older than
+five minutes is not shown. No battery on the line means the robot does not know, not that the
+battery is empty: any pad that is not a Nintendo one, or a pad that does not answer. In that
+case `sudo journalctl -u padd -b | grep battery` says why. `permission denied` there means
+the udev rule (`/etc/udev/rules.d/70-robot-pad-hidraw.rules`) is missing; an update installs it.
 
 A Pro Controller also carries a six-axis IMU, which the kernel exposes as a second input device
 beside the one that drives. `robotctl monitor`, with `p` for the pad block, shows it as a panel

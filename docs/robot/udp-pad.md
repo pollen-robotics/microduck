@@ -296,7 +296,7 @@ and absent means *not known*, never zero:
 
 | field | what |
 |---|---|
-| `health` | `robot.health` as `robotd` answered it: `healthy`, `degraded`, `reason`, `battery`, `motors`, `cpu_temp_c`, `cpu_throttle`, `control_loop`, `bus`, `imu` |
+| `health` | `robot.health` as `robotd` answered it: `healthy`, `degraded`, `reason`, `battery`, `goal_pwm`, `motors`, `cpu_temp_c`, `cpu_throttle`, `control_loop`, `bus`, `imu` |
 | `health_error` | why there is no `health` — `robotd` not answering |
 | `posture` | `policy`, `fallen`, `limp`, `picked_up`, from `robot.state` |
 | `posture_error` | why there is no `posture` |

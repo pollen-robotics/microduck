@@ -63,9 +63,6 @@ impl RobotClient for DeadThenHealthy {
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         None
     }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
-    }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true
     }
@@ -85,9 +82,6 @@ impl RobotClient for DegradedRobot {
     }
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         None
-    }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
     }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true
@@ -129,9 +123,6 @@ impl RobotClient for StartingThenHealthy {
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         Some(1)
     }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
-    }
     async fn reload_policies(&self, _t: std::time::Duration) -> bool {
         true
     }
@@ -151,9 +142,6 @@ impl RobotClient for FakeRobot {
     }
     async fn model_api(&self, _t: std::time::Duration) -> Option<u32> {
         self.model_api
-    }
-    async fn remote_session_active(&self, _t: std::time::Duration) -> bool {
-        false
     }
     async fn reload_policies(&self, _timeout: std::time::Duration) -> bool {
         true
@@ -177,13 +165,32 @@ impl Fixture {
         std::fs::create_dir_all(&install).unwrap();
         let publisher = Publisher::new(root.join("keys"), releases.clone());
 
-        Self {
+        let fx = Self {
             _dir: dir,
             root,
             releases,
             install,
             publisher,
-        }
+        };
+        // On, because most of this file is about what a revert does. The tests of the default
+        // call `auto_rollback_off`.
+        fx.set_auto_rollback(true);
+        fx
+    }
+
+    fn robotd_config(&self) -> PathBuf {
+        self.root.join("etc/robot/robotd.toml")
+    }
+
+    fn set_auto_rollback(&self, on: bool) {
+        let path = self.robotd_config();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("[update_gate]\nauto_rollback = {on}\n")).unwrap();
+    }
+
+    /// The shipped default: no key at all.
+    fn auto_rollback_off(&self) {
+        std::fs::write(self.robotd_config(), "").unwrap();
     }
 
     fn publish(&self, version: &str, hook: Option<&str>) {
@@ -277,6 +284,7 @@ impl Fixture {
 trusted_keys_dir = "{keys}"
 hw_rev = 1
 state_dir = "{state}"
+robotd_config = "{robotd}"
 
 [component.daemon]
 install_dir = "{install}"
@@ -287,6 +295,7 @@ health = {{ probe = "socket", timeout = "2s" }}
 "#,
             keys = keys_dir.display(),
             state = self.root.join("var/lib/robot/updater").display(),
+            robotd = self.robotd_config().display(),
             install = self.install.display(),
             published = self.releases.display(),
         ))
@@ -1111,6 +1120,67 @@ async fn rolls_back_when_the_new_release_is_unhealthy() {
     assert_eq!(fx.live_marker().as_deref(), Some("version=1.0.0\n"));
 }
 
+/// The default: with `[update_gate] auto_rollback` unset, a release that fails its gate stays
+/// live, reported `Stuck` with the command that reverts it, and is not marked known-bad.
+#[tokio::test]
+async fn a_failed_apply_stays_live_when_auto_rollback_is_off() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.auto_rollback_off();
+    fx.publish("1.1.0", None);
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
+    let result = apply_latest(&mut engine).await.unwrap();
+
+    match &result {
+        ApplyResult::Stuck { version, reason } => {
+            assert_eq!(*version, semver::Version::new(1, 1, 0));
+            assert!(reason.contains("auto-rollback is off"), "{reason}");
+            assert!(
+                reason.contains("robotctl update rollback daemon"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Stuck, got {other:?}"),
+    }
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+    assert!(
+        !fx.pending_file_exists(),
+        "the trial must not outlive the verdict"
+    );
+    assert!(engine.known_bad("daemon").is_empty());
+
+    // And the way back is the explicit one.
+    let mut engine = fx.engine_healthy();
+    let back = engine.rollback("daemon").await.unwrap();
+    assert!(matches!(back, ApplyResult::Applied { .. }), "{back:?}");
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// `select` and `rollback` share the gate, so they share the setting.
+#[tokio::test]
+async fn a_failed_select_stays_live_when_auto_rollback_is_off() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    fx.publish("1.1.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+    apply_exact(&mut engine, "1.1.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
+    let result = engine
+        .select("daemon", &semver::Version::new(1, 0, 0))
+        .await
+        .unwrap();
+
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+    assert!(!fx.pending_file_exists());
+}
+
 /// The counterpart to `rolls_back_when_the_new_release_is_unhealthy`. Rollback answers
 /// "did this release break the robot?", and a board with no servo power answers nothing
 /// about the release — it said the same before the swap, and reverting cannot change it.
@@ -1697,6 +1767,7 @@ async fn log_records_success_rollback_and_refusal() {
             Outcome::Success => "success",
             Outcome::RolledBack { .. } => "rolled_back",
             Outcome::Aborted { .. } => "aborted",
+            Outcome::Stuck { .. } => "stuck",
         })
         .collect();
 
@@ -3203,4 +3274,191 @@ async fn status_reports_a_healthy_robot_with_nothing_to_explain() {
     assert_eq!(daemon.healthy, Some(true));
     assert!(!daemon.degraded);
     assert_eq!(daemon.reason, None);
+}
+
+/// The boot counter's revert is the same setting: off, an exhausted trial on a robot that does not
+/// work is journalled `Stuck`, the release stays, and the trial is cleared so it is said once.
+#[tokio::test]
+async fn an_exhausted_trial_stays_live_when_auto_rollback_is_off() {
+    let fx = Fixture::new();
+    fx.publish("1.0.0", None);
+    let mut engine = fx.engine_healthy();
+    apply_latest(&mut engine).await.unwrap();
+
+    fx.publish("1.1.0", None);
+    let mut crashing = fx.engine(
+        Box::new(FakeRobot::healthy()),
+        Faults {
+            abort_after_swap: true,
+            ..Faults::none()
+        },
+        "",
+    );
+    let _ = apply_latest(&mut crashing).await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+
+    fx.auto_rollback_off();
+    let mut engine = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), "");
+    assert!(engine.recover_on_start().await.unwrap().is_empty());
+    let outcomes = engine.recover_on_start().await.unwrap();
+
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        matches!(&outcomes[0], ApplyResult::Stuck { reason, .. } if reason.contains("auto-rollback is off")),
+        "{outcomes:?}"
+    );
+    assert_eq!(fx.live_version().as_deref(), Some("1.1.0"));
+    assert!(!fx.pending_file_exists());
+    assert!(
+        engine.recover_on_start().await.unwrap().is_empty(),
+        "reported once, not on every start"
+    );
+    let log = engine.log(10).unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            &e.outcome,
+            Outcome::Stuck { reason } if reason.contains("auto-rollback is off")
+        )),
+        "{log:?}"
+    );
+}
+
+/// With auto-rollback off, a release that failed its gate and was then reverted by hand (what the
+/// `Stuck` reason says to do) is as failed as one the gate reverted itself. A later `rollback`
+/// must not land on it, as `rollback_skips_known_bad_releases` holds with auto-rollback on.
+#[tokio::test]
+async fn rollback_skips_a_release_that_was_stuck_and_reverted_by_hand() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 5";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+
+    // The operator follows the reason: `robotctl update rollback daemon`.
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+
+    // A fixed release, then a rollback from it.
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.2.0"));
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "rollback landed on 1.1.0, which failed its gate here and was reverted by hand; \
+         known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
+}
+
+/// With the shipped `keep_previous = 1`, the release after a reverted `Stuck` one keeps the good
+/// release before it, not the reverted one: a known-bad release takes no `keep_previous` slot.
+/// `rollback` then lands on the good one instead of having nothing to land on.
+#[tokio::test]
+async fn rollback_after_a_reverted_stuck_release_lands_on_the_good_one_before_it() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+    engine.rollback("daemon").await.unwrap();
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// The same with the gate doing the revert: with `keep_previous = 1`, the release that was
+/// rolled back does not push the good one out of the store.
+#[tokio::test]
+async fn rollback_after_a_gate_rollback_lands_on_the_good_release_with_keep_previous_1() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::RolledBack { .. }),
+        "{result:?}"
+    );
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// Moving forward past a `Stuck` release reverts nothing, so it is not known bad: with the shipped
+/// `keep_previous = 1` the release before it has been pruned by then, and a `rollback` from the
+/// next one lands on it, as it does with no journal rule at all.
+#[tokio::test]
+async fn rollback_can_land_on_a_stuck_release_the_robot_moved_past() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(matches!(result, ApplyResult::Stuck { .. }), "{result:?}");
+
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
+}
+
+/// The `Stuck` reason names `rollback`, so it has to work for two stuck releases in a row: the
+/// first was never reverted, only moved past, so the rollback from the second lands on it.
+#[tokio::test]
+async fn rollback_from_a_stuck_release_lands_on_the_stuck_one_before_it() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 5";
+    fx.auto_rollback_off();
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    for v in ["1.0.0", "1.1.0"] {
+        let result = apply_exact(&mut sick, v).await.unwrap();
+        assert!(
+            matches!(result, ApplyResult::Stuck { .. }),
+            "{v}: {result:?}"
+        );
+    }
+
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "known_bad = {:?}",
+        engine.known_bad("daemon")
+    );
 }

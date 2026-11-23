@@ -1,0 +1,16 @@
+[package]
+name = "duck-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared prototype of Microduck's BLE authenticated session"
+
+[dependencies]
+snow = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt"] }

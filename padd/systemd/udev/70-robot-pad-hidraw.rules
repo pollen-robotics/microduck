@@ -1,0 +1,9 @@
+# A Nintendo pad's hidraw node, to padd: it asks the pad for its battery there (padd/src/battery.rs),
+# one subcommand a minute, and writes what it hears for configd's pad.status.
+#
+# Only Nintendo's vendor id (057E), over Bluetooth (bus 0005) and USB (0003): the one family padd
+# asks. Group padd rather than input, so no other member of input can write to a pad. Installed
+# by hooks/postinstall, which reloads udev and re-triggers hidraw so a pad already connected gets
+# it without reconnecting.
+SUBSYSTEM=="hidraw", KERNELS=="0005:057E:*", GROUP="padd", MODE="0660"
+SUBSYSTEM=="hidraw", KERNELS=="0003:057E:*", GROUP="padd", MODE="0660"

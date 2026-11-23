@@ -1,6 +1,7 @@
 //! The page, served by the daemon it drives.
 //!
-//! An embedded console and an on-demand PNG snapshot, with no frontend build step. `http://<robot>:8080/` and there is nothing else to run —
+//! An embedded console and an on-demand PNG snapshot, with no frontend build step. The secure
+//! default serves these on loopback only; a direct LAN console needs an authenticated gateway.
 //! which is the whole of it, and `webrtc-console.md` §1 is why it is worth a dependency and a
 //! second port.
 //!
