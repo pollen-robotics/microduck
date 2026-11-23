@@ -35,6 +35,7 @@ pub mod agent;
 #[cfg(target_os = "linux")]
 pub mod bluez;
 pub mod chorale;
+pub mod lane;
 pub mod link;
 pub mod pairing;
 pub mod route;

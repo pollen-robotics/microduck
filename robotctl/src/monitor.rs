@@ -158,6 +158,10 @@ const PAD_RETRY: Duration = Duration::from_secs(2);
 /// faster poll would redraw the same number.
 const HEALTH_POLL: Duration = Duration::from_secs(2);
 
+/// How often the pad's battery file is read. `padd` rewrites it once a minute; this only has to
+/// notice within a few seconds of a pad connecting.
+const PAD_BATTERY_POLL: Duration = Duration::from_secs(5);
+
 /// How long a health answer may be the newest one before the row says how old it is.
 ///
 /// Three polls. `robotd` closing the socket is reported by the poller itself; this catches the
@@ -303,6 +307,15 @@ enum Update {
     /// The health poll is not answering. Not fatal either: it is a connection of its own, and
     /// the state stream ending is what [`Self::Ended`] is for.
     HealthLost(String),
+    /// `mapd`'s status: where the robot is in its map, or why it does not know.
+    Map(Box<proto::MapStatusResult>),
+    /// The map itself, fetched again whenever the status says it changed.
+    MapGrid(Box<proto::MapGridResult>),
+    /// `mapd` is not answering. Not fatal: mapping is optional, and off by default.
+    MapLost(String),
+    /// The connected pad's battery, as `padd` last read it, or `None` when there is no fresh
+    /// reading — no pad, a pad that is not a Nintendo one, or a `padd` that stopped asking.
+    PadBattery(Option<proto::pad_battery::Reading>),
 }
 
 /// Subscribe to `robot.state` and render it until interrupted.
@@ -315,6 +328,7 @@ pub fn run(
     pad_socket: &Path,
     tof_socket: &Path,
     media_socket: &Path,
+    map_socket: &Path,
     hz: u32,
     json: bool,
 ) -> Result<(), Failure> {
@@ -357,6 +371,8 @@ pub fn run(
     let camera_tx = tx.clone();
     let tx_for_tof = tx.clone();
     let health_tx = tx.clone();
+    let map_tx = tx.clone();
+    let battery_tx = tx.clone();
     let pad_socket = pad_socket.to_path_buf();
 
     // Held for as long as the view lives, not dropped: it is the write half of the subscription,
@@ -390,6 +406,15 @@ pub fn run(
     // and the reason why is on this answer and nowhere else.
     let health_socket = robot_socket.to_path_buf();
     thread::spawn(move || poll_health(&health_socket, &health_tx));
+
+    // Not a socket: the file `padd` keeps and `configd` serves on `pad.status`, read the same way
+    // and with the same freshness rule, so this and the phone never disagree about a pad. Absent
+    // on a monitor not running on the robot, which then shows no battery.
+    thread::spawn(move || poll_pad_battery(Path::new(proto::pad_battery::FILE), &battery_tx));
+
+    // A fifth: `mapd`, polled like the health. Its absence draws the odometry track instead.
+    let map_socket = map_socket.to_path_buf();
+    thread::spawn(move || poll_map(&map_socket, &map_tx));
 
     // The camera has no reader thread yet, and deliberately: `media.frame` is a *request*, and one
     // is only made while the block is open. `live` owns the toggle, so it owns the thread.
@@ -687,6 +712,66 @@ fn read_camera(socket: &Path, tx: &mpsc::Sender<Update>, asked_for: &Receiver<bo
 ///
 /// **It reconnects**, for the reason the pad reader does: `robotd` restarts during every update,
 /// and a session that outlived one would otherwise be permanently blind to the pack.
+/// How often `mapd` is asked where the robot is. The grid is fetched again only when the status
+/// says the map changed, or every [`MAP_GRID_REFRESH`] in case it moved without growing (a loop
+/// closure bends the map and adds no stop).
+const MAP_POLL: Duration = Duration::from_millis(500);
+const MAP_GRID_REFRESH: Duration = Duration::from_secs(10);
+/// The grid's resolution here: maploc's own, so a full-screen map of a room is about a cell a
+/// pixel.
+const MAP_RES_M: f64 = 0.025;
+
+fn poll_map(socket: &Path, tx: &mpsc::Sender<Update>) {
+    loop {
+        if let Err(why) = ask_map(socket, tx)
+            && tx.send(Update::MapLost(why)).is_err()
+        {
+            return; // the UI is gone
+        }
+        thread::sleep(PAD_RETRY);
+    }
+}
+
+/// One connection to `mapd`, polled until something ends it.
+fn ask_map(socket: &Path, tx: &mpsc::Sender<Update>) -> Result<(), String> {
+    let mut client = Client::connect_to("mapd", socket).map_err(|e| e.message)?;
+    // What the grid last fetched reflected: stops, loops, relocalizations.
+    let mut fetched_for = None;
+    let mut fetched_at = Instant::now();
+    loop {
+        let status: proto::MapStatusResult = client
+            .call(&proto::Call::MapStatus)
+            .map_err(|e| e.message)
+            .and_then(|r| {
+                r.result_as()
+                    .map_err(|e| format!("mapd answered unreadably: {e}"))
+            })?;
+        let version = (status.state.keyframes, status.loops, status.relocalizations);
+        let stale = fetched_for != Some(version) || fetched_at.elapsed() >= MAP_GRID_REFRESH;
+        let mapping = status.unavailable.is_none() || status.state.keyframes > 0;
+        if tx.send(Update::Map(Box::new(status))).is_err() {
+            return Ok(()); // the UI is gone
+        }
+        if stale && mapping {
+            let grid: proto::MapGridResult = client
+                .call(&proto::Call::MapGrid(proto::MapGridParams {
+                    res_m: Some(MAP_RES_M),
+                }))
+                .map_err(|e| e.message)
+                .and_then(|r| {
+                    r.result_as()
+                        .map_err(|e| format!("mapd answered unreadably: {e}"))
+                })?;
+            fetched_for = Some(version);
+            fetched_at = Instant::now();
+            if tx.send(Update::MapGrid(Box::new(grid))).is_err() {
+                return Ok(());
+            }
+        }
+        thread::sleep(MAP_POLL);
+    }
+}
+
 fn poll_health(socket: &Path, tx: &mpsc::Sender<Update>) {
     loop {
         if let Err(why) = ask_health(socket, tx)
@@ -695,6 +780,35 @@ fn poll_health(socket: &Path, tx: &mpsc::Sender<Update>) {
             return; // the UI is gone
         }
         thread::sleep(HEALTH_POLL);
+    }
+}
+
+/// Read the pad's battery file every [`PAD_BATTERY_POLL`], sending only what changed.
+fn poll_pad_battery(file: &Path, tx: &mpsc::Sender<Update>) {
+    let mut last: Option<proto::pad_battery::Reading> = None;
+    let mut first = true;
+    loop {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let reading = proto::pad_battery::read_fresh(file, now_s);
+        // `read_s` moves every minute with the level unchanged; that is not worth a repaint.
+        let same = |a: &Option<proto::pad_battery::Reading>,
+                    b: &Option<proto::pad_battery::Reading>| {
+            match (a, b) {
+                (Some(a), Some(b)) => a.mac == b.mac && a.battery == b.battery,
+                (None, None) => true,
+                _ => false,
+            }
+        };
+        if first || !same(&last, &reading) {
+            first = false;
+            if tx.send(Update::PadBattery(reading.clone())).is_err() {
+                return; // the UI is gone
+            }
+            last = reading;
+        }
+        thread::sleep(PAD_BATTERY_POLL);
     }
 }
 
@@ -984,6 +1098,11 @@ fn live(
                         view.toggle_duck();
                         fresh = true;
                     }
+                    // The map (or the odometry path) over the whole terminal, and back.
+                    KeyCode::Char('m') => {
+                        view.fullscreen_map = !view.fullscreen_map;
+                        fresh = true;
+                    }
                     KeyCode::Char('[') | KeyCode::Left => {
                         view.orbit_duck(-0.25);
                         fresh = true;
@@ -1042,6 +1161,9 @@ fn terminal_failure(e: std::io::Error) -> Failure {
 /// still looks like a driver with a hand on the stick from everywhere downstream.
 #[derive(Default)]
 struct PadView {
+    /// The pad's battery, from `padd`'s file, while fresh. Shown in the title only when it is about
+    /// the pad on screen: the reading names its pad, and so does the device.
+    battery: Option<proto::pad_battery::Reading>,
     /// Why there is nothing to show, when there is nothing: no tap on this robot, `padd` stopped,
     /// or a pad that has gone away. Never left blank — a pad block that is simply empty is the one
     /// failure mode a debug view must not have.
@@ -1394,6 +1516,9 @@ struct View {
     /// Is the robot view wanted? Distinct from whether it is *drawn*: it also needs a
     /// state to pose from, a terminal wide enough, and a model that parsed.
     show_duck: bool,
+    /// The map panel fills the terminal (`m`). A house drawn in the ten rows under the robot
+    /// view is a thumbnail; this is how it is read.
+    fullscreen_map: bool,
     /// The odometry track, drawn as a top-down map under the robot view.
     path: path_map::PathMap,
     /// ToF beams through the head FK, so the depth grid can name the floor.
@@ -1422,6 +1547,14 @@ struct View {
     health_at: Option<Instant>,
     /// Why the health poll is not answering, when it is not.
     health_lost: Option<String>,
+    /// `mapd`'s last status and map, and why it is not answering when it is not.
+    map_status: Option<proto::MapStatusResult>,
+    map_grid: Option<proto::MapGridResult>,
+    map_lost: Option<String>,
+    /// The robot's track in the **map** frame, from the map's poses — never odometry, whose frame
+    /// differs from the map's after a reboot or a loop closure. Restarted when the robot is lost,
+    /// so a relocalization does not draw a line across the room.
+    map_track: path_map::PathMap,
 }
 
 impl View {
@@ -1442,6 +1575,7 @@ impl View {
             no_robot,
             duck: duck::DuckView::new(),
             show_duck: true,
+            fullscreen_map: false,
             path: path_map::PathMap::new(),
             reprojector: kinematics::tof::Reprojector::alpha(),
             tof: None,
@@ -1454,6 +1588,10 @@ impl View {
             health: None,
             health_at: None,
             health_lost: None,
+            map_status: None,
+            map_grid: None,
+            map_lost: None,
+            map_track: path_map::PathMap::new(),
         }
     }
 
@@ -1557,11 +1695,35 @@ impl View {
                 self.camera.lost(why);
                 Ok(self.show_camera)
             }
+            Update::PadBattery(reading) => {
+                self.pad.battery = reading;
+                Ok(self.show_pad)
+            }
             Update::Health(health) => {
                 self.health = Some(*health);
                 self.health_at = Some(Instant::now());
                 self.health_lost = None;
                 Ok(true)
+            }
+            Update::Map(status) => {
+                match status.state.pose {
+                    Some(p) => self.map_track.observe(p.x, p.y, p.yaw),
+                    None => self.map_track = path_map::PathMap::new(),
+                }
+                self.map_status = Some(*status);
+                self.map_lost = None;
+                Ok(self.show_duck || self.fullscreen_map)
+            }
+            Update::MapGrid(grid) => {
+                self.map_grid = Some(*grid).filter(|g| g.width > 0);
+                Ok(self.show_duck || self.fullscreen_map)
+            }
+            Update::MapLost(why) => {
+                // The last map is kept on screen: it was true when it arrived, and a `mapd`
+                // restarting under an update does not unmap the house.
+                self.map_lost = Some(why);
+                self.map_status = None;
+                Ok(self.show_duck || self.fullscreen_map)
             }
             Update::HealthLost(why) => {
                 // The last reading is **kept**, not cleared: it was true when it arrived, and
@@ -1602,6 +1764,11 @@ impl View {
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        // The whole terminal is the map; everything else waits behind `m`.
+        if self.fullscreen_map {
+            self.render_path(frame, area);
+            return;
+        }
         let Some(rows) = self.latest.as_ref().map(joint_rows) else {
             // No robot state — either `robotd` has not sent one yet, or there is no `robotd` to
             // connect to. Either way the pad block is still drawn when it is open: it reads a
@@ -1808,18 +1975,71 @@ impl View {
         }
     }
 
-    /// The odometry track, top-down: boot-forward is up, the origin is `+`, the
-    /// robot is `●` with a heading ray. See [`path_map`].
+    /// The map when `mapd` has one, otherwise the odometry track: boot-forward is up, the
+    /// origin is `+`, the robot is `●` with a heading ray. See [`path_map`].
     fn render_path(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        let block = Block::bordered().title(" path ").title_bottom(
-            // The zoom level, or the caption is a shape with no size.
-            Line::from(format!(" {:.1} m across ", self.path.extent_m()))
-                .dim()
-                .right_aligned(),
-        );
+        let hint = if self.fullscreen_map {
+            " m back "
+        } else {
+            " m fills the screen "
+        };
+        if let Some(grid) = &self.map_grid {
+            let block = Block::bordered()
+                .title(format!(" map · {} ", self.map_caption()))
+                .title_bottom(Line::from(hint).dim().left_aligned())
+                .title_bottom(
+                    Line::from(format!(
+                        " {:.1} × {:.1} m ",
+                        f64::from(grid.width) * grid.res_m,
+                        f64::from(grid.height) * grid.res_m
+                    ))
+                    .dim()
+                    .right_aligned(),
+                );
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            path_map::draw_map(grid, &self.map_track, inner, frame.buffer_mut());
+            return;
+        }
+        let block = Block::bordered()
+            .title(format!(" path · {} ", self.map_caption()))
+            .title_bottom(Line::from(hint).dim().left_aligned())
+            .title_bottom(
+                // The zoom level, or the caption is a shape with no size.
+                Line::from(format!(" {:.1} m across ", self.path.extent_m()))
+                    .dim()
+                    .right_aligned(),
+            );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.path.draw(inner, frame.buffer_mut());
+    }
+
+    /// What the map is doing, in a few words for the panel's title.
+    fn map_caption(&self) -> String {
+        let Some(s) = &self.map_status else {
+            return if self.map_lost.is_some() {
+                "no mapd".to_owned()
+            } else {
+                "map…".to_owned()
+            };
+        };
+        if let Some(why) = &s.unavailable
+            && s.state.keyframes == 0
+        {
+            return if why.contains("enabled = false") {
+                "map off".to_owned()
+            } else {
+                "not mapping".to_owned()
+            };
+        }
+        let what = match (&s.state.pose, &s.state.lost) {
+            (_, Some(why)) => format!("lost ({why})"),
+            (Some(_), None) if s.state.collecting => "looking".to_owned(),
+            (Some(_), None) => "tracking".to_owned(),
+            (None, None) => "waiting for a stop".to_owned(),
+        };
+        format!("{} stops · {what}", s.state.keyframes)
     }
 
     /// The whole-robot block: what was asked of it, what it did, and what it can feel.
@@ -2160,6 +2380,15 @@ impl View {
             // sentinel exists to avoid.
             None => Span::raw("batt not read yet").dim(),
         });
+
+        // The PWM cap the battery sets, beside the battery it comes from — only when
+        // `bus.battery_voltage_based_pwm_limit` is on, which is the only time robotd sends it.
+        if let Some(pwm) = health.goal_pwm {
+            said.push(Span::raw(format!(
+                " · pwm {:.0}% ({pwm})",
+                f64::from(pwm) * 100.0 / f64::from(proto::HealthResult::GOAL_PWM_FULL)
+            )));
+        }
 
         // Said early, because it qualifies everything after it: these are the numbers from the
         // last answer, and this is how long ago that answer was.
@@ -2757,6 +2986,9 @@ impl View {
                 Style::new().fg(Color::Yellow),
             ));
         }
+        if let Some(battery) = self.pad_battery(device) {
+            title.extend(battery);
+        }
         if self.pad.imu.is_some() {
             // Loud on purpose: a pad with an IMU is news, and the block below has just grown.
             title.push(Span::styled(
@@ -2765,6 +2997,37 @@ impl View {
             ));
         }
         title
+    }
+
+    /// The battery, for the title: `· battery full ` in a colour that says whether to worry, and
+    /// `charging` when it is. Nothing when there is no reading about this pad — a pad whose battery
+    /// is unknown is not drawn as one whose battery is empty.
+    fn pad_battery(&self, device: &proto::PadInputDevice) -> Option<Vec<Span<'static>>> {
+        let reading = self.pad.battery.as_ref()?;
+        if let Some(unique) = device.unique.as_deref()
+            && !unique.eq_ignore_ascii_case(&reading.mac)
+        {
+            return None;
+        }
+        let level = reading.battery.level;
+        let colour = match level {
+            proto::PadBatteryLevel::Full | proto::PadBatteryLevel::Medium => Color::Green,
+            proto::PadBatteryLevel::Low => Color::Yellow,
+            proto::PadBatteryLevel::Critical | proto::PadBatteryLevel::Empty => Color::Red,
+        };
+        let mut style = Style::new().fg(colour);
+        if level.is_low() {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let mut spans = vec![
+            Span::raw("· battery ").dim(),
+            Span::styled(level.word(), style),
+        ];
+        if reading.battery.charging {
+            spans.push(Span::styled(" charging", Style::new().fg(Color::Cyan)));
+        }
+        spans.push(Span::raw(" "));
+        Some(spans)
     }
 
     /// What the trace is drawn to, and how much of a link is behind it.
@@ -3741,6 +4004,27 @@ mod tests {
             .find(|line| line.contains(" power "))
             .expect("the row is drawn");
         assert!(!power.contains("motors"), "{screen}");
+    }
+
+    /// The battery's PWM cap sits beside the battery when robotd sends it, and is not mentioned
+    /// at all when it does not — the switch is off, which is the default.
+    #[test]
+    fn the_pwm_cap_shows_only_when_robotd_sends_it() {
+        let power_row = |health| {
+            draw_with_health(110, 32, &a_state(), health)
+                .lines()
+                .find(|line| line.contains(" power "))
+                .expect("the row is drawn")
+                .to_owned()
+        };
+        let on = power_row(proto::HealthResult {
+            goal_pwm: Some(718),
+            ..a_health()
+        });
+        assert!(on.contains("batt 7.66 V 66% · pwm 81% (718)"), "{on}");
+
+        let off = power_row(a_health());
+        assert!(!off.contains("pwm"), "{off}");
     }
 
     /// An unread battery says so. Rendered as `0.00 V, 0%` it would put a flat-pack warning in
@@ -4887,6 +5171,40 @@ mod tests {
         assert!(screen.contains("no radio here"), "{screen}");
     }
 
+    /// The battery `padd` read is on the title of the pad it is about, and only that one: a reading
+    /// for another pad is not this pad's battery, and no reading is drawn as nothing at all.
+    #[test]
+    fn the_pad_title_says_its_battery_when_padd_read_one() {
+        let reading = |mac: &str| proto::pad_battery::Reading {
+            mac: mac.to_owned(),
+            battery: proto::PadBattery {
+                level: proto::PadBatteryLevel::Low,
+                charging: true,
+            },
+            read_s: 0,
+        };
+        let mut view = watching_a_pad();
+        // "battery low", not "battery": the robot's own battery is on screen elsewhere.
+        let none = render_to(&mut view, 110, 32);
+        assert!(!none.contains("battery low"), "{none}");
+
+        // `a_device` is on 78:86:2e:bb:13:28; the reading's case is BlueZ's, the device's the
+        // kernel's.
+        feed(
+            &mut view,
+            Update::PadBattery(Some(reading("78:86:2E:BB:13:28"))),
+        );
+        let ours = render_to(&mut view, 110, 32);
+        assert!(ours.contains("battery low charging"), "{ours}");
+
+        feed(
+            &mut view,
+            Update::PadBattery(Some(reading("98:B6:E9:5E:BB:DB"))),
+        );
+        let theirs = render_to(&mut view, 110, 32);
+        assert!(!theirs.contains("battery low"), "{theirs}");
+    }
+
     /// The buttons are named as the kernel names them, and an untouched pad says "none" rather than
     /// leaving the row blank — a blank row cannot be told apart from a row that never updates.
     #[test]
@@ -4949,6 +5267,7 @@ mod tests {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
                 limited_by: vec![],
+                source: None,
             },
             head: [0.0; 4],
             policy: "stand".to_owned(),
@@ -4972,11 +5291,14 @@ mod tests {
             odom: proto::OdomState::default(),
             theremin: None,
             laser: None,
+            soccer: None,
+            autonomous: false,
             chorale: None,
             t_ns: 0,
             imu: None,
             frames: None,
             skeleton: Vec::new(),
+            hearing: None,
         }
     }
 }

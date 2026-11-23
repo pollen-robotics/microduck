@@ -23,6 +23,6 @@ pub use imu::ImuData;
 pub use io::{Census, FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
 pub use model::{
     BATTERY_EMPTY_V, BATTERY_FULL_V, DEFAULT_POSITION, JOINT_IDS, JOINT_NAMES, NUM_JOINTS,
-    REST_POSITION, battery_percent,
+    REST_POSITION, battery_percent, goal_pwm_for,
 };
 pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};

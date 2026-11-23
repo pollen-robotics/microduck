@@ -65,8 +65,16 @@ fn permits(call: &proto::Call) -> bool {
         // The theremin rides with the sounds: it is one, and a browser that can quack a duck
         // may pick its instrument up too.
         RobotDo(_) | RobotSound(_) | RobotTheremin(_) => true,
+        // And how loud they are. §4 applies as it does to `pad.bind`: the level is written to the
+        // config file, so a LAN peer changes something that outlives the session — a level, set
+        // back from the same page.
+        RobotVolume | RobotSetVolume(_) => true,
         // Somebody watching the camera is exactly who would want to wave a laser for it.
         RobotLaserTrack(_) => true,
+        // And somebody watching the camera is who would roll a ball for it.
+        RobotSoccer(_) => true,
+        // The duck on its own walks the robot like the ball does, and from the same person.
+        RobotAutonomous(_) => true,
         // Somebody watching through the camera is who wants the room lit.
         RobotFlashlight(_) => true,
 
@@ -231,6 +239,25 @@ fn permits(call: &proto::Call) -> bool {
         TofStream => true,
         // The head IMU rides the same video path, for the same reason: it annotates the frames.
         HeadImuStream => true,
+        // The map and the pose in it: what a remote viewer draws the duck on. A wipe is the
+        // owner's to ask for, from wherever they drive the robot.
+        MapStatus | MapStream | MapGrid(_) | MapWipe => true,
+
+        // Writing a tag needs a person at the robot's head to touch one, and BLE is the transport
+        // that is in the room by construction; `btd` carries it. Nothing remote wants it yet.
+        NfcWrite(_) => false,
+        // Reading one too: it needs the same person at the head, holding the same tag.
+        NfcRead(_) => false,
+        // The photos are the owner's pictures of their home, and a LAN peer on the legacy direct
+        // path is not authenticated (`policy-channel-design.md`): anyone on the wifi could read
+        // them. `btd` carries them, after the setup code. A remote gallery is a decision about the
+        // remote path's authorisation, not a line here.
+        PhotoList | PhotoGet(_) | PhotoDelete(_) => false,
+        // Taking one shows a peer nothing it does not already have: a session here *is* the
+        // camera, live. The picture lands with the others and is read back over `btd`, which is
+        // where the authorisation to see the gallery lives; and the pose and countdown are the
+        // photo tag's, nothing a peer that may stand the robot up cannot already do.
+        PhotoTake => true,
 
         // ── reading the robot's software ─────────────────────────────────────
         //
@@ -461,6 +488,10 @@ mod tests {
                 // fifteen-second window, which a remote peer cannot satisfy — but unbonding one
                 // is a thing you do *because* the pad is not there.
                 proto::method::PAD_FORGET,
+                // Forgetting the map. Not `updaterd`'s to authorise — `mapd` answers it, and the
+                // map is the owner's — and the console is where somebody sees that the map has
+                // gone wrong.
+                proto::method::MAP_WIPE,
             ],
             "a mutating call was routed to WebRTC; is `deploy/updater.toml` still narrow enough?"
         );
@@ -471,6 +502,14 @@ mod tests {
     /// Named individually rather than checked as a group: this is the list that a later widening
     /// of the subset must not quietly grow past, and a test that says "some things are refused"
     /// would not notice.
+    /// A peer that has the camera live may ask the duck to take a picture; it still cannot read
+    /// the gallery, which is `btd`'s, behind the setup code.
+    #[test]
+    fn a_watching_peer_can_take_a_photo_but_not_read_them() {
+        assert!(permits(&proto::Call::PhotoTake));
+        assert!(!permits(&proto::Call::PhotoList));
+    }
+
     #[test]
     fn the_pin_and_the_factory_reset_are_never_available() {
         for call in proto::test_support::every_call() {
@@ -501,6 +540,8 @@ mod tests {
                     | proto::Call::TofStream
                     | proto::Call::HeadImuStream
                     | proto::Call::PadInput
+                    | proto::Call::MapStream
+                    | proto::Call::MapGrid(_)
             );
             if wanted {
                 assert!(

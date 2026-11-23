@@ -30,6 +30,7 @@ mod params;
 mod pickup;
 mod posture;
 mod soc;
+mod soccer;
 mod sound;
 mod theremin;
 mod vetbook;
@@ -140,6 +141,11 @@ const HOME_RAMP: Duration = Duration::from_secs(2);
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
 
+/// How often Goal PWM follows the battery ([`duck_control::goal_pwm_for`]). The EMA it reads
+/// already moves over ~10 s, and a pack drains over an hour: anything faster rewrites fifteen
+/// servos to learn nothing, anything much slower leaves a fresh pack's first minutes uncapped.
+const GOAL_PWM_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How long the policy holds the shutdown sit before the rest ramp, when no controller is there
 /// to say. The sitstand descent is a deliberate ~2 s glide and the robot then sits still for a
 /// second; a running controller derives the same from the set's `ramp_s`
@@ -222,6 +228,108 @@ impl Landing {
             _ => Duration::ZERO,
         };
         self.still_for >= held
+    }
+}
+
+/// Watching the policy stand a robot up, for a stand-up that stalls.
+///
+/// From the back, the stand-up sometimes gets half-way and stays there: the policy holds a
+/// pose it never gets out of, and nothing else moves it. A human cures that with Start twice —
+/// policy off, which returns to the home pose, and on again. This is the same cure without
+/// the human: if the robot is not up `limp_fall_standup_ms` after the policy took it, the
+/// limp-fall sequence's pose ramp puts it back into the standing pose and hands it over again.
+///
+/// "Up" is the predictor's arming test — inside `limp_fall_tilt_z` for `limp_fall_arm_ms` —
+/// so a robot rocking through vertical on its way up is not called standing. The clock only
+/// runs while the policy is actually driving: a retry's pose ramp, a pick-up pause or a blind
+/// bus restart it rather than eat into it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StandUp {
+    since: Instant,
+    upright_for: Duration,
+    /// Retries already spent on this stand-up.
+    retries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StandUpVerdict {
+    Waiting,
+    Up,
+    Stuck,
+}
+
+impl StandUp {
+    fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            upright_for: Duration::ZERO,
+            retries: 0,
+        }
+    }
+
+    /// The policy is not driving this tick: hold the clock at zero.
+    fn restart(&mut self, now: Instant) {
+        self.since = now;
+        self.upright_for = Duration::ZERO;
+    }
+
+    /// One driving tick. `gravity_z` is `None` on a tick with no fresh sample, which neither
+    /// counts as upright nor stops the timeout: a robot nobody can read is not standing.
+    fn observe(
+        &mut self,
+        gravity_z: Option<f64>,
+        now: Instant,
+        period: Duration,
+        upright_z: f64,
+        held: Duration,
+        timeout: Duration,
+    ) -> StandUpVerdict {
+        self.upright_for = match gravity_z {
+            Some(z) if z <= upright_z => self.upright_for.saturating_add(period),
+            _ => Duration::ZERO,
+        };
+        if self.upright_for >= held {
+            StandUpVerdict::Up
+        } else if now.duration_since(self.since) >= timeout {
+            StandUpVerdict::Stuck
+        } else {
+            StandUpVerdict::Waiting
+        }
+    }
+}
+
+/// A robot whose stand-up retries ran out, parked at the home pose with the policy off.
+///
+/// Not limp and not driving: stiff at home, as Start-off leaves it, so nothing grinds against
+/// whatever it is stuck on. It goes back to the policy by itself once somebody has stood it on
+/// its feet — upright inside `limp_fall_tilt_z` *and* still (gyro under `limp_fall_still_rate`)
+/// for `limp_fall_standup_resume_ms`. Still as well as upright, so a robot being carried the
+/// right way up is not handed over mid-air; and if it is, `[pickup]` is what catches that, as
+/// it would any other time.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Parked {
+    on_feet_for: Duration,
+}
+
+impl Parked {
+    /// One tick: `imu` is this tick's (gravity z, gyro magnitude), or `None` when blind —
+    /// which restarts the count, as for [`Landing`]. `true` once it has been on its feet long
+    /// enough to hand back.
+    fn observe(
+        &mut self,
+        imu: Option<(f64, f64)>,
+        period: Duration,
+        upright_z: f64,
+        still_rate: f64,
+        held: Duration,
+    ) -> bool {
+        self.on_feet_for = match imu {
+            Some((z, rate)) if z <= upright_z && rate < still_rate => {
+                self.on_feet_for.saturating_add(period)
+            }
+            _ => Duration::ZERO,
+        };
+        self.on_feet_for >= held
     }
 }
 
@@ -659,6 +767,10 @@ struct RobotState {
     motor_mean_c: AtomicU64,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
+    /// The Goal PWM last written while `bus.battery_voltage_based_pwm_limit` is on, for
+    /// `robot.health`. Zero means *not written* — off, or before the first write — since a
+    /// written Goal PWM is never 0.
+    goal_pwm: AtomicU32,
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
     /// kernel with no thermal sysfs ([`soc`]).
     cpu_temp_c: AtomicU64,
@@ -679,6 +791,8 @@ struct RobotState {
     shutdown: AtomicBool,
     /// What `robot.flashlight` last asked for, as [`leds::Flashlight`] stores it.
     flashlight: AtomicU8,
+    /// How bright, in thousandths of full: [`leds::flashlight_level`] of the last call that lit it.
+    flashlight_level: std::sync::atomic::AtomicU16,
     /// Whether this board has a flashlight, so `robot.flashlight` refuses on one that does not
     /// rather than accepting into the dark. Read once: an LED does not appear on a running board.
     has_flashlight: bool,
@@ -764,6 +878,11 @@ struct RobotState {
     /// drops off the I²C bus — and an accepted theremin on a duck with no depth is a
     /// feature that silently does nothing.
     theremin_ready: AtomicBool,
+    /// Whether laser tracking is switched on, and whether a theremin is up — the loop's own
+    /// knowledge, republished every tick for `robot.mode`, which is what a phone on Bluetooth
+    /// reads to know which game the duck is playing (it has no `robot.state` stream).
+    laser_on: AtomicBool,
+    theremin_on: AtomicBool,
     /// Whether `[theremin] enabled` allows an instrument at all, and there is a voice to play
     /// it in. Read once at startup, like the policies — and kept separate from
     /// [`State::theremin_ready`] so that the refusal can name the switch. Off is the default,
@@ -835,6 +954,7 @@ impl RobotState {
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_hottest: AtomicU32::new(0),
+            goal_pwm: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
             imu_stale_blocks: AtomicU64::new(0),
@@ -842,6 +962,7 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             flashlight: AtomicU8::new(0),
+            flashlight_level: std::sync::atomic::AtomicU16::new(leds::FULL),
             has_flashlight: leds::flashlight_fitted(),
             leds_changed: tokio::sync::Notify::new(),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
@@ -863,6 +984,8 @@ impl RobotState {
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             emotions: emotion::Library::load_release(&params.emotions.dir),
             theremin_ready: AtomicBool::new(false),
+            laser_on: AtomicBool::new(false),
+            theremin_on: AtomicBool::new(false),
             theremin_allowed: params.theremin.enabled && params.audio.enabled,
             chorale_accepted: params.chorale.accept,
             mode: AtomicU8::new(mode_code(params.policy.mode)),
@@ -895,6 +1018,10 @@ impl RobotState {
                 degraded,
                 reason,
                 battery: self.battery(),
+                goal_pwm: match self.goal_pwm.load(Ordering::Relaxed) {
+                    0 => None,
+                    pwm => Some(pwm as u16),
+                },
                 motors: self.motor_thermal(),
                 cpu_temp_c: {
                     // Zero is "never read", the same sentinel the battery uses: a board at
@@ -1215,6 +1342,9 @@ async fn main() -> ExitCode {
     }
 
     let intents = Arc::new(Intents::new());
+    // Where the duck on its own starts; `robot.autonomous` (an NFC tag, `robotctl autonomous`)
+    // changes it until the next boot.
+    intents.set_autonomous(params.autonomous.enabled);
 
     start_head_imu(&state, &params, args.fake || args.sim.is_some());
 
@@ -2375,6 +2505,10 @@ async fn control_loop<T: RobotIo>(
         Err(e) => tracing::debug!(error = %e, "vet book: servo identity read failed"),
     }
     let mut last_alert_read = Instant::now();
+    // `None` until the first voltage reading, so the cap goes on with the first sample rather
+    // than ten seconds after it.
+    let mut last_goal_pwm: Option<Instant> = None;
+    let pwm_follows_battery = params.bus.battery_voltage_based_pwm_limit;
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -2480,15 +2614,39 @@ async fn control_loop<T: RobotIo>(
     let limp_fall_max = Duration::from_millis(params.safety.limp_fall_max_ms);
     let limp_fall_pose = Duration::from_millis(params.safety.limp_fall_pose_ms);
     let mut limp_fall = LimpFall::Idle;
+    // The stalled-stand-up watch ([`StandUp`]): started whenever the policy takes the robot,
+    // gone once the robot is up, the retries are spent, or something else took over.
+    let mut standup: Option<StandUp> = None;
+    let standup_timeout = Duration::from_millis(params.safety.limp_fall_standup_ms);
+    let standup_upright = Duration::from_millis(params.safety.limp_fall_arm_ms);
+    // Retries spent: parked at home, policy off, until somebody stands it on its feet.
+    let mut standup_parked: Option<Parked> = None;
+    let standup_resume = Duration::from_millis(params.safety.limp_fall_standup_resume_ms);
 
     // The voice, and the ear. Both optional equipment: a robot without a codec or a bank
     // walks identically — the player degrades to a debug line, and the mic worker is only
     // spawned when configured, with its own retry loop when arecord flaps.
     //
     // A configured card this board lacks means ALSA's `default` instead (resolve_devices).
-    let audio = params.audio.resolve_devices(&robotd_params::alsa_card_ids(
+    let cards = robotd_params::alsa_card_ids(
         &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
-    ));
+    );
+    let audio = params.audio.resolve_devices(&cards);
+    // The speaker level, over whatever the board left (`aic3104-init.service` runs before this unit
+    // and sets the HAT codec's full level). On the configured card, or the board's own codec where
+    // it fell back to `default` — the face board's RK809 (`SpeakerCodec`).
+    if params.audio.enabled
+        && let Some(mixer) = params.audio.speaker_mixer(&cards)
+    {
+        match robotd_params::set_speaker_volume(&mixer, params.audio.volume) {
+            Ok(()) => tracing::info!(
+                volume = params.audio.volume,
+                card = %mixer.card,
+                "speaker level set"
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not set the speaker level"),
+        }
+    }
     if params.audio.enabled
         && let Some(card) = &audio.missing_card
     {
@@ -2545,12 +2703,18 @@ async fn control_loop<T: RobotIo>(
     // connection as well as for frames — a second of silence that reads as a broken feature.
     // Also off when audio is off, since a theremin with no voice is a mouth opening for no
     // reason.
+    // What the microphone heard, for `robot.state.hearing`: petting as a level, noises and voices
+    // as counters, so a subscriber that missed a frame still sees that something happened.
+    let mut hearing = proto::HearingState::default();
     let mut theremin = (params.theremin.enabled && params.audio.enabled)
         .then(|| theremin::Theremin::spawn(params.theremin.socket.clone(), params.theremin.hand()));
     // Laser tracking. The reader holds no connection to `mediad` while tracking is off, so on a
     // duck that never switches it on this is one sleeping thread. `[laser]` is re-read by that
     // thread while it is on — tuning it must not need a restart that drops the robot.
     let mut laser = laser::Laser::spawn(params.laser.clone(), params_path.clone());
+    // Autonomous soccer, the laser's sibling: likewise one sleeping thread until it is switched
+    // on, and `[soccer]` re-read live while it is.
+    let mut soccer = soccer::Soccer::spawn(params.soccer.clone(), params_path.clone());
     // How far the beak is open for the chorale, slewed across ticks — see where it is written.
     let mut chorale_mouth = 0.0f64;
     // And how the head sways while singing, applied to the next tick's command.
@@ -2601,6 +2765,11 @@ async fn control_loop<T: RobotIo>(
     {
         voice.play("greet", false);
     }
+
+    // The second quack of the two that say autonomous soccer has ended, and when it is due. Not
+    // played back to back: a sound cuts off the one before it, so two in one tick are one.
+    const SOCCER_QUACK_GAP: Duration = Duration::from_millis(350);
+    let mut soccer_quack_again: Option<Instant> = None;
 
     // When the joints in `sensors` were actually read, `CLOCK_MONOTONIC` ns — the clock
     // `tof.frame` and a mapper share. Stamped at the read, not at publish, because
@@ -2725,6 +2894,83 @@ async fn control_loop<T: RobotIo>(
                     block.walk = true;
                 }
                 laser_state = Some(block);
+            }
+        }
+
+        // Soccer mode. Manual soccer moves nothing here — it is the pad's bumpers — so its block
+        // only says so; autonomous soccer shares the robot exactly as the laser does above, and
+        // after it, so the two never both drive (`robot.soccer` and `robot.laserTrack` switch each
+        // other off besides).
+        let soccer_switch = intents.soccer();
+        // A kick autonomous soccer queued this tick, by name, until the skill code below says
+        // whether it started — which `soccer.kick_outcome` is then told, this same tick.
+        let mut soccer_kick: Option<&'static str> = None;
+        let mut soccer_kick_result: Option<Result<(), String>> = None;
+        let soccer_was_autonomous = soccer.autonomous();
+        soccer.set_autonomous(soccer_switch.autonomous);
+        // Said aloud, for whoever holds the pad or the tag: one quack as the robot starts playing
+        // by itself, two as it stops — whoever switched it, the pad, `robotctl` or `autod`. Always
+        // the same quacks rather than the bank's random pick, so the cue is recognised: the
+        // bank's first chirp, and for the second of the pair its second, so the two differ.
+        if soccer_switch.autonomous != soccer_was_autonomous {
+            if let Some(voice) = voice.as_mut() {
+                voice.play_same("chirp", 0);
+            }
+            soccer_quack_again = (!soccer_switch.autonomous).then(|| tick_start + SOCCER_QUACK_GAP);
+        }
+        if soccer_quack_again.is_some_and(|at| tick_start >= at) {
+            soccer_quack_again = None;
+            if let Some(voice) = voice.as_mut() {
+                voice.play_same("chirp", 1);
+            }
+        }
+        let mut soccer_state = soccer_switch.active.then(|| proto::SoccerState {
+            phase: "manual".into(),
+            ..Default::default()
+        });
+        if let Some(sample) = sensors.as_ref() {
+            let pose = laser::Pose {
+                head: mapping::head_joints_of(&sample.positions),
+                imu: sample.imu.quat,
+                odom: odometry.position(),
+                yaw: odometry.yaw(),
+            };
+            let driving = snapshot.enabled && bringup == Bringup::Ready;
+            if let Some(drive) = soccer.tick(&pose, snapshot.command.head[0], driving, tick_start) {
+                let mut block = drive.state;
+                let client_twist = snapshot.twist_age
+                    < Duration::from_millis(params.safety.deadman_ms)
+                    && snapshot.command.twist.iter().any(|v| *v != 0.0);
+                let client_head = snapshot.head_age < LASER_CLIENT_HEAD
+                    && snapshot.command.head.iter().any(|v| v.abs() > 1e-3);
+                if let Some(head) = drive.head
+                    && !client_head
+                {
+                    snapshot.command.head = head;
+                    snapshot.head_age = Duration::ZERO;
+                    block.head = true;
+                }
+                if let Some(twist) = drive.twist
+                    && !client_twist
+                {
+                    snapshot.command.twist = twist;
+                    // Live for the deadman: the ball is as fresh as `[soccer] memory_ms` allows,
+                    // and the search turn stops the moment autonomous is switched off.
+                    snapshot.twist_age = Duration::ZERO;
+                    block.walk = true;
+                }
+                // Queued like a pad's `robot.do`, and taken below in this same tick. Not while
+                // somebody is steering: their stick says they have the robot.
+                if let Some(kick) = drive.kick {
+                    if client_twist {
+                        soccer_kick_result = Some(Err("a stick is pushed".to_owned()));
+                    } else if !queue_skill(&state, &intents, kick) {
+                        soccer_kick_result =
+                            Some(Err(format!("this robot has no {kick} skill configured")));
+                    }
+                    soccer_kick = Some(kick);
+                }
+                soccer_state = Some(block);
             }
         }
 
@@ -2892,7 +3138,11 @@ async fn control_loop<T: RobotIo>(
                             .get(index)
                             .cloned()
                             .unwrap_or_else(|| index.to_string());
-                        match controller.start_skill(index) {
+                        let started = controller.start_skill(index);
+                        if soccer_kick == Some(name.as_str()) {
+                            soccer_kick_result = Some(started.map(|_| ()).map_err(str::to_owned));
+                        }
+                        match started {
                             Ok(true) => tracing::warn!(skill = %name, "skill started"),
                             Ok(false) => {}
                             Err(reason) => {
@@ -2903,6 +3153,12 @@ async fn control_loop<T: RobotIo>(
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
             }
+        }
+        if let Some(kick) = soccer_kick {
+            let outcome = soccer_kick_result.unwrap_or_else(|| {
+                Err(format!("{kick} was not started: the policy is not driving"))
+            });
+            soccer.kick_outcome(outcome, tick_start);
         }
 
         // Emotions, like the skills above: started on a robot the policy drove last tick with no
@@ -2982,11 +3238,20 @@ async fn control_loop<T: RobotIo>(
                         }
                         pet_detect::PettingEvent::End => tracing::debug!("petting ended"),
                     }
+                    hearing.petting = matches!(ev, pet_detect::PettingEvent::Start);
                 }
-                // Ambient sound events have no consumer until the autonomous brain arrives;
-                // surfaced at debug so mic tuning on a bench has data to look at.
+                // Counted for `robot.state.hearing`, where the autonomous brain reads them, and
+                // still logged at debug so mic tuning on a bench has data to look at.
                 while let Some(ev) = pet.try_recv_sound() {
                     tracing::debug!(event = ?ev, "ambient sound");
+                    match ev {
+                        pet_detect::worker::SoundEvent::Noise => {
+                            hearing.noises = hearing.noises.wrapping_add(1);
+                        }
+                        pet_detect::worker::SoundEvent::Voice => {
+                            hearing.voices = hearing.voices.wrapping_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -3433,6 +3698,112 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
             }
+
+            // A stand-up that stalls: what Start twice does by hand, done by itself — see
+            // [`StandUp`]. The watch is started on the driving edge further down.
+            if let Some(watch) = standup.as_mut() {
+                let still_ours = snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off
+                    && controller
+                        .as_ref()
+                        .is_some_and(|c| !c.busy() && !c.is_sitting());
+                if !still_ours || params.safety.limp_fall_standup_retries == 0 {
+                    // A disable, a skill, a sit, a shutdown: somebody else has the robot.
+                    standup = None;
+                } else if limp_fall != LimpFall::Idle || !was_driving {
+                    // Posing for a retry, limping through a fresh fall, paused: the policy is
+                    // not the one failing to stand it up right now.
+                    watch.restart(tick_start);
+                } else {
+                    match watch.observe(
+                        fresh.as_ref().map(|s| s.imu.gravity[2]),
+                        tick_start,
+                        period,
+                        params.safety.limp_fall_tilt_z,
+                        standup_upright,
+                        standup_timeout,
+                    ) {
+                        StandUpVerdict::Waiting => {}
+                        StandUpVerdict::Up => {
+                            if watch.retries > 0 {
+                                tracing::warn!(retries = watch.retries, "stood up after retrying");
+                            }
+                            standup = None;
+                        }
+                        StandUpVerdict::Stuck
+                            if watch.retries < params.safety.limp_fall_standup_retries =>
+                        {
+                            watch.retries += 1;
+                            watch.restart(tick_start);
+                            tracing::warn!(
+                                retry = watch.retries,
+                                of = params.safety.limp_fall_standup_retries,
+                                after_ms = standup_timeout.as_millis(),
+                                gravity_z =
+                                    fresh.as_ref().map(|s| format!("{:.2}", s.imu.gravity[2])),
+                                "stand-up stalled — posing back to standing and handing over again"
+                            );
+                            // The limp-fall sequence's own pose ramp, from where the robot is,
+                            // and its hand-back resets the controller: the Start-off/Start-on a
+                            // human does, through the path that already owns a robot on the floor.
+                            limp_fall = LimpFall::Posing {
+                                from: coast.known_positions(hold),
+                                since: tick_start,
+                            };
+                            falling.reset();
+                        }
+                        StandUpVerdict::Stuck => {
+                            tracing::warn!(
+                                retries = watch.retries,
+                                resume_ms = standup_resume.as_millis(),
+                                "stand-up still stalled — parking at the home pose; stand it on \
+                                 its feet to hand it back, or Start twice"
+                            );
+                            standup = None;
+                            // The same ramp to the standing pose, and then held there: parked
+                            // keeps `driving` false, so the hand-back at the end of the ramp
+                            // leaves the robot at `hold`, which it sets to the home pose.
+                            limp_fall = LimpFall::Posing {
+                                from: coast.known_positions(hold),
+                                since: tick_start,
+                            };
+                            falling.reset();
+                            standup_parked = Some(Parked::default());
+                        }
+                    }
+                }
+            }
+
+            // Parked after giving up: wait to be stood on its feet. Anything that takes the
+            // robot — Start (a disable), a relax, a shutdown — ends the park, and the next
+            // enable starts over with a fresh set of retries.
+            if let Some(parked) = standup_parked.as_mut() {
+                let still_ours = snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && shutdown_sit.is_none()
+                    && !powered_off;
+                if !still_ours {
+                    standup_parked = None;
+                } else if limp_fall == LimpFall::Idle
+                    && parked.observe(
+                        fresh.as_ref().map(|s| {
+                            (
+                                s.imu.gravity[2],
+                                s.imu.gyro.iter().map(|w| w * w).sum::<f64>().sqrt(),
+                            )
+                        }),
+                        period,
+                        params.safety.limp_fall_tilt_z,
+                        params.safety.limp_fall_still_rate,
+                        standup_resume,
+                    )
+                {
+                    tracing::warn!("on its feet — handing the parked robot back to the policy");
+                    standup_parked = None;
+                }
+            }
         }
         let in_limp_fall = limp_fall != LimpFall::Idle;
 
@@ -3447,6 +3818,7 @@ async fn control_loop<T: RobotIo>(
                     && snapshot.enabled
                     && bringup == Bringup::Ready
                     && !in_limp_fall
+                    && standup_parked.is_none()
                     && safety.imu_ready()
                     && shutdown_sit.is_none()
                     && shutdown_rest.is_none()
@@ -3495,8 +3867,9 @@ async fn control_loop<T: RobotIo>(
         {
             ramp(ema, target, cmd_alpha, accel, period.as_secs_f64());
         }
+        let head_rate = snapshot.head_alpha.unwrap_or(head_alpha);
         for (ema, target) in head_ema.iter_mut().zip(gated.head) {
-            slew(ema, target, head_alpha);
+            slew(ema, target, head_rate);
         }
         if snapshot.pose.active {
             for (ema, target) in body_ema.iter_mut().zip(snapshot.pose.body) {
@@ -3831,6 +4204,8 @@ async fn control_loop<T: RobotIo>(
             // The limp-fall sequence owns the robot for its duration: the whole point is
             // that the policy is *not* driving while the robot falls, lands and is posed.
             && !in_limp_fall
+            // Parked at home after a stand-up that would not happen, until it is on its feet.
+            && standup_parked.is_none()
             // Held in somebody's hand: the robot holds the pause pose until it is put down.
             && !pickup_paused
             // The rest ramp has the robot for the end of a shutdown.
@@ -3855,6 +4230,15 @@ async fn control_loop<T: RobotIo>(
             // A seated robot is held in its seat, not at home: start the network from there.
             if start_from_hold && let Some(controller) = controller.as_mut() {
                 controller.seed_from_pose(&hold);
+            }
+            // Every time the policy takes the robot, watch it get up — a robot that is already
+            // standing passes in `limp_fall_arm_ms`. Kept, not restarted, across a retry's own
+            // hand-back, or the retries would never run out.
+            if params.safety.limp_fall
+                && params.safety.limp_fall_standup_retries > 0
+                && standup.is_none()
+            {
+                standup = Some(StandUp::new(tick_start));
             }
         }
         if was_driving && !driving {
@@ -4181,6 +4565,11 @@ async fn control_loop<T: RobotIo>(
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
 
+        state.laser_on.store(laser.active(), Ordering::Relaxed);
+        state
+            .theremin_on
+            .store(theremin_state.is_some(), Ordering::Relaxed);
+
         vettally.tick(&vetbook::Facts {
             dt,
             torqued: bringup != Bringup::Limp && !powered_off,
@@ -4224,6 +4613,7 @@ async fn control_loop<T: RobotIo>(
                 movement: proto::MoveState {
                     requested: snapshot.command.twist,
                     applied: command.twist,
+                    source: intents.twist_source(),
                     limited_by: limits.iter().map(|l| limit_name(*l).to_owned()).collect(),
                 },
                 head: command.head,
@@ -4266,6 +4656,8 @@ async fn control_loop<T: RobotIo>(
                 },
                 theremin: theremin_state.clone(),
                 laser: laser_state.clone(),
+                soccer: soccer_state.clone(),
+                autonomous: intents.autonomous(),
                 chorale: chorale_state.clone(),
                 t_ns: sensors_read_ns,
                 imu: Some(proto::ImuState {
@@ -4276,6 +4668,7 @@ async fn control_loop<T: RobotIo>(
                     &sensors.positions,
                 ))),
                 skeleton: mapping::skeleton_at(&sensors.positions),
+                hearing: pet.as_ref().map(|_| hearing),
             });
         }
 
@@ -4321,6 +4714,39 @@ async fn control_loop<T: RobotIo>(
             }
             vettally.handoff(&state.vetbook, volts, false);
 
+            // `bus.battery_voltage_based_pwm_limit`: Goal PWM follows the pack, so the motors see
+            // ~6 V whether it is full or nearly flat, rewritten every interval even when
+            // unchanged — see `Safety::set_goal_pwm`. Off writes full duty once: Goal PWM is
+            // servo RAM, so a cap from an earlier run outlives a robotd restart otherwise.
+            let want = if pwm_follows_battery {
+                duck_control::goal_pwm_for(volts)
+            } else {
+                last_goal_pwm
+                    .is_none()
+                    .then_some(duck_control::model::GOAL_PWM_MAX)
+            };
+            if last_goal_pwm.is_none_or(|t| t.elapsed() >= GOAL_PWM_INTERVAL)
+                && let Some(pwm) = want
+            {
+                last_goal_pwm = Some(Instant::now());
+                let previous = safety.goal_pwm();
+                let result = safety.set_goal_pwm(pwm);
+                if pwm_follows_battery && result.is_ok() {
+                    state.goal_pwm.store(u32::from(pwm), Ordering::Relaxed);
+                }
+                match result {
+                    Ok(()) if previous.is_none() => tracing::info!(
+                        goal_pwm = pwm,
+                        battery_v = format!("{volts:.2}"),
+                        follows_battery = pwm_follows_battery,
+                        "goal PWM set"
+                    ),
+                    Ok(()) => tracing::debug!(goal_pwm = pwm, battery_v = volts, "goal PWM"),
+                    // Retried by the next apply, and again in ten seconds.
+                    Err(e) => tracing::debug!(error = %e, goal_pwm = pwm, "goal PWM write failed"),
+                }
+            }
+
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
                     total = ticks,
@@ -4335,6 +4761,7 @@ async fn control_loop<T: RobotIo>(
                         "{:.2}",
                         f64::from_bits(state.battery_v.load(Ordering::Relaxed))
                     ),
+                    goal_pwm = safety.goal_pwm(),
                     motor_max_c = format!(
                         "{:.0}",
                         f64::from_bits(state.motor_max_c.load(Ordering::Relaxed))
@@ -4712,6 +5139,9 @@ async fn handle(
     let mut beacons: Option<tokio::sync::broadcast::Receiver<proto::ChoraleAdvertise>> = None;
     let mut decimate = Duration::ZERO;
     let mut last_sent: Option<Instant> = None;
+    // What the client called itself in `hello`, for `move.source`: the brain's only way to see a
+    // pad that has taken over, since nothing here arbitrates between drivers.
+    let mut client: Option<Arc<str>> = None;
 
     loop {
         // Three things can happen: a request arrives, a state frame is due for a subscriber, or a
@@ -4823,6 +5253,20 @@ async fn handle(
 
         let call = request.as_call();
 
+        if let Ok(proto::Call::Hello(hello)) = &call {
+            client = hello.client.as_deref().map(Arc::from);
+        }
+        // The twist is stamped with who sent it, so it is set here, where the connection is known,
+        // rather than in `apply_intent`, which serves every connection alike.
+        if let Ok(proto::Call::RobotMove(p)) = &call {
+            intents.set_twist_from([p.vx, p.vy, p.vyaw], client.clone());
+            if let Some(id) = request.id.clone() {
+                let response = proto::Response::ok(Some(id), &proto::IntentResult::accepted());
+                write_line(&mut write_half, &response).await?;
+            }
+            continue;
+        }
+
         // Notifications get no reply, per the spec. Continuous intents arrive this way —
         // at 50 Hz a response per message would be pure overhead, and there is nothing
         // useful to say about a velocity that is superseded 20 ms later.
@@ -4879,7 +5323,10 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
             true
         }
         proto::Call::RobotHead(p) => {
-            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            intents.set_head_at(
+                [p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll],
+                p.alpha,
+            );
             true
         }
         proto::Call::RobotPose(p) => {
@@ -5264,6 +5711,53 @@ fn pad_bindings_report(config: &std::path::Path, state: &RobotState) -> proto::P
 /// The name is checked against the skills this robot has, which is the reason this call is served
 /// here rather than beside the rest of `pad.*` in `configd`. A refusal naming the real skills is
 /// worth much more than a button that turns out to do nothing.
+/// The speaker level in the config, and whether this board has the mixer it is written to.
+fn volume_now(config: &std::path::Path) -> Result<proto::VolumeResult, String> {
+    let params = params::Params::load(config, false).map_err(|e| e.to_string())?;
+    Ok(proto::VolumeResult {
+        volume: params.audio.volume,
+        applies: speaker_mixer(&params.audio).is_some(),
+    })
+}
+
+/// This board's speaker mixer, when it has one this build can drive and audio is on.
+fn speaker_mixer(audio: &params::AudioParams) -> Option<params::SpeakerMixer> {
+    if !audio.enabled {
+        return None;
+    }
+    audio.speaker_mixer(&robotd_params::alsa_card_ids(
+        &std::fs::read_to_string("/proc/asound/cards").unwrap_or_default(),
+    ))
+}
+
+/// `robot.setVolume`: written to `[audio] volume` — through the same editor and validation
+/// `robotctl configure` uses — then to the mixer, so it is heard at once and kept.
+///
+/// The file first: a level that could not be kept is refused rather than heard until the next
+/// restart quietly undoes it. A mixer that will not take it is logged, not refused — the level is
+/// stored, and `applies` already tells a client whether this board can hear it.
+fn set_volume_request(
+    p: &proto::VolumeParams,
+    config: &std::path::Path,
+) -> Result<proto::VolumeResult, String> {
+    if p.volume > 100 {
+        return Err(format!("volume {} is over 100 %", p.volume));
+    }
+    params::edit::set_key(config, "audio.volume", &p.volume.to_string())?;
+    let loaded = params::Params::load(config, false).map_err(|e| e.to_string())?;
+    let mixer = speaker_mixer(&loaded.audio);
+    if let Some(speaker) = &mixer
+        && let Err(e) = robotd_params::set_speaker_volume(speaker, loaded.audio.volume)
+    {
+        tracing::warn!(error = %e, "speaker level stored but not applied");
+    }
+    let now = proto::VolumeResult {
+        volume: loaded.audio.volume,
+        applies: mixer.is_some(),
+    };
+    Ok(now)
+}
+
 fn bind_pad_request(p: &proto::PadBindParams, state: &RobotState) -> proto::IntentResult {
     let defaults = params::PadParams::default();
     if defaults.skill(&p.button).is_none() {
@@ -5520,6 +6014,7 @@ fn dispatch(
                         head_pitch,
                         head_yaw,
                         head_roll,
+                        alpha: None,
                     },
                     clamped: gaze.clamped,
                 },
@@ -5612,7 +6107,43 @@ fn dispatch(
         // waiting for in `robot.state`'s laser block rather than here.
         proto::Call::RobotLaserTrack(p) => {
             intents.request_laser(p.active);
+            // One chaser at a time: a dot and a ball would fight over the legs.
+            if p.active {
+                intents.set_soccer(false, false);
+            }
             proto::Response::ok(Some(id), &proto::LaserTrackResult::default())
+        }
+
+        // Soccer mode, and autonomous soccer on it. Nothing to refuse at the door, for the
+        // laser's reason: whether `mediad` answers is a circumstance, and the soccer block in
+        // `robot.state` says what it is waiting for. Laser tracking goes off, as above.
+        proto::Call::RobotSoccer(p) => {
+            if p.active {
+                intents.request_laser(false);
+            }
+            intents.set_soccer(p.active, p.autonomous);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
+        }
+
+        // The duck on its own. A switch `autod` reads in `robot.state`; it moves nothing here, so
+        // there is nothing to refuse. Whether `autod` is running is `systemctl`'s to say.
+        //
+        // Switched off, the laser and a ball game the duck may have been playing go off here, not
+        // only in `autod`: an `autod` that is down, or restarting, when the switch goes off would
+        // otherwise leave the camera looking for a dot and the legs following it, on a robot
+        // somebody just switched back to being theirs. Soccer by hand is left alone — it is a pad's.
+        proto::Call::RobotAutonomous(p) => {
+            if intents.autonomous() && !p.active {
+                intents.request_laser(false);
+                if intents.soccer().autonomous {
+                    intents.set_soccer(false, false);
+                }
+            }
+            if intents.autonomous() != p.active {
+                tracing::warn!(on = p.active, "the duck on its own switched");
+            }
+            intents.set_autonomous(p.active);
+            proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
 
         // A sound is queued for the loop's next tick. Never refused for *circumstance* —
@@ -5640,9 +6171,13 @@ fn dispatch(
         proto::Call::RobotFlashlight(p) => {
             let result = if state.has_flashlight {
                 let current = state.flashlight.load(Ordering::Relaxed);
-                state
-                    .flashlight
-                    .store(leds::flashlight_after(current, p), Ordering::Relaxed);
+                let after = leds::flashlight_after(current, p);
+                if after != 0 {
+                    state
+                        .flashlight_level
+                        .store(leds::flashlight_level(p), Ordering::Relaxed);
+                }
+                state.flashlight.store(after, Ordering::Relaxed);
                 state.leds_changed.notify_one();
                 proto::IntentResult::accepted()
             } else {
@@ -5700,6 +6235,18 @@ fn dispatch(
             state.vetbook.tally(p);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
+        proto::Call::RobotVolume => match volume_now(&state.config_path) {
+            Ok(result) => proto::Response::ok(Some(id), &result),
+            Err(e) => {
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INTERNAL_ERROR, e))
+            }
+        },
+        proto::Call::RobotSetVolume(p) => match set_volume_request(p, &state.config_path) {
+            Ok(result) => proto::Response::ok(Some(id), &result),
+            Err(e) => {
+                proto::Response::err(Some(id), proto::Error::new(proto::code::INVALID_PARAMS, e))
+            }
+        },
         proto::Call::RobotVetbookNote(p) => {
             let result = match state.vetbook.note(&p.text) {
                 Ok(()) => proto::IntentResult::accepted(),
@@ -5783,6 +6330,11 @@ fn dispatch(
                 mode: mode_of(state.mode.load(Ordering::Relaxed))
                     .as_str()
                     .to_owned(),
+                soccer: Some(intents.soccer()).filter(|s| s.active),
+                autonomous: intents.autonomous(),
+                laser: state.laser_on.load(Ordering::Relaxed),
+                theremin: state.theremin_on.load(Ordering::Relaxed),
+                flashlight: state.flashlight.load(Ordering::Relaxed) != 0,
             },
         ),
 
@@ -6619,6 +7171,104 @@ mod tests {
         );
     }
 
+    /// The stalled-stand-up watch: a robot that gets up passes once it has stood for the
+    /// arming time, and one that stays tipped past the timeout is stuck.
+    #[test]
+    fn a_stand_up_passes_on_standing_and_stalls_on_the_timeout() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let timeout = Duration::from_secs(3);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Lying on its back, then up: three upright ticks and it is standing.
+        let mut w = StandUp::new(t0);
+        assert_eq!(
+            w.observe(Some(0.0), at(1_000), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        for ms in [1_020, 1_040] {
+            assert_eq!(
+                w.observe(Some(-0.98), at(ms), period, -0.9, held, timeout),
+                StandUpVerdict::Waiting
+            );
+        }
+        assert_eq!(
+            w.observe(Some(-0.98), at(1_060), period, -0.9, held, timeout),
+            StandUpVerdict::Up
+        );
+
+        // Stuck half-way — rocking through vertical for a tick now and then is not standing.
+        let mut w = StandUp::new(t0);
+        assert_eq!(
+            w.observe(Some(-0.95), at(2_000), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(2_980), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(3_000), period, -0.9, held, timeout),
+            StandUpVerdict::Stuck
+        );
+    }
+
+    /// The clock counts only the policy's own time: restarting it — the retry's pose ramp, a
+    /// pause — gives the next hand-back the whole timeout, and a blind tick is not upright.
+    #[test]
+    fn a_restart_gives_the_stand_up_its_whole_time_again() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let timeout = Duration::from_secs(3);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut w = StandUp::new(t0);
+        w.observe(Some(-0.98), at(2_000), period, -0.9, held, timeout);
+        w.observe(Some(-0.98), at(2_020), period, -0.9, held, timeout);
+        w.restart(at(2_900));
+        assert_eq!(
+            w.observe(None, at(3_500), period, -0.9, held, timeout),
+            StandUpVerdict::Waiting,
+            "timed from the restart, and the upright count went with it"
+        );
+        assert_eq!(
+            w.observe(Some(-0.4), at(5_900), period, -0.9, held, timeout),
+            StandUpVerdict::Stuck
+        );
+    }
+
+    /// A parked robot goes back to the policy only once it is on its feet *and* still for the
+    /// whole hold: lying there is not it, being carried upright is not it, and a blind tick
+    /// restarts the count.
+    #[test]
+    fn a_parked_robot_resumes_only_standing_still_on_its_feet() {
+        let period = Duration::from_millis(20);
+        let held = Duration::from_millis(60);
+        let observe = |p: &mut Parked, imu| p.observe(imu, period, -0.9, 1.0, held);
+        let mut p = Parked::default();
+
+        // Still on its back, as it was parked: never.
+        for _ in 0..50 {
+            assert!(!observe(&mut p, Some((0.1, 0.0))));
+        }
+        // Upright but swinging in somebody's hands: never.
+        for _ in 0..50 {
+            assert!(!observe(&mut p, Some((-0.98, 2.0))));
+        }
+        // Set down: two still ticks, a blind one, then the full three.
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, None), "blind, not standing");
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(!observe(&mut p, Some((-0.98, 0.2))));
+        assert!(
+            observe(&mut p, Some((-0.98, 0.2))),
+            "on its feet and let go"
+        );
+    }
+
     /// Limp-fall ships ON, and it must refuse a fallen robot nothing.
     ///
     /// This is the contract that answers "I booted it face-down and pressed Start": enable
@@ -7027,6 +7677,111 @@ mod tests {
             .result_as()
             .expect("robot.mode must deserialize as ModeResult");
         assert_eq!(mode.mode, "walk");
+    }
+
+    /// Soccer mode is read back in `robot.mode`, which is how a pad learns an NFC tag switched it;
+    /// autonomous implies soccer mode; and laser tracking and soccer switch each other off.
+    #[test]
+    fn soccer_is_answered_in_robot_mode_and_excludes_the_laser() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let mode = |intents: &Intents| -> Option<proto::SoccerParams> {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .soccer
+        };
+        let soccer = |active, autonomous| {
+            proto::Call::RobotSoccer(proto::SoccerParams { active, autonomous })
+        };
+        assert_eq!(mode(&intents), None);
+
+        let answer: proto::IntentResult = dispatch(&s, &intents, id(), &soccer(true, true))
+            .result_as()
+            .unwrap();
+        assert!(answer.accepted);
+        assert_eq!(
+            mode(&intents),
+            Some(proto::SoccerParams {
+                active: true,
+                autonomous: true
+            })
+        );
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        // Off is both off, whatever `autonomous` says.
+        dispatch(&s, &intents, id(), &soccer(false, true));
+        assert_eq!(mode(&intents), None);
+
+        dispatch(&s, &intents, id(), &soccer(true, false));
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
+        );
+        assert_eq!(mode(&intents), None, "the laser switches soccer off");
+    }
+
+    /// The duck on its own is a level `robot.autonomous` sets and `robot.mode` reads back — the
+    /// pad daemons' way to learn an NFC tag switched it — and it touches no other switch: the
+    /// brain manages the laser and the ball itself.
+    #[test]
+    fn autonomy_is_a_switch_answered_in_robot_mode() {
+        let s = state();
+        let intents = Intents::new();
+        let id = || proto::Id::Number(1);
+        let on = |intents: &Intents| -> bool {
+            dispatch(&s, intents, id(), &proto::Call::RobotMode)
+                .result_as::<proto::ModeResult>()
+                .unwrap()
+                .autonomous
+        };
+        assert!(!on(&intents));
+        let answer: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: true }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(answer.accepted);
+        assert!(on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            None,
+            "the laser is left alone"
+        );
+        // The duck playing ball when it is switched off: the game and the laser go with it.
+        intents.set_soccer(true, true);
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert!(!on(&intents));
+        assert_eq!(
+            intents.take_laser_request(),
+            Some(false),
+            "the laser goes off"
+        );
+        assert!(!intents.soccer().active, "the ball game ends");
+        // Off when already off touches nothing; soccer by hand is a pad's, never the switch's.
+        intents.set_soccer(true, false);
+        dispatch(
+            &s,
+            &intents,
+            id(),
+            &proto::Call::RobotAutonomous(proto::AutonomyParams { active: false }),
+        );
+        assert_eq!(intents.take_laser_request(), None);
+        assert!(intents.soccer().active && !intents.soccer().autonomous);
     }
 
     /// `robot.look` is a promise with two halves: the head actually moves (the intent is
@@ -7488,6 +8243,75 @@ mod tests {
         );
     }
 
+    /// Run the loop on a `FakeIo` until the first battery sample lands, and a few ticks more;
+    /// return every Goal PWM it wrote. The slow-sensor window is a `std` second, so this takes
+    /// one real second whatever tokio's clock does.
+    async fn goal_pwms_after_first_battery_sample(params: Params) -> Vec<u16> {
+        let s = Arc::new(RobotState::new(
+            &params,
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = FakeIo::at(DEFAULT_POSITION);
+            control_loop(
+                Borrowed(&mut io),
+                loop_state,
+                Arc::new(Intents::new()),
+                params,
+                PathBuf::from("/nonexistent/robotd.toml"),
+                Duration::from_millis(2),
+                Arc::new(|| {}),
+            )
+            .await;
+            tx.send(io.goal_pwms).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.battery_v.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_ne!(
+            s.battery_v.load(Ordering::Relaxed),
+            0,
+            "a battery sample landed"
+        );
+        let ticks = s.ticks.load(Ordering::Relaxed);
+        while s.ticks.load(Ordering::Relaxed) < ticks + 10 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        rx.recv().unwrap()
+    }
+
+    /// On, the cap goes on with the first voltage sample — `FakeIo`'s 7.4 V pack is 718 of 885 —
+    /// and is not rewritten every tick.
+    #[tokio::test(start_paused = true)]
+    async fn goal_pwm_follows_the_battery_when_asked() {
+        let mut params = Params::default();
+        params.bus.battery_voltage_based_pwm_limit = true;
+        let written = goal_pwms_after_first_battery_sample(params).await;
+        assert_eq!(written, vec![duck_control::goal_pwm_for(7.4).unwrap()]);
+        assert_eq!(written, vec![718]);
+    }
+
+    /// Off, the default, writes full duty once: Goal PWM is servo RAM, and a cap from an earlier
+    /// run with the setting on would otherwise outlive the restart that turned it off.
+    #[tokio::test(start_paused = true)]
+    async fn goal_pwm_is_reset_to_full_duty_when_off() {
+        let params = Params::default();
+        assert!(
+            !params.bus.battery_voltage_based_pwm_limit,
+            "off by default"
+        );
+        let written = goal_pwms_after_first_battery_sample(params).await;
+        assert_eq!(written, vec![duck_control::model::GOAL_PWM_MAX]);
+    }
+
     /// `FakeIo` by reference, so a test can read what the loop did to it after the loop ends.
     struct Borrowed<'a, T>(&'a mut T);
     impl<T: RobotIo> RobotIo for Borrowed<'_, T> {
@@ -7499,6 +8323,9 @@ mod tests {
         }
         fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
             self.0.set_gain(kp)
+        }
+        fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+            self.0.set_goal_pwm(pwm)
         }
         fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
             self.0.set_torque(on)
@@ -7940,6 +8767,90 @@ mod tests {
             written.positions, resting,
             "the loop moved the robot instead of holding where it found it"
         );
+    }
+
+    /// `move.source` is how the autonomous brain sees a pad that has taken over, and nothing else
+    /// tells it. So a client that named itself in `hello` must be the name on its twist, on both
+    /// framings of `robot.move`, and an unnamed client must not inherit the previous driver's name.
+    #[tokio::test]
+    async fn a_named_client_is_the_source_of_its_twist() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let s = Arc::new(RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let intents = Arc::new(Intents::new());
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+
+        let hello = proto::Request::call(
+            proto::Id::Number(1),
+            &proto::Call::Hello(proto::HelloParams {
+                api_version: proto::API_VERSION,
+                client: Some("padd".into()),
+            }),
+        );
+        let twist = proto::Call::RobotMove(proto::MoveParams {
+            vx: 0.2,
+            vy: 0.0,
+            vyaw: 0.0,
+        });
+        for line in [
+            serde_json::to_string(&hello).unwrap(),
+            serde_json::to_string(&proto::Request::notify(&twist)).unwrap(),
+        ] {
+            write
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        replies.next_line().await.unwrap().expect("hello answered");
+        // A request after the notification: once it is answered, the notification before it has
+        // been applied too, since one connection is served in order.
+        let request = proto::Request::call(proto::Id::Number(2), &twist);
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let reply: proto::Response =
+            serde_json::from_str(&replies.next_line().await.unwrap().unwrap()).unwrap();
+        assert!(reply.result_as::<proto::IntentResult>().unwrap().accepted);
+        assert_eq!(intents.twist_source().as_deref(), Some("padd"));
+        assert_eq!(intents.snapshot().command.twist, [0.2, 0.0, 0.0]);
+
+        drop(write);
+        served.await.unwrap().unwrap();
+
+        // A second, anonymous connection drives: the name goes with it.
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let served = tokio::spawn(handle(Arc::clone(&s), Arc::clone(&intents), server));
+        let (read, mut write) = client.into_split();
+        let mut replies = tokio::io::BufReader::new(read).lines();
+        write
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        replies.next_line().await.unwrap().expect("move answered");
+        assert_eq!(intents.twist_source(), None);
+        drop(write);
+        served.await.unwrap().unwrap();
+    }
+
+    /// A head target may carry its own smoothing rate; the next one without it goes back to the
+    /// shared rate rather than keeping the last client's.
+    #[test]
+    fn a_head_rate_applies_to_its_own_target_only() {
+        let intents = Intents::new();
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(0.9));
+        assert_eq!(intents.snapshot().head_alpha, Some(0.9));
+        intents.set_head_at([0.0, 0.1, 0.0, 0.0], Some(7.0));
+        assert_eq!(intents.snapshot().head_alpha, Some(1.0), "clamped");
+        intents.set_head([0.0; 4]);
+        assert_eq!(intents.snapshot().head_alpha, None);
     }
 
     /// **The policy-failure contract.** A policy that cannot load must not stop the robot
@@ -9969,6 +10880,9 @@ mod tests {
             fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
                 self.0.set_gain(kp)
             }
+            fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+                self.0.set_goal_pwm(pwm)
+            }
             fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
                 self.0.set_torque(on)
             }
@@ -10367,6 +11281,9 @@ mod tests {
         }
         fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
             self.inner.set_gain(kp)
+        }
+        fn set_goal_pwm(&mut self, pwm: u16) -> duck_control::io::Result<()> {
+            self.inner.set_goal_pwm(pwm)
         }
         fn set_torque(&mut self, on: bool) -> duck_control::io::Result<()> {
             self.inner.set_torque(on)
