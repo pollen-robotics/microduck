@@ -730,8 +730,8 @@ release nobody reverted. Once the robot is moved to a release that sorts older, 
 a `select` or any other install, it counts as known bad like a release the gate rolled back, so
 neither the unattended path nor a later `rollback` puts it back. Moving to a newer release reverts
 nothing and leaves it out, so with `keep_previous = 1`, which prunes the release before it, a
-`rollback` can still land on it. Once reverted, the same prune keeps it as the one older release,
-and `rollback` refuses, as it does after a release the gate rolled back.
+`rollback` can still land on it. Once reverted, prune drops it instead, as it does a release the
+gate rolled back, so the release before it stays the rollback target.
 `updaterd` reads the key through `Config::robotd_config`, both layers, on every decision. Missing,
 unreadable or not a bool reads as off.
 
@@ -770,7 +770,8 @@ unreadable or not a bool reads as off.
     that never answers holds `updaterd` off `/run/updaterd.sock` for the whole timeout — 30s with
     the shipped config — instead of the two seconds a single question took.
 - `keep_previous` (default 1) retained release dirs bound disk usage while
-  always leaving a known-good target to roll back to.
+  always leaving a known-good target to roll back to. A `known_bad` release takes no slot and
+  is removed at the next prune, or it would push out the good release `rollback` needs.
 
 ### 8.1 Minimum-version floor / kill switch
 

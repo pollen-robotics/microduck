@@ -3358,11 +3358,11 @@ async fn rollback_skips_a_release_that_was_stuck_and_reverted_by_hand() {
     );
 }
 
-/// With the shipped `keep_previous = 1`, the release after a reverted `Stuck` one prunes the
-/// release before it and keeps the reverted one as its only older release. `rollback` then
-/// refuses rather than reinstall what someone reverted, as it does after a gate rollback.
+/// With the shipped `keep_previous = 1`, the release after a reverted `Stuck` one keeps the good
+/// release before it, not the reverted one: a known-bad release takes no `keep_previous` slot.
+/// `rollback` then lands on the good one instead of having nothing to land on.
 #[tokio::test]
-async fn rollback_refuses_rather_than_reinstall_a_reverted_stuck_release() {
+async fn rollback_after_a_reverted_stuck_release_lands_on_the_good_one_before_it() {
     let fx = Fixture::new();
     for v in ["1.0.0", "1.1.0", "1.2.0"] {
         fx.publish(v, None);
@@ -3378,8 +3378,32 @@ async fn rollback_refuses_rather_than_reinstall_a_reverted_stuck_release() {
     engine.rollback("daemon").await.unwrap();
     apply_exact(&mut engine, "1.2.0").await.unwrap();
 
-    assert!(engine.rollback("daemon").await.is_err());
-    assert_eq!(fx.live_version().as_deref(), Some("1.2.0"));
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+}
+
+/// The same with the gate doing the revert: with `keep_previous = 1`, the release that was
+/// rolled back does not push the good one out of the store.
+#[tokio::test]
+async fn rollback_after_a_gate_rollback_lands_on_the_good_release_with_keep_previous_1() {
+    let fx = Fixture::new();
+    for v in ["1.0.0", "1.1.0", "1.2.0"] {
+        fx.publish(v, None);
+    }
+    let keep = "keep_previous = 1";
+    let mut engine = fx.engine(Box::new(FakeRobot::healthy()), Faults::none(), keep);
+    apply_exact(&mut engine, "1.0.0").await.unwrap();
+
+    let mut sick = fx.engine(Box::new(FakeRobot::unhealthy()), Faults::none(), keep);
+    let result = apply_exact(&mut sick, "1.1.0").await.unwrap();
+    assert!(
+        matches!(result, ApplyResult::RolledBack { .. }),
+        "{result:?}"
+    );
+    apply_exact(&mut engine, "1.2.0").await.unwrap();
+
+    engine.rollback("daemon").await.unwrap();
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
 }
 
 /// Moving forward past a `Stuck` release reverts nothing, so it is not known bad: with the shipped
