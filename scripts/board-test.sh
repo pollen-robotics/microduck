@@ -722,6 +722,18 @@ grep -q "1.28.0 satisfies" /tmp/hook3.log
 rm -f /usr/lib/libonnxruntime.version
 echo "    [ok] preinstall reads the version stamp of an OS image"
 
+# An OS image below the floor: the hook names the OS update rather than trying a download.
+echo 1.20.1 > /usr/lib/libonnxruntime.version
+code=0
+PATH="/stubfail:$PATH" /tmp/preinstall > /tmp/hook4.log 2>&1 || code=$?
+test "$code" -ne 0 || { echo "    [FAIL] hook passed an image below the floor"; exit 1; }
+grep -q "Update the OS image" /tmp/hook4.log
+if grep -q "fetching ONNX Runtime" /tmp/hook4.log; then
+    echo "    [FAIL] hook tried to download onto an OS image"; exit 1
+fi
+rm -f /usr/lib/libonnxruntime.version
+echo "    [ok] preinstall refuses an OS image below the floor, naming the OS update"
+
 # ── installing a real artifact: scripts/install.sh and hooks/postinstall ──
 #
 # The gap docs/project/install-path-gap.md option B names. Everything above drives the engine, which

@@ -48,7 +48,7 @@ die() { printf 'preinstall: %s\n' "$*" >&2; exit 1; }
 # what we are trying to avoid doing unsafely.
 installed_onnx() {
     if [ -r "$ONNX_STAMP" ]; then
-        tr -d ' \n' < "$ONNX_STAMP"
+        tr -d '[:space:]' < "$ONNX_STAMP"
         return
     fi
     resolved="$(readlink -f "${ONNX_LIB_DIR}/libonnxruntime.so" 2>/dev/null || true)"
@@ -128,7 +128,7 @@ install_onnx() {
     elif [ -x /usr/sbin/ldconfig ]; then
         /usr/sbin/ldconfig
     else
-        say "no ldconfig; robotd may need ORT_DYLIB_PATH=${ONNX_LIB_DIR}/libonnxruntime.so"
+        say "no ldconfig; robotd and mediad may need ORT_DYLIB_PATH=${ONNX_LIB_DIR}/libonnxruntime.so.1"
     fi
 }
 
@@ -224,6 +224,13 @@ if at_least "$have" "$ONNX_FLOOR"; then
     say "ONNX Runtime ${have} satisfies >= ${ONNX_FLOOR}"
 else
     say "ONNX Runtime ${have:-absent} is below ${ONNX_FLOOR}, which this release requires"
+
+    # On an OS image the runtime belongs to the image: a copy here would not change the stamp
+    # this check reads, and the image has no curl to fetch one.
+    [ ! -r "$ONNX_STAMP" ] \
+        || die "this OS image ships ONNX Runtime ${have}, below the ${ONNX_FLOOR} this release needs.
+  Update the OS image first, then this release."
+
     install_onnx
 
     # Verified rather than assumed: an install that reported success but left the symlink wrong

@@ -565,7 +565,9 @@ then cannot walk — which is why health reports the searched path.
 `ort`'s default bare `libonnxruntime.so`, which is a development symlink an OS image does not
 ship. On an OS image the runtime is a package, and `/usr/lib/libonnxruntime.version` names its
 version, as `librknnrt.version` does for the NPU runtime; `hooks/preinstall` reads that first and
-falls back to resolving `/usr/local/lib/libonnxruntime.so` on a board set up by script.
+falls back to resolving `/usr/local/lib/libonnxruntime.so` on a board set up by script. An image
+whose stamp is below the floor is refused with a message naming the OS update, since the hook can
+neither replace the image's package nor download on an image without `curl`.
 
 Not done, and deliberately: pre-binding the ONNX input/output tensors. The current path
 allocates a 61-float vector per inference, ~244 bytes at 50 Hz. Worth measuring on the board
