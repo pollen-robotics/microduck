@@ -202,15 +202,20 @@ impl Store {
         crate::fsutil::fsync_parent(&link)
     }
 
-    /// Delete old releases, keeping the active one, `keep_previous` most recent
-    /// others, and `golden` unconditionally.
+    /// Delete old releases, keeping the active one, the `keep_previous` most recent
+    /// others that are not `known_bad`, and `golden` unconditionally.
     ///
     /// Golden is exempt from the count so the never-brick guarantee doesn't
     /// silently expire as versions accumulate (`docs/design/updater-design.md` §8.2).
+    ///
+    /// A known-bad release is never a rollback target, so it does not take a
+    /// `keep_previous` slot and is removed: kept, it would push out the good release
+    /// `rollback` needs, and with `keep_previous = 1` leave it nothing to land on.
     pub fn prune(
         &self,
         keep_previous: usize,
         golden: Option<&semver::Version>,
+        known_bad: &[semver::Version],
     ) -> Result<Vec<semver::Version>, Error> {
         let active = self.current()?;
         let installed = self.list()?;
@@ -227,7 +232,17 @@ impl Store {
         // plausible rollback targets.
         candidates.sort_by(|a, b| b.cmp(a));
 
-        let doomed: Vec<_> = candidates.into_iter().skip(keep_previous).collect();
+        let mut kept = 0;
+        let doomed: Vec<_> = candidates
+            .into_iter()
+            .filter(|v| {
+                if known_bad.contains(v) || kept >= keep_previous {
+                    return true;
+                }
+                kept += 1;
+                false
+            })
+            .collect();
 
         let mut removed = Vec::new();
         for version in doomed {
@@ -407,7 +422,7 @@ mod tests {
         }
         store.swap_to(&v("1.3.0")).unwrap();
 
-        let removed = store.prune(1, None).unwrap();
+        let removed = store.prune(1, None, &[]).unwrap();
 
         assert_eq!(removed, vec![v("1.1.0"), v("1.0.0")]);
         assert_eq!(store.list().unwrap(), vec![v("1.3.0"), v("1.2.0")]);
@@ -426,11 +441,27 @@ mod tests {
         store.swap_to(&v("1.3.0")).unwrap();
 
         let golden = v("1.0.0");
-        let removed = store.prune(1, Some(&golden)).unwrap();
+        let removed = store.prune(1, Some(&golden), &[]).unwrap();
 
         assert!(!removed.contains(&golden));
         assert!(store.release_dir(&golden).is_dir(), "golden must survive");
         assert_eq!(removed, vec![v("1.1.0")]);
+    }
+
+    /// A known-bad release is removed and does not take a slot, so the good release
+    /// before it survives as the rollback target.
+    #[test]
+    fn prune_skips_known_bad_releases_in_the_count() {
+        let (_dir, store) = scratch();
+        for s in ["1.0.0", "1.1.0", "1.2.0"] {
+            fs::create_dir_all(store.release_dir(&v(s))).unwrap();
+        }
+        store.swap_to(&v("1.2.0")).unwrap();
+
+        let removed = store.prune(1, None, &[v("1.1.0")]).unwrap();
+
+        assert_eq!(removed, vec![v("1.1.0")]);
+        assert_eq!(store.list().unwrap(), vec![v("1.2.0"), v("1.0.0")]);
     }
 
     #[test]
@@ -441,8 +472,8 @@ mod tests {
         }
         store.swap_to(&v("1.2.0")).unwrap();
 
-        store.prune(1, None).unwrap();
-        let second = store.prune(1, None).unwrap();
+        store.prune(1, None, &[]).unwrap();
+        let second = store.prune(1, None, &[]).unwrap();
         assert!(second.is_empty(), "second prune should find nothing");
     }
 

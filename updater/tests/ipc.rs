@@ -1483,3 +1483,72 @@ async fn status_is_not_a_privileged_call() {
     assert!(status.error.is_none(), "{:?}", status.error);
     assert!(status.result.unwrap()["account"].is_null());
 }
+
+/// **With auto-rollback off, a release reverted by hand does not come back unattended.**
+///
+/// The shipped default. A mandatory release fails its gate and stays live as `Stuck`, whose reason
+/// says to run `robotctl update rollback daemon`. Someone does, and the robot is back on the
+/// release that works. The scheduled check must not then put the failed release back, which
+/// `known_bad` already prevents when the gate did the revert.
+#[tokio::test]
+async fn a_release_reverted_by_hand_after_stuck_is_not_reapplied_unattended() {
+    let fx = Harness::new();
+    fx.publish("1.0.0", false);
+    let (engine, healthy) = fx.engine_toggleable();
+    // `engine_with` turned auto-rollback on; the shipped default is the key absent.
+    std::fs::write(fx.root.join("etc/robot/robotd.toml"), "").unwrap();
+    let server = Arc::new(Server::new(engine));
+    let _handle = fx.serve_with(Arc::clone(&server)).await;
+    fx.apply_via_client().await;
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+
+    // 1.1.0 is mandatory and broken.
+    healthy.store(false, Ordering::Relaxed);
+    fx.publish_with("1.1.0", false, |m| {
+        m["min_supported"] = serde_json::json!("1.1.0");
+    });
+    server.check_all_for_test(AutoApply::Mandatory).await;
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.1.0"),
+        "auto-rollback off: the failed release stays live"
+    );
+
+    // The operator does what the `Stuck` reason says. 1.0.0 is healthy.
+    healthy.store(true, Ordering::Relaxed);
+    let mut client = Client::connect(&fx.socket).await;
+    client.hello().await;
+    let response = client
+        .call(
+            method::ROLLBACK,
+            serde_json::json!({ "component": "daemon" }),
+        )
+        .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    assert_eq!(fx.live_version().as_deref(), Some("1.0.0"));
+
+    // 1.1.0 is still broken. Three scheduled checks, as in the auto-rollback-on tests.
+    healthy.store(false, Ordering::Relaxed);
+    for _ in 0..3 {
+        server.check_all_for_test(AutoApply::Mandatory).await;
+    }
+
+    let attempts = fx
+        .journal_entries()
+        .into_iter()
+        .filter(|e| {
+            e["to"] == serde_json::json!("1.1.0")
+                && e["outcome"]["kind"] == serde_json::json!("stuck")
+        })
+        .count();
+    assert_eq!(
+        fx.live_version().as_deref(),
+        Some("1.0.0"),
+        "the scheduler reinstalled a release that failed its gate here and was reverted by hand \
+         ({attempts} stuck attempts on 1.1.0)"
+    );
+    assert_eq!(
+        attempts, 1,
+        "1.1.0 must be attempted once, not on every check"
+    );
+}
