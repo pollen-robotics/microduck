@@ -1289,10 +1289,15 @@ same preflight as an apply: the robot is not moving and nobody is watching it
 remotely, `interrupt_sessions` lifting only the second. The clock check applies
 to `os.apply` alone, since a switch makes no HTTPS request. The work runs as the
 transient unit `microduck-osupdate-apply`, the one the 8090 page starts too, so
-each path sees the other's update as running. `os.apply` gives the lock back once
-the update is under way, so while that unit runs an apply, rollback, select or
-reset answers `BUSY` and the scheduler holds its update: the reboot must not land
-in the middle of a swap either.
+each path sees the other's update as running. `os.apply` gives the engine lock
+back once the update is under way; what keeps the reboot out of a swap from then
+on is the script, which holds `/var/lib/robot/updater/update.lock` with `flock` from
+its checks until it asks for the reboot, so an install, rollback, select or reset
+from any path answers `BUSY`, and an OS update finds a running swap the same way.
+It must stay a `flock`: an `fcntl` lock does not conflict with one. On top of
+that, `updaterd` asks systemd whether that unit is running before a swap, so the
+refusal says an OS update is the reason and the scheduler holds its update
+until the next check rather than logging a failure.
 
 `os.apply` answers once the phase is past the script's checks, so a refusal the
 script makes at once — the build is already running, the channel has no
