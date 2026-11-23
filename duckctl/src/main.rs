@@ -743,12 +743,21 @@ fn remember(name: &str, address: &str) {
 /// Nothing answering is the case this exists to fall through: the robot moved, is off, or this
 /// laptop is on another network. The scan then runs exactly as it would have, and records the new
 /// address.
+///
+/// **A refusal is somebody there saying no**, not an empty address: on a shipping image it is
+/// usually the robot itself, which answers ssh on its USB-C link only, so it is not reported as a
+/// robot that moved. It still falls through to the scan — a refusal cannot tell the robot from
+/// another machine that took its lease — and the scan says which.
 fn recall_reachable(target: &Target) -> Option<(Ipv4Addr, String)> {
     let contents = std::fs::read_to_string(remembered_path()?).ok()?;
     let (address, name) = recall(&contents, target.wanted())?;
     let socket = std::net::SocketAddr::from((address, 22));
     match std::net::TcpStream::connect_timeout(&socket, REMEMBERED_PROBE) {
         Ok(_) => Some((address, name)),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            eprintln!("{address} refused ssh; scanning to check it is still {name}");
+            None
+        }
         Err(_) => {
             eprintln!("{name} is no longer at {address}; scanning instead");
             None
