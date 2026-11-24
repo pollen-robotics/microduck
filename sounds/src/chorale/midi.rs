@@ -23,7 +23,8 @@
 //!
 //! A single polyphonic track — one piano staff with chords in it, which is what "export MIDI"
 //! gives you from a lot of tools — is split by pitch rank within each chord. Crude and better
-//! than refusing: the lowest note of each chord is the bass line.
+//! than refusing: the lowest note of each chord is the bass line. If a chord has more than four
+//! notes, the importer keeps the lowest four and reports each higher note with its MIDI tick.
 //!
 //! ## What is deliberately dropped
 //!
@@ -267,7 +268,7 @@ pub fn parse(bytes: &[u8]) -> Result<Import, MidiError> {
         return Err(MidiError::NoNotes);
     }
     let bpm = 60_000_000.0 / micros_per_beat.max(1.0);
-    let (notes, casting, mut assign_dropped) = assign(&mut raws, &names, ticks_per_beat);
+    let (notes, casting, mut assign_dropped) = assign(raws, &names, ticks_per_beat);
     dropped.append(&mut assign_dropped);
 
     Ok(Import {
@@ -305,7 +306,7 @@ fn push(
 
 /// Turn raw note groups into four parts. See the module docs for why by pitch and not by order.
 fn assign(
-    raws: &mut [Raw],
+    mut raws: Vec<Raw>,
     names: &[String],
     ticks_per_beat: f64,
 ) -> (Vec<Note>, Vec<(Part, String)>, Vec<String>) {
@@ -314,7 +315,7 @@ fn assign(
 
     // One group with chords in it is a piano staff: split it by pitch rank per chord.
     if group_count == 1 {
-        split_by_rank(raws);
+        split_by_rank(&mut raws, &mut dropped);
     }
     let group_count = raws.iter().map(|r| r.group).max().unwrap_or(0) + 1;
 
@@ -397,18 +398,18 @@ fn assign(
 /// Crude — a real voice-splitter follows lines across time rather than ranking each chord
 /// independently — and it turns a piano-staff export into something singable, which is the whole
 /// bar it has to clear.
-fn split_by_rank(raws: &mut [Raw]) {
-    let mut onsets: Vec<u64> = raws.iter().map(|r| r.start_tick).collect();
-    onsets.sort_unstable();
-    onsets.dedup();
-    for onset in onsets {
-        let mut together: Vec<usize> = (0..raws.len())
-            .filter(|i| raws[*i].start_tick == onset)
-            .collect();
-        together.sort_by_key(|i| raws[*i].midi);
-        for (rank, index) in together.into_iter().enumerate() {
-            raws[index].group = rank.min(3);
+fn split_by_rank(raws: &mut Vec<Raw>, dropped: &mut Vec<String>) {
+    raws.sort_by_key(|note| (note.start_tick, note.midi));
+    for chord in raws.chunk_by_mut(|a, b| a.start_tick == b.start_tick) {
+        for (rank, note) in chord.iter_mut().enumerate() {
+            note.group = rank;
         }
+    }
+    for note in raws.extract_if(.., |note| note.group >= Part::ALL.len()) {
+        dropped.push(format!(
+            "MIDI note {} at tick {} (chord exceeds four parts)",
+            note.midi, note.start_tick
+        ));
     }
 }
 
@@ -701,6 +702,40 @@ mod tests {
         let soprano: Vec<&Note> = import.score.line(Part::Soprano).collect();
         assert_eq!(soprano.len(), 1);
         assert_eq!(soprano[0].beats, 2.0);
+    }
+
+    /// Folding a fifth chord tone into the soprano gave one duck two pitches at the same onset.
+    #[test]
+    fn a_fifth_chord_note_is_dropped_and_reported_at_its_onset() {
+        let bytes = Builder::new()
+            .track(
+                None,
+                0,
+                &[
+                    (0, 480, 76, 80),
+                    (0, 480, 79, 80),
+                    (0, 480, 84, 80),
+                    (0, 480, 88, 80),
+                    (480, 480, 72, 80),
+                    (480, 480, 55, 80),
+                    (480, 480, 64, 80),
+                    (480, 480, 48, 80),
+                    (480, 480, 60, 80),
+                ],
+            )
+            .build();
+        let import = parse(&bytes).expect("parses");
+        for (part, pitches) in Part::ALL
+            .into_iter()
+            .zip([[76, 48], [79, 55], [84, 60], [88, 64]])
+        {
+            let line: Vec<_> = import.score.line(part).map(|note| note.midi).collect();
+            assert_eq!(line, pitches, "{part:?}");
+        }
+        assert_eq!(
+            import.dropped,
+            ["MIDI note 72 at tick 480 (chord exceeds four parts)"]
+        );
     }
 
     /// Ticks become beats through the file's own division, and velocity becomes the dynamic.
