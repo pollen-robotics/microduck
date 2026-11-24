@@ -38,6 +38,16 @@
 //! and then debounced for a few ticks, because one noisy sample must not cost the robot
 //! its gains mid-stride.
 //!
+//! # Armed only from standing
+//!
+//! A fall is something that happens to a robot that was up. So the predictor only fires once
+//! it has seen the robot inside the tilt gate for `arm`, and disarms when it fires or when the
+//! caller resets it. Without that, a robot lying on its front at about 58° — which is what the
+//! limp-fall pose leaves after a fall forwards, a hair inside `fall_gravity_z`, so not
+//! `fallen` — sagging slowly as the policy takes it is tilted, tipping and predicted past the
+//! threshold: a fall, by every other test. It limped, posed, handed back and limped again, a
+//! loop that only broke when the fall verdict happened to latch (seen on a robot, 2026-10-27).
+//!
 //! # The tuning is the whole feature
 //!
 //! Too early and the robot limps out of leans it would have walked off — every false
@@ -65,6 +75,8 @@ pub struct FallPredictorConfig {
     pub lookahead: Duration,
     /// How long the verdict must hold before it fires.
     pub debounce: Duration,
+    /// How long the robot must be inside `tilt_z` — standing — before a fall can fire.
+    pub arm: Duration,
 }
 
 impl Default for FallPredictorConfig {
@@ -74,6 +86,7 @@ impl Default for FallPredictorConfig {
             predicted_z: -0.5,
             lookahead: Duration::from_millis(300),
             debounce: Duration::from_millis(60),
+            arm: Duration::from_millis(200),
         }
     }
 }
@@ -81,16 +94,18 @@ impl Default for FallPredictorConfig {
 /// Watches the IMU for a fall that has started but not landed.
 ///
 /// Edge-triggered: [`Self::observe`] returns `true` on the tick the debounce completes and
-/// then stays `false` until the robot stops looking like it is falling. The caller owns
-/// what to do about it and how long to keep doing it — this only reports the moment.
+/// then stays `false` until the robot has stood again for `arm`. The caller owns what to do
+/// about it and how long to keep doing it — this only reports the moment.
 #[derive(Debug, Clone)]
 pub struct FallPredictor {
     config: FallPredictorConfig,
     /// How long the three conditions have held together. Any tick that fails one resets it.
     falling_for: Duration,
-    /// Whether the trigger has already been handed out for this fall, so a caller polling
-    /// every tick gets one edge rather than a stream of them.
-    fired: bool,
+    /// How long the robot has been inside the tilt gate, uninterrupted.
+    upright_for: Duration,
+    /// Whether a fall can fire: the robot has stood for `arm` since the last trigger or
+    /// reset. Firing disarms, so a caller polling every tick gets one edge per fall.
+    armed: bool,
 }
 
 impl FallPredictor {
@@ -98,7 +113,8 @@ impl FallPredictor {
         Self {
             config,
             falling_for: Duration::ZERO,
-            fired: false,
+            upright_for: Duration::ZERO,
+            armed: false,
         }
     }
 
@@ -118,33 +134,41 @@ impl FallPredictor {
 
     /// One tick. `true` exactly once per fall, when the debounce completes.
     pub fn observe(&mut self, imu: &ImuData, dt: Duration) -> bool {
+        if imu.gravity[2] <= self.config.tilt_z {
+            self.upright_for = self.upright_for.saturating_add(dt);
+            if self.upright_for >= self.config.arm {
+                self.armed = true;
+            }
+        } else {
+            self.upright_for = Duration::ZERO;
+        }
+
         let rate = Self::gravity_z_rate(imu);
         let going_down = imu.gravity[2] > self.config.tilt_z
             && rate > 0.0
             && self.predicted_z(imu) > self.config.predicted_z;
 
-        if !going_down {
+        if !going_down || !self.armed {
             self.falling_for = Duration::ZERO;
-            // Re-arm only once the robot stops looking like it is falling, so the caller
-            // that limped is not handed a second trigger while the first one is still
-            // playing out on the way down.
-            self.fired = false;
             return false;
         }
 
         self.falling_for = self.falling_for.saturating_add(dt);
-        if self.falling_for >= self.config.debounce && !self.fired {
-            self.fired = true;
+        if self.falling_for >= self.config.debounce {
+            self.armed = false;
+            self.falling_for = Duration::ZERO;
             return true;
         }
         false
     }
 
     /// Forget the accumulated verdict — the caller has taken charge (it is limping, or the
-    /// policy stopped driving), so the next fall must be detected from scratch.
+    /// policy stopped driving), so the next fall must be detected from scratch, from a robot
+    /// seen standing again.
     pub fn reset(&mut self) {
         self.falling_for = Duration::ZERO;
-        self.fired = false;
+        self.upright_for = Duration::ZERO;
+        self.armed = false;
     }
 }
 
@@ -163,6 +187,16 @@ mod tests {
         }
     }
 
+    /// A predictor that has watched the robot stand for longer than `arm` — the state every
+    /// fall starts from.
+    fn standing() -> FallPredictor {
+        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        for _ in 0..10 {
+            assert!(!p.observe(&tipping(0.0, 0.0), DT));
+        }
+        p
+    }
+
     /// The derivative has to be the real one, or every threshold above it is guesswork.
     /// Pitching forward at 1 rad/s from 30° must raise gravity z at sin(30°) = 0.5 per
     /// second — the analytic value, not something close to it.
@@ -176,7 +210,7 @@ mod tests {
     /// a fall, whatever the magnitude of the rate.
     #[test]
     fn recovering_from_a_lean_never_fires() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let mut p = standing();
         // Well past the tilt gate, rotating back towards upright, fast.
         for _ in 0..50 {
             assert!(!p.observe(&tipping(0.9, -4.0), DT));
@@ -187,7 +221,7 @@ mod tests {
     /// it. This is the false positive that matters — it happens every step.
     #[test]
     fn a_footfall_on_an_upright_robot_never_fires() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let mut p = standing();
         for _ in 0..10 {
             // 8° of lean, 3 rad/s of impulse. The tilt gate is what refuses this.
             assert!(!p.observe(&tipping(0.14, 3.0), DT));
@@ -198,7 +232,7 @@ mod tests {
     /// floor. It must fire, and it must fire *once*.
     #[test]
     fn a_fall_fires_once_after_the_debounce() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let mut p = standing();
         let falling = tipping(0.6, 3.0);
         // 34° of tilt clears the -0.90 gate; the extrapolation clears -0.5.
         assert!(falling.gravity[2] > -0.90);
@@ -218,7 +252,7 @@ mod tests {
     /// belongs to `Safety`, on its own thresholds.
     #[test]
     fn a_static_tilt_is_not_a_fall() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let mut p = standing();
         for _ in 0..50 {
             assert!(!p.observe(&tipping(1.2, 0.0), DT));
         }
@@ -229,7 +263,7 @@ mod tests {
     /// limping here would *cause* the fall it is predicting.
     #[test]
     fn a_slow_lean_waits() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let mut p = standing();
         // 26° and 0.3 rad/s: predicted z is about -0.86, nowhere near the -0.5 floor.
         let leaning = tipping(0.46, 0.3);
         assert!(leaning.gravity[2] > -0.90, "past the tilt gate");
@@ -238,35 +272,93 @@ mod tests {
         }
     }
 
-    /// The trigger re-arms only after the robot stops looking like it is falling, so a
-    /// second fall is caught but the tail of the first one is not re-reported.
+    /// The trigger re-arms only once the robot has stood again for `arm`, so a second fall
+    /// is caught but the tail of the first one is not re-reported.
     #[test]
-    fn it_rearms_when_the_fall_stops() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+    fn it_rearms_once_the_robot_has_stood_again() {
+        let mut p = standing();
         let falling = tipping(0.6, 3.0);
         for _ in 0..3 {
             p.observe(&falling, DT);
         }
         assert!(!p.observe(&falling, DT), "already fired");
-        // Upright and still: the verdict clears.
+        // One upright tick is a swing through vertical, not standing: still disarmed.
         assert!(!p.observe(&tipping(0.0, 0.0), DT));
-        // And a fresh fall fires again, after its own debounce.
+        for _ in 0..5 {
+            assert!(
+                !p.observe(&falling, DT),
+                "not re-armed by a single upright tick"
+            );
+        }
+        // Standing for `arm`: a fresh fall fires again, after its own debounce.
+        for _ in 0..10 {
+            assert!(!p.observe(&tipping(0.0, 0.0), DT));
+        }
         assert!(!p.observe(&falling, DT));
         assert!(!p.observe(&falling, DT));
         assert!(p.observe(&falling, DT));
     }
 
-    /// `reset` drops a debounce in progress: the caller took charge, so the next fall is
-    /// detected from scratch rather than completing a count from before.
+    /// `reset` drops a debounce in progress and disarms: the caller took charge, so the next
+    /// fall is detected from scratch, from a robot seen standing again.
     #[test]
-    fn reset_drops_a_debounce_in_progress() {
-        let mut p = FallPredictor::new(FallPredictorConfig::default());
+    fn reset_drops_a_debounce_in_progress_and_disarms() {
+        let mut p = standing();
         let falling = tipping(0.6, 3.0);
         p.observe(&falling, DT);
         p.observe(&falling, DT);
         p.reset();
+        for _ in 0..10 {
+            assert!(!p.observe(&falling, DT), "disarmed until the robot stands");
+        }
+        for _ in 0..10 {
+            p.observe(&tipping(0.0, 0.0), DT);
+        }
         assert!(!p.observe(&falling, DT), "the count restarted");
         assert!(!p.observe(&falling, DT));
         assert!(p.observe(&falling, DT));
+    }
+
+    /// The loop seen on a robot (2026-10-27): after a fall forwards the limp-fall pose leaves
+    /// it lying on its front at gravity z ≈ -0.52 — not `fallen` — and handed back, it sags
+    /// at +0.2..0.4 /s. Tilted, tipping, predicted past -0.5: a fall by every other test, so
+    /// it limped, posed and limped again. A robot that has not stood since must not fire.
+    #[test]
+    fn a_robot_that_has_not_stood_never_fires() {
+        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let sagging = ImuData {
+            gyro: [0.0, 0.35, 0.0],
+            gravity: [0.854, 0.0, -0.52],
+            ..ImuData::default()
+        };
+        assert!(sagging.gravity[2] > -0.90, "past the tilt gate");
+        assert!(FallPredictor::gravity_z_rate(&sagging) > 0.0, "tipping");
+        assert!(
+            p.predicted_z(&sagging) > -0.5,
+            "predicted past the fall threshold"
+        );
+        for _ in 0..100 {
+            assert!(!p.observe(&sagging, DT));
+        }
+        // Same after the hand-back's reset, with the robot never having stood.
+        p.reset();
+        for _ in 0..100 {
+            assert!(!p.observe(&sagging, DT));
+        }
+    }
+
+    /// Arming needs `arm` of *uninterrupted* standing: a rocking stand-up that passes through
+    /// vertical for a tick at a time does not arm it.
+    #[test]
+    fn brief_upright_ticks_do_not_arm() {
+        let mut p = FallPredictor::new(FallPredictorConfig::default());
+        let falling = tipping(0.6, 3.0);
+        for _ in 0..20 {
+            p.observe(&tipping(0.0, 0.0), DT);
+            p.observe(&tipping(0.6, -1.0), DT);
+        }
+        for _ in 0..10 {
+            assert!(!p.observe(&falling, DT));
+        }
     }
 }

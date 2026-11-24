@@ -34,7 +34,9 @@ state_dir = "/var/lib/robot/updater"
 # crashed, or not yet installed (architecture.md §1.1).
 robot_socket = "/run/robotd.sock"
 
-# Accept artifacts signed with a dev-only key. Never true on a client robot.
+# Accept artifacts signed with a dev-only key. Never true on a client robot. Not the usual way to
+# make a dev board: `robotctl configure --allow-dev-daemon on` writes a marker in state_dir
+# instead, which an A/B OS update does not replace (updater-design.md §5.4). Either turns it on.
 allow_dev_keys = false
 
 # Permit `updaterd --inject-fault ...`. Never true on a client robot: it lets the
@@ -116,8 +118,8 @@ manifest_asset = "manifest.json"
 # Separate from tag_prefix because the two streams must never be confusable: a dev tag
 # *moves* (it points at whatever that branch last built) while a release tag is immutable,
 # and `latest` for the fleet must never consider a dev tag. Installing one also requires
-# allow_dev_keys and the dev public key, so a client robot cannot take a branch build even
-# if it somehow resolved the tag.
+# a dev board (`robotctl configure --allow-dev-daemon on`), so a client robot cannot take a branch
+# build even if it somehow resolved the tag.
 # ref_tag_prefix = "daemon-dev-"
 
 # NOTE the omissions here. `updaterd` restarts NEITHER itself NOR `btd`, even though

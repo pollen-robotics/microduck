@@ -41,6 +41,7 @@ pub mod ipc;
 pub mod journal;
 pub mod manifest;
 pub mod orphan;
+pub mod os;
 pub mod policy;
 pub mod preflight;
 pub mod reconcile;
@@ -51,6 +52,7 @@ pub mod robot;
 pub mod source;
 mod spawn;
 pub mod store;
+pub mod telemetry;
 pub mod transcript;
 /// Names to numbers, for the two lookups this crate makes against the user database.
 pub mod unix;
@@ -143,6 +145,18 @@ pub enum Error {
     )]
     AlreadySignedIn(String),
 
+    /// `policy.fetch` from a repo outside `pollen-robotics` on a robot that has not opted in.
+    ///
+    /// The message is the remedy, because the person who meets it is usually holding a phone or
+    /// a command line and has just picked something from `policy search`.
+    #[error(
+        "{0} is a community policy, and this robot only fetches policies from {org}. To allow \
+         community policies, set `allow_community = true` under `[policy]`:\n  sudo robotctl \
+         configure",
+        org = crate::policy::OFFICIAL_ORG
+    )]
+    CommunityPoliciesOff(String),
+
     #[error("config error: {0}")]
     Config(String),
 
@@ -184,6 +198,10 @@ pub enum Error {
 
     #[error("preflight check failed: {0}")]
     Preflight(String),
+
+    /// The only check that failed was the remote-session one: a WebRTC peer would be dropped.
+    #[error("{0}")]
+    SessionsConnected(String),
 
     #[error("hook {hook} failed: {detail}")]
     Hook { hook: String, detail: String },
@@ -276,6 +294,7 @@ impl Error {
             // The request is well-formed and refused because of what it did not say, which is
             // what `INVALID_PARAMS` is: passing `force` is the fix, and it is a parameter.
             Error::AlreadySignedIn(_) => code::INVALID_PARAMS,
+            Error::CommunityPoliciesOff(_) => code::PERMISSION_DENIED,
             Error::Network(_) => code::NETWORK,
             // Shares the network code rather than adding one, for the reason `StagingBehind`
             // shares the downgrade code above — with a second reason here. To a client this is
@@ -293,6 +312,7 @@ impl Error {
             Error::WouldOrphanUnit(_) => code::INCOMPATIBLE,
             Error::ArchiveTooLarge(_) => code::ARCHIVE_TOO_LARGE,
             Error::Preflight(_) => code::PREFLIGHT_FAILED,
+            Error::SessionsConnected(_) => code::SESSIONS_CONNECTED,
             Error::Hook { .. } => code::HOOK_FAILED,
             Error::Health(_) => code::HEALTH_CHECK_FAILED,
             // Shares the health code rather than adding one: to a client this is the same class of

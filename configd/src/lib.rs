@@ -37,3 +37,5 @@ pub mod pad;
 pub mod power;
 pub mod store;
 pub mod units;
+/// ssh on wifi for 30 minutes from the face button.
+pub mod wifi_ssh;

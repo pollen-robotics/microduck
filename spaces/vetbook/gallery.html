@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{ title }}</title>
+<meta name="description" content="{{ description }}">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{{ title }}">
+<meta property="og:description" content="{{ description }}">
+<meta property="og:url" content="{{ url }}">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🦆</text></svg>">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mochiy+Pop+One&family=Zen+Maru+Gothic:wght@500;700&display=swap">
+<style>
+:root {
+  --bg: #fff3f7; --ink: #4a3a5e; --soft: #8e7aa8; --pink: #ff5c9a; --pink-d: #e0558c;
+  --lav: #9b7bff; --mint: #5cc9a7; --card: #ffffff; --line: #f1d6e4; --field: #ffffff;
+  --display: "Mochiy Pop One", "Zen Maru Gothic", system-ui, sans-serif;
+  --body: "Zen Maru Gothic", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #221a2e; --ink: #f4ecff; --soft: #b9a8d4; --card: #2e2440; --line: #44365a; --field: #2e2440; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 500 17px/1.6 var(--body);
+  background-image: radial-gradient(color-mix(in srgb, var(--pink) 18%, transparent) 2px, transparent 2.5px); background-size: 28px 28px; }
+main { max-width: 1180px; margin: 0 auto; padding-inline: 16px; padding-block: 36px 64px; display: grid; gap: 22px; }
+h1 { font: 400 clamp(28px, 5vw, 44px)/1.15 var(--display); margin: 0; text-wrap: balance; display: flex; align-items: center; gap: 14px; }
+h1 img { width: 72px; height: auto; flex: none; }
+h1 span { color: var(--pink); }
+.lede { margin: 6px 0 0; color: var(--soft); max-width: 70ch; }
+code { font-size: .95em; background: var(--card); padding: 1px 6px; border-radius: 6px; }
+
+.controls { display: grid; gap: 12px; background: var(--card); border-radius: 22px; padding: 16px; box-shadow: 0 0 0 4px var(--line); }
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+input[type=search], select { font: 500 16px var(--body); color: var(--ink); background: var(--field); border: 2px solid var(--line);
+  border-radius: 99px; padding: 9px 16px; min-width: 0; }
+input[type=search] { flex: 1 1 240px; }
+input[type=search]:focus-visible, select:focus-visible, .chip:focus-visible, a:focus-visible { outline: 3px solid var(--pink); outline-offset: 2px; }
+label.inline { display: inline-flex; gap: 8px; align-items: center; color: var(--soft); font-size: 15px; }
+.chip { font: 700 14px var(--body); color: var(--ink); background: transparent; border: 2px solid var(--line); border-radius: 99px;
+  padding: 4px 12px; cursor: pointer; }
+.chip[aria-pressed=true] { background: var(--pink); border-color: var(--pink); color: #fff; }
+.chip .n { opacity: .7; font-weight: 500; }
+.count { color: var(--soft); font-size: 15px; margin: 0; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 380px), 1fr)); gap: 22px; list-style: none; padding: 0; margin: 0; }
+.duck { position: relative; background: var(--card); border-radius: 22px; overflow: hidden; display: grid;
+  box-shadow: 0 10px 28px #b04a8a22, 0 0 0 4px var(--line); transition: transform .15s; }
+.duck:hover { transform: translateY(-3px); }
+.shot { display: block; width: 100%; height: auto; aspect-ratio: 1200 / 630; background: var(--line); }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 12px 16px 14px; }
+.who { display: grid; gap: 2px; margin-right: auto; min-width: 0; }
+.duck h2 { font: 400 20px/1.2 var(--display); margin: 0; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+/* The whole tile opens the duck's page; the owner's link sits above it. */
+.duck h2 a { color: inherit; text-decoration: none; }
+.duck h2 a::after { content: ""; position: absolute; inset: 0; }
+.mood { font: 700 12px var(--body); color: #fff; background: var(--ink-mood); border-radius: 99px; padding: 1px 9px; }
+.owner { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 8px; color: var(--soft);
+  font-size: 14px; text-decoration: none; justify-self: start; }
+.owner:hover { color: var(--pink); }
+.owner img, .owner .ph { width: 22px; height: 22px; border-radius: 50%; background: var(--line); flex: none; object-fit: cover; }
+.stat { text-align: right; display: grid; }
+.stat b { font: 400 20px/1.1 var(--display); color: var(--pink); }
+.stat span { color: var(--soft); font-size: 12px; }
+.empty { background: var(--card); border-radius: 22px; padding: 32px; text-align: center; box-shadow: 0 0 0 6px var(--line); }
+.empty img { width: min(220px, 60%); height: auto; }
+footer { color: var(--soft); font-size: 14px; }
+footer a { color: inherit; }
+@media (prefers-reduced-motion: reduce) { .duck, .duck:hover { transition: none; transform: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><img src="/sticker.webp" alt="">Microduck <span>vet books</span></h1>
+    <p class="lede">Every microduck keeps a vet book: hours awake, distance walked, cuddles, falls and every servo it has
+      been through. These are the ducks whose owners chose to show theirs. On yours, <code>robotctl vetbook</code> and
+      <kbd>s</kbd> shares it — say yes to the gallery and it shows up here.</p>
+  </header>
+
+  {% if ducks %}
+  <section class="controls" aria-label="Find a duck">
+    <div class="row">
+      <input type="search" id="q" placeholder="Search a duck or an owner…" aria-label="Search by duck name or owner" autocomplete="off">
+      <label class="inline">Sort by
+        <select id="sort">
+          <option value="shared_at">Latest share</option>
+          <option value="distance_m">Distance walked</option>
+          <option value="awake_h">Time awake</option>
+          <option value="cuddles">Cuddles</option>
+          <option value="pets">Pets</option>
+          <option value="falls">Falls</option>
+          <option value="songs">Songs sung</option>
+          <option value="spins">Spins</option>
+          <option value="tricks">Tricks known</option>
+          <option value="top_speed_kmh">Top speed</option>
+          <option value="photos">Photos taken</option>
+          <option value="servos_replaced">Servos replaced</option>
+          <option value="age_days">Age</option>
+          <option value="name">Name</option>
+        </select>
+      </label>
+      <label class="inline">Badge
+        <select id="badge"><option value="">Any</option></select>
+      </label>
+    </div>
+    <div class="row" id="moods" role="group" aria-label="Filter by mood"></div>
+  </section>
+  <p class="count" id="count" aria-live="polite"></p>
+  <ul class="grid" id="grid"></ul>
+  {% else %}
+  <div class="empty"><img src="/sticker.webp" alt="A microduck head">
+    <p>No duck in the gallery yet. Be the first: on a microduck signed in to Hugging Face, open <code>robotctl vetbook</code>,
+      press <kbd>s</kbd> and say yes to the gallery.</p></div>
+  {% endif %}
+
+  <footer>Every book here is a public dataset on its owner's Hugging Face account. Sharing again without listing takes a duck back out.</footer>
+</main>
+{% if ducks %}
+<script>
+  const DUCKS = {{ ducks|tojson }};
+  const $ = id => document.getElementById(id);
+  const q = $("q"), sort = $("sort"), badge = $("badge"), moods = $("moods"), grid = $("grid"), count = $("count");
+  const selected = new Set();
+
+  const el = (tag, props = {}, ...kids) => {
+    const n = Object.assign(document.createElement(tag), props);
+    for (const k of kids) if (k != null) n.append(k);
+    return n;
+  };
+  const fmt = n => n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(Math.round(n));
+
+  // The number being sorted on, under the card, so a sorted gallery says why it is in that order.
+  const SHOWN = {
+    distance_m: ["walked", d => d.walked], awake_h: ["awake", d => d.awake],
+    cuddles: ["cuddles", d => fmt(d.stats.cuddles)], falls: ["oopsie falls", d => fmt(d.stats.falls)],
+    pets: ["pets", d => fmt(d.stats.pets)], songs: ["songs", d => fmt(d.stats.songs)],
+    spins: ["spins", d => fmt(d.stats.spins)], tricks: ["tricks", d => fmt(d.stats.tricks)],
+    top_speed_kmh: ["top speed", d => d.stats.top_speed_kmh.toFixed(1) + " km/h"],
+    photos: ["photos", d => fmt(d.stats.photos)], servos_replaced: ["new servos", d => fmt(d.stats.servos_replaced)],
+    age_days: ["days old", d => fmt(d.stats.age_days)],
+  };
+
+  // Mood chips and the badge list, from what the ducks actually have.
+  const tally = (pick) => { const m = new Map(); for (const d of DUCKS) for (const [k, v] of pick(d)) m.set(k, [v, (m.get(k)?.[1] || 0) + 1]); return m; };
+  for (const [key, [title, n]] of tally(d => [[d.mood, d.mood_title]])) {
+    const chip = el("button", { type: "button", className: "chip", value: key }, title + " ", el("span", { className: "n", textContent: n }));
+    chip.setAttribute("aria-pressed", "false");
+    chip.addEventListener("click", () => {
+      selected.has(key) ? selected.delete(key) : selected.add(key);
+      chip.setAttribute("aria-pressed", String(selected.has(key)));
+      draw();
+    });
+    moods.append(chip);
+  }
+  const badgeNames = tally(d => d.badges.map(b => [b.key, b.glyph + " " + b.name]));
+  for (const [key, [name, n]] of [...badgeNames].sort((a, b) => a[1][0].localeCompare(b[1][0])))
+    badge.append(el("option", { value: key, textContent: `${name} (${n})` }));
+
+  // The filters live in the address, so a filtered gallery is a link too.
+  const params = new URLSearchParams(location.search);
+  q.value = params.get("q") || "";
+  if ([...sort.options].some(o => o.value === params.get("sort"))) sort.value = params.get("sort");
+  if (badgeNames.has(params.get("badge"))) badge.value = params.get("badge");
+  for (const m of (params.get("mood") || "").split(",").filter(Boolean)) {
+    const chip = moods.querySelector(`[value="${CSS.escape(m)}"]`);
+    if (chip) { selected.add(m); chip.setAttribute("aria-pressed", "true"); }
+  }
+
+  function tile(d) {
+    const page = `/d/${encodeURIComponent(d.user)}/${encodeURIComponent(d.duck)}`;
+    const mood = el("span", { className: "mood", textContent: d.mood_title });
+    mood.style.setProperty("--ink-mood", d.mood_ink);
+    const owner = el("a", { className: "owner", href: `https://huggingface.co/${encodeURIComponent(d.owner)}`, target: "_blank", rel: "noopener" },
+      d.avatar ? el("img", { src: d.avatar, alt: "", loading: "lazy" }) : el("span", { className: "ph" }), "@" + d.owner);
+    const shown = SHOWN[sort.value];
+    const stat = shown && el("div", { className: "stat" }, el("b", { textContent: shown[1](d) }), el("span", { textContent: shown[0] }));
+    return el("li", { className: "duck" },
+      el("img", { className: "shot", src: d.image, alt: `${d.robot}'s vet book card`, width: 1200, height: 630, loading: "lazy", decoding: "async" }),
+      el("div", { className: "meta" },
+        el("div", { className: "who" }, el("h2", {}, el("a", { href: page, textContent: d.robot }), mood), owner),
+        stat));
+  }
+
+  function draw() {
+    const needle = q.value.trim().toLowerCase();
+    const rows = DUCKS.filter(d =>
+      (!needle || d.robot.toLowerCase().includes(needle) || d.duck.includes(needle) || d.owner.toLowerCase().includes(needle)) &&
+      (!selected.size || selected.has(d.mood)) &&
+      (!badge.value || d.badges.some(b => b.key === badge.value)));
+    const key = sort.value;
+    rows.sort(key === "name" ? (a, b) => a.robot.localeCompare(b.robot)
+      : key === "shared_at" ? (a, b) => b.shared_at - a.shared_at
+      : (a, b) => b.stats[key] - a.stats[key]);
+    grid.replaceChildren(...rows.map(tile));
+    count.textContent = rows.length === DUCKS.length
+      ? `${DUCKS.length} duck${DUCKS.length === 1 ? "" : "s"} in the gallery`
+      : `${rows.length} of ${DUCKS.length} ducks`;
+
+    const p = new URLSearchParams();
+    if (q.value.trim()) p.set("q", q.value.trim());
+    if (sort.value !== "shared_at") p.set("sort", sort.value);
+    if (badge.value) p.set("badge", badge.value);
+    if (selected.size) p.set("mood", [...selected].join(","));
+    history.replaceState(null, "", p.size ? "?" + p : location.pathname);
+  }
+  q.addEventListener("input", draw);
+  sort.addEventListener("change", draw);
+  badge.addEventListener("change", draw);
+  draw();
+</script>
+{% endif %}
+</body>
+</html>

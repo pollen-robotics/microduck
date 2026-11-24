@@ -1,0 +1,20 @@
+[package]
+name = "duck-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authenticated local tunnels from the wifi to mediad (video) and btd's lane (the API, Bluetooth's rules)"
+
+[dependencies]
+duck-auth = { path = "../duck-auth" }
+# Only for where `btd`'s lane socket is: one path, defined once.
+duck-ipc-proto = { path = "../duck-ipc-proto" }
+# The robot id in the setup code is its first name, derived from the SoC serial.
+robotd-params = { path = "../robotd-params" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync"] }
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

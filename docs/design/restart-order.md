@@ -7,9 +7,10 @@ three different documents, and the answer decides how a skew is diagnosed.
 Everything here is read from the code, and each step names the function that owns it. Where a
 narrative comment elsewhere disagrees with this page, the comment is the bug.
 
-## 1. The eight daemons, and the unit that is not one
+## 1. The eleven daemons, and the unit that is not one
 
-A release ships eight daemons — `robotd`, `configd`, `btd`, `padd`, `netpadd`, `mediad`, `tofd`, `updaterd` —
+A release ships eleven daemons — `robotd`, `configd`, `btd`, `padd`, `netpadd`, `autod`, `mediad`, `tofd`, `nfcd`,
+`mapd`, `updaterd` —
 each `ExecStart`ing a path under `/opt/robot/daemon/current/bin/`, so each is stale the instant the
 symlink moves, and each is either restarted by the update or restarted after it.
 
@@ -24,8 +25,11 @@ no `[Install]` section, and that is what keeps it out — see §1.1.
 | `configd` | yes | — |
 | `padd` | yes | — |
 | `netpadd` | yes | — |
+| `autod` | yes | — |
 | `mediad` | yes | — |
 | `tofd` | yes | — |
+| `nfcd` | yes | — |
+| `mapd` | yes — it saves the map on the way down | — |
 | `updaterd` | **never** — it is the process performing the update | yes |
 | `btd` | **never** — it may be the transport the update arrived over | yes |
 
@@ -74,7 +78,7 @@ units an update cannot touch are exactly the two it exists to watch.
 On today's release `units_to_restart` is exactly:
 
 ```
-configd, mediad, netpadd, padd, robotd, tofd
+configd, mapd, mediad, nfcd, netpadd, padd, robotd, tofd
 ```
 
 in that order — alphabetical, so the order is identical on every board and in every test. Exactly one of `padd` and `netpadd` runs, chosen by `ExecCondition=` on `[netpad] enabled` — `netpadd/systemd/netpadd.service` says why that and not `Conflicts=` — so the restart order between them does not matter. Nothing
@@ -120,7 +124,7 @@ onto the release carrying it. This cost a confused round of "the hook ran and lo
 | 9 | arm the boot counter (`pending.json`), *before* the swap | no |
 | 10 | swap `current` → `releases/<ver>` | no |
 | 11 | **`hooks/postinstall`** (cwd = `releases/<ver>`) | **starts newly shipped units** |
-| 12 | `on_apply` — `systemctl restart` each unit from §1, one at a time | **configd, mediad, netpadd, padd, robotd, tofd** |
+| 12 | `on_apply` — `systemctl restart` each unit from §1, one at a time | **configd, mapd, mediad, nfcd, netpadd, padd, robotd, tofd** |
 | 13 | `releases/<ver>/bin/updaterd --self-test` | no |
 | 14 | health gate: poll `robotd` over its socket, every 500 ms, up to 30 s | no |
 | 15 | confirm the boot counter, prune old releases | no |
@@ -254,8 +258,8 @@ would leave the robot with no pad and nothing saying so.
 
 ## 4. At boot
 
-systemd starts the daemons from `multi-user.target`, and `robot-boot-check.timer` arms the
-recovery check for 180 seconds in. There is **no ordering between the daemons** beyond `padd` and
+systemd starts the daemons from `multi-user.target`, and `robot-boot-check.timer` starts the
+recovery check a second in. There is **no ordering between the daemons** beyond `padd` and
 `netpadd` after `robotd` (advisory — each exits and retries every 5 s if the socket is absent) and
 `btd` after `dbus`/`bluetooth`. Nothing waits on `updaterd`, and `updaterd` waits on nothing but
 `network-online.target`, which is `Wants` rather than `Requires`.
@@ -310,11 +314,11 @@ A trial only exists if an apply was interrupted between step 9 and step 15 of §
 interruption logs "update still on trial" and the *second* reverts.
 
 **Every step above presupposes an `updaterd` that starts.** One more thing happens at boot for the
-case where none of it runs: `robot-boot-check.timer` fires 180 s in, asks whether `robotd`, `configd`,
+case where none of it runs: from a second in, `robot-boot-check` watches whether `robotd`, `configd`,
 `btd` and `updaterd` came up, and hands over to a `/bin/sh` rescue that swaps `current` to golden and
 reboots if they did not. It is deliberately outside every process on this page —
-[`boot-recovery-net.md`](boot-recovery-net.md) owns it, including why it is a deadline rather than
-`OnFailure=` on these units.
+[`boot-recovery-net.md`](boot-recovery-net.md) owns it, including why it watches rather than relying
+on `OnFailure=` on these units.
 
 ## 5. The startup reconciliation — did the restarts happen?
 

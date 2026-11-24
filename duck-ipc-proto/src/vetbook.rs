@@ -353,7 +353,8 @@ pub struct Retired {
 pub struct VetEvent {
     /// Unix seconds.
     pub at: u64,
-    /// `opened`, `update`, `swap`, `note`, `charge`.
+    /// `opened`, `update`, `swap`, `note`, `charge`, `policy` — a slot or skill starting or
+    /// stopping a community policy, naming its repo.
     pub kind: String,
     pub text: String,
 }

@@ -169,7 +169,7 @@ async fn a_share_creates_a_public_dataset_and_commits_the_book() {
     let (endpoint, hub) = fake_hub(false).await;
     let fx = fixture(&endpoint, true).await;
 
-    let result = updater::vetbook::share(&fx.account, &fx.sources)
+    let result = updater::vetbook::share(&fx.account, &fx.sources, &Default::default())
         .await
         .unwrap();
 
@@ -218,13 +218,40 @@ async fn a_share_creates_a_public_dataset_and_commits_the_book() {
     );
     assert!(files[1].1.contains("Graphite Bang's vet book"));
     assert!(files[1].1.contains(&result.image));
+    // Not asked to be listed: the book is public, but out of the gallery.
+    assert!(!result.listed);
+    assert_eq!(shared["share"]["listed"], false);
+    assert!(!files[1].1.contains(updater::vetbook::GALLERY_TAG));
+}
+
+#[tokio::test]
+async fn a_listed_share_says_so_in_the_book_and_the_tags() {
+    let (endpoint, hub) = fake_hub(false).await;
+    let fx = fixture(&endpoint, true).await;
+    let params = proto::VetbookShareParams { listed: true };
+    let result = updater::vetbook::share(&fx.account, &fx.sources, &params)
+        .await
+        .unwrap();
+    assert!(result.listed);
+
+    let hub = hub.lock().unwrap();
+    let (_, files) = committed_files(&hub.commits[0].1);
+    let shared: serde_json::Value = serde_json::from_str(&files[0].1).unwrap();
+    assert_eq!(shared["share"]["listed"], true);
+    assert!(
+        files[1]
+            .1
+            .contains(&format!("- {}\n", updater::vetbook::GALLERY_TAG)),
+        "{}",
+        files[1].1
+    );
 }
 
 #[tokio::test]
 async fn sharing_again_reuses_the_dataset() {
     let (endpoint, hub) = fake_hub(true).await;
     let fx = fixture(&endpoint, true).await;
-    updater::vetbook::share(&fx.account, &fx.sources)
+    updater::vetbook::share(&fx.account, &fx.sources, &Default::default())
         .await
         .unwrap();
     assert_eq!(hub.lock().unwrap().commits.len(), 1);
@@ -234,7 +261,7 @@ async fn sharing_again_reuses_the_dataset() {
 async fn a_robot_with_no_account_is_told_to_sign_in() {
     let (endpoint, hub) = fake_hub(false).await;
     let fx = fixture(&endpoint, false).await;
-    let err = updater::vetbook::share(&fx.account, &fx.sources)
+    let err = updater::vetbook::share(&fx.account, &fx.sources, &Default::default())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("robotctl account login"), "{err}");

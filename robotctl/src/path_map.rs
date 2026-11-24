@@ -11,6 +11,7 @@
 //! standing over the robot's starting pose. The origin is marked `+`, the
 //! robot `●` with a short ray for its heading.
 
+use duck_ipc_proto as proto;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -70,6 +71,17 @@ impl PathMap {
                 .collect();
             self.min_step *= 2.0;
         }
+    }
+
+    /// The recorded track, (x, y), oldest first — for drawing it over a view that owns its own
+    /// projection, the map's.
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
+    /// Where the robot is now, if it has been seen.
+    pub fn here(&self) -> Option<(f64, f64, f64)> {
+        self.here
     }
 
     /// How wide the tracked world currently is, metres — the number the panel
@@ -142,7 +154,158 @@ impl PathMap {
     }
 }
 
-/// A braille dot grid with per-cell colour and a few character overrides.
+// The map's colours, the ground-truth video's: walls red, floor seen clear the video's cyan at a
+// third over a dark ground (so a room reads as a surface without drowning what is on it), maploc's
+// track magenta, the robot yellow, stops grey. Unknown stays the terminal's own background.
+const WALL: [u8; 3] = [255, 60, 60];
+const FREE: [u8; 3] = [40, 85, 90];
+const TRACK: [u8; 3] = [230, 60, 255];
+const ROBOT: [u8; 3] = [255, 220, 40];
+const STOP: [u8; 3] = [140, 140, 140];
+
+/// The map `mapd` serves, top-down in the same orientation as the odometry track: the map's +x up
+/// the screen, +y screen-left. Drawn in coloured pixels — two square ones per cell, the half-block
+/// glyph of [`crate::cells`], like the 3D view — so walls, floor, track and robot each keep their
+/// own colour instead of sharing one per braille cell.
+///
+/// Every map cell paints at least one pixel and walls are painted over floor, so a one-cell wall
+/// survives a zoomed-out panel. The panel never grows — the world scales to fit, because the point
+/// of a map is seeing all of it.
+///
+/// `track` is the robot's pose history **in the map frame**, never raw odometry: after a reboot or
+/// a loop closure the two frames differ, and odometry drawn over the map reads as a bug.
+pub fn draw_map(grid_msg: &proto::MapGridResult, track: &PathMap, area: Rect, buf: &mut Buffer) {
+    let (w, h) = (area.width as usize, area.height as usize * 2);
+    let (cols, rows) = (grid_msg.width as usize, grid_msg.height as usize);
+    let cells = grid_msg.cells.as_bytes();
+    if w < 8 || h < 8 || cols == 0 || rows == 0 || cells.len() != cols * rows {
+        return;
+    }
+    let cell = grid_msg.res_m;
+    let (span_x, span_y) = (cols as f64 * cell, rows as f64 * cell);
+    // Map x runs up the screen and map y across it, so x is measured against the panel's height.
+    // Half-block pixels are square, so one scale serves both.
+    let scale =
+        ((h - 1) as f64 / span_x.max(MIN_SPAN_M)).min((w - 1) as f64 / span_y.max(MIN_SPAN_M));
+    let centre = (
+        grid_msg.origin[0] + span_x / 2.0,
+        grid_msg.origin[1] + span_y / 2.0,
+    );
+    let dot = |x: f64, y: f64| -> (isize, isize) {
+        (
+            (w as f64 / 2.0 - (y - centre.1) * scale).round() as isize,
+            (h as f64 / 2.0 - (x - centre.0) * scale).round() as isize,
+        )
+    };
+
+    let mut px = Pixels::new(w, h);
+    // Floor first, then walls over it.
+    for (kind, colour) in [(b'.', FREE), (b'#', WALL)] {
+        for j in 0..rows {
+            for i in 0..cols {
+                if cells[j * cols + i] != kind {
+                    continue;
+                }
+                let x0 = grid_msg.origin[0] + i as f64 * cell;
+                let y0 = grid_msg.origin[1] + j as f64 * cell;
+                px.fill(dot(x0, y0), dot(x0 + cell, y0 + cell), colour);
+            }
+        }
+    }
+    for k in &grid_msg.keyframes {
+        px.set(dot(k.x, k.y), STOP);
+    }
+    for pair in track.points().windows(2) {
+        px.line(dot(pair[0].0, pair[0].1), dot(pair[1].0, pair[1].1), TRACK);
+    }
+    if let Some((x, y, yaw)) = grid_msg
+        .pose
+        .as_ref()
+        .map(|p| (p.x, p.y, p.yaw))
+        .or(track.here())
+    {
+        // A heading ray of a fixed panel length, so it reads at every zoom, and a 3×3 body.
+        let reach = 4.0 / scale;
+        px.line(
+            dot(x, y),
+            dot(x + reach * yaw.cos(), y + reach * yaw.sin()),
+            ROBOT,
+        );
+        let (cx, cy) = dot(x, y);
+        px.fill((cx - 1, cy - 1), (cx + 1, cy + 1), ROBOT);
+    }
+    crate::cells::blit(area, buf, |x, y| px.get(x, y));
+}
+
+/// An RGB raster for [`draw_map`], `None` where nothing was drawn.
+struct Pixels {
+    w: usize,
+    h: usize,
+    px: Vec<Option<[u8; 3]>>,
+}
+
+impl Pixels {
+    fn new(w: usize, h: usize) -> Self {
+        Self {
+            w,
+            h,
+            px: vec![None; w * h],
+        }
+    }
+
+    fn get(&self, x: usize, y: usize) -> Option<[u8; 3]> {
+        self.px.get(y * self.w + x).copied().flatten()
+    }
+
+    fn set(&mut self, (x, y): (isize, isize), c: [u8; 3]) {
+        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
+            self.px[y as usize * self.w + x as usize] = Some(c);
+        }
+    }
+
+    /// The rectangle between two corners, inclusive, clipped: a cell smaller than a pixel still
+    /// paints one.
+    fn fill(&mut self, a: (isize, isize), b: (isize, isize), c: [u8; 3]) {
+        let (x0, x1) = (a.0.min(b.0).max(0), a.0.max(b.0).min(self.w as isize - 1));
+        let (y0, y1) = (a.1.min(b.1).max(0), a.1.max(b.1).min(self.h as isize - 1));
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.px[y as usize * self.w + x as usize] = Some(c);
+            }
+        }
+    }
+
+    /// Bresenham; endpoints may be off-panel (`set` clips), but a line whose ends are both far
+    /// outside is skipped rather than walked.
+    fn line(&mut self, a: (isize, isize), b: (isize, isize), c: [u8; 3]) {
+        let (dx, dy) = ((b.0 - a.0).abs(), -(b.1 - a.1).abs());
+        if dx.max(-dy) > (self.w + self.h) as isize * 4 {
+            return;
+        }
+        let (sx, sy) = (
+            if a.0 < b.0 { 1 } else { -1 },
+            if a.1 < b.1 { 1 } else { -1 },
+        );
+        let (mut x, mut y, mut err) = (a.0, a.1, dx + dy);
+        loop {
+            self.set((x, y), c);
+            if (x, y) == b {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+}
+
+/// A braille dot grid with per-cell colour and a few character overrides — the odometry track.
 struct Grid {
     w: usize,
     h: usize,
@@ -152,6 +315,8 @@ struct Grid {
     /// A character that replaces the braille in its cell — markers beat track.
     over: Vec<Option<(char, Color)>>,
 }
+
+const BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 impl Grid {
     fn new(w: usize, h: usize) -> Self {
@@ -172,7 +337,6 @@ impl Grid {
         let cell = (y / 4) * self.w + x / 2;
         // The braille bit layout: dots 1-2-3-7 down the left column, 4-5-6-8
         // down the right.
-        const BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
         self.dots[cell] |= BITS[y % 4][x % 2];
         if color.is_some() {
             self.color[cell] = color;
@@ -241,6 +405,53 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wall must ink the panel as a line, floor must fill its background, and the robot must be
+    /// its yellow marker — the three things a glance at the map is for.
+    #[test]
+    fn the_map_draws_walls_floor_and_the_robot() {
+        // 10 × 10 cells of 0.1 m: a wall along the top (max x) row, floor elsewhere.
+        let mut cells = String::new();
+        for _y in 0..10 {
+            for x in 0..10 {
+                cells.push(if x == 9 { '#' } else { '.' });
+            }
+        }
+        let grid = proto::MapGridResult {
+            res_m: 0.1,
+            origin: [0.0, 0.0],
+            width: 10,
+            height: 10,
+            cells,
+            keyframes: vec![],
+            pose: Some(proto::MapPose {
+                x: 0.5,
+                y: 0.5,
+                yaw: 0.0,
+            }),
+        };
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(area);
+        draw_map(&grid, &PathMap::new(), area, &mut buf);
+        let rgb = |c: [u8; 3]| Color::Rgb(c[0], c[1], c[2]);
+        let painted =
+            |x: u16, y: u16, c: [u8; 3]| buf[(x, y)].fg == rgb(c) || buf[(x, y)].bg == rgb(c);
+        // The wall is the top (max x) row of cells: red along the panel's top.
+        assert!(
+            (0..20).filter(|&x| painted(x, 0, WALL)).count() >= 10,
+            "no wall along the top"
+        );
+        assert!(
+            (0..10).any(|y| (0..20).any(|x| painted(x, y, ROBOT))),
+            "no robot"
+        );
+        assert!(
+            (0..10).any(|y| (0..20).any(|x| painted(x, y, FREE))),
+            "no floor"
+        );
+        // Drawn in half blocks, like the 3D view — not braille.
+        assert!((0..10).any(|y| (0..20).any(|x| buf[(x, y)].symbol() == "▀")));
+    }
 
     fn painted(map: &PathMap, w: u16, h: u16) -> Vec<String> {
         let area = Rect::new(0, 0, w, h);
@@ -349,5 +560,95 @@ mod tests {
         let mut map = PathMap::new();
         map.observe(1.0, 2.0, 0.5);
         let _ = painted(&map, 3, 1);
+    }
+}
+
+#[cfg(test)]
+mod picture {
+    use super::*;
+
+    /// Not a test — draws a replay export's map (`MAP_JSON`, `replay --export`) as the monitor
+    /// would, at `COLS×ROWS` cells, into `MAP_PPM`, two pixels a cell scaled up. Run with:
+    ///
+    ///     MAP_JSON=run.json MAP_PPM=map.ppm cargo test -p robotctl picture -- --ignored
+    #[test]
+    #[ignore = "writes a picture, run by hand"]
+    fn picture_of_a_replay_map() {
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(std::env::var("MAP_JSON").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let g = &v["grid"];
+        let rows: Vec<String> = g["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_owned())
+            .collect();
+        let pose = v["poses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|p| p["pose"].as_array().cloned());
+        let grid = proto::MapGridResult {
+            res_m: g["res"].as_f64().unwrap(),
+            origin: [
+                g["origin"][0].as_f64().unwrap(),
+                g["origin"][1].as_f64().unwrap(),
+            ],
+            width: g["w"].as_u64().unwrap() as u32,
+            height: g["h"].as_u64().unwrap() as u32,
+            cells: rows.concat(),
+            keyframes: vec![],
+            pose: pose.map(|p| proto::MapPose {
+                x: p[0].as_f64().unwrap(),
+                y: p[1].as_f64().unwrap(),
+                yaw: p[2].as_f64().unwrap(),
+            }),
+        };
+        let (cols, rws): (u16, u16) = (
+            std::env::var("COLS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(120),
+            std::env::var("ROWS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40),
+        );
+        let area = Rect::new(0, 0, cols, rws);
+        let mut buf = Buffer::empty(area);
+        draw_map(&grid, &PathMap::new(), area, &mut buf);
+        let (cw, ch) = (6usize, 12usize);
+        let (w, h) = (cols as usize * cw, rws as usize * ch);
+        let mut img = vec![[20u8, 20, 24]; w * h];
+        let rgb = |c: Color| match c {
+            Color::Rgb(r, g, b) => Some([r, g, b]),
+            _ => None,
+        };
+        for y in 0..rws {
+            for x in 0..cols {
+                let c = &buf[(x, y)];
+                let (top, bot) = match c.symbol() {
+                    "▀" => (rgb(c.fg), rgb(c.bg)),
+                    "▄" => (rgb(c.bg), rgb(c.fg)),
+                    _ => (None, None),
+                };
+                for py in 0..ch {
+                    for px in 0..cw {
+                        let col = if py < ch / 2 { top } else { bot };
+                        if let Some(col) = col {
+                            img[(y as usize * ch + py) * w + x as usize * cw + px] = col;
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for p in img {
+            out.extend_from_slice(&p);
+        }
+        std::fs::write(std::env::var("MAP_PPM").unwrap(), out).unwrap();
     }
 }

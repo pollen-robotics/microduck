@@ -149,13 +149,6 @@ pub trait RobotClient: Send + Sync {
     /// checks (`docs/design/updater-design.md` §5.5). `None` when unreachable.
     async fn model_api(&self, timeout: Duration) -> Option<u32>;
 
-    /// Is a telepresence/WebRTC session live? Restarting mid-session is a bad
-    /// surprise (`docs/design/architecture.md` §5).
-    ///
-    /// Defaults to `false` when unknown: this check is a courtesy, and must never
-    /// be the reason a recovery update is refused.
-    async fn remote_session_active(&self, timeout: Duration) -> bool;
-
     /// Tell `robotd` to re-read its policy slots from disk.
     ///
     /// Called after a policy set is swapped underneath it. `false` when the robot could not be
@@ -330,15 +323,6 @@ impl RobotClient for SocketRobotClient {
                 .collect(),
         )
     }
-
-    async fn remote_session_active(&self, timeout: Duration) -> bool {
-        // Defaults to false when unknown: this check is a courtesy and must never be
-        // the reason a recovery update is refused.
-        self.ask(&crate::proto::Call::RobotRemoteSessionActive, timeout)
-            .await
-            .and_then(|r| serde_json::from_value::<crate::proto::SessionActiveResult>(r).ok())
-            .is_some_and(|answer| answer.active)
-    }
 }
 
 /// A `robotd` that isn't there.
@@ -367,10 +351,6 @@ impl RobotClient for AbsentRobot {
 
     async fn policy_paths(&self, _timeout: Duration) -> Option<Vec<String>> {
         None
-    }
-
-    async fn remote_session_active(&self, _timeout: Duration) -> bool {
-        false
     }
 }
 

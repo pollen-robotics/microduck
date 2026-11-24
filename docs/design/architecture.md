@@ -15,7 +15,7 @@ rewritten). v1 targets a **single, well-specified hardware configuration**.
 
 ## The shape of it
 
-Seven daemons on one board, talking over unix sockets. One of them drives the robot; three
+Eight daemons on one board, talking over unix sockets. One of them drives the robot; three
 of the others exist so that the first one can be broken without the board becoming unreachable,
 and the rest are transports and sensors that own nothing.
 
@@ -70,7 +70,8 @@ same intents an app would (`netpadd` does the same for pad state sent over UDP o
 [`../robot/udp-pad.md`](../robot/udp-pad.md)); `mediad` carries the same calls over a WebRTC data channel and owns only
 the pipeline. All three are replaceable without touching robot behaviour, and all three are
 exercised daily, so the API an app will use cannot quietly rot. `tofd` is the odd one out: it owns
-one sensor, publishes frames, and reads nothing (§1).
+one sensor, publishes frames, and reads nothing (§1). `mapd` owns only the map: it subscribes to
+the robot and the sensor like any client, and sends the robot nothing.
 
 **Releases are swapped, not patched.** A build lands as a whole directory under
 `/opt/robot/daemon/releases/<version>/`; `updaterd` verifies its signature, moves the
@@ -86,15 +87,20 @@ counter ([`updater-design.md`](updater-design.md)).
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
 | `netpadd` | nothing — gamepad transport over UDP on the LAN, instead of `padd` ([`udp-pad.md`](../robot/udp-pad.md)) | UDP `[netpad] port` | `/run/robotd.sock` |
+| `autod` | nothing — the autonomous brain, an intent client like `padd`, idle unless `[autonomous] enabled` ([`autonomous.md`](autonomous.md)) | — | `/run/robotd.sock`, `/run/tofd/tof.sock` |
 | `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
 | `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus, or SPI on the beta board (`tof::link`) |
+| `mapd` | the onboard map and where the robot is in it ([`mapping-design.md`](mapping-design.md)) | `/run/mapd/map.sock` (`map.*`) | `robotd` and `tofd`, as a subscriber — it commands nothing |
 | `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |
 
 Where the state lives, and what survives an update:
 
 | | |
 |---|---|
-| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration; the installer writes it once and never overwrites it. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
+| `/etc/robot/robotd.toml`, `updater.toml` | per-board configuration as the image or the installer wrote it. The installer writes it once and never overwrites it; an OS image replaces it with every OS update. `robotd.toml` is read by `robotd` and — for `[media]` alone, what the camera streams — by `mediad`, so a change there restarts `mediad` rather than `robotd` |
+| `/var/lib/robot/robotd.toml` | the keys somebody changed on this robot, over the one above key by key — every writer (`robotctl configure`, `policy`, `pad`, and `robotd` serving the phone) writes here and only here (below) |
+| `/run/padd/pad-battery.json` | the connected pad's battery, written by `padd` (it can open the pad; `configd`'s private `/dev` cannot) and read by `configd` for `pad.status` and by `robotctl monitor`; gone with `padd` and with the boot ([`pair-a-gamepad.md`](../robot/pair-a-gamepad.md#the-pads-battery)) |
+| `/var/lib/robot/hf-token` | the Hugging Face sign-in, written by `updaterd` and read by `mediad` ([`remote-access-design.md`](remote-access-design.md) §2.5) |
 | `/var/lib/robot/config/config.json` | robot name and pairing PIN — a file plus `flock`, owned by `configd` (§3.1) |
 | `/var/lib/robot/vetbook.json` | the vet book — the robot's lifetime record, owned by `robotd` (`robotd/src/vetbook.rs`) |
 | NetworkManager profiles | wifi credentials; we never store them (§3) |
@@ -104,6 +110,40 @@ Where the state lives, and what survives an update:
 
 Everything outside `releases/<ver>/` survives both an update and a rollback. That is the
 whole rule, and it is why per-board config is not shipped in the release.
+
+**An OS update is a second kind of update, and it moves the line.** A robot whose OS updates by
+A/B slots (`microduck_yocto`) has a fresh root filesystem in each slot, so `/etc` is the image's
+and is replaced with it; only `/var/lib/robot` — its own partition — survives. That is why
+anything an *owner* decides lives there, and anything the *image* decides stays in `/etc`:
+
+- **`robotd.toml` is two layers.** `/etc/robot/robotd.toml` is the base — the board, the bus
+  port, what the image ships — and `/var/lib/robot/robotd.toml` holds only the keys changed on
+  this robot. `robotd_params::Params::load` merges them for every reader at the default path:
+  tables key by key, anything else (lists included) replaced whole. The image can then move its
+  own values forward and the owner's still stand. A file named with `--params`/`--config` is read
+  alone, as before.
+- **A broken user layer does not stop the robot.** It is set aside, the robot runs on the base,
+  and `robotd` reports *degraded* naming the file — never *unhealthy*, which would roll back every
+  release over a file no release can fix. A broken base is still fatal: that is a broken image.
+  The editors validate a user layer against its base before writing it, so only a hand edit can
+  produce one.
+- **A robot that predates the layers has its edits in the base**, mixed in with the template it
+  was installed from. The first time `robotd` starts with no user layer — or an editor writes
+  one, whichever comes first — the keys somebody changed are *moved* into a new one (`robotd_params::edit::adopt_base_edits`): a known key whose
+  value no release's template ever shipped live, never `[board] version`. Moved rather than
+  copied, because a copy left in the base would still be the default the editor compares against,
+  hiding the edit and making "revert" a no-op; a rollback to a release without layers runs on the
+  template's values until it moves forward again. On an A/B robot whose OS update arrives first,
+  the bundle's install hook (`microduck_yocto`, `microduck-bundle-hook`) copies the running slot's
+  base to `/var/lib/robot/robotd.toml.from-slot` while there is no user layer, and the edits are
+  adopted from there; it does the same for `hf-token`.
+- **`updater.toml` is still single-layered.** Almost all of it is the image's policy, but one key
+  is a per-robot decision — `auto_apply = "all"` on a canary — and on an A/B robot an OS update
+  currently puts it back to the image's value. Open. Being a dev board was the other one, and
+  is no longer a key here: it is a marker under `/var/lib/robot`
+  ([`updater-design.md`](updater-design.md) §5.4).
+- On a robot installed by `install.sh`, which has no slots, `/etc` survives anyway; the layers
+  change nothing there but where an edit lands.
 
 How a change reaches a robot, end to end:
 
@@ -135,6 +175,7 @@ safety authority sits (§6).
 | `btd` | BLE GATT server | **Transport adapter only** — owns no state (§4.1). See [`app-path-design.md`](app-path-design.md) |
 | `configd` | wifi, robot identity, power, gamepad pairing | Config must be reachable when `robotd` is dead (§3.1), and `btd` must own nothing (§4.1) — so it is neither's business but its own. Gamepad pairing is here rather than in `padd` because bonding a device needs root and BlueZ, and `padd` is deliberately an unprivileged client (§4.1) |
 | `tofd` | the head ToF sensor: an 8×8 depth matrix on the HAT's I²C bus | Perception, so split from `robotd` for the reason below. Owns one sensor and publishes frames; reads nothing. A board with no sensor fitted runs it anyway and says so |
+| `mapd` | the onboard map, and where the robot is in it | A client of `robotd` and `tofd`, split out so a mapping bug, a slow relocalization search or a corrupt map file never reaches the control loop. Commands nothing. [`mapping-design.md`](mapping-design.md) |
 | `updaterd` | update engine | See `updater-design.md` |
 
 Splitting `mediad` from `robotd` is deliberate: a media/perception crash must not
@@ -346,22 +387,20 @@ update", "select model" are actions, dispatched as RPC to the owning service.
 
 ### 3.2 The face LEDs
 
-The beta board's face carries twelve LEDs on a GPIO expander, which its device tree names
-`face:<place>:<colour>` under `/sys/class/leds`. An LED shows a piece of state, so it follows
+The beta board's face carries twelve LEDs on a GPIO expander and face-board-v1's on PWM drivers;
+either device tree names them `face:<place>:<colour>` under `/sys/class/leds`. On is the
+flashlight's `max_brightness`, and a dimmed level for the others — 5 for the camera, 15 for the
+rest, out of the PWM drivers' 255 (`duck_ipc_proto::led::name::lit_level`). An LED shows a piece of state, so it follows
 invariant 4: **each LED has one writer, the daemon that owns what it shows.** A Zero 3W has none of
 them, and every owner does nothing on a board without its LED.
 
 | LED | sysfs | Owner | Shows |
 |---|---|---|---|
-| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
+| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours, at a brightness (full unless asked; a PWM board dims, the beta's GPIO cannot). The pad's Home button toggles it. |
 | Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
 | Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
-| Network | `gb:{green,blue}` | `configd` | Blue when reachable from outside the LAN (the relay is registered with a live heartbeat); otherwise green on wifi, blinking green while joining, off without. |
+| Network | `gb:{green,blue}` | `configd` | Green on wifi, blinking green while joining. Without wifi, blue while a bonded Bluetooth gamepad is connected; off with neither. Wifi wins: a robot on wifi with a pad connected shows green. Above all of it, blinking blue while ssh is open on wifi (`configd::wifi_ssh`: the face button's 30 minutes, or `/run/microduck-ssh-wifi` touched over USB). |
 | Battery | `gr1:{green,red}`, `green2`, `green1` (bottom to top) | `robotd` | A three-step gauge filling up from `gr1`: three green above 70%, two above 40%, one above 15%; then `gr1` red, blinking at 5% and below. 3% hysteresis on each step. Off until the first reading. |
-
-The network LED reads one fact it does not own: whether `mediad`'s relay is registered, from the
-file `mediad` publishes for readers (`/run/mediad/remote.json`). It still has one writer, because
-green and blue from two daemons would show both at once.
 
 Every owner writes only on a change, which leaves `robotctl led` usable as a bench override until
 the owner next has something new to say; switches its LEDs off when it stops; and has an

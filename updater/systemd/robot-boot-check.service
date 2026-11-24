@@ -26,6 +26,10 @@ Type=oneshot
 # `hooks/postinstall` copy it out of the artifact, the way they already copy this unit file.
 ExecStart=/usr/local/sbin/robot-boot-check
 
+# The script watches for up to `boot_deadline_s` (300 s at most) before it decides, past the 90 s a
+# oneshot gets by default. Its uptime guard is 600 s, so it never needs longer than that.
+TimeoutStartSec=600
+
 # Nothing here is fatal to anything: the script decides, and its own refusals are exit 0 or 2.
 # A non-zero exit is a bug in it, worth seeing in `systemctl status` rather than retrying.
 Restart=no

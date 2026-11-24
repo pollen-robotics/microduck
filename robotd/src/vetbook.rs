@@ -136,6 +136,13 @@ impl Book {
         Ok(())
     }
 
+    /// A slot or skill started or stopped running a community policy — what
+    /// `community_policy_events` in `main.rs` says. Left for the next save, like a tally: nobody
+    /// switches a robot off because a gait changed.
+    pub fn policy(&self, text: &str) {
+        self.lock().event(now(), "policy", text);
+    }
+
     /// `robotd` just adopted a factory-fresh servo into joint `id`: the old one is retired with
     /// what it did, and the new one starts from zero. Saved at once, for the same reason as a note.
     ///

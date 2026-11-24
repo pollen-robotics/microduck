@@ -142,8 +142,8 @@ async fn serve(
         let _ = tx.send(port);
     }
 
-    let roller = match robot.ask_roller().await {
-        Ok(r) => r.unwrap_or(false),
+    let mode = match robot.ask_mode().await {
+        Ok(mode) => mode.unwrap_or_default(),
         Err(e) => {
             tracing::error!(error = %e, "mode request failed");
             return std::process::ExitCode::FAILURE;
@@ -153,6 +153,7 @@ async fn serve(
         deadzone: args.deadzone,
         max_head: args.max_head,
     };
+    let roller = mode.mode == "roller";
     let mut config = Config::defaults(roller, &overrides);
     config.reload(&args.config, &overrides);
     tracing::warn!(
@@ -171,12 +172,12 @@ async fn serve(
         fallback: HEARTBEAT,
     });
     let (mut mapper, mut continuous) = (Mapper::new(), Continuous::default());
+    mapper.set_soccer(mode.soccer);
     let (mut out, mut frame) = (Vec::new(), Vec::new());
     let mut buf = [0u8; 512];
     let mut housekeeping = Instant::now() + pad_map::BINDINGS_POLL;
-    let mut config_at = std::fs::metadata(&args.config)
-        .and_then(|m| m.modified())
-        .ok();
+    // Both layers: an edit lands in the user layer, which the base's mtime never sees.
+    let mut config_at = robotd_params::config_stamp(&args.config);
     let (mut malformed, mut malformed_logged) = (0u64, None::<Instant>);
     let (mut late, mut late_logged) = (0u64, None::<Instant>);
     let mut lateness = Lateness::default();
@@ -269,21 +270,24 @@ async fn serve(
         let now = Instant::now();
         if now >= housekeeping {
             housekeeping = now + pad_map::BINDINGS_POLL;
-            let at = std::fs::metadata(&args.config)
-                .and_then(|m| m.modified())
-                .ok();
+            let at = robotd_params::config_stamp(&args.config);
             if at != config_at {
                 config_at = at;
                 if config.reload(&args.config, &overrides) {
                     tracing::warn!("controller settings reloaded");
                 }
             }
-            match robot.ask_roller().await {
-                Ok(Some(r)) if r != config.roller => {
-                    config.roller = r;
-                    tracing::warn!(roller = r, "drive mode changed — stick shaping follows");
+            match robot.ask_mode().await {
+                Ok(Some(mode)) => {
+                    let r = mode.mode == "roller";
+                    if r != config.roller {
+                        config.roller = r;
+                        tracing::warn!(roller = r, "drive mode changed — stick shaping follows");
+                    }
+                    // Soccer mode changes what the buttons do, and an NFC tag switches it.
+                    mapper.set_soccer(mode.soccer);
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "mode request failed");
                     return std::process::ExitCode::FAILURE;

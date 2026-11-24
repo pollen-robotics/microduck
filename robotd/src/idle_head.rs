@@ -18,8 +18,10 @@
 //!   and smaller its glances get, as if dozing off, and now and then it **yawns** — the beak
 //!   opens slowly and the head tips back. Silent. Any motion wakes it.
 //!
-//! All of it is added on top of whatever the head and body were last asked to do, the way the
-//! chorale's sway is, and fades in and out over `fade_s`, so it never jumps. Every number is
+//! It looks around the straight head, not wherever the head was last left: a head the pad parked
+//! off to one side is eased back to the middle as the behaviour fades in ([`IdleOffset::takeover`])
+//! and handed back as it fades out. The breath is added on top of whatever the body was asked to
+//! do. Both fade in and out over `fade_s`, so nothing jumps. Every number is
 //! `[idle]` in `robotd.toml` ([`IdleParams`]).
 //!
 //! A piece of the autonomous behaviour stack's LookAround/Chill states
@@ -40,6 +42,10 @@ pub struct IdleOffset {
     pub body_z: f64,
     /// Mouth opening, 0..1 — the yawn. The caller decides who else has the mouth.
     pub mouth: f64,
+    /// How much of the commanded head pose this replaces, 0..1: the caller scales the commanded
+    /// head by `1 - takeover` before adding `head`, so the glances centre on the straight head
+    /// rather than on wherever the pad left it.
+    pub takeover: f64,
 }
 
 /// One move and the pause after it: from where, to where, when it started, how long the move
@@ -105,10 +111,11 @@ impl IdleHead {
     }
 
     /// One tick. `still` says nothing is asking for motion right now — the caller decides what
-    /// counts.
+    /// counts, and that includes whether the look-around is switched on in the current mode
+    /// ([`IdleParams::enabled_in`]): the mode can change under a running loop, the tuning cannot.
     pub fn tick(&mut self, now: Instant, still: bool, dt: Duration) -> IdleOffset {
         let p = self.tuning;
-        self.still_since = if still && p.enabled {
+        self.still_since = if still {
             Some(self.still_since.unwrap_or(now))
         } else {
             None
@@ -194,6 +201,7 @@ impl IdleHead {
             ],
             body_z: g * breath,
             mouth: g * (beak + p.yawn_open * yawn).min(1.0),
+            takeover: g,
         }
     }
 
@@ -375,6 +383,7 @@ mod tests {
         assert!(peak(1) <= p.glance_pitch + p.nudge_pitch + p.drift + 1e-9);
         assert!(peak(3) <= p.tilt_roll + p.drift + 1e-9);
         assert!(later.iter().any(|o| o.body_z != 0.0), "it breathes");
+        assert_eq!(later.last().unwrap().takeover, 1.0, "it has the whole head");
     }
 
     /// **No jumps**: from one tick to the next the head moves a little, whatever it is doing —
@@ -393,6 +402,8 @@ mod tests {
             }
             let step = (pair[1].mouth - pair[0].mouth).abs();
             assert!(step < 0.05, "a {step} mouth step");
+            let step = (pair[1].takeover - pair[0].takeover).abs();
+            assert!(step < 0.05, "a {step} takeover step");
         }
     }
 
@@ -522,18 +533,6 @@ mod tests {
         let mut idle = IdleHead::new(never, 17);
         let (_, all) = run(&mut idle, t0, 600.0, true);
         assert!(all.iter().all(|o| o.mouth == 0.0), "0 is never");
-    }
-
-    /// Off is off, however still the robot is.
-    #[test]
-    fn disabled_it_does_nothing() {
-        let p = IdleParams {
-            enabled: false,
-            ..IdleParams::default()
-        };
-        let mut idle = IdleHead::new(p, 9);
-        let (_, all) = run(&mut idle, Instant::now(), 30.0, true);
-        assert!(all.iter().all(|o| *o == IdleOffset::default()));
     }
 
     #[test]

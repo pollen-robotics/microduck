@@ -202,12 +202,18 @@ impl Fixture {
     /// The gate timeout is short (3s) so the unhealthy test fails fast; a real robot gets
     /// 30s (see `updater.example.toml`).
     fn engine(&self) -> Engine {
+        // Auto-rollback on: what this file tests is the gate against a real robotd, and a revert
+        // is half of that.
+        let robotd_config = self.root.join("etc/robot/robotd.toml");
+        std::fs::create_dir_all(robotd_config.parent().unwrap()).unwrap();
+        std::fs::write(&robotd_config, "[update_gate]\nauto_rollback = true\n").unwrap();
         let config = Config::from_toml(&format!(
             r#"
 trusted_keys_dir = "{keys}"
 hw_rev = 1
 state_dir = "{state}"
 robot_socket = "{socket}"
+robotd_config = "{robotd_config}"
 
 [component.daemon]
 install_dir = "{install}"
@@ -218,6 +224,7 @@ health = {{ probe = "socket", timeout = "3s" }}
             keys = self.root.join("keys").display(),
             state = self.root.join("var/lib/robot/updater").display(),
             socket = self.socket().display(),
+            robotd_config = robotd_config.display(),
             install = self.install.display(),
             published = self.publisher.releases.display(),
         ))
@@ -279,10 +286,6 @@ async fn real_robotd_answers_every_method_the_engine_calls() {
         client.model_api(t).await,
         Some(2),
         "modelApi must parse; None here means the field name drifted"
-    );
-    assert!(
-        !client.remote_session_active(t).await,
-        "no session should be active on a fresh robotd"
     );
 }
 
