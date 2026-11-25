@@ -594,6 +594,14 @@ release. It changes far less often than the daemon, and ~20 MB in every artifact
 every update for nothing. The trade is that a board missing it installs and starts fine and
 then cannot walk — which is why health reports the searched path.
 
+`robotd` and `mediad` load it as `libonnxruntime.so.1` (`ORT_DYLIB_PATH` in their units), not as
+`ort`'s default bare `libonnxruntime.so`, which is a development symlink an OS image does not
+ship. On an OS image the runtime is a package, and `/usr/lib/libonnxruntime.version` names its
+version, as `librknnrt.version` does for the NPU runtime; `hooks/preinstall` reads that first and
+falls back to resolving `/usr/local/lib/libonnxruntime.so` on a board set up by script. An image
+whose stamp is below the floor is refused with a message naming the OS update, since the hook can
+neither replace the image's package nor download on an image without `curl`.
+
 Not done, and deliberately: pre-binding the ONNX input/output tensors. The current path
 allocates a 61-float vector per inference, ~244 bytes at 50 Hz. Worth measuring on the board
 before optimising.
