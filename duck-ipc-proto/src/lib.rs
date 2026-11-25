@@ -485,7 +485,206 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// installs. Served by `updaterd`, which hands the work to the image's `microduck-osupdate`
 /// ([`OsStatus`]). New routes: an `updaterd` predating them answers METHOD_NOT_FOUND, and a board
 /// whose image has no A/B slots answers [`code::NOT_SUPPORTED`].
-pub const API_VERSION: u32 = 46;
+///
+/// # v47 — anonymous usage data
+///
+/// [`method::TELEMETRY_STATUS`] and [`method::TELEMETRY_SET`]: whether the robot shares anonymous
+/// usage data, and the owner's switch for it ([`TelemetryResult`]). New routes: an `updaterd`
+/// predating them answers METHOD_NOT_FOUND — and sends nothing, so a client may read that as off.
+///
+/// # v48 — hardware that goes quiet on a running robot
+///
+/// [`BusHealth::missing`] and [`ImuHealth::missing`] are no longer only about the bus coming up.
+/// During a run of failed reads `robotd` pings every servo and the IMU board and fills them the
+/// same way, and `robot.health` reports **degraded** naming what went silent — the verdict the
+/// same robot got on its next boot — rather than unhealthy, which is the verdict that blames the
+/// release. A run in which every device still answers its ping stays unhealthy. Same fields, same
+/// shapes: an older reader prints the read failures and does not see the names.
+///
+/// # v49 — a release left live after it failed
+///
+/// [`Outcome::Stuck`]: the update log's entry for a release that failed its gate and stayed live —
+/// automatic rollback off, or a revert that itself failed. These were filed as `Aborted`, which
+/// means nothing changed, and `robotctl update log` printed them as "refused". An older client
+/// cannot parse a log holding one; an older `updaterd` skips the line.
+///
+/// # v50 — the remote-session check sees WebRTC peers
+///
+/// `os.apply` and `os.switch` are permitted over WebRTC. The preflight's remote-session check,
+/// which `robotd` used to answer with a constant `false`, now counts `mediad`'s WebRTC peers
+/// ([`read_webrtc_peers`]): `update.apply`, `os.apply` and `os.switch` are refused with the new
+/// [`code::SESSIONS_CONNECTED`] while one is connected, unless `interrupt_sessions` is set. A request made
+/// over WebRTC by the only peer connected is exempt. `robot.remoteSessionActive` is gone; it was
+/// `updaterd`'s question, refused to every client.
+///
+/// # v51 — which pads were in pairing mode
+///
+/// `candidates` on [`PadPairResult::Failed`]: an `ambiguous` refusal lists the pads it saw, so a
+/// client can offer them and pair one by `mac`. Additive: an older `configd` omits it, which
+/// reads as an empty list, and a client that does not know it ignores it.
+///
+/// # v52 — laser tracking
+///
+/// [`method::ROBOT_LASER_TRACK`] switches laser tracking on or off, and [`RobotState::laser`]
+/// carries what it sees while it is on — absent otherwise, so an older client reads the frame it
+/// always did. Underneath, `robotd` subscribes to `mediad`'s local [`method::MEDIA_LASER`] on
+/// [`socket::MEDIA`]: a `mediad` older than this refuses that method, and the answer to
+/// `robot.laserTrack` says so rather than tracking nothing.
+///
+/// # v53 — the impact guard
+///
+/// [`RobotState::impact_guard`]: what ROBOTIS's impact guard firmware is doing on each servo, for
+/// recording a robot that runs it. Additive: absent from an older `robotd`, and from a robot whose
+/// servos have no guard.
+///
+/// # v54 — ssh on wifi over BLE (daemon 0.20.0 only)
+///
+/// `system.openWifiSsh`: configd opened ssh on wifi until reboot when asked over the secure BLE
+/// session. Shipped in daemon 0.20.0 and withdrawn in the next release (v55 below).
+///
+/// # v55 — `system.openWifiSsh` withdrawn
+///
+/// ssh on wifi stays a decision made with the robot open: over the head's USB-C link
+/// (`sudo touch /run/microduck-ssh-wifi`, microduck_yocto#110) or by flashing the dev image. Once
+/// opened, the login is the shared operator password, so an opening from a phone in Bluetooth range
+/// put a root-capable account on the network for anyone on it. A v54 client asking a v55 configd is
+/// refused by name; nothing else on the wire changed.
+///
+/// Since daemon 0.22, a 5 s hold of the face button (behind a hole, so it takes a pin) opens it
+/// for 30 minutes too: hands on the robot, which is the line BLE crossed. `configd::wifi_ssh` owns
+/// it; it is not on the wire, so the API version is unchanged.
+///
+/// # v56 — writing a tag
+///
+/// [`method::NFC_WRITE`]: `nfcd` writes a text onto the next NTAG touched to the reader, on its
+/// own socket [`socket::NFC`] — the first call `nfcd` answers rather than makes. An older `nfcd`
+/// has no socket, so the call fails to connect rather than being refused by name.
+///
+/// # v57 — a join's progress
+///
+/// [`NetStatusResult::joining`]: while a `net.connect` is in flight, `net.status` says which
+/// network it is joining and how far it has got, so a client can show progress instead of a 45s
+/// spinner. Additive: absent from an older `configd`, and whenever no join is in flight.
+///
+/// # v58 — soccer mode
+///
+/// [`method::ROBOT_SOCCER`] switches soccer mode — the pad's bumpers kick — and, on top of it,
+/// autonomous soccer, where the robot finds a purple ball, walks to it and kicks it.
+/// [`RobotState::soccer`] carries what it is doing while soccer mode is on, and
+/// [`ModeResult::soccer`] says whether it is, so a pad daemon that already polls `robot.mode`
+/// learns of a switch made from elsewhere — an NFC tag. Underneath, `robotd` subscribes to
+/// `mediad`'s local [`method::MEDIA_BALL`]; a `mediad` older than this refuses it, and the soccer
+/// block's `camera` line says so. All additive.
+///
+/// # v59 — `map.*`, the onboard map
+///
+/// A new service, `mapd`, on [`socket::MAP`]: [`method::MAP_STATUS`], [`method::MAP_STREAM`],
+/// [`method::MAP_GRID`] and [`method::MAP_WIPE`] — where the robot is in its own map, and the map.
+/// New routes: a release predating `mapd` has no socket to answer them, and a transport that
+/// forwards them says so by name.
+///
+/// # v60 — the autonomous brain: who is driving, what the duck hears, a head that moves fast
+///
+/// Five additions, all for `autod` (`docs/design/autonomous.md`), all optional on the wire:
+///
+/// - [`HelloParams::client`]: a client may name itself. `robotd` remembers the name for that
+///   connection.
+/// - [`MoveState::source`]: the name of the client whose `robot.move` is in the twist slot. It is
+///   how the brain sees a pad that has taken over, since `robotd` arbitrates nothing.
+/// - [`RobotState::hearing`]: petting, and counters of the noises and voices the microphone heard.
+///   These never left `robotd` before.
+/// - [`HeadParams::alpha`]: a per-intent head smoothing rate, for motion faster than
+///   `[control] head_alpha` lets through.
+/// - [`method::ROBOT_AUTONOMOUS`]: the switch the brain obeys, held by `robotd` and read back in
+///   [`ModeResult::autonomous`] and [`RobotState::autonomous`]. `[autonomous] enabled` is only
+///   its value at boot, so an NFC tag can switch the duck on without writing the config. A v59
+///   `robotd` answers it METHOD_NOT_FOUND, by name.
+///
+/// Install consequences, both directions:
+///
+/// - **A v59 `robotd` refuses** a `hello` carrying `client`, and a `robot.head` carrying `alpha`,
+///   with `INVALID_PARAMS`. `padd` logs the refused hello and drives on, and `autod` sends `alpha`
+///   only to a robot that answered its hello with 60 or later. On such a robot, a brain cannot see
+///   a pad take over, so it would fight the pad. That is the consequence of a half-updated robot:
+///   updating moves every daemon together.
+/// - **A v59 client reading a v60 robot** ignores the new fields; nothing it reads changed.
+///
+/// # v61 — reading a tag
+///
+/// [`method::NFC_READ`]: `nfcd` reads the next tag touched and says what is on it, on the same
+/// socket as [`method::NFC_WRITE`]. A v60 `nfcd` answers it METHOD_NOT_FOUND, by name; nothing
+/// else on the wire changed.
+///
+/// # v62 — the flashlight's brightness, and the battery's PWM cap
+///
+/// [`FlashlightParams::brightness`]: how bright, 0 to 1 of the LED's full brightness, so the light
+/// can be on without dazzling the person it points at. Absent is full, as before, and is not sent:
+/// a client that does not set it still works against an older `robotd`, which refuses the field by
+/// name when one does. A board whose LEDs are on/off only (the beta's GPIO expander) lights any
+/// brightness above zero fully.
+///
+/// [`HealthResult::goal_pwm`]: the Goal PWM `robotd` writes when
+/// `bus.battery_voltage_based_pwm_limit` is on. Optional and absent when off, so a v61 client
+/// reading a v62 robot ignores it and a v62 client reading a v61 robot shows nothing. (Numbered
+/// v62 on `main` and on the photo branch both; merged here under one heading.)
+///
+/// # v63 — `bwep`
+///
+/// [`SoundTag::Bwep`]: a tiny cute retch, which the photo sequence plays as the robot lets go of
+/// the e-ink display in its beak. An older `robotd` refuses the tag as unknown; its voice bank is
+/// re-rendered on install (bank v6) so the robot has the sound in its own voice.
+///
+/// # v64 — `photo.list`, `photo.get`, `photo.delete`
+///
+/// [`method::PHOTO_LIST`], [`method::PHOTO_GET`] and [`method::PHOTO_DELETE`]: the photos the photo
+/// sequence keeps in `/var/lib/robot/photos`, listed, read a chunk at a time — the picture or a
+/// small preview of it — and deleted, so a phone can show and keep them. Answered by `nfcd`,
+/// which takes them. An older `nfcd` answers METHOD_NOT_FOUND, by name.
+///
+/// # v65 — the pad's battery
+///
+/// [`Pad::battery`]: how full the connected pad's battery is, and whether it is charging, on
+/// `pad.status`. `padd` asks the pad and writes [`pad_battery::FILE`]; `configd` reads it. Optional
+/// and absent when unknown — a pad that is not a Nintendo one, a `padd` too old to ask, a reading
+/// gone stale — so a v64 client reading a v65 robot ignores it, and a v65 client reading a v64
+/// robot shows nothing.
+///
+/// # v66 — the speaker volume
+///
+/// `robot.volume` reads the speaker level and `robot.setVolume` sets it ([`VolumeParams`],
+/// [`VolumeResult`]): a percentage, written to `[audio] volume` and to the codec's mixer at once,
+/// so it is heard as it is set and kept across a restart. An older `robotd` answers
+/// METHOD_NOT_FOUND, by name.
+///
+/// # v67 — every switch in `robot.mode`, and the play modes over Bluetooth
+///
+/// [`ModeResult::laser`], [`ModeResult::theremin`] and [`ModeResult::flashlight`]: `robot.mode`
+/// says which of the robot's switches are on, so a phone on Bluetooth — which has no
+/// `robot.state` stream — can show the one game the duck is playing. Absent while off, so a v66
+/// client reading a v67 robot ignores them, and a v67 client reading a v66 robot reads them off.
+///
+/// `btd` now routes `robot.mode`, `robot.laserTrack`, `robot.soccer` and `robot.autonomous`, as
+/// well as `robot.theremin` and `robot.flashlight`. A route opening, not a wire change: an older
+/// `btd` refuses them with PERMISSION_DENIED, by name, which is how the app tells.
+///
+/// # v68 — `photo.take`
+///
+/// [`method::PHOTO_TAKE`]: the photo sequence asked for from a phone — the pose, the flashlight
+/// countdown and the picture, kept with the others in `/var/lib/robot/photos`, without the e-ink
+/// display the tag's sequence ends with. No params; [`IntentResult`] once it has started, so a
+/// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
+/// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
+///
+/// # v69 — seated skills
+///
+/// [`SkillParams::entry_pose`] and [`PolicyFetchResult::entry_pose`]: the pose a skill starts
+/// from, `"standing"` or `"seated"`, and the only one the robot will start it in. A seated skill
+/// runs from the seat and hands the seat back; a standing one is refused from the seat as every
+/// skill was. Absent means standing on both, so a v68 client reading a v69 robot sees every skill
+/// as before, and a v69 client writing to a v68 robot is refused for the unknown field — by
+/// `deny_unknown_fields` on `SkillParams`, which names it — rather than seeing a seated skill
+/// silently stored as standing.
+pub const API_VERSION: u32 = 69;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -520,6 +719,16 @@ pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
+/// The file in `updaterd`'s `state_dir` whose presence makes this robot a dev board: it trusts
+/// the team dev key `updaterd` carries built in, so `robotctl update apply --ref <branch>`
+/// installs what CI built for that branch.
+///
+/// `robotctl configure --allow-dev-daemon on|off` writes and removes it; `updaterd` reads it at
+/// startup. A file in `state_dir` rather than a key in `updater.toml` because `/etc` is the
+/// image's on an A/B robot and an OS update replaces it, while `state_dir` is under
+/// `/var/lib/robot`, which survives. `docs/design/updater-design.md` §5.4 owns the mechanism.
+pub const DEV_BUILDS_MARKER: &str = "allow-dev-builds";
+
 pub mod led;
 pub mod vetbook;
 
@@ -547,9 +756,25 @@ pub mod socket {
     /// `RuntimeDirectory=`, so systemd removes the socket when the daemon stops.
     pub const TOF: &str = "/run/tofd/tof.sock";
 
+    /// `mapd`'s map and pose — every [`super::method`] in the `map.*` namespace. Under `/run/mapd/`
+    /// for the same reason as the depth stream's.
+    pub const MAP: &str = "/run/mapd/map.sock";
+
     /// `mediad`'s on-demand raw-frame endpoint. It is local-only: a raw camera frame is for a
     /// recorder or perception process on the robot, not a multi-megabyte WebRTC control reply.
     pub const MEDIA: &str = "/run/mediad/media.sock";
+
+    /// `nfcd`'s — [`super::method::NFC_WRITE`] and [`super::method::NFC_READ`], and the photos it
+    /// takes: [`super::method::PHOTO_LIST`], [`super::method::PHOTO_GET`],
+    /// [`super::method::PHOTO_DELETE`]. Under `/run/nfcd/`, its
+    /// `RuntimeDirectory=`, for the same reason as the pad's.
+    pub const NFC: &str = "/run/nfcd/nfc.sock";
+
+    /// `btd`'s wifi lane: a `btd` session — Bluetooth's routing table, word for word — for a phone
+    /// on the robot's network. Not for clients on the robot: `duck-gateway` is the only one, and
+    /// it connects only after the phone has proved the setup code. Under `/run/btd/`, `btd`'s
+    /// `RuntimeDirectory=`, mode 0600, owned by `btd`, which `duck-gateway` also runs as.
+    pub const BTD_LANE: &str = "/run/btd/lane.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -633,6 +858,26 @@ pub mod method {
     /// or the WebRTC control datachannel. Local clients dial `socket::MEDIA` explicitly.
     pub const MEDIA_FRAME: &str = "media.frame";
 
+    /// Look for a laser dot in the camera frames, on `mediad`'s local socket. Answered with
+    /// `null`, then a stream of [`MEDIA_LASER_DOT`] notifications for as long as the connection
+    /// stays open — closing it is how a subscriber stops the detector.
+    ///
+    /// Local-only, like [`MEDIA_FRAME`], and not a `Call`: its only client is `robotd`, which
+    /// turns a direction into a place on the floor. Params are [`super::LaserDetectParams`].
+    pub const MEDIA_LASER: &str = "media.laser";
+    /// `mediad` → subscriber: one look's answer, [`super::LaserDot`]. Sent whether or not a dot
+    /// was found, because "nothing" is what lets a tracker let go.
+    pub const MEDIA_LASER_DOT: &str = "media.laserDot";
+
+    /// Look for the purple ball in the camera frames, on `mediad`'s local socket — the laser's
+    /// subscription, for a ball: answered with `null`, then one [`MEDIA_BALL_SEEN`] per look until
+    /// the connection closes. Local-only and not a `Call`; its client is `robotd`'s autonomous
+    /// soccer. Params are [`super::BallDetectParams`].
+    pub const MEDIA_BALL: &str = "media.ball";
+    /// `mediad` → subscriber: one look's answer, [`super::BallSeen`], sent whether or not a ball
+    /// was found.
+    pub const MEDIA_BALL_SEEN: &str = "media.ballSeen";
+
     pub const CHECK: &str = "update.check";
     pub const APPLY: &str = "update.apply";
     pub const ROLLBACK: &str = "update.rollback";
@@ -659,8 +904,6 @@ pub mod method {
     pub const ROBOT_HEALTH: &str = "robot.health";
     /// Which model API version does this build implement?
     pub const ROBOT_MODEL_API: &str = "robot.modelApi";
-    /// Is a telepresence session live?
-    pub const ROBOT_SESSION_ACTIVE: &str = "robot.remoteSessionActive";
 
     // ── intents ──────────────────────────────────────────────────────────────
     //
@@ -772,6 +1015,68 @@ pub mod method {
     /// what the sensor said about the frame — which is the field diagnostic for this whole
     /// feature.
     pub const ROBOT_THEREMIN: &str = "robot.theremin";
+    /// Switch laser tracking on or off: a laser dot on the floor in front of the camera is
+    /// followed with the head and walked to. Discrete; send as a request, idempotent both ways.
+    ///
+    /// It shares the robot with every other driver rather than taking it: a client stick that is
+    /// deflected wins over the dot, and with no dot in sight the robot does what it was asked
+    /// to. [`ROBOT_STATE`]'s `laser` block carries what the camera sees — including the colour
+    /// of the reddest bright pixel when nothing passed the thresholds, which is what tuning
+    /// `[laser]` needs.
+    pub const ROBOT_LASER_TRACK: &str = "robot.laserTrack";
+    /// Write a text onto the next tag touched to the reader: one NDEF text record, as a phone
+    /// app writes it, so the tag then reads as that text everywhere — a mode tag, a pairing tag.
+    /// The answer comes when a tag has been written and read back, or when none was touched in
+    /// time; see [`super::NfcWriteResult`]. Answered by `nfcd`.
+    ///
+    /// An NTAG (NFC Forum Type 2) is written, and on the beta board's reader an ISO 15693 tag
+    /// (Type 5) too, formatted first if blank. A MIFARE Classic, a locked tag or a text too long
+    /// for the tag is refused with why, and nothing on it changes.
+    pub const NFC_WRITE: &str = "nfc.write";
+    /// Read the next tag touched to the reader, or one already lying on it, and say what it
+    /// holds: its UID and its NDEF text and URI records. The answer comes when a tag has been
+    /// read or when none was touched in time; see [`super::NfcReadResult`]. Answered by `nfcd`.
+    ///
+    /// While a read waits, the tag touched is read rather than acted on: reading a pairing tag
+    /// does not pair, reading a mode tag does not switch the mode.
+    pub const NFC_READ: &str = "nfc.read";
+    /// The photos the photo sequence has kept, newest first: a name, a size and when each was
+    /// taken; see [`super::PhotoListResult`]. Answered by `nfcd`, from its photo directory, while
+    /// a sequence runs too. No params.
+    pub const PHOTO_LIST: &str = "photo.list";
+    /// A chunk of one photo, base64, at an offset: the picture as kept, or with `preview` a small
+    /// JPEG of it made on first asking. At most [`super::PhotoGetParams::MAX_LEN`] bytes a call, so
+    /// a reply fits a BLE line; see [`super::PhotoChunk`]. Answered by `nfcd`.
+    pub const PHOTO_GET: &str = "photo.get";
+    /// Delete one photo, and its preview. Answered by `nfcd`; see [`super::PhotoDeleteResult`].
+    pub const PHOTO_DELETE: &str = "photo.delete";
+    /// Take a photo: the photo tag's pose, flashlight countdown and picture, without the e-ink
+    /// display — the head back to the centre after, the robot left standing or seated as it was.
+    /// No params; the answer is [`super::IntentResult`], given once the sequence has started, not
+    /// once the picture is kept: the picture shows up in [`PHOTO_LIST`] about seven seconds later.
+    ///
+    /// Refused while a photo is being taken (asked, or a tag's), when `robotd` cannot be asked,
+    /// and when the robot is busy with something it would be wrong to interrupt — a skill, a
+    /// ground pick, a rest — the tag's own rule. A robot that is not driving is started first,
+    /// as for the tag. Answered by `nfcd`, which takes them. (v68)
+    pub const PHOTO_TAKE: &str = "photo.take";
+    /// Soccer mode, and autonomous soccer on top of it. Discrete; send as a request, idempotent;
+    /// the answer is [`super::IntentResult`]. Params are [`super::SoccerParams`].
+    ///
+    /// Soccer mode itself moves nothing: it is what a pad daemon reads (in [`ROBOT_MODE`]'s
+    /// answer) to put the kicks on the bumpers and autonomous soccer on D-pad down. Autonomous
+    /// soccer finds the purple ball with the camera, walks to it and kicks it with the nearer
+    /// foot, then looks for it again — sharing the robot the way laser tracking does: a deflected
+    /// client stick wins. Switching soccer on switches laser tracking off, and the other way round.
+    pub const ROBOT_SOCCER: &str = "robot.soccer";
+    /// The duck on its own (`autod`), on or off. Discrete; send as a request, idempotent; the
+    /// answer is [`super::IntentResult`]. Params are [`super::AutonomyParams`].
+    ///
+    /// A switch `robotd` holds and `autod` obeys, read back in [`ROBOT_MODE`]'s answer and in
+    /// [`ROBOT_STATE`]'s `autonomous`. It starts at boot from `[autonomous] enabled`; this changes
+    /// it until the next boot. An NFC `autonomous_mode` tag sends it, and every other mode tag
+    /// switches it off. `docs/design/autonomous.md` owns what the duck then does.
+    pub const ROBOT_AUTONOMOUS: &str = "robot.autonomous";
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`super::ChoraleResult`].
     ///
@@ -818,6 +1123,11 @@ pub mod method {
     /// Another daemon's counts and records since its last report, for the vet book — see
     /// [`crate::vetbook::VetbookTallyParams`]. Local daemons only.
     pub const ROBOT_VETBOOK_TALLY: &str = "robot.vetbookTally";
+
+    /// The speaker level, percent — see [`VolumeResult`]. A read.
+    pub const ROBOT_VOLUME: &str = "robot.volume";
+    /// Set the speaker level: heard at once, and kept in `[audio] volume`.
+    pub const ROBOT_SET_VOLUME: &str = "robot.setVolume";
 
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
@@ -911,6 +1221,17 @@ pub mod method {
     pub const OS_APPLY: &str = "os.apply";
     /// Reboot into the other slot as it is, with no download: the way back from an OS update.
     pub const OS_SWITCH: &str = "os.switch";
+
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    //
+    // Anonymous usage data, sent to PostHog: on by default, and this is the owner's switch.
+    // Served by `updaterd`, which has the network stack and is up whenever the board is. What is
+    // sent and what never is: `docs/robot/telemetry.md`.
+
+    /// Whether this robot shares anonymous usage data.
+    pub const TELEMETRY_STATUS: &str = "telemetry.status";
+    /// Turn sharing on or off, at once and across reboots. Off also forgets the random robot id.
+    pub const TELEMETRY_SET: &str = "telemetry.set";
 
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
@@ -1035,6 +1356,23 @@ pub mod method {
 
     /// One head-IMU sample, pushed after [`HEAD_IMU_STREAM`].
     pub const HEAD_IMU_FRAME: &str = "head_imu.frame";
+
+    // ── map.* ────────────────────────────────────────────────────────────────
+    //
+    // `mapd`'s, on [`super::socket::MAP`]. It builds the map from `robot.state` and `tof.frame`,
+    // the way any client could, and owns nothing else: the robot does not need it to walk.
+
+    /// Where the robot is in its map, whether it knows, and how big the map is.
+    pub const MAP_STATUS: &str = "map.status";
+    /// Subscribe to the pose: answered with the status, then [`MAP_STATE`] notifications at a few
+    /// hertz until the connection closes.
+    pub const MAP_STREAM: &str = "map.stream";
+    /// One pose update, pushed after [`MAP_STREAM`].
+    pub const MAP_STATE: &str = "map.state";
+    /// The map itself, as an occupancy grid.
+    pub const MAP_GRID: &str = "map.grid";
+    /// Forget the map and start a new one from where the robot stands.
+    pub const MAP_WIPE: &str = "map.wipe";
 }
 
 /// JSON-RPC error codes.
@@ -1083,6 +1421,11 @@ pub mod code {
     /// board whose image has no A/B slots. Not [`METHOD_NOT_FOUND`]: the daemon has the route,
     /// and upgrading the app would not change the answer.
     pub const NOT_SUPPORTED: i32 = 15;
+    /// An update refused only because a WebRTC peer is connected and it would drop them. Its own
+    /// code, not [`PREFLIGHT_FAILED`], because a client answers it differently from every other
+    /// refusal: it asks its user whether to drop them, and on yes sends the same call again with
+    /// `interrupt_sessions`. Matching a message would break the first time it was reworded.
+    pub const SESSIONS_CONNECTED: i32 = 16;
 }
 
 /// Request identifier. `None` on a [`Request`] makes it a notification.
@@ -1123,7 +1466,6 @@ pub enum Call {
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
-    RobotRemoteSessionActive,
 
     // ── intents ──────────────────────────────────────────────────────────────
     /// Continuous. Send as a notification.
@@ -1154,6 +1496,12 @@ pub enum Call {
     RobotFlashlight(FlashlightParams),
     /// Pick the ToF theremin up or put it down. Discrete; the answer is [`ThereminResult`].
     RobotTheremin(ThereminParams),
+    /// Switch laser tracking on or off. Discrete; the answer is [`LaserTrackResult`].
+    RobotLaserTrack(LaserTrackParams),
+    /// Soccer mode and autonomous soccer. Discrete; the answer is [`IntentResult`].
+    RobotSoccer(SoccerParams),
+    /// The duck on its own, on or off. Discrete; the answer is [`IntentResult`].
+    RobotAutonomous(AutonomyParams),
     /// Start or stop looking for other ducks to sing with. Discrete; the answer is
     /// [`ChoraleResult`].
     RobotChorale(ChoraleParams),
@@ -1180,6 +1528,10 @@ pub enum Call {
     RobotVetbookNote(vetbook::VetbookNoteParams),
     /// Add another daemon's counts to it; see [`method::ROBOT_VETBOOK_TALLY`].
     RobotVetbookTally(vetbook::VetbookTallyParams),
+    /// The speaker level; see [`method::ROBOT_VOLUME`].
+    RobotVolume,
+    /// Set it; see [`method::ROBOT_SET_VOLUME`].
+    RobotSetVolume(VolumeParams),
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -1220,6 +1572,12 @@ pub enum Call {
     OsApply(OsApplyParams),
     /// Reboot into the other slot; see [`method::OS_SWITCH`].
     OsSwitch(OsSwitchParams),
+
+    // ── telemetry.* ──────────────────────────────────────────────────────────
+    /// Whether usage data is shared; see [`method::TELEMETRY_STATUS`].
+    TelemetryStatus,
+    /// Turn sharing on or off; see [`method::TELEMETRY_SET`].
+    TelemetrySet(TelemetrySetParams),
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -1266,13 +1624,30 @@ pub enum Call {
     /// Subscribe to the head IMU (`tofd` on zero3, `robotd` on beta); see
     /// [`method::HEAD_IMU_STREAM`].
     HeadImuStream,
+    /// Write a text onto the next tag touched; see [`method::NFC_WRITE`]. Answered by `nfcd`.
+    NfcWrite(NfcWriteParams),
+    /// Read the next tag touched; see [`method::NFC_READ`]. Answered by `nfcd`.
+    NfcRead(NfcReadParams),
+    /// The photos kept; see [`method::PHOTO_LIST`]. Answered by `nfcd`.
+    PhotoList,
+    /// A chunk of one photo; see [`method::PHOTO_GET`]. Answered by `nfcd`.
+    PhotoGet(PhotoGetParams),
+    /// Delete one photo; see [`method::PHOTO_DELETE`]. Answered by `nfcd`.
+    PhotoDelete(PhotoDeleteParams),
+    /// Take a photo; see [`method::PHOTO_TAKE`]. Answered by `nfcd`.
+    PhotoTake,
+    /// Answered by `mapd`; see [`method::MAP_STATUS`].
+    MapStatus,
+    MapStream,
+    MapGrid(MapGridParams),
+    MapWipe,
 }
 
 /// The service that owns the answer to a call.
 ///
 /// One socket per service, connected directly — there is no broker (`architecture.md` §2.2). A
 /// transport adapter holds connections to the services whose calls it carries, and to no others:
-/// `btd` holds three, and `padd` being absent from them is deliberate rather than incidental —
+/// `btd` holds four, and `padd` being absent from them is deliberate rather than incidental —
 /// `padd` is the unprivileged client whose whole value is having no special access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
@@ -1286,6 +1661,10 @@ pub enum Service {
     Pad,
     /// `tofd` — the depth stream.
     Tof,
+    /// `nfcd` — writing and reading a tag.
+    Nfc,
+    /// `mapd` — the map and the pose in it.
+    Map,
 }
 
 /// How long answering a call holds a connection, and therefore which connection carries it.
@@ -1336,7 +1715,6 @@ impl Call {
             Call::RobotSafeToRestart => method::ROBOT_SAFE_TO_RESTART,
             Call::RobotHealth => method::ROBOT_HEALTH,
             Call::RobotModelApi => method::ROBOT_MODEL_API,
-            Call::RobotRemoteSessionActive => method::ROBOT_SESSION_ACTIVE,
             Call::RobotMove(_) => method::ROBOT_MOVE,
             Call::RobotHead(_) => method::ROBOT_HEAD,
             Call::RobotLook(_) => method::ROBOT_LOOK,
@@ -1352,6 +1730,15 @@ impl Call {
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotFlashlight(_) => method::ROBOT_FLASHLIGHT,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
+            Call::RobotLaserTrack(_) => method::ROBOT_LASER_TRACK,
+            Call::NfcWrite(_) => method::NFC_WRITE,
+            Call::NfcRead(_) => method::NFC_READ,
+            Call::PhotoList => method::PHOTO_LIST,
+            Call::PhotoGet(_) => method::PHOTO_GET,
+            Call::PhotoDelete(_) => method::PHOTO_DELETE,
+            Call::PhotoTake => method::PHOTO_TAKE,
+            Call::RobotSoccer(_) => method::ROBOT_SOCCER,
+            Call::RobotAutonomous(_) => method::ROBOT_AUTONOMOUS,
             Call::RobotChorale(_) => method::ROBOT_CHORALE,
             Call::ChoraleSubscribe => method::CHORALE_SUBSCRIBE,
             Call::ChoraleBeaconSet(_) => method::CHORALE_BEACON,
@@ -1364,6 +1751,8 @@ impl Call {
             Call::RobotVetbook => method::ROBOT_VETBOOK,
             Call::RobotVetbookNote(_) => method::ROBOT_VETBOOK_NOTE,
             Call::RobotVetbookTally(_) => method::ROBOT_VETBOOK_TALLY,
+            Call::RobotVolume => method::ROBOT_VOLUME,
+            Call::RobotSetVolume(_) => method::ROBOT_SET_VOLUME,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1380,6 +1769,8 @@ impl Call {
             Call::OsCheck => method::OS_CHECK,
             Call::OsApply(_) => method::OS_APPLY,
             Call::OsSwitch(_) => method::OS_SWITCH,
+            Call::TelemetryStatus => method::TELEMETRY_STATUS,
+            Call::TelemetrySet(_) => method::TELEMETRY_SET,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -1404,6 +1795,10 @@ impl Call {
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
             Call::HeadImuStream => method::HEAD_IMU_STREAM,
+            Call::MapStatus => method::MAP_STATUS,
+            Call::MapStream => method::MAP_STREAM,
+            Call::MapGrid(_) => method::MAP_GRID,
+            Call::MapWipe => method::MAP_WIPE,
         }
     }
 
@@ -1461,6 +1856,9 @@ impl Call {
                                       // account root already signed in — with a token the `robot` group can read, so
                                       // this gate would protect nothing and only put `sudo` in front of a share button.
                                       // Which transports may carry it is the route tables' decision, not this one.
+                // Forgetting the map throws away what the robot learned of its home over hours,
+                // and nothing brings it back. Asking where it is stays ungated.
+                | Call::MapWipe
         )
     }
 
@@ -1538,6 +1936,8 @@ impl Call {
             // worth of waiting, so a refusal the script makes at once comes back as an error
             // rather than as a phase. Long enough to want its own lane, and they change the robot.
             Call::OsApply(_) | Call::OsSwitch(_) => (Updater, Operation),
+            // A small file and a flag; the sending happens in a task `updaterd` owns.
+            Call::TelemetryStatus | Call::TelemetrySet(_) => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -1545,7 +1945,6 @@ impl Call {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
@@ -1554,6 +1953,8 @@ impl Call {
             Call::RobotVetbookNote(_) => (Robot, Prompt),
             // A merge into the book under its lock, and nothing else.
             Call::RobotVetbookTally(_) => (Robot, Prompt),
+            // A read of the config, and a small write to it plus two `amixer` calls.
+            Call::RobotVolume | Call::RobotSetVolume(_) => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
             Call::RobotMove(_)
@@ -1571,6 +1972,9 @@ impl Call {
             | Call::RobotSound(_)
             | Call::RobotFlashlight(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
+            | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
             | Call::RobotLoadPolicy(_)
@@ -1624,6 +2028,24 @@ impl Call {
             Call::PadInput => (Pad, Stream),
             Call::TofStream => (Tof, Stream),
             Call::HeadImuStream => (Tof, Stream),
+
+            // ── nfcd ────────────────────────────────────────────────────────
+            //
+            // Waits for somebody to touch a tag, up to the timeout it was given: seconds, so its
+            // own lane.
+            Call::NfcWrite(_) | Call::NfcRead(_) => (Nfc, Operation),
+            // A directory listing and a file read: milliseconds, and a preview's first making is
+            // one JPEG decoded and shrunk, well under a second.
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) => (Nfc, Prompt),
+            // Answered once the sequence has started — one `robot.state` read to see the robot is
+            // free — not once the picture is kept.
+            Call::PhotoTake => (Nfc, Prompt),
+            // ── mapd ────────────────────────────────────────────────────────
+            //
+            // Status and grid are lookups of what the mapper already holds; the grid is rendered
+            // on demand, a few milliseconds for a house. A wipe deletes a file.
+            Call::MapStatus | Call::MapGrid(_) | Call::MapWipe => (Map, Prompt),
+            Call::MapStream => (Map, Stream),
 
             // ── answered by no service ──────────────────────────────────────
             //
@@ -1688,11 +2110,20 @@ impl Call {
             Call::VetbookShare(p) => encode(p),
             Call::OsApply(p) => encode(p),
             Call::OsSwitch(p) => encode(p),
+            Call::TelemetrySet(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotFlashlight(p) => encode(p),
             Call::RobotVetbookNote(p) => encode(p),
             Call::RobotVetbookTally(p) => encode(p),
+            Call::RobotSetVolume(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
+            Call::RobotLaserTrack(p) => encode(p),
+            Call::NfcWrite(p) => encode(p),
+            Call::NfcRead(p) => encode(p),
+            Call::PhotoGet(p) => encode(p),
+            Call::PhotoDelete(p) => encode(p),
+            Call::RobotSoccer(p) => encode(p),
+            Call::RobotAutonomous(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
             Call::ChoraleBeaconSet(p) => encode(p),
             Call::ChoraleHeard(p) => encode(p),
@@ -1713,7 +2144,6 @@ impl Call {
             | Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotStop
             | Call::RobotInit
             | Call::RobotRelax
@@ -1722,6 +2152,7 @@ impl Call {
             | Call::RobotPolicies
             | Call::RobotModel
             | Call::RobotVetbook
+            | Call::RobotVolume
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::DetectorCheck
@@ -1729,6 +2160,7 @@ impl Call {
             | Call::AccountLogout
             | Call::OsStatus
             | Call::OsCheck
+            | Call::TelemetryStatus
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1742,7 +2174,13 @@ impl Call {
             | Call::PadInput
             | Call::TofStream
             | Call::HeadImuStream
+            | Call::MapStatus
+            | Call::MapStream
+            | Call::MapWipe
+            | Call::PhotoList
+            | Call::PhotoTake
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
+            Call::MapGrid(p) => encode(p),
         }
     }
 
@@ -1773,7 +2211,6 @@ impl Call {
             method::ROBOT_SAFE_TO_RESTART => Call::RobotSafeToRestart,
             method::ROBOT_HEALTH => Call::RobotHealth,
             method::ROBOT_MODEL_API => Call::RobotModelApi,
-            method::ROBOT_SESSION_ACTIVE => Call::RobotRemoteSessionActive,
             method::ROBOT_MOVE => Call::RobotMove(decode(params)?),
             method::ROBOT_HEAD => Call::RobotHead(decode(params)?),
             method::ROBOT_LOOK => Call::RobotLook(decode(params)?),
@@ -1789,6 +2226,18 @@ impl Call {
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_FLASHLIGHT => Call::RobotFlashlight(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
+            method::ROBOT_LASER_TRACK => Call::RobotLaserTrack(decode(params)?),
+            method::NFC_WRITE => Call::NfcWrite(decode(params)?),
+            method::NFC_READ => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::NfcRead(decode(params.or(Some(&empty)))?)
+            }
+            method::PHOTO_LIST => Call::PhotoList,
+            method::PHOTO_TAKE => Call::PhotoTake,
+            method::PHOTO_GET => Call::PhotoGet(decode(params)?),
+            method::PHOTO_DELETE => Call::PhotoDelete(decode(params)?),
+            method::ROBOT_SOCCER => Call::RobotSoccer(decode(params)?),
+            method::ROBOT_AUTONOMOUS => Call::RobotAutonomous(decode(params)?),
             method::ROBOT_CHORALE => Call::RobotChorale(decode(params)?),
             method::CHORALE_SUBSCRIBE => Call::ChoraleSubscribe,
             method::CHORALE_BEACON => Call::ChoraleBeaconSet(decode(params)?),
@@ -1801,6 +2250,8 @@ impl Call {
             method::ROBOT_VETBOOK => Call::RobotVetbook,
             method::ROBOT_VETBOOK_NOTE => Call::RobotVetbookNote(decode(params)?),
             method::ROBOT_VETBOOK_TALLY => Call::RobotVetbookTally(decode(params)?),
+            method::ROBOT_VOLUME => Call::RobotVolume,
+            method::ROBOT_SET_VOLUME => Call::RobotSetVolume(decode(params)?),
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -1830,6 +2281,8 @@ impl Call {
                 let empty = Value::Object(serde_json::Map::new());
                 Call::OsSwitch(decode(params.or(Some(&empty)))?)
             }
+            method::TELEMETRY_STATUS => Call::TelemetryStatus,
+            method::TELEMETRY_SET => Call::TelemetrySet(decode(params)?),
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1862,6 +2315,13 @@ impl Call {
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
             method::HEAD_IMU_STREAM => Call::HeadImuStream,
+            method::MAP_STATUS => Call::MapStatus,
+            method::MAP_STREAM => Call::MapStream,
+            method::MAP_GRID => {
+                let empty = Value::Object(serde_json::Map::new());
+                Call::MapGrid(decode(params.or(Some(&empty)))?)
+            }
+            method::MAP_WIPE => Call::MapWipe,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -1897,6 +2357,7 @@ pub mod test_support {
         vec![
             Call::Hello(HelloParams {
                 api_version: API_VERSION,
+                client: Some("autod".into()),
             }),
             Call::Check(ComponentParams {
                 component: component.clone(),
@@ -1932,7 +2393,6 @@ pub mod test_support {
             Call::RobotSafeToRestart,
             Call::RobotHealth,
             Call::RobotModelApi,
-            Call::RobotRemoteSessionActive,
             Call::RobotMove(MoveParams {
                 vx: 0.2,
                 vy: -0.1,
@@ -1943,6 +2403,7 @@ pub mod test_support {
                 head_pitch: -0.1,
                 head_yaw: 0.2,
                 head_roll: 0.0,
+                alpha: Some(0.8),
             }),
             Call::RobotLook(LookParams {
                 x: 1.0,
@@ -1977,8 +2438,10 @@ pub mod test_support {
                 on: true,
                 toggle: false,
                 color: FlashlightColor::Cyan,
+                brightness: Some(0.25),
             }),
             Call::RobotShutdown,
+            Call::RobotAutonomous(AutonomyParams { active: true }),
             Call::RobotMode,
             Call::RobotPolicies,
             Call::RobotModel,
@@ -1986,6 +2449,8 @@ pub mod test_support {
             Call::RobotVetbookNote(vetbook::VetbookNoteParams {
                 text: "reglued the beak".into(),
             }),
+            Call::RobotVolume,
+            Call::RobotSetVolume(VolumeParams { volume: 40 }),
             Call::RobotVetbookTally(vetbook::VetbookTallyParams {
                 tallies: [(vetbook::key::PHOTOS.to_owned(), 1.0)].into(),
                 ..Default::default()
@@ -2020,6 +2485,8 @@ pub mod test_support {
             Call::OsSwitch(OsSwitchParams {
                 interrupt_sessions: true,
             }),
+            Call::TelemetryStatus,
+            Call::TelemetrySet(TelemetrySetParams { enabled: false }),
             Call::RobotLoadPolicy(LoadPolicyParams {
                 slot: Some("walk".into()),
                 path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
@@ -2073,6 +2540,28 @@ pub mod test_support {
             Call::PadInput,
             Call::TofStream,
             Call::HeadImuStream,
+            Call::NfcWrite(NfcWriteParams {
+                text: "walk_mode".into(),
+                timeout_s: Some(30),
+            }),
+            Call::NfcRead(NfcReadParams {
+                timeout_s: Some(30),
+            }),
+            Call::PhotoList,
+            Call::PhotoGet(PhotoGetParams {
+                name: "2026-11-11_14-03-27".into(),
+                preview: true,
+                offset: 16384,
+                len: Some(4096),
+            }),
+            Call::PhotoDelete(PhotoDeleteParams {
+                name: "2026-11-11_14-03-27-2".into(),
+            }),
+            Call::PhotoTake,
+            Call::MapStatus,
+            Call::MapStream,
+            Call::MapGrid(MapGridParams { res_m: Some(0.05) }),
+            Call::MapWipe,
         ]
     }
 }
@@ -2165,6 +2654,24 @@ impl Request {
             method: method::TOF_FRAME.to_owned(),
             params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
         }
+    }
+
+    /// A map pose notification: no `id`.
+    pub fn notify_map_state(state: &MapState) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::MAP_STATE.to_owned(),
+            params: Some(serde_json::to_value(state).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a map pose notification back.
+    pub fn as_map_state(&self) -> Option<MapState> {
+        if self.method != method::MAP_STATE {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
     }
 
     /// Read a depth-frame notification back.
@@ -2342,6 +2849,9 @@ impl From<&str> for ComponentId {
 #[serde(deny_unknown_fields)]
 pub struct HelloParams {
     pub api_version: u32,
+    /// Who is calling, for [`MoveState::source`]. A short stable name, `padd` or `autod`. (v60)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2386,6 +2896,15 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+    /// How fast the head glides to this target: the per-tick EMA rate, 0..1, where 1 means
+    /// "arrive at once". Absent means `[control] head_alpha`, the shared feel every other client
+    /// gets.
+    ///
+    /// It exists for motion faster than that rate lets through. At 0.2 and 50 Hz, a 4.5 Hz feather
+    /// shake arrives at about a third of its amplitude. It applies to this target only: the next
+    /// `robot.head` without it goes back to the shared rate. Clamped to 0..1. (v60)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
 }
 
 /// A point to look at, trunk frame, metres — see [`method::ROBOT_LOOK`]. The gaze form
@@ -2434,6 +2953,8 @@ pub enum SoundTag {
     Coo,
     /// The held joy ride: start → loop while held → end.
     Wheee,
+    /// A tiny cute retch and a bubble — letting go of what the beak held. (v63)
+    Bwep,
 }
 
 impl SoundTag {
@@ -2447,6 +2968,7 @@ impl SoundTag {
             SoundTag::Chirp => "chirp",
             SoundTag::Coo => "coo",
             SoundTag::Wheee => "wheee",
+            SoundTag::Bwep => "bwep",
         }
     }
 }
@@ -2494,13 +3016,17 @@ impl FlashlightColor {
 
 /// See [`method::ROBOT_FLASHLIGHT`]. Shaped like [`EnableParams`]: `toggle` wins over `on`, so a
 /// button that does not know the light's state can still flip it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlashlightParams {
     pub on: bool,
     pub toggle: bool,
     /// The colour it lights in. Ignored when the call switches it off.
     pub color: FlashlightColor,
+    /// How bright, 0 to 1 of the LED's full brightness, clamped by the robot. Absent is full.
+    /// Ignored when the call switches it off. (v62)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<f64>,
 }
 
 /// See [`method::ROBOT_THEREMIN`].
@@ -2571,6 +3097,481 @@ pub struct ThereminState {
     /// "valid" codes and died at exactly that distance, invisibly, for want of this line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor: Option<String>,
+}
+
+/// See [`method::ROBOT_LASER_TRACK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaserTrackParams {
+    /// True switches tracking on, false off. Idempotent both ways.
+    pub active: bool,
+}
+
+/// Answer to [`Call::RobotLaserTrack`].
+///
+/// Refused only for what the robot knows at the door — `[laser]` will not parse, say. Whether
+/// `mediad` is answering is *not* a refusal: it may be restarting, and the tracker reconnects by
+/// itself; [`LaserTrackState::camera`] says what it is waiting for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackResult {
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for LaserTrackResult {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+        }
+    }
+}
+
+/// See [`method::NFC_WRITE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfcWriteParams {
+    /// What the tag will read: `walk_mode`, `microduck_gamepad_pairing`, any text.
+    pub text: String,
+    /// How long to wait for a tag, in seconds. Absent: [`NfcWriteParams::DEFAULT_TIMEOUT_S`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+}
+
+impl NfcWriteParams {
+    pub const DEFAULT_TIMEOUT_S: u32 = 20;
+    /// The longest wait asked for that is honoured; more is cut to this.
+    pub const MAX_TIMEOUT_S: u32 = 120;
+
+    /// The wait this asks for, defaulted and capped.
+    pub fn timeout(&self) -> std::time::Duration {
+        let s = self
+            .timeout_s
+            .unwrap_or(Self::DEFAULT_TIMEOUT_S)
+            .clamp(1, Self::MAX_TIMEOUT_S);
+        std::time::Duration::from_secs(u64::from(s))
+    }
+}
+
+/// See [`method::NFC_READ`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NfcReadParams {
+    /// How long to wait for a tag, in seconds. Absent: [`NfcWriteParams::DEFAULT_TIMEOUT_S`],
+    /// capped as a write's is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+}
+
+impl NfcReadParams {
+    /// The wait this asks for, defaulted and capped as [`NfcWriteParams::timeout`] is.
+    pub fn timeout(&self) -> std::time::Duration {
+        NfcWriteParams {
+            text: String::new(),
+            timeout_s: self.timeout_s,
+        }
+        .timeout()
+    }
+}
+
+/// Answer to [`Call::NfcRead`]: what the tag touched holds, or why nothing was read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfcReadResult {
+    /// A tag was touched and its memory read. True for a blank tag too, with no records.
+    pub read: bool,
+    /// The tag's UID, `04:a1:…`, when one was touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// The NDEF message's text and URI records, in order. Records of any other type are left out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub records: Vec<NfcRecord>,
+    /// Why nothing was read — no tag in time, a MIFARE Classic — or, with `read`, why the memory
+    /// holds no NDEF message: a blank tag, one lifted during a write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Answer to [`Call::PhotoList`]: every photo kept, newest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoListResult {
+    pub photos: Vec<Photo>,
+}
+
+/// One photo the photo sequence kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Photo {
+    /// The file's name without `.jpg`: the robot's local time it was taken at,
+    /// `2026-11-11_14-03-27`, with `-2`, `-3`, … for a second one in the same second. What
+    /// [`Call::PhotoGet`] and [`Call::PhotoDelete`] name it by, and what a phone keeps it under.
+    pub name: String,
+    /// The picture's size in bytes, which is what reading it to the end takes.
+    pub bytes: u64,
+    /// When it was written, in seconds since the epoch: the file's modification time. A robot
+    /// that had no clock yet when it took the photo says so with a time in 1970, and the name has
+    /// the same wrong time in it.
+    pub taken_s: u64,
+}
+
+/// See [`method::PHOTO_GET`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoGetParams {
+    /// A [`Photo::name`] from [`Call::PhotoList`]. Anything that is not one — a path, a `..` — is
+    /// refused rather than looked for.
+    pub name: String,
+    /// The small preview rather than the picture: a JPEG [`PhotoGetParams::PREVIEW_SIDE`] pixels
+    /// on its longer side, about a single chunk. Made on first asking and kept beside the photo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preview: bool,
+    /// Where to start, in bytes.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub offset: u64,
+    /// How many bytes, at most. Absent, or more than [`PhotoGetParams::MAX_LEN`], is that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u32>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
+impl PhotoGetParams {
+    /// The most one call answers with. 16 KiB is about 22 KB of base64, well inside a BLE reply
+    /// line (`duck_ble::framing::MAX_REPLY_LINE`, 64 KiB) and a second or so on the air at a
+    /// phone's MTU, so a long download stays a series of short answers that each say how far it
+    /// got.
+    pub const MAX_LEN: u32 = 16 * 1024;
+    /// The preview's longer side, in pixels: a grid tile on a phone at 3x.
+    pub const PREVIEW_SIDE: u32 = 360;
+
+    /// The length this asks for, defaulted and capped.
+    pub fn chunk_len(&self) -> u32 {
+        self.len.unwrap_or(Self::MAX_LEN).clamp(1, Self::MAX_LEN)
+    }
+}
+
+/// Answer to [`Call::PhotoGet`]: one chunk of the file, and how big the whole of it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhotoChunk {
+    pub name: String,
+    /// The whole file's size — the picture's, or the preview's — so a reader knows when it is
+    /// done and how far along it is.
+    pub total: u64,
+    /// Where this chunk starts, as asked.
+    pub offset: u64,
+    /// The bytes, base64 (standard alphabet, padded). Empty at or past the end.
+    pub data: String,
+}
+
+/// See [`method::PHOTO_DELETE`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoDeleteParams {
+    /// A [`Photo::name`]; refused as [`PhotoGetParams::name`] is.
+    pub name: String,
+}
+
+/// Answer to [`Call::PhotoDelete`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PhotoDeleteResult {
+    /// False when there was no such photo — already deleted, say — which is not an error.
+    pub deleted: bool,
+}
+
+/// One NDEF record on a tag, as a person wrote it: `{"type": "text", "value": "walk_mode"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "lowercase")]
+pub enum NfcRecord {
+    Text(String),
+    Uri(String),
+}
+
+/// Answer to [`Call::NfcWrite`]: the tag was written and read back, or why not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NfcWriteResult {
+    pub written: bool,
+    /// The tag's UID, `04:a1:…`, when one was touched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    /// Why nothing was written: no tag in time, a tag that is not an NTAG, a text too long.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// What laser tracking is doing, in [`RobotState`]. Absent while tracking is off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserTrackState {
+    /// The camera side, as a line: `looking at 1–15 Hz`, or why it is not — `mediad` not answering,
+    /// no camera geometry. The first thing to read when nothing happens.
+    pub camera: String,
+    /// The newest look's answer from `mediad`, if there has been one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dot: Option<LaserDot>,
+    /// Where the dot is on the floor, in the robot's own heading frame (+x ahead, +y left),
+    /// metres — the last sighting, carried by odometry while it is remembered. `None` when there
+    /// is nothing to follow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_m: Option<[f64; 2]>,
+    /// How long since the dot was last seen, milliseconds. `None` before the first sighting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// The head is following the dot this tick.
+    #[serde(default, skip_serializing_if = "not")]
+    pub head: bool,
+    /// The legs are following the dot this tick — false while a client stick is deflected, the
+    /// policy is not driving, or the robot has parked on the dot.
+    #[serde(default, skip_serializing_if = "not")]
+    pub walk: bool,
+    /// The velocity tracking asked for this tick, `[vx, vy, vyaw]` — before the loop's own
+    /// smoothing and limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twist: Option<[f64; 3]>,
+}
+
+/// [`method::MEDIA_LASER`]'s params: what counts as a laser dot, and how often to look.
+///
+/// Thresholds are in the camera's own YUV (BT.601, 0–255; chroma 128 is grey). The stream runs
+/// at its normal auto-exposure — nothing here touches the sensor — so a dot's core saturates
+/// towards white and its *rim* is where the red is: bright and red both, which is what these
+/// gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LaserDetectParams {
+    /// Luma a dot pixel must reach.
+    pub y_min: u8,
+    /// Red chroma (Cr / V) a dot pixel must reach.
+    pub v_min: u8,
+    /// Blue chroma (Cb / U) a dot pixel must stay under — rejects bright whites and pinks.
+    pub u_max: u8,
+    /// Fewest pixels around the brightest hit for it to be a dot rather than noise.
+    pub min_pixels: u32,
+    /// Most pixels around the brightest hit for it to still be a dot rather than a red lamp.
+    pub max_pixels: u32,
+    /// How far around the brightest hit belongs to the same dot, pixels of the full frame.
+    pub radius_px: u32,
+    /// Looks per second with no dot in sight.
+    pub search_hz: f64,
+    /// Looks per second while a dot is being seen, and for a second after.
+    pub track_hz: f64,
+}
+
+impl Default for LaserDetectParams {
+    fn default() -> Self {
+        Self {
+            y_min: 150,
+            v_min: 165,
+            u_max: 140,
+            min_pixels: 3,
+            max_pixels: 600,
+            radius_px: 24,
+            // Measured on a face-board-v1: 3 Hz cost 3.4% of a core in mediad, and each look costs
+            // the same, so 1 Hz is about a third of that — for half a second's wait, on average,
+            // before a dot is first noticed. Tracking itself is unaffected.
+            search_hz: 1.0,
+            track_hz: 15.0,
+        }
+    }
+}
+
+/// One look's answer, the params of [`method::MEDIA_LASER_DOT`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaserDot {
+    /// A dot passed every threshold. False is still a message: the tracker needs to hear it.
+    pub seen: bool,
+    /// The dot's direction as a cv2 camera ray `[x, y, 1]` (+x right, +y down, +z out of the
+    /// lens) of the camera **upright** — the board's mount turn and the lens's intrinsics already
+    /// undone, so a consumer needs nothing but the head FK. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ray: Option<[f64; 2]>,
+    /// Where the dot is in the upright picture, pixels, for a readout. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<[f64; 2]>,
+    /// The upright picture's size, `[width, height]` — what `px` and `candidate_px` are in, so a
+    /// display can scale them without knowing the camera or its mount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where a candidate that passed the colour thresholds but was then rejected by size sat, in
+    /// the upright picture's pixels — what an overlay draws to show a near miss.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
+    /// Pixels counted in the dot (sampled, so a fraction of the real area), or 0.
+    pub pixels: u32,
+    /// The best candidate's colour, `[Y, U, V]` — the brightest red-leaning pixel in the frame,
+    /// reported **whether or not it passed**. Point the laser, read this, set the thresholds a
+    /// little below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_yuv: Option<[u8; 3]>,
+    /// Why a candidate was rejected, when there was one and it was: `"too small"`, `"too big"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// The rate this look was taken at, looks per second.
+    pub hz: f64,
+    /// Scan time for this look, milliseconds.
+    pub took_ms: f64,
+}
+
+/// See [`method::ROBOT_SOCCER`].
+///
+/// | `active` | `autonomous` | |
+/// |---|---|---|
+/// | `false` | either | soccer mode off, and autonomous with it |
+/// | `true` | `false` | soccer mode, driven by hand: the bumpers kick |
+/// | `true` | `true` | autonomous soccer: find the ball, walk to it, kick it |
+///
+/// `autonomous` defaults to false, so `{"active": true}` is what an NFC tag sends.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoccerParams {
+    pub active: bool,
+    #[serde(default)]
+    pub autonomous: bool,
+}
+
+/// See [`method::ROBOT_AUTONOMOUS`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutonomyParams {
+    pub active: bool,
+}
+
+/// What soccer mode is doing, in [`RobotState`]. Absent while soccer mode is off.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoccerState {
+    /// Autonomous soccer is on. False is soccer mode driven by hand, and then nothing below is
+    /// filled in: the camera is not being looked at.
+    pub autonomous: bool,
+    /// What autonomous soccer is doing, as a word: `manual`, `searching`, `approaching`,
+    /// `lining up`, `kicking`, `waiting for the policy`.
+    pub phase: String,
+    /// The camera side, as a line — `looking at 3 Hz`, or why it is not. The first thing to read
+    /// when nothing happens.
+    pub camera: String,
+    /// The newest look's answer from `mediad`, if there has been one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ball: Option<BallSeen>,
+    /// Where the ball is on the floor in the robot's own heading frame (+x ahead, +y left),
+    /// metres — the last sighting, carried by odometry while it is remembered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_m: Option<[f64; 2]>,
+    /// The ball's distance from its apparent size alone, metres — a cross-check on `target_m`,
+    /// which comes from the floor. Two numbers that disagree say `[soccer] floor_offset_m` or the
+    /// camera calibration is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_range_m: Option<f64>,
+    /// How long since the ball was last seen, milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_ms: Option<u64>,
+    /// How far the ball is from the kick spot, `[x, y]` metres (+x: still ahead of it, +y: to
+    /// the left of it), while lining up. What to read when the robot stands at the ball and does
+    /// not kick.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spot_m: Option<[f64; 2]>,
+    /// The foot the robot is lining up to kick with, `left` or `right`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foot: Option<String>,
+    /// Kicks started since autonomous soccer was switched on.
+    pub kicks: u32,
+    /// The head is following the ball this tick.
+    #[serde(default, skip_serializing_if = "not")]
+    pub head: bool,
+    /// The legs are autonomous soccer's this tick — false while a client stick is deflected.
+    #[serde(default, skip_serializing_if = "not")]
+    pub walk: bool,
+    /// The velocity asked for this tick, `[vx, vy, vyaw]`, before the loop's smoothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub twist: Option<[f64; 3]>,
+}
+
+/// [`method::MEDIA_BALL`]'s params: what counts as the ball, and how often to look.
+///
+/// Colour is in the camera's own YUV (BT.601, 0–255; chroma 128 is grey). Purple is the one
+/// colour with **both** chromas above grey — blue has V below, red and skin have U below — so a
+/// ball pixel is one whose U and V both reach their minimums. The shape gates reject a purple
+/// thing that is not round.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BallDetectParams {
+    /// Blue chroma (Cb / U) a ball pixel must reach.
+    pub u_min: u8,
+    /// Red chroma (Cr / V) a ball pixel must reach.
+    pub v_min: u8,
+    /// Luma a ball pixel must reach — below it, chroma is sensor noise.
+    pub y_min: u8,
+    /// Fewest grid cells (one per 4×4 pixels) that make a ball.
+    pub min_cells: u32,
+    /// How much of its bounding box the blob must fill. A disc fills π/4 ≈ 0.79.
+    pub min_fill: f64,
+    /// Longest side over shortest side of the blob's box, for a blob clear of the frame's edge.
+    pub max_aspect: f64,
+    /// Looks per second with no ball in sight.
+    pub search_hz: f64,
+    /// Looks per second while the ball is seen, and for a second after.
+    pub track_hz: f64,
+}
+
+impl Default for BallDetectParams {
+    fn default() -> Self {
+        Self {
+            u_min: 145,
+            v_min: 134,
+            y_min: 20,
+            min_cells: 6,
+            min_fill: 0.45,
+            max_aspect: 1.8,
+            search_hz: 5.0,
+            track_hz: 15.0,
+        }
+    }
+}
+
+/// One look's answer, the params of [`method::MEDIA_BALL_SEEN`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BallSeen {
+    /// A ball passed every gate. False is still a message: the tracker needs to hear it.
+    pub seen: bool,
+    /// The ball centre's direction as a cv2 ray `[x, y, 1]` of the camera **upright** — mount and
+    /// intrinsics undone, as [`LaserDot::ray`]. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ray: Option<[f64; 2]>,
+    /// The ball's apparent diameter in the same normalised units as `ray` — so its distance is
+    /// about the ball's diameter over this. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    /// The ball's centre in the upright picture, pixels. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub px: Option<[f64; 2]>,
+    /// The ball's radius in pixels, for an overlay. Present when `seen`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radius_px: Option<f64>,
+    /// The upright picture's size, `[width, height]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<[u32; 2]>,
+    /// Where the biggest purple blob sat when it was rejected, upright pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_px: Option<[f64; 2]>,
+    /// Grid cells in the ball, or in the rejected blob.
+    pub cells: u32,
+    /// The most purple sample in the frame, `[Y, U, V]`, **whether or not it passed** — hold the
+    /// ball up, read this, set the thresholds a little below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_yuv: Option<[u8; 3]>,
+    /// Why the biggest blob was rejected: `"too small"`, `"not round"`, `"not filled"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<String>,
+    /// The rate this look was taken at, looks per second.
+    pub hz: f64,
+    /// Scan time for this look, milliseconds.
+    pub took_ms: f64,
 }
 
 /// The one-shot skills, plus the sit↔stand toggle. See [`method::ROBOT_DO`].
@@ -2655,6 +3656,26 @@ pub struct ModeResult {
     /// `"walk"` or `"roller"`. A string rather than an enum so a client older than a new
     /// mode reports it instead of failing to parse the answer.
     pub mode: String,
+    /// Soccer mode's two switches, while soccer mode is on; absent while it is off. Here because
+    /// `padd` and `netpadd` already ask `robot.mode` once a second, and soccer mode changes what
+    /// the pad's buttons do. (v58)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soccer: Option<SoccerParams>,
+    /// The duck on its own is switched on ([`method::ROBOT_AUTONOMOUS`]): a pad daemon then keeps
+    /// quiet until its pad is touched. Absent while off. (v60)
+    #[serde(default, skip_serializing_if = "not")]
+    pub autonomous: bool,
+    /// Laser tracking is switched on ([`method::ROBOT_LASER_TRACK`]), whether or not a dot is in
+    /// sight. Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub laser: bool,
+    /// A theremin is up ([`method::ROBOT_THEREMIN`]): armed or playing. Absent while down — the
+    /// loop puts it down by itself when the robot walks or goes over. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub theremin: bool,
+    /// The flashlight is lit ([`method::ROBOT_FLASHLIGHT`]). Absent while off. (v67)
+    #[serde(default, skip_serializing_if = "not")]
+    pub flashlight: bool,
 }
 
 /// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
@@ -2872,6 +3893,11 @@ pub struct PolicyFetchResult {
     pub chain: bool,
     /// The manifest's `schema_version`, so a client can say which convention it read.
     pub schema_version: Option<u32>,
+    /// The manifest's `entry_pose`, verbatim: `"standing"` or `"seated"` is the vocabulary, and
+    /// what decides which pose the robot will start the skill in. Verbatim rather than parsed, so
+    /// a client can tell "said nothing" from "said something this build does not understand" and
+    /// ask the publisher for the word. Absent from an older `updaterd`.
+    pub entry_pose: Option<String>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].
@@ -3019,6 +4045,23 @@ pub struct OsSwitchParams {
     /// Skip *only* the "no active remote session" preflight check, as for `update.apply`.
     #[serde(default)]
     pub interrupt_sessions: bool,
+}
+
+/// Parameters of [`Call::TelemetrySet`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySetParams {
+    pub enabled: bool,
+}
+
+/// Answer to both `telemetry.*` calls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryResult {
+    /// The owner's choice, as stored.
+    pub enabled: bool,
+    /// Whether anything is actually sent: `enabled`, and no `MICRODUCK_TELEMETRY=0` or
+    /// `DO_NOT_TRACK=1` in `updaterd`'s environment.
+    pub active: bool,
 }
 
 /// Answer to every `os.*` call: the board's two slots, what its channel offers, and where an
@@ -3201,7 +4244,8 @@ pub struct SubscribeResult {
     pub ground_pick: Option<String>,
     /// The configurable one-shot skills this robot has, in priority order, and the names
     /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
-    /// has is now config: a client learns them here instead of assuming five.
+    /// has is now config: a client learns them here instead of assuming five. The emotions in
+    /// `[emotions] dir` come last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
 }
@@ -3710,6 +4754,11 @@ pub enum Outcome {
     Aborted {
         reason: String,
     },
+    /// Changed, failed its check, and left live: nothing reverted it. The release the entry's `to`
+    /// names is what runs now.
+    Stuck {
+        reason: String,
+    },
 }
 
 /// One line of an update's transcript.
@@ -3879,6 +4928,12 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
+    /// The Goal PWM `robotd` last wrote to every servo, out of 885 (100 % duty), when
+    /// `bus.battery_voltage_based_pwm_limit` is on: it follows the battery so the motors see
+    /// ~6 V. Absent when the switch is off, before the first write, and from an older `robotd`.
+    /// Reported, never judged — same rule as the battery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_pwm: Option<u16>,
     /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
     /// never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3954,10 +5009,11 @@ pub struct BusHealth {
     /// commanded anything and is still waiting for a robot to answer — the signature of
     /// servo power being off.
     pub startup_failures: u32,
-    /// While waiting: the expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping
-    /// round, in that table's order. Empty once the bus is up, before the first round, and when
-    /// the port itself would not open. All fifteen is servo power off; some of them is servos
-    /// unplugged, and naming them is the point.
+    /// The expected servo IDs ([`JOINT_IDS`]) that did not answer the last ping round, in that
+    /// table's order. Rounds run while `robotd` waits for the bus, and on a running loop during a
+    /// run of failed reads (non-zero `consecutive_errors`). Empty on a working bus, before the
+    /// first round, and when the port would not open or the ping itself failed. All fifteen is
+    /// servo power off; some of them is servos unplugged, and naming them is the point.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<u8>,
 }
@@ -4017,10 +5073,10 @@ pub struct ImuHealth {
     /// `sync_read` — so the bus reports no error and `ready` stays true — and repeats itself on
     /// every tick, which makes the run climb without bound. See [`ImuHealth::frozen`].
     pub consecutive_stale_blocks: u64,
-    /// While the bus is coming up: every servo answered its ping and the IMU board did not.
-    /// `robotd` waits rather than run without orientation, so this is also why it is not
-    /// ticking. Cleared once the bus is up; never set at runtime, where a board that stops
-    /// answering shows as consecutive bus read failures instead.
+    /// Every servo answered its ping and the IMU board did not — the same rounds as
+    /// [`BusHealth::missing`]. While the bus is coming up `robotd` waits rather than run without
+    /// orientation, so this is also why it is not ticking; on a running loop it is why the reads
+    /// are failing. Cleared once a read succeeds.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub missing: bool,
 }
@@ -4117,6 +5173,12 @@ impl Battery {
     /// so `robotctl monitor` and `duckctl udp-pad` cannot disagree about the same pack.
     pub const LOW_PCT: f64 = 30.0;
     pub const CRITICAL_PCT: f64 = 15.0;
+}
+
+impl HealthResult {
+    /// [`Self::goal_pwm`] at 100 % duty: the XL330's factory PWM Limit, which
+    /// `duck_control::model::GOAL_PWM_MAX` also names — that crate does not depend on this one.
+    pub const GOAL_PWM_FULL: u16 = 885;
 }
 
 /// Answer to a discrete intent — [`Call::RobotStop`], [`Call::RobotEnable`].
@@ -4226,6 +5288,15 @@ pub struct RobotState {
     /// empty is *not reported*, never zero load. (v36)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub currents_ma: Vec<f64>,
+    /// Each joint's impact guard, indexed as [`JOINT_NAMES`]: 0 armed, 1 braking after an
+    /// impact, 2 holding softly until the goal comes back past the position. `null` for a servo
+    /// whose firmware has no guard — anything but ROBOTIS's V3 and V4.
+    ///
+    /// Read after the tick's goal positions are written, and only on ticks with a subscriber, so
+    /// a robot nobody is recording runs the bus it always did. Empty when no servo has the guard,
+    /// or the read failed. (v53)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impact_guard: Vec<Option<u8>>,
     /// Where contact odometry believes the robot is. `default` so a frame from
     /// a `robotd` predating the estimator still parses — zeros, like a robot
     /// that has not moved.
@@ -4235,6 +5306,17 @@ pub struct RobotState {
     /// instrument is down — see [`ThereminState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theremin: Option<ThereminState>,
+    /// What laser tracking sees and does, while it is switched on. Absent otherwise — see
+    /// [`LaserTrackState`]. (v52)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub laser: Option<LaserTrackState>,
+    /// What soccer mode is doing, while it is on. Absent otherwise — see [`SoccerState`]. (v58)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soccer: Option<SoccerState>,
+    /// The duck on its own is switched on ([`method::ROBOT_AUTONOMOUS`]) — what `autod` obeys.
+    /// Absent while off. (v60)
+    #[serde(default, skip_serializing_if = "not")]
+    pub autonomous: bool,
     /// What the chorale is doing, when one is running. Absent otherwise, which is the ordinary
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4258,6 +5340,30 @@ pub struct RobotState {
     /// for real. `frames` is a few leaves of this. Empty from a daemon predating it. (v25)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skeleton: Vec<PoseState>,
+    /// What the microphone makes of the room. Absent while nothing is listening:
+    /// `[audio] pet_detect` off, no microphone, or a daemon predating v60.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hearing: Option<HearingState>,
+}
+
+/// What the microphone hears, in [`RobotState::hearing`]. (v60)
+///
+/// Petting is a level: someone is scratching the head now. Noises and voices are events, so they
+/// are **counters** rather than flags. A subscriber decimated to 5 Hz, or one that missed a frame,
+/// still sees that something happened, by the counter having moved. Both start at zero when
+/// `robotd` starts.
+///
+/// They count everything the microphone heard, including the duck's own voice. Telling the duck
+/// apart from the room is the consumer's job, because only the consumer knows what it asked the
+/// duck to say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HearingState {
+    pub petting: bool,
+    /// Sharp transients: a clap, a bang, a dropped object.
+    pub noises: u32,
+    /// Sustained utterances: someone talking to the duck, or quacking at it.
+    pub voices: u32,
 }
 
 /// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
@@ -4380,6 +5486,11 @@ pub struct OdomState {
 pub struct MoveState {
     pub requested: [f64; 3],
     pub applied: [f64; 3],
+    /// The [`HelloParams::client`] name of the connection whose `robot.move` filled the twist
+    /// slot. Absent if that client never named itself, if nothing has driven yet, or if the
+    /// daemon predates v60. With `limited_by` free of `deadman`, it says who is driving now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Empty when the command went through untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limited_by: Vec<String>,
@@ -4431,12 +5542,6 @@ pub struct ModelApiResult {
     pub model_api: u32,
 }
 
-/// Answer to [`Call::RobotRemoteSessionActive`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionActiveResult {
-    pub active: bool,
-}
-
 // ── net.* results ────────────────────────────────────────────────────────────
 
 /// What the wifi link is doing.
@@ -4468,6 +5573,45 @@ pub struct NetStatusResult {
     /// provisioning gives us a real serial (`updater-design.md` §5.7).
     pub mac: Option<String>,
     pub iface: Option<String>,
+    /// The `net.connect` in flight, if there is one. (v57)
+    ///
+    /// Present from the moment `configd` accepts the call until it answers, and only then: an
+    /// autoconnect NetworkManager starts on its own shows as `connecting` with no `joining`. While
+    /// it is present, the other fields still describe the link as it is — which, early in a join,
+    /// can be the network the robot is about to leave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joining: Option<Joining>,
+}
+
+/// How far a `net.connect` has got. See [`NetStatusResult::joining`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Joining {
+    /// The network asked for.
+    pub ssid: String,
+    pub step: JoinStep,
+    /// Since `configd` accepted the call.
+    pub elapsed_seconds: u32,
+    /// The longest `configd` will take before answering `timeout`, counted from the same instant.
+    /// An upper bound for a progress bar, not an estimate: most joins finish well inside it.
+    pub timeout_seconds: u32,
+}
+
+/// One stage of a join, in the order a successful one passes through them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinStep {
+    /// Looking for the network before touching any profile — a few seconds.
+    Scanning,
+    /// NetworkManager is preparing the radio and associating with the access point.
+    Associating,
+    /// The WPA handshake: this is where a passphrase is checked.
+    Authenticating,
+    /// The access point rejected the handshake and NetworkManager is asking for a key, which
+    /// nothing on the robot will supply. Almost always a wrong passphrase; the call answers
+    /// `bad_key` shortly after.
+    KeyRejected,
+    /// Associated; waiting for an address, which on a busy network is where the time goes.
+    Addressing,
 }
 
 /// How a network is secured. What a client needs in order to know whether to ask for a
@@ -4631,6 +5775,126 @@ pub struct Pad {
     pub trusted: bool,
     /// Connected right now. This is the one that answers "why is the robot not moving".
     pub connected: bool,
+    /// How full its battery is, when the robot knows: a connected pad `padd` could ask, read
+    /// recently. Absent otherwise — which is most pads, and says nothing about the battery. (v65)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<PadBattery>,
+}
+
+/// A pad's battery, as the pad reports it: a level, not a percentage.
+///
+/// A Switch pad says one of five levels in every subcommand reply, and a clone answers nothing
+/// finer — the voltage query that a genuine one answers comes back empty. So the steps are the
+/// pad's own and nothing here pretends to more precision than it gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadBattery {
+    pub level: PadBatteryLevel,
+    /// On a cable and charging.
+    pub charging: bool,
+}
+
+/// See [`PadBattery`]. The names are the levels the pad reports, from the top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadBatteryLevel {
+    Full,
+    Medium,
+    Low,
+    Critical,
+    Empty,
+}
+
+impl PadBatteryLevel {
+    /// From the high nibble of a Switch report's battery byte with its charging bit (the lowest)
+    /// cleared: 8, 6, 4, 2, 0. An odd step a pad never sends is read as the one below it.
+    pub fn from_switch(step: u8) -> Self {
+        match step & 0x0e {
+            8.. => Self::Full,
+            6 => Self::Medium,
+            4 => Self::Low,
+            2 => Self::Critical,
+            _ => Self::Empty,
+        }
+    }
+
+    /// Worth telling someone about before the pad dies mid-drive.
+    pub fn is_low(self) -> bool {
+        matches!(self, Self::Low | Self::Critical | Self::Empty)
+    }
+
+    /// As a person would say it: "full", "low".
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Critical => "critical",
+            Self::Empty => "empty",
+        }
+    }
+}
+
+impl PadBattery {
+    /// From a Switch report's battery byte (byte 2 of a `0x21` or `0x30` input report): the high
+    /// nibble is the level, its lowest bit charging; the low nibble is connection info, ignored.
+    pub fn from_switch_byte(byte: u8) -> Self {
+        let high = byte >> 4;
+        Self {
+            level: PadBatteryLevel::from_switch(high),
+            charging: high & 1 == 1,
+        }
+    }
+}
+
+/// How a pad's battery gets from `padd`, which can ask the pad, to `configd`, which answers
+/// `pad.status` — and to `robotctl monitor`, on the robot.
+///
+/// **A file, because `configd` cannot ask the pad itself.** It runs with `PrivateDevices=yes`: its
+/// `/dev` is made once when it starts, and a pad's hidraw node appears when the pad connects. `padd`
+/// is already following the pad from connect to disconnect, so it asks, and writes what it heard
+/// here; a reader takes it only while it is fresh ([`read_fresh`]).
+pub mod pad_battery {
+    use super::PadBattery;
+    use serde::{Deserialize, Serialize};
+
+    /// Under `padd`'s `RuntimeDirectory=`, so it is gone with the daemon and with the boot.
+    pub const FILE: &str = "/run/padd/pad-battery.json";
+
+    /// How old a reading may be and still be shown. `padd` asks every minute; five missed answers
+    /// is a `padd` that stopped, or a pad that stopped answering, and a level from then is a guess.
+    pub const STALE_S: u64 = 300;
+
+    /// What [`FILE`] holds.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Reading {
+        /// The pad's address, as BlueZ writes it: `98:B6:E9:5E:BB:DB`. What a reader matches the
+        /// reading to its pad by.
+        pub mac: String,
+        #[serde(flatten)]
+        pub battery: PadBattery,
+        /// When the pad said it, in seconds since the epoch.
+        pub read_s: u64,
+    }
+
+    /// The reading in `path`, if there is one, it parses, and it is no older than [`STALE_S`] at
+    /// `now_s`. A reading from the future — a clock that stepped back — is taken: refusing it would
+    /// hide the battery until the clock caught up, for no better answer.
+    pub fn read_fresh(path: &std::path::Path, now_s: u64) -> Option<Reading> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let reading: Reading = serde_json::from_str(&text).ok()?;
+        (now_s.saturating_sub(reading.read_s) <= STALE_S).then_some(reading)
+    }
+
+    /// `pads` with the reading put on the connected pad it is about, if any.
+    pub fn attach(pads: &mut [super::Pad], reading: Option<&Reading>) {
+        let Some(reading) = reading else { return };
+        if let Some(pad) = pads
+            .iter_mut()
+            .find(|p| p.connected && p.mac.eq_ignore_ascii_case(&reading.mac))
+        {
+            pad.battery = Some(reading.battery);
+        }
+    }
 }
 
 /// Whether one of the robot's units is running, as systemd sees it.
@@ -4793,6 +6057,15 @@ pub enum PadPairResult {
         reason: PadPairFailure,
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
+        /// For [`PadPairFailure::Ambiguous`]: the pads that were in pairing mode, so a client can
+        /// show them and retry with [`PadPairParams::mac`] set to the one meant. Empty for every
+        /// other reason.
+        ///
+        /// A list rather than `detail`'s prose because the next step needs the addresses: a
+        /// refusal that only said "two pads" left a phone with nothing to offer but "switch one
+        /// off", which is not an option when the other belongs to somebody across the room.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        candidates: Vec<Pad>,
     },
 }
 
@@ -4834,6 +6107,11 @@ pub struct SkillParams {
     /// Servo gain relative to the gait's, when this skill wants its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gain_ratio: Option<f64>,
+    /// The pose it starts from, and the only one the robot starts it in: `"standing"` or
+    /// `"seated"`. Absent is standing on the way in and is what a standing skill answers; on a
+    /// `robot.setSkill` for a skill that exists, absent keeps what it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_pose: Option<String>,
     /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
     /// Ignored on the way in — a client cannot make a built-in an override by saying so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -4857,6 +6135,25 @@ pub struct SkillsResult {
     /// listing what a robot can do needs both, and neither can be edited here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub built_in: Vec<String>,
+}
+
+/// Parameters for [`Call::RobotSetVolume`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeParams {
+    /// Percent: 100 is the codec's full level, 0 mutes the speaker. Over 100 is refused.
+    pub volume: u8,
+}
+
+/// Answer to [`Call::RobotVolume`] and [`Call::RobotSetVolume`]: the level as stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VolumeResult {
+    /// Percent, 0–100.
+    pub volume: u8,
+    /// Whether this board has a speaker mixer the level is written to — the Zero 3W HAT's
+    /// AIC3104, or the beta and face boards' RK809. False on any other codec: the level is kept,
+    /// and changes nothing it can hear.
+    pub applies: bool,
 }
 
 /// Parameters for [`Call::PadBind`].
@@ -5198,6 +6495,96 @@ pub struct PadInputResult {
     /// Why not, when it was refused — a platform with no evdev to read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// A pose in the map: metres, metres, radians. The map's frame is wherever its first stop was,
+/// facing the way the robot faced then — a map has no north.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapPose {
+    pub x: f64,
+    pub y: f64,
+    pub yaw: f64,
+}
+
+/// Where the robot is in its map — [`method::MAP_STATE`], and the heart of [`MapStatusResult`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapState {
+    /// `CLOCK_MONOTONIC` of the robot state this pose was computed from — the clock
+    /// [`RobotState::t_ns`] uses.
+    pub t_ns: u64,
+    /// The pose, while the robot knows it. Absent while it is lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pose: Option<MapPose>,
+    /// Why it does not know where it is: `boot` (it has not recognised anything since it started),
+    /// `carried`, `bumped` (picked up for a moment — a stumble, the start of a fall — and looking
+    /// nearby), `sat` (stood up, and checking it was not carried while seated), `fell`, or
+    /// `contradiction` (what it sees stopped matching the map). Absent while it knows. A client
+    /// should treat a word it does not know as "lost": the list grows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost: Option<String>,
+    /// A stop is being collected: the robot is standing still and its views are going into the
+    /// map. What makes the map grow — it maps only where it stops and looks.
+    pub collecting: bool,
+    /// Stops in the map proper.
+    pub keyframes: u32,
+}
+
+/// Answer to [`Call::MapStatus`], and the first answer to [`Call::MapStream`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapStatusResult {
+    pub state: MapState,
+    /// Why it is not mapping at all: a `robotd` or `tofd` it cannot reach, a robot predating the
+    /// telemetry the map needs. Absent while the inputs flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Loop closures and relocalizations since `mapd` started.
+    pub loops: u32,
+    pub relocalizations: u32,
+    /// Stops kept apart from the map: made while lost and not yet recognised in it.
+    pub island_keyframes: u32,
+    /// Where the map is kept, and when it was last written there (seconds since the epoch).
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<u64>,
+}
+
+/// Parameters of [`Call::MapGrid`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MapGridParams {
+    /// Cell size, metres. Absent is `mapd`'s default; it is clamped to what the map can carry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub res_m: Option<f64>,
+}
+
+/// Answer to [`Call::MapGrid`]: the occupancy grid, as `mapd` renders it from its keyframes now.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapGridResult {
+    pub res_m: f64,
+    /// Map coordinates of the low corner of cell (0, 0).
+    pub origin: [f64; 2],
+    pub width: u32,
+    pub height: u32,
+    /// One character per cell, row-major from the lowest y: `?` unknown, `.` free, `#` occupied.
+    /// Text rather than numbers because it is what a grid of three states is — a third of the
+    /// bytes of a JSON array, and readable in a terminal.
+    pub cells: String,
+    /// Where each stop of the map was made.
+    pub keyframes: Vec<MapPose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pose: Option<MapPose>,
+}
+
+/// Answer to [`Call::MapWipe`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MapWipeResult {
+    /// Stops forgotten.
+    pub keyframes: u32,
 }
 
 /// Answer to [`Call::TofStream`].
@@ -5735,18 +7122,74 @@ fn camera_stats_path() -> std::path::PathBuf {
 
 /// Publish [`CameraStats`]. Never fatal: a robot that cannot describe its camera still has one.
 pub fn publish_camera_stats(stats: &CameraStats) -> Result<(), String> {
-    let path = camera_stats_path();
+    publish_camera_stats_at(&camera_stats_path(), stats)
+}
+
+/// [`publish_camera_stats`] at `path`.
+///
+/// Written aside and renamed into place, because [`read_webrtc_peers`] gates an OS update on this
+/// file and a reader catching it half-written would read "nobody is connected".
+fn publish_camera_stats_at(path: &std::path::Path, stats: &CameraStats) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut json = serde_json::to_vec(stats).map_err(|e| e.to_string())?;
     json.push(b'\n');
-    std::fs::write(&path, json).map_err(|e| format!("{}: {e}", path.display()))
+    let aside = path.with_extension("json.new");
+    std::fs::write(&aside, json).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// What `mediad` published about its camera, or `None` — not running, no camera, or too old.
+/// How old [`CameraStats`] may be and still count as `mediad`'s answer. It is rewritten every
+/// second while the camera delivers frames, so this is several missed rewrites.
+pub const CAMERA_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many WebRTC peers `mediad` is serving right now, or `None` when it is not saying.
+///
+/// The one answer to "is someone on a call with this robot?". `updaterd`'s preflight asks it
+/// before an update that would drop the call, and `mediad` asks it to tell a session that is
+/// alone from one with company (`updater-design.md` §7.2).
+///
+/// `None` — `mediad` stopped, no camera, a file older than [`CAMERA_STATS_MAX_AGE`] — is for the
+/// caller to read, and the updater reads it as nobody: its check is a courtesy and must never be
+/// the reason a recovery update is refused.
+pub fn read_webrtc_peers() -> Option<u32> {
+    webrtc_peers_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+fn webrtc_peers_at(path: &std::path::Path, now: std::time::SystemTime) -> Option<u32> {
+    if camera_stats_age_at(path, now)? > CAMERA_STATS_MAX_AGE {
+        return None;
+    }
+    let stats: CameraStats = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some(stats.consumers)
+}
+
+/// What `mediad` published about its camera, or `None` — not running, or no camera.
+///
+/// Not aged: the file is only rewritten while frames arrive, so a camera that has stopped leaves
+/// its last rate behind. [`camera_stats_age`] is how a reader tells the two apart.
 pub fn read_camera_stats() -> Option<CameraStats> {
     serde_json::from_slice(&std::fs::read(camera_stats_path()).ok()?).ok()
+}
+
+/// How long ago `mediad` last rewrote [`CameraStats`], or `None` when there is no file.
+///
+/// Past [`CAMERA_STATS_MAX_AGE`] the camera has stopped delivering frames, whatever the file's
+/// `fps` says. A file from the future — a clock that stepped — reads as fresh.
+pub fn camera_stats_age() -> Option<std::time::Duration> {
+    camera_stats_age_at(&camera_stats_path(), std::time::SystemTime::now())
+}
+
+/// [`camera_stats_age`] for the file at `path`, as of `now`. The one place the clock-step rule
+/// lives: a file from the future is a clock that stepped, not a fresh answer, and either way it is
+/// not old — so it reads as age zero.
+fn camera_stats_age_at(
+    path: &std::path::Path,
+    now: std::time::SystemTime,
+) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(now.duration_since(modified).unwrap_or_default())
 }
 
 /// What `mediad`'s relay is doing with the rendezvous service, published for `robotctl` to read.
@@ -5908,6 +7351,91 @@ mod tests {
     use super::test_support::every_call;
     use super::*;
 
+    /// `candidates` is v51's, so both directions of a mixed install must still parse: a refusal
+    /// from an older `configd` has no such key, and one that has nothing to list must not grow
+    /// one — an older client parses the same bytes it always did.
+    #[test]
+    fn a_pad_refusal_without_candidates_reads_and_writes_as_before() {
+        let old =
+            r#"{"outcome":"failed","reason":"ambiguous","detail":"2 pads are in pairing mode"}"#;
+        let parsed: PadPairResult = serde_json::from_str(old).expect("an older configd's refusal");
+        assert!(matches!(
+            &parsed,
+            PadPairResult::Failed { reason: PadPairFailure::Ambiguous, candidates, .. }
+                if candidates.is_empty()
+        ));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
+    }
+
+    fn camera_stats(consumers: u32) -> CameraStats {
+        CameraStats {
+            fps: 30.0,
+            target_fps: 30,
+            width: 1280,
+            height: 720,
+            format: "UYVY".into(),
+            frames: 1,
+            dropped: 0,
+            consumers,
+        }
+    }
+
+    /// How old the camera file is: nothing without one, measured from its mtime, and zero rather
+    /// than an error when the clock has stepped back past it.
+    #[test]
+    fn camera_stats_age_is_measured_from_the_file() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(camera_stats_age_at(&path, now), None, "no file, no age");
+
+        publish_camera_stats_at(&path, &camera_stats(0)).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let later = modified + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            camera_stats_age_at(&path, later),
+            Some(CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1)),
+        );
+
+        let earlier = modified - std::time::Duration::from_secs(60);
+        assert_eq!(
+            camera_stats_age_at(&path, earlier),
+            Some(std::time::Duration::ZERO),
+            "a clock that stepped back reads as fresh"
+        );
+    }
+
+    /// The count an OS update is gated on: read back as written, and only while it is fresh.
+    #[test]
+    fn webrtc_peers_are_read_only_while_fresh() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("camera.json");
+        let now = std::time::SystemTime::now();
+        assert_eq!(webrtc_peers_at(&path, now), None, "no file is no answer");
+
+        publish_camera_stats_at(&path, &camera_stats(2)).unwrap();
+        assert_eq!(webrtc_peers_at(&path, now), Some(2));
+        assert!(
+            !path.with_extension("json.new").exists(),
+            "renamed into place"
+        );
+
+        let later = now + CAMERA_STATS_MAX_AGE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            webrtc_peers_at(&path, later),
+            None,
+            "a stopped writer is no answer"
+        );
+
+        std::fs::write(&path, b"{\"fps\":").unwrap();
+        assert_eq!(
+            webrtc_peers_at(&path, now),
+            None,
+            "a torn file is no answer"
+        );
+    }
+
     /// The path a release actually installs to, which is what makes "which version is running"
     /// answerable at all.
     #[test]
@@ -6026,6 +7554,7 @@ mod tests {
                             | Call::PadInput
                             | Call::TofStream
                             | Call::HeadImuStream
+                            | Call::MapStream
                     ),
                     "{} is on the Stream lane but is not a subscription",
                     call.method()
@@ -6034,11 +7563,129 @@ mod tests {
         }
     }
 
+    /// What a client of `nfc.read` parses: each record a type and a value, a blank tag no
+    /// `records` member at all.
+    #[test]
+    fn a_read_tag_is_records_of_a_type_and_a_value() {
+        let read = NfcReadResult {
+            read: true,
+            uid: Some("04:a1".into()),
+            records: vec![
+                NfcRecord::Text("walk_mode".into()),
+                NfcRecord::Uri("https://pollen.ai".into()),
+            ],
+            reason: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&read).unwrap(),
+            serde_json::json!({
+                "read": true,
+                "uid": "04:a1",
+                "records": [
+                    {"type": "text", "value": "walk_mode"},
+                    {"type": "uri", "value": "https://pollen.ai"},
+                ],
+            })
+        );
+        let blank: NfcReadResult =
+            serde_json::from_value(serde_json::json!({"read": true, "reason": "blank"})).unwrap();
+        assert!(blank.records.is_empty());
+    }
+
+    /// The byte the Pro Controller on duck-d556 answered with, and the others it can send.
+    #[test]
+    fn a_switch_battery_byte_is_a_level_and_a_charging_bit() {
+        let read = PadBattery::from_switch_byte;
+        assert_eq!(
+            read(0x80),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: false
+            }
+        );
+        assert_eq!(
+            read(0x91),
+            PadBattery {
+                level: PadBatteryLevel::Full,
+                charging: true
+            }
+        );
+        assert_eq!(read(0x6e).level, PadBatteryLevel::Medium);
+        assert_eq!(read(0x40).level, PadBatteryLevel::Low);
+        assert_eq!(read(0x20).level, PadBatteryLevel::Critical);
+        assert_eq!(read(0x0e).level, PadBatteryLevel::Empty);
+        assert!(read(0x40).level.is_low() && !read(0x60).level.is_low());
+    }
+
+    #[test]
+    fn a_pad_without_a_battery_says_nothing_about_one() {
+        let pad = Pad {
+            mac: "98:B6:E9:5E:BB:DB".into(),
+            name: "Pro Controller".into(),
+            paired: true,
+            trusted: true,
+            connected: true,
+            battery: None,
+        };
+        let wire = serde_json::to_value(&pad).unwrap();
+        assert!(wire.get("battery").is_none());
+        // And a v64 robot's answer reads as no battery.
+        let old: Pad = serde_json::from_value(serde_json::json!({
+            "mac": "98:B6:E9:5E:BB:DB", "name": "Pro Controller",
+            "paired": true, "trusted": true, "connected": true
+        }))
+        .unwrap();
+        assert_eq!(old, pad);
+    }
+
+    #[test]
+    fn a_battery_reading_is_taken_while_fresh_and_for_its_own_pad() {
+        let dir = std::env::temp_dir().join(format!("pad-battery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("pad-battery.json");
+        std::fs::write(
+            &file,
+            r#"{"mac":"98:b6:e9:5e:bb:db","level":"low","charging":false,"read_s":1000}"#,
+        )
+        .unwrap();
+
+        assert!(pad_battery::read_fresh(&file, 1000 + pad_battery::STALE_S).is_some());
+        assert!(pad_battery::read_fresh(&file, 1001 + pad_battery::STALE_S).is_none());
+        assert!(
+            pad_battery::read_fresh(&file, 10).is_some(),
+            "a clock stepped back"
+        );
+        assert!(pad_battery::read_fresh(&dir.join("absent.json"), 1000).is_none());
+
+        let reading = pad_battery::read_fresh(&file, 1000).unwrap();
+        let pad = |mac: &str, connected| Pad {
+            mac: mac.into(),
+            name: String::new(),
+            paired: true,
+            trusted: true,
+            connected,
+            battery: None,
+        };
+        let mut pads = vec![
+            pad("78:86:2E:BB:13:28", true),
+            pad("98:B6:E9:5E:BB:DB", true),
+        ];
+        pad_battery::attach(&mut pads, Some(&reading));
+        assert_eq!(pads[0].battery, None);
+        assert_eq!(pads[1].battery.unwrap().level, PadBatteryLevel::Low);
+
+        // The pad it is about, switched off: a reading from before is not shown on it.
+        let mut off = vec![pad("98:B6:E9:5E:BB:DB", false)];
+        pad_battery::attach(&mut off, Some(&reading));
+        assert_eq!(off[0].battery, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            77,
+            91,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6276,6 +7923,9 @@ mod tests {
                 // needs on a robot it is not allowed to reconfigure.
                 method::PAD_PAIR,
                 method::PAD_FORGET,
+                // Forgetting the map is not recoverable. `map.status` and `map.grid` must stay off
+                // this list: where a robot thinks it is is the first question about a lost one.
+                method::MAP_WIPE,
             ]
         );
     }
@@ -6623,6 +8273,91 @@ mod tests {
     /// a v12 client must see byte-for-byte the frame it saw before, and a v13 one must find
     /// the field where the docs say it is.
     #[test]
+    fn the_laser_block_is_absent_until_tracking_is_on() {
+        let mut state = a_state();
+        let off = serde_json::to_string(&state).unwrap();
+        assert!(!off.contains("laser"), "{off}");
+
+        state.laser = Some(LaserTrackState {
+            camera: "looking at 1–15 Hz".into(),
+            dot: Some(LaserDot {
+                seen: true,
+                ray: Some([0.1, 0.3]),
+                px: Some([400.0, 900.0]),
+                pixels: 12,
+                peak_yuv: Some([210, 110, 190]),
+                ..Default::default()
+            }),
+            target_m: Some([0.8, -0.1]),
+            walk: true,
+            ..Default::default()
+        });
+        let on = serde_json::to_string(&state).unwrap();
+        let back: RobotState = serde_json::from_str(&on).unwrap();
+        assert_eq!(back.laser, state.laser);
+        // Tracking that is not driving the head says nothing about it, rather than `false`.
+        let block = serde_json::to_value(&state.laser).unwrap();
+        assert!(block.get("head").is_none(), "{block}");
+    }
+
+    /// Soccer mode is absent from `robot.mode` and `robot.state` while it is off, so an older
+    /// client reads the frames it always did, and `{"active": true}` is manual soccer.
+    #[test]
+    fn soccer_is_absent_until_switched_on() {
+        let off = serde_json::to_string(&ModeResult {
+            mode: "walk".into(),
+            soccer: None,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(off, r#"{"mode":"walk"}"#);
+        let manual: SoccerParams = serde_json::from_str(r#"{"active": true}"#).unwrap();
+        assert_eq!(
+            manual,
+            SoccerParams {
+                active: true,
+                autonomous: false
+            }
+        );
+        let call = Call::parse(
+            method::ROBOT_SOCCER,
+            Some(&serde_json::json!({"active": true, "autonomous": true})),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            Call::RobotSoccer(SoccerParams {
+                active: true,
+                autonomous: true
+            })
+        );
+
+        let mut state = a_state();
+        assert!(!serde_json::to_string(&state).unwrap().contains("soccer"));
+        state.soccer = Some(SoccerState {
+            autonomous: true,
+            phase: "approaching".into(),
+            target_m: Some([0.6, 0.1]),
+            ..Default::default()
+        });
+        let back: RobotState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.soccer, state.soccer);
+        let empty: BallDetectParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, BallDetectParams::default());
+        assert!(serde_json::from_str::<BallDetectParams>(r#"{"u_mn": 10}"#).is_err());
+    }
+
+    /// `media.laser` with no params is the defaults, and a misspelt threshold is refused rather
+    /// than silently ignored — the thresholds are the whole of tuning this.
+    #[test]
+    fn laser_detect_params_default_and_refuse_unknown_keys() {
+        let empty: LaserDetectParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, LaserDetectParams::default());
+        assert!(serde_json::from_str::<LaserDetectParams>(r#"{"y_mn": 10}"#).is_err());
+    }
+
+    #[test]
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = a_state();
         let down = serde_json::to_string(&state).unwrap();
@@ -6653,6 +8388,38 @@ mod tests {
         assert_eq!(back.theremin, None);
     }
 
+    /// The brain reads petting and noises off the state stream, and a frame from a v37 daemon has
+    /// no `hearing` at all. It must parse as "nothing is listening", not fail, or `autod` against
+    /// a half-updated robot would drop every frame.
+    #[test]
+    fn hearing_is_absent_until_something_listens_and_counts_when_it_does() {
+        let quiet = serde_json::to_string(&a_state()).unwrap();
+        assert!(!quiet.contains("hearing"), "{quiet}");
+        assert!(!quiet.contains("source"), "{quiet}");
+        let back: RobotState = serde_json::from_str(&quiet).unwrap();
+        assert_eq!(back.hearing, None);
+        assert_eq!(back.movement.source, None);
+
+        let mut state = a_state();
+        state.hearing = Some(HearingState {
+            petting: true,
+            noises: 3,
+            voices: 1,
+        });
+        let line = serde_json::to_string(&state).unwrap();
+        let back: RobotState = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.hearing, state.hearing);
+    }
+
+    /// A v37 client's hello carries no name, and must keep being served.
+    #[test]
+    fn a_hello_without_a_name_still_parses() {
+        let hello: HelloParams = serde_json::from_str(r#"{"api_version":37}"#).unwrap();
+        assert_eq!(hello.client, None);
+        let head: HeadParams = serde_json::from_str(r#"{"head_yaw":0.3}"#).unwrap();
+        assert_eq!(head.alpha, None, "absent means the shared rate");
+    }
+
     /// `move` and `loop` are Rust keywords, so the fields are renamed on the wire. A typo
     /// in either rename is invisible in Rust and breaks every consumer, so pin the JSON.
     #[test]
@@ -6663,6 +8430,7 @@ mod tests {
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],
+                source: Some("padd".into()),
                 limited_by: vec!["deadman".into()],
             },
             policy: "walk".into(),
@@ -6749,6 +8517,7 @@ mod tests {
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
+                source: None,
                 limited_by: Vec::new(),
             },
             head: [0.0; 4],
@@ -6768,13 +8537,18 @@ mod tests {
             targets: vec![0.0; 15],
             velocities: Vec::new(),
             currents_ma: Vec::new(),
+            impact_guard: Vec::new(),
             odom: OdomState::default(),
             theremin: None,
+            laser: None,
+            soccer: None,
+            autonomous: false,
             chorale: None,
             t_ns: 0,
             imu: None,
             frames: None,
             skeleton: Vec::new(),
+            hearing: None,
         }
     }
 
@@ -6785,6 +8559,7 @@ mod tests {
         let movement = MoveState {
             requested: [0.0; 3],
             applied: [0.0; 3],
+            source: None,
             limited_by: Vec::new(),
         };
         let line = serde_json::to_string(&movement).unwrap();

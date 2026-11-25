@@ -1,5 +1,6 @@
 //! The controller sections of `robotd.toml` — `[pad]`, `[pad_imu_head_control]`, `[pad_drive]`,
-//! `[pad_axes]`, `[pad_head]`, `[pad_body]` and `[pad_roller]` — read into a [`Config`].
+//! `[pad_axes]`, `[pad_head]`, `[pad_body]` and `[pad_roller]` — and `[autonomous]`, read into a
+//! [`Config`].
 
 use std::path::Path;
 use std::time::Duration;
@@ -51,6 +52,7 @@ impl Config {
             head: Default::default(),
             body: Default::default(),
             roller_limits: Default::default(),
+            autonomy: Default::default(),
             roller,
         };
         config.apply(overrides);
@@ -62,7 +64,13 @@ impl Config {
             self.axes.deadzone = deadzone;
         }
         if let Some(max_head) = overrides.max_head {
-            self.head = robotd_params::PadHeadParams::all(max_head);
+            // The limits only: the file's `expo` and `max_speed` are not what `--max-head` says.
+            let (expo, max_speed) = (self.head.expo, self.head.max_speed);
+            self.head = robotd_params::PadHeadParams {
+                expo,
+                max_speed,
+                ..robotd_params::PadHeadParams::all(max_head)
+            };
         }
     }
 
@@ -92,6 +100,7 @@ impl Config {
         self.head = params.pad_head;
         self.body = params.pad_body;
         self.roller_limits = params.pad_roller;
+        self.autonomy = params.autonomous;
         self.apply(overrides);
         let (b, d) = (&self.bindings, &self.drive);
         tracing::info!(
@@ -100,6 +109,7 @@ impl Config {
             vx = ?(d.vx_min, d.vx_max), vy = ?(d.vy_min, d.vy_max),
             vyaw = ?(d.vyaw_min, d.vyaw_max),
             deadzone = self.axes.deadzone,
+            autonomous = self.autonomy.enabled, pad_idle_s = self.autonomy.pad_idle_s,
             "controller settings"
         );
         // Every binding is a lot of line for the common case of none changed.

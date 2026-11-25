@@ -338,6 +338,12 @@ impl Model {
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),
             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
+            "policy.accel_vx" | "policy.accel_vy" | "policy.accel_vyaw" => {
+                let axis = ["policy.accel_vx", "policy.accel_vy", "policy.accel_vyaw"]
+                    .iter()
+                    .position(|k| *k == key)?;
+                Some(policy.twist_accel[axis].map_or("none".to_owned(), |a| a.to_string()))
+            }
             "media.bitrate" => Some(params.media.bitrate_resolved().to_string()),
             "audio.pet_detect" => Some(
                 params
@@ -346,6 +352,7 @@ impl Model {
                     .to_string(),
             ),
             "audio.pet_model" => path(params.audio.pet_model_resolved()),
+            "idle.enabled" => Some(params.idle.enabled_in(params.policy.mode).to_string()),
             _ => None,
         }
     }
@@ -521,6 +528,9 @@ impl Model {
         entry["duration"] = toml_edit::value(skill.duration);
         if skill.chain {
             entry["chain"] = toml_edit::value(true);
+        }
+        if !skill.entry_pose.is_standing() {
+            entry["entry_pose"] = toml_edit::value(skill.entry_pose.as_str());
         }
         // Only what differs from a plain zero-command one-shot. A file full of explicit
         // defaults is the unreadable thing this whole editor exists to avoid.
@@ -849,6 +859,17 @@ pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
         .find(|e| e.key == key)
         .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
     model.edit(entry, skill)?;
+    model.save()
+}
+
+/// Set one key through the model — the same validation and atomic write as the editor — and save.
+pub fn set_key(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let mut model = Model::load(path)?;
+    let entry = REGISTRY
+        .iter()
+        .find(|e| e.key == key)
+        .ok_or_else(|| format!("{key} is not a key robotd knows"))?;
+    model.edit(entry, value)?;
     model.save()
 }
 
@@ -2006,8 +2027,12 @@ mod tests {
                 "idle",
                 "pickup",
                 "theremin",
+                "laser",
+                "soccer",
                 "head_imu",
+                "map",
                 "audio",
+                "emotions",
                 "media",
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
@@ -2018,7 +2043,8 @@ mod tests {
                 "pad_head",
                 "pad_body",
                 "pad_roller",
-                "netpad"
+                "netpad",
+                "autonomous"
             ]
         );
     }
@@ -2182,6 +2208,50 @@ mod tests {
         assert!(!written.contains("command"), "{written}");
         assert!(!written.contains("unwind"), "{written}");
         assert!(!written.contains("chain"), "{written}");
+        assert!(
+            !written.contains("entry_pose"),
+            "standing is the default, and not written"
+        );
+    }
+
+    /// A seated skill survives the round trip through the daemon's own loader — and only the
+    /// skill that asked; the built-ins seeded beside it stay standing.
+    #[test]
+    fn a_seated_skill_is_written_and_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("robotd.toml");
+        std::fs::write(&config, "[policy]\n").expect("write");
+
+        set_skill(
+            &config,
+            &crate::SkillDef {
+                name: "scoot".into(),
+                path: Some(PathBuf::from("/srv/scoot.onnx")),
+                duration: 2.5,
+                command: [-0.05, 0.0, 0.0],
+                entry_pose: crate::EntryPose::Seated,
+                ..Default::default()
+            },
+        )
+        .expect("added");
+
+        let written = std::fs::read_to_string(&config).expect("read");
+        assert_eq!(
+            written.matches("entry_pose = \"seated\"").count(),
+            1,
+            "{written}"
+        );
+        let parsed = Params::load(&config, true).expect("robotd would accept it");
+        let skills = parsed.policy.resolved().skills;
+        for skill in &skills {
+            assert_eq!(
+                skill.entry_pose == crate::EntryPose::Seated,
+                skill.name == "scoot",
+                "{}",
+                skill.name
+            );
+        }
+        assert!(skills.iter().any(|s| s.name == "scoot"));
     }
 
     /// A policy that holds until told otherwise writes both halves, and what is written is

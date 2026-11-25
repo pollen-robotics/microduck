@@ -115,6 +115,17 @@ impl Board {
         self
     }
 
+    /// Write `[update_gate] auto_rollback` into one of robotd.toml's two layers. Without it the boot
+    /// check names a failure and hands nothing over, which is the shipped default.
+    fn with_auto_rollback(&self, layer: &str, on: bool) -> &Self {
+        std::fs::write(
+            self.dir.path().join(layer),
+            format!("[update_gate]\nauto_rollback = {on}  # a comment\n"),
+        )
+        .expect("params layer");
+        self
+    }
+
     fn run(&self, script: &str, args: &[&str], units: &[(&str, &str, u32, u32)]) -> Rescue {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -481,6 +492,7 @@ fn the_boot_check_does_nothing_when_every_daemon_came_up() {
 #[test]
 fn the_boot_check_rescues_a_failed_daemon() {
     let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.with_auto_rollback("base.toml", true);
     board.link("current", "1.2.0").link("golden", "1.0.0");
     board.booted_secs_ago(180);
 
@@ -516,6 +528,7 @@ fn the_boot_check_rescues_a_failed_daemon() {
 #[test]
 fn the_boot_check_rescues_a_daemon_that_keeps_restarting() {
     let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.with_auto_rollback("base.toml", true);
     board.link("current", "1.2.0").link("golden", "1.0.0");
     board.booted_secs_ago(200);
 
@@ -660,6 +673,7 @@ fn the_boot_check_passes_once_every_daemon_has_settled() {
 #[test]
 fn the_boot_check_rescues_before_the_deadline() {
     let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.with_auto_rollback("base.toml", true);
     board.link("current", "1.2.0").link("golden", "1.0.0");
     board.booted_secs_ago(20);
 
@@ -801,4 +815,73 @@ fn the_boot_check_and_robotd_params_agree_on_the_deadline() {
     );
     assert_eq!(value("DEADLINE_MIN"), robotd_params::BOOT_DEADLINE_MIN_S);
     assert_eq!(value("DEADLINE_MAX"), robotd_params::BOOT_DEADLINE_MAX_S);
+}
+
+/// The shipped default: a release whose daemons did not come up is named and left alone — no swap,
+/// no breadcrumb, no reboot — and the operator is told the command that does it by hand.
+#[test]
+fn the_boot_check_hands_nothing_over_when_auto_rollback_is_off() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.booted_secs_ago(180);
+
+    let run = board.boot_check(&[], &[("robotd.service", "failed", 5)]);
+
+    assert_eq!(run.code(), 2, "stderr: {}", run.stderr());
+    assert!(run.stderr().contains("robotd.service"), "{}", run.stderr());
+    assert!(
+        run.stderr().contains("auto_rollback is off"),
+        "{}",
+        run.stderr()
+    );
+    assert!(
+        run.stderr().contains("robot-rescue --reboot"),
+        "{}",
+        run.stderr()
+    );
+    assert_eq!(
+        board.link_target("current").as_deref(),
+        Some("releases/1.2.0")
+    );
+    assert!(board.breadcrumb().is_none());
+    assert!(run.systemctl.is_empty(), "{}", run.systemctl);
+}
+
+/// The owner's layer wins, in both directions, as it does for the deadline.
+#[test]
+fn the_boot_check_reads_auto_rollback_from_the_owners_layer() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board
+        .with_auto_rollback("base.toml", true)
+        .with_auto_rollback("user.toml", false);
+    board.booted_secs_ago(180);
+
+    let run = board.boot_check(&[], &[("robotd.service", "failed", 5)]);
+    assert_eq!(run.code(), 2, "stderr: {}", run.stderr());
+    assert_eq!(
+        board.link_target("current").as_deref(),
+        Some("releases/1.2.0")
+    );
+
+    board
+        .with_auto_rollback("base.toml", false)
+        .with_auto_rollback("user.toml", true);
+    let run = board.boot_check(&[], &[("robotd.service", "failed", 5)]);
+    assert_eq!(run.code(), 0, "stderr: {}", run.stderr());
+    assert_eq!(
+        board.link_target("current").as_deref(),
+        Some("releases/1.0.0")
+    );
+}
+
+/// `--dry-run` is the OS slot gate's question, and the setting is not part of it.
+#[test]
+fn the_boot_check_dry_run_answers_whatever_auto_rollback_says() {
+    let board = Board::with_releases(&["1.0.0", "1.2.0"]);
+    board.link("current", "1.2.0").link("golden", "1.0.0");
+    board.booted_secs_ago(180);
+
+    let run = board.boot_check(&["--dry-run"], &[("btd.service", "failed", 4)]);
+    assert_eq!(run.code(), 3, "stderr: {}", run.stderr());
 }

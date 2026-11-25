@@ -126,6 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 trusted_keys_dir = "{prefix}/keys"
 hw_rev = 1
 state_dir = "{prefix}/var"
+# Auto-rollback on: the checks driving this fixture are about what a revert does.
+robotd_config = "{prefix}/robotd.toml"
 
 # `--inject-fault` is refused without this, and it is never set on a client robot.
 allow_fault_injection = true
@@ -146,6 +148,10 @@ keep_previous = 2
         prefix = prefix.display(),
     );
     std::fs::write(cli.root.join("updater.toml"), config)?;
+    std::fs::write(
+        cli.root.join("robotd.toml"),
+        "[update_gate]\nauto_rollback = true\n",
+    )?;
 
     println!("\nminted at {}", cli.root.display());
 

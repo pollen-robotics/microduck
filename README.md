@@ -73,6 +73,7 @@ It also sits, kicks a ball, rolls forward on command, and quacks in a voice that
 |---|---|
 | [Cheat sheet](docs/robot/cheatsheet.md) | Every `robotctl` command: drive, configure, voice, chorale, theremin, wifi, updates, logs. Start here. |
 | [Gamepad](docs/robot/cheatsheet.md#gamepad-configd) | The full button mapping, and pairing a pad — [once per pad](docs/robot/pair-a-gamepad.md), plus what to do when it will not bond. |
+| [NFC tags](docs/robot/nfc-tags.md) | Touch a tag to the head: pair a pad, or switch to walk, roller, laser or soccer. Writing your own tags. |
 | [`duckctl`](docs/robot/duckctl.md) | The robot from a laptop over Bluetooth, with no network and no ssh. |
 | [Updates](docs/robot/cheatsheet.md#updates-updaterd) | Install, roll back, pin. Every update is verified, health-gated and reversible. |
 
@@ -93,8 +94,9 @@ It also sits, kicks a ball, rolls forward on command, and quacks in a voice that
 
 Rust, no framework, one workspace. `robotd` owns the control loop and the motor bus; `updaterd`
 installs signed releases and rolls them back when a robot comes up unhealthy; `configd` owns wifi
-and identity; `btd` is the Bluetooth path a phone uses; `padd` reads the gamepad; `mediad` streams
-the camera over WebRTC; `tofd` serves the depth sensor. They talk over one JSON-RPC contract on
+and identity; `btd` is the Bluetooth path a phone uses; `padd` reads the gamepad; `autod` is the
+duck's own brain, when it is switched on; `mediad` streams the camera over WebRTC; `tofd` serves the
+depth sensor. They talk over one JSON-RPC contract on
 Unix sockets, and every client — the app, the console, the gamepad, your script — sends exactly the
 same calls.
 

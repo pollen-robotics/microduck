@@ -23,7 +23,7 @@ use duck_ipc_proto as proto;
 /// How long a call holds a connection. Defined once, in the protocol crate.
 pub use proto::Lane;
 
-/// The service that owns the answer to a call, restricted to the three `btd` holds sockets to.
+/// The service that owns the answer to a call, restricted to the four `btd` holds sockets to.
 ///
 /// Narrower than [`proto::Service`] on purpose. `padd` and `tofd` answer calls too, and `btd` has
 /// no connection to either: `padd` is the unprivileged client whose whole value is having no
@@ -38,6 +38,8 @@ pub enum Upstream {
     Robot,
     /// `configd` — wifi and the robot's identity.
     Config,
+    /// `nfcd` — writing a tag.
+    Nfc,
 }
 
 impl TryFrom<proto::Service> for Upstream {
@@ -48,10 +50,11 @@ impl TryFrom<proto::Service> for Upstream {
             proto::Service::Updater => Ok(Upstream::Updater),
             proto::Service::Robot => Ok(Upstream::Robot),
             proto::Service::Config => Ok(Upstream::Config),
+            proto::Service::Nfc => Ok(Upstream::Nfc),
             // Not sockets `btd` holds. Unreachable in practice, because `permits` refuses every
             // call these answer — and an error rather than a panic so that staying true is not
             // something this file has to be careful about.
-            proto::Service::Pad | proto::Service::Tof => Err(()),
+            proto::Service::Pad | proto::Service::Tof | proto::Service::Map => Err(()),
         }
     }
 }
@@ -137,6 +140,10 @@ fn permits(call: &proto::Call) -> bool {
         // of builds; `apply` and `switch` end in a reboot, so the link drops after the answer.
         OsStatus | OsCheck => true,
         OsApply(_) | OsSwitch(_) => true,
+
+        // The owner's switch for anonymous usage data. The phone is where an owner looks for a
+        // privacy setting, and the reply is two booleans.
+        TelemetryStatus | TelemetrySet(_) => true,
 
         // Is the robot alright? The one `robot.*` call an app has any use for.
         RobotHealth => true,
@@ -235,10 +242,10 @@ fn permits(call: &proto::Call) -> bool {
         ResetToGolden(_) => false,
 
         // `updaterd`'s private questions to `robotd` — may I restart the control loop, which
-        // model API is this, is a telepresence session live. Internal plumbing of the update
+        // model API is this. Internal plumbing of the update
         // decision, of no use to a client and misleading if exposed: a phone reading
         // `safeToRestart` would learn nothing it could act on.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi => false,
 
         // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
         // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
@@ -288,16 +295,32 @@ fn permits(call: &proto::Call) -> bool {
         // radio's version of `robotctl quack`. One request, not a stream, and it moves nothing.
         RobotSound(_) => true,
 
-        // Harmless and rather charming from a phone — but they ride the same refusal as the
-        // rest of robot.* until the app path exists to want them: opening a call to the radio
-        // ahead of a client that can use it buys nothing and widens the surface.
-        //
-        // The theremin sits here rather than with motor control even though it moves the
-        // mouth, because what it is is a sound: the mouth is following the note. Same
-        // refusal either way, and the same reason to lift it — an app that can play the duck.
-        RobotTheremin(_) | RobotChorale(_) => false,
-        // The flashlight waits for the same app: an LED is no more urgent from a phone than a quack.
-        RobotFlashlight(_) => false,
+        // The speaker level, read and set. Asked from the room by whoever is listening to the
+        // duck, and set from the app's settings: the same class as a quack, plus a write to
+        // `[audio] volume` so the level survives a restart. Trivially undone from the same phone.
+        RobotVolume | RobotSetVolume(_) => true,
+
+        // The theremin is a sound, and sounds are routed above. It moves the mouth, but the mouth
+        // is following the note, which is `robot.sound`'s mouth-on-a-quack by another name; it
+        // walks nothing. It waited here for "an app that can play the duck", and the app's home
+        // screen is now that: Sing beside Quack, which without this needed the video connection,
+        // and so wifi, for an instrument whose whole input is a hand ten centimetres from the beak.
+        RobotTheremin(_) => true,
+        // The chorale stays refused: it starts the robot listening for other ducks, and the
+        // animation that follows was asked for by none of the people in the room.
+        RobotChorale(_) => false,
+        // The games: laser chase, soccer, the duck on its own. They walk the robot, and that was
+        // the reason to refuse them — "the radio is not a control transport". But none of them is
+        // a stream from the phone: each is one switch, and what walks the robot afterwards is the
+        // robot's own camera and its own brain, exactly as when an NFC mode tag switches it —
+        // with no bond, no PIN, nobody's phone at all. A PIN-bonded phone in radio range is more
+        // of a someone than a card touched to the head. What the phone does not get is the
+        // steering: `robot.move` and its stream stay on the video connection. The app's home
+        // screen switches them here, one game at a time, the way a mode tag does.
+        RobotLaserTrack(_) | RobotSoccer(_) | RobotAutonomous(_) => true,
+        // The face light, on the same reasoning as the theremin: an LED is no more consequential
+        // from a phone than a quack, and the app that was waited for now has a Light button.
+        RobotFlashlight(_) => true,
 
         // The chorale's own namespace is between `btd` and `robotd` — it is how this daemon is told
         // what to advertise and how it reports what it heard. Not a client surface at all, so a
@@ -309,10 +332,11 @@ fn permits(call: &proto::Call) -> bool {
         // robot, and that is `robotctl` or the pad's long-press, deliberately.
         RobotShutdown => false,
 
-        // Only a stick-mapping hint for local clients like `padd`. An app gets the same answer
-        // through `system.info` territory when it ever needs one; no reason to open another read
-        // to the radio today.
-        RobotMode => false,
+        // Which switches are on: the mode, soccer, the duck on its own, the laser, the theremin, the
+        // light (v67). Read once a few seconds by the app's home screen so its game tiles say what
+        // the duck is doing rather than what this phone last asked — a tag, the pad or `autod`
+        // switch them too. A read of a few bytes; it was refused only for having no client.
+        RobotMode => true,
 
         // Switching modes means the robot goes home, loads other policies and drives differently
         // — and the reason to switch is that somebody just put wheels on it. That is a decision
@@ -526,6 +550,31 @@ fn permits(call: &proto::Call) -> bool {
         TofStream => false,
         // Same as the ToF: the head IMU is tofd's, reached over mediad's video path, not BLE.
         HeadImuStream => false,
+
+        // **Writing a tag is asked from the room by construction**: nothing is written until
+        // somebody touches a tag to the robot's head, which is where a phone in BLE range is.
+        // `duckctl nfc-flash` is the client. It changes the tag, never the robot — the tag's
+        // text does whatever it does only when touched again, like one a phone app wrote.
+        NfcWrite(_) => true,
+        // Reading one is the same touch, and changes nothing at all: the tag read is not acted on.
+        NfcRead(_) => true,
+        // **The phone's gallery, and the reason it is here rather than on WebRTC.** The photos are
+        // the owner's — their home, their people — and this link proved the setup code before any
+        // call reached a service, which is what makes it the place to read them from. A picture is
+        // hundreds of kilobytes, so `photo.get` answers in chunks a BLE line holds: tens of seconds
+        // for a whole one, a second for its preview, and a phone shows the previews first.
+        // Deleting one is the owner tidying their own pictures, from the app they keep them in.
+        PhotoList | PhotoGet(_) | PhotoDelete(_) => true,
+        // **Taking one is a quack with a pose.** Asked from the room, by the person the duck is
+        // about to look at: it quacks, lifts its head and counts down with its light for five
+        // seconds before the picture, so nobody in front of it is surprised — and the picture is
+        // read back over this same link. It moves the robot no more than the photo tag does, and
+        // a robot busy with a skill is refused, as the tag leaves it alone.
+        PhotoTake => true,
+        // The map is `mapd`'s, which is not a socket `btd` holds; a grid is tens of kilobytes,
+        // which is minutes through a 20-byte pipe. A phone asking where its duck is will be a
+        // reason to forward `map.status` — not yet one anybody has.
+        MapStatus | MapStream | MapGrid(_) | MapWipe => false,
     }
 }
 
@@ -730,7 +779,6 @@ mod tests {
             }),
             proto::Call::RobotSafeToRestart,
             proto::Call::RobotModelApi,
-            proto::Call::RobotRemoteSessionActive,
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());
         }
@@ -744,6 +792,7 @@ mod tests {
             (
                 proto::Call::Hello(proto::HelloParams {
                     api_version: proto::API_VERSION,
+                    client: None,
                 }),
                 Upstream::Updater,
             ),
@@ -765,6 +814,53 @@ mod tests {
             hold: None,
         });
         assert_eq!(upstream_for(&quack), Some(Upstream::Robot));
+    }
+
+    /// **A photo is asked for from the phone that reads it back.** `nfcd` takes it, as it takes
+    /// the photo tag's, and its lane is the gallery's: answered once the pose has started.
+    #[test]
+    fn a_phone_can_ask_for_a_photo() {
+        assert_eq!(
+            destination_for(&proto::Call::PhotoTake),
+            Some((Upstream::Nfc, Lane::Prompt))
+        );
+    }
+
+    /// **Sing and light, beside the quack.** The app's home screen offers them next to its
+    /// sounds; refused here, they needed the video connection and so wifi. The chorale, their
+    /// neighbour on the refused list, stays there.
+    #[test]
+    fn sing_and_light_reach_robotd_and_the_chorale_does_not() {
+        let sing = proto::Call::RobotTheremin(proto::ThereminParams { active: true });
+        let light = proto::Call::RobotFlashlight(proto::FlashlightParams {
+            toggle: true,
+            ..Default::default()
+        });
+        assert_eq!(upstream_for(&sing), Some(Upstream::Robot));
+        assert_eq!(upstream_for(&light), Some(Upstream::Robot));
+        let chorale = proto::Call::RobotChorale(proto::ChoraleParams {
+            active: true,
+            piece: None,
+        });
+        assert_eq!(route_for(&chorale), Route::Refused);
+    }
+
+    /// **The games are switches a phone may throw, and `robot.mode` says which are thrown.**
+    /// The steering is not among them: the robot walks to the dot or the ball on its own.
+    #[test]
+    fn games_are_switched_over_bluetooth_and_read_back() {
+        let games = [
+            proto::Call::RobotLaserTrack(proto::LaserTrackParams { active: true }),
+            proto::Call::RobotSoccer(proto::SoccerParams {
+                active: true,
+                autonomous: true,
+            }),
+            proto::Call::RobotAutonomous(proto::AutonomyParams { active: true }),
+            proto::Call::RobotMode,
+        ];
+        for call in &games {
+            assert_eq!(upstream_for(call), Some(Upstream::Robot), "{call:?}");
+        }
     }
 
     /// **A phone can ask for a skill, see what the robot has, and change what it runs.**
@@ -874,6 +970,7 @@ mod tests {
                 head_pitch: 0.0,
                 head_yaw: 0.0,
                 head_roll: 0.0,
+                alpha: None,
             }),
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());

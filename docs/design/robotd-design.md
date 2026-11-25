@@ -154,6 +154,8 @@ write()         one sync_write     · goal positions
 publish         atomics always; a state frame only if someone subscribed     (§4.1)
 
 every 1 s       slow_sensors()     · registers 144–146 · voltage + temperature (§2.1)
+
+while subscribed, after write()   impact_guard() · register 66 · servos on the guard firmware (§2.1)
 ```
 
 Where the data goes, once per period:
@@ -279,7 +281,11 @@ saying so:
   "latches on input-voltage faults" it says the opposite of what it does. Alongside them,
   `homing_offset` is −512 on the knees (13, 23) and 0 everywhere else, the values from the
   runtime's `setup_motor_rpi.py` flashing rig. Every pose and policy assumes the knees carry that
-  offset, and a servo straight from the box does not.
+  offset, and a servo straight from the box does not. And `current_limit = 1000` mA, against the
+  factory's 1750, with Goal Current written alongside because position control caps at Goal
+  Current, which takes Current Limit only at boot. A servo refuses an EEPROM write with torque on,
+  which is how a standing robot is when an update restarts `robotd`, so then the check says so
+  and leaves the write to the next start rather than cutting torque or holding the loop off.
 - **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
   57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
   the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
@@ -301,6 +307,39 @@ eight bytes past its end, with twelve bytes of trajectory registers nothing want
 so they are sampled together once a second in their own transaction (~1 ms) rather than
 widening the tick's read to 22 bytes per servo at 50 Hz. The sampling interval is the same
 window the achieved rate is measured over, so one clock drives both.
+
+**The impact guard's state is a fourth read, and only while someone records.** ROBOTIS's impact
+guard firmwares (`firmware_version` 3, 4) brake a servo that hits something and hold it softly,
+which is what keeps gear teeth whole; their register 66 says which of armed, braking or holding each
+servo is in. That is a transaction of its own (~1 ms), so it is read only on ticks with a
+`robot.state` subscriber, after the goal positions are written — the read→decide→write path is the
+same with or without it — and only from a robot where at least one servo runs that firmware. The
+firmware is read once a start with the vet book's identity read, and every servo on another one is
+named in the journal and published as `null`. The guard's own settings are EEPROM on that firmware
+(40–43 and 56–59), asserted by the same startup check as the registers above. `bus.impact_guard`
+is off by default, until it is understood why the stress test robot on it fell on its own far more
+often than any other (2026-11-09); on, it writes the six `bus.impact_guard_*` settings, by default
+what a microduck walks with (a short brake on fast
+arrivals, no hold, a stronger speed taper: ROBOTIS's factory values made a walking robot fall), or
+with `bus.impact_guard = false` a deceleration no impact reaches, a hold current the motor never
+draws and no speed taper — the factory firmware with only Current Limit. V4 adds Impact Guard
+Enable (67, RAM), off after every power-up and with it the whole guard, and off there writes no
+settings: the switch does it, so the toggle cannot leave stale settings behind. The torque-on write
+sets it to what `bus.impact_guard` asks first; that one moment follows every way a servo can lose
+RAM (power-up, reboot, a latched error), each of which leaves it limp, and a servo still stiff after
+a `robotd` restart takes the write too. New settings are written with torque off and run from the
+next torque on, without a reboot: on V3, each restart's hold current and taper showed in the very
+next walk on lavandiere (2026-11-05); on V4, the gear bench's first shot after the write ran them.
+
+**Goal PWM can follow the battery.** With `bus.battery_voltage_based_pwm_limit` on (off by
+default), every 10 s the loop writes Goal PWM (100, RAM) on every servo at `6 V / battery EMA`
+out of 885, the factory PWM Limit: 648 (73 %) on a full 8.2 V pack, 856 at 6.2 V, 885 below
+6 V. The motor then sees ~6 V whatever the charge (`duck_control::model::goal_pwm_for`). It is
+Goal PWM and not PWM Limit (36, EEPROM) because PWM Limit reaches Goal PWM only at boot. It is
+rewritten even when unchanged, and the first apply after a servo reboot writes it again. Off
+writes 885 once at startup: Goal PWM survives a `robotd` restart, so without that a cap from an
+earlier run would stay in place. While on, `robot.health` carries the last value as `goal_pwm`, and `robotctl
+monitor` shows it beside the battery.
 
 Voltage is averaged across the servos: all fifteen sit on one pack, so a single reading is the
 same measurement with more noise, and a device answering zero is filtered out rather than
@@ -468,10 +507,33 @@ until the next walk; here scale and gain are recomputed from the active state ev
 
 **One move at a time, and none from the seat.** A ground pick, a skill, a sit or a rise is
 refused while any other is in flight — including the glide down into the seat — and only
-standing up is accepted from a seated robot. The one request a running skill takes is one for
+standing up — and a seated skill, below — is accepted from a seated robot. The one request a running skill takes is one for
 itself when it chains, which is the button being held. This is a second divergence: the
 prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
 network handed a pose it was not trained from.
+
+**Each skill starts only from the pose it was trained from: its `entry_pose`.** Standing — the
+default, and every skill before there was a choice — is refused from the seat, which is the rule
+above. Seated is the mirror: a policy trained *from* the seat, like the MicroDock's scoot that
+shuffles on its seat from the pose `alpha_sitstand` sits in, is refused standing, rising and on
+the glide down, and starts only from a settled seat. Nothing about the seat changes while it runs
+— the skill outranks the sitstand network, and when its window ends the seat is still the seat, so
+the sitstand network holds it again and standing up is still the sit toggle's. It runs at the
+seat's tuning — scale 1.0 and full gain, what the sitstand network holds the seat at — unless it
+sets its own: the standing-tuning heuristic (`|twist| ≤ 0.05` means standing gain) is about a
+robot on its feet, and in the seat it made the scoot's stiffness depend on the speed typed and
+jump at both hand-overs. The pose comes from
+the manifest ([`policy-manifest.md`](../policy-manifest.md) owns the field), or `robotctl policy
+add --entry-pose`, and is written to the skill's `[[policy.skill]]` entry. A value this build does
+not know reads as standing rather than refusing the file.
+
+`robot.do` refuses a move in the wrong pose at the door, with the loop's reason, rather than
+answering "queued" for a loop that drops it into the debug log. **Both ask one rule**,
+`control::pose_blocks`, of one state: the loop publishes where it is in the sit↔stand cycle —
+standing, gliding down, seated, rising — as a byte each tick, and the door reads it. The glide
+down and the rise were exactly where a bool used to say "queued" for a request the loop then
+dropped. What is left is one queue hop: a `sit_toggle` and a move sent back to back, before the
+loop has ticked in between — 20 ms, not two seconds.
 
 The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
 flight and, on a seated robot, holds the seat where it is rather than sending the standing home
@@ -531,6 +593,14 @@ ONNX Runtime is a **board prerequisite**, installed by `scripts/install.sh`, not
 release. It changes far less often than the daemon, and ~20 MB in every artifact would enlarge
 every update for nothing. The trade is that a board missing it installs and starts fine and
 then cannot walk — which is why health reports the searched path.
+
+`robotd` and `mediad` load it as `libonnxruntime.so.1` (`ORT_DYLIB_PATH` in their units), not as
+`ort`'s default bare `libonnxruntime.so`, which is a development symlink an OS image does not
+ship. On an OS image the runtime is a package, and `/usr/lib/libonnxruntime.version` names its
+version, as `librknnrt.version` does for the NPU runtime; `hooks/preinstall` reads that first and
+falls back to resolving `/usr/local/lib/libonnxruntime.so` on a board set up by script. An image
+whose stamp is below the floor is refused with a message naming the OS update, since the hook can
+neither replace the image's package nor download on an image without `curl`.
 
 Not done, and deliberately: pre-binding the ONNX input/output tensors. The current path
 allocates a 61-float vector per inference, ~244 bytes at 50 Hz. Worth measuring on the board
@@ -602,6 +672,17 @@ sequence takes the fall away from the policy: limp at `gain_limp` following the 
 wait for the gyro to go quiet, ramp back to the standing pose over ~1 s, hand over. The
 hand-back is nothing more than that — the twist has been held at zero throughout, so command
 magnitude selects the standing network, and that is the stand-up.
+
+A stand-up can still stall: from the back the policy sometimes gets half-way and holds a pose
+it never gets out of, and the human cure is Start twice — policy off, home pose, policy on. The
+daemon does that itself. Whenever the policy takes the robot (this hand-back, or an enable on the
+floor) it has `limp_fall_standup_ms` (3 s) to have it up — inside the tilt gate for
+`limp_fall_arm_ms`, the predictor's own arming test. If not, the sequence's pose ramp puts it
+back into the standing pose and hands over again, up to `limp_fall_standup_retries` (3) times in
+a row. A disable, a skill or a sit drops the watch. Out of retries, the robot is parked: stiff at
+the home pose with the policy off — `driving` false (§1.4), as for a pick-up — until it has been
+upright and still for `limp_fall_standup_resume_ms` (1 s), which is somebody standing it on its
+feet and letting go, and then the policy takes it back. Start twice also ends the park.
 
 It runs off the policy's path by construction: `driving` is false for the whole sequence
 (§1.4), so the targets come from the sequence rather than the controller, and they reach the
@@ -841,7 +922,6 @@ robot.
 | `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
-| `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
 
 Health is computed by the IPC side from atomics the loop publishes — a last-tick timestamp plus
 counters — never by asking the loop. That is what lets a *wedged* loop report itself unhealthy
@@ -860,6 +940,15 @@ updated at all until someone works out why. Motor temperature would do the same 
 afternoon, and a throttled clock on a robot that had got warm once — which is the strongest case
 of the three, since the release that would fix the heat is the one the gate would refuse to
 keep.
+
+**A run of failed reads could be either, so the loop asks the bus which.** A servo unplugged
+mid-run fails every sync read exactly as a release with a broken read path does, and only the
+second is something a rollback fixes. So once the run reaches `max_consecutive_errors`, and every
+few seconds while it lasts, the loop pings each servo and the IMU board. If any of them is silent,
+the verdict is degraded and names them, which is what the same robot gets on its next boot. If
+every one answers, or the ping itself fails, it stays unhealthy. Without the ping round, the
+verdict for the same hardware depended on whether it was unplugged before or after `robotd`
+started.
 
 **Why they travel together anyway.** One method, because the question arrives once: a robot
 behaving oddly gets asked "what is going on", and a verdict without the numbers behind it just
@@ -949,7 +1038,11 @@ can reach the requested pose.
 
 D-pad mode selection and Start/Select holds remain fixed. With IMU head control active,
 `head_drive` uses the `drive` stick bindings while tilt drives the head through `[pad_head]` limits.
-Smoothing remains in `robotd`'s `[control]` settings. `--deadzone` and `--max-head`, on either
+Smoothing remains in `robotd`'s `[control]` settings, with one pad-only addition: the head
+sticks go through `[pad_head] expo`, a response curve that spends the stick's centre on fine
+movements, and `max_speed`, a cap in rad/s on how fast they move the head target — a full snap
+glides at that speed rather than jumping and then crawling in on `head_alpha`. Neither applies to
+the IMU head. `--deadzone` and `--max-head`, on either
 daemon, override the corresponding file settings for bench use.
 
 `robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
@@ -1019,7 +1112,10 @@ intents the loop already arbitrates.
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
+| `laser.rs` | a laser dot from `mediad`'s `media.laser` (a ray, not a pixel) → a place on the floor through head FK, IMU and odometry → a head pose and a twist, each taken only while no client wants that half | the module header; the detector is `mediad/src/laser.rs` |
+| `soccer.rs` | soccer mode's two switches (`robot.soccer`, read back in `robot.mode` for the pads); autonomous play: the purple ball from `media.ball`, projected as the laser's dot but a radius above the floor → walk to it, line a foot up, queue the kick | the module header; the detector is `mediad/src/ball.rs`, the pad's half `pad-map/src/mapper.rs` |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
+| `emotion.rs` | an emotion = keyframes and a wav, shipped in the release with `[emotions] dir` on top, played by `robot.do <name>` through the same head, pose and mouth commands a client sends | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |
 | `vetbook.rs` | the robot's lifetime record: a tally the tick adds to without a lock, handed to the shared book once a second with `try_lock`, saved atomically once a minute; plus a 1-byte read of each servo's latched alerts every 10 s | the module header, and `duck_ipc_proto::vetbook` for the record |
 
@@ -1030,11 +1126,14 @@ behind `RobotIo`, because it has to keep answering when the motor bus does not.
 one when a second reader would otherwise have to derive its contract from the code
 (`../README.md`). These have exactly one implementation and one consumer each, and their decisions
 are local enough to live in the module header next to what they constrain. What they need instead
-is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin].
+is to be *operable*, and that is the cheat sheet's job: [the voice], [the chorale], [the theremin],
+[laser tracking], [soccer].
 
 [the voice]: ../robot/cheatsheet.md#the-voice
 [the chorale]: ../robot/cheatsheet.md#the-duck-chorale
 [the theremin]: ../robot/cheatsheet.md#play-the-duck-the-tof-theremin
+[laser tracking]: ../robot/cheatsheet.md#follow-a-laser-dot
+[soccer]: ../robot/cheatsheet.md#play-soccer
 
 ## 5. Why it exists, and where it came from
 

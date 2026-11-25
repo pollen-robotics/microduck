@@ -256,6 +256,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 trusted_keys_dir = "{p}/keys"
 hw_rev = 1
 state_dir = "{p}/var"
+# Auto-rollback on: the checks driving this fixture are about what a revert does.
+robotd_config = "{p}/robotd.toml"
 allow_fault_injection = true
 
 [component.daemon]
@@ -268,6 +270,10 @@ health = {{ probe = "command", program = "/usr/bin/systemctl", args = ["is-activ
         p = prefix.display()
     );
     std::fs::write(cli.root.join("updater.toml"), config)?;
+    std::fs::write(
+        cli.root.join("robotd.toml"),
+        "[update_gate]\nauto_rollback = true\n",
+    )?;
 
     println!(
         "\nminted at {}, paths written for {}",

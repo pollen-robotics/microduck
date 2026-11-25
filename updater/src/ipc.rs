@@ -130,6 +130,13 @@ pub struct Server {
 
     /// Where `vetbook.share` asks for the book and the robot's name.
     vetbook: crate::vetbook::Sources,
+
+    /// Anonymous usage data: the owner's switch, and the queue the task started by
+    /// [`Self::spawn_telemetry`] sends.
+    telemetry: Arc<crate::telemetry::Telemetry>,
+
+    /// What runs and watches an OS update. A test points it at stubs.
+    os: crate::os::Tools,
 }
 
 impl Server {
@@ -169,7 +176,18 @@ impl Server {
             forced_owner_uid: None,
             account: Arc::new(crate::account::account_at(token_path)),
             vetbook: crate::vetbook::Sources::default(),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(PathBuf::from(
+                crate::telemetry::DEFAULT_PATH,
+            ))),
+            os: crate::os::Tools::system(),
         }
+    }
+
+    /// Keep the telemetry state somewhere other than a robot's: `updaterd` passes its
+    /// `state_dir`, and a test a temporary directory.
+    pub fn with_telemetry_at(mut self, path: PathBuf) -> Self {
+        self.telemetry = Arc::new(crate::telemetry::Telemetry::new(path));
+        self
     }
 
     /// Where `vetbook.share` finds `robotd` and `configd`, when not at their default sockets.
@@ -186,6 +204,13 @@ impl Server {
     #[doc(hidden)]
     pub fn with_account_for_test(mut self, token_path: PathBuf, endpoint: String) -> Self {
         self.account = Arc::new(crate::account::account_for_test(token_path, endpoint));
+        self
+    }
+
+    /// Run and watch OS updates with these programs instead of the robot's.
+    #[doc(hidden)]
+    pub fn with_os_tools_for_test(mut self, tools: crate::os::Tools) -> Self {
+        self.os = tools;
         self
     }
 
@@ -313,6 +338,12 @@ impl Server {
         tokio::spawn(crate::account::maintain(Arc::clone(&self.account)))
     }
 
+    /// Report this start and send usage data until the process ends. Nothing leaves the robot
+    /// while the owner's switch is off; see [`crate::telemetry`].
+    pub fn spawn_telemetry(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(Arc::clone(&self.telemetry).run(self.vetbook.robot_socket.clone()))
+    }
+
     /// One pass of the scheduler. Exposed so tests can drive it without waiting for
     /// a timer.
     #[doc(hidden)]
@@ -389,6 +420,14 @@ impl Server {
                         continue;
                     }
 
+                    if crate::os::running(&self.os).await {
+                        tracing::info!(
+                            %component,
+                            %candidate,
+                            "an OS update is running; holding this one until the next check"
+                        );
+                        continue;
+                    }
                     if mandatory {
                         tracing::warn!(
                             %component,
@@ -427,6 +466,9 @@ impl Server {
     /// unattended update in progress rather than an unexplained restart.
     async fn apply_unattended(&self, component: &str) -> Result<proto::ApplyResult, crate::Error> {
         let mut engine = self.engine.try_lock().map_err(|_| crate::Error::Busy)?;
+        if crate::os::running(&self.os).await {
+            return Err(crate::Error::Busy);
+        }
 
         let (tx, rx) = mpsc::unbounded_channel::<Progress>();
         let pump = self.spawn_progress_pump(rx);
@@ -703,6 +745,14 @@ impl Server {
                 Ok(was) => Response::ok(Some(id), &crate::account::logout_result(was)),
                 Err(e) => Response::err(Some(id), crate::Error::from(e).to_rpc_error()),
             },
+            // ── telemetry.* ─────────────────────────────────────────────────────
+            //
+            // No engine lock: a flag and a small file, outside every release directory.
+            Call::TelemetryStatus => Response::ok(Some(id), &self.telemetry.status()),
+            Call::TelemetrySet(params) => match self.telemetry.set(params.enabled) {
+                Ok(result) => Response::ok(Some(id), &result),
+                Err(e) => Response::err(Some(id), e.to_rpc_error()),
+            },
             // No engine lock, like the account: it reads two daemons and talks to the Hub, and
             // touches nothing an update owns.
             Call::VetbookShare(params) => {
@@ -716,11 +766,11 @@ impl Server {
             //
             // The reads take no engine lock: the OS's state is the script's, not the engine's, and
             // `os.status` is what a client polls while an OS update downloads.
-            Call::OsStatus => match crate::os::status(&crate::os::Tools::system()).await {
+            Call::OsStatus => match crate::os::status(&self.os).await {
                 Ok(status) => Response::ok(Some(id), &status),
                 Err(e) => Response::err(Some(id), e),
             },
-            Call::OsCheck => match crate::os::check(&crate::os::Tools::system()).await {
+            Call::OsCheck => match crate::os::check(&self.os).await {
                 Ok(status) => Response::ok(Some(id), &status),
                 Err(e) => Response::err(Some(id), e),
             },
@@ -749,7 +799,7 @@ impl Server {
                 if let Err(e) = engine.os_preflight(interrupt_sessions, network).await {
                     return Response::err(Some(id), e.to_rpc_error());
                 }
-                match crate::os::start(&crate::os::Tools::system(), &action).await {
+                match crate::os::start(&self.os, &action).await {
                     Ok(status) => Response::ok(Some(id), &status),
                     Err(e) => Response::err(Some(id), e),
                 }
@@ -840,7 +890,6 @@ impl Server {
             Call::RobotSafeToRestart
             | Call::RobotHealth
             | Call::RobotModelApi
-            | Call::RobotRemoteSessionActive
             | Call::RobotMove(_)
             | Call::RobotHead(_)
             | Call::RobotLook(_)
@@ -856,6 +905,9 @@ impl Server {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotTheremin(_)
+            | Call::RobotLaserTrack(_)
+            | Call::RobotSoccer(_)
+            | Call::RobotAutonomous(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
             | Call::ChoraleBeaconSet(_)
@@ -868,6 +920,8 @@ impl Server {
             | Call::RobotVetbook
             | Call::RobotVetbookNote(_)
             | Call::RobotVetbookTally(_)
+            | Call::RobotVolume
+            | Call::RobotSetVolume(_)
             | Call::RobotLoadPolicy(_)
             | Call::RobotReloadPolicies
             | Call::RobotSubscribe(_) => Response::err(
@@ -925,12 +979,36 @@ impl Server {
                 ),
             ),
 
+            // And again for the map: `mapd` owns it.
+            Call::MapStatus | Call::MapStream | Call::MapGrid(_) | Call::MapWipe => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "map.* is served by mapd, on /run/mapd/map.sock",
+                ),
+            ),
+
             // Same story one namespace over: `tofd` owns the sensor and answers for it.
             Call::TofStream | Call::HeadImuStream => Response::err(
                 Some(id),
                 proto::Error::new(
                     proto::code::METHOD_NOT_FOUND,
                     "tof.stream is served by tofd, on /run/tofd/tof.sock; head_imu.stream by tofd on a zero3 and by robotd (/run/robotd.sock) on a beta",
+                ),
+            ),
+
+            Call::NfcWrite(_) | Call::NfcRead(_) => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "nfc.write and nfc.read are served by nfcd, on /run/nfcd/nfc.sock",
+                ),
+            ),
+            Call::PhotoList | Call::PhotoGet(_) | Call::PhotoDelete(_) | Call::PhotoTake => Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::METHOD_NOT_FOUND,
+                    "photo.* is served by nfcd, on /run/nfcd/nfc.sock",
                 ),
             ),
 
@@ -1020,6 +1098,18 @@ impl Server {
                 );
             }
         };
+        // `os.apply` gives the engine back once its update is under way, and that update ends
+        // in a reboot that must not land in the middle of a swap. Asked under the lock, so no
+        // `os.apply` can start between this and the swap; the 8090 page does not take it.
+        if crate::os::running(&self.os).await {
+            return Response::err(
+                Some(id),
+                proto::Error::new(
+                    proto::code::BUSY,
+                    "an OS update is running; retry once it has finished",
+                ),
+            );
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Progress>();
 

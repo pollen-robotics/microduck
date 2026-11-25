@@ -846,6 +846,25 @@ mod tests {
         assert_eq!(m.incompatibility(here()), None);
     }
 
+    /// **The scoot's manifest as published**, `HannesVonEssen/microduck-backwards-scoot`: its
+    /// `entry_pose` is a sentence, and it reaches the client verbatim — the client is what tells
+    /// "said nothing" from "said something not understood", and asks for the word.
+    #[test]
+    fn entry_pose_is_passed_on_verbatim() {
+        let m = manifest(serde_json::json!({
+            "schema_version": 4, "model_api": 1, "kind": "perpetual",
+            "obs_len": 61, "action_len": 14,
+            "entry_pose": "sitting, after the official alpha_sitstand policy sits the duck down",
+            "command": { "idle": [0.0, 0.0, 0.0] },
+            "robot": { "model": "microduck" }
+        }));
+        assert_eq!(
+            m.entry_pose.as_deref(),
+            Some("sitting, after the official alpha_sitstand policy sits the duck down")
+        );
+        assert_eq!(m.incompatibility(here()), None);
+    }
+
     /// **The unified convention, schema 2.** The official set's fields and the community's are one
     /// vocabulary now (`docs/policy-manifest.md`); a single-policy repo may carry any of them, and
     /// this reads the ones a client acts on — the encoding above all, since it is what says whether
@@ -1162,6 +1181,9 @@ pub struct PolicyManifest {
     pub ramp_s: Option<f64>,
     /// `walk` or `roller`, for a policy that belongs to one drive mode.
     pub mode: Option<String>,
+    /// `standing` or `seated`: the pose it starts from, and the only one the robot will start it
+    /// in. Passed on verbatim — see [`crate::proto::PolicyFetchResult::entry_pose`].
+    pub entry_pose: Option<String>,
     pub command: Option<ManifestCommand>,
     pub obs_len: Option<usize>,
     pub action_len: Option<usize>,
@@ -1436,6 +1458,7 @@ pub async fn fetch(
         encoding: manifest.command.as_ref().and_then(|c| c.encoding.clone()),
         chain: manifest.chain,
         schema_version: manifest.schema_version,
+        entry_pose: manifest.entry_pose,
     })
 }
 
