@@ -26,12 +26,25 @@ same code path the robot runs, so there is no train/infer drift. Record data on 
 arecord -D plughw:aic3104,0 -f S16_LE -r 16000 -c 1 -d 30 /tmp/petting_01.wav
 ```
 
-into `data/petting/` and `data/normal/` (walking, motors, ambient — anything that isn't
-petting; the recordings themselves are not vendored here), then:
+Record several independent sessions for each class. The trainer splits whole sessions, not the
+overlapping one-second windows extracted from them: putting adjacent windows on opposite sides
+would make validation measure memorisation. [`data/README.md`](data/README.md) defines the
+recommended manifest, provenance fields, privacy checks, and hard negatives. The legacy
+`data/petting/*.wav` and `data/normal/*.wav` layout remains accepted, with each WAV treated as one
+session. Recordings are ignored by Git.
+
+Then run:
 
 ```bash
 cargo build --release -p pet-detect --bin pet-features
-uv run --with torch --with onnx training/train.py
+uv run pet-detect/training/train.py
 ```
 
-and commit the refreshed `models/pet_detect.onnx`.
+Training is deterministic for a seed, balances the two classes, stops on held-out loss, restores
+the best epoch, and writes both `models/pet_detect.onnx` and `models/pet_detect.report.json`. The
+report records every input hash, the session split, per-session results, the F1-calibrated operating
+point, performance at the shipped 0.95 enter threshold, and PyTorch-to-ONNX parity.
+
+Review the report before changing the model or thresholds. A model update should include the report
+and explain any session where performance regressed; dataset recordings belong in a separately
+versioned dataset, not this repository.
