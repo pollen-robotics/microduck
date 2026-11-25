@@ -34,6 +34,12 @@ struct Args {
     #[arg(long, default_value = duck_ipc_proto::socket::NFC)]
     nfc_socket: PathBuf,
 
+    /// Where the wifi lane listens (`btd::lane`): `duck-gateway` connects here once a phone on the
+    /// network has proved the setup code. Served only in secure mode — the gateway has nothing to
+    /// check a phone against without the setup code either.
+    #[arg(long, default_value = duck_ipc_proto::socket::BTD_LANE)]
+    lane_socket: PathBuf,
+
     /// Retained for compatibility with existing service overrides. Pairing is now required
     /// unless `--insecure-no-pairing` is explicitly selected for a controlled bench.
     #[arg(long, conflicts_with = "insecure_no_pairing")]
@@ -151,6 +157,18 @@ async fn main() -> ExitCode {
             "serving WITHOUT pairing: the PIN and any wifi passphrase cross this link in clear, \
              readable by anyone in range. Development only — see app-path-design.md §5.5"
         );
+    }
+
+    if secure.is_some() {
+        // Beside the radio, not instead of it, and never a reason for `btd` to stop: a lane that
+        // cannot listen leaves every phone on Bluetooth, which is where it was before the lane.
+        let lane = args.lane_socket.clone();
+        let lane_sockets = sockets.clone();
+        tokio::spawn(async move {
+            if let Err(error) = btd::lane::serve(&lane, lane_sockets).await {
+                tracing::error!(%error, path = %lane.display(), "the wifi lane stopped");
+            }
+        });
     }
 
     run(sockets, name, require_pairing, secure).await

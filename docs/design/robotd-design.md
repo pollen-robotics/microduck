@@ -507,10 +507,33 @@ until the next walk; here scale and gain are recomputed from the active state ev
 
 **One move at a time, and none from the seat.** A ground pick, a skill, a sit or a rise is
 refused while any other is in flight — including the glide down into the seat — and only
-standing up is accepted from a seated robot. The one request a running skill takes is one for
+standing up — and a seated skill, below — is accepted from a seated robot. The one request a running skill takes is one for
 itself when it chains, which is the button being held. This is a second divergence: the
 prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
 network handed a pose it was not trained from.
+
+**Each skill starts only from the pose it was trained from: its `entry_pose`.** Standing — the
+default, and every skill before there was a choice — is refused from the seat, which is the rule
+above. Seated is the mirror: a policy trained *from* the seat, like the MicroDock's scoot that
+shuffles on its seat from the pose `alpha_sitstand` sits in, is refused standing, rising and on
+the glide down, and starts only from a settled seat. Nothing about the seat changes while it runs
+— the skill outranks the sitstand network, and when its window ends the seat is still the seat, so
+the sitstand network holds it again and standing up is still the sit toggle's. It runs at the
+seat's tuning — scale 1.0 and full gain, what the sitstand network holds the seat at — unless it
+sets its own: the standing-tuning heuristic (`|twist| ≤ 0.05` means standing gain) is about a
+robot on its feet, and in the seat it made the scoot's stiffness depend on the speed typed and
+jump at both hand-overs. The pose comes from
+the manifest ([`policy-manifest.md`](../policy-manifest.md) owns the field), or `robotctl policy
+add --entry-pose`, and is written to the skill's `[[policy.skill]]` entry. A value this build does
+not know reads as standing rather than refusing the file.
+
+`robot.do` refuses a move in the wrong pose at the door, with the loop's reason, rather than
+answering "queued" for a loop that drops it into the debug log. **Both ask one rule**,
+`control::pose_blocks`, of one state: the loop publishes where it is in the sit↔stand cycle —
+standing, gliding down, seated, rising — as a byte each tick, and the door reads it. The glide
+down and the rise were exactly where a bool used to say "queued" for a request the loop then
+dropped. What is left is one queue hop: a `sit_toggle` and a move sent back to back, before the
+loop has ticked in between — 20 ms, not two seconds.
 
 The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
 flight and, on a seated robot, holds the seat where it is rather than sending the standing home
@@ -570,6 +593,14 @@ ONNX Runtime is a **board prerequisite**, installed by `scripts/install.sh`, not
 release. It changes far less often than the daemon, and ~20 MB in every artifact would enlarge
 every update for nothing. The trade is that a board missing it installs and starts fine and
 then cannot walk — which is why health reports the searched path.
+
+`robotd` and `mediad` load it as `libonnxruntime.so.1` (`ORT_DYLIB_PATH` in their units), not as
+`ort`'s default bare `libonnxruntime.so`, which is a development symlink an OS image does not
+ship. On an OS image the runtime is a package, and `/usr/lib/libonnxruntime.version` names its
+version, as `librknnrt.version` does for the NPU runtime; `hooks/preinstall` reads that first and
+falls back to resolving `/usr/local/lib/libonnxruntime.so` on a board set up by script. An image
+whose stamp is below the floor is refused with a message naming the OS update, since the hook can
+neither replace the image's package nor download on an image without `curl`.
 
 Not done, and deliberately: pre-binding the ONNX input/output tensors. The current path
 allocates a 61-float vector per inference, ~244 bytes at 50 Hz. Worth measuring on the board

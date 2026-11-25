@@ -1,5 +1,5 @@
 [Unit]
-Description=Authenticated local media gateway
+Description=Authenticated local gateway (media on 9443, btd's wifi lane on 9444)
 # After configd, whose ExecStartPre leaves the setup-code key this imports.
 After=network.target mediad.service configd.service
 Wants=mediad.service

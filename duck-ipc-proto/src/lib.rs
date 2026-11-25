@@ -675,16 +675,26 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
 /// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
 ///
-/// # v69 — a phase-encoded skill
+/// # v69 — seated skills
+///
+/// [`SkillParams::entry_pose`] and [`PolicyFetchResult::entry_pose`]: the pose a skill starts
+/// from, `"standing"` or `"seated"`, and the only one the robot will start it in. A seated skill
+/// runs from the seat and hands the seat back; a standing one is refused from the seat as every
+/// skill was. Absent means standing on both, so a v68 client reading a v69 robot sees every skill
+/// as before, and a v69 client writing to a v68 robot is refused for the unknown field — by
+/// `deny_unknown_fields` on `SkillParams`, which names it — rather than seeing a seated skill
+/// silently stored as standing.
+///
+/// # v70 — a phase-encoded skill
 ///
 /// [`SkillParams`] gains `encoding`, `period_s` and `end_phase`, so a policy whose command is a
 /// phase can be a one-shot: the daemon writes `[cos 2πφ, sin 2πφ, 0]` the way the ground pick
-/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v68 `robotd`
+/// already does. **It bumps because [`SkillParams`] denies unknown fields.** A v69 `robotd`
 /// would accept the call only by ignoring those members, and then run a phase policy on a
 /// constant command — a robot moving plausibly and wrongly. Refusing the unknown members is
 /// what this bump makes an older daemon do; a board has to be on this release before
 /// `robotctl policy add` can install a phase skill.
-pub const API_VERSION: u32 = 69;
+pub const API_VERSION: u32 = 70;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -769,6 +779,12 @@ pub mod socket {
     /// [`super::method::PHOTO_DELETE`]. Under `/run/nfcd/`, its
     /// `RuntimeDirectory=`, for the same reason as the pad's.
     pub const NFC: &str = "/run/nfcd/nfc.sock";
+
+    /// `btd`'s wifi lane: a `btd` session — Bluetooth's routing table, word for word — for a phone
+    /// on the robot's network. Not for clients on the robot: `duck-gateway` is the only one, and
+    /// it connects only after the phone has proved the setup code. Under `/run/btd/`, `btd`'s
+    /// `RuntimeDirectory=`, mode 0600, owned by `btd`, which `duck-gateway` also runs as.
+    pub const BTD_LANE: &str = "/run/btd/lane.sock";
 }
 
 /// Where each daemon publishes what it is running: `/run/<service>/identity.json`.
@@ -3891,6 +3907,11 @@ pub struct PolicyFetchResult {
     pub chain: bool,
     /// The manifest's `schema_version`, so a client can say which convention it read.
     pub schema_version: Option<u32>,
+    /// The manifest's `entry_pose`, verbatim: `"standing"` or `"seated"` is the vocabulary, and
+    /// what decides which pose the robot will start the skill in. Verbatim rather than parsed, so
+    /// a client can tell "said nothing" from "said something this build does not understand" and
+    /// ask the publisher for the word. Absent from an older `updaterd`.
+    pub entry_pose: Option<String>,
 }
 
 /// What to search the Hub for, for [`Call::PolicySearch`].
@@ -6111,6 +6132,11 @@ pub struct SkillParams {
     /// perpetual one, which wraps instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_phase: Option<f64>,
+    /// The pose it starts from, and the only one the robot starts it in: `"standing"` or
+    /// `"seated"`. Absent is standing on the way in and is what a standing skill answers; on a
+    /// `robot.setSkill` for a skill that exists, absent keeps what it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_pose: Option<String>,
     /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
     /// Ignored on the way in — a client cannot make a built-in an override by saying so.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -7791,7 +7817,7 @@ mod tests {
     /// A phase skill's new members survive the wire, and a payload from before them still
     /// parses. The other direction — an older daemon refusing members it does not know — is
     /// [`an_unknown_params_member_is_refused_by_name`]: [`SkillParams`] denies unknown fields,
-    /// which is why [`API_VERSION`] moved. Without that, a v68 `robotd` would run a phase
+    /// which is why [`API_VERSION`] moved. Without that, a v69 `robotd` would run a phase
     /// policy on a constant command.
     #[test]
     fn a_phase_skill_round_trips_and_an_older_payload_still_parses() {
