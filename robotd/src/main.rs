@@ -918,9 +918,10 @@ struct RobotState {
     /// distinguishes them.
     homed: AtomicBool,
 
-    /// The duck is parked in its seat, latched there by `sit_toggle`.
+    /// Where the duck is in the sit↔stand cycle, as a [`control::Seat`] byte.
     ///
-    /// **Published because "stand up" means two different calls.** A duck on its feet stands with
+    /// **Published because "stand up" means two different calls**, and because what a robot may
+    /// start depends on it. On the wire it is `sitting` — the seat or the way into it. A duck on its feet stands with
     /// `robot.init`; a duck in the seat is *held* there by a latch this daemon drives, and `init`
     /// argues with it rather than winning. What ends a sit is `robot.do sit_toggle`, and a client
     /// cannot know which of the two to send without this — the playground sent `init` at a seated
@@ -928,7 +929,11 @@ struct RobotState {
     ///
     /// Not `busy`: a seated duck is parked, not travelling, which is the distinction
     /// [`control::Controller::busy`] already draws.
-    sitting: AtomicBool,
+    ///
+    /// A byte rather than the bool it was, so `robot.do` can refuse what the loop would drop:
+    /// the glide down and the rise each refuse moves the bool could not tell apart from the
+    /// states either side of them. [`control::pose_blocks`] is the rule both ask.
+    seat: AtomicU8,
 
     /// The vet book: the robot's lifetime record. The loop hands it what it counted once a second
     /// and never waits for it — see [`vetbook`].
@@ -1001,7 +1006,7 @@ impl RobotState {
             fallen: AtomicBool::new(false),
             moving: AtomicBool::new(false),
             homed: AtomicBool::new(false),
-            sitting: AtomicBool::new(false),
+            seat: AtomicU8::new(control::Seat::Up.as_u8()),
             // In memory until `main` opens the robot's own; tests keep it that way.
             vetbook: vetbook::Book::open(None, env!("CARGO_PKG_VERSION")),
             period_us: params.period().as_micros() as u64,
@@ -4126,8 +4131,11 @@ async fn control_loop<T: RobotIo>(
             .store(bringup == Bringup::Ready, Ordering::Relaxed);
         // Beside `homed` and for the same reason: a client deciding what to press needs the
         // robot's answer, not its own guess. No controller means no seat to be in.
-        state.sitting.store(
-            controller.as_ref().is_some_and(|c| c.is_sitting()),
+        state.seat.store(
+            controller
+                .as_ref()
+                .map_or(control::Seat::Up, |c| c.seat())
+                .as_u8(),
             Ordering::Relaxed,
         );
 
@@ -5976,30 +5984,32 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     names
 }
 
+/// Where the loop last said the robot is in the sit↔stand cycle.
+fn seat_of(state: &RobotState) -> control::Seat {
+    control::Seat::from_u8(state.seat.load(Ordering::Relaxed))
+}
+
 /// Why the robot's pose rules out `skill`, or `None` when it does not.
 ///
-/// The loop starts each move only from the pose it was trained from — standing for every move but
-/// a seated skill, the seat for that ([`control::Controller::start_skill`]) — and says so only in
-/// the journal at debug level. It cannot do more, because a held pad button lands there fifty
-/// times a second. A request is the one place a caller is waiting for an answer, so it is refused
-/// here, with the loop's own words.
+/// The loop starts each move only from the pose it was trained from, and says so only in the
+/// journal at debug level — it cannot do more, because a held pad button lands there fifty times
+/// a second. A request is the one place a caller is waiting for an answer, so it is refused here,
+/// by the same rule ([`control::pose_blocks`]) on the seat the loop published, in the loop's own
+/// words. The glide down and the rise included: those were where "queued" used to mean dropped.
 ///
-/// What this side cannot see is the glide down into a seat that was just asked for, which the
-/// loop also refuses; that window is two seconds after a sit, and a request in it is still
-/// "queued" and dropped. Emotions are left to the loop, which already sits for the ones that sit.
+/// What is left is one queue hop — a `sit_toggle` and a move sent back to back, before the loop
+/// has ticked in between — which is 20 ms rather than two seconds. Emotions and `sit_toggle` are
+/// not moves this rule is about: the loop already sits for the emotions that sit.
 fn pose_refusal(state: &RobotState, skill: &str) -> Option<&'static str> {
     let policies = state.policies.load();
-    let seated = policies.seated.iter().any(|s| s == skill);
-    let standing =
-        !seated && (skill == "ground_pick" || policies.skills.iter().any(|s| s == skill));
-    let sitting = state.sitting.load(Ordering::Relaxed);
-    if sitting && standing {
-        Some(control::SITTING)
-    } else if !sitting && seated {
-        Some(control::STANDING)
+    let entry = if policies.seated.iter().any(|s| s == skill) {
+        params::EntryPose::Seated
+    } else if skill == "ground_pick" || policies.skills.iter().any(|s| s == skill) {
+        params::EntryPose::Standing
     } else {
-        None
-    }
+        return None;
+    };
+    control::pose_blocks(seat_of(state), entry)
 }
 
 fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
@@ -6318,7 +6328,7 @@ fn dispatch(
                 // The same flag `robot.do` refuses on, so a client can wait for it rather than
                 // be told no and guess whether asking again would help.
                 homed: Some(state.homed.load(Ordering::Relaxed)),
-                sitting: Some(state.sitting.load(Ordering::Relaxed)),
+                sitting: Some(seat_of(state).is_sitting()),
                 change_error: state
                     .policy_change_error
                     .load_full()
@@ -8051,10 +8061,12 @@ mod tests {
     }
 
     /// **A move in the wrong pose is refused at the door**, with the loop's reason, rather than
-    /// answering "queued" and having the loop drop it into the debug log: a standing move from the
-    /// seat, and a seated skill standing. Standing up is always the way out of the seat.
+    /// answering "queued" and having the loop drop it into the debug log — at every seat the loop
+    /// publishes, the glide down and the rise included. Standing up is always accepted, and what
+    /// is accepted is queued while what is refused is not.
     #[test]
     fn robot_do_refuses_a_move_in_the_wrong_pose() {
+        use control::Seat;
         let mut params = Params::default();
         params.policy.skills.push(params::SkillDef {
             name: "scoot".into(),
@@ -8071,7 +8083,6 @@ mod tests {
         let intents = Intents::new();
         intents.set_enabled(true);
         s.homed.store(true, Ordering::Relaxed);
-        s.sitting.store(true, Ordering::Relaxed);
         let ask = |skill: &str| -> proto::IntentResult {
             dispatch(
                 &s,
@@ -8085,34 +8096,38 @@ mod tests {
             .unwrap()
         };
 
-        for skill in ["kick_left", "roulade", "ground_pick"] {
-            let refused = ask(skill);
-            assert!(!refused.accepted, "{skill} from the seat must be refused");
-            assert!(
-                refused.reason.as_deref().unwrap().contains("sitting"),
-                "and say why: {:?}",
-                refused.reason
-            );
+        // (seat, the standing moves' answer, the seated skill's answer); `None` is accepted.
+        let rising = Some("the robot is standing up");
+        let cases = [
+            (Seat::Up, None, Some(control::STANDING)),
+            (
+                Seat::SittingDown,
+                Some(control::SITTING),
+                Some("still sitting down"),
+            ),
+            (Seat::Seated, Some(control::SITTING), None),
+            (Seat::Rising, rising, rising),
+        ];
+        for (seat, standing, seated) in cases {
+            s.seat.store(seat.as_u8(), Ordering::Relaxed);
+            intents.take_skills();
+            for skill in ["kick_left", "roulade", "ground_pick"] {
+                let answer = ask(skill);
+                assert_eq!(answer.accepted, standing.is_none(), "{skill} at {seat:?}");
+                assert_eq!(answer.reason.as_deref(), standing, "{skill} at {seat:?}");
+            }
+            let answer = ask("scoot");
+            assert_eq!(answer.accepted, seated.is_none(), "scoot at {seat:?}");
+            assert_eq!(answer.reason.as_deref(), seated, "scoot at {seat:?}");
+
+            let queued = intents.take_skills();
+            let expected = if standing.is_none() { 2 } else { 0 } + u32::from(seated.is_none());
+            assert_eq!(queued.skills.count_ones(), expected, "queued at {seat:?}");
+            assert_eq!(queued.ground_pick, standing.is_none(), "pick at {seat:?}");
+
+            assert!(ask("sit_toggle").accepted, "sit_toggle at {seat:?}");
+            assert!(intents.take_skills().sit_toggle);
         }
-        let queued = intents.take_skills();
-        assert_eq!(queued.skills, 0, "a refusal must not queue");
-        assert!(!queued.ground_pick);
-
-        assert!(ask("sit_toggle").accepted, "standing up is the way out");
-        assert!(ask("scoot").accepted, "a seated skill is allowed");
-        assert!(intents.take_skills().skills != 0, "and queued");
-
-        // Standing, every standing skill is accepted as before, and the seated one is refused.
-        s.sitting.store(false, Ordering::Relaxed);
-        assert!(ask("kick_left").accepted);
-        let refused = ask("scoot");
-        assert!(!refused.accepted, "a seated skill standing must be refused");
-        assert_eq!(refused.reason.as_deref(), Some(control::STANDING));
-        assert_eq!(
-            intents.take_skills().skills.count_ones(),
-            1,
-            "only the kick was queued"
-        );
     }
 
     /// An emotion is a skill as far as a client can tell: `robot.do` queues it, and it is in the
@@ -10640,12 +10655,15 @@ mod tests {
         // `robot.init` and `robot.do sit_toggle` has no other way to know which one stands a duck
         // up, and guessing sits a standing one down every other press.
         assert_eq!(read(&s).sitting, Some(false), "a duck on its feet says so");
-        s.sitting.store(true, Ordering::Relaxed);
-        assert_eq!(
-            read(&s).sitting,
-            Some(true),
-            "and a duck in its seat says so"
-        );
+        for (seat, sitting) in [
+            (control::Seat::SittingDown, true),
+            (control::Seat::Seated, true),
+            (control::Seat::Rising, false),
+            (control::Seat::Up, false),
+        ] {
+            s.seat.store(seat.as_u8(), Ordering::Relaxed);
+            assert_eq!(read(&s).sitting, Some(sitting), "{seat:?}");
+        }
     }
 
     /// `robot.policies` answers for every slot, including the empty ones, and says where each

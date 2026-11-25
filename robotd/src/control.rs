@@ -42,10 +42,87 @@ use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
 use robotd_params::EntryPose;
 
+/// Where the robot is in the sit↔stand cycle, from outside the controller.
+///
+/// [`Sit`] with the two things that change what may start folded in: the glide down
+/// (`sit_settle`) and a seat about to rise by itself (`auto_rise`). Published by the loop as a
+/// byte, so `robot.do` refuses exactly what the loop would drop — see [`pose_blocks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Seat {
+    Up = 0,
+    /// Sat down and still gliding into the seat.
+    SittingDown = 1,
+    /// In the seat, settled.
+    Seated = 2,
+    /// Standing up, by request or by itself.
+    Rising = 3,
+}
+
+impl Seat {
+    /// The byte [`Self::from_u8`] reads back.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Seat {
+        match value {
+            1 => Seat::SittingDown,
+            2 => Seat::Seated,
+            3 => Seat::Rising,
+            _ => Seat::Up,
+        }
+    }
+
+    /// In the seat or on the way into it: what `robot.state`'s `sitting` says, and what tells a
+    /// client that standing up is `sit_toggle` rather than `robot.init`.
+    pub fn is_sitting(self) -> bool {
+        matches!(self, Seat::SittingDown | Seat::Seated)
+    }
+}
+
+/// Why a move that starts from `entry` cannot start with the robot at `seat`, or `None` when it
+/// can. **The one rule**, read by the loop ([`Controller::start_skill`] and the ground pick) and
+/// by `robot.do` at the door, so the two cannot drift apart into "queued" followed by nothing.
+pub fn pose_blocks(seat: Seat, entry: EntryPose) -> Option<&'static str> {
+    match (seat, entry) {
+        (Seat::Rising, _) => Some("the robot is standing up"),
+        (Seat::SittingDown, EntryPose::Seated) => Some("still sitting down"),
+        (Seat::SittingDown | Seat::Seated, EntryPose::Standing) => Some(SITTING),
+        (Seat::Up, EntryPose::Seated) => Some(STANDING),
+        (Seat::Seated, EntryPose::Seated) | (Seat::Up, EntryPose::Standing) => None,
+    }
+}
+
 /// Why a standing move is refused from the seat, and a seated one standing. `robot.do` answers
 /// with the same words before the request reaches the loop.
 pub const SITTING: &str = "the robot is sitting — stand it up first";
 pub const STANDING: &str = "this skill starts from the seat — sit the robot down first";
+
+/// A skill's scale and gain: its own overrides, falling back to the tuning of the pose it runs in.
+///
+/// Standing, that is the gait's — at standing tuning while the twist is inside the standing
+/// threshold, which is how a kick keeps running at the tuning it was tuned against while a roulade
+/// can ask for something else. **Seated, it is the seat's**: scale 1.0 and full gain, what the
+/// sitstand network holds the seat at, so a seated skill takes the seat over and hands it back
+/// with no jump in stiffness, whatever its twist.
+fn skill_tuning(
+    tuning: &Tuning,
+    overrides: Option<&robotd_params::SkillOverrides>,
+    seated: bool,
+    standing_tuned: bool,
+) -> (f64, u16) {
+    let (scale, ratio) = if seated {
+        (1.0, 1.0)
+    } else if standing_tuned {
+        (tuning.standing_action_scale, tuning.standing_gain_ratio)
+    } else {
+        (tuning.action_scale, 1.0)
+    };
+    let scale = overrides.and_then(|o| o.action_scale).unwrap_or(scale);
+    let ratio = overrides.and_then(|o| o.gain_ratio).unwrap_or(ratio);
+    (scale, (tuning.gain as f64 * ratio).round() as u16)
+}
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -367,16 +444,19 @@ impl Controller {
         if self.active.is_some() {
             return Some("a scripted move is already running");
         }
-        match (self.sit, entry) {
-            (Sit::Rising { .. }, _) => Some("the robot is standing up"),
-            (Sit::Sitting, EntryPose::Standing) => Some(SITTING),
-            (Sit::Sitting, EntryPose::Seated) if self.sit_settle > 0.0 => {
-                Some("still sitting down")
-            }
-            (Sit::Sitting, EntryPose::Seated) if self.auto_rise => Some("the robot is standing up"),
-            (Sit::Sitting, EntryPose::Seated) => None,
-            (Sit::Up, EntryPose::Seated) => Some(STANDING),
-            (Sit::Up, EntryPose::Standing) => None,
+        pose_blocks(self.seat(), entry)
+    }
+
+    /// Where the robot is in the sit↔stand cycle, as [`pose_blocks`] needs it — and as the loop
+    /// publishes it, so `robot.do` asks the same question of the same answer.
+    pub fn seat(&self) -> Seat {
+        match self.sit {
+            Sit::Up => Seat::Up,
+            Sit::Rising { .. } => Seat::Rising,
+            // A seat about to rise by itself is already a stand.
+            Sit::Sitting if self.auto_rise => Seat::Rising,
+            Sit::Sitting if self.sit_settle > 0.0 => Seat::SittingDown,
+            Sit::Sitting => Seat::Seated,
         }
     }
 
@@ -689,31 +769,22 @@ impl Controller {
         // applies whenever the *effective* command is inside the standing threshold and the
         // standing network exists — which is how a kick window and the sitstand rise end up
         // at standing gain in the prototype, so they do here too.
+        //
+        // **Never in the seat.** The heuristic is about a robot on its feet; a seated skill's
+        // slow twist (the scoot's 0.05) is not a robot standing still, and without this its gain
+        // would flip with the speed someone typed and jump at the hand-over either way.
+        let seated = self.sit == Sit::Sitting;
         let standing_tuned = matches!(net, Net::Stand)
             || (matches!(net, Net::Skill(_) | Net::SitStand)
+                && !seated
                 && self.policy.will_stand(effective.twist_magnitude()));
         let (scale, gain) = match net {
-            // A skill's own overrides, falling back to the gait's — which is how a kick keeps
-            // running at the standing tuning it was tuned against while a roulade can ask for
-            // something else.
-            Net::Skill(index) => {
-                let overrides = self.skills.skills.get(index).map(|d| &d.params);
-                let scale = overrides
-                    .and_then(|o| o.action_scale)
-                    .unwrap_or(if standing_tuned {
-                        self.tuning.standing_action_scale
-                    } else {
-                        self.tuning.action_scale
-                    });
-                let ratio = overrides.and_then(|o| o.gain_ratio).unwrap_or({
-                    if standing_tuned {
-                        self.tuning.standing_gain_ratio
-                    } else {
-                        1.0
-                    }
-                });
-                (scale, (self.tuning.gain as f64 * ratio).round() as u16)
-            }
+            Net::Skill(index) => skill_tuning(
+                &self.tuning,
+                self.skills.skills.get(index).map(|d| &d.params),
+                seated,
+                standing_tuned,
+            ),
             Net::GroundPick => (
                 self.skills.ground_pick_action_scale,
                 (self.tuning.gain as f64 * self.skills.ground_pick_gain_ratio).round() as u16,
@@ -822,6 +893,55 @@ mod tests {
                 .unwrap()
                 .targets
         );
+    }
+
+    /// **The pose rule, every case**, without a network — so CI covers what the ignored
+    /// controller tests cover on a machine with ONNX Runtime.
+    #[test]
+    fn pose_blocks_every_seat_and_entry() {
+        use EntryPose::{Seated, Standing};
+        let cases = [
+            (Seat::Up, Standing, None),
+            (Seat::Up, Seated, Some(STANDING)),
+            (Seat::SittingDown, Standing, Some(SITTING)),
+            (Seat::SittingDown, Seated, Some("still sitting down")),
+            (Seat::Seated, Standing, Some(SITTING)),
+            (Seat::Seated, Seated, None),
+            (Seat::Rising, Standing, Some("the robot is standing up")),
+            (Seat::Rising, Seated, Some("the robot is standing up")),
+        ];
+        for (seat, entry, expected) in cases {
+            assert_eq!(pose_blocks(seat, entry), expected, "{seat:?} / {entry:?}");
+        }
+    }
+
+    /// The byte the loop publishes reads back as the seat it was, and `sitting` on the wire is
+    /// the seat or the way into it.
+    #[test]
+    fn a_seat_survives_the_byte_and_says_whether_it_sits() {
+        for seat in [Seat::Up, Seat::SittingDown, Seat::Seated, Seat::Rising] {
+            assert_eq!(Seat::from_u8(seat.as_u8()), seat);
+        }
+        assert!(Seat::SittingDown.is_sitting() && Seat::Seated.is_sitting());
+        assert!(!Seat::Up.is_sitting() && !Seat::Rising.is_sitting());
+    }
+
+    /// **A seated skill runs at the seat's tuning, whatever its twist**: scale 1.0 and full gain,
+    /// what the sitstand network holds the seat at — not the standing heuristic, which would make
+    /// the scoot's gain depend on the speed someone typed. Its own overrides still win.
+    #[test]
+    fn a_seated_skill_runs_at_the_seats_tuning() {
+        let t = Tuning::default();
+        assert_eq!(skill_tuning(&t, None, true, false), (1.0, 200));
+        // Standing, unchanged: standing tuning inside the threshold, the gait's outside it.
+        assert_eq!(skill_tuning(&t, None, false, true), (1.0, 160));
+        assert_eq!(skill_tuning(&t, None, false, false), (0.9, 200));
+        let own = robotd_params::SkillOverrides {
+            action_scale: Some(0.8),
+            gain_ratio: Some(0.5),
+        };
+        assert_eq!(skill_tuning(&t, Some(&own), true, false), (0.8, 100));
+        assert_eq!(skill_tuning(&t, Some(&own), false, true), (0.8, 100));
     }
 
     /// The prototype's **current alpha configuration** — its built-in defaults, which the

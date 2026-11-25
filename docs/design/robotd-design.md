@@ -518,14 +518,22 @@ above. Seated is the mirror: a policy trained *from* the seat, like the MicroDoc
 shuffles on its seat from the pose `alpha_sitstand` sits in, is refused standing, rising and on
 the glide down, and starts only from a settled seat. Nothing about the seat changes while it runs
 — the skill outranks the sitstand network, and when its window ends the seat is still the seat, so
-the sitstand network holds it again and standing up is still the sit toggle's. The pose comes from
+the sitstand network holds it again and standing up is still the sit toggle's. It runs at the
+seat's tuning — scale 1.0 and full gain, what the sitstand network holds the seat at — unless it
+sets its own: the standing-tuning heuristic (`|twist| ≤ 0.05` means standing gain) is about a
+robot on its feet, and in the seat it made the scoot's stiffness depend on the speed typed and
+jump at both hand-overs. The pose comes from
 the manifest ([`policy-manifest.md`](../policy-manifest.md) owns the field), or `robotctl policy
 add --entry-pose`, and is written to the skill's `[[policy.skill]]` entry. A value this build does
 not know reads as standing rather than refusing the file.
 
 `robot.do` refuses a move in the wrong pose at the door, with the loop's reason, rather than
-answering "queued" for a loop that drops it into the debug log. The one window it cannot see is the
-two seconds of glide after a sit was asked for.
+answering "queued" for a loop that drops it into the debug log. **Both ask one rule**,
+`control::pose_blocks`, of one state: the loop publishes where it is in the sit↔stand cycle —
+standing, gliding down, seated, rising — as a byte each tick, and the door reads it. The glide
+down and the rise were exactly where a bool used to say "queued" for a request the loop then
+dropped. What is left is one queue hop: a `sit_toggle` and a move sent back to back, before the
+loop has ticked in between — 20 ms, not two seconds.
 
 The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
 flight and, on a seated robot, holds the seat where it is rather than sending the standing home
