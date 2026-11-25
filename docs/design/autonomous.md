@@ -141,7 +141,7 @@ states come over:
 | LookAround | big glances, head cocks |
 | Wander | walks to a goal point 1–3 m away in the odometry frame (below), brief side glances that snap back so the ToF keeps seeing the path |
 | TurnInPlace | spins toward the least-visited direction, head leading |
-| Zoomies | full speed, jerky turns, the wheee ride; only with fresh, clear ToF ahead |
+| Zoomies | full speed, jerky turns, the wheee ride; only with fresh, clear ToF ahead and no edge there (§5) |
 | Stretch | crane up, yawn, coo, head shake |
 | Ruffle | fast feather shiver |
 | Dance | body-pose groove, the head grooving along |
@@ -216,9 +216,10 @@ metre of its start on a robot.
   with a small cost for turning.
 - **Avoiding dead ends.** It avoids paths within 0.4 m of where an obstacle stopped the duck in the
   last five minutes, so the next goal is not behind the same wall.
-- **Walking it.** The duck pivots first when the goal is more than 0.7 rad off its heading, steers
-  as it walks, and slows inside 0.4 m.
-- **Ending a bout.** A bout ends on arrival (0.25 m), or after 8 s without getting 10 cm closer.
+- **Walking it.** The duck pivots first when the goal is more than 0.7 rad off its heading, or
+  when it faces an edge (§5), steers as it walks, and slows inside 0.4 m.
+- **Ending a bout.** A bout ends on arrival (0.25 m), after 8 s without getting 10 cm closer, or
+  when the way to the goal sets off toward an edge (§5).
   A timer computed from distance and speed was wrong, because the gait does not walk as fast as it
   is asked to.
 - **The bout log.** Every bout ends with one `wander bout over` line: distance covered against the
@@ -255,8 +256,15 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    odometry's trunk height. The runtime's floor rule used a fixed 0.12 m trunk height and no IMU,
    so a pitched trunk read the floor as a wall. Hits higher than `MAX_HEIGHT_M` above the floor
    (0.35 m, above the duck) or farther than 1.5 m are dropped: the duck walks under tables.
+   **A drop is in the way too.** A steep beam (at least 15° below the horizon) that comes back from
+   more than 5 cm below the floor, plus 3 cm per metre it landed out, went over an edge: down a
+   step, off a table. Seen two frames running, it becomes a hit at floor height, at the furthest
+   floor seen in front of it: a steeper beam of its column on the floor, or floor seen earlier on
+   the same bearing within the last 0.5 m walked. With neither, and no drop already known up to its
+   edge, the edge may be under the beak: in the path, the drop is kept at the sensor, which stops
+   the duck until it has turned well away.
 4. **Confirm before believing.** A hit counts only if a second hit, in the same frame or the one
-   before, lies within 8 cm of it. A single noisy zone stops nothing.
+   before, lies within 8 cm of it. A single noisy zone stops nothing. A drop is seen twice instead.
 5. **Remember in the world.** Confirmed hits are stored in the odometry frame and re-expressed in
    the *current* body frame every tick, so a remembered chair leg keeps getting closer as the duck
    walks at it. A hit expires after `STALE_S` (1.5 s). It is not dropped just because a later
@@ -266,7 +274,9 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    the beak (`BEAK_M`), not from the trunk origin. Clear space to the left and to the right picks
    which way to steer.
 7. **Freshness.** Fresh means the forward corridor was observed within `FRESH_S`, either by a
-   trusted range or by a 255 (the head is not glancing away). The gate is the runtime's:
+   trusted range or by a 255 (the head is not glancing away), with at least two of those beams
+   steep enough to see a drop (step 3): a head held up past that stops the walk, a bob does not.
+   The gate is the runtime's:
 
    | data ahead | result |
    |---|---|
@@ -276,6 +286,25 @@ was unreliable. `autod/src/obstacle.rs` rebuilds it for the real 15 Hz:
    | hit under `REACT_M` (0.45 m) | slow down and steer away |
    | hit under `STOP_M` (0.15 m) | spin away |
    | three hard stops within the heat window | a boxed-in break-out spin |
+
+**After a drop stops it, the duck turns away from the edge before it steps.** The ToF only sees
+ahead, and a turn in place drifts a few centimetres. So a duck that stops for a drop, turns, sees
+floor and steps, then stops again, can work its way over the edge sideways. Where a drop stopped
+the duck is remembered for 60 s, in odometry's frame. Within 45 cm of such a spot, and less than
+75° off the way to it:
+
+- **No step.** Not a wander's, not a turn's creep, not a brace's. Zoomies end, and do not start.
+- **No goal.** A path that sets off that way is shut like one past a wall, and a wander whose goal
+  lies that way gives it up. One that faces the spot with its goal elsewhere pivots to the goal
+  first.
+
+With such spots most of the way round the duck, as in a corner, the 75° narrows to as little as
+57° (half the widest gap between them, less 14°), to leave the way straight out open. With less
+than 115° between them anywhere there is no way out, and the duck takes no step until they are
+forgotten; a new stop for a drop there starts its own 60 s. And any stop there, for a drop or a
+wall, turns away from the side the spots are on, whatever the ToF says about the sides, unless
+they lie straight ahead or behind, or as much to one side as the other. The 60 s are the brain's
+clock, which stands still while the pad drives.
 
 **Nothing sees behind, so the duck must not go there.** The brain never asks for a backward twist.
 The robot backs up anyway: the walking policy drifts backwards when it turns in place (to be fixed
@@ -306,7 +335,8 @@ where the odometry frame sits in the map. Everything the brain remembers — the
 the way was shut, the current goal — is kept in the **brain's frame**: the map's from the first fix
 of the session, odometry's until then. At the first fix, what was kept in odometry's frame is
 carried into the map's. A goal is converted back through the latest offset every tick, so a
-correction moves the goal, never the duck's footing.
+correction moves the goal, never the duck's footing. Where drops stopped the duck (§5) stays in
+odometry's frame for the same reason: that is footing.
 
 **The duck makes stops worth mapping.** The map grows only where the robot stands still and looks
 (`mapping-design.md` §2), and wider views match better. So with a map:
@@ -340,6 +370,15 @@ at the first fix, when the map's frame is known to be the same one.
 
 ## 7. What is not here yet
 
+- **Drops the sensor cannot see.**
+  - Off a table the floor may be out of range, and a status 255 there still reads as clear:
+    treating "no return" as a drop would bring back the stalls in front of dark floors that step 2
+    removed.
+  - A polished floor's mirror image of a wall comes back long, and below the floor: on such a floor
+    the duck may stop for edges that are not there. Not yet tried on a robot.
+- **An edge the duck drifts over.** A turn in place close to an edge can still carry the duck
+  over it, and so can backing up: the rule in §5 only keeps it from stepping there. That needs the
+  policy's drift fixed, or edges on the map.
 - **Going somewhere on purpose.** Planning a path on the grid around what the map knows — back to a
   favourite nap spot, to where the ball was last seen. Goals are still straight lines.
 - **A wiped map leaves the saved novelty grid behind**, in a frame that no longer exists. It fades

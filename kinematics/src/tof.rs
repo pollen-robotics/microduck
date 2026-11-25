@@ -12,6 +12,8 @@
 //!   - **Too-close returns.** Below ~10 cm the sensor's readings stop being
 //!     trustworthy — cover-glass crosstalk and pulse pile-up produce phantom
 //!     short returns — so a reading in that band is discarded as noise.
+//!   - **Drops.** A steep beam returning from well below the floor went over
+//!     an edge, and is a drop rather than floor.
 //!
 //! The sensor pose comes from [`HeadFk::tof_in_trunk`] per frame, and the
 //! trunk's height above the floor from the MJCF itself
@@ -46,6 +48,17 @@ pub enum Zone {
         /// Where it touched, in the trunk frame — for drawing the ground the
         /// robot has actually confirmed, not for avoiding.
         point: [f64; 3],
+    },
+    /// The beam went over an edge, returning from well below the floor
+    /// ([`Reprojector::DROP_M`]).
+    Drop {
+        /// Where it landed, in the trunk frame.
+        point: [f64; 3],
+        /// Where it passed the floor's height, in the trunk frame: the edge
+        /// is no further.
+        edge: [f64; 3],
+        /// How far below the floor it landed, metres.
+        depth: f64,
     },
     /// Something is there.
     Hit {
@@ -106,6 +119,16 @@ impl Reprojector {
     /// sensor's own crosstalk produces phantom short readings.
     pub const MIN_RANGE_M: f64 = 0.10;
 
+    /// A return this far below the floor, plus [`Self::DROP_PER_M`] per metre
+    /// it landed out, went over an edge. The slope allows for pitch error.
+    pub const DROP_M: f64 = 0.05;
+    /// See [`Self::DROP_M`].
+    pub const DROP_PER_M: f64 = 0.03;
+
+    /// Only beams at least this steep (sine of the angle below the horizon)
+    /// are judged: a shallow one lands too far out to tell.
+    pub const DROP_MIN_DOWNWARD: f64 = 0.26;
+
     pub fn new(model: &'static Model) -> Self {
         // Zone centres, evenly spread over the FOV with a half-zone inset at
         // the edges (an 8-zone row has 8 centres, not 9 fenceposts). Row 0 is
@@ -148,6 +171,15 @@ impl Reprojector {
         self.fk.tof_in_trunk(head_joints)
     }
 
+    /// Which beams are steep enough to be judged for a drop at this head pose and posture.
+    pub fn judged(&self, head_joints: [f64; 4], posture: &Posture) -> [bool; N_ZONES] {
+        let sensor = self.fk.tof_in_trunk(head_joints);
+        let level = level_from_gravity(posture.gravity);
+        std::array::from_fn(|i| {
+            -level.rotate(sensor.quat.rotate(self.beams[i]))[2] >= Self::DROP_MIN_DOWNWARD
+        })
+    }
+
     /// Reproject one frame.
     ///
     /// `ranges_m` is the frame's 64 slant ranges in row-major order, `None`
@@ -186,11 +218,29 @@ impl Reprojector {
                 r.mul_add(dir[1], sensor.pos[1]),
                 r.mul_add(dir[2], sensor.pos[2]),
             ];
+            let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
             if above_floor > 0.0 && downward > 0.0 && r * downward >= floor_threshold {
-                zones[i] = Zone::Floor { point };
+                let below = r.mul_add(downward, -above_floor);
+                if downward >= Self::DROP_MIN_DOWNWARD
+                    && below >= Self::DROP_PER_M.mul_add(horizontal, Self::DROP_M)
+                {
+                    // Along the beam to the floor's height.
+                    let t = above_floor / downward;
+                    let edge = [
+                        t.mul_add(dir[0], sensor.pos[0]),
+                        t.mul_add(dir[1], sensor.pos[1]),
+                        t.mul_add(dir[2], sensor.pos[2]),
+                    ];
+                    zones[i] = Zone::Drop {
+                        point,
+                        edge,
+                        depth: below,
+                    };
+                } else {
+                    zones[i] = Zone::Floor { point };
+                }
                 continue;
             }
-            let horizontal = r * (dir_level[0] * dir_level[0] + dir_level[1] * dir_level[1]).sqrt();
             if horizontal < Self::MIN_RANGE_M {
                 zones[i] = Zone::TooClose;
                 continue;
@@ -336,6 +386,100 @@ mod tests {
             matches!(interrupted[zone], Zone::Hit { .. }),
             "three quarters of the way to the floor is an obstacle: {:?}",
             interrupted[zone]
+        );
+    }
+
+    /// A return a stair below the floor is a drop, not floor.
+    #[test]
+    fn a_return_below_the_floor_is_not_the_floor() {
+        let rp = Reprojector::alpha();
+        let looking_down = [0.0, 0.3, 0.0, 0.0];
+        let zone = 6 * COLS + 3;
+        let sensor = rp.sensor_in_trunk(looking_down);
+        let above_floor = sensor.pos[2] + Model::alpha().trunk_height_m();
+        let down = -sensor.quat.rotate(rp.beams[zone])[2];
+        let past_the_edge = (above_floor + 0.10) / down;
+        let zones = rp.project(
+            &one_return(zone, past_the_edge),
+            looking_down,
+            &Posture::default(),
+        );
+        let Zone::Drop { point, edge, depth } = zones[zone] else {
+            panic!("10 cm below the floor is not the floor: {:?}", zones[zone]);
+        };
+        assert!((depth - 0.10).abs() < 0.01, "depth {depth}");
+        let floor_z = -Model::alpha().trunk_height_m();
+        assert!(
+            (edge[2] - floor_z).abs() < 0.01,
+            "the edge point is at floor height: {edge:?}"
+        );
+        assert!(
+            edge[0] < point[0],
+            "and before where the beam landed: {edge:?} {point:?}"
+        );
+    }
+
+    /// A return a few cm low is still floor.
+    #[test]
+    fn a_return_a_little_below_the_floor_is_still_the_floor() {
+        let rp = Reprojector::alpha();
+        let looking_down = [0.0, 0.3, 0.0, 0.0];
+        let zone = 6 * COLS + 3;
+        let sensor = rp.sensor_in_trunk(looking_down);
+        let above_floor = sensor.pos[2] + Model::alpha().trunk_height_m();
+        let down = -sensor.quat.rotate(rp.beams[zone])[2];
+        let zones = rp.project(
+            &one_return(zone, (above_floor + 0.03) / down),
+            looking_down,
+            &Posture::default(),
+        );
+        assert!(
+            matches!(zones[zone], Zone::Floor { .. }),
+            "{:?}",
+            zones[zone]
+        );
+    }
+
+    /// `judged` is the beams `project` judges, with the trunk tilted too.
+    #[test]
+    fn judged_beams_are_the_ones_project_calls_drops() {
+        let rp = Reprojector::alpha();
+        let head = [0.0, -0.05, 0.0, 0.0];
+        let posture = Posture {
+            gravity: [0.05, 0.0, -1.0],
+            trunk_height_m: None,
+        };
+        let zones = rp.project(&[Some(3.0); N_ZONES], head, &posture);
+        let judged = rp.judged(head, &posture);
+        for i in 0..N_ZONES {
+            assert_eq!(judged[i], matches!(zones[i], Zone::Drop { .. }), "zone {i}");
+        }
+        assert!(judged.iter().any(|&j| j), "some beam is judged");
+    }
+
+    /// A shallow beam is not judged for a drop, however deep.
+    #[test]
+    fn a_shallow_beam_is_not_judged_for_a_drop() {
+        let rp = Reprojector::alpha();
+        let level = [0.0; 4];
+        let sensor = rp.sensor_in_trunk(level);
+        let above_floor = sensor.pos[2] + Model::alpha().trunk_height_m();
+        let zone = (0..N_ZONES)
+            .find(|&z| {
+                let down = -sensor.quat.rotate(rp.beams[z])[2];
+                (0.05..Reprojector::DROP_MIN_DOWNWARD).contains(&down)
+            })
+            .expect("a level head has shallow downward beams");
+        let down = -sensor.quat.rotate(rp.beams[zone])[2];
+        let zones = rp.project(
+            &one_return(zone, (above_floor + 0.20) / down),
+            level,
+            &Posture::default(),
+        );
+        assert!(
+            matches!(zones[zone], Zone::Floor { .. }),
+            "{:?}",
+            zones[zone]
         );
     }
 
