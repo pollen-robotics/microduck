@@ -412,6 +412,9 @@ mod tests {
             beat: 91,
             register: 56,
             id: 0x3D,
+            conductor: 0x11,
+            round: 7,
+            timed: true,
             roster: vec![(56, 0x3D), (180, 0x11)],
         }
     }
@@ -471,7 +474,7 @@ mod tests {
     /// not a beat. `0xFFFF` is unassigned and anyone may use it.
     #[test]
     fn somebody_elses_payload_is_not_a_beacon() {
-        for payload in [vec![], vec![0x01], vec![0xC0], vec![0xC0, 1, 2, 3, 4, 5]] {
+        for payload in [vec![], vec![0x01], vec![0xC1], vec![0xC1, 1, 2, 3, 4, 5]] {
             let data = HashMap::from([(COMPANY_ID, payload.clone())]);
             assert_eq!(beacon_in(&data), None, "{payload:?}");
         }

@@ -936,18 +936,26 @@ that has not opted in puts nothing on the air, rather than politely declining.
 
 How it works, in the order the questions come up:
 
-- **Nobody is in charge.** Both ducks see the same beacons and the lower id conducts, so there is no
-  election to lose and no message that has to arrive.
-- **There is no shared clock.** The boards have no NTP and no RTC agreement, so the conductor's beat
-  counter *is* the timebase: it bumps a byte in a BLE advertisement once per beat, and the arrival of
-  a new value is the downbeat. Followers average the phase over about 25 beats, which brings the
-  radio's jitter inside the ±20 ms an ensemble needs.
+- **Nobody is in charge.** Ducks that hear only idle ducks let the lowest id conduct — and if that
+  duck never starts (it may have heard nobody yet), the next one up takes over after a moment.
+- **Every singer says what it is singing.** Not just the conductor: each duck in a performance
+  advertises whose it is, the piece, the roster and the beat. So a duck arriving joins the moment it
+  hears *anyone* singing, and two halves of a room that started separately end on one song as soon
+  as any two of their ducks hear each other — the lower conductor id's.
+- **There is no shared clock.** The conductor's beat counter *is* the timebase: it bumps a byte in a
+  BLE advertisement once per beat, and the arrival of a new value is the downbeat. Followers average
+  the phase over about 25 beats; a duck that cannot hear the conductor takes the beat from a duck
+  that can.
+- **Every piece starts with a silent count-in** of a few beats, so everyone comes in on the first
+  note together. Pieces follow each other with a breath between them, on the same beat.
 - **Parts are worked out, not assigned.** The lowest duck sings bass. The conductor broadcasts the
-  roster and everyone replays the same seating over it — which is what stops two ducks singing the
-  same line when they can each see a different subset of the room.
-- **Joining changes nobody's part.** A duck arriving takes the part that is free. A duck that leaves
-  keeps its *seat* — its line simply goes unsung, exactly as in a choir somebody walked out of —
-  because reseating the survivors is the one thing worth avoiding mid-piece.
+  roster and everyone replays the same seating over it. A duck the conductor cannot hear is proposed
+  for a seat by the ducks that can; failing that, it takes the part it would be given rather than
+  sitting the piece out.
+- **Joining changes nobody's part** mid-piece, and a duck that leaves keeps its seat — its line simply
+  goes unsung. Its seat is given up between pieces.
+- **All ducks need the same release.** The beacon's layout changed in v69 (`0xC1`); a duck on an older
+  one does not hear a newer one at all.
 
 The readout names the part as soon as it is settled, so what a duck ended up singing survives in the
 scrollback:
@@ -958,8 +966,8 @@ listening for other ducks — Ctrl-C to stop
   tenor    bar   12  beat  45.2  3 voices
 ```
 
-The conductor picks the piece per performance, and a performance *ends* — after the last
-note everyone goes back to listening, re-settles, and sings something else after a breath.
+The conductor picks the piece per performance, and after the last note and a breath it goes
+straight on to the next one with the same ensemble. Alone, it goes back to listening.
 `robotctl chorale --piece 2` pins what this robot picks **if it conducts** (a follower sings
 what the beacon names, so set it on every duck to guarantee the song); unknown ids are
 refused with the robot's catalogue. Ids: 1 wistful, 2 duck-strut, 3 outer-wilds (test asset,

@@ -126,6 +126,12 @@ impl Conductor {
     pub fn beat(&self) -> Option<u64> {
         self.emitted
     }
+
+    /// The local time beat `beat` goes on the air — exact, not as polled — so that the next piece
+    /// can start on this one's grid, where every follower can work out the downbeat in advance.
+    pub fn time_of_beat(&self, beat: f64) -> f64 {
+        self.started_at + beat * self.beat_s
+    }
 }
 
 /// One heard beat: which beat it was, and when it arrived here.
@@ -150,6 +156,8 @@ pub struct Follower {
     last_beat: Option<f64>,
     /// Local time the conductor's beat 0 landed here, averaged over the window.
     phase: Option<f64>,
+    /// Outliers in a row. See [`Follower::REACQUIRE`].
+    rejected: Vec<Heard>,
 }
 
 impl Follower {
@@ -167,13 +175,56 @@ impl Follower {
     /// second would drag the fit further than sixteen good beats pull it back.
     pub const OUTLIER_S: f64 = 0.20;
 
+    /// This many outliers in a row, **agreeing with each other** to within
+    /// [`Follower::REACQUIRE_AGREE_S`], and the lock is what is wrong, not the beats: the window is
+    /// replaced by them, and the duck stays locked — on the new phase — throughout.
+    ///
+    /// Agreeing, because a lossy radio produces runs of *late* sightings too, and those scatter;
+    /// dropping a good lock on them would leave a duck unlocked, and silent, for a bar.
+    ///
+    /// Without it, outlier rejection is a trap. A lock that settled a few hundred milliseconds off —
+    /// four bad first observations are enough — rejects every correct beat that would pull it back,
+    /// and the duck sings audibly behind the others for the rest of the piece. Seen in the room
+    /// simulation as one duck a quarter-beat late, forever, with a perfectly healthy spread.
+    pub const REACQUIRE: usize = 4;
+
+    /// How closely the rejected beats have to agree to be believed over the lock, seconds.
+    pub const REACQUIRE_AGREE_S: f64 = 0.06;
+
     pub fn new(bpm: f64) -> Self {
         Self {
             beat_s: 60.0 / bpm.max(1.0),
             heard: Vec::new(),
             last_beat: None,
             phase: None,
+            rejected: Vec::new(),
         }
+    }
+
+    /// A follower that already knows where beat 0 lands — locked from the start.
+    ///
+    /// For the next piece of a performance this duck was already locked to: the conductor starts
+    /// it on a beat of the old grid that both sides can compute, so the phase is known before the
+    /// first beat of the new piece is heard. Seeded as [`Follower::locked`]'s worth of exact
+    /// observations, which real ones then outvote — and if the seed was wrong,
+    /// [`Follower::REACQUIRE`] throws it away.
+    pub fn seeded(bpm: f64, phase: f64) -> Self {
+        let mut follower = Self::new(bpm);
+        let beat_s = follower.beat_s;
+        follower.heard = (0..4)
+            .map(|beat| Heard {
+                beat: f64::from(beat) - 4.0,
+                at: phase + beat_s * (f64::from(beat) - 4.0),
+            })
+            .collect();
+        follower.refit();
+        follower.last_beat = None;
+        follower
+    }
+
+    /// Local time the conductor's beat 0 landed here, once there is an estimate.
+    pub fn phase(&self) -> Option<f64> {
+        self.phase
     }
 
     /// Take one heard beat: `beat` is the wrapped byte off the wire, `at` the local time the new
@@ -189,9 +240,29 @@ impl Follower {
         if let Some(phase) = self.phase {
             let predicted = phase + self.beat_s * unwrapped;
             if (at - predicted).abs() > Self::OUTLIER_S && self.heard.len() >= 4 {
+                self.rejected.push(Heard {
+                    beat: unwrapped,
+                    at,
+                });
+                if self.rejected.len() > Self::REACQUIRE {
+                    self.rejected.remove(0);
+                }
+                let implied: Vec<f64> = self
+                    .rejected
+                    .iter()
+                    .map(|heard| heard.at - self.beat_s * heard.beat)
+                    .collect();
+                let low = implied.iter().copied().fold(f64::INFINITY, f64::min);
+                let high = implied.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                if self.rejected.len() < Self::REACQUIRE || high - low > Self::REACQUIRE_AGREE_S {
+                    return;
+                }
+                self.heard = std::mem::take(&mut self.rejected);
+                self.refit();
                 return;
             }
         }
+        self.rejected.clear();
         self.heard.push(Heard {
             beat: unwrapped,
             at,
@@ -483,6 +554,38 @@ mod tests {
 
     /// Nobody sings on the first beat they hear. One observation carries the whole slot window as
     /// its error bar, and entering on it would be audibly early or late.
+    /// A lock that settled in the wrong place lets go of it, instead of rejecting every correct
+    /// beat as an outlier for the rest of the piece.
+    #[test]
+    fn a_lock_in_the_wrong_place_is_reacquired() {
+        const BPM: f64 = 60.0;
+        let mut follower = Follower::new(BPM);
+        // Locked a third of a beat late.
+        for beat in 0..8u8 {
+            follower.observe(beat, f64::from(beat) + 0.33);
+        }
+        assert!((follower.position_beats(10.0).expect("locked") - 9.67).abs() < 1e-6);
+        // The true beat, from now on.
+        for beat in 8..16u8 {
+            follower.observe(beat, f64::from(beat));
+        }
+        let at = follower.position_beats(20.0).expect("locked again");
+        assert!((at - 20.0).abs() < 0.01, "back on the beat: {at}");
+    }
+
+    /// A seed that was wrong — the conductor started somewhere else — is thrown away as soon as
+    /// the real beats agree with each other.
+    #[test]
+    fn a_wrong_seed_is_reacquired() {
+        const BPM: f64 = 60.0;
+        let mut follower = Follower::seeded(BPM, 100.0);
+        for beat in 0..8u8 {
+            follower.observe(beat, 40.0 + f64::from(beat));
+        }
+        let at = follower.position_beats(50.0).expect("locked");
+        assert!((at - 10.0).abs() < 0.01, "on the real beat: {at}");
+    }
+
     #[test]
     fn a_follower_waits_before_it_sings() {
         let mut follower = Follower::new(60.0);

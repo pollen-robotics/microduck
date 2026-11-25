@@ -168,11 +168,21 @@ On main's chorale:
 Which is the field report — "sometimes nothing happens, sometimes two different songs" — with
 disagreeing rosters and a duplicated part as well.
 
-**What it does not yet prove.** With `chorale-election` merged the same scenario still splits (bars
-5, 12 and 8: three timelines). But at `--discovery 20 --loss 0.4` *both* converge, so ninety seconds
-of discovery is harsher than that branch was written for, and this is not evidence the fix fails on a
-robot. The experiment worth running is a sweep — the discovery value at which each version stops
-converging — which is now a loop over a number rather than four robots and a room.
+**What fixed it** was not tuning the election. The room had to stop depending on everyone hearing the
+conductor: every singing duck now advertises the performance it is in, a lower conductor's
+performance absorbs a higher one wherever any two of their singers meet, a count-in hides the merge
+and lets everyone lock before the first note, and pieces follow each other without re-electing. The
+module header of `robotd/src/chorale.rs` owns the mechanism.
+
+**The same radio, in-process.** `robotd/src/chorale/sim.rs` runs whole rooms of `Chorale`s through
+the control loop's tick with the radio above — per-pair discovery, loss, advertising-slot latency —
+plus dead and one-way links, latecomers and restarts, from a seed. `chorale::room::random_rooms`
+sweeps hundreds of rooms on every test run (`ROOMS=3000` for more, `ROOM_SEED=<n>` with
+`chorale::room::replay` for one room's log). On `main` before the fix, 299 rooms in 300 went wrong —
+81 sang two songs at once and 295 left a duck out. Now no room does either, or doubles a part. What
+is left is timing on the very worst radios (an advertisement caught every 70 ms or rarer): a
+follower's lag there is the radio's real latency differing from `beat::SLOT_MEAN_S`, which wants
+measuring on hardware rather than assuming.
 
 ## 6. Architecture follows the host
 

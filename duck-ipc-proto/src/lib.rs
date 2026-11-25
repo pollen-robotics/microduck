@@ -674,7 +674,16 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// display the tag's sequence ends with. No params; [`IntentResult`] once it has started, so a
 /// client watches [`method::PHOTO_LIST`] for the picture. Answered by `nfcd`; an older one answers
 /// METHOD_NOT_FOUND, by name, which is how a client tells a robot that cannot.
-pub const API_VERSION: u32 = 68;
+///
+/// # v69 — the chorale beacon carries its performance
+///
+/// [`ChoraleBeacon`] grew [`ChoraleBeacon::conductor`], [`ChoraleBeacon::round`] and
+/// [`ChoraleBeacon::timed`], and every singing duck — not only the conductor — now advertises one.
+/// The over-the-air layout changed with it, under a new tag (`0xC1`): **a duck on v68 or older does
+/// not hear a v69 duck, nor the reverse,** so every duck that should sing together needs this
+/// release. On the socket the new fields default when absent, so `btd` and `robotd` — which ship
+/// together — tolerate each other either way.
+pub const API_VERSION: u32 = 69;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -6774,8 +6783,29 @@ pub struct ChoraleBeacon {
     /// conductor's byte, everyone merged the two into one duck, and it dropped the conductor's
     /// beacons as its own reflection and could never join.
     pub id: u16,
+    /// Whose performance this is: the conducting duck's [`ChoraleBeacon::id`]. Equal to `id` on the
+    /// conductor's own beacon; meaningless on an idle one.
+    ///
+    /// **Every singing duck says which performance it is in**, not just the conductor. That is what
+    /// makes a chorale converge on a radio where discovery is slow and one-sided: a duck that has
+    /// not yet found the conductor still finds *somebody* singing, and learns from them what is
+    /// being sung, by whom, and where the beat is. Two performances in one room meet as soon as any
+    /// duck of one hears any duck of the other, and the lower conductor id is the one that stays.
+    #[serde(default)]
+    pub conductor: u16,
+    /// Which of the conductor's performances: bumped every time it starts a piece, wrapping.
+    ///
+    /// What tells "the conductor has moved on to the next piece" (or was restarted) from a duck still
+    /// relaying the last one — the beat counter going backwards could not, once followers relay it.
+    #[serde(default)]
+    pub round: u8,
+    /// Whether [`ChoraleBeacon::beat`] is a beat. Always on the conductor's beacon; on a follower's
+    /// only once its phase lock has settled, because a relayed beat is only as good as the lock
+    /// that produced it.
+    #[serde(default)]
+    pub timed: bool,
     /// Who is singing, in seating order — `(register, id)` per duck. Empty from a duck that is only
-    /// listening.
+    /// listening. A follower relays the roster it last had from its performance.
     ///
     /// **This is what stops two ducks singing each other's part.** Seating depends on join order
     /// (`sounds::chorale::seat`), so a duck that seats itself from whatever it happened to hear
@@ -6783,8 +6813,8 @@ pub struct ChoraleBeacon {
     /// keeps the roster and broadcasts it; everyone else replays `seat_all` over it. One source of
     /// truth, which is what a conductor is for.
     ///
-    /// There is room: the controller reports a 251-byte advertising budget and a full quartet's
-    /// roster is eight bytes.
+    /// The whole beacon has to stay a *legacy* advertisement — 31 bytes of AD, of which this is 22 at
+    /// most — or BlueZ switches the instance to extended PDUs, which a legacy scanner cannot see.
     pub roster: Vec<(u8, u16)>,
 }
 
@@ -6809,7 +6839,14 @@ impl ChoraleBeacon {
     /// The advertisement's service UUID already says "this is a duck", so this only has to separate
     /// *this* payload from the address field the other advertising instance carries — a scanner
     /// reading four bytes of IPv4 as a beacon would hear a beat in `192.168.1.42`.
-    pub const TAG: u8 = 0xC0;
+    ///
+    /// `0xC1` since the beacon grew a conductor, a round and the `timed` flag. The first layout was
+    /// `0xC0`; a duck running it reads this as somebody else's advertisement and ignores it, which
+    /// is the right failure for two ducks that cannot sing together.
+    pub const TAG: u8 = 0xC1;
+
+    /// The flag in the roster-count byte that carries [`ChoraleBeacon::timed`].
+    const TIMED: u8 = 0x80;
 
     /// Quantise a pitch centre into [`ChoraleBeacon::register`].
     pub fn quantise_register(pitch_center_hz: f64) -> u8 {
@@ -6836,13 +6873,16 @@ impl ChoraleBeacon {
     /// hardware, this and the roster guard in `robotd`'s chorale are the two places that cap it.
     pub const MAX_ROSTER: usize = 4;
 
-    /// The manufacturer-data payload: tag, the fixed fields, then the roster length and its
-    /// entries. Ids are big-endian u16 — see [`ChoraleBeacon::id`] for why they grew.
+    /// The manufacturer-data payload: tag, the fixed fields, then the roster length (with the
+    /// `timed` flag in its top bit) and its entries. Ids are big-endian u16 — see
+    /// [`ChoraleBeacon::id`] for why they grew.
     pub fn to_bytes(&self) -> Vec<u8> {
         let roster = &self.roster[..self.roster.len().min(Self::MAX_ROSTER)];
         let mut bytes = vec![Self::TAG, self.piece, self.beat, self.register];
         bytes.extend(self.id.to_be_bytes());
-        bytes.push(roster.len() as u8);
+        bytes.extend(self.conductor.to_be_bytes());
+        bytes.push(self.round);
+        bytes.push(roster.len() as u8 | if self.timed { Self::TIMED } else { 0 });
         for (register, id) in roster {
             bytes.push(*register);
             bytes.extend(id.to_be_bytes());
@@ -6865,13 +6905,17 @@ impl ChoraleBeacon {
             register,
             id_hi,
             id_lo,
+            conductor_hi,
+            conductor_lo,
+            round,
             count,
             rest @ ..,
         ] = bytes
         else {
             return None;
         };
-        let count = usize::from(*count);
+        let timed = count & Self::TIMED != 0;
+        let count = usize::from(count & !Self::TIMED);
         if count > Self::MAX_ROSTER || rest.len() != count * 3 {
             return None;
         }
@@ -6880,6 +6924,9 @@ impl ChoraleBeacon {
             beat: *beat,
             register: *register,
             id: u16::from_be_bytes([*id_hi, *id_lo]),
+            conductor: u16::from_be_bytes([*conductor_hi, *conductor_lo]),
+            round: *round,
+            timed,
             roster: rest
                 .as_chunks::<3>()
                 .0
@@ -8129,13 +8176,36 @@ mod tests {
             beat: 217,
             register: 56,
             id: 0x9F,
+            conductor: 0x02,
+            round: 201,
+            timed: true,
             roster: vec![(56, 0x9F), (140, 0x02), (200, 0x71)],
         };
         let bytes = beacon.to_bytes();
         assert_eq!(ChoraleBeacon::from_bytes(&bytes), Some(beacon.clone()));
         assert!(beacon.singing());
-        // A trio's beacon is a dozen bytes — nowhere near even a legacy advertisement's budget.
-        assert!(bytes.len() <= 20, "{} bytes: {bytes:?}", bytes.len());
+        // A full quartet stays a legacy advertisement: 22 bytes of payload, plus the AD header
+        // (length, type, company id) and room for BlueZ's flags field, inside 31.
+        let quartet = ChoraleBeacon {
+            roster: vec![(56, 0x9F), (140, 0x02), (200, 0x71), (90, 0xFFFF)],
+            ..beacon.clone()
+        };
+        let quartet_bytes = quartet.to_bytes();
+        assert_eq!(ChoraleBeacon::from_bytes(&quartet_bytes), Some(quartet));
+        assert!(
+            quartet_bytes.len() + 4 + 3 <= 31,
+            "{} bytes: {quartet_bytes:?}",
+            quartet_bytes.len()
+        );
+        // The flag is not the count: an untimed relay round-trips as untimed.
+        let untimed = ChoraleBeacon {
+            timed: false,
+            ..beacon.clone()
+        };
+        assert_eq!(
+            ChoraleBeacon::from_bytes(&untimed.to_bytes()),
+            Some(untimed)
+        );
 
         // Idle: willing, but nothing under way, and nobody seated. What a duck waiting for company
         // advertises.
@@ -8174,6 +8244,9 @@ mod tests {
             beat: 0,
             register: 56,
             id: 1,
+            conductor: 1,
+            round: 0,
+            timed: true,
             roster: vec![(56, 1), (140, 2)],
         };
         let bytes = good.to_bytes();
@@ -8184,8 +8257,9 @@ mod tests {
         long.push(0);
         assert_eq!(ChoraleBeacon::from_bytes(&long), None);
         let mut lying = bytes.clone();
-        // The count byte sits after tag, piece, beat, register and the two id bytes.
-        lying[6] = 4;
+        // The count byte sits after tag, piece, beat, register, the two id bytes, the two
+        // conductor bytes and the round.
+        lying[9] = 4;
         assert_eq!(ChoraleBeacon::from_bytes(&lying), None);
         // More ducks than there are parts is not a chorale.
         let crowd = ChoraleBeacon {
@@ -8212,6 +8286,12 @@ mod tests {
             );
         }
         assert_eq!(ChoraleBeacon::from_bytes(&[0x00, 1, 2, 3, 4, 0]), None);
+        // The first layout — tag `0xC0`, no conductor or round — is not this beacon. A duck on an
+        // older release is somebody else's advertisement, not a performance to join.
+        assert_eq!(
+            ChoraleBeacon::from_bytes(&[0xC0, 1, 5, 56, 0x12, 0x34, 1, 56, 0x12, 0x34]),
+            None
+        );
     }
 
     /// The register byte has to be fine enough to cast from and wide enough for every duck, or two
@@ -8224,6 +8304,9 @@ mod tests {
                 beat: 0,
                 register: ChoraleBeacon::quantise_register(hz),
                 id: 0,
+                conductor: 0,
+                round: 0,
+                timed: false,
                 roster: Vec::new(),
             }
             .pitch_center_hz()
