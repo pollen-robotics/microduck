@@ -1612,11 +1612,16 @@ enum PolicyCommand {
         unwind: Option<f64>,
         /// The twist fed while it runs, as three comma-separated numbers. Zeros unless given,
         /// which is what every one-shot published so far expects.
-        #[arg(long, value_name = "X,Y,Z")]
+        #[arg(long, value_name = "X,Y,Z", allow_hyphen_values = true)]
         command: Option<String>,
         /// The twist fed while it unwinds. Zeros unless given.
-        #[arg(long, value_name = "X,Y,Z")]
+        #[arg(long, value_name = "X,Y,Z", allow_hyphen_values = true)]
         unwind_command: Option<String>,
+        /// The pose it starts from, and the only one the robot will start it in. Read from the
+        /// manifest's `entry_pose` when it says; standing when nothing says. A seated skill is
+        /// refused standing and ends seated; a standing one is refused from the seat.
+        #[arg(long, value_enum)]
+        entry_pose: Option<PoseArg>,
         #[arg(long)]
         json: bool,
     },
@@ -4662,6 +4667,7 @@ fn run_policy_skill(
         unwind,
         command: command_spec,
         unwind_command,
+        entry_pose,
         json,
     } = command
     else {
@@ -4698,6 +4704,11 @@ fn run_policy_skill(
     {
         return Err(Failure::new(exit::USAGE, why));
     }
+    let pose = Pose::of(
+        entry_pose.map(PoseArg::pose),
+        from_manifest.as_ref().map(|m| m.entry_pose.as_deref()),
+    );
+
     // The manifest supplies the length for a policy that ends itself. One that does not —
     // `kind: perpetual` — has no length to supply, and handing back mid-pose is exactly what a
     // hold and an unwind are for, so it is a refusal rather than a guess.
@@ -4734,6 +4745,7 @@ fn run_policy_skill(
         // Whether a held button chains another run is the policy's to say — the roulade does,
         // a kick does not — and the manifest is where it says it.
         chain: from_manifest.as_ref().is_some_and(|m| m.chain),
+        entry_pose: pose.resolved(),
         command: command_spec
             .as_deref()
             .map(twist_of)
@@ -4766,6 +4778,9 @@ fn run_policy_skill(
         return Ok(());
     }
     println!("{name} added, {duration}s");
+    if let Some(note) = pose.note() {
+        println!("  {note}");
+    }
     if skill.unwind_s > 0.0 {
         println!(
             "  then {}s coming back before the gait takes over",
@@ -4779,6 +4794,92 @@ fn run_policy_skill(
     report_reload(robot_socket);
     println!("  `robotctl robot do {name}` runs it, once the policy is driving");
     Ok(())
+}
+
+/// `--entry-pose`, as clap spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PoseArg {
+    Standing,
+    Seated,
+}
+
+impl PoseArg {
+    fn pose(self) -> robotd_params::EntryPose {
+        match self {
+            PoseArg::Standing => robotd_params::EntryPose::Standing,
+            PoseArg::Seated => robotd_params::EntryPose::Seated,
+        }
+    }
+}
+
+/// Where a skill's starting pose came from, which decides what `policy add` says about it.
+///
+/// **Standing whenever nothing says otherwise**, because that is the pose every skill had before
+/// there was a choice, and a seated policy installed as standing is refused from the seat —
+/// visibly — rather than run from a pose it was not trained from. But silence is worth a line:
+/// a publisher who adds the word makes the next install automatic, so the note asks for it.
+#[derive(Debug, Clone, PartialEq)]
+enum Pose {
+    /// `--entry-pose`: the person at the robot said.
+    Given(robotd_params::EntryPose),
+    /// The manifest said, in the vocabulary.
+    Declared(robotd_params::EntryPose),
+    /// A manifest that says something this does not understand — prose, usually.
+    Unreadable(String),
+    /// A manifest with no `entry_pose`.
+    Unsaid,
+    /// A local file: no manifest to say anything.
+    NoManifest,
+}
+
+impl Pose {
+    /// `manifest` is `None` for a local file and `Some(None)` for a manifest without the field.
+    fn of(given: Option<robotd_params::EntryPose>, manifest: Option<Option<&str>>) -> Pose {
+        if let Some(pose) = given {
+            return Pose::Given(pose);
+        }
+        match manifest {
+            None => Pose::NoManifest,
+            Some(None) => Pose::Unsaid,
+            Some(Some(said)) => match robotd_params::EntryPose::from_manifest(said) {
+                Some(pose) => Pose::Declared(pose),
+                None => Pose::Unreadable(said.to_owned()),
+            },
+        }
+    }
+
+    fn resolved(&self) -> robotd_params::EntryPose {
+        match self {
+            Pose::Given(pose) | Pose::Declared(pose) => *pose,
+            Pose::Unreadable(_) | Pose::Unsaid | Pose::NoManifest => {
+                robotd_params::EntryPose::Standing
+            }
+        }
+    }
+
+    /// What `policy add` prints about it, or nothing for a standing skill that said so.
+    fn note(&self) -> Option<String> {
+        const ASK: &str = "\"entry_pose\": \"standing\" or \"seated\" in its manifest.json \
+                           makes this automatic — worth asking its publisher";
+        Some(match self {
+            Pose::Given(robotd_params::EntryPose::Seated)
+            | Pose::Declared(robotd_params::EntryPose::Seated) => {
+                "starts seated: sit the robot down first, and it ends seated".to_owned()
+            }
+            Pose::Given(_) | Pose::Declared(_) => return None,
+            Pose::Unreadable(said) => format!(
+                "starts standing: its manifest's entry_pose is {said:?}, which is not a pose — \
+                 `--entry-pose seated` if it starts from the seat. {ASK}"
+            ),
+            Pose::Unsaid => format!(
+                "starts standing: its manifest does not say — `--entry-pose seated` if it starts \
+                 from the seat. {ASK}"
+            ),
+            Pose::NoManifest => {
+                "starts standing — `--entry-pose seated` if it starts from the seat".to_owned()
+            }
+        })
+    }
 }
 
 /// Why a policy with this `command.encoding` cannot be a one-shot skill, or `None` when it can.
@@ -5188,7 +5289,17 @@ fn render_skills(skills: &proto::SkillsResult) -> String {
             .as_deref()
             .map(shorten_policy_path)
             .unwrap_or_else(|| format!("{}.onnx (this robot\'s own)", skill.name));
-        let _ = writeln!(out, " {mark} {:width$}  {runs:>8}  {what}", skill.name);
+        // Said only for a seated one: standing is what every skill has always been.
+        let seated = if skill.entry_pose.as_deref() == Some("seated") {
+            "  (seated)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            " {mark} {:width$}  {runs:>8}  {what}{seated}",
+            skill.name
+        );
     }
     for name in &skills.built_in {
         let _ = writeln!(
@@ -6311,6 +6422,86 @@ mod tests {
         assert_eq!(
             (service.as_str(), lines, boot, json),
             ("robotd", 20, -1, false)
+        );
+    }
+
+    // ── robotctl policy add ──────────────────────────────────────────────
+
+    /// A backward twist starts with a minus, which clap reads as a flag unless told otherwise —
+    /// and backing up is exactly what the scoot is for.
+    #[test]
+    fn a_negative_twist_parses_without_an_equals_sign() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "policy",
+            "add",
+            "scoot",
+            "scoot_dock.onnx",
+            "--hold",
+            "2.5",
+            "--command",
+            "-0.05,0,0",
+            "--unwind-command",
+            "-1,0,0",
+            "--entry-pose",
+            "seated",
+        ])
+        .expect("a negative --command must parse");
+        let Namespace::Policy {
+            command:
+                PolicyCommand::Add {
+                    command,
+                    unwind_command,
+                    entry_pose,
+                    ..
+                },
+            ..
+        } = cli.namespace
+        else {
+            panic!("expected policy add, got {:?}", cli.namespace);
+        };
+        assert_eq!(command.as_deref(), Some("-0.05,0,0"));
+        assert_eq!(unwind_command.as_deref(), Some("-1,0,0"));
+        assert_eq!(entry_pose, Some(PoseArg::Seated));
+    }
+
+    /// **Standing unless something says otherwise, and a sentence is not something.** The flag
+    /// beats the manifest; the manifest's word is taken; prose and silence are standing, with a
+    /// note asking for the word.
+    #[test]
+    fn a_skills_pose_comes_from_the_flag_then_the_manifest_then_standing() {
+        use robotd_params::EntryPose::{Seated, Standing};
+        let prose = "sitting, after the official alpha_sitstand policy sits the duck down";
+
+        assert_eq!(
+            Pose::of(Some(Standing), Some(Some("seated"))).resolved(),
+            Standing
+        );
+        assert_eq!(Pose::of(None, Some(Some("seated"))).resolved(), Seated);
+        assert_eq!(Pose::of(None, Some(Some(prose))).resolved(), Standing);
+        assert_eq!(Pose::of(None, Some(None)).resolved(), Standing);
+        assert_eq!(Pose::of(None, None).resolved(), Standing);
+
+        assert_eq!(
+            Pose::of(None, Some(Some("standing"))).note(),
+            None,
+            "said, so quiet"
+        );
+        for asks in [
+            Pose::of(None, Some(Some(prose))),
+            Pose::of(None, Some(None)),
+        ] {
+            let note = asks.note().unwrap();
+            assert!(
+                note.contains("\"entry_pose\": \"standing\" or \"seated\""),
+                "{note}"
+            );
+        }
+        assert!(
+            Pose::of(None, Some(Some("seated")))
+                .note()
+                .unwrap()
+                .contains("seated")
         );
     }
 

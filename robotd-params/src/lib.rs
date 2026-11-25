@@ -2139,9 +2139,80 @@ pub struct SkillDef {
     #[serde(default)]
     pub chain: bool,
 
+    /// The pose it starts from, and so the only pose it may be started in. **Standing unless
+    /// said otherwise** — every skill before this field existed was one, and is still.
+    ///
+    /// See [`EntryPose`]. Written only when seated, so a table of standing skills reads as it
+    /// always did.
+    #[serde(default, skip_serializing_if = "EntryPose::is_standing")]
+    pub entry_pose: EntryPose,
+
     /// What this skill changes about the robot while it runs, and only while it runs.
     #[serde(default)]
     pub params: SkillOverrides,
+}
+
+/// The pose a skill starts from — what its network was trained from — and so the only pose the
+/// robot will start it in.
+///
+/// **A network handed a pose it was never trained from is the failure this guards against**, in
+/// both directions. A kick or a roll from the seat throws the robot over, and a pad button pressed
+/// by accident while the duck sits is how that used to happen. A policy trained *from* the seat —
+/// the MicroDock's scoot, which shuffles on its seat from the pose `alpha_sitstand` sits in — has
+/// the mirror problem: on a standing robot it is the one with no idea where it is.
+///
+/// A seated skill hands back to the seat: when its window ends the sitstand network holds the
+/// seat again, and standing up is still the sit toggle's. A standing one hands back to the gait,
+/// as every skill always has.
+///
+/// The manifest's `entry_pose` says which ([`EntryPose::from_manifest`]); absent is standing, so
+/// nothing published before the field existed changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryPose {
+    #[default]
+    Standing,
+    Seated,
+}
+
+impl EntryPose {
+    pub fn is_standing(&self) -> bool {
+        *self == EntryPose::Standing
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EntryPose::Standing => "standing",
+            EntryPose::Seated => "seated",
+        }
+    }
+
+    /// A manifest's `entry_pose`, or `None` when it is not one of the two words.
+    ///
+    /// `"sitting"` is taken for seated because it is what people write. Anything else — prose
+    /// such as "standing, feet together" included — is not a claim this can act on, and the
+    /// caller treats it as absent and says so; a sentence is for a person, and the guard it
+    /// would switch off is not something to infer from one.
+    pub fn from_manifest(value: &str) -> Option<EntryPose> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "standing" => Some(EntryPose::Standing),
+            "seated" | "sitting" => Some(EntryPose::Seated),
+            _ => None,
+        }
+    }
+}
+
+/// Lenient, because this is read from `robotd.toml` and an official set's manifest: a value this
+/// build does not know is standing — the default, and the pose every skill had before the field —
+/// never a file refused over it.
+impl<'de> Deserialize<'de> for EntryPose {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        Ok(EntryPose::from_manifest(&value).unwrap_or_else(|| {
+            tracing::warn!(entry_pose = %value, "unknown entry_pose; taken as standing");
+            EntryPose::Standing
+        }))
+    }
 }
 
 /// Parameters a skill changes for its duration, restored when it ends.
@@ -2255,6 +2326,9 @@ pub struct SetPolicy {
     pub mode: Option<Mode>,
     /// The command block: how the daemon is meant to drive this network.
     pub command: Option<SetCommand>,
+    /// The pose it starts from. Absent, and any value but the two [`EntryPose`] words, is
+    /// standing — what every set entry has been.
+    pub entry_pose: Option<String>,
 }
 
 /// The machine-readable half of a manifest's command block.
@@ -2462,6 +2536,11 @@ fn builtin_skills(manifest: Option<&SetManifest>) -> Vec<SkillDef> {
                     path: Some(PathBuf::from(POLICY_DIR).join(&p.file)),
                     duration: p.duration_s?,
                     chain: p.chain,
+                    entry_pose: p
+                        .entry_pose
+                        .as_deref()
+                        .and_then(EntryPose::from_manifest)
+                        .unwrap_or_default(),
                     unwind: p.command.as_ref().and_then(|c| c.idle).unwrap_or_default(),
                     unwind_s: p.unwind_s.unwrap_or(0.0),
                     params: SkillOverrides {
@@ -2491,6 +2570,7 @@ fn fallback_skills() -> Vec<SkillDef> {
         path: Some(PathBuf::from(POLICY_DIR).join(file)),
         duration: 0.5,
         chain: false,
+        entry_pose: EntryPose::Standing,
         command: [0.0; 3],
         unwind: [0.0; 3],
         unwind_s: 0.0,
@@ -2505,6 +2585,7 @@ fn fallback_skills() -> Vec<SkillDef> {
             // Holding the button chains rolls, which is how the prototype maps a held trigger
             // onto a one-shot.
             chain: true,
+            entry_pose: EntryPose::Standing,
             command: [0.0; 3],
             unwind: [0.0; 3],
             unwind_s: 0.0,
@@ -3693,6 +3774,10 @@ impl Params {
 fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String>) {
     fields.retain(|key, value| {
         let path = format!("{prefix}.{key}");
+        if path == "policy.skill" {
+            prune_skills(value, ignored);
+            return true;
+        }
         if registry::entry_for(&path).is_some() {
             return true;
         }
@@ -3708,6 +3793,62 @@ fn prune_fields(prefix: &str, fields: &mut toml::Table, ignored: &mut Vec<String
         ignored.push(path);
         false
     });
+}
+
+/// Every key a `[[policy.skill]]` entry may carry, and its `params` table's — [`SkillDef`] and
+/// [`SkillOverrides`] as serde names them. Pinned to the structs by
+/// `skill_keys_are_every_skill_field`.
+const SKILL_KEYS: &[&str] = &[
+    "name",
+    "path",
+    "duration",
+    "command",
+    "unwind",
+    "unwind_s",
+    "chain",
+    "entry_pose",
+    "params",
+];
+const SKILL_PARAMS_KEYS: &[&str] = &["action_scale", "gain_ratio"];
+
+/// [`prune_fields`] for the skill table, which the registry knows only as one entry.
+///
+/// **A skill entry is where a newer build's key is likeliest to land**, because `robotctl policy
+/// add` writes it there: `entry_pose`, written by a build that has it, used to make an older build
+/// refuse the whole file — and a `robotd` that will not start, over a skill nobody pressed.
+/// Dropped and named instead, the skill still loads with what this build understands of it.
+fn prune_skills(value: &mut toml::Value, ignored: &mut Vec<String>) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    for entry in entries {
+        let Some(fields) = entry.as_table_mut() else {
+            continue;
+        };
+        let name = fields
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("?")
+            .to_owned();
+        fields.retain(|key, value| {
+            if key == "params"
+                && let Some(params) = value.as_table_mut()
+            {
+                params.retain(|k, _| {
+                    let known = SKILL_PARAMS_KEYS.contains(&k);
+                    if !known {
+                        ignored.push(format!("policy.skill[{name}].params.{k}"));
+                    }
+                    known
+                });
+            }
+            let known = SKILL_KEYS.contains(&key);
+            if !known {
+                ignored.push(format!("policy.skill[{name}].{key}"));
+            }
+            known
+        });
+    }
 }
 
 /// Re-parse a file that `deny_unknown_fields` rejected, dropping the keys this build has no
@@ -3994,6 +4135,34 @@ mod tests {
         );
     }
 
+    /// An official set entry says its pose the way a single-policy repo does, and the skill
+    /// carries it; an entry that says nothing, or prose, is standing.
+    #[test]
+    fn a_set_entry_says_whether_it_starts_seated() {
+        let manifest: super::SetManifest = serde_json::from_value(serde_json::json!({
+            "policies": [
+                { "file": "scoot.onnx", "kind": "episodic", "duration_s": 2.0,
+                  "entry_pose": "seated" },
+                { "file": "roulade.onnx", "kind": "episodic", "duration_s": 1.0 },
+                { "file": "bow.onnx", "kind": "episodic", "duration_s": 4.0,
+                  "entry_pose": "standing, feet together" }
+            ]
+        }))
+        .unwrap();
+        let poses: Vec<(String, EntryPose)> = builtin_skills(Some(&manifest))
+            .into_iter()
+            .map(|s| (s.name, s.entry_pose))
+            .collect();
+        assert_eq!(
+            poses,
+            vec![
+                ("scoot".to_owned(), EntryPose::Seated),
+                ("roulade".to_owned(), EntryPose::Standing),
+                ("bow".to_owned(), EntryPose::Standing),
+            ]
+        );
+    }
+
     /// **A set cannot shadow a skill the daemon drives itself.**
     ///
     /// The manifest lives on the Hub, so nothing in this repository can check it before a board
@@ -4248,6 +4417,88 @@ mod tests {
         assert_eq!(pad.y, "excited");
         assert_eq!(pad.lb, "yes");
         assert_eq!(pad.rb, "no");
+    }
+
+    /// **A key a newer build wrote into a skill entry is dropped, not fatal** — the skill loads
+    /// with what this build knows of it, and the rest of the file with it.
+    #[test]
+    fn an_unknown_key_in_a_skill_entry_drops_the_key_not_the_file() {
+        let text = "[control]\nhz = 50\n\n[[policy.skill]]\nname = \"scoot\"\nduration = 2.5\n\
+                    entry_pose = \"seated\"\nsomething_newer = 3\n[policy.skill.params]\ngain_ratio = 0.5\n\
+                    later = 1\n";
+        let (params, ignored) = Params::parse(text).expect("parses");
+        assert_eq!(
+            ignored,
+            vec![
+                "policy.skill[scoot].params.later".to_owned(),
+                "policy.skill[scoot].something_newer".to_owned(),
+            ]
+        );
+        let scoot = &params.policy.skills[0];
+        assert!(scoot.entry_pose == EntryPose::Seated && scoot.duration == 2.5);
+        assert_eq!(scoot.params.gain_ratio, Some(0.5));
+    }
+
+    /// A pose this build does not know is standing — the default — not a file refused. A
+    /// future build adding a third pose must not stop an older `robotd` from starting.
+    #[test]
+    fn an_unknown_entry_pose_is_standing_not_fatal() {
+        let text = "[[policy.skill]]\nname = \"x\"\nduration = 1.0\nentry_pose = \"lying\"\n";
+        let (params, ignored) = Params::parse(text).expect("parses");
+        assert!(ignored.is_empty());
+        assert_eq!(params.policy.skills[0].entry_pose, EntryPose::Standing);
+    }
+
+    /// The manifest's two words, and what people write for the second. Prose is not a claim.
+    #[test]
+    fn entry_pose_reads_the_two_words_and_nothing_else() {
+        assert_eq!(EntryPose::from_manifest("seated"), Some(EntryPose::Seated));
+        assert_eq!(
+            EntryPose::from_manifest(" Sitting "),
+            Some(EntryPose::Seated)
+        );
+        assert_eq!(
+            EntryPose::from_manifest("standing"),
+            Some(EntryPose::Standing)
+        );
+        assert_eq!(
+            EntryPose::from_manifest(
+                "sitting, after the official alpha_sitstand policy sits the duck down"
+            ),
+            None
+        );
+    }
+
+    /// The pruner's list of skill keys is every field serde knows, and nothing else — or a key a
+    /// build *does* understand would be pruned, or one it does not would still be fatal.
+    #[test]
+    fn skill_keys_are_every_skill_field() {
+        let full = SkillDef {
+            name: "x".into(),
+            path: Some(PathBuf::from("/x.onnx")),
+            duration: 1.0,
+            command: [1.0; 3],
+            unwind: [1.0; 3],
+            unwind_s: 1.0,
+            chain: true,
+            entry_pose: EntryPose::Seated,
+            params: SkillOverrides {
+                action_scale: Some(1.0),
+                gain_ratio: Some(1.0),
+            },
+        };
+        let table = toml::Table::try_from(&full).expect("serialises");
+        let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
+        let mut expected = SKILL_KEYS.to_vec();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+        let params = table["params"].as_table().expect("params");
+        let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        let mut expected = SKILL_PARAMS_KEYS.to_vec();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is

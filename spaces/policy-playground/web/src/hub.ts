@@ -287,5 +287,15 @@ export function skillFor(fetched: Record<string, unknown>, hold: number): Record
   if (fetched.idle) params.unwind = fetched.idle;
   if (number(fetched.unwind_s)) params.unwind_s = number(fetched.unwind_s);
   if (number(fetched.action_scale)) params.action_scale = number(fetched.action_scale);
+  // The pose it starts from. Sent only for a seated one: standing is what absent means, and
+  // leaving it out keeps a standing install working on a robot older than the field.
+  if (seated(fetched.entry_pose)) params.entry_pose = "seated";
   return params;
+}
+
+/** The manifest's `entry_pose` names the seat — the robot's own reading, `EntryPose::from_manifest`. */
+export function seated(pose: unknown): boolean {
+  if (typeof pose !== "string") return false;
+  const word = pose.trim().toLowerCase();
+  return word === "seated" || word === "sitting";
 }
