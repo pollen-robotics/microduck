@@ -1,0 +1,5 @@
+# The tools' venv. Everything build_assets.sh generates is ignored where it lands, in
+# android/.gitignore: it is rebuilt from pinned sources rather than committed, and the meshes among
+# it are CC BY-NC-SA, a different licence from this repository's.
+tools/.venv/
+__pycache__/
