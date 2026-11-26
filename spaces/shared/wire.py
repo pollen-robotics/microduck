@@ -37,6 +37,7 @@ reader of this protocol gets wrong once. `list` is the same. Everything else arr
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import json
 import logging
@@ -264,12 +265,16 @@ class WsConsumer:
         message is swallowed in silence — a stream that looks connected and says nothing.
         """
         assert self._stream is not None
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buffer = ""
         try:
             for chunk in self._stream.iter_content(chunk_size=None):
                 if self._stop.is_set():
                     return
-                buffer += chunk.decode("utf-8", "replace").replace("\r\n", "\n")
+                # HTTP chunks can split a UTF-8 character or a CRLF pair. Keep
+                # decoding state and join the text before normalising line endings.
+                buffer += decoder.decode(chunk)
+                buffer = buffer.replace("\r\n", "\n")
                 while "\n\n" in buffer:
                     frame, _, buffer = buffer.partition("\n\n")
                     data = "".join(
