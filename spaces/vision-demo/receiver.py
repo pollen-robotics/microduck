@@ -129,9 +129,17 @@ class Frames:
             stream.frames += 1
             stream.picture = picture
 
-    def closed(self, username: str, robot: str) -> None:
+    def closed(self, stream: Stream) -> None:
+        """Forget `stream`, unless a newer connection from the same robot has already replaced it.
+
+        A robot can redial before this end sees its previous connection go, so the old socket's
+        teardown can run after the new one's hello. Removing by key alone would then drop the live
+        stream, and the page would say "no stream yet" while frames are still arriving.
+        """
+        key = (stream.username, stream.robot)
         with self._lock:
-            self._streams.pop((username, robot), None)
+            if self._streams.get(key) is stream:
+                del self._streams[key]
 
     def of(self, username: str) -> list[Stream]:
         with self._lock:
@@ -297,5 +305,6 @@ def mount(app: Any) -> None:
         except Exception as e:  # noqa: BLE001 - one bad socket is not a bad Space
             logger.warning("a frame stream failed: %r", e)
         finally:
-            FRAMES.closed(username, robot)
+            if stream is not None:
+                FRAMES.closed(stream)
             logger.info("the frame stream from %s ended", robot)
