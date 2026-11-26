@@ -109,6 +109,11 @@ gstreamer = { version = "0.24", features = ["v1_22"] }
 # and taking them off the encoded branch would mean decoding what was just encoded.
 gstreamer-app = { version = "0.24", features = ["v1_22"] }
 gstreamer-webrtc = { version = "0.24", features = ["v1_22"] }
+# One call: `RTPHeaderExtension::create_from_uri`, for the RFC 6051 ntp-64 extension the
+# payloader is given in `wire_payloader_setup`. It is a separate crate from `gstreamer` because
+# it is a separate `.pc` file — `gstreamer-rtp-1.0`, in plugins-base beside `gstreamer-sdp-1.0`,
+# which is the same split `gst-plugins-rs`'s own webrtc crate depends on.
+gstreamer-rtp = { version = "0.24", features = ["v1_22"] }
 # `GstVideoMeta`, which the camera source has to advertise in the ALLOCATION query or v4l2src
 # copies every frame — see `advertise_video_meta`. Typed, so the meta API type comes from the
 # bindings rather than a hand-written GType lookup.
@@ -125,6 +130,7 @@ gstreamer = [
     "dep:gstreamer-app",
     "dep:gstreamer-video",
     "dep:gstreamer-webrtc",
+    "dep:gstreamer-rtp",
     "dep:glib",
 ]
 
@@ -135,6 +141,7 @@ gstreamer = [
 gstreamer = { version = "0.24", features = ["v1_22"], optional = true }
 gstreamer-app = { version = "0.24", features = ["v1_22"], optional = true }
 gstreamer-webrtc = { version = "0.24", features = ["v1_22"], optional = true }
+gstreamer-rtp = { version = "0.24", features = ["v1_22"], optional = true }
 gstreamer-video = { version = "0.24", features = ["v1_22"], optional = true }
 glib = { version = "0.21", optional = true }
 
