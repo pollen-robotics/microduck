@@ -387,8 +387,11 @@ pub async fn install_set(
         source: e,
     })?;
 
+    // A repaired seed shares the old revision but has a different directory name. Keep the
+    // actual predecessor, not a name reconstructed from its version that may be a fallback.
+    let previous_set = std::fs::read_link(root.join("current")).ok();
     swap_current(root, &name)?;
-    prune(root, &name, previous.as_deref());
+    prune(root, &name, previous_set.as_deref());
     Ok((version, previous))
 }
 
@@ -402,20 +405,23 @@ pub async fn install_set(
 ///
 /// Best effort. A set that cannot be removed is disk space, not a failed install, and undoing a
 /// good install over it would be the wrong trade.
-fn prune(root: &Path, keep: &str, previous: Option<&str>) {
-    let previous = previous.map(|v| format!("{SET_PREFIX}{v}"));
+fn prune(root: &Path, keep: &str, previous: Option<&Path>) {
+    let previous = previous.and_then(Path::file_name);
     let Ok(entries) = std::fs::read_dir(root.join("releases")) else {
         return;
     };
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = entry.file_name();
         // `seed-` only. Anything else under here belongs to whatever installed it, which is the
         // rule the seeder opens with and this must not be the exception to.
-        if !name.starts_with(SET_PREFIX) || name == keep || Some(&name) == previous.as_ref() {
+        if !name.to_string_lossy().starts_with(SET_PREFIX)
+            || name == keep
+            || Some(name.as_os_str()) == previous
+        {
             continue;
         }
         if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-            tracing::warn!(set = %name, error = %e, "could not remove an old policy set");
+            tracing::warn!(set = %name.to_string_lossy(), error = %e, "could not remove an old policy set");
         }
     }
 }
@@ -594,7 +600,7 @@ mod tests {
             std::fs::create_dir_all(root.join("releases").join(name)).unwrap();
         }
 
-        prune(root, "seed-v3", Some("v2"));
+        prune(root, "seed-v3", Some(Path::new("releases/seed-v2")));
 
         let mut left: Vec<String> = std::fs::read_dir(root.join("releases"))
             .unwrap()
@@ -611,6 +617,31 @@ mod tests {
             ],
             "the live set, the one it replaced, and anything that is not ours"
         );
+    }
+
+    /// After repairing v5, updating to v6 must keep the complete predecessor rather than its
+    /// old fallback, even though both directories record version=v5.
+    #[test]
+    fn a_repaired_seed_is_kept_as_the_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["seed-v5", "seed-v5-repair", "seed-v6", "from-a-tool"] {
+            std::fs::create_dir_all(root.join("releases").join(name)).unwrap();
+        }
+        swap_current(root, "seed-v5-repair").unwrap();
+        let previous = std::fs::read_link(root.join("current")).unwrap();
+        swap_current(root, "seed-v6").unwrap();
+
+        prune(root, "seed-v6", Some(&previous));
+
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            Path::new("releases/seed-v6")
+        );
+        assert!(root.join("releases/seed-v6").exists());
+        assert!(root.join("releases/seed-v5-repair").exists());
+        assert!(!root.join("releases/seed-v5").exists());
+        assert!(root.join("releases/from-a-tool").exists());
     }
 
     /// A first install has no predecessor, and must not read that as licence to keep nothing —
