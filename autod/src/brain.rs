@@ -825,7 +825,9 @@ impl Brain {
         self.take_fix(world.map);
         // Backing up: said once per stretch, with what was moving the robot, and stopped at once
         // with a wall behind.
-        let backing = self.back_v < BACK_V;
+        // Sitting shifts the trunk back, so the odometry drift looks like backing up. A seated
+        // duck is not walking anywhere; without this the nap and brace checks fight every tick.
+        let backing = !world.sitting && self.back_v < BACK_V;
         if backing && !self.backing_logged {
             self.backing_logged = true;
             tracing::warn!(
@@ -2713,6 +2715,21 @@ mod tests {
         }
         let at = braced_at.expect("braced before the wall");
         assert!(at > 0.1 + 0.2, "with room to spare: stopped at x = {at:.2}");
+    }
+
+    /// A seated duck drifting back (sitting shifts the trunk) must not brace: otherwise the Nap
+    /// and Brace checks trade the state every tick and the nap never runs.
+    #[test]
+    fn seated_nap_does_not_brace_on_backing() {
+        let (mut brain, mut w) = by_the_wall(0.4);
+        brain.enter(State::Nap);
+        w.sitting = true;
+        for i in 0..100 {
+            w.pose[0] = 0.4 - 0.1 * 0.02 * f64::from(i);
+            brain.step(0.02, &w);
+            assert_eq!(brain.state(), State::Nap);
+        }
+        assert!(brain.back_v < BACK_V, "the bench does drift back");
     }
 
     /// Without a map nothing knows what is behind, so backing up is only logged.
