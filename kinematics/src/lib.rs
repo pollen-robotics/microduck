@@ -23,6 +23,7 @@ mod mjcf;
 
 pub mod hand;
 pub mod head;
+pub mod offer;
 pub mod tof;
 
 pub use math::{Pose, Quat};
