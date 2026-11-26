@@ -57,6 +57,7 @@ own the mechanism is the bug.
 | [`mapping-design.md`](design/mapping-design.md) | `mapd` and `maploc`: the onboard map from the ToF and the legs, a stop as the unit of mapping, losing and finding itself, what is kept. |
 | [`autonomous.md`](design/autonomous.md) | `autod`, the duck on its own: the brain, booting without a pad, the pad's takeover, and ToF obstacle avoidance. |
 | [`simulation.md`](design/simulation.md) | The twin: where the seam between daemon and body is, the body protocol, the fake radio, the containers, and what it is and is not a twin of. |
+| [`autonomous-brain.md`](design/autonomous-brain.md) | A proposal for the autonomous brain: one client, built on prediction, above the shipped policies — and an implementation running in simulation. |
 
 ## `project/` — you are running the project
 
