@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use duck_ipc_proto as proto;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 mod config;
@@ -47,6 +47,10 @@ use status::Status;
 /// Same mode and reasoning as every other socket here: the group decides who may
 /// ask, and it is the same group that may watch `robot.state`.
 const SOCKET_MODE: u32 = 0o660;
+
+/// Longest request line read. The only requests are a method name and an id, so anything near
+/// this is not one.
+const MAX_LINE: usize = 64 * 1024;
 
 /// The group that may read the stream. Deliberately the same one as `robotd`'s
 /// socket and `padd`'s tap: whoever may watch the robot may watch what it sees.
@@ -701,7 +705,21 @@ async fn subscriber(
     // dropped.
     loop {
         line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        // Bounded, so a peer that never sends a newline cannot make this buffer without end.
+        if (&mut reader)
+            .take(MAX_LINE as u64 + 1)
+            .read_line(&mut line)
+            .await?
+            == 0
+        {
+            return Ok(());
+        }
+        if line.len() > MAX_LINE {
+            let response = proto::Response::err(
+                None,
+                proto::Error::new(proto::code::INVALID_REQUEST, "request too large"),
+            );
+            write_line(&mut write, &response).await?;
             return Ok(());
         }
         let request: proto::Request = match serde_json::from_str(line.trim()) {
@@ -851,6 +869,31 @@ async fn write_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that never sends a newline must be refused while it is still writing, not
+    /// buffered for as long as it cares to write.
+    #[tokio::test]
+    async fn an_unterminated_oversized_request_is_refused_while_it_arrives() {
+        let (frames, _) = tokio::sync::broadcast::channel::<proto::TofFrame>(4);
+        let (imu_frames, _) = tokio::sync::broadcast::channel::<proto::HeadImuFrame>(4);
+        let status = Arc::new(Status::new(15));
+        let imu_status = Arc::new(ImuStatus::new(100));
+        let (server, client) = UnixStream::pair().unwrap();
+        tokio::spawn(async move {
+            let _ = subscriber(server, &status, &frames, &imu_status, &imu_frames).await;
+        });
+        let (read, mut write) = client.into_split();
+        let mut reader = BufReader::new(read);
+
+        write.write_all(&vec![b'x'; MAX_LINE + 1]).await.unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut answer))
+            .await
+            .expect("an oversized line must be refused before its newline arrives")
+            .unwrap();
+        let response: proto::Response = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(response.error.unwrap().code, proto::code::INVALID_REQUEST);
+    }
 
     /// **A connection that has asked for nothing wants nothing**, and one that asked for depth
     /// does not want the IMU. `accept` used to subscribe to both channels before reading a byte
