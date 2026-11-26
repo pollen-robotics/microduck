@@ -82,6 +82,7 @@ thinking is not lost and does not get mistaken for a decision.
 | | |
 |---|---|
 | [`autonomous_behavior.md`](ideas/autonomous_behavior.md) | The behavior stack: what the runtime's brain has to give up, and the ideas the chorale and theremin work left behind. |
+| [`autonomous_cognition.md`](ideas/autonomous_cognition.md) | A smarter duck: reflexes, behaviors and a remote model at three speeds; gaze; places named by a VLM; a behavior library to vibe code against. |
 
 ## Elsewhere
 
