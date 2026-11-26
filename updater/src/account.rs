@@ -140,11 +140,63 @@ fn link_in_place(at: &Path, target: &Path) -> std::io::Result<()> {
 
 /// The group that may read the token file.
 ///
-/// `mediad` runs as `User=mediad` with `SupplementaryGroups=robot`, and it is the process that
-/// needs the token — it is the one holding the relay. `updaterd` runs as root and writes it. So
-/// the file is `root:robot` and `0640`: readable by the daemons that belong to this robot, and by
-/// nothing else with a login on the board.
-pub const TOKEN_GROUP: &str = "robot";
+/// `mediad` holds the relay and is the one process that needs the token, and `updaterd` runs as
+/// root and writes it, so the file is root-owned, `0640`, with this group. Not `robot`: that is the
+/// socket group, and `btd`, `padd`, `tofd` and every operator with a shell are in it.
+/// `mediad.service` grants this one and `robot.conf` creates it.
+pub const TOKEN_GROUP: &str = "robot-account";
+
+/// Give the credential at `path` to [`TOKEN_GROUP`], at `updaterd`'s startup.
+///
+/// The store sets the group when it saves, and a signed-in robot saves only on a refresh, about a
+/// week before a 30-day expiry. Without this, a board signed in before the group changed keeps the
+/// old one until then. In place rather than through the store: the secret is not rewritten, so a
+/// refresh landing at the same moment cannot be lost to it, and its mtime still says how recent the
+/// sign-in is.
+pub fn settle_group(path: &Path) {
+    let Some(gid) = crate::unix::group_id(TOKEN_GROUP) else {
+        if path.exists() {
+            tracing::info!(
+                group = TOKEN_GROUP,
+                path = %path.display(),
+                "no such group here; the account credential keeps the group it has"
+            );
+        }
+        return;
+    };
+    match settle(path, gid) {
+        Ok(true) => tracing::warn!(
+            path = %path.display(),
+            group = TOKEN_GROUP,
+            "gave the account credential to its group"
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            path = %path.display(),
+            error = %e,
+            "could not give the account credential to its group"
+        ),
+    }
+}
+
+/// [`settle_group`] with the group as a number. `Ok(true)` when the file changed.
+///
+/// The group before the mode, so the file is never readable by a group it was not meant for.
+fn settle(path: &Path, gid: u32) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if meta.gid() == gid && meta.mode() & 0o777 == 0o640 {
+        return Ok(false);
+    }
+    std::os::unix::fs::chown(path, None, Some(gid))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
+    Ok(true)
+}
 
 /// The account this robot belongs to, at [`DEFAULT_PATH`].
 pub fn account() -> Account {
@@ -365,6 +417,106 @@ mod tests {
             "new",
             "through the link"
         );
+    }
+
+    /// The constant, the unit that grants the group and the two files that create it name one
+    /// group, and it is not the socket group.
+    #[test]
+    fn the_token_group_is_the_one_the_unit_and_sysusers_name() {
+        let unit = include_str!("../../mediad/systemd/mediad.service");
+        let granted = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("SupplementaryGroups="))
+            .expect("mediad.service names its groups");
+        assert!(
+            granted.split_whitespace().any(|g| g == TOKEN_GROUP),
+            "mediad.service does not grant {TOKEN_GROUP}: {granted}"
+        );
+
+        let sysusers = include_str!("../systemd/sysusers.d/robot.conf");
+        let created = format!("g {TOKEN_GROUP} -");
+        assert!(
+            sysusers.lines().any(|l| l.trim() == created),
+            "robot.conf does not create {TOKEN_GROUP}"
+        );
+
+        let install = include_str!("../../scripts/install.sh");
+        assert!(
+            install.contains(&format!("groupadd --system {TOKEN_GROUP}")),
+            "install.sh does not create {TOKEN_GROUP} on a board without systemd-sysusers"
+        );
+
+        assert_ne!(TOKEN_GROUP, "robot");
+    }
+
+    const CREDENTIAL: &str = r#"{"access_token":"hf_abc","username":"duck"}"#;
+
+    /// The groups this process may give a file to without being root.
+    fn my_groups() -> Vec<u32> {
+        let mut gids = vec![0 as libc::gid_t; 256];
+        // SAFETY: the buffer holds `gids.len()` entries and `getgroups` writes at most that many
+        // into it, touching no shared state.
+        let n = unsafe { libc::getgroups(gids.len() as libc::c_int, gids.as_mut_ptr()) };
+        gids.truncate(n.max(0) as usize);
+        gids
+    }
+
+    fn credential(dir: &tempfile::TempDir, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.path().join("token");
+        std::fs::write(&path, CREDENTIAL).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    /// A board signed in before the group changed: the file has the old group, and startup gives
+    /// it the new one in place, without rewriting the secret.
+    #[test]
+    fn a_credential_with_the_old_group_gets_the_new_one_at_startup() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = credential(&dir, 0o640);
+        let before = std::fs::metadata(&path).unwrap();
+        let Some(new) = my_groups().into_iter().find(|&g| g != before.gid()) else {
+            eprintln!("this process is in one group only; nothing to move the file to");
+            return;
+        };
+
+        assert!(settle(&path, new).unwrap());
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.gid(), new);
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(after.ino(), before.ino(), "changed in place, not rewritten");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CREDENTIAL);
+
+        assert!(!settle(&path, new).unwrap());
+        let again = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (again.ctime(), again.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec()),
+            "and the next start touches nothing"
+        );
+    }
+
+    /// A save whose chown failed left the file private; the next start relaxes it for the group.
+    #[test]
+    fn a_private_credential_is_relaxed_for_its_group() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = credential(&dir, 0o600);
+        let gid = std::fs::metadata(&path).unwrap().gid();
+
+        assert!(settle(&path, gid).unwrap());
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn no_credential_is_nothing_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!settle(&dir.path().join("absent"), 0).unwrap());
     }
 
     /// Rolled back, an older `updaterd` signed in again: its rename replaced the link with a
