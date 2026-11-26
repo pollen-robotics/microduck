@@ -1,9 +1,9 @@
 # Checks on every push and pull request.
 #
-# Split into three parallel jobs deliberately, so the wait is the slowest one rather than the
-# total: `check` is fast and catches most things, `board` catches the class of problem that only
+# Split into parallel jobs deliberately, so the wait is the slowest one rather than the total:
+# `check` is fast and catches most things, `board` catches the class of problem that only
 # appears off the dev machine (cross-linking, glibc floors, unix-socket and permission
-# semantics), and `coverage` needs its own instrumented build.
+# semantics), `coverage` needs its own instrumented build, and `sdk` is the Python client.
 name: ci
 
 # Documentation is excluded from all of it. Editing a markdown file used to cross-compile for
@@ -384,3 +384,24 @@ jobs:
           # branch does not accumulate a wall of near-identical coverage reports.
           gh pr comment "${{ github.event.number }}" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
             || gh pr comment "${{ github.event.number }}" --body-file "$RUNNER_TEMP/comment.md"
+
+  # The Python SDK's tests. One of them reads the field names from `duck-ipc-proto`, so a field
+  # renamed on the robot's side fails here rather than on a robot. Only docs skip this file, so a
+  # change to the proto alone runs it too.
+  #
+  # Two Pythons, the two ends of what people install. 3.10 is the floor `sdk/pyproject.toml`
+  # promises, and pip gives it older `numpy` and `websockets` than a new Python gets. 3.15 is the
+  # newest that `av`, `aiortc` and the rest ship wheels for, so nothing compiles here.
+  sdk:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.15']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e "sdk[test,frames,video]"
+      - run: pytest sdk/tests

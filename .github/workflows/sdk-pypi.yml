@@ -1,0 +1,111 @@
+# `microduck` on PyPI, so `pip install microduck` gets the Python SDK on any machine.
+#
+# On a stable release tag only, `daemon-vX.Y.Z`, as `duckctl-pypi.yml` is, and with the same
+# version: the workspace version in `Cargo.toml`, stamped into `sdk/pyproject.toml` at build time,
+# so there is no second number to bump. The SDK speaks the proto, so one number says which SDK goes
+# with which robot, and a fix reaches PyPI the way it reaches a robot. Staging and dev tags are
+# not published; the stable tag that promotes them is.
+#
+# An sdist and a wheel. The SDK is pure Python, so the sdist builds anywhere and nothing compiles
+# on the user's machine either way.
+#
+# Trusted publishing, as for `duckctl`: no API token in the repo secrets. It needs a publisher on
+# PyPI naming this repository, this file and the `pypi` environment. `docs/project/ci-setup.md` has
+# the one-time setup.
+#
+# `workflow_dispatch` is for a tag a manual promotion created, which starts no workflow, or a run to
+# repeat: start it from the tag (Use workflow from → Tags → `daemon-vX.Y.Z`).
+name: microduck to PyPI
+
+on:
+  push:
+    tags:
+      - 'daemon-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sdk-pypi-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # A tag that disagrees with `Cargo.toml` would publish a version nobody released, and a PyPI
+  # version can never be taken back. Refused here, before anything is built.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$TAG" in
+              daemon-v*) ;;
+              *) echo "::error::run this from a daemon-vX.Y.Z tag, not '$TAG'"; exit 1 ;;
+          esac
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [ "${TAG#daemon-v}" != "$version" ]; then
+              echo "::error::$TAG but the workspace is $version in Cargo.toml"
+              exit 1
+          fi
+          echo "publishing microduck $version" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Built in its own job, so the job that can publish runs nothing but the upload.
+  build:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # `sdk/pyproject.toml` says 0.0.0 and nothing else may: this is the one place its version is
+      # written, and a line it cannot find fails the build rather than publishing 0.0.0.
+      - name: Stamp the workspace version
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          import pathlib, re, tomllib
+          version = tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"]
+          path = pathlib.Path("sdk/pyproject.toml")
+          text, n = re.subn(r'(?m)^version = "0\.0\.0"$', f'version = "{version}"', path.read_text())
+          if n != 1:
+              raise SystemExit('sdk/pyproject.toml has no `version = "0.0.0"` line to stamp')
+          path.write_text(text)
+          print(f"microduck {version}")
+          EOF
+      - run: pip install build
+      - run: python -m build sdk --outdir dist
+      - name: The files carry that version
+        run: |
+          set -eu
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          ls -l dist
+          test -f "dist/microduck-$version-py3-none-any.whl"
+          test -f "dist/microduck-$version.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microduck-dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/microduck
+    permissions:
+      id-token: write   # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: microduck-dist
+          path: dist
+      # `skip-existing`, so re-running a release whose upload half-failed finishes it rather than
+      # failing on the files PyPI already has (it never accepts the same file twice).
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

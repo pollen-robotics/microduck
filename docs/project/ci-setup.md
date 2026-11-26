@@ -210,6 +210,7 @@ promote.yml            workflow_dispatch → _promote-release.yml
 dev.yml                every push: an unsigned-for-customers dev build, `team.dev` key
 _build-duckctl.yml     duckctl wheels + archives per platform           (called by dev.yml, duckctl-pypi.yml)
 duckctl-pypi.yml       tag daemon-v*: duckctl wheels → PyPI, for `uvx duckctl`, then the Homebrew formula
+sdk-pypi.yml           tag daemon-v*: the Python SDK, sdist + wheel → PyPI, for `pip install microduck`
 ```
 
 The recipe lives in the two called workflows so the staging and stable paths cannot drift apart in
@@ -243,6 +244,24 @@ A **manual promotion** (`gh workflow run promote`) needs one more step:
 `gh workflow run duckctl-pypi --ref daemon-v<version>`. That path creates the stable tag with
 `GITHUB_TOKEN`, and GitHub does not start workflows on a push made with it, so the tag alone
 publishes nothing. Re-running is safe: files PyPI already has are skipped.
+
+## `microduck` on PyPI
+
+`pip install microduck` installs the Python SDK in `sdk/`. `sdk-pypi.yml` publishes it on every
+`daemon-v*` tag push, beside `duckctl`: an sdist and a wheel, both pure Python. Its version is the
+workspace version, stamped into `sdk/pyproject.toml` (which says 0.0.0) at build time, so a release
+needs nothing bumped for it, and the workflow refuses a tag that disagrees with `Cargo.toml`.
+
+No token here either. The one-time setup, **not done yet**:
+
+1. On PyPI: *Your projects → Publishing → Add a new pending publisher*. Fill in project
+   `microduck`, owner `pollen-robotics`, repository `microduck`, workflow `sdk-pypi.yml`,
+   environment `pypi`. The name was free on 2026-11-02, and the first upload creates the project.
+2. The `pypi` environment exists already, for `duckctl`.
+
+The first upload is the first `daemon-v*` tag cut after this workflow merged. A **manual
+promotion** needs `gh workflow run sdk-pypi --ref daemon-v<version>` as well, for the reason
+`duckctl` does. Re-running is safe: files PyPI already has are skipped.
 
 ## `duckctl` on Homebrew
 

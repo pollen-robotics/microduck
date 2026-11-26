@@ -60,13 +60,10 @@ TIMEOUT = 20
 # library's signature instead. The difference between the two calls was the client, and nothing
 # else: same URL, same `Authorization`, same everything.
 #
-# So this names the page honestly rather than imitating a browser. A caller that says who it is
+# So this names the client honestly rather than imitating a browser. A caller that says who it is
 # and carries a link is what a rate limiter is meant to let through, and it is the half of this
 # that stays true if the rule ever changes.
-USER_AGENT = (
-    "microduck-policy-playground/1.0 "
-    "(+https://huggingface.co/spaces/pollen-robotics/microduck-policy-playground)"
-)
+USER_AGENT = "microduck-sdk/0.1 (+https://github.com/pollen-robotics/microduck/tree/main/sdk)"
 
 # Headers that say *who* answered. Asked only when the answer is one the application could not
 # have written: an edge or a proxy names itself and carries an id worth quoting, where FastAPI
@@ -214,22 +211,3 @@ def ducks(token: str, base: str = DEFAULT_CENTRAL_URL) -> tuple[list[Robot], lis
         else:
             theirs.append(f"{robot.name} ({robot.kind or 'no kind declared'})")
     return ours, theirs
-
-
-if __name__ == "__main__":
-    import os
-    import sys
-
-    from huggingface_hub import get_token
-
-    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
-    credential = os.environ.get("HF_TOKEN") or get_token()
-    if not credential:
-        sys.exit("no token: run `hf auth login`, or set HF_TOKEN")
-    try:
-        found, others = ducks(credential)
-    except RendezvousError as e:
-        sys.exit(str(e))
-    for duck in found:
-        print(f"  {duck.peer_id}  {duck.label()}")
-    print(f"\n{len(found)} duck(s)" + (f"; also listed: {', '.join(others)}" if others else ""))
