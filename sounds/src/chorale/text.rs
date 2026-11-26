@@ -69,7 +69,7 @@ pub fn parse(source: &str) -> Result<Score, ParseError> {
             problem,
         };
         // Comments run to end of line, so a chord can be annotated with what it is.
-        let content = raw.split('#').next().unwrap_or("").trim();
+        let content = without_comment(raw).trim();
         if content.is_empty() {
             continue;
         }
@@ -154,6 +154,22 @@ pub fn parse(source: &str) -> Result<Score, ParseError> {
         });
     }
     Ok(Score::from_gestures(&name, bpm, &gestures))
+}
+
+/// The line up to its comment, if it has one.
+///
+/// A comment is a `#` that starts a word, not any `#` at all: `#` is also the sharp sign, and a
+/// note written `F#4` — the spelling the format documents — would otherwise be cut to `F`, which
+/// is no note at all.
+fn without_comment(line: &str) -> &str {
+    let mut previous = None;
+    for (at, c) in line.char_indices() {
+        if c == '#' && previous.is_none_or(char::is_whitespace) {
+            return &line[..at];
+        }
+        previous = Some(c);
+    }
+    line
 }
 
 /// `solo <part> under B T A S [hum <vowel>] sing <note>[:beats][/vowel] ...`
@@ -495,6 +511,26 @@ mod tests {
         }
         // An empty score is a score-level failure, not a line-level one.
         assert_eq!(parse("name: t\nbpm: 60\n").expect_err("empty").line, 0);
+    }
+
+    /// A sharp is written `F#4`, as the format's own documentation says, and a `#` inside a
+    /// note name is not the start of a comment. Cutting the line at it turned every sharp into
+    /// a note with no octave, so no score could contain one.
+    #[test]
+    fn a_sharp_is_a_note_and_not_a_comment() {
+        let score = parse("name: t\nbpm: 60\nchord 2 D3 A3 D4 F#4   # D major\n")
+            .expect("a sharp is a note name");
+        assert_eq!(
+            score.line(Part::Soprano).next().expect("sings").midi,
+            66,
+            "F#4 is the F sharp above middle C"
+        );
+        let solo = parse("name: t\nbpm: 60\nsolo soprano under D3 - - - sing C#5:2 D5\n")
+            .expect("a sharp in a solo line too");
+        assert_eq!(
+            solo.line(Part::Soprano).map(|n| n.midi).collect::<Vec<_>>(),
+            vec![73, 74]
+        );
     }
 
     /// Comments and blank lines are not content — a score is meant to be annotated, and the
