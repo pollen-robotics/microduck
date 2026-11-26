@@ -17,7 +17,12 @@
 set -euo pipefail
 
 NAME="${1:-}"
-[ -n "$NAME" ] || { echo "usage: $0 <directory under spaces/> [--space id] [--dry-run]" >&2; exit 2; }
+# A flag in the NAME position means the name is missing, not a directory under spaces/. Without
+# this it is reported as "no such space source" with exit 1 — neither a usage error nor the
+# exit code the rest of the script uses for one.
+case "$NAME" in
+    ""|-*) echo "usage: $0 <directory under spaces/> [--space id] [--dry-run]" >&2; exit 2 ;;
+esac
 shift
 
 SPACE="pollen-robotics/microduck-$NAME"
@@ -25,7 +30,16 @@ DRY_RUN=
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --space) SPACE="$2"; shift 2 ;;
+        --space)
+            # Same bad-argument path as publish-console.sh: a missing value must not become an
+            # "unbound variable" error, and the next option must not become the Space id.
+            [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ] || {
+                echo "--space needs an org/name" >&2
+                exit 2
+            }
+            SPACE="$2"
+            shift 2
+            ;;
         --dry-run) DRY_RUN=1; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
