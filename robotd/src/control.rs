@@ -164,6 +164,23 @@ impl Default for Tuning {
     }
 }
 
+/// The ground pick's heading observation saturates here, radians before the gain — the
+/// training clip.
+const HEADING_CLIP: f64 = 0.5;
+
+/// Yaw of the trunk in the world, from the IMU's trunk→world `[w, x, y, z]` quaternion.
+fn trunk_yaw(q: &[f64; 4]) -> f64 {
+    let [w, x, y, z] = *q;
+    (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z))
+}
+
+/// Minus the yaw turned since `yaw0`, wrapped to ±π, clipped to ±[`HEADING_CLIP`], times `gain`.
+fn heading_obs(yaw: f64, yaw0: f64, gain: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let err = (yaw - yaw0 + PI).rem_euclid(TAU) - PI;
+    gain * (-err).clamp(-HEADING_CLIP, HEADING_CLIP)
+}
+
 /// The scripted-skill numbers, resolved per mode by `params` — from the installed set's
 /// manifest where it says, and from the prototype's literals where it does not.
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +193,11 @@ pub struct SkillTuning {
     pub ground_pick_action_scale: f64,
     /// Gain multiplier while the pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// Send this times minus the trunk yaw since the pick started (wrapped, clipped ±0.5 rad) in
+    /// twist[2]. 0 = off.
+    pub ground_pick_heading: f64,
+    /// Seconds past `ground_pick_end_phase` the pick keeps driving with the phase zeroed.
+    pub ground_pick_settle_s: f64,
     /// How long the sitstand network rises (posture flag 0) before the main policy takes over.
     /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
     pub sitstand_rise_s: f64,
@@ -195,6 +217,8 @@ impl Default for SkillTuning {
             ground_pick_end_phase: robotd_params::DEFAULT_GROUND_PICK_END_PHASE,
             ground_pick_action_scale: 1.0,
             ground_pick_gain_ratio: 1.0,
+            ground_pick_heading: 0.0,
+            ground_pick_settle_s: 0.0,
             sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
             sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
             skills: Vec::new(),
@@ -306,6 +330,8 @@ pub struct Controller {
     previous: Option<[f64; NUM_JOINTS]>,
     /// Ground-pick phase, 0..`skills.ground_pick_end_phase`. `None` when inactive.
     ground_pick: Option<f64>,
+    /// Trunk yaw on the pick's first tick, for `skills.ground_pick_heading`. Cleared at start.
+    ground_pick_yaw0: Option<f64>,
     /// **A running skill switches the fall reflex off**, because `busy()` is what gates the
     /// limp-fall predictor and any active skill makes it true. That was uncontroversial when
     /// every one-shot was under a second; a skill configured to hold for ten is a robot with no
@@ -336,6 +362,7 @@ impl Controller {
             last_action: [0.0; ACTION_LEN],
             previous: None,
             ground_pick: None,
+            ground_pick_yaw0: None,
             active: None,
             sit: Sit::Up,
             sit_settle: 0.0,
@@ -380,6 +407,7 @@ impl Controller {
         self.last_action = from.last_action;
         self.previous = from.previous;
         self.ground_pick = from.ground_pick;
+        self.ground_pick_yaw0 = from.ground_pick_yaw0;
         self.active = from.active;
         self.sit = from.sit;
         self.sit_settle = from.sit_settle;
@@ -493,6 +521,7 @@ impl Controller {
             return Err(reason);
         }
         self.ground_pick = Some(0.0);
+        self.ground_pick_yaw0 = None;
         Ok(())
     }
 
@@ -718,8 +747,24 @@ impl Controller {
             // The twist slots carry the phase encoding; head and body are zero-padded,
             // mirroring the training env's `zero_command_padding`.
             let angle = std::f64::consts::TAU * phase;
+            // Past the end phase (only with `ground_pick_settle_s`) the phase slots go to zero:
+            // the stop signal a `-Settle` policy answers by standing still, feet together.
+            let settling = phase >= self.skills.ground_pick_end_phase;
+            // A heading-observing policy also reads minus the yaw since the pick started, as
+            // the training command writes it: wrapped to ±π, clipped to ±0.5 rad.
+            let heading = if self.skills.ground_pick_heading != 0.0 {
+                let yaw = trunk_yaw(&sensors.imu.quat);
+                let yaw0 = *self.ground_pick_yaw0.get_or_insert(yaw);
+                heading_obs(yaw, yaw0, self.skills.ground_pick_heading)
+            } else {
+                0.0
+            };
             let c = Command {
-                twist: [angle.cos(), angle.sin(), 0.0],
+                twist: if settling {
+                    [0.0, 0.0, heading]
+                } else {
+                    [angle.cos(), angle.sin(), heading]
+                },
                 ..Command::default()
             };
             (Net::GroundPick, c, "ground_pick".into())
@@ -834,7 +879,8 @@ impl Controller {
         // phase after the motor write.
         if let Some(phase) = self.ground_pick.as_mut() {
             *phase += dt / self.skills.ground_pick_period;
-            if *phase >= self.skills.ground_pick_end_phase {
+            let settle = self.skills.ground_pick_settle_s.max(0.0) / self.skills.ground_pick_period;
+            if *phase >= self.skills.ground_pick_end_phase + settle {
                 self.ground_pick = None;
             }
         }
@@ -988,6 +1034,25 @@ mod tests {
         let standing_gain = (t.gain as f64 * t.standing_gain_ratio).round() as u16;
         assert_eq!(standing_gain, 160);
         assert!(standing_gain < t.gain);
+    }
+
+    /// The heading observation is the training command's: minus the yaw turned since the start,
+    /// wrapped across ±π, saturating at 0.5 rad. Turning left (yaw up) reads negative.
+    #[test]
+    fn the_heading_observation_matches_training() {
+        let about_z = |a: f64| [(a / 2.0).cos(), 0.0, 0.0, (a / 2.0).sin()];
+        for a in [0.0, 0.3, -1.2, 3.0] {
+            assert!((trunk_yaw(&about_z(a)) - a).abs() < 1e-12);
+        }
+        assert_eq!(heading_obs(1.0, 1.0, 1.0), 0.0);
+        assert!((heading_obs(1.2, 1.0, 1.0) + 0.2).abs() < 1e-12);
+        assert!((heading_obs(-0.1, 0.0, 1.0) - 0.1).abs() < 1e-12);
+        assert!((heading_obs(-3.1, 3.1, 1.0) + (std::f64::consts::TAU - 6.2)).abs() < 1e-12);
+        assert_eq!(heading_obs(2.0, 0.0, 1.0), -0.5);
+        assert_eq!(heading_obs(-2.0, 0.0, 1.0), 0.5);
+        // -HdgObs4: the same clip point, scaled.
+        assert!((heading_obs(0.1, 0.0, 4.0) + 0.4).abs() < 1e-12);
+        assert_eq!(heading_obs(-2.0, 0.0, 4.0), 2.0);
     }
 
     /// The ground pick ends at 70% of its cycle — ending at 100% replays the reach on the

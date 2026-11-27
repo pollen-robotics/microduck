@@ -275,6 +275,11 @@ pub const REGISTRY: &[Entry] = &[
         "One ground-pick cycle, seconds; unset resolves per mode",
     ),
     entry(
+        "policy.ground_pick_end_phase",
+        Kind::OptionalFloat,
+        "Where the ground pick hands back, in cycles; unset = the set's (0.7)",
+    ),
+    entry(
         "policy.ground_pick_action_scale",
         Kind::OptionalFloat,
         "Action scale during the ground pick; unset resolves per mode",
@@ -298,6 +303,16 @@ pub const REGISTRY: &[Entry] = &[
         "policy.accel_vyaw",
         Kind::OptionalFloat,
         "Yaw acceleration limit, rad/s²; unset or 0: none",
+    ),
+    entry(
+        "policy.ground_pick_heading",
+        Kind::Float,
+        "Heading-error gain in the ground pick's yaw slot (-HdgObs policies; 0 = off)",
+    ),
+    entry(
+        "policy.ground_pick_settle_s",
+        Kind::Float,
+        "Seconds the ground pick runs on past its end phase with the phase zeroed (-Settle policies; 0 = off)",
     ),
     feature(
         "policy.voltage_adapt",
