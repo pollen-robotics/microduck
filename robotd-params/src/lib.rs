@@ -2026,10 +2026,14 @@ pub struct PolicyParams {
     pub head_lowpass: Option<f64>,
     /// Same, for the ten leg joints. Walking default 0.7.
     pub legs_lowpass: Option<f64>,
-    /// One ground-pick cycle, seconds. The move ends at the set's `end_phase` (70% of the
-    /// cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
+    /// One ground-pick cycle, seconds. The move ends at `ground_pick_end_phase`, else the set's
+    /// `end_phase` (70% of the cycle, as the prototype does). Absent resolves from the installed set's phase-encoded
     /// entry for this mode, else 4.0 walking, 3.0 roller (the crouch).
     pub ground_pick_period: Option<f64>,
+    /// Where the ground pick hands back, in cycles from 0. Absent: the set's `end_phase`, else
+    /// 0.7. Above 1.0 the phase keeps wrapping, which is how a cyclic phase policy (a moonwalk)
+    /// runs for several cycles in the skill slot.
+    pub ground_pick_end_phase: Option<f64>,
     /// Action scale while the ground pick runs. Absent: the set's entry, else 1.0 walking,
     /// 0.8 roller.
     pub ground_pick_action_scale: Option<f64>,
@@ -2045,6 +2049,17 @@ pub struct PolicyParams {
     pub accel_vx: Option<f64>,
     pub accel_vy: Option<f64>,
     pub accel_vyaw: Option<f64>,
+    /// Feed the heading error into the ground pick's third twist slot, times this gain: minus
+    /// the trunk yaw since the pick started, radians, wrapped and clipped to ±0.5 before the
+    /// gain (+ = turn left, as the walk's yaw-rate command). For phase policies trained with it:
+    /// 1 for the `-HdgObs` moonwalks, 4 for `-HdgObs4`. 0 (the default) leaves the slot at 0, as
+    /// every other ground pick is trained.
+    pub ground_pick_heading: f64,
+    /// Seconds the ground pick keeps driving after `ground_pick_end_phase`, with the phase slots
+    /// zeroed (twist [0, 0, heading]): the stop signal `-Settle` moonwalks are trained to answer
+    /// by bringing the feet together and standing still before the stand network takes over.
+    /// 0 (the default) hands back at the end phase, as every other ground pick is trained.
+    pub ground_pick_settle_s: f64,
     /// The one-shot skills this robot has, in priority order.
     ///
     /// Empty means the built-in three — kicks and roulade, with the numbers they have always
@@ -2705,6 +2720,8 @@ pub struct ResolvedPolicy {
     pub ground_pick_gain_ratio: f64,
     /// The twist's acceleration limit per axis, `[vx, vy, vyaw]`; `None` is no limit.
     pub twist_accel: [Option<f64>; 3],
+    pub ground_pick_heading: f64,
+    pub ground_pick_settle_s: f64,
     /// Seconds the sitstand network rises before the gait takes over.
     pub sitstand_rise_s: f64,
     /// Seconds the seat takes to settle after the flag flips.
@@ -2935,8 +2952,9 @@ impl PolicyParams {
                     Mode::Walk => 4.0,
                     Mode::Roller => 3.0,
                 }),
-            ground_pick_end_phase: pick
-                .map(|t| t.end_phase)
+            ground_pick_end_phase: self
+                .ground_pick_end_phase
+                .or(pick.map(|t| t.end_phase))
                 .unwrap_or(DEFAULT_GROUND_PICK_END_PHASE),
             ground_pick_action_scale: self
                 .ground_pick_action_scale
@@ -2954,6 +2972,8 @@ impl PolicyParams {
                 [self.accel_vx.or(roller_vx), self.accel_vy, self.accel_vyaw]
                     .map(|a| a.filter(|a| *a > 0.0))
             },
+            ground_pick_heading: self.ground_pick_heading,
+            ground_pick_settle_s: self.ground_pick_settle_s,
             sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
             sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
@@ -3058,11 +3078,14 @@ impl Default for PolicyParams {
             head_lowpass: None,
             legs_lowpass: None,
             ground_pick_period: None,
+            ground_pick_end_phase: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
             accel_vx: None,
             accel_vy: None,
             accel_vyaw: None,
+            ground_pick_heading: 0.0,
+            ground_pick_settle_s: 0.0,
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
@@ -4306,16 +4329,14 @@ mod tests {
         let tuned = super::PolicyParams {
             mode: super::Mode::Roller,
             ground_pick_period: Some(6.0),
+            ground_pick_end_phase: Some(15.0),
             ground_pick_action_scale: Some(0.7),
             ..Default::default()
         }
         .resolved_with(Some(&set));
         assert_eq!(tuned.ground_pick_period, 6.0);
+        assert_eq!(tuned.ground_pick_end_phase, 15.0);
         assert_eq!(tuned.ground_pick_action_scale, 0.7);
-        assert_eq!(
-            tuned.ground_pick_end_phase, 0.7,
-            "there is no key for the cutoff"
-        );
     }
 
     /// **The set says how the sit↔stand is timed.** The rise was a literal second and the

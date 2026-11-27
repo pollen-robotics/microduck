@@ -2316,6 +2316,8 @@ fn try_controller(
             ground_pick_end_phase: policy_cfg.ground_pick_end_phase,
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+            ground_pick_heading: policy_cfg.ground_pick_heading,
+            ground_pick_settle_s: policy_cfg.ground_pick_settle_s,
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),

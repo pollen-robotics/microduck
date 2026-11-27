@@ -240,12 +240,21 @@ mode = "walk"
 # it runs. Unset period/scale come from the installed set's manifest — the phase-encoded entry
 # tagged with this mode (4.0 / 1.0 for the walking pick, 5.0 / 0.8 for the roller crouch, as
 # they are trained) — and, on a board whose set predates the manifest, from the prototype's
-# 4.0 / 1.0 walking, 3.0 / 0.8 roller. The move hands back at the manifest's `end_phase`
-# (70% of the cycle); there is no key for that. The sitstand's rise and settle times come from
+# 4.0 / 1.0 walking, 3.0 / 0.8 roller. The move hands back at `ground_pick_end_phase`,
+# else the manifest's `end_phase` (70% of the cycle); above 1.0 a cyclic phase policy keeps going. The sitstand's rise and settle times come from
 # the set the same way.
 # ground_pick_period = 4.0
+# ground_pick_end_phase = 0.7
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+# Phase policies trained with a heading observation read gain x minus the trunk yaw since the pick
+# started (radians, clipped to +-0.5 before the gain) in the third twist slot: 1 for the -HdgObs
+# moonwalks, 4 for -HdgObs4. 0 leaves the slot at 0.
+# ground_pick_heading = 0.0
+# Phase policies trained with a stop signal (-Settle moonwalks) run on this many seconds past the end
+# phase with the phase slots zeroed, to finish standing still with the feet together. 0 hands back at
+# the end phase.
+# ground_pick_settle_s = 0.0
 
 # How fast the smoothed twist may change, per axis: m/s² forward/back and sideways, rad/s² in
 # yaw. It acts after [control] cmd_alpha, so a small stick move is the EMA as before, and only a

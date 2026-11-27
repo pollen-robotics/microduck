@@ -337,6 +337,7 @@ impl Model {
             "policy.head_lowpass" => policy.head_lowpass.and_then(float),
             "policy.legs_lowpass" => policy.legs_lowpass.and_then(float),
             "policy.ground_pick_period" => float(policy.ground_pick_period),
+            "policy.ground_pick_end_phase" => float(policy.ground_pick_end_phase),
             "policy.ground_pick_action_scale" => float(policy.ground_pick_action_scale),
             "policy.accel_vx" | "policy.accel_vy" | "policy.accel_vyaw" => {
                 let axis = ["policy.accel_vx", "policy.accel_vy", "policy.accel_vyaw"]
