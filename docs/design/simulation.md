@@ -356,15 +356,30 @@ for 0.15 m/s it stands, in `microduck_rl`'s own `scripts/infer_policy.py` as muc
 **velstand needs the robot with backlash.** It was trained as `Mjlab-VelStand-Rough-Backlash`, and
 on `robot_groundcontact.xml` — what `scene.xml` includes — it does not take a step either, with or
 without the BAM actuators. On `robot_groundcontact_backlash.xml` (`scene_backlash.xml`) it walks
-and turns, so that is `duck-sim`'s default scene. Measured with `scripts/duck-sim drive`, which
-reports the simulator's own trunk travel rather than the daemon's odometry: 0.15 m/s forward gives
-0.06; 0.8 rad/s on the spot gives 50°/s; 0.1 m/s with 0.5 rad/s gives 24°/s. The forward shortfall
+and turns, so that is `duck-sim`'s default scene. The original measurements used policy set **v8**.
+At 0.15 m/s forward the duck averaged 0.06 m/s. At 0.8 rad/s on the spot it turned at 50°/s,
+and at 0.1 m/s with 0.5 rad/s it turned at 24°/s. The forward shortfall
 is still open — the body server runs the MJCF's position actuators, not the BAM model the policy
 was trained against, and that is the first suspect. The other built-in scenes, the apartment among
 them, carry robots without backlash, so a duck walks in them only once they gain it.
 
-The check that would have caught both: "still upright after walking" is not walking. `drive` now
-says how far the duck went, and says so loudly when it is under a quarter of what was asked.
+**The policy set matters even in the same scene.** Sets v9 and v10 use v7's `velstand.onnx`.
+The table shows the range over two eight-second runs of `scripts/duck-sim drive` per command
+and policy, each from a fresh stand in the headless `backlash` scene (daemon `56424ef`,
+`microduck_rl` `0daab160`, MuJoCo 3.10.0). The simulator ran at 1.00–1.01× real time.
+For forward commands, `drive` measures the horizontal displacement of the trunk. For turns
+in place, it sums the changes in heading. The hashes identify each `velstand.onnx` by SHA-256.
+
+| `drive` arguments (m/s, rad/s) | v8 (`2fc7f8ee`) | v10 (`ce894d30`) |
+| --- | ---: | ---: |
+| `0.15 0` (default) | 59 cm | 1 cm |
+| `0.20 0` | 74–75 cm | 74–75 cm |
+| `0.25 0` | 85–86 cm | 90–91 cm |
+| `0 1.0` | 483–490° | 8° |
+| `0 0.5` | 15° | 2–3° |
+
+At the default 0.15 m/s, the v10 duck stays upright. Its trunk moves less than a quarter
+of the distance requested, so `drive` reports “it did not walk”.
 
 ## 12. Known material to reuse
 
