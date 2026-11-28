@@ -543,11 +543,11 @@ the view to 27° rather than saving anything. It is also a robot whose sensor no
 which the beta board's GC2093 was until its family solve (`CameraIntrinsics::beta`, unit sky-gtc,
 ~85°): each sensor in `mediad::sensor` publishes its own lens's geometry, never the other family's.
 
-## 11. Everything on the wire should carry the time it happened — **built; verified on loopback**
+## 11. Everything on the wire should carry the time it happened — **built; verified on a robot**
 
-A sample and a frame each state when the robot saw them, on one clock. **Both halves are written
-and have been measured only on an x86 loopback pair, not on a robot** — the *Measured* subsection
-below says what that does and does not cover.
+A sample and a frame each state when the robot saw them, on one clock. Both halves are written and
+were measured on a face-board-v1 beta; the *Measured* subsection below says what the loopback and
+the robot runs cover.
 
 **The control channel (v24).** `robot.state` and `tof.frame` carry `t_ns`, and so does
 `head_imu.frame`: `CLOCK_MONOTONIC` in nanoseconds, one clock every daemon on a board shares, so a
@@ -629,17 +629,29 @@ the robot needs no change for it: FEC is negotiated per consumer, so a browser k
 
 ### Measured
 
-Loopback `webrtcsink`/`webrtcsrc` on x86, FEC on and off, one run each way, 30 s per run:
+First on an x86 loopback pair (`webrtcsink`/`webrtcsrc`, FEC on and off, one run each way, 30 s per
+run), then on a face-board-v1 beta: daemon 0.23.1 with only `mediad` replaced by this change,
+GStreamer 1.28.5 on the board.
 
-| FEC | frames with a capture time |
-|---|---|
-| on | 2 of 302 |
-| off | 300 of 303, from the first frame |
+| Run | FEC | frames with a capture time | clock |
+|---|---|---|---|
+| loopback | on | 2 of 302 | — |
+| loopback | off | 300 of 303, from the first frame | — |
+| face-board beta, 0.23.1 `mediad` | off | 431 of 439 | wall clock, NTP epoch (~4.0e18 ns) |
+| face-board beta, this change | off | 584 of 584 | `CLOCK_MONOTONIC`, same axis as `robot.state` `t_ns` |
+| face-board beta, this change | on | 39 of 587 | monotonic, but the jitterbuffer drops the mapping |
 
-That is a statement about the extension surviving the jitterbuffer. It says nothing about a real
-robot's capture-to-encode path, its queueing, or a network, none of which a loopback exercises.
-**The numbers above go in this table only after a robot run**, with the command below and the
-frame-to-sample differences it prints.
+On the board the frame times are exactly 33.33 ms apart, so they are capture times and not send
+times. Frame time minus the newest `robot.state` sample is −105 to +148 ms (median −18 ms); that
+spread matches the sample spacing (~120 ms) plus network delay, and there is no offset between the
+two clocks. Chrome on Android and the phone app both play this `mediad` at 30 fps without loss: the
+offer carries `ntp-64` at id 4 next to TWCC at id 1, both answers keep TWCC and drop `ntp-64`, and
+RED/ULPFEC/RTX are still negotiated.
+
+The loopback numbers only say the extension survives the jitterbuffer; the robot run adds the
+capture-to-encode path, the timestamps themselves and one real network. FEC still loses the
+extension on the board — 252 payload-type switches on that SSRC in 10 s — which is the jitterbuffer
+bug above, not something to change here.
 
 ### Running the check
 
@@ -655,8 +667,9 @@ scripts/check-frame-dating.py --signaller ws://<robot>:8443 --robot-socket /tmp/
 frame. A difference around 1.8e18 ns means the frame is being dated on the wall clock; no lines at
 all means the frames carry nothing to read.
 
-**What is left.** A robot run, and the numbers in the table above. Nothing else in this repository:
-the control half shipped in v24, and the media half is the two functions this section names.
+**What is left.** Nothing in this repository: the control half shipped in v24, the media half is
+the two functions this section names, and the robot numbers are in the table above. What the next
+board run adds is a network other than the one used here.
 
 All of it is additive, so no `API_VERSION` bump was needed — the fields v24 added are ignored by an
 older client, and the media half changed nothing on the wire but which clock the existing fields
