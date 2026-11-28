@@ -23,7 +23,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 ROBOT_SOCKET = "/run/robotd.sock"
-API_VERSION = 44
+API_VERSION = 53
 
 # `GstWebRTCFECType`'s `none`, as the number: GI reads the property through the `GstWebRTC`
 # typelib, which a laptop may not have.
@@ -144,8 +144,13 @@ def on_pad_added(pipeline, pad, report):
         return
 
     def on_decodebin_pad(_decodebin, decodebin_pad):
-        if decodebin_pad.get_name().startswith("video"):
-            decodebin_pad.link(sink.get_static_pad("sink"))
+        # decodebin names its output pads src_0, src_1, ...; the video pad is the first one that
+        # appears, not one whose name starts with "video".
+        sink_pad = sink.get_static_pad("sink")
+        if sink_pad.is_linked():
+            return
+        if decodebin_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+            print(f"could not link {decodebin_pad.get_name()} to fakesink", file=sys.stderr)
 
     decodebin.connect("pad-added", on_decodebin_pad)
     decodebin.sync_state_with_parent()
